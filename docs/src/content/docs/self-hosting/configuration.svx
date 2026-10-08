@@ -67,6 +67,8 @@ env:
   - {name: WYRD_PEER_TLS_DIR, value: /etc/wyrd/peer}
 ```
 
+A `forge-worker` process opens no peer listener. Give it `WYRD_PEER_TLS_DIR` alone so it can dial the Forge leader for compaction work; it refuses `WYRD_PEER_ADDRESS`.
+
 The peer listener accepts only mutual TLS from that CA. A valid certificate identifies a cluster process, not a tenant: each receiver still checks the tenant, query, fence, and deadline of every call against its own state.
 
 ## Authentication
@@ -160,9 +162,28 @@ Every API-serving process runs the verification runtime: one scheduler, the Veri
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `WYRD_VERIFICATION_ENABLED` | `true` | Run the verification runtime in this process. Set `0` to disable it or `1` to enable it. |
-| `WYRD_VERIFICATION_INGEST_ENDPOINT` | none | Scribe-bearing gRPC endpoint (`http://` or `https://`) that Verifier results are published through. When unset, a process that hosts a Scribe and serves plaintext gRPC publishes through its own listener; any other process runs no Verifier runner until this is set. |
 
 On shutdown the runtime stops claiming work immediately, gives in-flight runs up to 30 seconds to finish, then releases their leases so another process retries them under the same run identity. That drain happens inside `WYRD_SHUTDOWN_DRAIN_MS`, so keep your supervisor's stop timeout (Kubernetes `terminationGracePeriodSeconds`) above it.
+
+### Operator connection keys
+
+Wyrd stores every Slack, PagerDuty, and HTTP [Operator connection](/how-to/operate/operator-connections/) credential itself, encrypted in Postgres. Each credential version has its own data key, wrapped by a 32-byte key-encryption key (KEK). These variables say only where the KEK lives; credentials are never deployment configuration. Keys are read at use and never cached, so a rotated key file or Vault secret applies on the next read. They correspond to the `[verification.operator_keys]` config-file section.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `WYRD_OPERATOR_KEK_SOURCE` | `env` | `env`, `file`, or `vault`. |
+| `WYRD_OPERATOR_KEK_ACTIVE_VERSION` | `1` | Positive key version that new and rotated credentials are wrapped under, at most `2147483647`. |
+| `WYRD_OPERATOR_KEK_V<version>` | none | Base64 key for one version when the source is `env`. Development only. |
+| `WYRD_OPERATOR_KEK_DIR` | none | Directory of base64 key files named `v<version>` when the source is `file`. Each file must be unreadable by group and others. |
+| `WYRD_OPERATOR_KEK_VAULT_ADDR` | none | HashiCorp Vault base URL when the source is `vault`. Production requires `https`. |
+| `WYRD_OPERATOR_KEK_VAULT_MOUNT` | `secret` | KV v2 mount. |
+| `WYRD_OPERATOR_KEK_VAULT_PREFIX` | `wyrd/operator-keys` | Path prefix. Each tenant's key is read from `<mount>/data/<prefix>/<data_tenant_id>/<version>`, field `key` (base64). |
+| `WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE` | none | File holding the Vault token, re-read on every key read and subject to the same owner-only check. |
+| `WYRD_OPERATOR_KEK_VAULT_TOKEN` | none | Inline Vault token. Set this or the token file, not both. |
+
+The production profile refuses the `env` source. A production deployment without `WYRD_SERVER_TENANT_SLUG` is multi-tenant and must use `vault` over `https`, so each tenant has its own key; it fails startup if Vault or any active tenant's active key is unavailable. A single-tenant production deployment may use `file`. Outside those rules the server starts without a readable active key, and only creating a connection or changing its credential refuses, with `WYRD_OPERATOR_503_KEY_UNAVAILABLE`.
+
+To rotate the KEK, publish the new version's key first, then raise `WYRD_OPERATOR_KEK_ACTIVE_VERSION`. The server rewraps existing rows onto the active version in the background. Keep older versions readable until no row references them.
 
 ## Readiness
 
@@ -237,6 +258,12 @@ export AWS_REGION=us-east-1
 # Signing key (required in production).
 export WYRD_SIGNING_KEY_FILE=/run/secrets/signing-key.pem
 
+# Operator connection keys. With no WYRD_SERVER_TENANT_SLUG this deployment
+# is multi-tenant, which requires Vault over https.
+export WYRD_OPERATOR_KEK_SOURCE=vault
+export WYRD_OPERATOR_KEK_VAULT_ADDR=https://vault.internal:8200
+export WYRD_OPERATOR_KEK_VAULT_TOKEN_FILE=/run/secrets/vault-token
+
 # Observability (optional but recommended).
 export WYRD_OTLP_ENDPOINT=http://otel-collector:4317
 export WYRD_SERVICE_NAME=wyrd
@@ -253,6 +280,7 @@ Boot rejects a configuration that breaks any of these:
 - A production profile requires a signing key and gRPC reflection off.
 - Any trusted issuer or workload binding requires `WYRD_SERVER_TENANT_SLUG`.
 - `WYRD_OTLP_ENDPOINT`, if set, must be a valid URL with an `http`, `https`, or `grpc` scheme.
+- Operator connection keys must follow the source rules in [Operator connection keys](#operator-connection-keys).
 
 ## Related
 

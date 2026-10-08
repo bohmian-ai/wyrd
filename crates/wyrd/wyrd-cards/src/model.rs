@@ -47,8 +47,10 @@ use {
 /// This is not the durable registry record. It is converted into `ModelSpec`
 /// when a Rust-only spec body is needed.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.model", from_py_object))]
-// justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
-#[allow(clippy::unsafe_derive_deserialize)]
+#[allow(
+    clippy::unsafe_derive_deserialize,
+    reason = "pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary"
+)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCardMetadata {
     /// Interface metadata that will be written into the `ModelSpec`.
@@ -92,8 +94,10 @@ impl Default for ModelCardMetadata {
     feature = "python",
     pyclass(module = "wyrd.model", skip_from_py_object)
 )]
-// justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
-#[allow(clippy::unsafe_derive_deserialize)]
+#[allow(
+    clippy::unsafe_derive_deserialize,
+    reason = "pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary"
+)]
 #[derive(Serialize, Deserialize)]
 pub struct ModelCard {
     /// `ModelCard` space.
@@ -110,6 +114,14 @@ pub struct ModelCard {
     pub annotations: Annotations,
     /// `ModelCard` holder metadata.
     pub metadata: ModelCardMetadata,
+    /// Server-derived BLAKE3 hash of the registered Card's artifact manifest.
+    ///
+    /// Read from `metadata.artifact_hash` of a loaded envelope and never
+    /// computed locally, so it is the trusted hash an executable model is
+    /// checked against. `None` for a locally authored holder. The registry
+    /// re-derives it on registration, so the envelope `to_card` emits omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_hash: Option<String>,
     /// Local holder creation timestamp.
     ///
     /// This is construction state for the in-process holder, not part of the
@@ -230,6 +242,20 @@ impl ModelCardMetadata {
         })
     }
 
+    /// Return the declared task type as its constructor token, such as
+    /// `"binary_classification"`, the same value `task_type=` accepts.
+    #[getter(task_type)]
+    pub fn task_type_py(&self) -> &'static str {
+        task_type_token(self.task_type)
+    }
+
+    /// Return the stored interface kind, such as `"Sklearn"`, or `"Custom"`
+    /// for a subclass-backed interface.
+    #[getter]
+    pub fn interface_kind(&self) -> &'static str {
+        self.interface.kind()
+    }
+
     /// Return this metadata as a Python-serializable dict for inspection.
     ///
     /// # Errors
@@ -256,6 +282,7 @@ impl ModelCard {
             });
         }
         let metadata = card.metadata;
+        let artifact_hash = metadata.artifact_hash.clone();
         let Spec::Model(spec) = card.spec else {
             return Err(WyrdError::ModelValidation {
                 message: "ModelCard envelope spec must be a Model spec".to_owned(),
@@ -317,6 +344,7 @@ impl ModelCard {
                 sample_input: spec.sample_input,
                 card_refs,
             },
+            artifact_hash,
 
             // this should be the time the card was created on the server
             // TODO: fix this when the server returns a created_at timestamp in the envelope
@@ -327,6 +355,21 @@ impl ModelCard {
             #[cfg(feature = "python")]
             artifact_workspace: None,
         })
+    }
+
+    /// Load a native holder from a saved Card directory or a Card file.
+    ///
+    /// A directory is read through the `card.json` that [`ModelCard`] `save`
+    /// writes; any other path is read as one JSON or YAML Card envelope. The
+    /// envelope then passes through [`ModelCard::from_card`], so kind, version,
+    /// and `ModelSpec` validation stay in one place. No model bytes are read.
+    ///
+    /// # Errors
+    /// Returns a Wyrd loader error when the file cannot be read or parsed, and
+    /// a `ModelCard` validation error when the envelope is not a valid Model
+    /// Card.
+    pub fn from_path(path: &std::path::Path) -> Result<Self, WyrdError> {
+        Self::from_card(crate::local::read_card(path)?)
     }
 
     /// Hydrate the holder's built-in or caller-supplied Python interface.
@@ -376,8 +419,10 @@ impl ModelCard {
     /// conversion, or model spec validation fails.
     #[new]
     #[pyo3(signature = (model_or_interface, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None))]
-    // justification: pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the ModelCard() Python constructor
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the ModelCard() Python constructor"
+    )]
     pub fn __new__(
         model_or_interface: &Bound<'_, PyAny>,
         space: Option<&str>,
@@ -412,6 +457,7 @@ impl ModelCard {
             labels: resolved_labels,
             annotations: resolved_annotations,
             metadata,
+            artifact_hash: None,
             created_at: utc_now(),
             is_card: true,
             interface: Some(handle.into_py_any(py)?),
@@ -535,6 +581,15 @@ impl ModelCard {
         &self.uid
     }
 
+    /// Return the registered Card's server-derived artifact manifest hash.
+    ///
+    /// This is the value to pass as a trusted artifact hash when hydrating an
+    /// executable model. It is `None` for a locally authored holder.
+    #[getter]
+    pub fn artifact_hash(&self) -> Option<&str> {
+        self.artifact_hash.as_deref()
+    }
+
     /// Convert this `ModelCard`'s identity into a Wyrd `CardRef`.
     ///
     /// # Errors
@@ -639,10 +694,7 @@ impl ModelCard {
     /// # Errors
     /// Returns a Wyrd error when no interface is attached, interface save
     /// fails, or card JSON cannot be written.
-    #[wyrd_test_contract_macros::critical("python:ModelCard.save")]
     #[pyo3(signature = (path, save_kwargs=None))]
-    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
-    #[allow(clippy::needless_pass_by_value)]
     pub fn save(
         &mut self,
         py: Python<'_>,
@@ -679,10 +731,7 @@ impl ModelCard {
     /// Returns a Wyrd error when neither a local path nor retained server
     /// artifacts are available, no interface is attached, or interface load
     /// fails.
-    #[wyrd_test_contract_macros::critical("python:ModelCard.load")]
     #[pyo3(signature = (path=None, load_kwargs=None))]
-    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
-    #[allow(clippy::needless_pass_by_value)]
     pub fn load(
         &mut self,
         py: Python<'_>,
@@ -714,7 +763,6 @@ impl ModelCard {
     ///
     /// # Errors
     /// Returns a Wyrd error when serialization fails.
-    #[wyrd_test_contract_macros::critical("python:ModelCard.model_dump_json")]
     #[pyo3(name = "model_dump_json")]
     pub fn model_dump_json_py(&self) -> CardPyResult<String> {
         self.model_dump_json()
@@ -757,7 +805,6 @@ impl ModelCard {
     /// Returns a Wyrd error when JSON parsing or Card validation fails, or the
     /// serialized custom interface cannot be rebuilt without an explicit
     /// Python interface object.
-    #[wyrd_test_contract_macros::critical("python:ModelCard.model_validate_json")]
     #[staticmethod]
     #[pyo3(name = "model_validate_json", signature = (json_string, interface=None))]
     pub fn model_validate_json_py(
@@ -765,13 +812,40 @@ impl ModelCard {
         json_string: &str,
         interface: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<Self> {
-        let mut card = Self::from_card(serde_json::from_str(json_string)?)?;
+        let mut card = Self::from_card(WyrdPyError::parse_json_input(json_string)?)?;
         card.hydrate_interface(py, interface)?;
         Ok(card)
     }
 
-    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
-    #[allow(clippy::needless_pass_by_value)]
+    /// Load a saved `ModelCard` directory or a Model Card YAML or JSON file.
+    ///
+    /// A directory written by `save` loads the envelope from its `card.json`
+    /// and then loads the saved model through the hydrated interface, so the
+    /// returned holder's `model` is ready. A Card file loads the envelope and
+    /// interface only. Python subclass-backed cards pass
+    /// `interface=YourInterface` exactly as for `model_validate_json`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd loader error when the Card file cannot be read or
+    /// parsed, a `ModelCard` validation error when the envelope is invalid or
+    /// the interface cannot be rebuilt, and the interface's error when loading
+    /// saved model artifacts fails.
+    #[staticmethod]
+    #[pyo3(name = "from_path", signature = (path, interface=None, load_kwargs=None))]
+    pub fn from_path_py(
+        py: Python<'_>,
+        path: PathBuf,
+        interface: Option<&Bound<'_, PyAny>>,
+        load_kwargs: Option<&Bound<'_, PyAny>>,
+    ) -> CardPyResult<Self> {
+        let mut card = Self::from_path(&path)?;
+        card.hydrate_interface(py, interface)?;
+        if path.is_dir() {
+            card.load(py, Some(path), load_kwargs)?;
+        }
+        Ok(card)
+    }
+
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(interface) = self.interface.as_ref() {
             visit.call(interface)?;
@@ -1106,6 +1180,20 @@ mod tests {
         assert_eq!(card_ref.version.as_str(), "0.1.0");
     }
 
+    /// A loaded envelope's server-derived `artifact_hash` is kept on the
+    /// holder verbatim, so callers read the trusted hash instead of
+    /// recomputing it.
+    #[test]
+    fn from_card_keeps_registered_artifact_hash() {
+        let mut card = model_card().to_card().expect("holder converts to a Card");
+        card.metadata.artifact_hash = Some("registered-hash".to_owned());
+
+        let loaded = ModelCard::from_card(card).expect("Model envelope loads");
+
+        assert_eq!(loaded.artifact_hash.as_deref(), Some("registered-hash"));
+    }
+
+    /// A valid locally authored Sklearn holder with labels and annotations.
     fn model_card() -> ModelCard {
         let mut labels = BTreeMap::new();
         labels.insert(label_key("domain"), label_value("churn"));
@@ -1131,6 +1219,7 @@ mod tests {
                 sample_input: None,
                 card_refs: Vec::new(),
             },
+            artifact_hash: None,
             created_at: Utc::now(),
             is_card: true,
             #[cfg(feature = "python")]

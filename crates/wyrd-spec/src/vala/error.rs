@@ -175,16 +175,6 @@ pub enum BifrostError {
     )]
     QueryStreamIncomplete,
 
-    /// The transactional query read-decision audit could not be committed.
-    #[error("query audit unavailable")]
-    #[wyrd_error(
-        code = "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE",
-        status = 503,
-        title = "Query audit unavailable",
-        remediation = "Restore the audit/SQL dependency before retrying."
-    )]
-    QueryAuditUnavailable,
-
     /// Query execution failed after the public stream began.
     #[error("query execution failed")]
     #[wyrd_error(
@@ -240,7 +230,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
         status = 400,
         title = "Reserved system column name",
-        remediation = "Rename the column — wyrd_event_time, wyrd_ingested_at, wyrd_batch_id, and data_tenant_id are reserved."
+        remediation = "Rename the column — run_id, card_uid, principal_id, wyrd_request_id, wyrd_event_time, and wyrd_ingested_at are reserved."
     )]
     ReservedColumn {
         /// The reserved column name that was supplied.
@@ -453,6 +443,20 @@ pub enum BifrostError {
         detail: String,
     },
 
+    /// The query request's `deadline_ms` is outside `1..=u32::MAX`
+    /// milliseconds.
+    ///
+    /// Clients refuse it before IO and the server refuses it in Oracle
+    /// validation, so every surface reports this one code.
+    #[error("deadline_ms must be an integer between 1 and 4294967295")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_QUERY_INVALID_DEADLINE",
+        status = 400,
+        title = "Invalid query deadline",
+        remediation = "Omit deadline_ms or pass a whole number of milliseconds between 1 and 4294967295."
+    )]
+    QueryInvalidDeadline,
+
     /// The query exceeded the configured execution time budget.
     #[error("query execution timed out")]
     #[wyrd_error(
@@ -518,19 +522,6 @@ pub enum BifrostError {
     )]
     Internal {
         /// Human-readable detail about the internal failure.
-        detail: String,
-    },
-
-    /// The transactional audit outbox could not durably record the operation.
-    #[error("audit outbox unavailable: {detail}")]
-    #[wyrd_error(
-        code = "WYRD_VALA_500_AUDIT_UNAVAILABLE",
-        status = 500,
-        title = "Audit outbox unavailable",
-        remediation = "The operation was refused because its audit row could not be durably recorded. Retry; if it persists, check the audit outbox and catalog database health."
-    )]
-    AuditUnavailable {
-        /// Human-readable detail about the audit-append failure.
         detail: String,
     },
 
@@ -806,6 +797,21 @@ column to let the server stamp receipt time."
         remediation = "Retry with the table's registered compaction target, omit it, or register a different table."
     )]
     CompactionTargetMismatch {
+        /// Canonical `<namespace>.<name>` of the conflicting table.
+        table: String,
+    },
+
+    /// A register retry supplied a compaction type that differs from the
+    /// table's existing explicit type, or supplied one for a table that
+    /// compacts with the default `small-files` type without declaring it.
+    #[error("compaction type mismatch for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH",
+        status = 409,
+        title = "Bifrost compaction type mismatch",
+        remediation = "Retry with the table's registered compaction type, omit it, or register a different table."
+    )]
+    CompactionTypeMismatch {
         /// Canonical `<namespace>.<name>` of the conflicting table.
         table: String,
     },

@@ -68,6 +68,7 @@ async fn execute_analytical(
         .query_sql(
             query_context(tenant)?,
             BifrostQueryRequest {
+                params: Vec::new(),
                 sql: sql.to_owned(),
                 deadline_ms: Some(30_000),
             },
@@ -128,6 +129,7 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
 /// Builds one published-only strict request with the journey's deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
+        params: Vec::new(),
         sql: sql.to_owned(),
         deadline_ms: Some(30_000),
     }
@@ -138,7 +140,7 @@ fn request(sql: &str) -> BifrostQueryRequest {
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_analytical_cancel_deadline_and_slow_consumer_leave_six_clean_nodes() {
-    prove_terminal_cleanup()
+    Box::pin(prove_terminal_cleanup())
         .await
         .expect("analytical terminal cleanup journey");
 }
@@ -178,6 +180,7 @@ async fn prove_terminal_cleanup() -> Result<(), JourneyError> {
         .query_sql(
             query_context(tenant)?,
             BifrostQueryRequest {
+                params: Vec::new(),
                 deadline_ms: Some(1),
                 ..request(&sql)
             },
@@ -318,7 +321,7 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_analytical_raw_sql_proves_pushdown_exchange_and_qualified_spill() {
-    prove_pushdown_exchange_and_spill()
+    Box::pin(prove_pushdown_exchange_and_spill())
         .await
         .expect("analytical pushdown, exchange, and spill journey");
 }
@@ -483,7 +486,7 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_analytical_production_telemetry_covers_every_hot_path() {
-    prove_production_telemetry()
+    Box::pin(prove_production_telemetry())
         .await
         .expect("analytical production telemetry journey");
 }

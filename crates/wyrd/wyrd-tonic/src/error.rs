@@ -61,14 +61,12 @@ fn http_status_to_grpc_code(status: u16) -> Code {
         404 => Code::NotFound,
         409 => Code::AlreadyExists,
         412 => Code::FailedPrecondition,
-        413 => Code::ResourceExhausted,
-        429 => Code::ResourceExhausted,
+        413 | 429 | 507 => Code::ResourceExhausted,
         499 => Code::Cancelled,
         500 => Code::Internal,
         501 => Code::Unimplemented,
         503 => Code::Unavailable,
         504 => Code::DeadlineExceeded,
-        507 => Code::ResourceExhausted,
         _ => Code::Unknown,
     }
 }

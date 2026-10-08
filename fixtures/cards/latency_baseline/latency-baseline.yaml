@@ -1,0 +1,26 @@
+# One hundred healthy request latencies, 0 to 99 ms, alternating gold and silver tiers.
+apiVersion: wyrd/v1
+kind: Data
+metadata:
+  name: latency-baseline
+  version: 1.0.0
+  space: default
+spec:
+  interface:
+    kind: Parquet
+    meta:
+      compression: Snappy
+  schema:
+    columns:
+      - name: latency
+        dtype: float64
+      - name: tier
+        dtype: string
+  stats:
+    row_count: 100
+    col_count: 2
+    byte_count: 1213
+    sha256: c4f7700b380aff2662e88d034154d1890c33d3c12c8dda1a0ca9481f43bb9906
+artifacts:
+  - relative_path: data/data.parquet
+    content_type: application/vnd.apache.parquet

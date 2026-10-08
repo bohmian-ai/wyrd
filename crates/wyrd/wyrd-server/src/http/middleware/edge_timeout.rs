@@ -1,11 +1,13 @@
-//! Protected-edge request timeout with one staged query handoff.
+//! Protected-edge request timeout with a staged handoff for routes that own a
+//! longer deadline.
 //!
 //! Every protected request is bounded by `LimitsConfig::timeout` while it holds
-//! a concurrency slot. `POST /v1/query` alone is staged: body collection,
-//! authentication, and capability admission stay under that generic timer, but
-//! once the handler hands the request to Oracle dispatch — which captures the
-//! request's own query deadline — the generic timer stops racing it. Oracle then
-//! owns preparation, first-batch wait, and terminal-stream timing and cleanup.
+//! a concurrency slot. `POST /v1/query` and `POST /v1/verification/execute` are
+//! staged: body collection, authentication, and admission stay under that
+//! generic timer, but once the handler hands the request to the work that
+//! carries its own deadline — Oracle dispatch for a query, the Verifier engine
+//! for a direct execution — the generic timer stops racing it. That deadline
+//! then owns the rest of the request's timing and cleanup.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -18,33 +20,44 @@ use tokio_util::sync::CancellationToken;
 use tower::timeout::error::Elapsed;
 use tower::{BoxError, Layer, Service};
 
-/// Path of the only route whose edge timeout is staged.
+/// Path of the public SQL query route.
 const QUERY_PATH: &str = "/v1/query";
+
+/// Path of the direct verification route, whose engine owns a 60-second
+/// deadline.
+const EXECUTE_PATH: &str = "/v1/verification/execute";
 
 /// Reports whether `request` is the public SQL query, `POST /v1/query`.
 ///
-/// This is the one route whose waiting belongs to Oracle rather than to the
-/// generic protected edge.
+/// Its waiting belongs to Oracle rather than to the generic protected edge,
+/// and edge capacity treats it separately.
 pub(crate) fn is_public_query<B>(request: &Request<B>) -> bool {
     request.method() == Method::POST && request.uri().path() == QUERY_PATH
 }
 
-/// Request extension that ends the generic edge timer for one query.
+/// Reports whether `request`'s edge timer is staged: the public query or a
+/// direct verification execution.
+fn is_staged<B>(request: &Request<B>) -> bool {
+    is_public_query(request)
+        || (request.method() == Method::POST && request.uri().path() == EXECUTE_PATH)
+}
+
+/// Request extension that ends the generic edge timer for one staged request.
 ///
-/// Inserted only on `POST /v1/query`. The query handler calls
-/// [`Self::hand_off_to_oracle`] immediately before Oracle dispatch captures the
-/// query deadline; dropping it without a handoff leaves the edge timer armed.
+/// Inserted only on staged routes. The handler calls [`Self::hand_off`]
+/// immediately before the work that captures the request's own deadline;
+/// dropping it without a handoff leaves the edge timer armed.
 #[derive(Clone, Debug)]
-pub struct QueryEdgeTimer {
+pub struct EdgeTimer {
     /// Sticky handoff signal observed by the edge future.
     handoff: CancellationToken,
 }
 
-impl QueryEdgeTimer {
-    /// Stops the generic edge timer so the query's own deadline governs the rest.
+impl EdgeTimer {
+    /// Stops the generic edge timer so the request's own deadline governs the rest.
     ///
     /// Idempotent: repeated calls have no further effect.
-    pub fn hand_off_to_oracle(&self) {
+    pub fn hand_off(&self) {
         self.handoff.cancel();
     }
 }
@@ -78,7 +91,8 @@ impl<S> Layer<S> for EdgeTimeoutLayer {
     }
 }
 
-/// Service enforcing the generic edge timeout, staged for `POST /v1/query`.
+/// Service enforcing the generic edge timeout, staged for the routes
+/// [`is_staged`] selects.
 #[derive(Clone, Debug)]
 pub struct EdgeTimeout<S> {
     /// Wrapped body-limit, authentication, and route stack.
@@ -102,7 +116,7 @@ where
     /// which the outer error handler maps to the request-timeout problem.
     type Error = BoxError;
     /// Future racing the inner call against the edge limit until completion
-    /// or query handoff.
+    /// or a staged route's handoff.
     type Future = EdgeFuture<S::Response>;
 
     /// Delegates readiness to the wrapped stack.
@@ -115,19 +129,19 @@ where
     }
 
     /// Races the wrapped call against the edge limit until completion or, for a
-    /// query, until its handler hands the request to Oracle.
+    /// staged route, until its handler hands the request off.
     ///
-    /// Expiry drops the in-flight call, cancelling pre-Oracle work, and returns
+    /// Expiry drops the in-flight call, cancelling pre-handoff work, and returns
     /// [`Elapsed`] for the existing request-timeout problem mapping.
     ///
     /// # Errors
     ///
     /// The returned future resolves to the wrapped stack's failure, boxed, or to
-    /// [`Elapsed`] when the edge limit passes before completion or query handoff.
+    /// [`Elapsed`] when the edge limit passes before completion or handoff.
     fn call(&mut self, mut request: Request<Body>) -> Self::Future {
-        let handoff = is_public_query(&request).then(|| {
+        let handoff = is_staged(&request).then(|| {
             let handoff = CancellationToken::new();
-            request.extensions_mut().insert(QueryEdgeTimer {
+            request.extensions_mut().insert(EdgeTimer {
                 handoff: handoff.clone(),
             });
             handoff

@@ -25,20 +25,20 @@ use crate::TenantConn;
 /// principals). The predicate can therefore match several rows, so it fetches at
 /// most two and [`service_account_by_card_ref`] accepts only a single match; an
 /// ambiguous reference resolves no principal rather than an arbitrary one.
-const SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str = r#"
+const SERVICE_ACCOUNT_BY_CARD_REF_SQL: &str = r"
         SELECT id, principal_kind, card_ref, status
           FROM wyrd.auth_service_accounts
          WHERE principal_kind = $1
            AND card_ref @> $2
            AND status = 'active'
          LIMIT 2
-        "#;
+        ";
 
-const INSERT_REFRESH_TOKEN_SQL: &str = r#"
+const INSERT_REFRESH_TOKEN_SQL: &str = r"
         INSERT INTO wyrd.auth_refresh_tokens (
             id, data_tenant_id, principal_kind, principal_id, token_hash, expires_at
         ) VALUES ($1, $2, $3, $4, $5, $6)
-        "#;
+        ";
 
 /// Active tenant-scope machine principal row.
 ///
@@ -63,7 +63,7 @@ pub struct ServiceAccountPrincipalRow {
 pub struct ApiKeyLookupRow {
     /// API key id.
     pub api_key_id: Uuid,
-    /// Stored Argon2 PHC string.
+    /// Stored SHA-256 hex verifier.
     pub key_hash: String,
     /// Service account id.
     pub principal_id: Uuid,
@@ -96,6 +96,10 @@ pub enum ApiKeyStatus {
 ///
 /// # Errors
 /// Returns a SQLx error when Postgres rejects the insert.
+///
+/// # Panics
+///
+/// Panics if a stored `CardUid` is not a UUID, which the type invariant rules out.
 pub async fn insert_service_account(
     conn: &mut TenantConn<'_>,
     id: Uuid,
@@ -124,12 +128,12 @@ pub async fn insert_service_account(
     let version = card_ref.map(|card_ref| card_ref.version.as_str());
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO wyrd.auth_service_accounts (
             id, data_tenant_id, principal_kind, card_kind, card_uid,
             card_ref, space, name, version, description, status, created_by
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'active', $11)
-        "#,
+        ",
     )
     .bind(id)
     .bind(conn.data_tenant_id().as_uuid())
@@ -219,14 +223,14 @@ pub async fn service_account_by_id(
     id: Uuid,
 ) -> Result<Option<ServiceAccountPrincipalRow>, sqlx::Error> {
     sqlx::query_as::<_, ServiceAccountPrincipalRow>(
-        r#"
+        r"
         SELECT id, principal_kind, card_ref, status
           FROM wyrd.auth_service_accounts
          WHERE data_tenant_id = $1
            AND id = $2
            AND status = 'active'
            AND principal_kind <> 'system'
-        "#,
+        ",
     )
     .bind(conn.data_tenant_id().as_uuid())
     .bind(id)
@@ -257,12 +261,12 @@ pub async fn provision_system_principal(conn: &mut TenantConn<'_>) -> Result<Uui
 /// Returns the database error when the read fails.
 pub async fn system_principal_id(conn: &mut TenantConn<'_>) -> Result<Option<Uuid>, SqlxError> {
     sqlx::query_scalar(
-        r#"
+        r"
         SELECT id
           FROM wyrd.auth_service_accounts
          WHERE principal_kind = 'system'
            AND status = 'active'
-        "#,
+        ",
     )
     .fetch_optional(&mut **conn.transaction())
     .await
@@ -281,14 +285,14 @@ pub async fn tenant_admin_principal_id(
     conn: &mut TenantConn<'_>,
 ) -> Result<Option<Uuid>, SqlxError> {
     sqlx::query_scalar(
-        r#"
+        r"
         SELECT id
           FROM wyrd.auth_service_accounts
          WHERE principal_kind = 'tenant_admin'
            AND status = 'active'
          ORDER BY created_at
          LIMIT 1
-        "#,
+        ",
     )
     .fetch_optional(&mut **conn.transaction())
     .await
@@ -296,7 +300,7 @@ pub async fn tenant_admin_principal_id(
 
 /// Insert a hashed credential row for a tenant-scope principal.
 ///
-/// Stores only the Argon2 verifier and non-secret lookup metadata; the
+/// Stores only the SHA-256 verifier and non-secret lookup metadata; the
 /// plaintext is returned once by the issuing caller and never persisted.
 /// `lifetime` is optional: an administrative credential issued during tenant
 /// provisioning or recovery has no natural lifetime, while a workload key
@@ -318,7 +322,7 @@ pub async fn insert_api_key(
     lifetime: Option<Duration>,
 ) -> Result<(DateTime<Utc>, Option<DateTime<Utc>>), sqlx::Error> {
     sqlx::query_as(
-        r#"
+        r"
         INSERT INTO wyrd.auth_api_keys (
             id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at
         ) VALUES ($1, $2, $3, $4, $5, $6,
@@ -326,7 +330,7 @@ pub async fn insert_api_key(
                        ELSE statement_timestamp() + ($7 * interval '1 second')
                   END)
         RETURNING created_at, expires_at
-        "#,
+        ",
     )
     .bind(id)
     .bind(conn.data_tenant_id().as_uuid())
@@ -350,7 +354,7 @@ pub async fn api_key_by_prefix(
     prefix: &str,
 ) -> Result<Option<ApiKeyLookupRow>, sqlx::Error> {
     sqlx::query_as::<_, ApiKeyLookupRow>(
-        r#"
+        r"
         SELECT k.id AS api_key_id,
                k.key_hash,
                sa.id AS principal_id,
@@ -366,7 +370,7 @@ pub async fn api_key_by_prefix(
            AND k.revoked_at IS NULL
            AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())
          LIMIT 1
-        "#,
+        ",
     )
     .bind(conn.data_tenant_id().as_uuid())
     .bind(prefix)
@@ -386,14 +390,14 @@ pub async fn api_key_status_by_prefix(
     prefix: &str,
 ) -> Result<ApiKeyStatus, sqlx::Error> {
     let row: Option<(bool, bool)> = sqlx::query_as(
-        r#"
+        r"
         SELECT revoked_at IS NOT NULL,
                COALESCE(expires_at <= statement_timestamp(), false)
           FROM wyrd.auth_api_keys
          WHERE data_tenant_id = $1
            AND prefix = $2
          LIMIT 1
-        "#,
+        ",
     )
     .bind(conn.data_tenant_id().as_uuid())
     .bind(prefix)
@@ -414,30 +418,18 @@ pub async fn touch_api_key_last_used(
     api_key_id: Uuid,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"
+        r"
         UPDATE wyrd.auth_api_keys
            SET last_used_at = now()
          WHERE data_tenant_id = $1
            AND id = $2
-        "#,
+        ",
     )
     .bind(conn.data_tenant_id().as_uuid())
     .bind(api_key_id)
     .execute(&mut **conn.transaction())
     .await?;
     Ok(())
-}
-
-/// Return role names granted to a non-human principal.
-#[deprecated(
-    since = "0.0.1",
-    note = "use role_assignments::list_service_account_roles"
-)]
-pub async fn service_account_roles(
-    conn: &mut TenantConn<'_>,
-    principal_id: Uuid,
-) -> Result<Vec<String>, sqlx::Error> {
-    super::role_assignments::list_service_account_roles(conn, principal_id).await
 }
 
 /// Insert a principal-generic refresh token row.
@@ -473,7 +465,7 @@ mod tests {
 
     #[test]
     fn api_key_lookup_filters_all_public_invalid_key_cases() {
-        let sql = r#"
+        let sql = r"
         SELECT k.id AS api_key_id,
                k.key_hash,
                sa.id AS principal_id,
@@ -489,7 +481,7 @@ mod tests {
            AND k.revoked_at IS NULL
            AND (k.expires_at IS NULL OR k.expires_at > statement_timestamp())
          LIMIT 1
-        "#;
+        ";
 
         assert!(sql.contains("k.prefix = $2"));
         assert!(sql.contains("k.revoked_at IS NULL"));

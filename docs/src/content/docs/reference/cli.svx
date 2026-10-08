@@ -136,6 +136,37 @@ wyrd auth issue-key \
   ]}
 />
 
+### auth grant-role
+
+Grant a built-in or tenant Role to the principal bound to a Service or Agent
+Card (`POST /v1/auth/grant-role`). Requires a tenant administrator (`*`)
+credential in the ambient chain. Granting a Role the principal already holds
+succeeds with `granted: false`. The Role reaches the principal's tokens at its
+next key exchange. See [Authorization](/concepts/authorization/).
+
+```bash
+wyrd auth grant-role \
+  --kind Service --name checkout --version 1.0.0 --space prod \
+  --role workload --server https://acme.wyrd.cloud
+```
+
+<DataTable
+  columns={[
+    { header: 'Flag', role: 'name' },
+    { header: 'Required' },
+    { header: 'Env' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['--kind', 'yes', '—', 'Card kind of the target principal: Service or Agent.'],
+    ['--name', 'yes', '—', 'Card name.'],
+    ['--version', 'yes', '—', 'Card version (e.g. 1.0.0).'],
+    ['--space', 'yes', '—', 'Card space.'],
+    ['--role', 'yes', '—', 'Built-in or tenant Role to grant (e.g. workload).'],
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
+  ]}
+/>
+
 ## wyrd eval run
 
 Score pre-collected observations locally against an Eval-backed Verifier card
@@ -218,6 +249,34 @@ WYRD_ACCESS_TOKEN=... wyrd gateway deployment list --server https://acme.wyrd.cl
     ['governance-policy put --file <path> | get | delete', 'Replace, read, or reset the governance policy.'],
     ['capture-policy put --file <path> | get', 'Replace or read the capture policy.'],
     ['--server', 'Wyrd server base URL (WYRD_SERVER_URL). Credentials resolve from WYRD_ACCESS_TOKEN, WYRD_API_KEY, or client configuration; the CLI never accepts them as arguments.']
+  ]}
+/>
+
+## wyrd operator-connection
+
+Manage the tenant's encrypted [Operator connections](/how-to/operate/operator-connections/).
+`create` and `update` read the whole request body, secret included, from a JSON
+or YAML file, or from stdin with `--body-file -`, so a credential never appears
+in argv or shell history. Every verb prints the server's redacted JSON view.
+Reads require `operators:read`; writes require `operators:write`.
+
+```bash
+wyrd operator-connection create --body-file slack.yaml --server https://acme.wyrd.cloud
+wyrd operator-connection list --server https://acme.wyrd.cloud
+```
+
+<DataTable
+  columns={[
+    { header: 'Command', role: 'name' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['create --body-file <path>', 'Create a connection from a provider-tagged body.'],
+    ['list', 'List every connection in the tenant, redacted.'],
+    ['get --connection-id <uuid>', 'Read one connection, redacted.'],
+    ['update --connection-id <uuid> --body-file <path>', 'Patch a connection: rotate its secret, change nonsecret configuration, or set status to active or disabled.'],
+    ['disable --connection-id <uuid>', 'Disable a connection. It is retained, never deleted; re-enable it with update.'],
+    ['--server', 'Wyrd server base URL (WYRD_SERVER_URL). The credential resolves from the ambient chain.']
   ]}
 />
 

@@ -25,3 +25,6 @@ utoipa = { workspace = true, optional = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+
+[lints]
+workspace = true

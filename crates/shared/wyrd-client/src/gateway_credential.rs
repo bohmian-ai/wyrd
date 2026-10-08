@@ -44,6 +44,9 @@ pub struct CredentialWriter {
 
 impl CredentialWriter {
     /// Binds the handle to an assembled client.
+    ///
+    /// # Arguments
+    /// * `client` - Assembled client whose auth and transport carry every mutation.
     #[must_use]
     pub fn new(client: WyrdClient) -> Self {
         Self { client }
@@ -53,6 +56,9 @@ impl CredentialWriter {
     ///
     /// A repeated submission under the same name rotates the credential in
     /// place. The answer never echoes a submitted secret.
+    ///
+    /// # Arguments
+    /// * `write` - Credential name and secret material to create or rotate.
     ///
     /// # Errors
     /// Returns the server's stable permission, invalid-configuration,
@@ -67,6 +73,9 @@ impl CredentialWriter {
 
     /// Terminally revokes a provider credential; repeating is harmless.
     ///
+    /// # Arguments
+    /// * `name` - Provider credential to revoke.
+    ///
     /// # Errors
     /// Returns the server's permission, not-found, or availability error.
     pub async fn revoke_credential(
@@ -78,6 +87,9 @@ impl CredentialWriter {
     }
 
     /// Deletes an unreferenced provider credential; an absent name succeeds.
+    ///
+    /// # Arguments
+    /// * `name` - Provider credential to delete.
     ///
     /// # Errors
     /// Returns the server's permission, conflict (still referenced), or
@@ -97,6 +109,6 @@ impl CredentialWriter {
         path: &str,
         body: Option<&S>,
     ) -> Result<D, WyrdError> {
-        self.client.request_json(method, path, body).await
+        self.client.http.request_json(method, path, body).await
     }
 }

@@ -425,6 +425,7 @@ fn is_peer_only_component(kind: &CardKind) -> bool {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::collections::BTreeMap;
     use wyrd_semver::{VersionBlock, VersionSpec};
 
     use super::{binding_validation_errors, spec_binding_errors, validate_composition};
@@ -467,8 +468,8 @@ mod tests {
                 bump: None,
                 space: card_ref.space,
                 uid: None,
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::default(),
+                annotations: BTreeMap::default(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,

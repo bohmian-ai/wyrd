@@ -138,9 +138,10 @@ pub(crate) mod pg_tests {
     use wyrd_sql::row_types::auth::HumanSessionBinding;
 
     use super::revoke_principal_in_conn;
-    use crate::exchange_api_key::token_hash;
+    use crate::audit::test_outbox::{drain, outbox};
     use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
     use crate::refresh::RefreshTokens;
+    use wyrd_auth_issue::hash_secret;
 
     fn make_service_card_ref(name: &str) -> CardRef {
         CardRef {
@@ -442,7 +443,7 @@ pub(crate) mod pg_tests {
 
         // Remove the runtime role's write privilege so the revocation statement
         // fails exactly as an unavailable or misconfigured store would.
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query("REVOKE UPDATE ON wyrd.auth_service_accounts FROM wyrd_app")
             .execute(&admin)
             .await
@@ -521,7 +522,7 @@ pub(crate) mod pg_tests {
             &mut setup,
             Uuid::new_v4(),
             user_id,
-            &token_hash(current.expose_secret()),
+            &hash_secret(current.expose_secret()),
             Utc::now() + Duration::days(30),
             None,
             HumanSessionBinding {
@@ -589,8 +590,13 @@ pub(crate) mod pg_tests {
             )
             .expect("test private key loads"),
         );
+        let audit = outbox(&fixture);
         let service = RefreshTokens {
-            issuer: TenantTokenIssuer::new(key, TokenExchangeSettings::default()),
+            issuer: TenantTokenIssuer::new(
+                key,
+                TokenExchangeSettings::default(),
+                Arc::clone(&audit),
+            ),
         };
 
         let (user_id, current) = seed_user_with_current_refresh(&fixture).await;
@@ -633,7 +639,7 @@ pub(crate) mod pg_tests {
             .expect("the route commits the revocation");
 
         let mut fresh = fixture.tenant_conn().await.expect("fresh conn opens");
-        let successor_row = refresh_by_hash(&mut fresh, &token_hash(successor.expose_secret()))
+        let successor_row = refresh_by_hash(&mut fresh, &hash_secret(successor.expose_secret()))
             .await
             .expect("lookup")
             .expect("C exists");
@@ -659,5 +665,6 @@ pub(crate) mod pg_tests {
             user.status, "suspended",
             "the revocation suspended the user"
         );
+        drain(&audit).await;
     }
 }

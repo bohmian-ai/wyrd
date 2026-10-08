@@ -4,11 +4,14 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::sync::{mpsc, watch};
+use vala_sql::ValaPostgres;
+use vala_sql::queries::scribe_batch_commits::ScribeBatchCommit;
 use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
@@ -420,6 +423,11 @@ pub trait ShardItem {
     fn table(&self) -> &TableRef;
     /// In-flight bytes charged to the item.
     fn bytes(&self) -> usize;
+    /// Client batch identity the item carries.
+    ///
+    /// A client retry reuses the ID, so the scheduler uses it with the tenant
+    /// and table to keep two copies of one batch out of the same group.
+    fn batch_id(&self) -> [u8; 16];
 }
 
 /// One fixed shard mailbox.
@@ -534,6 +542,17 @@ struct TenantTableQueues<T> {
     active_tables: VecDeque<TableRef>,
 }
 
+impl<T> TenantTableQueues<T> {
+    /// Returns the request the tenant's next turn would take, without taking it.
+    ///
+    /// Reads the front of the next table's queue, which is the item
+    /// [`TenantTableRoundRobin::pop_next_table_item`] pops while the rotation
+    /// and queues stay in step.
+    fn peek_next_table_item(&self) -> Option<&T> {
+        self.by_table.get(self.active_tables.front()?)?.front()
+    }
+}
+
 impl<T> Default for TenantTableQueues<T> {
     fn default() -> Self {
         Self {
@@ -580,8 +599,15 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
     /// requeues both levels behind their peers when either still has work.
     /// Tenants and tables whose queues emptied are dropped from the rotation
     /// entirely rather than left as empty entries a later turn would waste.
+    ///
+    /// The group never holds two copies of one tenant/table/batch identity:
+    /// the owner's duplicate checks see a batch only after its group commits,
+    /// so a second in-group copy would write its WAL slices twice. When the
+    /// next request is such a copy, its tenant goes back to the front of the
+    /// rotation, keeping its turn for the next group, and this group ends.
     pub fn pop_group(&mut self) -> Vec<T> {
         let mut result = Vec::new();
+        let mut batches = HashSet::new();
         while result.len() < MAX_GROUP_ITEMS {
             let Some(tenant) = self.active_tenants.pop_front() else {
                 break;
@@ -589,10 +615,19 @@ impl<T: ShardItem> TenantTableRoundRobin<T> {
             let Some(queues) = self.pending_by_tenant.get_mut(&tenant) else {
                 continue;
             };
+            // ponytail: a resent copy closes the group; the next group's
+            // existing memtable and durable fence checks absorb it.
+            if let Some(next) = queues.peek_next_table_item()
+                && batches.contains(&(tenant, next.table().clone(), next.batch_id()))
+            {
+                self.active_tenants.push_front(tenant);
+                break;
+            }
             let Some(item) = Self::pop_next_table_item(queues) else {
                 self.pending_by_tenant.remove(&tenant);
                 continue;
             };
+            batches.insert((tenant, item.table().clone(), item.batch_id()));
             result.push(item);
             if queues.active_tables.is_empty() {
                 self.pending_by_tenant.remove(&tenant);
@@ -644,6 +679,10 @@ impl ShardItem for PreparedAppend {
 
     fn bytes(&self) -> usize {
         self.prepared_bytes
+    }
+
+    fn batch_id(&self) -> [u8; 16] {
+        *self.batch_id.as_bytes()
     }
 }
 
@@ -767,7 +806,7 @@ struct ShardOwner {
     /// Optional immutable-generation persistence runtime.
     persistence: Option<Arc<PersistenceRuntime>>,
     /// Vala SQL pool retained only by the production batch-control fence.
-    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    control_postgres: Option<Arc<ValaPostgres>>,
     /// Completion sender routed back to this owner's command mailbox.
     completion_tx: mpsc::Sender<ShardCommand>,
     /// Typed WAL stream identity for generations and replay.
@@ -853,7 +892,7 @@ pub(crate) struct ScribeShardStartConfig {
     /// Optional immutable-generation persistence runtime.
     pub(crate) persistence: Option<Arc<PersistenceRuntime>>,
     /// Tenant-scoped SQL owner used to fence durable public batch ACKs.
-    pub(crate) control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    pub(crate) control_postgres: Option<Arc<ValaPostgres>>,
     /// Typed pod stream identity.
     pub(crate) stream: StreamIdentity,
     /// Shared active/immutable memory ledger.
@@ -3585,7 +3624,14 @@ impl ShardOwner {
                 })?,
                 request_id: first.request_id,
             };
-            if self.commit_batch_control_fence(&postgres, &commit).await? {
+            let ingested_at = chrono::DateTime::from_timestamp_micros(append.ingested_at_micros)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "Scribe admission instant exceeds the PostgreSQL range".to_owned(),
+                })?;
+            if self
+                .commit_batch_control_fence(&postgres, &commit, ingested_at)
+                .await?
+            {
                 tracing::debug!(
                     tenant = %append.tenant,
                     table = %append.table.fqn(),
@@ -3600,6 +3646,9 @@ impl ShardOwner {
 
     /// Commits or durably reconciles one exact WAL batch-control fence.
     ///
+    /// `ingested_at` is the batch's admission instant, the value stamped on
+    /// its rows as `wyrd_ingested_at`; the fence stores it unchanged.
+    ///
     /// A `PostgreSQL` COMMIT error is always ambiguous. The method opens a fresh
     /// tenant transaction and compares every durable identity field. An exact
     /// row completes once; an absent row retries the identical insert. An unavailable or contradictory lookup poisons the shared
@@ -3613,13 +3662,15 @@ impl ShardOwner {
     /// failures poison admission and retain the group until restart.
     async fn commit_batch_control_fence(
         &self,
-        postgres: &vala_sql::ValaPostgres,
-        commit: &vala_sql::queries::scribe_batch_commits::ScribeBatchCommit,
+        postgres: &ValaPostgres,
+        commit: &ScribeBatchCommit,
+        ingested_at: DateTime<Utc>,
     ) -> Result<bool, ScribeError> {
         loop {
             let mut conn = postgres.tenant_conn(commit.tenant).await?;
             let recorded =
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit).await?;
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit, ingested_at)
+                    .await?;
             if conn.commit().await.is_ok() {
                 return Ok(matches!(
                     recorded,
@@ -5812,6 +5863,14 @@ mod tests {
         fn bytes(&self) -> usize {
             self.bytes
         }
+
+        /// Derives the batch identity from the arrival sequence, so items that
+        /// share a sequence model one batch and its resent copy.
+        fn batch_id(&self) -> [u8; 16] {
+            let mut id = [0; 16];
+            id[..size_of::<usize>()].copy_from_slice(&self.sequence.to_le_bytes());
+            id
+        }
     }
 
     /// Proves an ample shutdown budget flushes every owner before draining tasks.
@@ -6395,6 +6454,7 @@ mod tests {
             crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
+                ingested_at_micros: 0,
                 rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
                 measured_wire_bytes: initial_bytes,
                 reservation,
@@ -6872,6 +6932,82 @@ mod tests {
         assert_eq!(owner.wal_io.sync_submissions_for_test(), 2);
     }
 
+    /// A batch resent while its original is still queued commits once.
+    ///
+    /// A client retry reuses the batch ID, so both copies can be queued before
+    /// either is visible. The scheduler closes the group at the resent copy,
+    /// and the owner's next group absorbs it through the memtable identity: the
+    /// rows are visible once, both copies acknowledge with the same row count,
+    /// only the original reports a first commit, and the unrelated batch in the
+    /// first group commits beside it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the isolated owner cannot be built, a group fails, an ACK is
+    /// missing, the copies share a group, or the visible rows or first-commit
+    /// reports diverge.
+    #[tokio::test]
+    async fn same_batch_resent_before_commit_lands_in_a_later_group_and_commits_once() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let key = owner_key();
+        let resent = uuid::Uuid::now_v7();
+        let (appends, acks) =
+            acked_group_for_key(&budget, &key, &[resent, uuid::Uuid::now_v7(), resent]);
+        for append in appends {
+            assert!(
+                !owner
+                    .handle_command(ShardCommand::Append(Box::new(append)))
+                    .await
+            );
+        }
+
+        let mut group_sizes = Vec::new();
+        while !owner.scheduler.is_empty() {
+            let group = owner.scheduler.pop_group();
+            group_sizes.push(group.len());
+            owner.process_group(group).await.expect("group commits");
+        }
+        assert_eq!(
+            group_sizes,
+            [2, 1],
+            "the resent copy closes the first group"
+        );
+
+        let mut completions = Vec::new();
+        for ack in acks {
+            completions.push(ack.await.expect("ACK delivered").expect("batch commits"));
+        }
+        assert_eq!(completions[0].rows, completions[2].rows);
+        assert_eq!(
+            completions
+                .iter()
+                .map(|c| c.first_commit)
+                .collect::<Vec<_>>(),
+            [true, true, false],
+            "only the original copy of a resent batch is its first commit"
+        );
+        let visible = owner.memtable.stats().expect("query-visible rows");
+        assert_eq!(
+            u64::try_from(visible.writable_rows + visible.immutable_rows)
+                .expect("test row count fits u64"),
+            completions[0].rows + completions[1].rows
+        );
+    }
+
     /// A crash after the group COMMIT sync but before the last fence replays once.
     ///
     /// An uncommitted row holds the third batch's fence key, so the real owner
@@ -6889,7 +7025,7 @@ mod tests {
         let database = wyrd_dev_fixtures::pg::PgFixture::start()
             .await
             .expect("Postgres fixture");
-        let superuser = database.superuser_pool().await.expect("superuser pool");
+        let superuser = database.superuser_pool().expect("superuser pool");
         let postgres = Arc::new(database.vala_postgres().clone());
         let key = SealKey::new(
             database.data_tenant_id(),
@@ -6926,8 +7062,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO vala.scribe_batch_commits (data_tenant_id, logical_table_fqn, batch_id, \
              slice_set_digest, slice_count, wal_node_id, wal_writer_epoch, wal_shard_id, \
-             wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id) \
-             VALUES ($1, $2, $3, $4, 1, $5, 1, 0, 0, 0, 0, $6)",
+             wal_segment_sequence, wal_lsn_min, wal_lsn_max, request_id, ingested_at) \
+             VALUES ($1, $2, $3, $4, 1, $5, 1, 0, 0, 0, 0, $6, statement_timestamp())",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table.fqn())
@@ -7578,6 +7714,31 @@ mod tests {
             vec![true, false, true, false, true, false],
             "request size buys no extra tenant-level turns"
         );
+    }
+
+    /// A resent copy of a queued batch starts the next group.
+    ///
+    /// Pushing `[A, B, A']` for one tenant and table, where `A'` reuses `A`'s
+    /// batch identity, must drain as `[A, B]` then `[A']`, so the owner never
+    /// sees both copies in one group.
+    ///
+    /// # Panics
+    ///
+    /// Panics when both copies share a group or arrival order changes.
+    #[test]
+    fn scheduler_ends_group_before_a_resent_batch() {
+        let tenant = DataTenantId::new_v7();
+        let mut scheduler = TenantTableRoundRobin::default();
+        for sequence in [1, 2, 1] {
+            scheduler.push(scheduled(tenant, "hot", sequence));
+        }
+
+        let sequences = |group: Vec<Item>| group.into_iter().map(|item| item.sequence).collect();
+        let first: Vec<usize> = sequences(scheduler.pop_group());
+        let second: Vec<usize> = sequences(scheduler.pop_group());
+        assert_eq!(first, [1, 2]);
+        assert_eq!(second, [1]);
+        assert!(scheduler.is_empty());
     }
 
     /// Verify that shard lookup is bounded within the fixed topology for any batch.

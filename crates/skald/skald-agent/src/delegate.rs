@@ -57,6 +57,7 @@ impl AgentDelegateTool {
     }
 
     /// Overrides the parent-facing tool description before trait erasure.
+    #[must_use]
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self

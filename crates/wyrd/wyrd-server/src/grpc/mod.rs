@@ -12,6 +12,8 @@ pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
+mod capture_peer;
+mod forge_peer;
 mod otlp;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
@@ -307,14 +309,11 @@ where
                 .into_status()
                 .into_http());
             }
-            let _lease = match admission.try_acquire(declared.unwrap_or(0)) {
-                Ok(lease) => lease,
-                Err(_) => {
-                    return Ok(Status::resource_exhausted(
-                        "gRPC encoded-body capacity is occupied",
-                    )
-                    .into_http());
-                }
+            let Ok(_lease) = admission.try_acquire(declared.unwrap_or(0)) else {
+                return Ok(
+                    Status::resource_exhausted("gRPC encoded-body capacity is occupied")
+                        .into_http(),
+                );
             };
             inner
                 .call(Request::from_parts(parts, head.replay(body)))
@@ -354,10 +353,9 @@ where
     if !state.bifrost.serves_api() {
         return Ok(router);
     }
-    let bifrost = Arc::clone(&state.bifrost);
-    let traces = otlp::TraceOtlpGrpcService::new(Arc::clone(&bifrost));
-    let metrics = otlp::MetricsOtlpGrpcService::new(Arc::clone(&bifrost));
-    let logs = otlp::LogsOtlpGrpcService::new(Arc::clone(&bifrost));
+    let traces = otlp::TraceOtlpGrpcService::new(state);
+    let metrics = otlp::MetricsOtlpGrpcService::new(state);
+    let logs = otlp::LogsOtlpGrpcService::new(state);
     let bifrost_query = query::BifrostQueryGrpc::new(state.clone());
     let transport = state.bifrost.transport_admission();
     Ok(router
@@ -393,8 +391,8 @@ where
 /// plan decode or storage IO.
 ///
 /// Returns `Ok(None)` when this target selects no private service, which is the
-/// Forge-worker case: it keeps using its durable assignment path and opens no
-/// peer socket.
+/// Forge-worker case: it only dials the elected Forge leader's peer route and
+/// opens no peer socket.
 ///
 /// # Errors
 /// Returns [`GrpcError::Transport`] when tonic rejects the peer TLS material.
@@ -424,10 +422,16 @@ pub fn build_peer_grpc(
         ),
     );
     let router = match state.bifrost_ingest() {
-        Some(scribe) => router.add_service(GrpcTransportAdmissionService::new_peer(
-            scribe_tail::ScribeTailGrpc::new(scribe.tail_service()).into_server(),
-            transport.clone(),
-        )),
+        Some(scribe) => router
+            .add_service(GrpcTransportAdmissionService::new_peer(
+                scribe_tail::ScribeTailGrpc::new(scribe.tail_service()).into_server(),
+                transport.clone(),
+            ))
+            .add_service(GrpcTransportAdmissionService::new_peer(
+                capture_peer::ScribeCapturePeerGrpc::new(Arc::clone(scribe.scribe()) as _)
+                    .into_server(),
+                transport.clone(),
+            )),
         None => router,
     };
     let router = match state
@@ -452,6 +456,13 @@ pub fn build_peer_grpc(
                 transport.clone(),
             ))
         }
+        None => router,
+    };
+    let router = match state.forge_handle() {
+        Some(forge) => router.add_service(GrpcTransportAdmissionService::new_peer(
+            forge_peer::ForgeLeaderPeerGrpc::new(Arc::clone(forge)).into_server(),
+            transport.clone(),
+        )),
         None => router,
     };
     let router = match state.bifrost_query() {

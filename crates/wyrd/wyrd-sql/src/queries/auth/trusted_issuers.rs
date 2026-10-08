@@ -11,15 +11,15 @@ use serde_json::Value;
 use crate::TenantConn;
 use crate::row_types::auth::TrustedIssuerRow;
 
-const TRUSTED_ISSUERS_FOR_TENANT_SQL: &str = r#"
+const TRUSTED_ISSUERS_FOR_TENANT_SQL: &str = r"
     SELECT data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
            client_auth, claim_mapping, group_role_map, default_roles,
            principal_kind, jwks_ttl_secs, client_secret_enc,
            created_at, updated_at
       FROM wyrd.auth_trusted_issuers
-"#;
+";
 
-const UPSERT_TRUSTED_ISSUER_SQL: &str = r#"
+const UPSERT_TRUSTED_ISSUER_SQL: &str = r"
     INSERT INTO wyrd.auth_trusted_issuers (
         data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
         client_auth, claim_mapping, group_role_map, default_roles,
@@ -37,38 +37,38 @@ const UPSERT_TRUSTED_ISSUER_SQL: &str = r#"
         jwks_ttl_secs = EXCLUDED.jwks_ttl_secs,
         client_secret_enc = EXCLUDED.client_secret_enc,
         updated_at = now()
-"#;
+";
 
-const TRUSTED_ISSUER_EXISTS_SQL: &str = r#"
+const TRUSTED_ISSUER_EXISTS_SQL: &str = r"
     SELECT EXISTS (
         SELECT 1
           FROM wyrd.auth_trusted_issuers
          WHERE data_tenant_id = wyrd.current_tenant()
            AND issuer_url = $1
     )
-"#;
+";
 
-const INSERT_TRUSTED_ISSUER_SQL: &str = r#"
+const INSERT_TRUSTED_ISSUER_SQL: &str = r"
     INSERT INTO wyrd.auth_trusted_issuers (
         data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
         client_auth, claim_mapping, group_role_map, default_roles,
         principal_kind, jwks_ttl_secs, client_secret_enc
     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-"#;
+";
 
-const TRUSTED_ISSUER_BY_URL_SQL: &str = r#"
+const TRUSTED_ISSUER_BY_URL_SQL: &str = r"
     SELECT data_tenant_id, issuer_url, jwks_uri, expected_audience, client_id,
            client_auth, claim_mapping, group_role_map, default_roles,
            principal_kind, jwks_ttl_secs, client_secret_enc,
            created_at, updated_at
       FROM wyrd.auth_trusted_issuers
      WHERE issuer_url = $1
-"#;
+";
 
-const DELETE_TRUSTED_ISSUER_SQL: &str = r#"
+const DELETE_TRUSTED_ISSUER_SQL: &str = r"
     DELETE FROM wyrd.auth_trusted_issuers
      WHERE issuer_url = $1
-"#;
+";
 
 /// Owned column values for an upsert into `wyrd.auth_trusted_issuers`.
 ///

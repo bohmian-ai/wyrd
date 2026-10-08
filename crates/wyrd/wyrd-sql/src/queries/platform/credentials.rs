@@ -1,6 +1,6 @@
 //! Query slots for `platform.credentials`.
 //!
-//! A credential authenticates exactly one platform principal. Only the Argon2
+//! A credential authenticates exactly one platform principal. Only the SHA-256
 //! verifier and non-secret lookup metadata are stored; the plaintext is returned
 //! once by the issuing operation and is never recoverable afterwards.
 //!
@@ -27,7 +27,7 @@ pub struct PlatformCredentialLookupRow {
     pub id: Uuid,
     /// Owning principal id.
     pub principal_id: Uuid,
-    /// Stored Argon2 PHC verifier.
+    /// Stored SHA-256 hex verifier.
     pub secret_hash: String,
     /// Owning principal's lifecycle status.
     pub principal_status: String,

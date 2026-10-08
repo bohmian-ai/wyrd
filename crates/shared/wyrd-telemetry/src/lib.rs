@@ -332,9 +332,13 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
 /// Install a production-shaped OpenTelemetry provider with in-memory export.
 ///
 /// This initializer uses the same resource, sampler, SDK provider, OTel layer,
-/// filter, formatter, and global subscriber path as [`init`]. Only the exporter
+/// filter, formatter, and global subscriber path as [`init`]. The exporter
 /// destination differs, allowing journeys to inspect completed spans without a
-/// second telemetry implementation.
+/// second telemetry implementation, and every captured span also carries its
+/// `tracing` level as the `level` attribute. The ambient `WYRD_LOG` filter
+/// decides which spans are captured, so a test asserting that an operation is
+/// DEBUG detail reads that attribute instead of inferring the level from
+/// whether the span appeared.
 ///
 /// # Errors
 ///
@@ -359,7 +363,11 @@ pub fn init_test_capture(
     tracing_subscriber::registry()
         .with(resolve_filter(&config))
         .with(tracing_subscriber::fmt::layer())
-        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .with(
+            tracing_opentelemetry::layer()
+                .with_tracer(tracer)
+                .with_level(true),
+        )
         .try_init()
         .map_err(|_| WyrdError::Conflict {
             message: "global tracing subscriber already set".to_owned(),

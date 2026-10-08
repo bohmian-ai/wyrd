@@ -299,7 +299,7 @@ impl AgentTool for RecordingTool {
     }
 
     /// Fixed description.
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "records calls"
     }
 

@@ -119,17 +119,16 @@ impl OraclePeerGrpc {
         OraclePeerServiceServer::new(self)
     }
 
-    /// Appends one scrubbed denial and fails closed if audit storage is unavailable.
+    /// Stages one scrubbed denial on the system audit chain without waiting.
     ///
     /// # Errors
     ///
-    /// Returns `Unavailable` when the record cannot be persisted, because a
-    /// refusal Wyrd cannot account for is not a refusal it may forget.
-    async fn audit_denial(&self, violation: BifrostSecurityViolationKind) -> Result<(), Status> {
+    /// Returns `Unavailable` when this node composes no peer capability, so
+    /// there is no security auditor to stage on.
+    fn audit_denial(&self, violation: BifrostSecurityViolationKind) -> Result<(), Status> {
         self.security_audit()?
-            .append_unverified_ticket_rejection(violation)
-            .await
-            .map_err(|_| Status::unavailable("Bifrost peer security audit unavailable"))
+            .stage_unverified_ticket_rejection(violation);
+        Ok(())
     }
 
     /// Selects the exact role-owned peer security audit without constructing an aggregate.
@@ -156,9 +155,8 @@ impl OraclePeerGrpc {
     /// Returns `FailedPrecondition` when no Oracle role owns this node's
     /// reservation authority, `Unauthenticated` when no context is presented,
     /// and `PermissionDenied` for a context that is malformed, misbound,
-    /// or expired. The refusal is durably audited before it returns;
-    /// an audit that cannot commit surfaces as `Unavailable`.
-    async fn authorize_reservation<T: Message>(
+    /// or expired. The refusal is staged for audit before it returns.
+    fn authorize_reservation<T: Message>(
         &self,
         operation: ReservationOperationV1,
         context_free: &T,
@@ -172,8 +170,7 @@ impl OraclePeerGrpc {
             .oracle()
             .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?;
         let Some(context) = context else {
-            self.audit_denial(BifrostSecurityViolationKind::PeerSignature)
-                .await?;
+            self.audit_denial(BifrostSecurityViolationKind::PeerSignature)?;
             return Err(Status::unauthenticated(
                 "Bifrost peer reservation context is absent",
             ));
@@ -199,14 +196,8 @@ impl OraclePeerGrpc {
                 &context_free.encode_to_vec(),
                 chrono::Utc::now(),
             )
-            .await
             .map(|_| ())
-            .map_err(|error| match error {
-                vala_bifrost_redux::oracle::peer::PeerSecurityError::AuditUnavailable => {
-                    Status::unavailable("Bifrost peer security audit unavailable")
-                }
-                _ => Status::permission_denied("Bifrost peer reservation is not authorized"),
-            })
+            .map_err(|_| Status::permission_denied("Bifrost peer reservation is not authorized"))
     }
 }
 
@@ -481,8 +472,7 @@ impl OraclePeerService for OraclePeerGrpc {
             .await
             .is_err()
         {
-            self.audit_denial(BifrostSecurityViolationKind::PeerFence)
-                .await?;
+            self.audit_denial(BifrostSecurityViolationKind::PeerFence)?;
             return Err(Status::permission_denied("Oracle peer fence is not live"));
         }
         self.authorize_reservation(
@@ -492,8 +482,7 @@ impl OraclePeerService for OraclePeerGrpc {
             request.leader_node_id,
             request.leader_fencing_token,
             request.query_id.as_uuid(),
-        )
-        .await?;
+        )?;
         let worker = self
             .bifrost
             .oracle_peer_service()
@@ -553,17 +542,16 @@ impl OraclePeerService for OraclePeerGrpc {
                 tracing::warn!("Oracle-target fragment refused: Oracle peers run no fragments");
                 Err(DispatchError::Terminal)
             }
-            ClusterRole::Scribe => match self.bifrost.scribe() {
-                Some(scribe) => {
+            ClusterRole::Scribe => {
+                if let Some(scribe) = self.bifrost.scribe() {
                     ScribeFragmentExecutor::new(Arc::clone(scribe))
                         .execute(request)
                         .await
-                }
-                None => {
+                } else {
                     tracing::error!("Scribe fragment reached a process without the Scribe owner");
                     Err(DispatchError::Terminal)
                 }
-            },
+            }
         }
         .map_err(dispatch_status)?;
         let shutdown = self.shutdown.clone();

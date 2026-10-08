@@ -1,7 +1,10 @@
+"""Saving a DataCard locally and loading it back with ``DataCard.from_path``."""
+
 from __future__ import annotations
 
 import gzip
 import json
+from collections.abc import Callable
 from hashlib import sha256
 from pathlib import Path
 
@@ -25,14 +28,19 @@ from wyrd.data import (
     PandasInterface,
     ParquetInterface,
     PolarsInterface,
+    Split,
     SqlInterface,
     TextInterface,
     TorchInterface,
     WyrdError,
 )
 
+ROWS = [{"x": 1}, {"x": 2}]
+
 
 class JsonInterface(DataInterface):
+    """A user-defined interface that stores its data as one JSON file."""
+
     def __init__(self, data=None):
         super().__init__()
         self.data = data
@@ -48,583 +56,341 @@ class JsonInterface(DataInterface):
         self.data = json.loads((path / "data" / "custom" / "data.json").read_text())
 
 
-def _assert_card_json(path: Path, interface_kind: str) -> None:
-    payload = json.loads((path / "card.json").read_text(encoding="utf-8"))
-    assert payload["apiVersion"] == "wyrd/v1"
-    assert payload["kind"] == "Data"
-    assert payload["spec"]["interface"]["kind"] == interface_kind
-    assert payload["spec"]["card_refs"] == []
+@pytest.fixture
+def sources(tmp_path: Path) -> dict[str, Path]:
+    """Local files and directories a user would point a DataCard at."""
+    root = tmp_path / "source"
+    (root / "images").mkdir(parents=True)
+    (root / "images" / "a.png").write_bytes(b"png")
+    (root / "texts").mkdir()
+    (root / "texts" / "a.txt").write_text("hello", encoding="utf-8")
+    pq.write_table(pa.table({"x": pa.array([1, 2], type=pa.int64())}), root / "data.parquet")
+    (root / "rows.jsonl").write_text('{"x": 1}\n{"x": 2}\n', encoding="utf-8")
+    with gzip.open(root / "rows.jsonl.gz", "wt", encoding="utf-8") as handle:
+        handle.write('{"x": 1}\n{"x": 2}\n')
+    return {
+        "parquet": root / "data.parquet",
+        "jsonl": root / "rows.jsonl",
+        "jsonl.gz": root / "rows.jsonl.gz",
+        "images": root / "images",
+        "texts": root / "texts",
+    }
 
 
-def _assert_stats(card: DataCard) -> None:
-    assert card.stats.byte_count > 0
-    assert len(card.stats.sha256) == 64
-
-
-def _huggingface_dataset() -> Dataset:
+@pytest.fixture
+def greetings() -> Dataset:
+    """A small Hugging Face dataset with a recorded name."""
     data = Dataset.from_dict({"text": ["hello", "world"], "label": [0, 1]})
     data.info.dataset_name = "local/test"
     return data
 
 
-def _parquet_path(path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.table({"x": pa.array([1, 2], type=pa.int64())})
-    pq.write_table(table, path)
-    return path
-
-
-def _jsonl_path(path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{"x": 1}\n{"x": 2}\n', encoding="utf-8")
-    return path
-
-
-def _gzip_jsonl_path(path: Path) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with gzip.open(path, "wt", encoding="utf-8") as handle:
-        handle.write('{"x": 1}\n{"x": 2}\n')
-    return path
-
-
-def _image_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    (path / "a.png").write_bytes(b"png")
-    return path
-
-
-def _text_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    (path / "a.txt").write_text("hello", encoding="utf-8")
-    return path
-
-
-@pytest.mark.wyrd_covers("python:DataCard.save")
-@pytest.mark.wyrd_covers("python:DataCard.load")
-def test_pandas_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
-    data = pd.DataFrame({"x": [1, 2]})
-    path = tmp_path / "pandas-raw"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Pandas"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["x"].tolist() == [1, 2]
-    _assert_card_json(path, "Pandas")
-    _assert_stats(card)
-
-
-def test_polars_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
-    data = pl.DataFrame({"x": [1, 2]})
-    path = tmp_path / "polars-raw"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Polars"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["x"].to_list() == [1, 2]
-    _assert_card_json(path, "Polars")
-    _assert_stats(card)
-
-
-def test_pyarrow_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
-    data = pa.table({"x": pa.array([1, 2], type=pa.int64())})
-    path = tmp_path / "pyarrow-raw"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Arrow"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data.column("x").to_pylist() == [1, 2]
-    _assert_card_json(path, "Arrow")
-    _assert_stats(card)
-
-
-def test_numpy_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
-    data = np.array([1, 2], dtype=np.int64)
-    path = tmp_path / "numpy-raw"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Numpy"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data.tolist() == [1, 2]
-    _assert_card_json(path, "Numpy")
-    _assert_stats(card)
-
-
-def test_torch_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
-    data = torch.tensor([1, 2], dtype=torch.int64)
-    path = tmp_path / "torch-raw"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Torch"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["value"].tolist() == [1, 2]
-    _assert_card_json(path, "Torch")
-    _assert_stats(card)
-
-
-def test_sql_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
-    data = {"queries": {"train": "select 1"}}
-    path = tmp_path / "sql-raw"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Sql"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["queries"] == {"train": "select 1"}
-    _assert_card_json(path, "Sql")
-    _assert_stats(card)
-
-
-def test_huggingface_raw_data_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _huggingface_dataset()
-    path = tmp_path / "huggingface-raw"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Huggingface"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["text"] == ["hello", "world"]
-    _assert_card_json(path, "Huggingface")
-    _assert_stats(card)
-
-
-def test_parquet_path_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _parquet_path(tmp_path / "source" / "data.parquet")
-    path = tmp_path / "parquet-path"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Parquet"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data.column("x").to_pylist() == [1, 2]
-    _assert_card_json(path, "Parquet")
-    _assert_stats(card)
-
-
-def test_jsonl_path_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _jsonl_path(tmp_path / "source" / "rows.jsonl")
-    path = tmp_path / "jsonl-path"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Jsonl"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data == [{"x": 1}, {"x": 2}]
-    _assert_card_json(path, "Jsonl")
-    _assert_stats(card)
-
-
-def test_gzip_jsonl_path_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _gzip_jsonl_path(tmp_path / "source" / "rows.jsonl.gz")
-    path = tmp_path / "jsonl-gzip-path"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Jsonl"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data == [{"x": 1}, {"x": 2}]
-    _assert_card_json(path, "Jsonl")
-    _assert_stats(card)
-
-
-def test_image_directory_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _image_dir(tmp_path / "source" / "images")
-    path = tmp_path / "image-directory"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Image"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["files"][0]["path"].endswith("a.png")
-    _assert_card_json(path, "Image")
-    _assert_stats(card)
-
-
-def test_text_directory_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _text_dir(tmp_path / "source" / "text")
-    path = tmp_path / "text-directory"
-
-    card = DataCard(data)
-    assert card.interface.kind == "Text"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["files"][0]["path"].endswith("a.txt")
-    _assert_card_json(path, "Text")
-    _assert_stats(card)
-
-
-def test_pandas_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = pd.DataFrame({"x": [1, 2]})
-    interface = PandasInterface(data=data)
-    path = tmp_path / "pandas-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Pandas"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["x"].tolist() == [1, 2]
-    assert (path / "data" / "data.parquet").is_file()
-    _assert_card_json(path, "Pandas")
-    _assert_stats(card)
-
-
-def test_polars_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = pl.DataFrame({"x": [1, 2]})
-    interface = PolarsInterface(data=data)
-    path = tmp_path / "polars-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Polars"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["x"].to_list() == [1, 2]
-    assert (path / "data" / "data.parquet").is_file()
-    _assert_card_json(path, "Polars")
-    _assert_stats(card)
-
-
-def test_arrow_parquet_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = pa.table({"x": pa.array([1, 2], type=pa.int64())})
-    interface = ArrowInterface(data=data)
-    path = tmp_path / "arrow-parquet-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Arrow"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data.column("x").to_pylist() == [1, 2]
-    assert (path / "data" / "data.parquet").is_file()
-    _assert_card_json(path, "Arrow")
-    _assert_stats(card)
-
-
-def test_arrow_ipc_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = pa.table({"x": pa.array([1, 2], type=pa.int64())})
-    interface = ArrowInterface(data=data, format="ipc")
-    path = tmp_path / "arrow-ipc-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Arrow"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data.column("x").to_pylist() == [1, 2]
-    assert (path / "data" / "data.arrow").is_file()
-    _assert_card_json(path, "Arrow")
-    _assert_stats(card)
-
-
-def test_parquet_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _parquet_path(tmp_path / "source" / "data.parquet")
-    interface = ParquetInterface(data=data)
-    path = tmp_path / "parquet-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Parquet"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data.column("x").to_pylist() == [1, 2]
-    assert (path / "data" / "data.parquet").is_file()
-    _assert_card_json(path, "Parquet")
-    _assert_stats(card)
-
-
-def test_numpy_npy_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = np.array([1, 2], dtype=np.int64)
-    interface = NumpyInterface(data=data)
-    path = tmp_path / "numpy-npy-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Numpy"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data.tolist() == [1, 2]
-    assert (path / "data" / "data.npy").is_file()
-    _assert_card_json(path, "Numpy")
-    _assert_stats(card)
-
-
-def test_numpy_npz_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = np.array([1, 2], dtype=np.int64)
-    interface = NumpyInterface(data=data, format="npz")
-    path = tmp_path / "numpy-npz-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Numpy"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data.tolist() == [1, 2]
-    assert (path / "data" / "data.npz").is_file()
-    _assert_card_json(path, "Numpy")
-    _assert_stats(card)
-
-
-def test_torch_safetensors_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = torch.tensor([1, 2], dtype=torch.int64)
-    interface = TorchInterface(data=data)
-    path = tmp_path / "torch-safetensors-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Torch"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["value"].tolist() == [1, 2]
-    assert (path / "data" / "data.safetensors").is_file()
-    _assert_card_json(path, "Torch")
-    _assert_stats(card)
-
-
-def test_torch_pickle_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = torch.tensor([1, 2], dtype=torch.int64)
-    interface = TorchInterface(data=data, save_format="pickle")
-    path = tmp_path / "torch-pickle-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Torch"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data.tolist() == [1, 2]
-    assert (path / "data" / "data.pt").is_file()
-    _assert_card_json(path, "Torch")
-    _assert_stats(card)
-
-
-def test_sql_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    interface = SqlInterface(data={"queries": {"train": "select 1"}}, dialect="duckdb")
-    path = tmp_path / "sql-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Sql"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["queries"] == {"train": "select 1"}
-    assert (path / "data" / "sql.json").is_file()
-    _assert_card_json(path, "Sql")
-    _assert_stats(card)
-
-
-def test_jsonl_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    interface = JsonlInterface(data=[{"x": 1}, {"x": 2}])
-    path = tmp_path / "jsonl-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Jsonl"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data == [{"x": 1}, {"x": 2}]
-    assert (path / "data" / "data.jsonl").is_file()
-    _assert_card_json(path, "Jsonl")
-    _assert_stats(card)
-
-
-def test_jsonl_gzip_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    interface = JsonlInterface(data=[{"x": 1}, {"x": 2}], compression="gzip")
-    path = tmp_path / "jsonl-gzip-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Jsonl"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data == [{"x": 1}, {"x": 2}]
-    assert (path / "data" / "data.jsonl.gz").is_file()
-    _assert_card_json(path, "Jsonl")
-    _assert_stats(card)
-
-
-def test_jsonl_zstd_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    interface = JsonlInterface(data=[{"x": 1}, {"x": 2}], compression="zstd")
-    path = tmp_path / "jsonl-zstd-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Jsonl"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data == [{"x": 1}, {"x": 2}]
-    assert (path / "data" / "data.jsonl.zst").is_file()
-    _assert_card_json(path, "Jsonl")
-    _assert_stats(card)
-
-
-def test_image_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _image_dir(tmp_path / "source" / "images")
-    interface = ImageInterface(data=data)
-    path = tmp_path / "image-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Image"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["files"][0]["path"].endswith("a.png")
-    assert (path / "data" / "manifest.json").is_file()
-    _assert_card_json(path, "Image")
-    _assert_stats(card)
-
-
-def test_text_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _text_dir(tmp_path / "source" / "text")
-    interface = TextInterface(data=data)
-    path = tmp_path / "text-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Text"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["files"][0]["path"].endswith("a.txt")
-    assert (path / "data" / "manifest.json").is_file()
-    _assert_card_json(path, "Text")
-    _assert_stats(card)
-
-
-def test_huggingface_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    data = _huggingface_dataset()
-    interface = HuggingfaceInterface(data=data, dataset_id="local/test")
-    path = tmp_path / "huggingface-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Huggingface"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text())
-    card.load(path)
-
-    assert card.data["text"] == ["hello", "world"]
-    assert (path / "data" / "dataset").is_dir()
-    _assert_card_json(path, "Huggingface")
-    _assert_stats(card)
-
-
-def test_custom_interface_datacard_save_and_load(tmp_path: Path) -> None:
-    interface = JsonInterface(data={"x": 1})
-    path = tmp_path / "custom-interface"
-
-    card = DataCard(interface)
-    assert card.interface.kind == "Custom"
-    card.save(path)
-
-    card = DataCard.model_validate_json((path / "card.json").read_text(), interface=JsonInterface)
-    card.load(path)
+def first_file(data: dict) -> str:
+    return Path(data["files"][0]["path"]).name
+
+
+Input = Callable[[dict[str, Path], Dataset], object]
+Read = Callable[[object], object]
+
+
+@pytest.mark.parametrize(
+    ("make_data", "kind", "read", "expected"),
+    [
+        pytest.param(
+            lambda s, h: pd.DataFrame(ROWS),
+            "Pandas",
+            lambda d: d["x"].tolist(),
+            [1, 2],
+            id="pandas",
+        ),
+        pytest.param(
+            lambda s, h: pl.DataFrame(ROWS),
+            "Polars",
+            lambda d: d["x"].to_list(),
+            [1, 2],
+            id="polars",
+        ),
+        pytest.param(
+            lambda s, h: pa.Table.from_pylist(ROWS),
+            "Arrow",
+            lambda d: d.column("x").to_pylist(),
+            [1, 2],
+            id="arrow",
+        ),
+        pytest.param(
+            lambda s, h: np.array([1, 2]), "Numpy", lambda d: d.tolist(), [1, 2], id="numpy"
+        ),
+        pytest.param(
+            lambda s, h: torch.tensor([1, 2]),
+            "Torch",
+            lambda d: d["value"].tolist(),
+            [1, 2],
+            id="torch",
+        ),
+        pytest.param(
+            lambda s, h: {"queries": {"train": "select 1"}},
+            "Sql",
+            lambda d: d["queries"],
+            {"train": "select 1"},
+            id="sql",
+        ),
+        pytest.param(
+            lambda s, h: h, "Huggingface", lambda d: d["text"], ["hello", "world"], id="huggingface"
+        ),
+        pytest.param(
+            lambda s, h: s["parquet"],
+            "Parquet",
+            lambda d: d.column("x").to_pylist(),
+            [1, 2],
+            id="parquet-file",
+        ),
+        pytest.param(lambda s, h: s["jsonl"], "Jsonl", lambda d: d, ROWS, id="jsonl-file"),
+        pytest.param(lambda s, h: s["jsonl.gz"], "Jsonl", lambda d: d, ROWS, id="gzip-jsonl-file"),
+        pytest.param(lambda s, h: s["images"], "Image", first_file, "a.png", id="image-directory"),
+        pytest.param(lambda s, h: s["texts"], "Text", first_file, "a.txt", id="text-directory"),
+    ],
+)
+def test_detected_data_round_trips_through_a_saved_card(
+    tmp_path: Path,
+    sources: dict[str, Path],
+    greetings: Dataset,
+    make_data: Input,
+    kind: str,
+    read: Read,
+    expected: object,
+) -> None:
+    DataCard(make_data(sources, greetings)).save(tmp_path / "card")
+
+    card = DataCard.from_path(tmp_path / "card")
+
+    assert card.interface.kind == kind
+    assert read(card.data) == expected
+    assert card.stats.byte_count > 0
+
+
+@pytest.mark.parametrize(
+    ("make_interface", "kind", "read", "expected"),
+    [
+        pytest.param(
+            lambda s, h: PandasInterface(data=pd.DataFrame(ROWS)),
+            "Pandas",
+            lambda d: d["x"].tolist(),
+            [1, 2],
+            id="pandas",
+        ),
+        pytest.param(
+            lambda s, h: PolarsInterface(data=pl.DataFrame(ROWS)),
+            "Polars",
+            lambda d: d["x"].to_list(),
+            [1, 2],
+            id="polars",
+        ),
+        pytest.param(
+            lambda s, h: ArrowInterface(data=pa.Table.from_pylist(ROWS)),
+            "Arrow",
+            lambda d: d.column("x").to_pylist(),
+            [1, 2],
+            id="arrow-parquet",
+        ),
+        pytest.param(
+            lambda s, h: ArrowInterface(data=pa.Table.from_pylist(ROWS), format="ipc"),
+            "Arrow",
+            lambda d: d.column("x").to_pylist(),
+            [1, 2],
+            id="arrow-ipc",
+        ),
+        pytest.param(
+            lambda s, h: ParquetInterface(data=pa.Table.from_pylist(ROWS)),
+            "Parquet",
+            lambda d: d.column("x").to_pylist(),
+            [1, 2],
+            id="parquet",
+        ),
+        pytest.param(
+            lambda s, h: NumpyInterface(data=np.array([1, 2])),
+            "Numpy",
+            lambda d: d.tolist(),
+            [1, 2],
+            id="numpy-npy",
+        ),
+        pytest.param(
+            lambda s, h: NumpyInterface(data=np.array([1, 2]), format="npz"),
+            "Numpy",
+            lambda d: d.tolist(),
+            [1, 2],
+            id="numpy-npz",
+        ),
+        pytest.param(
+            lambda s, h: TorchInterface(data=torch.tensor([1, 2])),
+            "Torch",
+            lambda d: d["value"].tolist(),
+            [1, 2],
+            id="torch-safetensors",
+        ),
+        pytest.param(
+            lambda s, h: TorchInterface(data=torch.tensor([1, 2]), save_format="pickle"),
+            "Torch",
+            lambda d: d.tolist(),
+            [1, 2],
+            id="torch-pickle",
+        ),
+        pytest.param(
+            lambda s, h: SqlInterface(data={"queries": {"train": "select 1"}}, dialect="duckdb"),
+            "Sql",
+            lambda d: d["queries"],
+            {"train": "select 1"},
+            id="sql",
+        ),
+        pytest.param(
+            lambda s, h: JsonlInterface(data=ROWS), "Jsonl", lambda d: d, ROWS, id="jsonl"
+        ),
+        pytest.param(
+            lambda s, h: JsonlInterface(data=ROWS, compression="gzip"),
+            "Jsonl",
+            lambda d: d,
+            ROWS,
+            id="jsonl-gzip",
+        ),
+        pytest.param(
+            lambda s, h: JsonlInterface(data=ROWS, compression="zstd"),
+            "Jsonl",
+            lambda d: d,
+            ROWS,
+            id="jsonl-zstd",
+        ),
+        pytest.param(
+            lambda s, h: ImageInterface(data=s["images"]), "Image", first_file, "a.png", id="image"
+        ),
+        pytest.param(
+            lambda s, h: TextInterface(data=s["texts"]), "Text", first_file, "a.txt", id="text"
+        ),
+        pytest.param(
+            lambda s, h: HuggingfaceInterface(data=h, dataset_id="local/test"),
+            "Huggingface",
+            lambda d: d["text"],
+            ["hello", "world"],
+            id="huggingface",
+        ),
+    ],
+)
+def test_interface_data_round_trips_through_a_saved_card(
+    tmp_path: Path,
+    sources: dict[str, Path],
+    greetings: Dataset,
+    make_interface: Input,
+    kind: str,
+    read: Read,
+    expected: object,
+) -> None:
+    DataCard(make_interface(sources, greetings)).save(tmp_path / "card")
+
+    card = DataCard.from_path(tmp_path / "card")
+
+    assert card.interface.kind == kind
+    assert read(card.data) == expected
+    assert card.stats.byte_count > 0
+
+
+def test_custom_interface_round_trips_through_a_saved_card(tmp_path: Path) -> None:
+    DataCard(JsonInterface(data={"x": 1})).save(tmp_path)
+
+    card = DataCard.from_path(tmp_path, interface=JsonInterface)
 
     assert isinstance(card.interface, JsonInterface)
     assert card.data == {"x": 1}
-    _assert_card_json(path, "Custom")
-    _assert_stats(card)
 
 
 def test_load_without_path_requires_registry_configuration() -> None:
     card = DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})))
 
-    with pytest.raises(WyrdError):
+    with pytest.raises(WyrdError) as error:
         card.load()
+
+    assert error.value.code == "WYRD_DATA_400_VALIDATION"
 
 
 def test_save_does_not_create_artifact_cards_or_card_refs(tmp_path: Path) -> None:
-    card = DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})))
+    DataCard(PandasInterface(data=pd.DataFrame({"x": [1]}))).save(tmp_path)
 
-    card.save(tmp_path)
-
-    payload = json.loads((tmp_path / "card.json").read_text(encoding="utf-8"))
-    assert payload["spec"]["card_refs"] == []
+    assert DataCard.from_path(tmp_path).metadata.to_dict()["card_refs"] == []
 
 
-def test_huggingface_pointer_only_save_writes_pointer_json(tmp_path: Path) -> None:
-    interface = HuggingfaceInterface(dataset_id="acme/data", revision="abcdef0")
-    card = DataCard(interface)
-    card.save(tmp_path)
+def test_huggingface_pointer_reloads_as_the_same_pointer(tmp_path: Path) -> None:
+    DataCard(HuggingfaceInterface(dataset_id="acme/data", revision="abcdef0")).save(tmp_path)
 
-    assert (tmp_path / "data" / "dataset_pointer.json").is_file()
-    _assert_card_json(tmp_path, "Huggingface")
-    _assert_stats(card)
+    card = DataCard.from_path(tmp_path / "card.json")
+
+    assert isinstance(card.interface, HuggingfaceInterface)
+    assert (card.interface.dataset_id, card.interface.revision) == ("acme/data", "abcdef0")
 
 
 def test_huggingface_pointer_load_without_allow_remote_raises(tmp_path: Path) -> None:
-    interface = HuggingfaceInterface(dataset_id="acme/data", revision="abcdef0")
-    card = DataCard(interface)
-    card.save(tmp_path)
+    DataCard(HuggingfaceInterface(dataset_id="acme/data", revision="abcdef0")).save(tmp_path)
 
-    card2 = DataCard.model_validate_json((tmp_path / "card.json").read_text(encoding="utf-8"))
-    with pytest.raises(WyrdError):
-        card2.load(tmp_path)
+    with pytest.raises(WyrdError) as error:
+        DataCard.from_path(tmp_path)
+
+    assert error.value.code == "WYRD_DATA_400_VALIDATION"
+
+
+def test_from_path_keeps_the_card_identity(tmp_path: Path) -> None:
+    DataCard(pd.DataFrame({"x": [1, 2]}), name="churn").save(tmp_path)
+
+    assert DataCard.from_path(tmp_path).name == "churn"
+
+
+def test_from_path_reads_a_card_file_without_loading_data(tmp_path: Path) -> None:
+    saved = DataCard(pd.DataFrame({"x": [1, 2]}), name="churn")
+    saved.save(tmp_path)
+
+    card = DataCard.from_path(tmp_path / "card.json")
+
+    assert (card.uid, card.interface.kind, card.interface.has_source) == (
+        saved.uid,
+        "Pandas",
+        False,
+    )
+
+
+def test_from_path_missing_file_raises_loader_error(tmp_path: Path) -> None:
+    with pytest.raises(WyrdError) as error:
+        DataCard.from_path(tmp_path / "absent.yaml")
+
+    assert error.value.code == "WYRD_LOADER_400_IO"
+
+
+def test_from_path_rejects_non_data_envelope(fixtures_dir: Path) -> None:
+    with pytest.raises(WyrdError) as error:
+        DataCard.from_path(fixtures_dir / "authoring" / "prompt" / "seeded-prompt.yaml")
+
+    assert error.value.code == "WYRD_DATA_400_VALIDATION"
+
+
+def test_splits_and_target_columns_survive_save_and_load(tmp_path: Path) -> None:
+    DataCard(
+        pd.DataFrame({"x": [1, 2, 3], "label": [0, 1, 0]}),
+        splits={"train": Split.index_range(0, 2), "test": Split.column("x", ">", 2)},
+        target_columns=["label"],
+    ).save(tmp_path)
+
+    card = DataCard.from_path(tmp_path)
+
+    assert {name: split.to_dict() for name, split in card.splits.items()} == {
+        "train": Split.index_range(0, 2).to_dict(),
+        "test": Split.column("x", ">", 2).to_dict(),
+    }
+    assert card.target_columns == ["label"]
+
+
+def test_datacard_rejects_target_column_missing_from_schema() -> None:
+    with pytest.raises(WyrdError) as error:
+        DataCard(pd.DataFrame({"x": [1]}), target_columns=["label"])
+
+    assert error.value.code == "WYRD_DATA_400_TARGET_COLUMN_UNKNOWN"
+
+
+def test_datacard_rejects_split_on_unknown_column() -> None:
+    with pytest.raises(WyrdError) as error:
+        DataCard(pd.DataFrame({"x": [1]}), splits={"test": Split.column("y", "==", 1)})
+
+    assert error.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"

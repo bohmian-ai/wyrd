@@ -17,7 +17,7 @@ pub struct ColumnRef<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FeatureLookupError;
 
-impl<'a> ColumnRef<'a> {
+impl ColumnRef<'_> {
     pub fn data_type_string(&self) -> String {
         format!("{:?}", self.array.data_type())
     }

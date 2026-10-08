@@ -126,18 +126,20 @@ Locked cross-cutting decisions that any contributor must honor:
   explicit scopes.
 - Audit is foundational across CLI, UI, MCP, Python SDK, `wyrd-server`, and
   Vala surfaces.
-- Audit records authorization decisions, not engine mechanics. Except for the
-  explicitly non-blocking Oracle read and gateway invocation paths below,
-  every decision that evaluates a principal's permission is transactionally
-  audited in the transaction that made it. Engine-internal transitions —
+- Audit records authorization decisions, not engine mechanics. Permissions
+  are blocking; audits are non-blocking. Every permission check completes
+  before the operation proceeds or refuses, and its decision is staged on the
+  non-blocking audit outbox without the request waiting for the commit; a
+  failed commit is logged and counted and never fails the operation. Every
+  audited surface follows this rule; no error exists to report an audit
+  write failure. Engine-internal transitions —
   Scribe batch commits, Forge maintenance — evaluate no permission and are
   recorded as lineage in their own operational tables, never as audit.
 - There is one audit write path and one publisher. Every audit event is
   committed to `vala.audit_staging` through the canonical append, and only the
   `AuditPublisher` moves staged rows into `vala.system.audit_log` via Scribe.
-  Oracle read decisions, tenant tripwires, and gateway invocation decisions use
-  that same path from a tracked, non-blocking task; no other audit table, WAL,
-  relay, or log sink exists.
+  The process audit outbox is the only caller of that append; no other audit
+  table, WAL, relay, or log sink exists.
 - Bifrost clients use `wyrd_client::Bifrost` over the crate's shared HTTP and
   gRPC transport. Rust, Python, and TypeScript project that same facade. Gate, Scribe,
   Oracle, and Forge remain server owners and never become client types.
@@ -233,21 +235,22 @@ behavior with the wrong structural shape is incomplete.
   functional code is implementation drift, not precedent. A localized edit
   does not require an unrelated crate-wide rewrite, but every new or materially
   changed symbol and its immediate module structure must comply.
-- Stateful capabilities, multi-step workflows, dependency-backed behavior,
-  configuration-backed behavior, and invariant-bearing domain behavior MUST
-  have one clear owning concrete struct.
-- Public operations and internal orchestration that use an owner's state or
-  dependencies MUST be inherent methods on that owner. Callers should discover
-  workflows through shapes such as `cards.register(...)`,
+- Stateful capabilities and invariant-bearing domain behavior MUST have one
+  clear owning concrete struct when that owner retains meaningful state,
+  identity, resources, or invariants across operations.
+- Public operations that act on an owner's retained state or dependencies
+  SHOULD be inherent methods on that owner. Callers should discover durable
+  capabilities through shapes such as `cards.register(...)`,
   `registry.resolve(...)`, and `writer.flush(...)`.
 - Compose dependencies through explicit struct fields and constructors. When
   multiple functions repeatedly accept the same clients, stores, configuration,
   or context, consolidate that state into the owning struct instead of
   threading it through a functional call graph.
-- Free functions are permitted only for genuinely stateless, deterministic
-  helpers, narrow conversions, and algorithms with no natural owner. A
-  workflow function is not made stateless merely because all of its
-  dependencies are parameters.
+- Free functions may coordinate multi-step or async work when all state,
+  dependencies, identity, and lifetime remain caller-owned for that invocation.
+  Introduce a struct only when it earns ownership by retaining meaningful state,
+  resources, identity, or invariants across calls, or when its type prevents an
+  invalid lifecycle from being represented.
 - Do not create zero-sized utility structs solely to turn unrelated functions
   into methods. The struct must own meaningful state, dependencies, identity,
   or invariants.
@@ -400,7 +403,7 @@ missing higher one.
 3. **Unit tests — supporting.** A single function or type in isolation, IO-free,
    credential-free, in the fast lane. Use them for pure logic, error/`WyrdError`
    mapping, and negative branches that are cleaner to force in-process than
-   end-to-end (e.g. an injected audit-append failure → fail-closed refusal).
+   end-to-end (e.g. an injected audit commit failure → counted, never refused).
 
 Rule: every new user/agent-facing capability ships a user-journey test. Pushing
 a user-observable behavior — especially a negative flow — down to a unit test
@@ -492,10 +495,9 @@ not use a positional filter that can pass after selecting no test.
   `utoipa-axum` registrations that mount the routes, and is not a checked-in
   artifact: prove an OpenAPI change against the served document with
   `mise run test:principals:integration`
-  (`crates/wyrd/wyrd-server/tests/pg_openapi_contract.rs`).
-- Boundary-sensitive change: run the matching boundary check, such as
-  `mise run check:client-tier`, `mise run check:pyo3-scope`, or
-  `mise run check:unwrap-audit`.
+  (`crates/wyrd/wyrd-server/tests/integration/pg_openapi_contract.rs`).
+- Boundary-sensitive change: run `mise run check:deps` for crate and
+  dependency boundaries, or `mise run check:tenant-isolation` for SQL tenancy.
 - Docs-site change under `docs/`: run `mise run docs:check`.
 - Example change: run the touched example task, or `mise run check:examples`
   when the change affects shared example behavior.
@@ -538,9 +540,8 @@ mise run py:test:unit  # all Python tests
 
 ```bash
 mise run codegen:check              # generated contract drift
-mise run check:client-tier          # client-tier boundary
-mise run check:pyo3-scope           # PyO3 boundary
-mise run check:unwrap-audit         # unwrap/expect audit
+mise run check:deps                 # crate and dependency boundaries
+mise run check:tenant-isolation     # SQL tenant isolation
 ```
 
 ## 12. Completion Standard
@@ -620,10 +621,8 @@ Skills are referenced by name; each harness resolves a named skill from its
 own skill directory. Do not hard-code harness-specific skill paths in plans,
 task packets, or documentation.
 
-The shared workflow skill source is `.agents/skills`; `.claude/skills` is its
-generated Claude discovery mirror. Run `mise run skills:sync` after editing a
-shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
-`agents/openai.yaml` metadata remains only in the canonical source.
+The shared workflow skill source is `.agents/skills`; `.claude/skills` is a
+symlink to it for Claude discovery, so there is no copy to keep in sync.
 
 - `$wyrd-spec` fixes intent, externally observable behavior, constraints, and
   expensive-to-reverse decisions. Only explicit human approval makes a revision

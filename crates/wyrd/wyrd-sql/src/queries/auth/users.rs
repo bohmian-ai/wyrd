@@ -41,11 +41,11 @@ pub async fn insert_user(
     password_hash: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        r#"
+        r"
         INSERT INTO wyrd.auth_users (
             id, data_tenant_id, email, password_hash, auth_type, status
         ) VALUES ($1, $2, $3, $4, $5, 'active')
-        "#,
+        ",
     )
     .bind(id)
     .bind(conn.data_tenant_id().as_uuid())
@@ -66,12 +66,12 @@ pub async fn user_by_id(
     id: Uuid,
 ) -> Result<Option<UserRow>, sqlx::Error> {
     sqlx::query_as::<_, UserRow>(
-        r#"
+        r"
         SELECT id, email, auth_type, status, created_at, updated_at
           FROM wyrd.auth_users
          WHERE data_tenant_id = wyrd.current_tenant()
            AND id = $1
-        "#,
+        ",
     )
     .bind(id)
     .fetch_optional(&mut **conn.transaction())
@@ -99,11 +99,11 @@ pub async fn delete_user(conn: &mut TenantConn<'_>, id: Uuid) -> Result<bool, sq
 
 #[cfg(test)]
 mod tests {
-    const INSERT_USER_SQL: &str = r#"
+    const INSERT_USER_SQL: &str = r"
         INSERT INTO wyrd.auth_users (
             id, data_tenant_id, email, password_hash, auth_type, status
         ) VALUES ($1, $2, $3, $4, $5, 'active')
-        "#;
+        ";
     const DELETE_USER_SQL: &str = "UPDATE wyrd.auth_users
             SET status = 'deleted', updated_at = now()
           WHERE data_tenant_id = wyrd.current_tenant()

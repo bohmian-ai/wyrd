@@ -3,7 +3,6 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-mod config;
 mod download;
 mod download_progress;
 mod engine;
@@ -38,7 +37,7 @@ mod tests {
     /// The public handle, selector, and request types compose without staged-card or transport exports.
     #[test]
     fn public_surface_compiles_without_staged_card_or_transport_exports() {
-        let _ = Cards::new;
+        let _ = Cards::from_env;
         let _ = Cards::with_client;
         let _ = CardSelector::named(
             CardKind::Prompt,

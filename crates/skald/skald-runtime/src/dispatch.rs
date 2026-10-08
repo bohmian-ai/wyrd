@@ -90,10 +90,6 @@ fn request_model(request: &ProviderRequest) -> Option<&str> {
         ProviderRequest::OpenAiResponses(request) => Some(&request.model),
         ProviderRequest::OpenAiEmbeddings(request) => Some(&request.model),
         ProviderRequest::AnthropicMessage(request) => Some(&request.model),
-        ProviderRequest::GeminiGenerateContent(_)
-        | ProviderRequest::GoogleBatchEmbed(_)
-        | ProviderRequest::VertexPredict(_)
-        | ProviderRequest::RawV1 { .. } => None,
         // ProviderRequest is #[non_exhaustive]. Any new variant that carries a
         // model field must be added above; this arm exists only for forward
         // compatibility and will silently omit model telemetry for unknown variants.

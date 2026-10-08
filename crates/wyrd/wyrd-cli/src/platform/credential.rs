@@ -10,7 +10,9 @@ use clap::{Args, Subcommand};
 use secrecy::SecretString;
 use url::Url;
 use uuid::Uuid;
-use wyrd_client::Platform;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::HttpConfig;
+use wyrd_client::{Platform, WyrdClient};
 use wyrd_spec::auth::PrincipalId;
 
 use crate::error::WyrdCliError;
@@ -60,7 +62,18 @@ impl PlatformEndpoint {
             .filter(|value| !value.is_empty())
             .map(SecretString::from)
             .ok_or(WyrdCliError::NoPlatformCredential)?;
-        Platform::connect(self.server.as_str(), &credential)
+        let client = WyrdClient::with_config(ClientConfig {
+            http: HttpConfig {
+                base_url: self.server.as_str().trim_end_matches('/').to_owned(),
+                ..HttpConfig::default()
+            },
+            credential: Some(credential),
+            ..ClientConfig::default()
+        })
+        .map_err(|source| WyrdCliError::Server {
+            source: source.into(),
+        })?;
+        Platform::with_client(&client)
             .await
             .map_err(|source| WyrdCliError::Server { source })
     }

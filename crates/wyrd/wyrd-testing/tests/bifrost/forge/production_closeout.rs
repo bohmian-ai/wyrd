@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::public_support::{
-    JourneyTable, ManagedRow, append_values, canonical_order, read_managed_rows, register_table,
-    tenant_client, unique_table,
+    JourneyTable, ManagedRow, append_values, canonical_order, enable_compaction, read_managed_rows,
+    register_table, set_table_properties, tenant_client, unique_table,
 };
 use arrow::array::{BinaryBuilder, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -15,7 +15,11 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use rand::{RngCore, SeedableRng, rngs::StdRng};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
-use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
+use vala_bifrost_redux::forge::{
+    ForgeCommitNotice, ForgeCompactionDispatch, ForgeCompactionOutcome, ForgeCompactionType,
+    ForgeConfig, ForgeError, ForgeHeldTerm, ForgeLifecycleEvent, ForgeTableKey, ForgeTableSettings,
+    ForgeWorkerCompletionObserver,
+};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
 use vala_bifrost_redux::storage::{StorageOperation, StorageOperationBarrier};
@@ -30,35 +34,12 @@ use wyrd_testing::bifrost::{
     BifrostClusterSpec, CommitUncertaintyCatalog, TestOracleResources, WyrdTestCluster,
 };
 
-/// Reads one node's live Oracle reader-authority fence.
-///
-/// Durable protection rows are keyed by node and epoch, so an inspection has to
-/// name the exact fence the reading node currently holds rather than any value
-/// carried on the wire.
-///
-/// # Panics
-/// Panics if the node is absent, composes no Oracle, or reports a negative fence.
-fn oracle_fence(cluster: &WyrdTestCluster, node: NodeId) -> u64 {
-    let authority = cluster
-        .server_by_node(node)
-        .expect("the inspected node is composed")
-        .state()
-        .bifrost
-        .oracle()
-        .expect("the inspected node composes an Oracle")
-        .engine()
-        .reader_authority()
-        .fencing_token();
-    u64::try_from(authority).expect("positive Oracle fence")
-}
-
 /// Every Oracle-serving node's ranged-read pause, armed before a lazy public read.
 ///
-/// The destination Oracle answers a delegated cut on its analytical follower,
-/// which acquires that node's durable reader protection *before* it opens any
-/// object. Stalling the production storage owner at its first ranged read
-/// therefore holds the query at a point where the protection it committed is
-/// already durable and observable, without adding any production seam.
+/// The query's leader commits its active table read before any object IO, so
+/// stalling the production storage owner at the first ranged read holds the
+/// query at a point where that read is already durable and observable,
+/// without adding any production seam.
 struct OracleReadBarriers {
     /// One barrier per Oracle-serving node, paired with that node's identity.
     entries: Vec<(NodeId, Arc<StorageOperationBarrier>)>,
@@ -129,7 +110,10 @@ impl Drop for OracleReadBarriers {
 /// Diagnostic limit for a scheduler pass; never the production ticker interval.
 const PASS_BOUND: Duration = Duration::from_secs(15);
 /// Production-sized rewrites may spend several minutes encoding physical bytes.
-const REWRITE_BOUND: Duration = Duration::from_secs(600);
+const REWRITE_BOUND: Duration = Duration::from_mins(10);
+/// Maintenance passes driven while a reader is held; each must defer every
+/// destructive route, so several passes prove the deferral is not one-shot.
+const HELD_READER_PASSES: usize = 3;
 /// Environment flag selecting the standard production geometry profile.
 ///
 /// Journey-only: it changes nothing but the sizes this test's own setup
@@ -156,8 +140,6 @@ struct GeometryProfile {
     /// Parquet row-group target, always below the file target so a rolled
     /// output necessarily contains more than one group.
     row_group_bytes: u64,
-    /// Compaction eligibility threshold this journey's Forge config uses.
-    small_file_threshold_bytes: u64,
     /// Whether the qualification sizing of the worker and Oracle pods applies.
     production_resources: bool,
 }
@@ -175,11 +157,6 @@ impl GeometryProfile {
         scribe_target_bytes: 4 * 1024 * 1024,
         iceberg_target_bytes: 8 * 1024 * 1024,
         row_group_bytes: 1024 * 1024,
-        // Just under the file target, as production's is: a packed residue that
-        // has not yet reached the target is still small, so the backlog keeps
-        // rolling instead of stalling on one intermediate output the next pass
-        // may no longer touch.
-        small_file_threshold_bytes: 7 * 1024 * 1024,
         production_resources: false,
     };
 
@@ -190,7 +167,6 @@ impl GeometryProfile {
         scribe_target_bytes: 512 * 1024 * 1024,
         iceberg_target_bytes: 1024 * 1024 * 1024,
         row_group_bytes: 128 * 1024 * 1024,
-        small_file_threshold_bytes: 768 * 1024 * 1024,
         production_resources: true,
     };
 
@@ -228,11 +204,7 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if the production topology cannot start or lacks its observer.
     async fn start() -> Self {
-        Self::start_with_config(ForgeConfig {
-            small_file_threshold_bytes: GeometryProfile::selected().small_file_threshold_bytes,
-            ..ForgeConfig::default()
-        })
-        .await
+        Self::start_with_config(ForgeConfig::default()).await
     }
 
     /// Starts the same role topology with the journey's maintenance policy.
@@ -241,16 +213,21 @@ impl CloseoutJourney {
     /// Panics if the real role graph cannot start or its observer is absent.
     async fn start_with_config(config: ForgeConfig) -> Self {
         let profile = GeometryProfile::selected();
-        let mut spec = BifrostClusterSpec::dedicated_forge_workers().with_scribe_geometry_for_test(
-            vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
-                .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
-                .expect("the selected staging target is a valid geometry"),
-        );
+        // The one worker drains only the journey's tables, so the tenant's audit
+        // table cannot take a slot a geometry or competing-table plan is owed.
+        let mut spec = BifrostClusterSpec::dedicated_forge_workers()
+            .with_scribe_geometry_for_test(
+                vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
+                    .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
+                    .expect("the selected staging target is a valid geometry"),
+            )
+            .without_audit_publication_for_test();
         let coordinator_node = spec.nodes[3].node_id;
         let scribe_node = spec.nodes[0].node_id;
         let oracle_node = spec.nodes[2].node_id;
         let worker_node = spec.nodes[1].node_id;
-        spec.nodes[3].roles = spec.nodes[0].roles.clone();
+        let scribe_roles = spec.nodes[0].roles.clone();
+        spec.nodes[3].roles = scribe_roles;
         spec.nodes[0].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
         spec.nodes[2].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
         // Only the qualification profile needs an oversized worker pod: its
@@ -321,28 +298,51 @@ impl CloseoutJourney {
         }
     }
 
-    /// Drives real passes until one compacted file owns this small test table.
+    /// Promotes owed debt, then waits for a pulled rewrite of this table's head.
+    ///
+    /// One scheduler pass promotes owed Scribe debt; its commit makes the table
+    /// due on the leader, and a worker pulls it on its own interval. Progress
+    /// is observed through settled attempts, never sleeps, until a snapshot
+    /// newer than the one on entry names only Forge outputs.
     ///
     /// # Panics
-    /// Panics if promotion/rewrite fails or cannot settle the fixed-hour data.
+    /// Panics if no such rewrite publishes within the rewrite bound, or on any
+    /// worker or SQL failure observed while draining.
+    async fn compact(&self, binding: &TenantTableBinding) -> (i64, BTreeMap<String, DataFile>) {
+        let (entry, _) = self.live_files(binding).await;
+        self.scheduler_pass().await;
+        let current = tokio::time::timeout(REWRITE_BOUND, async {
+            loop {
+                let next = self.observer.attempts() + 1;
+                let current = self.live_files(binding).await;
+                if current.0 != entry && current.1.keys().all(|path| path.contains("/data/forge/"))
+                {
+                    return current;
+                }
+                self.observer.wait_for_attempts_at_least(next).await;
+            }
+        })
+        .await
+        .expect("a pulled rewrite publishes the table's current head");
+        self.drain_tasks().await;
+        current
+    }
+
+    /// Compacts this small fixed-hour test table into exactly one Forge file.
+    ///
+    /// # Panics
+    /// Panics if [`Self::compact`] panics or the rewrite leaves more than one file.
     async fn compact_small_table(
         &self,
         binding: &TenantTableBinding,
     ) -> (i64, BTreeMap<String, DataFile>) {
-        let mut previous = None;
-        for _ in 0..12 {
-            self.scheduler_pass().await;
-            self.drain_tasks().await;
-            let current = self.live_files(binding).await;
-            if current.1.len() == 1
-                && previous == Some(current.0)
-                && current.1.keys().all(|path| path.contains("/data/forge/"))
-            {
-                return current;
-            }
-            previous = Some(current.0);
-        }
-        panic!("small fixed-hour table did not converge through real maintenance");
+        let current = self.compact(binding).await;
+        assert_eq!(
+            current.1.len(),
+            1,
+            "one partition rewrites into one small file"
+        );
+        current
     }
 
     /// Requires a named object to be physically absent, rejecting other IO errors.
@@ -359,29 +359,29 @@ impl CloseoutJourney {
 
     /// Observes an exact production expired-cleanup delete with protection held.
     ///
-    /// The post-delete pause permits inspection of its still-prepared durable
-    /// claim before settlement; no SQL transaction spans the storage effect.
+    /// The elected leader's maintenance pass executes expired cleanup on its
+    /// own executor, so the delete is paused on the leader node's real object
+    /// store. The post-delete pause permits inspection of its still-prepared
+    /// durable claim before settlement; no SQL transaction spans the storage
+    /// effect.
     ///
     /// # Panics
-    /// Panics if deletion stalls, has the wrong owner/route, loses a protected
-    /// object, or lacks its terminal settlement.
+    /// Panics if no node holds the leader term, deletion stalls, has the wrong
+    /// route, loses a protected object, or lacks its terminal settlement.
     async fn collect_exact(
         &self,
         binding: &TenantTableBinding,
         path: &str,
         protected: &BTreeMap<String, DataFile>,
     ) {
-        let worker = self
-            .cluster
-            .server_by_node(self.worker_node)
-            .expect("worker node");
-        let control = worker
+        let leader = self.leader();
+        let control = leader
             .forge_object_store_control_for_test()
             .expect("real storage control");
         control.pause_after_delete_for_path(path);
         let drive = async {
             for _ in 0..12 {
-                self.scheduler_pass().await;
+                self.maintenance_pass().await;
                 self.drain_tasks().await;
                 if self.object_missing(path).await {
                     return;
@@ -400,8 +400,8 @@ impl CloseoutJourney {
                 .tenant_conn_for(binding.tenant)
                 .await
                 .expect("tenant inspection");
-            let rows: Vec<(Uuid, Uuid, serde_json::Value)> = sqlx::query_as(
-                "SELECT t.task_id, t.claimed_by, t.evidence FROM vala.forge_tasks t \
+            let rows: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
+                "SELECT t.task_id, t.evidence FROM vala.forge_tasks t \
                  JOIN vala.forge_tasks s ON s.task_id=(t.plan->'parameters'->>'source_task_id')::uuid \
                  WHERE t.strategy='expired_cleanup' AND t.state='prepared' \
                  AND s.strategy='snapshot_expiry' AND s.state='succeeded'",
@@ -409,12 +409,11 @@ impl CloseoutJourney {
             conn.commit().await.expect("inspection releases SQL");
             let matching: Vec<_> = rows
                 .into_iter()
-                .filter_map(|(task, owner, raw)| {
+                .filter_map(|(task, raw)| {
                     let evidence = evidence_from_json(raw).expect("validated cleanup evidence");
                     let index = usize::try_from(evidence.prepared_candidate_index?)
                         .expect("candidate index");
-                    (evidence.cleanup_candidates[index].path.as_str() == path)
-                        .then_some((task, owner))
+                    (evidence.cleanup_candidates[index].path.as_str() == path).then_some(task)
                 })
                 .collect();
             assert_eq!(
@@ -422,9 +421,8 @@ impl CloseoutJourney {
                 1,
                 "exact expired-cleanup candidate owns the delete"
             );
-            assert_eq!(matching[0].1, self.worker_node.as_uuid());
             control.release_completed_delete();
-            matching[0].0
+            matching[0]
         };
         let ((), task) = tokio::join!(drive, inspect);
         let mut conn = self
@@ -447,8 +445,8 @@ impl CloseoutJourney {
             .expect("lineage inspection releases SQL");
         assert!(deleted > 0);
         eprintln!(
-            "expired cleanup task={task}, worker={}, physically deleted={path}",
-            self.worker_node.as_uuid()
+            "expired cleanup task={task}, leader={}, physically deleted={path}",
+            leader.node_id().as_uuid()
         );
     }
 
@@ -509,7 +507,8 @@ impl CloseoutJourney {
     ///
     /// # Panics
     /// Panics when the route wrote no operation, its operation never settled,
-    /// or a destructive sibling route ran beside it.
+    /// or it reported no physical deletion. Independently eligible sibling
+    /// expiry or cleanup is permitted and is not evidence against it.
     async fn assert_orphan_evidence(&self, tenant: DataTenantId) {
         let mut conn = self
             .coordinator()
@@ -524,12 +523,6 @@ impl CloseoutJourney {
         .fetch_all(&mut **conn.transaction())
         .await
         .expect("orphan collection lineage evidence");
-        let strategies: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT strategy FROM vala.forge_tasks WHERE data_tenant_id=wyrd.current_tenant()",
-        )
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("durable strategy inventory");
         conn.commit()
             .await
             .expect("read-only lineage inspection completes");
@@ -544,12 +537,6 @@ impl CloseoutJourney {
             );
             eprintln!("orphan collection operation {operation}: {phase}");
         }
-        assert!(
-            strategies
-                .iter()
-                .all(|strategy| strategy != "snapshot_expiry" && strategy != "expired_cleanup"),
-            "a sibling destructive route ran beside collection: {strategies:?}"
-        );
         let metrics = self
             .cluster
             .telemetry()
@@ -583,14 +570,15 @@ impl CloseoutJourney {
                     Field::new("payload", DataType::Binary, false),
                 ],
                 physical_layout: None,
-                audit: None,
             })
             .await
             .expect("payload table registration");
+        let binding = TenantTableBinding::resolve((tenant, table_ref)).expect("table binding");
+        enable_compaction(self.scribe(), &binding).await;
         JourneyTable {
             qualified: format!("{}.{name}", BifrostNamespace::Datasets.as_str()),
             name,
-            binding: TenantTableBinding::resolve((tenant, table_ref)).expect("table binding"),
+            binding,
         }
     }
 
@@ -732,15 +720,55 @@ impl CloseoutJourney {
         .expect("the abandoned rewrite and its retry both settle");
     }
 
-    /// Settles the planning pass the coordinator runs as soon as it starts.
+    /// Waits until the leader no longer owes `binding`'s table a compaction.
     ///
-    /// A coordinator plans immediately on start, so a fixture that drives its
-    /// own passes must settle that boot pass before arranging the world.
-    /// Otherwise the boot pass plans concurrently with the first driven pass
-    /// and the run observes tasks neither pass alone accounts for.
+    /// A refused dispatch closes its row and leaves the retry to the leader,
+    /// which re-dispatches the table on a later worker pull; until that retry
+    /// settles the debt, planning admits no orphan cleanup for the table.
     ///
     /// # Panics
-    /// Panics if the boot pass does not complete in 15 seconds.
+    /// Panics if the debt outlives the rewrite bound or a worker fails for an
+    /// unexpected reason.
+    async fn settle_owed_compaction(&self, binding: &TenantTableBinding) {
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table: vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
+                vala_bifrost_redux::catalog::BIFROST_CATALOG_NAME,
+                binding.logical_namespace.as_str(),
+                binding.table_ref.name.as_str(),
+            )
+            .expect("table identity"),
+        };
+        let owed = || {
+            self.coordinator()
+                .state()
+                .forge_coordinator()
+                .and_then(|forge| forge.held_leader_term())
+                .is_some_and(|term| term.schedule().owes_compaction(&key))
+        };
+        tokio::time::timeout(REWRITE_BOUND, async {
+            while owed() {
+                let next = self.observer.attempts() + 1;
+                self.observer.wait_for_attempts_at_least(next).await;
+                self.drain_tasks_allowing_injected_refusal().await;
+            }
+        })
+        .await
+        .expect("the leader's retry settles the refused table's debt");
+    }
+
+    /// Settles the coordinator's boot maintenance pass, then runs its first
+    /// leader heartbeat.
+    ///
+    /// The maintenance timer ticks immediately on start, so a fixture that
+    /// drives its own passes must settle that boot pass before arranging the
+    /// world; otherwise it runs concurrently with the first driven pass. The
+    /// first heartbeat waits a full period, so one driven heartbeat then takes
+    /// the leader term and promotes owed Scribe debt before the journey reads
+    /// the table's published snapshot.
+    ///
+    /// # Panics
+    /// Panics if either pass does not complete within its bound.
     async fn await_boot_pass(&self) {
         tokio::time::timeout(
             PASS_BOUND,
@@ -748,7 +776,57 @@ impl CloseoutJourney {
                 .wait_for_forge_scheduler_passes_for_test(1),
         )
         .await
-        .expect("a freshly started coordinator completes its boot planning pass");
+        .expect("a freshly started coordinator completes its boot maintenance pass");
+        self.scheduler_pass().await;
+    }
+
+    /// Returns the running node whose Forge coordinator holds the leader term.
+    ///
+    /// # Panics
+    /// Panics unless exactly one running node holds a term.
+    fn leader(&self) -> &WyrdTestServer {
+        let mut leaders = self.cluster.servers().filter(|server| {
+            server
+                .state()
+                .forge_coordinator()
+                .and_then(|forge| forge.held_leader_term())
+                .is_some()
+        });
+        let leader = leaders
+            .next()
+            .expect("one node holds the Forge leader term");
+        assert!(leaders.next().is_none(), "exactly one Forge leader");
+        leader
+    }
+
+    /// Requests and observes one leader maintenance pass on every coordinator.
+    ///
+    /// Only the term holder runs manifest rewrite, expiry, and cleanup; every
+    /// other coordinator skips the tick but still reports it, so waiting on
+    /// each proves the leader's pass returned without guessing which leads.
+    /// Nodes without a Forge coordinator run no maintenance loop.
+    ///
+    /// # Panics
+    /// Panics if any node does not complete the requested pass in time.
+    async fn maintenance_pass(&self) {
+        let pending: Vec<_> = self
+            .cluster
+            .servers()
+            .filter(|server| server.state().forge_coordinator().is_some())
+            .map(|server| {
+                let before = server.completed_forge_scheduler_passes_for_test();
+                server.request_forge_maintenance_pass_for_test();
+                (server, before)
+            })
+            .collect();
+        for (server, before) in pending {
+            tokio::time::timeout(
+                PASS_BOUND,
+                server.wait_for_forge_scheduler_passes_for_test(before + 1),
+            )
+            .await
+            .expect("production maintenance responds to its trigger");
+        }
     }
 
     /// Requests and observes one real scheduler pass before inspecting SQL.
@@ -879,7 +957,11 @@ impl CloseoutJourney {
             .count()
     }
 
-    /// Corroborates every completed rewrite with its lineage and metrics.
+    /// Corroborates every completed rewrite of one table with its lineage and
+    /// metrics.
+    ///
+    /// Only `binding`'s own operations are read: the tenant's audit table is
+    /// maintained alongside it and settles rewrites of its own.
     ///
     /// An attempt publishes each of its admitted plans independently, so a
     /// completed rewrite settles *one operation per plan*, not one per task —
@@ -895,7 +977,8 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics on unsettled operation evidence, on two plans sharing one
     /// operation identity, or on missing physical data-flow counters.
-    async fn assert_rewrite_evidence(&self, tenant: DataTenantId) -> usize {
+    async fn assert_rewrite_evidence(&self, binding: &TenantTableBinding) -> usize {
+        let tenant = binding.tenant;
         let mut conn = self
             .coordinator()
             .tenant_conn_for(tenant)
@@ -904,8 +987,12 @@ impl CloseoutJourney {
         let rows: Vec<(Uuid, String, serde_json::Value)> = sqlx::query_as(
             "SELECT operation_id, phase, prepared_detail \
              FROM vala.forge_operation_state \
-             WHERE family='iceberg_rewrite'",
+             WHERE family='iceberg_rewrite' AND resource = $1",
         )
+        .bind(format!(
+            "bifrost://{}/{}/{}",
+            binding.tenant, binding.table_ref.namespace, binding.table_ref.name
+        ))
         .fetch_all(&mut **conn.transaction())
         .await
         .expect("rewrite lineage evidence");
@@ -949,20 +1036,7 @@ impl CloseoutJourney {
                 "{family}"
             );
         }
-        let authority = self
-            .oracle()
-            .state()
-            .bifrost
-            .oracle()
-            .expect("Oracle role")
-            .engine()
-            .reader_authority();
-        eprintln!(
-            "Oracle epoch node={} fence={}; worker identities={:?}",
-            authority.node_id(),
-            authority.fencing_token(),
-            self.observer.completed_workers()
-        );
+        eprintln!("worker identities={:?}", self.observer.completed_workers());
         operations
     }
 
@@ -1035,13 +1109,13 @@ impl GeometryWorkload {
             writer.write(&batch).expect("IPC batch");
             writer.finish().expect("IPC terminal");
         }
-        let batch_id = Uuid::now_v7();
-        transport
-            .insert(table, batch_id, ipc)
+        let request_id = transport
+            .insert(table, Uuid::now_v7(), ipc)
             .await
             .expect("public append acknowledged");
+        let request_id = Uuid::parse_str(request_id.as_str()).expect("request identity is a UUID");
         self.expected.extend(values.iter().map(|value| ManagedRow {
-            batch_id,
+            request_id,
             value: *value,
         }));
     }
@@ -1083,35 +1157,26 @@ impl GeometryWorkload {
     }
 }
 
-/// Proves each output rolled at the declared target on a whole row group.
+/// Proves the rewrite's balanced outputs are well-formed replacements.
 ///
-/// A writer can only close a file on a completed row group, so the exact
-/// property being checked is that the *final* group is the one that carried the
-/// file across the target: every earlier group ended below it, and nothing was
-/// written after the crossing. That distinguishes a correct rolling threshold
-/// from a writer that keeps appending past its target or cuts early, which a
-/// size band cannot. Exactly one file — the last residue — stays below target.
+/// The full-table rewrite plans one task per partition and writes it through
+/// `max_output_parallelism` balanced writers, as RisingWave does, so outputs
+/// are split evenly rather than rolled at the target. Each output must stay at
+/// or under the declared target and report ascending row groups inside its
+/// physical file.
 ///
 /// # Panics
-/// Panics when no output crosses the target, when a crossing file started its
-/// final group at or beyond the target, when more than one residue exists, or
-/// when a row group escapes its physical file.
+/// Panics when no output exists, an output exceeds the declared target, or a
+/// row group escapes its physical file.
 fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, target: u64) {
     let output_sizes: Vec<_> = outputs.values().map(DataFile::file_size_in_bytes).collect();
-    eprintln!(
-        "Forge physical bytes: {output_sizes:?}; exact rows: {}",
-        rows
-    );
-    let residues = output_sizes.iter().filter(|size| **size < target).count();
-    assert_eq!(
-        residues, 1,
-        "only the final residue stays below the declared target {target}: {output_sizes:?}"
-    );
-    assert!(
-        output_sizes.iter().any(|size| *size >= target),
-        "at least one output rolled at the declared target {target}: {output_sizes:?}"
-    );
+    eprintln!("Forge physical bytes: {output_sizes:?}; exact rows: {rows}");
+    assert!(!outputs.is_empty(), "the rewrite publishes outputs");
     for (path, file) in outputs {
+        assert!(
+            file.file_size_in_bytes() <= target,
+            "{path} stays within the declared target {target}: {output_sizes:?}"
+        );
         let offsets = file.split_offsets().expect("row-group offsets");
         assert!(!offsets.is_empty(), "{path} reports its row groups");
         assert!(
@@ -1124,29 +1189,10 @@ fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, tar
             }),
             "{path} row groups stay inside the physical file"
         );
-        if file.file_size_in_bytes() < target {
-            continue;
-        }
-        assert!(
-            offsets.len() > 1,
-            "a rolled replacement has multiple row groups: {path}"
-        );
-        let final_group = u64::try_from(
-            *offsets
-                .last()
-                .expect("a non-empty offset list has a last entry"),
-        )
-        .expect("a row-group offset inside the file is representable");
-        assert!(
-            final_group < target,
-            "{path} was still below the declared target {target} when its final row group opened, \
-             so that group is the one that crossed: final group at {final_group}, size {}",
-            file.file_size_in_bytes()
-        );
     }
 }
 
-/// Qualifies real 512 MiB Scribe inputs and approximately 1 GiB Forge outputs.
+/// Qualifies real 512 MiB Scribe inputs and balanced Forge outputs within the 1 GiB target.
 ///
 /// Public exact rows, manifest membership, old-object presence and a second
 /// unchanged pass jointly distinguish publication from destructive cleanup.
@@ -1155,6 +1201,10 @@ fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, tar
 /// Panics on any route, geometry, exactness, tenancy, or convergence violation.
 #[tokio::test]
 #[ignore = "requires Postgres and production-sized object storage"]
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders this gauge as whole numbers, so f64 equality is exact"
+)]
 async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let mut journey = CloseoutJourney::start().await;
     let tenant = journey.cluster.data_tenant_id();
@@ -1166,6 +1216,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let name = unique_table("geometry");
     let table = journey.register_payload_table(tenant, name).await;
     let neighbour_table = register_table(journey.scribe(), neighbour, &table.name).await;
+    enable_compaction(journey.scribe(), &neighbour_table.binding).await;
     journey.declare_geometry(&table.binding).await;
     journey.declare_geometry(&neighbour_table.binding).await;
     let target = journey.declared_target_bytes(&table.binding).await;
@@ -1237,15 +1288,9 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .restart_node(journey.coordinator_node)
         .await
         .expect("coordinator starts after complete ingestion");
+    // The new leader promotes all owed debt inside its boot pass, so the
+    // promoted cut is read before any driven pass can rewrite it.
     journey.await_boot_pass().await;
-    for server in journey.cluster.servers().iter() {
-        server
-            .forge_clock()
-            .advance(chrono::Duration::days(1))
-            .expect("closed partition");
-    }
-    journey.scheduler_pass().await;
-    journey.drain_tasks().await;
     let (promoted_snapshot, inputs) = journey.live_files(&table.binding).await;
     assert_eq!(
         inputs.len(),
@@ -1254,54 +1299,15 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     );
     let (neighbour_promoted, _) = journey.live_files(&neighbour_table.binding).await;
     let published_before = journey.snapshot_count(&table.binding).await;
-    // The managed core first normalizes promoted-file identity, then packs
-    // current-recipe files. Continue packing residues until a pass is unchanged.
-    let mut replacement = journey.live_files(&table.binding).await;
-    let mut passes = 0;
-    for pass in 0..8 {
-        passes += 1;
-        journey.scheduler_pass().await;
-        journey.drain_tasks().await;
-        let next = journey.live_files(&table.binding).await;
-        eprintln!(
-            "rewrite pass {pass}: {:?}",
-            next.1
-                .values()
-                .map(DataFile::file_size_in_bytes)
-                .collect::<Vec<_>>()
-        );
-        let unchanged = next.0 == replacement.0;
-        replacement = next;
-        // A pass that publishes nothing is not necessarily the end of the
-        // backlog: a busy worker can return one before the packing it owes has
-        // run. The cut is settled only once it is both unchanged and rolled at
-        // the declared target, which is the property this loop is packing for.
-        if unchanged
-            && replacement
-                .1
-                .values()
-                .any(|file| file.file_size_in_bytes() >= target)
-        {
-            break;
-        }
+    for server in journey.cluster.servers().iter() {
+        server
+            .forge_clock()
+            .advance(chrono::Duration::days(1))
+            .expect("closed partition");
     }
-    let (replacement_snapshot, outputs) = replacement;
-    assert!(
-        outputs
-            .values()
-            .any(|file| file.file_size_in_bytes() >= target),
-        "geometry backlog must roll at the declared target: {:?}",
-        outputs
-            .values()
-            .map(DataFile::file_size_in_bytes)
-            .collect::<Vec<_>>()
-    );
+    // One dispatched full rewrite covers the closed partition's whole head.
+    let (replacement_snapshot, outputs) = journey.compact(&table.binding).await;
     assert_ne!(replacement_snapshot, promoted_snapshot);
-    assert!(
-        passes > 1,
-        "the geometry backlog is packed over more than one pass, so its residue \
-         is replanned rather than published in one commit"
-    );
     let (neighbour_snapshot, neighbour_files) = journey.live_files(&neighbour_table.binding).await;
     assert_ne!(
         neighbour_snapshot, neighbour_promoted,
@@ -1315,38 +1321,23 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     assert_output_geometry(&outputs, workload.expected.len(), target);
     journey.assert_objects(&inputs).await;
     journey.assert_objects(&outputs).await;
-    // A public read that returns the right rows can still be reading a stale
-    // cut. Pause the follower at its first-batch gate and require its durable
-    // protection to name the replacement snapshot: that is what proves the
-    // post-compaction read pinned the new cut rather than the promoted one.
+    // Pause the follower at its first ranged read: the query's active table
+    // read must already be durable there, because acquisition commits it
+    // before any object IO.
     let barriers = OracleReadBarriers::arm(&journey.cluster);
     let paused_read = read_managed_rows(&reader, &table.qualified);
     let inspect_protection = async {
         let reader_node = tokio::time::timeout(PASS_BOUND, barriers.first_reached())
             .await
             .expect("lazy query reaches its first ranged read");
-        let record = journey
+        let active = journey
             .cluster
             .server_by_node(reader_node)
             .expect("the stalled reader is a composed node")
-            .oracle_table_protection_for_test(
-                &table.binding,
-                reader_node,
-                oracle_fence(&journey.cluster, reader_node),
-            )
+            .oracle_active_table_reads_for_test(&table.binding)
             .await
-            .expect("protection read")
-            .expect("durable protection before the first ranged read");
-        assert!(
-            record
-                .frontier
-                .members
-                .iter()
-                .any(|member| member.protected_snapshot_id == replacement_snapshot),
-            "the post-compaction read pins the replacement snapshot \
-             {replacement_snapshot}: {:?}",
-            record.frontier.members
-        );
+            .expect("active read inspection");
+        assert_eq!(active, 1, "the held query owns one active table read");
         barriers.release();
     };
     let (actual, ()) = tokio::join!(paused_read, inspect_protection);
@@ -1386,15 +1377,13 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     journey.assert_objects(&inputs).await;
     // Each admitted plan publishes on its own, so the rewrite passes owe one
     // operation per snapshot they added — not one per completed task.
-    let operations = journey.assert_rewrite_evidence(tenant).await;
+    let operations = journey.assert_rewrite_evidence(&table.binding).await;
     assert_eq!(
         operations,
         journey.snapshot_count(&table.binding).await - published_before,
         "every snapshot the rewrite passes published carries its own operation"
     );
-    // Audited reads above keep publishing retained audit, so the coordinator
-    // can plan and start audit-log maintenance after the last drain. Ownership
-    // is therefore judged once every role has drained, when every attempt
+    // Ownership is judged once every role has drained, when every attempt
     // guard must have returned its increment.
     let telemetry = journey.cluster.telemetry().clone();
     journey.cluster.shutdown().await.expect("all roles drain");
@@ -1430,7 +1419,7 @@ struct ReaderCleanupJourney {
     old_snapshot: i64,
     /// Exact data files the paused query must retain.
     old_files: BTreeMap<String, DataFile>,
-    /// Earlier replaced data object eligible for deletion while the query lives.
+    /// Earlier replaced data object collected only after the reader releases.
     earlier_object: String,
 }
 
@@ -1440,11 +1429,7 @@ impl ReaderCleanupJourney {
     /// # Panics
     /// Panics if public setup, promotion, or compaction fails.
     async fn start() -> Self {
-        let mut roles = CloseoutJourney::start_with_config(ForgeConfig {
-            snapshot_expiry_enabled: true,
-            ..ForgeConfig::default()
-        })
-        .await;
+        let mut roles = CloseoutJourney::start_with_config(ForgeConfig::default()).await;
         let tenant = roles.cluster.data_tenant_id();
         let neighbour = roles
             .cluster
@@ -1455,6 +1440,7 @@ impl ReaderCleanupJourney {
             .register_payload_table(tenant, unique_table("retained_reader"))
             .await;
         let neighbour_table = register_table(roles.scribe(), neighbour, &table.name).await;
+        enable_compaction(roles.scribe(), &neighbour_table.binding).await;
         let writer = tenant_client(roles.scribe(), tenant).await;
         let reader = tenant_client(roles.oracle(), tenant).await;
         let neighbour_writer = tenant_client(roles.scribe(), neighbour).await;
@@ -1485,12 +1471,12 @@ impl ReaderCleanupJourney {
             .restart_node(roles.coordinator_node)
             .await
             .expect("coordinator starts");
+        // The boot pass promotes the owed debt, so the promoted inputs are
+        // read before any driven pass can rewrite them.
         roles.await_boot_pass().await;
-        roles.advance_maintenance(chrono::Duration::hours(2));
-        roles.scheduler_pass().await;
-        roles.drain_tasks().await;
         let (_, earlier_files) = roles.live_files(&table.binding).await;
         assert!(earlier_files.len() >= 2, "two real promoted inputs");
+        roles.advance_maintenance(chrono::Duration::hours(2));
         let earlier_object = earlier_files.keys().next().expect("earlier object").clone();
         let (old_snapshot, old_files) = roles.compact_small_table(&table.binding).await;
         assert!(!old_files.contains_key(&earlier_object));
@@ -1514,50 +1500,40 @@ impl ReaderCleanupJourney {
         }
     }
 
-    /// Waits for every Oracle epoch to narrow its durable frontier after terminal.
+    /// Waits for the terminal query to release its active table read.
     ///
     /// # Panics
-    /// Panics if an epoch retains the completed old query or inspection fails.
+    /// Panics if the read survives the pass bound or inspection fails.
     async fn wait_for_reader_release(&self) {
         tokio::time::timeout(PASS_BOUND, async {
             loop {
-                let mut retained = false;
-                for server in self.roles.cluster.servers() {
-                    if let Some(oracle) = server.state().bifrost.oracle() {
-                        let authority = oracle.engine().reader_authority();
-                        let record = server
-                            .oracle_table_protection_for_test(
-                                &self.table.binding,
-                                server.node_id(),
-                                u64::try_from(authority.fencing_token())
-                                    .expect("positive Oracle fence"),
-                            )
-                            .await
-                            .expect("durable frontier inspection");
-                        retained |= record.is_some_and(|record| {
-                            record
-                                .frontier
-                                .members
-                                .iter()
-                                .any(|member| member.ancestry_path.contains(&self.old_snapshot))
-                        });
-                    }
-                }
-                if !retained {
+                let active = self
+                    .roles
+                    .coordinator()
+                    .oracle_active_table_reads_for_test(&self.table.binding)
+                    .await
+                    .expect("active read inspection");
+                if active == 0 {
                     return;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("terminal query releases durable protection");
+        .expect("terminal query releases its active table read");
     }
 
-    /// Holds a public reader while earlier objects are deleted, then releases it.
+    /// Holds a public reader across a rewrite and destructive passes, then
+    /// collects the earlier replaced object once the reader releases.
+    ///
+    /// While the query owns its active table read, another pod still rewrites
+    /// the table, but every maintenance pass defers expiry and cleanup, so the
+    /// earlier object, the reader's files, and its snapshot all survive.
     ///
     /// # Panics
-    /// Panics if the query was not protected, cleanup touches its inputs, or its
-    /// terminal rows change after another process publishes and expires snapshots.
+    /// Panics if the query was not protected, a held pass deletes anything, its
+    /// terminal rows change, or the earlier object is not collected after
+    /// release.
     async fn protect_during_cleanup(&mut self) {
         let expected = canonical_order(self.workload.expected.clone());
         let barriers = OracleReadBarriers::arm(&self.roles.cluster);
@@ -1567,26 +1543,15 @@ impl ReaderCleanupJourney {
                 .await
                 .expect("lazy query reaches its first ranged read");
             assert_ne!(reader_node, self.roles.worker_node);
-            let record = self
+            let active = self
                 .roles
                 .cluster
                 .server_by_node(reader_node)
                 .expect("the stalled reader is a composed node")
-                .oracle_table_protection_for_test(
-                    &self.table.binding,
-                    reader_node,
-                    oracle_fence(&self.roles.cluster, reader_node),
-                )
+                .oracle_active_table_reads_for_test(&self.table.binding)
                 .await
-                .expect("protection read")
-                .expect("durable protection before the first ranged read");
-            assert!(
-                record
-                    .frontier
-                    .members
-                    .iter()
-                    .any(|member| member.protected_snapshot_id == self.old_snapshot)
-            );
+                .expect("active read inspection");
+            assert_eq!(active, 1, "the held query owns one active table read");
             self.workload
                 .append_batch(&self.transport, &self.table.qualified, &[5, 6])
                 .await;
@@ -1597,10 +1562,15 @@ impl ReaderCleanupJourney {
                 .expect("new rows flush");
             let (current, _) = self.roles.compact_small_table(&self.table.binding).await;
             assert_ne!(current, self.old_snapshot);
-            self.roles.advance_maintenance(chrono::Duration::days(2));
-            self.roles
-                .collect_exact(&self.table.binding, &self.earlier_object, &self.old_files)
-                .await;
+            for _ in 0..HELD_READER_PASSES {
+                self.roles.maintenance_pass().await;
+                self.roles.drain_tasks().await;
+            }
+            assert!(
+                !self.roles.object_missing(&self.earlier_object).await,
+                "an active table read defers every destructive pass"
+            );
+            self.roles.assert_objects(&self.old_files).await;
             let metadata = self
                 .roles
                 .coordinator()
@@ -1623,6 +1593,12 @@ impl ReaderCleanupJourney {
             "old reader returns exactly its protected cut"
         );
         self.wait_for_reader_release().await;
+        // With the last reader gone the earlier object is collected without an
+        // age wait; the reader's own files stay live through the head's
+        // rewrite lineage until `finish` moves the head on.
+        self.roles
+            .collect_exact(&self.table.binding, &self.earlier_object, &self.old_files)
+            .await;
     }
 
     /// Moves the rewrite head onward and observes exact old-object deletion.
@@ -1668,7 +1644,7 @@ impl ReaderCleanupJourney {
     }
 }
 
-/// An old public reader survives real cross-pod expiration and physical cleanup.
+/// An old public reader defers cross-pod expiration and physical cleanup.
 ///
 /// # Panics
 /// Panics when durable protection, exact deletion ownership, or tenant rows fail.
@@ -1711,15 +1687,14 @@ impl OrphanJourney {
     /// Panics if public setup, promotion, or the refused publication does not
     /// leave at least one closed output that no snapshot names.
     async fn start() -> Self {
-        // The production collection route ages objects against the wall clock
-        // its planning demand is stamped with, not the manual maintenance
-        // clock, so the terminal floor has to be a real interval this journey
-        // can outlive. Two seconds is long enough that the object is provably
+        // The leader's collection pass ages objects against the Forge clock it
+        // reads when the pass runs, and this journey never advances that clock,
+        // so the terminal floor has to be a real interval this journey can
+        // outlive. Two seconds is long enough that the object is provably
         // young while its own rewrite is still open and short enough that the
         // bounded collection loop below crosses it.
         let mut roles = CloseoutJourney::start_with_config(ForgeConfig {
             orphan_gc_ttl: std::time::Duration::from_secs(2),
-            maintenance_trigger_interval: std::time::Duration::from_millis(1),
             ..ForgeConfig::default()
         })
         .await;
@@ -1736,7 +1711,22 @@ impl OrphanJourney {
         let table = roles
             .register_payload_table(tenant, unique_table("never_published"))
             .await;
+        // Collection must be proved by difference: it removes the tracked
+        // generation and nothing else. Snapshot expiry would legitimately
+        // delete replaced outputs once the clock advances, so this table opts
+        // out of it and keeps leader-maintenance membership through manifest
+        // rewrite, which deletes no data object.
+        set_table_properties(
+            roles.scribe(),
+            &table.binding,
+            &[
+                ("wyrd.forge.enable-snapshot-expiration", "false"),
+                ("wyrd.forge.enable-manifest-rewrite", "true"),
+            ],
+        )
+        .await;
         let neighbour_table = register_table(roles.scribe(), neighbour, &table.name).await;
+        enable_compaction(roles.scribe(), &neighbour_table.binding).await;
         let writer = tenant_client(roles.scribe(), tenant).await;
         let reader = tenant_client(roles.oracle(), tenant).await;
         let neighbour_writer = tenant_client(roles.scribe(), neighbour).await;
@@ -1769,10 +1759,9 @@ impl OrphanJourney {
             .expect("coordinator starts");
         roles.await_boot_pass().await;
         // No maintenance-clock advance here. This journey's terminal age floor
-        // is a real interval measured by the production planning demand, so a
+        // is a real interval measured by the leader's collection pass, so a
         // manual clock running ahead of storage would report every object as
         // already old and erase the young window the scenario has to observe.
-        // The table owes maintenance on its own trigger interval instead.
         roles.compact_small_table(&table.binding).await;
 
         // One more acknowledged flush, promoted on its own pass. Promotion is a
@@ -1905,6 +1894,7 @@ impl OrphanJourney {
         let drive = async {
             roles.scheduler_pass().await;
             roles.drain_tasks_allowing_injected_refusal().await;
+            roles.settle_owed_compaction(&table.binding).await;
         };
         let inspect = async {
             tokio::time::timeout(
@@ -2030,7 +2020,7 @@ impl OrphanJourney {
             .coordinator()
             .completed_forge_scheduler_passes_for_test();
         for _ in 0..12 {
-            self.roles.scheduler_pass().await;
+            self.roles.maintenance_pass().await;
             self.roles.drain_tasks_allowing_injected_refusal().await;
             let mut remaining = false;
             for path in &self.orphans {
@@ -2051,7 +2041,7 @@ impl OrphanJourney {
                 .coordinator()
                 .completed_forge_scheduler_passes_for_test()
                 > before,
-            "collection ran through the existing scheduler trigger"
+            "collection ran through the leader maintenance trigger"
         );
         // Ownership is proved by difference, not by membership: every object
         // this table owned before the pass must survive it except the tracked
@@ -2101,4 +2091,1066 @@ impl OrphanJourney {
 async fn failed_never_published_output_is_collected_after_terminal_age() {
     let journey = OrphanJourney::start().await;
     journey.finish().await;
+}
+
+/// Two coordinators sharing one election row, composed only from cluster owners.
+///
+/// The fixture adds no replica runner, clock or election harness: every
+/// coordinator is a real server node of the shared-Postgres cluster, passes
+/// are the production loop's own, and leadership is read from each node's
+/// coordinator.
+struct LeaderJourney {
+    /// Real nodes sharing Postgres, storage and the election row.
+    cluster: WyrdTestCluster,
+    /// Notification source for every executed Forge attempt in the cluster.
+    observer: ForgeWorkerCompletionObserver,
+    /// Tenant every table in the journey belongs to.
+    tenant: DataTenantId,
+}
+
+impl LeaderJourney {
+    /// Starts `spec` with the default Forge policy and a completion observer.
+    ///
+    /// `inject_uncertainty` routes every node's Forge catalog through the
+    /// cluster's shared [`CommitUncertaintyCatalog`], which passes commits
+    /// through unchanged until a scenario arms one of its holds.
+    ///
+    /// # Panics
+    /// Panics if the cluster cannot start or composes no observer.
+    async fn start(spec: BifrostClusterSpec, inject_uncertainty: bool) -> Self {
+        let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+            spec,
+            ForgeConfig::default(),
+            false,
+            inject_uncertainty,
+        )
+        .await
+        .expect("leader journey cluster starts");
+        let observer = cluster
+            .forge_completion_observer()
+            .expect("completion observer");
+        let tenant = cluster.data_tenant_id();
+        Self {
+            cluster,
+            observer,
+            tenant,
+        }
+    }
+
+    /// Borrows one running node.
+    ///
+    /// # Panics
+    /// Panics if the node is unknown or stopped.
+    fn node(&self, node: NodeId) -> &WyrdTestServer {
+        self.cluster.server_by_node(node).expect("running node")
+    }
+
+    /// Runs one production planning pass on `node` and waits for it.
+    ///
+    /// # Panics
+    /// Panics if the pass does not complete within the diagnostic bound.
+    async fn pass(&self, node: NodeId) {
+        let server = self.node(node);
+        let before = server.completed_forge_scheduler_passes_for_test();
+        server.request_forge_scheduler_pass_for_test();
+        tokio::time::timeout(
+            PASS_BOUND,
+            server.wait_for_forge_scheduler_passes_for_test(before + 1),
+        )
+        .await
+        .expect("the production loop completes the requested pass");
+    }
+
+    /// Runs one leader maintenance tick on `node` and waits for it.
+    ///
+    /// The tick is the production timer's own pass; a node without the
+    /// leader term returns from it without touching any table.
+    ///
+    /// # Panics
+    /// Panics if the pass does not complete within the diagnostic bound.
+    async fn maintain(&self, node: NodeId) {
+        let server = self.node(node);
+        let before = server.completed_forge_scheduler_passes_for_test();
+        server.request_forge_maintenance_pass_for_test();
+        tokio::time::timeout(
+            PASS_BOUND,
+            server.wait_for_forge_scheduler_passes_for_test(before + 1),
+        )
+        .await
+        .expect("the production maintenance loop completes the requested tick");
+    }
+
+    /// Advances every running node's Forge clock by `duration`.
+    ///
+    /// # Panics
+    /// Panics if the requested test time is unrepresentable.
+    fn advance(&self, duration: chrono::Duration) {
+        for server in self.cluster.servers() {
+            server
+                .forge_clock()
+                .advance(duration)
+                .expect("maintenance time advances");
+        }
+    }
+
+    /// Returns the snapshot ids `table` currently retains.
+    ///
+    /// # Panics
+    /// Panics if the catalog cannot load the table.
+    async fn snapshots(&self, via: NodeId, table: &JourneyTable) -> BTreeSet<i64> {
+        self.node(via)
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&table.binding.table_ident())
+            .await
+            .expect("journey table")
+            .metadata()
+            .snapshots()
+            .map(|snapshot| snapshot.snapshot_id())
+            .collect()
+    }
+
+    /// Counts `table`'s durable expiry, expired-cleanup and orphan attempts.
+    ///
+    /// # Panics
+    /// Panics when the read-only inspection fails.
+    async fn maintenance_rows(&self, table: &JourneyTable) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+             AND table_name = $2 AND strategy IN \
+             ('snapshot_expiry', 'expired_cleanup', 'orphan_cleanup')",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(&table.name)
+        .fetch_one(self.cluster.pg_fixture().operator_pool().pool())
+        .await
+        .expect("forge_tasks inspection")
+    }
+
+    /// Whether `path` still exists in shared storage.
+    ///
+    /// # Panics
+    /// Panics on a storage error other than absence.
+    async fn exists(&self, path: &str) -> bool {
+        match self.cluster.storage_operator().stat(path).await {
+            Ok(_) => true,
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => false,
+            Err(error) => panic!("object inspection failed: {error}"),
+        }
+    }
+
+    /// Classifies `path` with `via`'s production orphan predicate.
+    ///
+    /// # Panics
+    /// Panics when the production classifier fails.
+    async fn eligibility(&self, via: NodeId, table: &JourneyTable, path: &str) -> String {
+        self.node(via)
+            .forge_gc_eligibility_for_test(&table.binding, path)
+            .await
+            .expect("production eligibility classification")
+    }
+
+    /// Returns the leader term `node` holds, if any.
+    fn held(&self, node: NodeId) -> Option<Arc<ForgeHeldTerm>> {
+        self.node(node)
+            .state()
+            .forge_coordinator()
+            .and_then(|forge| forge.held_leader_term())
+    }
+
+    /// Returns every running node that holds a leader term.
+    fn leaders(&self) -> Vec<(NodeId, i64)> {
+        self.cluster
+            .servers()
+            .filter_map(|server| {
+                self.held(server.node_id())
+                    .map(|term| (server.node_id(), term.fencing_token()))
+            })
+            .collect()
+    }
+
+    /// Registers a table that enables compaction and manifest rewriting.
+    ///
+    /// # Panics
+    /// Panics if registration or the catalog property commit fails.
+    async fn register_scheduled_table(&self, via: NodeId, prefix: &str) -> JourneyTable {
+        self.register_table_with(via, prefix, &[]).await
+    }
+
+    /// Registers a scheduled table with additional Forge table properties.
+    ///
+    /// # Panics
+    /// Panics if registration or the catalog property commit fails.
+    async fn register_table_with(
+        &self,
+        via: NodeId,
+        prefix: &str,
+        properties: &[(&str, &str)],
+    ) -> JourneyTable {
+        let table = register_table(self.node(via), self.tenant, &unique_table(prefix)).await;
+        let catalog = self.node(via).bifrost_catalog().iceberg_catalog();
+        let loaded = catalog
+            .load_table(&table.binding.table_ident())
+            .await
+            .expect("scheduled table");
+        let tx = Transaction::new(&loaded);
+        let tx = properties
+            .iter()
+            .fold(
+                tx.update_table_properties()
+                    .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
+                    .set(
+                        "wyrd.forge.enable-manifest-rewrite".to_owned(),
+                        "true".to_owned(),
+                    ),
+                |update, (key, value)| update.set((*key).to_owned(), (*value).to_owned()),
+            )
+            .apply(tx)
+            .expect("Forge table settings");
+        tx.commit_once(catalog.as_ref())
+            .await
+            .expect("Forge table settings commit");
+        table
+    }
+
+    /// Appends rows through `via`'s public ingest and seals them as hot objects.
+    ///
+    /// # Panics
+    /// Panics if the append is refused or the Scribe flush fails.
+    async fn write_hot(&self, via: NodeId, table: &JourneyTable, values: &[i64]) {
+        let client = tenant_client(self.node(via), self.tenant).await;
+        append_values(&client, &table.qualified, Uuid::now_v7(), values).await;
+        self.node(via)
+            .flush_bifrost()
+            .await
+            .expect("acknowledged rows seal as hot objects");
+    }
+
+    /// Counts the table's hot objects that still owe an Iceberg promotion.
+    ///
+    /// # Panics
+    /// Panics when the read-only inspection fails.
+    async fn unpromoted(&self, table: &JourneyTable) -> i64 {
+        sqlx::query_scalar(
+            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 \
+             AND table_name = $2 AND committed_snapshot_id IS NULL",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(&table.name)
+        .fetch_one(self.cluster.pg_fixture().operator_pool().pool())
+        .await
+        .expect("file_list inspection")
+    }
+
+    /// Waits until every hot object of `table` has been promoted.
+    ///
+    /// Each wait is one completed Forge attempt, never a timer.
+    ///
+    /// # Panics
+    /// Panics if the bound elapses or an attempt returns an error.
+    async fn await_promoted(&self, table: &JourneyTable) {
+        tokio::time::timeout(PASS_BOUND, async {
+            while self.unpromoted(table).await > 0 {
+                let next = self.observer.attempts() + 1;
+                self.observer.wait_for_attempts_at_least(next).await;
+            }
+        })
+        .await
+        .expect("hot objects are promoted by a coordinator");
+        assert!(
+            self.observer.returned_errors().is_empty(),
+            "{:?}",
+            self.observer.returned_errors()
+        );
+    }
+
+    /// Builds the leader's key for one journey table.
+    ///
+    /// # Panics
+    /// Panics if the journey table name is not a valid Forge table identity.
+    fn key(&self, table: &JourneyTable) -> ForgeTableKey {
+        ForgeTableKey {
+            tenant: self.tenant,
+            table: vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
+                vala_bifrost_redux::catalog::BIFROST_CATALOG_NAME,
+                BifrostNamespace::Datasets.as_str(),
+                &table.name,
+            )
+            .expect("table identity"),
+        }
+    }
+}
+
+/// One coordinator leads; its successor starts with an empty volatile schedule.
+///
+/// Mirrors RisingWave's meta election: only the elected node builds the
+/// Iceberg compaction manager, a replacement is elected through the shared
+/// SQL row, and the replacement's tracks and maintenance sets start empty.
+///
+/// # Panics
+/// Panics when two coordinators lead, a commit is not counted by the leader,
+/// or the successor inherits any pending count or maintenance membership.
+#[tokio::test]
+#[ignore = "requires Postgres and two coordinator replicas"]
+async fn one_leader_failover_volatile_state() {
+    let spec = BifrostClusterSpec::two_mixed();
+    let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let mut journey = LeaderJourney::start(spec, false).await;
+    journey.pass(first).await;
+    journey.pass(second).await;
+    let leaders = journey.leaders();
+    assert_eq!(
+        leaders.len(),
+        1,
+        "exactly one coordinator leads: {leaders:?}"
+    );
+    let (leader, first_token) = leaders[0];
+    let standby = if leader == first { second } else { first };
+
+    // A commit promoted on the standby reaches the leader over the peer route.
+    let table = journey
+        .register_scheduled_table(standby, "leader_failover")
+        .await;
+    journey.write_hot(standby, &table, &[1, 2, 3]).await;
+    journey.await_promoted(&table).await;
+    let key = journey.key(&table);
+    let counted = journey
+        .held(leader)
+        .expect("leader still holds its term")
+        .schedule()
+        .track_for_test(&key)
+        .expect("the leader tracks the promoted table");
+    assert_eq!(
+        counted.pending_commits, 1,
+        "one promotion is one Iceberg commit"
+    );
+    assert_eq!(journey.held(standby).map(|term| term.fencing_token()), None);
+
+    // Graceful stop resigns; the standby takes over on its next pass.
+    let stopped = Instant::now();
+    journey
+        .cluster
+        .stop_node(leader)
+        .await
+        .expect("leader stops");
+    journey.pass(standby).await;
+    let successor = journey.held(standby).expect("the standby takes over");
+    eprintln!("Forge leader failover took {:?}", stopped.elapsed());
+    assert!(
+        successor.fencing_token() > first_token,
+        "a new term is minted"
+    );
+    assert_eq!(
+        successor.schedule().sizes_for_test(),
+        (0, 0, 0),
+        "the successor starts with no tracks or maintenance membership"
+    );
+
+    // The successor counts only commits it observes, through the local route.
+    journey.write_hot(standby, &table, &[4, 5]).await;
+    journey.await_promoted(&table).await;
+    let recounted = successor
+        .schedule()
+        .track_for_test(&key)
+        .expect("the successor tracks the table after a new commit");
+    assert_eq!(recounted.pending_commits, 1, "no pending count is copied");
+
+    // The restarted former leader is a standby while the successor's term lives.
+    journey.cluster.restart_node(leader).await.expect("restart");
+    journey.pass(leader).await;
+    assert_eq!(
+        journey.leaders(),
+        vec![(standby, successor.fencing_token())]
+    );
+    journey.cluster.shutdown().await.expect("cluster drains");
+}
+
+/// Ends the live election term the way a lapsed lease does.
+///
+/// The row stays owned by the old term but is no longer live, which is
+/// exactly what PostgreSQL holds once a renewal fails to land in time. The
+/// replica that held it is not told; it must discover the loss itself.
+///
+/// # Panics
+/// Panics when the election row cannot be updated.
+async fn lapse_leader_term(journey: &LeaderJourney) {
+    sqlx::query(
+        "UPDATE vala.forge_scheduler_state SET expires_at = statement_timestamp() WHERE singleton",
+    )
+    .execute(journey.cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("election row lapses");
+}
+
+/// Waits for `term` to be revoked by its own replica's renewal loop.
+///
+/// # Panics
+/// Panics if the replica keeps the term past the diagnostic bound.
+async fn await_revoked(term: &ForgeHeldTerm) {
+    tokio::time::timeout(PASS_BOUND, term.revoked())
+        .await
+        .expect("the replaced term is revoked by its renewal loop");
+}
+
+/// A lost term is revoked while promotion and maintenance are parked.
+///
+/// Renewal runs beside hinted promotion, so a promotion held at the catalog
+/// cannot keep a replaced term alive: the old replica discovers the loss on
+/// its own heartbeat and refuses notify, pull and report under that term.
+/// The same revocation stops a paused maintenance pass, which then performs
+/// no cleanup or orphan effect, and the next leader settles what it left.
+///
+/// # Panics
+/// Panics when a replaced term is not revoked, still serves a leader handler,
+/// or its maintenance pass makes a durable effect after revocation, or when
+/// the successor leaves an attempt unsettled.
+#[tokio::test]
+#[ignore = "requires Postgres and two coordinator replicas"]
+async fn revoked_term_stops_promotion_dispatch_and_maintenance() {
+    let spec = BifrostClusterSpec::two_mixed();
+    let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let journey = LeaderJourney::start(spec, true).await;
+    let catalog = journey
+        .cluster
+        .commit_uncertainty_catalog()
+        .expect("the topology wraps the real Forge catalog");
+    journey.pass(first).await;
+    journey.pass(second).await;
+    let (old_leader, _) = journey.leaders()[0];
+    let successor = if old_leader == first { second } else { first };
+    let forge = |node: NodeId| {
+        Arc::clone(
+            journey
+                .node(node)
+                .state()
+                .forge_coordinator()
+                .expect("coordinator"),
+        )
+    };
+
+    // A hinted promotion on the leader is parked at its catalog commit.
+    let table = journey
+        .register_scheduled_table(old_leader, "revoked_promotion")
+        .await;
+    let old_term = journey.held(old_leader).expect("leader term");
+    catalog.pause_before_commit();
+    journey.write_hot(old_leader, &table, &[1, 2]).await;
+    tokio::time::timeout(PASS_BOUND, catalog.wait_for_before_commit())
+        .await
+        .expect("the hinted promotion reaches the catalog");
+
+    // The term lapses; the standby takes it, and the parked replica's own
+    // renewal loop revokes the old term while the promotion is still held.
+    lapse_leader_term(&journey).await;
+    journey.pass(successor).await;
+    let new_term = journey.held(successor).expect("the standby takes over");
+    assert!(new_term.fencing_token() > old_term.fencing_token());
+    await_revoked(&old_term).await;
+    assert!(journey.held(old_leader).is_none());
+    let old = forge(old_leader);
+    let key = journey.key(&table);
+    let refused = |result: Result<(), ForgeError>, handler: &str| {
+        assert!(
+            matches!(result, Err(ForgeError::FenceLost { .. })),
+            "{handler} under a revoked term: {result:?}"
+        );
+    };
+    refused(
+        old.accept_commit_notice(
+            old_term.fencing_token(),
+            ForgeCommitNotice {
+                key: key.clone(),
+                snapshot_id: 1,
+                settings: ForgeTableSettings::default(),
+            },
+        ),
+        "notify",
+    );
+    refused(
+        old.serve_compaction_pull(old_term.fencing_token(), 4)
+            .map(|_| ()),
+        "pull",
+    );
+    refused(
+        old.serve_compaction_report(
+            old_term.fencing_token(),
+            &key,
+            Uuid::now_v7(),
+            ForgeCompactionOutcome::Failed,
+        )
+        .map(|_| ()),
+        "report",
+    );
+
+    // Released, the promotion lands once and its notice reaches the successor.
+    catalog.release_paused_before_commit();
+    journey.await_promoted(&table).await;
+    assert_eq!(
+        new_term
+            .schedule()
+            .track_for_test(&key)
+            .map(|track| track.pending_commits),
+        Some(1),
+        "the successor counts the parked promotion exactly once"
+    );
+
+    // A cold table the successor maintains: expiry is due and an aged
+    // rowless output waits for the orphan sweep that follows it.
+    let cold = register_table(
+        journey.node(successor),
+        journey.tenant,
+        &unique_table("revoked_maintenance"),
+    )
+    .await;
+    set_table_properties(
+        journey.node(successor),
+        &cold.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
+    for values in [&[1, 2][..], &[3, 4]] {
+        journey.write_hot(successor, &cold, values).await;
+        journey.await_promoted(&cold).await;
+    }
+    let orphan = format!(
+        "{}/data/forge/v2/{}-00000-{}.parquet",
+        cold.binding.object_prefix.trim_end_matches('/'),
+        Uuid::now_v7(),
+        Uuid::now_v7()
+    );
+    journey
+        .cluster
+        .storage_operator()
+        .write(&orphan, b"never published".to_vec())
+        .await
+        .expect("rowless output");
+    journey.advance(chrono::Duration::days(2));
+    assert_eq!(
+        journey.eligibility(successor, &cold, &orphan).await,
+        "Eligible"
+    );
+
+    // The pass is held after the catalog accepts the expiry; the term is
+    // replaced and revoked there, and the pass then starts nothing more.
+    let controls = forge(successor).expiry_controls_for_test();
+    controls.arm_expiry_accepted();
+    let server = journey.node(successor);
+    let passes = server.completed_forge_scheduler_passes_for_test();
+    server.request_forge_maintenance_pass_for_test();
+    tokio::time::timeout(PASS_BOUND, controls.wait_expiry_accepted())
+        .await
+        .expect("the successor's expiry is accepted");
+    let accepted = (
+        journey.snapshots(successor, &cold).await,
+        journey.maintenance_rows(&cold).await,
+    );
+    lapse_leader_term(&journey).await;
+    journey.pass(old_leader).await;
+    let third = journey.held(old_leader).expect("a third term is acquired");
+    assert!(third.fencing_token() > new_term.fencing_token());
+    await_revoked(&new_term).await;
+    // The accepted expiry is one table-fenced effect that completes through
+    // loss of the leader term; nothing after it may start.
+    controls.release_expiry_accepted();
+    tokio::time::timeout(
+        PASS_BOUND,
+        server.wait_for_forge_scheduler_passes_for_test(passes + 1),
+    )
+    .await
+    .expect("the revoked maintenance pass returns");
+    assert_eq!(
+        (
+            journey.snapshots(successor, &cold).await,
+            journey.maintenance_rows(&cold).await,
+        ),
+        accepted,
+        "a revoked pass makes no later expiry or cleanup effect"
+    );
+    assert!(
+        journey.exists(&orphan).await,
+        "a revoked pass sweeps nothing"
+    );
+    assert!(journey.held(successor).is_none());
+
+    // The third term rejoins the table on its next commit and settles the
+    // revoked pass's accepted expiry before its own cleanup.
+    journey.write_hot(old_leader, &cold, &[5]).await;
+    tokio::time::timeout(PASS_BOUND, async {
+        while journey.unpromoted(&cold).await > 0 {
+            let next = journey.observer.attempts() + 1;
+            journey.observer.wait_for_attempts_at_least(next).await;
+        }
+    })
+    .await
+    .expect("the rejoining commit is promoted");
+    journey.advance(chrono::Duration::minutes(1));
+    journey.maintain(old_leader).await;
+    assert!(!journey.exists(&orphan).await, "the next leader sweeps it");
+    let unsettled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+         AND table_name = $2 AND state NOT IN ('succeeded', 'failed', 'cancelled')",
+    )
+    .bind(journey.tenant.as_uuid())
+    .bind(&cold.name)
+    .fetch_one(journey.cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("forge_tasks inspection");
+    assert_eq!(unsettled, 0, "every maintenance attempt settled");
+    journey.cluster.shutdown().await.expect("cluster drains");
+}
+
+/// A restarted leader recovers lost-hint promotion debt with an empty schedule.
+///
+/// The second node runs Scribe without a coordinator, so its hot objects have
+/// no hint consumer: only the leader's `file_list` sweep can promote them.
+///
+/// # Panics
+/// Panics if hot objects stay unpromoted after the restart, or the restarted
+/// leader carries any track or membership from its previous term.
+#[tokio::test]
+#[ignore = "requires Postgres and two replicas"]
+async fn restart_recovers_hot_promotion_with_empty_schedule() {
+    // The tenant's audit table would otherwise join the recovered membership.
+    let mut spec = BifrostClusterSpec::two_mixed().without_audit_publication_for_test();
+    spec.nodes[1].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
+    let (leader, scribe) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let mut journey = LeaderJourney::start(spec, false).await;
+    journey.pass(leader).await;
+    let first_token = journey
+        .held(leader)
+        .expect("the only coordinator leads")
+        .fencing_token();
+
+    let before = journey
+        .register_scheduled_table(leader, "restart_before")
+        .await;
+    journey.write_hot(leader, &before, &[1, 2]).await;
+    journey.await_promoted(&before).await;
+    assert!(
+        journey
+            .held(leader)
+            .expect("term")
+            .schedule()
+            .track_for_test(&journey.key(&before))
+            .is_some(),
+        "the first term tracks its table"
+    );
+
+    journey
+        .cluster
+        .stop_node(leader)
+        .await
+        .expect("leader stops");
+    let lost = journey
+        .register_scheduled_table(scribe, "restart_lost")
+        .await;
+    journey.write_hot(scribe, &lost, &[7, 8, 9]).await;
+    assert!(
+        journey.unpromoted(&lost).await > 0,
+        "no coordinator promoted the Scribe-only objects"
+    );
+
+    journey.cluster.restart_node(leader).await.expect("restart");
+    journey.pass(leader).await;
+    assert_eq!(
+        journey.unpromoted(&lost).await,
+        0,
+        "the sweep promoted the debt"
+    );
+    let term = journey
+        .held(leader)
+        .expect("the restarted coordinator leads");
+    assert!(term.fencing_token() > first_token, "a new term is minted");
+    assert!(
+        term.schedule()
+            .track_for_test(&journey.key(&before))
+            .is_none(),
+        "no track survives the restart"
+    );
+    assert_eq!(
+        term.schedule()
+            .track_for_test(&journey.key(&lost))
+            .map(|track| track.pending_commits),
+        Some(1),
+        "the recovered promotion is the only counted commit"
+    );
+    assert_eq!(
+        term.schedule().sizes_for_test(),
+        (1, 1, 1),
+        "membership holds only the recovered table"
+    );
+    journey.cluster.shutdown().await.expect("cluster drains");
+}
+
+/// A new leader maintains nothing until a commit, then cleans only safe orphans.
+///
+/// Mirrors `RisingWave`'s Iceberg GC loop at e23ddf95: the elected node's
+/// maintenance sets are volatile, so after failover a cold table is not
+/// expired, rewritten or swept until its next commit notice makes it a member
+/// again. Wyrd's never-published orphan sweep has no `RisingWave` equivalent;
+/// it reuses the protected deletion boundary, so an unresolved expiry
+/// operation on the table protects even an aged rowless output.
+///
+/// # Panics
+/// Panics if the successor or the standby maintains a cold table, the rejoined
+/// table is not expired and swept, the unresolved operation leaves the orphan
+/// collectable, or a repeated sweep over the deleted object fails.
+#[tokio::test]
+#[ignore = "requires Postgres and two replicas"]
+async fn empty_maintenance_restart_protects_orphans() {
+    let spec = BifrostClusterSpec::two_mixed();
+    let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let mut journey = LeaderJourney::start(spec, true).await;
+    let catalog = journey
+        .cluster
+        .commit_uncertainty_catalog()
+        .expect("the topology wraps the real Forge catalog");
+    journey.pass(first).await;
+    journey.pass(second).await;
+    let (leader, _) = journey.leaders()[0];
+    let successor = if leader == first { second } else { first };
+
+    // Snapshot expiration is on by default; compaction is opted out, because
+    // the leader skips the orphan sweep for a table that owes a rewrite. The
+    // table's only leader work is maintenance and it never owes a rewrite.
+    let table = register_table(
+        journey.node(leader),
+        journey.tenant,
+        &unique_table("cold_restart"),
+    )
+    .await;
+    set_table_properties(
+        journey.node(leader),
+        &table.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
+    for values in [&[1, 2][..], &[3, 4]] {
+        journey.write_hot(leader, &table, values).await;
+        journey.await_promoted(&table).await;
+    }
+    let key = journey.key(&table);
+    assert!(
+        journey
+            .held(leader)
+            .expect("leader term")
+            .schedule()
+            .maintenance_tables()
+            .1
+            .contains(&key),
+        "the first term counts the table for snapshot expiration"
+    );
+    // A rowless output in the writer's canonical grammar: what a rewrite that
+    // died before preparing leaves behind, and what only the sweep can reach.
+    let orphan = format!(
+        "{}/data/forge/v2/{}-00000-{}.parquet",
+        table.binding.object_prefix.trim_end_matches('/'),
+        Uuid::now_v7(),
+        Uuid::now_v7()
+    );
+    journey
+        .cluster
+        .storage_operator()
+        .write(&orphan, b"never published".to_vec())
+        .await
+        .expect("rowless output");
+
+    journey
+        .cluster
+        .stop_node(leader)
+        .await
+        .expect("leader stops");
+    journey.pass(successor).await;
+    journey.cluster.restart_node(leader).await.expect("restart");
+    journey.pass(leader).await;
+    assert_eq!(journey.leaders().len(), 1);
+    let term = journey.held(successor).expect("the successor leads");
+    // The successor may legitimately schedule the tenant's audit table, whose
+    // retained reads keep promoting; this table must start with no membership.
+    let schedule = term.schedule();
+    let (manifest_rewrite, snapshot_expiration) = schedule.maintenance_tables();
+    assert!(
+        schedule.track_for_test(&key).is_none()
+            && !manifest_rewrite.contains(&key)
+            && !snapshot_expiration.contains(&key),
+        "the successor starts with empty maintenance membership for this table"
+    );
+
+    // Past retention and the orphan floor, both replicas tick and nothing runs.
+    journey.advance(chrono::Duration::days(2));
+    let retained = journey.snapshots(successor, &table).await;
+    let rows = journey.maintenance_rows(&table).await;
+    assert!(retained.len() > 1, "expiry is due: {retained:?}");
+    assert_eq!(
+        journey.eligibility(successor, &table, &orphan).await,
+        "Eligible",
+        "the orphan is collectable, so only membership withholds the sweep"
+    );
+    journey.maintain(successor).await;
+    journey.maintain(leader).await;
+    assert_eq!(journey.snapshots(successor, &table).await, retained);
+    assert_eq!(journey.maintenance_rows(&table).await, rows);
+    assert!(journey.exists(&orphan).await, "a cold table is not swept");
+
+    // A new commit rejoins the table; the standby still maintains nothing.
+    journey.write_hot(successor, &table, &[5]).await;
+    journey.await_promoted(&table).await;
+    let rejoined = journey.snapshots(successor, &table).await;
+    let rows = journey.maintenance_rows(&table).await;
+    journey.maintain(leader).await;
+    assert_eq!(journey.held(leader).map(|term| term.fencing_token()), None);
+    assert_eq!(journey.snapshots(successor, &table).await, rejoined);
+    assert_eq!(journey.maintenance_rows(&table).await, rows);
+    assert!(journey.exists(&orphan).await, "a standby sweeps nothing");
+
+    // The leader's expiry is held after the catalog accepted it: that
+    // unresolved operation protects the aged orphan until it settles.
+    catalog.pause_after_snapshot_removal();
+    let drive = journey.maintain(successor);
+    let inspect = async {
+        tokio::time::timeout(PASS_BOUND, catalog.wait_for_commit())
+            .await
+            .expect("the rejoined table's expiry reaches the catalog");
+        assert_eq!(
+            journey.eligibility(successor, &table, &orphan).await,
+            "Protected",
+            "an unresolved expiry protects every object of its table"
+        );
+        assert!(journey.exists(&orphan).await);
+        catalog.release_paused_commit();
+    };
+    tokio::join!(drive, inspect);
+    let expired = journey.snapshots(successor, &table).await;
+    assert_eq!(expired.len(), 1, "retain-last keeps only the head");
+    assert!(expired.is_subset(&rejoined));
+    assert!(
+        !journey.exists(&orphan).await,
+        "the settled pass swept the rowless output"
+    );
+
+    // A later sweep, at a new cut, settles idempotently without the object.
+    let swept = journey.maintenance_rows(&table).await;
+    journey.advance(chrono::Duration::minutes(1));
+    journey.maintain(successor).await;
+    assert!(!journey.exists(&orphan).await);
+    assert!(
+        journey.maintenance_rows(&table).await > swept,
+        "the repeated pass ran its own recorded sweep"
+    );
+    let unsettled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+         AND table_name = $2 AND state NOT IN ('succeeded', 'failed', 'cancelled')",
+    )
+    .bind(journey.tenant.as_uuid())
+    .bind(&table.name)
+    .fetch_one(journey.cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("forge_tasks inspection");
+    assert_eq!(unsettled, 0, "every maintenance attempt settled");
+    assert!(
+        journey.observer.returned_errors().is_empty(),
+        "{:?}",
+        journey.observer.returned_errors()
+    );
+    journey.cluster.shutdown().await.expect("cluster drains");
+}
+
+/// Compactors pull the oldest due tables on either route and both replicas work.
+///
+/// Mirrors RisingWave's compactor pull (`compactor/mod.rs:1606-1640`) and
+/// oldest-due dispatch (`schedule.rs:428-490,915-993`) at e23ddf95: a pull
+/// names only table identities, a failed delivery returns the table to Idle
+/// with its commits, and success consumes only the commits counted at
+/// dispatch. The first cluster runs coordinators without workers so every
+/// pull is the test's own; the second lets both replicas' workers pull.
+///
+/// # Panics
+/// Panics when a pull returns tables out of due order or beyond its limit,
+/// a route disagrees with the other, a report loses a commit, or the workers
+/// of only one replica execute the dispatched backlog.
+#[tokio::test]
+#[ignore = "requires Postgres and two replicas"]
+async fn compactors_pull_oldest_due_with_capacity() {
+    let due_now = [("wyrd.forge.compaction.trigger-snapshot-count", "1")];
+    let mut spec = BifrostClusterSpec::two_mixed();
+    for node in &mut spec.nodes {
+        node.roles.remove(&BifrostRuntimeRole::ForgeWorker);
+    }
+    let (first, second) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
+    let journey = LeaderJourney::start(spec, false).await;
+    journey.pass(first).await;
+    journey.pass(second).await;
+    let (leader, _) = journey.leaders()[0];
+    let standby = if leader == first { second } else { first };
+    let forge = |node: NodeId| {
+        Arc::clone(
+            journey
+                .node(node)
+                .state()
+                .forge_coordinator()
+                .expect("coordinator"),
+        )
+    };
+    let mut keys = Vec::new();
+    let mut tables = Vec::new();
+    for index in 0..5_i64 {
+        let table = journey
+            .register_table_with(leader, "pull_due", &due_now)
+            .await;
+        journey.write_hot(leader, &table, &[index]).await;
+        journey.await_promoted(&table).await;
+        keys.push(journey.key(&table));
+        tables.push(table);
+    }
+    let pulled_keys = |dispatches: &[ForgeCompactionDispatch]| {
+        dispatches
+            .iter()
+            .map(|dispatch| dispatch.key.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // The peer route and the in-process route share one oldest-due order.
+    let peer = forge(standby).pull_compaction(2).await.expect("peer pull");
+    assert_eq!(pulled_keys(&peer), keys[..2], "the two oldest due tables");
+    assert!(
+        peer.iter()
+            .all(|dispatch| dispatch.compaction_type == ForgeCompactionType::SmallFiles),
+        "a dispatch names the table and its task type, never files: {peer:?}"
+    );
+    let local = forge(leader).pull_compaction(2).await.expect("local pull");
+    assert_eq!(pulled_keys(&local), keys[2..4], "the next two due tables");
+
+    // A failed delivery returns the table to Idle, due now, with its commit.
+    forge(standby)
+        .report_compaction(&peer[0], ForgeCompactionOutcome::NotStarted)
+        .await
+        .expect("peer report");
+    let term = journey.held(leader).expect("leader term");
+    let reverted = term.schedule().track_for_test(&keys[0]).expect("track");
+    assert_eq!((reverted.pending_commits, reverted.in_flight), (1, None));
+    let again = forge(leader).pull_compaction(4).await.expect("local pull");
+    assert_eq!(
+        pulled_keys(&again),
+        vec![keys[0].clone(), keys[4].clone()],
+        "only due Idle tables are offered, oldest due first, within the limit"
+    );
+
+    // A commit during execution survives success; a stale report is ignored.
+    journey.write_hot(leader, &tables[1], &[10]).await;
+    journey.await_promoted(&tables[1]).await;
+    forge(standby)
+        .report_compaction(&peer[1], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("peer report");
+    let finished = term.schedule().track_for_test(&keys[1]).expect("track");
+    assert_eq!(
+        (finished.pending_commits, finished.in_flight),
+        (1, None),
+        "success consumes only the commit counted at dispatch"
+    );
+    forge(leader)
+        .report_compaction(&peer[0], ForgeCompactionOutcome::Failed)
+        .await
+        .expect("local report");
+    assert_eq!(
+        term.schedule()
+            .track_for_test(&keys[0])
+            .expect("track")
+            .in_flight,
+        Some(again[0].task_id),
+        "a report for an earlier task changes nothing"
+    );
+    journey.cluster.shutdown().await.expect("cluster drains");
+
+    // Both replicas' workers pull from the one leader and execute the backlog.
+    let journey = LeaderJourney::start(BifrostClusterSpec::two_mixed(), false).await;
+    let nodes = journey
+        .cluster
+        .servers()
+        .map(wyrd_testing::WyrdTestServer::node_id)
+        .collect::<Vec<_>>();
+    for node in &nodes {
+        journey.pass(*node).await;
+    }
+    let (leader, _) = journey.leaders()[0];
+    journey.observer.hold_after_claims_for_test(2);
+    let mut tables = Vec::new();
+    for index in 0..9_i64 {
+        let table = journey
+            .register_table_with(leader, "pull_work", &due_now)
+            .await;
+        journey.write_hot(leader, &table, &[index]).await;
+        tables.push(table);
+    }
+    tokio::time::timeout(PASS_BOUND, journey.observer.wait_for_claims_for_test())
+        .await
+        .expect("each replica's worker claims pulled work");
+    journey.observer.release_claims_for_test();
+    let names = tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect::<Vec<_>>();
+    let term = journey.held(leader).expect("leader term");
+    tokio::time::timeout(REWRITE_BOUND, async {
+        loop {
+            let next = journey.observer.attempts() + 1;
+            let idle = tables.iter().all(|table| {
+                term.schedule()
+                    .track_for_test(&journey.key(table))
+                    .is_some_and(|track| track.pending_commits == 0 && track.in_flight.is_none())
+            });
+            if idle {
+                break;
+            }
+            journey.observer.wait_for_attempts_at_least(next).await;
+        }
+    })
+    .await
+    .expect("the pulled backlog drains");
+    let dispatched: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT task_id, state FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+         AND table_name = ANY($2) AND plan->'parameters' ? 'compaction_type'",
+    )
+    .bind(journey.tenant.as_uuid())
+    .bind(&names)
+    .fetch_all(journey.cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("dispatched task inspection");
+    assert_eq!(
+        dispatched.len(),
+        tables.len(),
+        "one dispatched attempt per table"
+    );
+    assert!(
+        dispatched.iter().all(|(_, state)| state == "succeeded"),
+        "{dispatched:?}"
+    );
+    let dispatched = dispatched
+        .into_iter()
+        .map(|(task_id, _)| task_id)
+        .collect::<BTreeSet<_>>();
+    let workers = journey
+        .observer
+        .lifecycle_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            ForgeLifecycleEvent::Claimed { task_id, worker_id }
+                if dispatched.contains(&task_id) =>
+            {
+                Some(worker_id)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        workers.len(),
+        2,
+        "both replicas' workers executed pulled work"
+    );
+    assert!(
+        journey.observer.returned_errors().is_empty(),
+        "{:?}",
+        journey.observer.returned_errors()
+    );
+    journey.cluster.shutdown().await.expect("cluster drains");
 }

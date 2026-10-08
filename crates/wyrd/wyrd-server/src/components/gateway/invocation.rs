@@ -389,8 +389,8 @@ impl<'a> GatewayInvocation<'a> {
     /// Latency: on the request path, with sequential Postgres round trips:
     /// the tenant snapshot load and the reservation commit in
     /// [`Self::admit`]. Every invoke-decision audit, here and per fallback
-    /// model in [`Self::route`], is staged on `gateway_tasks` and is not a
-    /// request-path round trip.
+    /// model in [`Self::route`], is staged on the process audit outbox and is
+    /// not a request-path round trip.
     ///
     /// # Errors
     /// Returns `ServiceUnavailable` while the server drains,
@@ -612,12 +612,11 @@ impl<'a> GatewayInvocation<'a> {
     ///
     /// Returns the verdict; the caller decides whether a denial refuses the
     /// call (requested model), only skips a candidate (fallback), or hides the
-    /// model from a listing. The decision row is appended by a task spawned on
-    /// [`AppState::gateway_tasks`] rather than awaited here, so no invocation
-    /// waits on Postgres to record its own decision and shutdown still drains
-    /// the append. A staged append that fails is logged and counted under
-    /// `gateway_audit_commit_failures_total`; that decision keeps no row, and
-    /// an abrupt process loss may drop appends that had not yet committed.
+    /// model from a listing. The decision row is staged on the process audit
+    /// outbox, so no invocation waits on Postgres to record its own decision; a
+    /// failed commit is logged, counted under
+    /// `outbox_write_failures_total{outbox="audit"}`, and retried, and an
+    /// abrupt process loss may drop decisions that had not yet committed.
     ///
     /// # Errors
     /// Returns the deny reason when `caller` may not invoke `model`.
@@ -655,19 +654,7 @@ impl<'a> GatewayInvocation<'a> {
             &permission.to_string(),
             outcome,
         );
-        let vala = self.state.postgres.vala().clone();
-        let tenant = caller.data_tenant_id;
-        self.state.gateway_tasks.spawn(async move {
-            if let Err(error) = audit::record_audit(&vala, tenant, &event).await {
-                metrics::counter!("gateway_audit_commit_failures_total").increment(1);
-                tracing::error!(
-                    %error,
-                    operation = %event.operation,
-                    request_id = %event.request_id,
-                    "gateway invoke decision did not commit to the audit outbox"
-                );
-            }
-        });
+        self.state.audit_outbox.stage(caller.data_tenant_id, event);
         verdict
     }
 
@@ -806,15 +793,15 @@ impl<'a> GatewayInvocation<'a> {
         })
     }
 
-    /// Projects and enqueues the capture of one terminal call, if selected.
+    /// Projects and delivers the capture of one terminal call, if selected.
     ///
-    /// Runs after the caller has its answer and never waits for publication;
-    /// every drop is counted by [`GatewayCapture::record`]. The whole capture —
-    /// request content, object get, put, and read-back, and first-use producer
-    /// construction — is bounded by the admitted call's absolute deadline, so
-    /// a hung dependency cannot hold facts, object bytes, or this task past
-    /// the call. On expiry the partial work is dropped, releasing what it
-    /// held, no row is enqueued (the enqueue itself never awaits), and one
+    /// Runs after the caller has its answer; every outcome is counted by
+    /// [`GatewayCapture::record`]. The whole capture — request content, object
+    /// get, put, and read-back, and every Scribe submission — is bounded by
+    /// the admitted call's absolute deadline, so a hung dependency cannot hold
+    /// facts, object bytes, or this task past the call. Delivery itself stops
+    /// retrying at that deadline with its own drop reason; work still running
+    /// when it passes is dropped, releasing what it held, and one
     /// [`CaptureDrop::Unavailable`] is recorded.
     async fn capture(state: &AppState, call: &AdmittedCall, facts: Option<CallFacts>) {
         let Some(mut facts) = facts else {
@@ -831,7 +818,11 @@ impl<'a> GatewayInvocation<'a> {
             }
             match CallCapture::from_facts(facts) {
                 Ok(capture) => {
-                    state.gateway_capture.publish(state, &capture).await.ok();
+                    state
+                        .gateway_capture
+                        .publish(state, &capture, call.deadline)
+                        .await
+                        .ok();
                 }
                 Err(drop) => GatewayCapture::record(call.call_id, Err(drop)),
             }

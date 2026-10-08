@@ -7,6 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
@@ -40,15 +41,15 @@ const ROW_DIGEST_DOMAIN: &[u8] = b"wyrd.bifrost.journey.public-rows.v1";
 
 /// One acknowledged row, identified exactly as public ingest identified it.
 ///
-/// A public read is compared as the multiset of `(batch_id, value)` pairs.
-/// Holding the batch identity beside the value is what makes it an
+/// A public read is compared as the multiset of `(request_id, value)` pairs.
+/// Holding the request identity beside the value is what makes it an
 /// *exactness* check rather than a value-column check: a promotion or rewrite
-/// that moved a row between batches, dropped one, or duplicated one changes
+/// that moved a row between appends, dropped one, or duplicated one changes
 /// the sorted pair multiset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ManagedRow {
-    /// Batch identity the caller submitted with the append.
-    pub(crate) batch_id: Uuid,
+    /// Request identity the append was sent under, stamped as `wyrd_request_id`.
+    pub(crate) request_id: Uuid,
     /// User payload column.
     pub(crate) value: i64,
 }
@@ -87,7 +88,6 @@ pub(crate) async fn register_table(
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await
         .expect("the catalog registers the journey table");
@@ -97,6 +97,57 @@ pub(crate) async fn register_table(
         binding: TenantTableBinding::resolve((tenant, table_ref))
             .expect("the registered table resolves to its physical binding"),
     }
+}
+
+/// Makes one registered table's Forge compaction due on every commit.
+///
+/// Compaction is on for every table by default; the explicit opt-in only
+/// states the journey's intent. A snapshot-count trigger of one makes each
+/// promotion commit due on the next compactor pull, so a journey never waits
+/// out the hourly interval.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or the property commit fails.
+pub(crate) async fn enable_compaction(server: &WyrdTestServer, binding: &TenantTableBinding) {
+    set_table_properties(
+        server,
+        binding,
+        &[
+            ("wyrd.forge.enable-compaction", "true"),
+            ("wyrd.forge.compaction.trigger-snapshot-count", "1"),
+        ],
+    )
+    .await;
+}
+
+/// Commits Iceberg table properties, such as one table's Forge settings.
+///
+/// The leader reads these settings from the table each promotion commit
+/// notifies it about, so they govern every later commit.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or the property commit fails.
+pub(crate) async fn set_table_properties(
+    server: &WyrdTestServer,
+    binding: &TenantTableBinding,
+    properties: &[(&str, &str)],
+) {
+    let catalog = server.bifrost_catalog().iceberg_catalog();
+    let table = catalog
+        .load_table(&binding.table_ident())
+        .await
+        .expect("the configured table loads");
+    let tx = Transaction::new(&table);
+    let mut update = tx.update_table_properties();
+    for (key, value) in properties {
+        update = update.set((*key).to_owned(), (*value).to_owned());
+    }
+    let tx = update.apply(tx).expect("table properties");
+    tx.commit_once(catalog.as_ref())
+        .await
+        .expect("table properties commit");
 }
 
 /// Builds a unique table name for one journey.
@@ -154,9 +205,9 @@ fn encode_ipc(batch: &arrow::record_batch::RecordBatch) -> Vec<u8> {
 
 /// Appends one batch of values through public authenticated gRPC ingest.
 ///
-/// The batch identity is supplied by the caller rather than generated here, so
-/// the journey can name every row it acknowledged before the server has said
-/// anything back. Returns the exact rows that append must later read back.
+/// The batch identity is supplied by the caller; the request identity the
+/// append was sent under is returned with each row, so the journey names every
+/// row it acknowledged. Returns the exact rows that append must later read back.
 ///
 /// # Panics
 ///
@@ -180,15 +231,16 @@ pub(crate) async fn append_values(
         ))],
     )
     .expect("value batch");
-    wyrd_testing::bifrost::write::RawIngest::connect(client)
+    let request_id = wyrd_testing::bifrost::write::RawIngest::connect(client)
         .await
         .expect("public ingest transport connects")
         .insert(table, batch_id, encode_ipc(&batch))
         .await
         .expect("the public append is acknowledged");
+    let request_id = Uuid::parse_str(request_id.as_str()).expect("request identity is a UUID");
     rows.iter()
         .map(|value| ManagedRow {
-            batch_id,
+            request_id,
             value: *value,
         })
         .collect()
@@ -197,7 +249,7 @@ pub(crate) async fn append_values(
 /// Computes the canonical digest of one ordered acknowledged-row vector.
 ///
 /// The encoding is domain-separated and length-delimited over raw identity
-/// bytes: the 16-byte batch identity, then the value as a fixed-width
+/// bytes: the 16-byte request identity, then the value as a fixed-width
 /// big-endian integer. Nothing about `Debug`, JSON, Arrow buffer layout, or
 /// iteration order can reach the hash, so the digest means the same thing
 /// whichever tier answered the read.
@@ -206,7 +258,7 @@ pub(crate) fn rows_digest(rows: &[ManagedRow]) -> String {
     hasher.update(ROW_DIGEST_DOMAIN);
     hasher.update((rows.len() as u64).to_be_bytes());
     for row in rows {
-        hasher.update(row.batch_id.as_bytes());
+        hasher.update(row.request_id.as_bytes());
         hasher.update(row.value.to_be_bytes());
     }
     hex::encode(hasher.finalize())
@@ -214,7 +266,7 @@ pub(crate) fn rows_digest(rows: &[ManagedRow]) -> String {
 
 /// Sorts an acknowledged-row vector into the journey's canonical order.
 ///
-/// Rows sort by `(batch_id, value)`, so the order depends only on which rows
+/// Rows sort by `(request_id, value)`, so the order depends only on which rows
 /// were read and never on which tier or file answered.
 pub(crate) fn canonical_order(mut rows: Vec<ManagedRow>) -> Vec<ManagedRow> {
     rows.sort_unstable();
@@ -226,7 +278,7 @@ pub(crate) fn canonical_order(mut rows: Vec<ManagedRow>) -> Vec<ManagedRow> {
 /// Every query reads published and live sources, so a successful terminal is
 /// what makes the read an authority check: the answer must come from whichever tier currently owns the rows, so
 /// a promotion or a rewrite that lost, duplicated, or stranded a row shows up
-/// here rather than only in the catalog. The managed batch identity is
+/// here rather than only in the catalog. The managed request identity is
 /// selected alongside the user column so the result is comparable by identity,
 /// and the rows are returned in the journey's canonical order.
 ///
@@ -238,7 +290,7 @@ pub(crate) async fn read_managed_rows(
     client: &wyrd_client::WyrdClient,
     table: &str,
 ) -> Vec<ManagedRow> {
-    let sql = format!("SELECT wyrd_batch_id, value FROM {table}");
+    let sql = format!("SELECT wyrd_request_id, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&public_query(sql.clone()))
         .await
@@ -270,12 +322,12 @@ pub(crate) async fn read_managed_rows(
 /// paths funnel through here, so the tally counts exactly the rows the server
 /// streamed back and nothing a caller merely expected.
 fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedRow> {
-    let batch_ids = batch
-        .column_by_name("wyrd_batch_id")
-        .expect("the result carries the managed batch identity")
+    let request_ids = batch
+        .column_by_name("wyrd_request_id")
+        .expect("the result carries the managed request identity")
         .as_any()
-        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
-        .expect("the managed batch identity stays FixedSizeBinary(16)");
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("the managed request identity stays Utf8");
     let values = batch
         .column_by_name("value")
         .expect("the result carries the user column")
@@ -284,15 +336,10 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
         .expect("the user column stays Int64");
     PUBLIC_ROWS_RETURNED.fetch_add(batch.num_rows() as u64, Ordering::AcqRel);
     (0..batch.num_rows())
-        .map(|row| {
-            let raw: [u8; 16] = batch_ids
-                .value(row)
-                .try_into()
-                .expect("the managed batch identity is exactly 16 bytes");
-            ManagedRow {
-                batch_id: Uuid::from_bytes(raw),
-                value: values.value(row),
-            }
+        .map(|row| ManagedRow {
+            request_id: Uuid::parse_str(request_ids.value(row))
+                .expect("the managed request identity is a UUID"),
+            value: values.value(row),
         })
         .collect()
 }
@@ -302,6 +349,7 @@ fn public_query(sql: String) -> BifrostQueryRequest {
     BifrostQueryRequest {
         sql,
         deadline_ms: Some(120_000),
+        params: Vec::new(),
     }
 }
 
@@ -310,11 +358,16 @@ fn public_query(sql: String) -> BifrostQueryRequest {
 /// Used only for the cross-tenant probe, where the interesting outcome is the
 /// refusal itself: a tenant that can name a neighbour's table at all is a
 /// tenancy defect, so the journey must see an error rather than empty rows.
+///
+/// # Errors
+///
+/// Returns the public [`wyrd_client::bifrost::BifrostClientError`] when the
+/// query is refused, or when opening or draining its result stream fails.
 pub(crate) async fn try_read(
     client: &wyrd_client::WyrdClient,
     table: &str,
 ) -> Result<Vec<ManagedRow>, wyrd_client::bifrost::BifrostClientError> {
-    let sql = format!("SELECT wyrd_batch_id, value FROM {table}");
+    let sql = format!("SELECT wyrd_request_id, value FROM {table}");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&public_query(sql))
         .await?;

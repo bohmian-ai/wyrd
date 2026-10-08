@@ -1312,7 +1312,7 @@ mod protocol_tests {
             scenario_id: ScenarioId::new("a").unwrap(),
             turn: 0,
             message: "m".to_string(),
-            history: (0..MAX_HISTORY_TURNS + 1)
+            history: (0..=MAX_HISTORY_TURNS)
                 .map(|_| ConversationTurn {
                     role: TurnRole::User,
                     content: "x".to_string(),
@@ -2211,9 +2211,8 @@ mod task_enum_tests {
     fn condition_accessor_returns_inner_option() {
         use crate::vala::eval::condition::EvalCondition;
 
-        let mut assertion_task = match assertion("c", vec![]) {
-            EvalTask::Assertion(assertion_task) => assertion_task,
-            _ => unreachable!(),
+        let EvalTask::Assertion(mut assertion_task) = assertion("c", vec![]) else {
+            unreachable!()
         };
         assertion_task.condition = Some(EvalCondition {
             path: JsonPath::new("$.flag").unwrap(),

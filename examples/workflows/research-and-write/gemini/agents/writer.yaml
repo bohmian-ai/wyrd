@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: examples
+  name: writer
+  version: "0.1.0"
+spec:
+  prompt:
+    model: gemini-2.0-flash
+    request:
+      provider: gemini_generate_content
+      body:
+        system_instruction:
+          role: user
+          parts:
+            - text: You are a concise writer. Turn the research notes into a two-sentence summary.
+        contents:
+          - role: user
+            parts:
+              - text: "Write a summary from: {{research}}"
+    variables: [research]
+    response_type: text
+  tool_names: []

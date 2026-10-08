@@ -383,23 +383,22 @@ async fn scribe_promotion_revalidates_footer_and_appends_without_data_put() {
 /// still unsettled in SQL. The production `pin_sealed_table` cut is taken at
 /// that instant, and before and after it, and each cut must partition the
 /// sealed set exactly.
+///
+/// # Panics
+///
+/// Panics when the fixture seals nothing, the held promotion does not reach
+/// or leave the catalog boundary in time, or any cut double-counts or misses
+/// a sealed row.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
-    let server = start_engine_fixture_server().await;
-    let fixture = seed_forge_group(&server, "promotion_window").await;
-    let catalog_owner = server.bifrost_catalog();
-    let table_ref = fixture.binding.table_ref.clone();
-    let tenant = fixture.tenant;
-
-    let sealed = file_rows(&fixture)
-        .await
-        .into_iter()
-        .map(|row| row.file_path)
-        .collect::<BTreeSet<_>>();
-    assert!(!sealed.is_empty(), "the fixture sealed real objects");
-
     /// Asserts one production cut sees every sealed path exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cut cannot be acquired, materialized, or released, when
+    /// a path is visible from both hot and promoted sources, or when the cut
+    /// does not cover the sealed set exactly.
     async fn assert_exact_cut(
         catalog: &vala_bifrost_redux::catalog::BifrostCatalog,
         table: &vala_bifrost_redux::catalog::TableRef,
@@ -407,15 +406,31 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
         sealed: &BTreeSet<String>,
         label: &str,
     ) {
-        let permit = vala_bifrost_redux::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
-        let prepared = catalog
-            .prepare_reader_identity(table, tenant)
+        let query_id = uuid::Uuid::now_v7();
+        let acquired = catalog
+            .acquire_active_cut(
+                tenant,
+                vala_sql::queries::oracle_reader_authority::ActiveReadOwner {
+                    query_id,
+                    node_id: uuid::Uuid::now_v7(),
+                    fencing_token: 1,
+                },
+                std::time::Instant::now() + std::time::Duration::from_hours(1),
+                std::slice::from_ref(table),
+            )
             .await
-            .expect("the registered table prepares its reader identity");
+            .expect("the registered table acquires its active cut")
+            .expect("an hour remains before the deadline")
+            .pop()
+            .expect("one acquired table");
         let pinned = catalog
-            .materialize_reader_cut(prepared, &permit)
+            .materialize_acquired_cut(tenant, table, acquired)
             .await
             .unwrap_or_else(|error| panic!("{label} cut: {error}"));
+        catalog
+            .release_active_reads(tenant, query_id)
+            .await
+            .expect("the inspection cut releases its active read");
         let hot = pinned
             .hot_files
             .iter()
@@ -432,6 +447,19 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
             "{label}: the cut does not cover the sealed set exactly"
         );
     }
+
+    let server = start_engine_fixture_server().await;
+    let fixture = seed_forge_group(&server, "promotion_window").await;
+    let catalog_owner = server.bifrost_catalog();
+    let table_ref = fixture.binding.table_ref.clone();
+    let tenant = fixture.tenant;
+
+    let sealed = file_rows(&fixture)
+        .await
+        .into_iter()
+        .map(|row| row.file_path)
+        .collect::<BTreeSet<_>>();
+    assert!(!sealed.is_empty(), "the fixture sealed real objects");
 
     assert_exact_cut(&catalog_owner, &table_ref, tenant, &sealed, "before").await;
 
@@ -457,7 +485,7 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
     assert_exact_cut(&catalog_owner, &table_ref, tenant, &sealed, "mid-window").await;
     catalog.release_paused_commit();
 
-    let forge = tokio::time::timeout(std::time::Duration::from_secs(60), held)
+    let forge = tokio::time::timeout(std::time::Duration::from_mins(1), held)
         .await
         .expect("held promotion completes")
         .expect("held promotion task");
@@ -640,68 +668,17 @@ async fn scribe_promotion_ambiguity_reconciles_without_recommit() {
     );
 }
 
-/// The operation deadline bounds the conflict retry to zero second attempts.
-///
-/// The commit is parked at the real catalog seam, the Forge clock is moved
-/// past the operation's own retry budget, and only then is the parked commit
-/// refused. The deadline captured before the first attempt must therefore
-/// already be spent, so the definite conflict closes the operation instead of
-/// buying a second catalog call. One delegated update — against two in the
-/// retry scenario — is what proves the barrier held.
-#[tokio::test]
-#[ignore = "requires Postgres"]
-async fn scribe_promotion_deadline_expires_before_conflict_retry() {
-    let server = start_engine_fixture_server().await;
-    let clock = server.forge_clock();
-    let fixture = seed_forge_group(&server, "promotion_deadline").await;
-    let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-    catalog.pause_before_commit();
-
-    let forge = SupervisedForge::start_with_seams(
-        &fixture,
-        fixture.config.clone(),
-        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-        Arc::clone(&fixture.object_store),
-    );
-    let forge = forge
-        .run_one_failure_while(async {
-            catalog.wait_for_before_commit().await;
-            let expired = clock.now().expect("manual Forge clock")
-                + chrono::Duration::from_std(fixture.config.iceberg_total_retry_timeout)
-                    .expect("retry budget is representable")
-                + chrono::Duration::seconds(1);
-            clock.set(expired).expect("manual Forge clock advances");
-            catalog.reject_paused_before_commit();
-        })
-        .await;
-
-    assert_eq!(
-        catalog.update_attempts(),
-        1,
-        "the expired deadline permitted no second catalog call: {:?}",
-        forge.returned_errors()
-    );
-    assert_eq!(
-        promotion_phases(&fixture).await,
-        vec!["reset".to_owned()],
-        "a conflict past the deadline closes the operation"
-    );
-    let unsettled = file_rows(&fixture).await;
-    assert!(
-        unsettled
-            .iter()
-            .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
-        "nothing was settled by a refused promotion: {unsettled:?}"
-    );
-    forge.shutdown().await;
-}
-
 /// Cancellation drains a parked promotion without settling anything.
 ///
-/// The worker is cancelled while its commit is parked before delegation, so
-/// acceptance is unknown by construction. Draining must therefore release the
+/// The coordinator is cancelled while its inline promotion commit is parked
+/// before delegation, so acceptance is unknown by construction. Draining must therefore release the
 /// attempt and its lease while leaving the operation Prepared: settling it
 /// either way would claim knowledge the worker does not have.
+///
+/// # Panics
+///
+/// Panics when the drained operation leaves `prepared`, any sealed row is
+/// settled, or the drained attempt still holds its lease.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_cancellation_drains_without_settlement() {
@@ -716,11 +693,11 @@ async fn scribe_promotion_cancellation_drains_without_settlement() {
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&fixture.object_store),
     );
-    let worker_stop = forge.worker_stop();
+    let coordinator_stop = forge.coordinator_stop();
     let forge = forge
         .run_one_failure_while(async {
             catalog.wait_for_before_commit().await;
-            worker_stop.cancel();
+            coordinator_stop.cancel();
             catalog.wait_for_before_commit_drop().await;
         })
         .await;
@@ -836,7 +813,7 @@ async fn scribe_promotion_lease_loss_and_takeover_settle_once() {
     let stolen = steal_forge_lease(&fixture).await;
     catalog.reject_paused_commit();
 
-    let forge = tokio::time::timeout(std::time::Duration::from_secs(60), held)
+    let forge = tokio::time::timeout(std::time::Duration::from_mins(1), held)
         .await
         .expect("stolen promotion returns")
         .expect("stolen promotion task");

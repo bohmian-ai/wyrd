@@ -4,50 +4,64 @@
 //! facts under the policy admitted with the call into one
 //! `vala.gateway.calls` row and one linked GenAI span per attempt, applying
 //! mandatory secret redaction and binary-content references to any selected
-//! payload. [`GatewayCapture`] then hands both batches to the tenant's
-//! embedded `wyrd-client` producer with a non-waiting enqueue: the ordinary
-//! queue owns encoding, sealing, retry, and publication, so a slow, saturated,
-//! or unavailable Bifrost never changes the call. A disabled policy never
-//! reaches this module.
+//! payload. [`GatewayCapture`], the process's one capture writer, then submits
+//! both batches as a server-internal write: in-process to this pod's Scribe,
+//! or over the mutually authenticated peer plane to a live Scribe when this
+//! pod runs none. Capture holds no token, evaluates no permission, and writes
+//! no audit decision. Delivery is bounded by the call's deadline, so a slow,
+//! saturated, or unavailable Bifrost drops the capture with a counted reason
+//! and never changes the call. A disabled policy never reaches this module.
+//!
+//! The same writer carries Verifier result batches along the same route,
+//! attributed to the tenant SYSTEM principal and the run's exact Verifier.
+//! Those share the transport but not the delivery policy: a result batch is
+//! never dropped, and is retried until acknowledged or the run's lease is lost.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::future::Future;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
+use arrow::ipc::writer::StreamWriter;
 use arrow::json::ReaderBuilder;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use chrono::{DateTime, TimeDelta, Utc};
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::cluster::ClusterRegistry;
+use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeError, ScribeIngressFrame};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::tables::gateway::CallsTable;
 use vala_bifrost_redux::tables::signal::correlation_fields;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
-use vala_bifrost_redux::tables::{DomainTable, builtin_table};
-use wyrd_auth_issue::IssuingKey;
-use wyrd_auth_verify::GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS;
-use wyrd_client::auth::AuthMiddleware;
-use wyrd_client::bifrost::BifrostClientError;
-use wyrd_client::config::ClientConfig;
-use wyrd_client::error::WyrdClientError;
-use wyrd_client::transport::HttpTransport;
-use wyrd_client::transport::ResolvedCredential;
-use wyrd_client::transport::credential::{AccessTokenSource, MintedAccessToken};
-use wyrd_client::{Bifrost as BifrostClient, WyrdClient};
+use vala_bifrost_redux::tables::{
+    DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, SpansTable,
+};
 use wyrd_gateway::{AttemptRecord, IngressDialect, MediaRequest, UploadContent};
-use wyrd_queue::{QueueConfig, WyrdQueueError};
+use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, SecretBearer};
+use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
+use wyrd_spec::envelope::CardKind;
 use wyrd_spec::gateway::{
     GATEWAY_JSON_MAX_BYTES, GatewayAccountingEntryV1, GatewayAttemptSpanFieldsV1, GatewayCallId,
     GatewayCallOutcome, GatewayCallPayloadV1, GatewayCaptureMode, GatewayCapturePolicy,
     GatewayOperation, GatewayPayloadField, GatewayPayloadObjectRefV1, ModelRef,
 };
+use wyrd_spec::ids::{CardUid, VerificationRunId};
+use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::NodeId;
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
 use wyrd_tonic::otlp::common::v1::any_value::Value as AnyValueKind;
@@ -56,20 +70,24 @@ use wyrd_tonic::otlp::resource::v1::Resource;
 use wyrd_tonic::otlp::trace::v1::span::SpanKind;
 use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
+use wyrd_tonic::tonic::Code;
+use wyrd_tonic::tonic::transport::Channel;
+use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_client::ScribeCapturePeerServiceClient;
+use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, VerifierResultAttribution};
 
-use crate::state::AppState;
-
-/// Destination of the logical-call row.
-const CALLS_TABLE: &str = "vala.gateway.calls";
-
-/// Destination of the linked attempt spans.
-const SPANS_TABLE: &str = "vala.traces.spans";
+use crate::state::{AppState, Bifrost};
 
 /// Value substituted for a redacted secret.
 const REDACTED: &str = "[REDACTED]";
 
 /// Service and instrumentation-scope name of published attempt spans.
 const GATEWAY_SERVICE: &str = "wyrd.gateway";
+
+/// First pause before resubmitting a batch Scribe refused retryably.
+const RETRY_INITIAL: Duration = Duration::from_millis(10);
+
+/// Longest pause between resubmissions; the call's deadline bounds the total.
+const RETRY_MAX: Duration = Duration::from_secs(1);
 
 /// Normalized key fragments whose values are always credentials.
 ///
@@ -91,7 +109,7 @@ const SECRET_KEY_FRAGMENTS: &[&str] = &[
     "sessiontoken",
 ];
 
-/// Why one call's capture was not enqueued; the call itself is unaffected.
+/// Why one call's capture was not delivered; the call itself is unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureDrop {
     /// A selected payload could not be canonicalized within the fixed ceiling,
@@ -99,13 +117,14 @@ pub(crate) enum CaptureDrop {
     Payload,
     /// The projected record violated its public contract.
     Invalid,
-    /// The record could not be assembled into its Arrow batch.
+    /// The record could not be assembled into its Arrow batch or encoded.
     Projection,
-    /// The tenant's capture producer could not be constructed.
+    /// No Scribe acknowledged before the call's deadline: none is reachable
+    /// from this pod, it is closed or failing, or the deadline elapsed.
     Unavailable,
-    /// The bounded queue or byte budget refused the batch.
+    /// Scribe refused the batch for backpressure until the call's deadline.
     Saturated,
-    /// The producer refused the batch for another reason, such as shutdown.
+    /// Scribe refused the batch terminally, for example as malformed.
     Rejected,
     /// A selected binary object could not be written to or verified in object
     /// storage, so the whole capture is dropped rather than referencing bytes
@@ -127,80 +146,281 @@ impl CaptureDrop {
         }
     }
 
-    /// Classifies a producer refusal as saturation or another rejection.
-    fn from_client(error: &BifrostClientError) -> Self {
+    /// Whether a later resubmission of the same batch may be acknowledged.
+    const fn is_retryable(self) -> bool {
+        matches!(self, Self::Saturated | Self::Unavailable)
+    }
+
+    /// Classifies an in-process Scribe refusal.
+    ///
+    /// Backpressure and a full WAL are saturation; a closed, failing, or
+    /// object-store-blocked writer is unavailable; anything else refuses this
+    /// batch for good.
+    pub(crate) fn from_scribe(error: &ScribeError) -> Self {
         match error {
-            BifrostClientError::Queue(WyrdQueueError::QueueFull | WyrdQueueError::Backpressure) => {
-                Self::Saturated
+            ScribeError::IngestBusy { .. } | ScribeError::WalDiskFull => Self::Saturated,
+            ScribeError::IngressClosed
+            | ScribeError::ObjectStorePutFailed(_)
+            | ScribeError::Internal { .. } => Self::Unavailable,
+            _ => Self::Rejected,
+        }
+    }
+
+    /// Classifies a peer Scribe's gRPC refusal by status code.
+    ///
+    /// The peer service projects Scribe errors through Gate's one ingest
+    /// status mapping, so saturation arrives as `ResourceExhausted`, and a
+    /// closed or failing writer, like an unreachable peer, as `Unavailable`
+    /// or `Internal`.
+    fn from_code(code: Code) -> Self {
+        match code {
+            Code::ResourceExhausted => Self::Saturated,
+            Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown => {
+                Self::Unavailable
             }
             _ => Self::Rejected,
         }
     }
 }
 
-/// Server-local renewable source of tenant-scoped capture access tokens.
-///
-/// The embedded client's [`AuthMiddleware`] caches, proactively refreshes,
-/// and force-refreshes through it, so capture owns no refresh loop and never
-/// persists a credential.
-struct CaptureTokenSource {
-    /// Server signing key; the only issuer of the reserved capture identity.
-    key: Arc<IssuingKey>,
-    /// The one tenant every minted token binds.
-    tenant: DataTenantId,
-    /// Registered UID of the tenant's `vala.gateway.calls` destination.
-    calls_uid: Uuid,
-    /// Registered UID of the tenant's `vala.traces.spans` destination.
-    spans_uid: Uuid,
-    /// Stable, non-secret pooling identity naming the tenant.
-    identity: String,
+/// One of the five destinations the capture writer submits to: the two
+/// gateway capture tables and the three Verifier result tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureTable {
+    /// `vala.gateway.calls`, one row per captured call.
+    Calls,
+    /// `vala.traces.spans`, one span per captured attempt.
+    Spans,
+    /// `vala.verification.results`, one canonical summary row per Verifier run.
+    Results,
+    /// `vala.drift.result_features`, the Drift result's feature rows.
+    DriftFeatures,
+    /// `vala.eval.result_items`, the Eval result's task rows.
+    EvalItems,
 }
 
-impl CaptureTokenSource {
-    /// Builds the source minting `tenant`'s capture tokens with `key`.
-    ///
-    /// `calls_uid` and `spans_uid` are the destination UIDs resolved when the
-    /// producer is built; every minted token's permissions are scoped to them.
-    fn new(key: Arc<IssuingKey>, tenant: DataTenantId, calls_uid: Uuid, spans_uid: Uuid) -> Self {
-        Self {
-            key,
-            tenant,
-            calls_uid,
-            spans_uid,
-            identity: format!("gateway_capture:{tenant}"),
+impl CaptureTable {
+    /// Every destination, in a fixed order.
+    const ALL: [Self; 5] = [
+        Self::Calls,
+        Self::Spans,
+        Self::Results,
+        Self::DriftFeatures,
+        Self::EvalItems,
+    ];
+
+    /// Fully qualified table name, which the peer RPC carries.
+    pub(crate) const fn fqn(self) -> &'static str {
+        match self {
+            Self::Calls => "vala.gateway.calls",
+            Self::Spans => "vala.traces.spans",
+            Self::Results => "vala.verification.results",
+            Self::DriftFeatures => "vala.drift.result_features",
+            Self::EvalItems => "vala.eval.result_items",
+        }
+    }
+
+    /// Resolves a fully qualified name to a destination, refusing any other
+    /// table.
+    pub(crate) fn from_fqn(fqn: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|table| table.fqn() == fqn)
+    }
+
+    /// Whether this destination is a Verifier result table, which is written
+    /// only under a [`VerifierAttribution`].
+    pub(crate) const fn is_result(self) -> bool {
+        matches!(self, Self::Results | Self::DriftFeatures | Self::EvalItems)
+    }
+
+    /// Logical Bifrost table this destination names.
+    fn table_ref(self) -> TableRef {
+        match self {
+            Self::Calls => TableRef::new(BifrostNamespace::Gateway, CallsTable::NAME),
+            Self::Spans => TableRef::new(BifrostNamespace::Traces, SpansTable::NAME),
+            Self::Results => TableRef::new(BifrostNamespace::Verification, ResultsTable::NAME),
+            Self::DriftFeatures => {
+                TableRef::new(BifrostNamespace::Drift, ResultFeaturesTable::NAME)
+            }
+            Self::EvalItems => TableRef::new(BifrostNamespace::Eval, ResultItemsTable::NAME),
         }
     }
 }
 
-impl AccessTokenSource for CaptureTokenSource {
-    /// Names the capture identity of this source's tenant.
-    fn identity(&self) -> &str {
-        &self.identity
+/// The frozen run identity a Verifier result batch is written under.
+///
+/// Every value comes from the run's frozen Postgres row and the tenant's
+/// stored SYSTEM principal, never from a Verifier or the Arrow payload. The
+/// frame principal built from it is the tenant SYSTEM principal scoped to
+/// exactly this Verifier, so Scribe stamps that principal as `principal_id`
+/// and the Verifier UID as `card_uid`, and refuses a row whose `card_ref`
+/// names another Card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VerifierAttribution {
+    /// The run the result belongs to.
+    pub(crate) run_id: VerificationRunId,
+    /// The exact Verifier Card, carrying its UID.
+    pub(crate) verifier: CardRef,
+    /// The tenant's SYSTEM principal.
+    pub(crate) principal: PrincipalId,
+}
+
+impl VerifierAttribution {
+    /// Projects this attribution onto the peer RPC, the Verifier reference
+    /// and its UID as separate fields.
+    fn to_wire(&self) -> VerifierResultAttribution {
+        VerifierResultAttribution {
+            run_id: self.run_id.to_string(),
+            verifier_ref: CardRef {
+                uid: None,
+                ..self.verifier.clone()
+            }
+            .to_string(),
+            verifier_uid: self
+                .verifier
+                .uid
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            principal_id: self.principal.to_string(),
+        }
     }
 
-    /// Mints one gateway capture access token at the maximum capture lifetime.
-    ///
-    /// The expiry is read before signing, so the cache refreshes no later than
-    /// the token's real expiry.
+    /// Parses a peer-submitted attribution.
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdClientError::Config`] when the key refuses to issue.
-    fn mint(&self) -> Result<MintedAccessToken, WyrdClientError> {
-        let ttl =
-            TimeDelta::seconds(i64::try_from(GATEWAY_CAPTURE_TOKEN_MAX_TTL_SECONDS).unwrap_or(0));
-        let expires_at = Utc::now() + ttl;
-        let token = self
-            .key
-            .issue_gateway_capture_access_token(self.tenant, self.calls_uid, self.spans_uid, ttl)
-            .map_err(|error| WyrdClientError::Config {
-                field: "gateway_capture.access_token".to_owned(),
-                reason: error.to_string(),
-            })?;
-        Ok(MintedAccessToken {
-            access_token: SecretBearer::new(token),
-            expires_at,
+    /// Returns a static reason when the run or principal id is malformed, the
+    /// reference is not an exact Verifier Card reference, or the UID is
+    /// malformed.
+    pub(crate) fn from_wire(wire: &VerifierResultAttribution) -> Result<Self, &'static str> {
+        let run_id = wire
+            .run_id
+            .parse::<VerificationRunId>()
+            .map_err(|_| "result run_id is not a run id")?;
+        let mut verifier = CardRef::from_str(&wire.verifier_ref)
+            .map_err(|_| "result verifier_ref is not a Card reference")?;
+        if verifier.kind != CardKind::Verifier || verifier.uid.is_some() {
+            return Err("result verifier_ref does not name a Verifier version");
+        }
+        verifier.uid = Some(
+            wire.verifier_uid
+                .parse::<CardUid>()
+                .map_err(|_| "result verifier_uid is not a Card UID")?,
+        );
+        let principal = wire
+            .principal_id
+            .parse::<PrincipalId>()
+            .map_err(|_| "result principal_id is not a principal id")?;
+        Ok(Self {
+            run_id,
+            verifier,
+            principal,
         })
+    }
+}
+
+/// One encoded batch bound for one tenant's capture or result destination.
+///
+/// The local writer and the peer service both submit through
+/// [`Self::into_frame`], so a batch is identical in-process and over the peer
+/// plane. A result table's batch carries its [`VerifierAttribution`] and a
+/// capture table's carries none; the peer service refuses any other
+/// combination. Cloning shares the encoded bytes.
+#[derive(Debug, Clone)]
+pub(crate) struct CaptureBatch {
+    /// Tenant the rows belong to.
+    pub(crate) tenant: DataTenantId,
+    /// Destination table.
+    pub(crate) table: CaptureTable,
+    /// Deterministic identity Scribe deduplicates resubmissions on.
+    pub(crate) batch_id: Uuid,
+    /// Request that admitted the call, or that the result write runs under.
+    pub(crate) request_id: RequestId,
+    /// The batch as one Arrow IPC stream.
+    pub(crate) ipc: Bytes,
+    /// The run identity of a Verifier result batch; `None` for capture.
+    pub(crate) verifier: Option<VerifierAttribution>,
+}
+
+impl CaptureBatch {
+    /// Encodes `batch` as one IPC stream for `call_id`'s `table` capture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CaptureDrop::Projection`] when Arrow cannot encode the batch.
+    fn encode(
+        tenant: DataTenantId,
+        call_id: GatewayCallId,
+        table: CaptureTable,
+        request_id: RequestId,
+        batch: &RecordBatch,
+    ) -> Result<Self, CaptureDrop> {
+        let mut writer = StreamWriter::try_new(Vec::new(), batch.schema().as_ref())
+            .map_err(|_| CaptureDrop::Projection)?;
+        writer.write(batch).map_err(|_| CaptureDrop::Projection)?;
+        let ipc = writer.into_inner().map_err(|_| CaptureDrop::Projection)?;
+        Ok(Self {
+            tenant,
+            table,
+            batch_id: Self::derive_id(tenant, call_id, table),
+            request_id,
+            ipc: Bytes::from(ipc),
+            verifier: None,
+        })
+    }
+
+    /// Derives the batch identity from the tenant, call, and destination.
+    ///
+    /// The same call's batch for the same table always has the same id, so a
+    /// retry, or a resubmission to another Scribe, is absorbed by Scribe's
+    /// batch-id dedup instead of writing the rows twice. The digest carries
+    /// UUIDv7 version and variant bits, as Gate's derived OTLP ids do.
+    pub(crate) fn derive_id(
+        tenant: DataTenantId,
+        call_id: GatewayCallId,
+        table: CaptureTable,
+    ) -> Uuid {
+        let mut digest = Sha256::new();
+        digest.update(b"wyrd.gateway.capture.batch-id.v1");
+        digest.update(tenant.as_uuid().as_bytes());
+        digest.update(call_id.as_uuid().as_bytes());
+        digest.update(table.fqn().as_bytes());
+        let digest: [u8; 32] = digest.finalize().into();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x70;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(bytes)
+    }
+
+    /// Builds the Scribe frame for this batch.
+    ///
+    /// A capture batch is submitted under the reserved capture principal; a
+    /// result batch under the tenant SYSTEM principal whose Card scope is
+    /// exactly the frozen Verifier, from which Scribe stamps `card_uid`. The
+    /// principal carries no permission: both are server-internal writes that
+    /// evaluate none, exactly like audit publication, and its id is what
+    /// Scribe stamps as the rows' `principal_id`.
+    pub(crate) fn into_frame(self) -> ScribeIngressFrame {
+        let (id, kind) = match &self.verifier {
+            None => (GATEWAY_CAPTURE_PRINCIPAL, PrincipalKind::User),
+            Some(attribution) => (
+                attribution.principal,
+                PrincipalKind::System {
+                    card_ref_scope: CardRefScope::own(&attribution.verifier),
+                },
+            ),
+        };
+        ScribeIngressFrame {
+            principal: Principal::new(id, kind, self.tenant, Vec::new(), PermissionSet::new()),
+            authenticated_tenant: self.tenant,
+            table: self.table.table_ref(),
+            expected_schema_fingerprint: None,
+            request_id: self.request_id,
+            batch_id: self.batch_id,
+            measured_wire_bytes: self.ipc.len(),
+            payload: IngressPayload::ArrowIpc(self.ipc),
+        }
     }
 }
 
@@ -250,20 +470,20 @@ pub(crate) struct CallFacts {
     /// within the capture ceiling.
     pub(crate) response: Result<Option<Value>, CaptureDrop>,
     /// Bytes of every selected binary object already substituted by a typed
-    /// reference, awaiting persistence before the referencing row is enqueued.
+    /// reference, awaiting persistence before the referencing row is delivered.
     pub(crate) objects: PayloadObjects,
 }
 
 /// One call's validated analytical record: its row and attempt spans.
 #[derive(Debug)]
 pub(crate) struct CallCapture {
-    /// Tenant whose producer publishes the record.
+    /// Tenant the record belongs to.
     tenant: DataTenantId,
     /// Operation, which names the GenAI spans.
     operation: GatewayOperation,
     /// The `vala.gateway.calls` row.
     payload: GatewayCallPayloadV1,
-    /// Bytes of every object the row references, persisted before enqueue.
+    /// Bytes of every object the row references, persisted before delivery.
     objects: PayloadObjects,
     /// One span's fields per attempt, in ordinal order.
     spans: Vec<GatewayAttemptSpanFieldsV1>,
@@ -435,93 +655,329 @@ impl CallCapture {
         Ok(Some(batch))
     }
 
-    /// Enqueues both batches on `producer` without waiting for publication,
-    /// each under the call's originating request ID.
+    /// Encodes the row batch and, when the call made attempts, the span batch
+    /// under their deterministic identities and the call's request ID.
     ///
     /// # Errors
     ///
-    /// Returns the projection drop of either batch, [`CaptureDrop::Saturated`]
-    /// when the bounded queue refuses one, and [`CaptureDrop::Rejected`] for any
-    /// other refusal. A refused span batch leaves the row enqueued.
-    pub(crate) fn enqueue(&self, producer: &BifrostClient) -> Result<(), CaptureDrop> {
-        let calls = self.calls_batch()?;
-        let spans = self.spans_batch()?;
-        producer
-            .enqueue_batch(CALLS_TABLE, calls, Some(self.request_id.clone()))
-            .map_err(|error| CaptureDrop::from_client(&error))?;
-        if let Some(spans) = spans {
-            producer
-                .enqueue_batch(SPANS_TABLE, spans, Some(self.request_id.clone()))
-                .map_err(|error| CaptureDrop::from_client(&error))?;
+    /// Returns the projection drop of either batch.
+    pub(crate) fn batches(&self) -> Result<Vec<CaptureBatch>, CaptureDrop> {
+        let encode = |table, batch: &RecordBatch| {
+            CaptureBatch::encode(
+                self.tenant,
+                self.payload.call_id,
+                table,
+                self.request_id.clone(),
+                batch,
+            )
+        };
+        let mut batches = vec![encode(CaptureTable::Calls, &self.calls_batch()?)?];
+        if let Some(spans) = self.spans_batch()? {
+            batches.push(encode(CaptureTable::Spans, &spans)?);
         }
-        Ok(())
+        Ok(batches)
     }
 }
 
-/// Pause between shutdown requests while a producer's retained batch awaits
-/// its retry.
-const CAPTURE_DRAIN_PAUSE: Duration = Duration::from_millis(10);
-
-/// Per-tenant owner of embedded capture producers.
+/// Live, ready Scribes reachable over the peer plane, with one reusable
+/// channel each.
 ///
-/// A producer exists only for a tenant that has captured at least one call,
-/// so a disabled tenant creates nothing and readiness never depends on
-/// Bifrost.
-#[derive(Default)]
-pub struct GatewayCapture {
-    /// Embedded client of each capturing tenant.
+/// The roster is read from cluster membership on every attempt, so a Scribe
+/// that joins, leaves, or stops being ready is followed without restart.
+struct CapturePeers {
+    /// Authoritative cluster membership.
+    cluster: Arc<ClusterRegistry>,
+    /// Cluster mTLS identity presented to every peer Scribe.
+    tls: BifrostPeerTls,
+    /// Reusable channel per Scribe node, keyed with the endpoint it dials.
     ///
-    /// Shared weakly with each producer's loss observer so a settled loss
-    /// republishes the gauges from every producer's ownership. The lock is
-    /// never held across an await.
-    producers: Arc<ProducerMap>,
-    /// Serializes first-use producer construction and shutdown across the
-    /// construction's awaited catalog, database, and connect IO.
-    construction: tokio::sync::Mutex<()>,
+    /// An entry is replaced when membership names another endpoint for the
+    /// node and dropped when the node leaves the roster. The lock is never
+    /// held across an await.
+    channels: Mutex<HashMap<NodeId, (String, Channel)>>,
 }
 
-/// Embedded capture client of each capturing tenant.
-type ProducerMap = std::sync::Mutex<HashMap<DataTenantId, Arc<BifrostClient>>>;
-
-impl GatewayCapture {
-    /// Enqueues `capture` on its tenant's producer and records the outcome.
+impl CapturePeers {
+    /// Returns the channel of the Scribe that serves submission `attempt`.
     ///
-    /// Never awaits publication: the only awaited work is persisting the
-    /// call's referenced objects, first-use producer construction, and the
-    /// non-waiting enqueue, and callers run this after the call's answer and
-    /// accounting. Every referenced object is written and verified *before*
-    /// the row naming it is enqueued, so a published reference always had
-    /// bytes behind it; a storage failure drops the whole capture instead.
-    /// The converse is deliberate: bytes that persist while enqueue fails are
-    /// left for the bucket lifecycle to expire. Every drop is counted and
-    /// logged without payload content.
+    /// Ready Scribes are ordered by node id and attempts rotate across them,
+    /// so a retry after a refusal is redirected to the next Scribe. A cached
+    /// channel is reused while its endpoint matches; otherwise a lazy channel
+    /// is built, so a connect failure surfaces on the RPC itself.
     ///
     /// # Errors
     ///
-    /// Returns the [`CaptureDrop`] that prevented enqueue, for tests; the call
-    /// is unaffected either way.
+    /// Returns [`CaptureDrop::Unavailable`] when no Scribe is live and ready
+    /// or its endpoint is invalid.
+    fn channel(&self, attempt: usize) -> Result<Channel, CaptureDrop> {
+        let snapshot = self.cluster.snapshot();
+        let mut scribes = snapshot
+            .live_scribes()
+            .into_iter()
+            .filter(|lease| lease.ready)
+            .map(|lease| (lease.key.node_id, lease.address.as_str()))
+            .collect::<Vec<_>>();
+        if scribes.is_empty() {
+            return Err(CaptureDrop::Unavailable);
+        }
+        scribes.sort_by_key(|(node_id, _)| node_id.as_uuid());
+        let (node_id, endpoint) = scribes[attempt % scribes.len()];
+        let mut channels = self
+            .channels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        channels.retain(|cached, _| scribes.iter().any(|(node, _)| node == cached));
+        if let Some((cached, channel)) = channels.get(&node_id)
+            && cached == endpoint
+        {
+            return Ok(channel.clone());
+        }
+        let channel = self
+            .tls
+            .endpoint(endpoint.to_owned())
+            .map_err(|_| CaptureDrop::Unavailable)?
+            .connect_lazy();
+        channels.insert(node_id, (endpoint.to_owned(), channel.clone()));
+        Ok(channel)
+    }
+
+    /// Submits `batch` to the Scribe serving `attempt` and waits for its ACK.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CaptureDrop`] the peer's status code classifies, or
+    /// [`CaptureDrop::Unavailable`] when no Scribe can be dialed.
+    async fn submit(&self, batch: &CaptureBatch, attempt: usize) -> Result<(), CaptureDrop> {
+        let mut client = ScribeCapturePeerServiceClient::new(self.channel(attempt)?);
+        client
+            .ingest_capture(IngestCaptureRequest {
+                tenant_id: batch.tenant.to_string(),
+                table: batch.table.fqn().to_owned(),
+                batch_id: batch.batch_id.to_string(),
+                request_id: batch.request_id.as_str().to_owned(),
+                arrow_ipc: batch.ipc.clone(),
+                verifier: batch.verifier.as_ref().map(VerifierAttribution::to_wire),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|status| CaptureDrop::from_code(status.code()))
+    }
+}
+
+/// Where this process's capture writer submits.
+enum CaptureRoute {
+    /// Scribe runs in this pod and acknowledges in-process.
+    Local(Arc<dyn Scribe>),
+    /// This pod runs no Scribe and submits over the peer plane.
+    Peer(CapturePeers),
+    /// This process can reach no Scribe, so every capture is dropped.
+    Unavailable,
+}
+
+/// The process's one gateway capture writer.
+///
+/// It is chosen once from pod topology: in-process when this pod runs Scribe,
+/// otherwise the capture-only peer RPC to a live Scribe. It holds no tenant
+/// state, queue, or backlog: each capture's batches are submitted while the
+/// call's capture task runs and either acknowledged or dropped by the call's
+/// deadline.
+pub struct GatewayCapture {
+    /// Submission path selected at construction.
+    route: CaptureRoute,
+}
+
+impl GatewayCapture {
+    /// Selects the writer for this process's Bifrost topology.
+    ///
+    /// A local Scribe wins; an Oracle-only pod uses its peer-plane identity
+    /// and cluster membership; a process with neither drops every capture as
+    /// unavailable.
+    #[must_use]
+    pub fn for_bifrost(bifrost: &Bifrost) -> Self {
+        let route = match (bifrost.scribe(), bifrost.oracle()) {
+            (Some(scribe), _) => {
+                CaptureRoute::Local(Arc::clone(scribe.scribe()) as Arc<dyn Scribe>)
+            }
+            (None, Some(oracle)) => match oracle.lifecycle_transport().peer_tls() {
+                Some(tls) => CaptureRoute::Peer(CapturePeers {
+                    cluster: oracle.cluster(),
+                    tls: tls.clone(),
+                    channels: Mutex::new(HashMap::new()),
+                }),
+                None => CaptureRoute::Unavailable,
+            },
+            (None, None) => CaptureRoute::Unavailable,
+        };
+        Self { route }
+    }
+
+    /// Builds a writer submitting in-process to `scribe`, standing in for a
+    /// pod's own Scribe.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn local(scribe: Arc<dyn Scribe>) -> Self {
+        Self {
+            route: CaptureRoute::Local(scribe),
+        }
+    }
+
+    /// Delivers `capture` by `deadline` and records the outcome.
+    ///
+    /// Every referenced object is written and verified *before* the row
+    /// naming it is submitted, so a published reference always had bytes
+    /// behind it; a storage failure drops the whole capture instead. Bytes
+    /// that persist while delivery fails are left for the bucket lifecycle to
+    /// expire. The row batch is delivered before the span batch, each retried
+    /// while Scribe refuses retryably and the deadline allows. Every drop is
+    /// counted and logged without payload content.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`CaptureDrop`] that prevented delivery, for tests; the
+    /// call is unaffected either way.
     pub(crate) async fn publish(
         &self,
         state: &AppState,
         capture: &CallCapture,
+        deadline: Instant,
     ) -> Result<(), CaptureDrop> {
-        let result = match capture.objects.persist(state, capture.tenant).await {
-            Ok(()) => match self.producer(state, capture.tenant).await {
-                Ok(producer) => capture.enqueue(&producer),
-                Err(drop) => Err(drop),
-            },
-            Err(drop) => Err(drop),
-        };
+        let result = self.deliver(state, capture, deadline).await;
         Self::record(capture.payload.call_id, result);
-        Self::record_backlog(&self.producers);
         result
+    }
+
+    /// Persists `capture`'s objects, then delivers each of its batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage, projection, or delivery drop that stopped it.
+    async fn deliver(
+        &self,
+        state: &AppState,
+        capture: &CallCapture,
+        deadline: Instant,
+    ) -> Result<(), CaptureDrop> {
+        capture.objects.persist(state, capture.tenant).await?;
+        for batch in capture.batches()? {
+            until_deadline(deadline, |attempt| self.submit(&batch, attempt)).await?;
+        }
+        Ok(())
+    }
+
+    /// Whether this process reaches any Scribe, in-process or over the peer
+    /// plane.
+    pub(crate) const fn reaches_scribe(&self) -> bool {
+        !matches!(self.route, CaptureRoute::Unavailable)
+    }
+
+    /// Writes one Verifier result batch until Scribe acknowledges it.
+    ///
+    /// Unlike capture, a result batch is never dropped for time: retryable
+    /// refusals (backpressure, an unavailable peer) are retried with the same
+    /// bounded backoff for as long as `lost` is not cancelled, which the
+    /// runner cancels when the run's lease is lost or the work is abandoned.
+    /// A peer refusal redirects the next attempt to the next ready Scribe.
+    /// Resubmissions reuse the batch's identity, so Scribe's batch-id dedup
+    /// absorbs a write that was durable but unacknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a terminal refusal at once, or the latest retryable refusal
+    /// once `lost` is cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// An attempt in flight when `lost` fires is dropped; whether Scribe
+    /// accepted it is unknown, and a later write of the same batch is absorbed
+    /// by dedup.
+    pub(crate) async fn write_result(
+        &self,
+        batch: &CaptureBatch,
+        lost: &CancellationToken,
+    ) -> Result<(), CaptureDrop> {
+        let mut pause = RETRY_INITIAL;
+        let mut latest = CaptureDrop::Unavailable;
+        for ordinal in 0.. {
+            latest = tokio::select! {
+                () = lost.cancelled() => return Err(latest),
+                submitted = self.submit(batch, ordinal) => match submitted {
+                    Ok(()) => return Ok(()),
+                    Err(refusal) if refusal.is_retryable() => refusal,
+                    Err(refusal) => return Err(refusal),
+                },
+            };
+            tokio::select! {
+                () = lost.cancelled() => return Err(latest),
+                () = tokio::time::sleep(pause) => {}
+            }
+            pause = (pause * 2).min(RETRY_MAX);
+        }
+        Err(latest)
+    }
+
+    /// Writes every batch of `payload` exactly as the runner does: encoded
+    /// for `tenant` under the attribution of `principal` running `verifier`
+    /// in `run_id`, details before the summary, each until acknowledged.
+    ///
+    /// A test seam for journeys that must fix a result's event time or move
+    /// Scribe's receipt clock between batches, both of which the runner owns.
+    /// `before` receives each batch's index just before it is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoding error, or the reason of a terminal write refusal.
+    #[cfg(feature = "test-support")]
+    pub async fn write_result_payload_for_test(
+        &self,
+        payload: &crate::verification::results::ResultPayload,
+        tenant: DataTenantId,
+        run_id: VerificationRunId,
+        verifier: &CardRef,
+        principal: PrincipalId,
+        mut before: impl FnMut(usize),
+    ) -> Result<(), String> {
+        let batches = payload
+            .encode(
+                tenant,
+                &VerifierAttribution {
+                    run_id,
+                    verifier: verifier.clone(),
+                    principal,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let never = CancellationToken::new();
+        for (index, batch) in batches.iter().enumerate() {
+            before(index);
+            self.write_result(batch, &never)
+                .await
+                .map_err(|drop| drop.reason().to_owned())?;
+        }
+        Ok(())
+    }
+
+    /// Submits `batch` once along this writer's route.
+    ///
+    /// # Errors
+    ///
+    /// Returns the classified Scribe refusal, or [`CaptureDrop::Unavailable`]
+    /// when this process reaches no Scribe.
+    async fn submit(&self, batch: &CaptureBatch, attempt: usize) -> Result<(), CaptureDrop> {
+        match &self.route {
+            CaptureRoute::Local(scribe) => scribe
+                .ingest_frame(batch.clone().into_frame())
+                .await
+                .map(|_| ())
+                .map_err(|error| CaptureDrop::from_scribe(&error)),
+            CaptureRoute::Peer(peers) => peers.submit(batch, attempt).await,
+            CaptureRoute::Unavailable => Err(CaptureDrop::Unavailable),
+        }
     }
 
     /// Counts and logs one capture outcome.
     pub(crate) fn record(call_id: GatewayCallId, result: Result<(), CaptureDrop>) {
-        let outcome = result.err().map_or("enqueued", CaptureDrop::reason);
+        let outcome = result.err().map_or("delivered", CaptureDrop::reason);
         metrics::counter!("wyrd_gateway_capture_total", "outcome" => outcome).increment(1);
-        if outcome != "enqueued" {
+        if outcome != "delivered" {
             tracing::warn!(
                 call_id = %call_id.as_uuid(),
                 reason = outcome,
@@ -529,196 +985,43 @@ impl GatewayCapture {
             );
         }
     }
+}
 
-    /// Publishes producer, backlog, and retry gauges across all `producers`.
-    ///
-    /// Sampling and publishing happen under the map lock, so concurrent
-    /// callers publish in the order they sampled and the last one wins with
-    /// the newest ownership.
-    fn record_backlog(producers: &ProducerMap) {
-        let producers = Self::lock(producers);
-        Self::record_gauges(producers.len(), producers.values());
-    }
-
-    /// Locks `producers`, recovering the map if a holder panicked.
-    ///
-    /// No holder mutates the map partially, so a poisoned map is still whole.
-    fn lock(
-        producers: &ProducerMap,
-    ) -> std::sync::MutexGuard<'_, HashMap<DataTenantId, Arc<BifrostClient>>> {
-        producers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Sets the producer gauge to `producers` and the backlog and retry gauges
-    /// to the ownership `clients` still hold.
-    fn record_gauges<'a>(producers: usize, clients: impl Iterator<Item = &'a Arc<BifrostClient>>) {
-        let (mut bytes, mut retries) = (0_usize, 0_usize);
-        for client in clients {
-            let metrics = client.metrics();
-            bytes += metrics.owned_bytes;
-            retries += metrics.retry_entries;
-        }
-        metrics::gauge!("wyrd_gateway_capture_producers").set(producers as f64);
-        metrics::gauge!("wyrd_gateway_capture_backlog_bytes").set(bytes as f64);
-        metrics::gauge!("wyrd_gateway_capture_retry_entries").set(retries as f64);
-    }
-
-    /// Counts every capture row `producer` settles as lost after admission
-    /// and republishes the backlog and retry gauges.
-    ///
-    /// The queue reports each loss synchronously once the lost owner's bytes
-    /// and retry slot are released, so a terminal refusal or unretainable
-    /// retry is observable, with settled gauges, without a later call. The
-    /// observer holds the map weakly, so it never keeps producers alive.
-    fn observe(&self, producer: &BifrostClient) {
-        let producers = Arc::downgrade(&self.producers);
-        producer.observe_losses(move |rows| {
-            if let Some(producers) = producers.upgrade() {
-                Self::record_backlog(&producers);
-            }
-            metrics::counter!("wyrd_gateway_capture_publication_dropped_rows_total")
-                .increment(rows);
-        });
-    }
-
-    /// Number of tenants with a constructed capture producer.
-    #[cfg(test)]
-    pub(crate) async fn producer_count(&self) -> usize {
-        Self::lock(&self.producers).len()
-    }
-
-    /// Returns `tenant`'s producer, constructing it on first use.
-    ///
-    /// Construction ensures both built-in destinations, captures their table
-    /// UIDs into the renewable capture credential, and connects an embedded
-    /// client from the server's ordinary client configuration and
-    /// `WYRD_GRPC_URL`. A failure is retried on the next captured call. The
-    /// UIDs are fixed for the producer's life: a destination recreated under a
-    /// new UID stays denied until a server restart rebuilds the producer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CaptureDrop::Saturated`], constructing nothing, when
-    /// [`QueueConfig::MAX_LIVE_ENTRIES`] tenants already own producers, and
-    /// [`CaptureDrop::Unavailable`] when this replica has no catalog or
-    /// signing key, or when a catalog, storage, or client step fails.
-    // ponytail: one lock serializes first-use construction across tenants;
-    // per-tenant init cells if many tenants enable capture at once.
-    async fn producer(
-        &self,
-        state: &AppState,
-        tenant: DataTenantId,
-    ) -> Result<Arc<BifrostClient>, CaptureDrop> {
-        let _construction = self.construction.lock().await;
-        {
-            let producers = Self::lock(&self.producers);
-            if let Some(producer) = producers.get(&tenant) {
-                return Ok(Arc::clone(producer));
-            }
-            if producers.len() >= QueueConfig::MAX_LIVE_ENTRIES {
-                return Err(CaptureDrop::Saturated);
-            }
-        }
-        let producer = Arc::new(Self::connect(state, tenant).await.map_err(|error| {
-            tracing::warn!(%tenant, %error, "gateway capture producer unavailable");
-            CaptureDrop::Unavailable
-        })?);
-        self.observe(&producer);
-        Self::lock(&self.producers).insert(tenant, Arc::clone(&producer));
-        Ok(producer)
-    }
-
-    /// Provisions `tenant`'s capture authority and connects its client.
-    ///
-    /// # Errors
-    ///
-    /// Returns a redacted description of the failed step.
-    async fn connect(state: &AppState, tenant: DataTenantId) -> Result<BifrostClient, String> {
-        let catalog = state
-            .bifrost
-            .catalog()
-            .ok_or("this replica has no Bifrost catalog")?;
-        let key = state
-            .auth
-            .issuing_key
-            .clone()
-            .ok_or("this replica has no signing key")?;
-        let mut uids = [Uuid::nil(); 2];
-        for (uid, (namespace, name)) in uids
-            .iter_mut()
-            .zip([("gateway", "calls"), ("traces", "spans")])
-        {
-            let definition = builtin_table(namespace, name).ok_or("built-in table missing")?;
-            let table = catalog
-                .ensure_builtin(tenant, definition)
-                .await
-                .map_err(|error| error.to_string())?;
-            *uid = Uuid::from_bytes(*table.as_bytes());
-        }
-        let config = ClientConfig::from_env();
-        let source = CaptureTokenSource::new(key, tenant, uids[0], uids[1]);
-        let auth = AuthMiddleware::new(&config, ResolvedCredential::Renewable(Arc::new(source)))
-            .map_err(|error| error.to_string())?;
-        let http = HttpTransport::new(&config.http, Arc::clone(&auth))
-            .map_err(|error| error.to_string())?;
-        let client = WyrdClient::from_parts(auth, http, config.grpc);
-        BifrostClient::connect(&client)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    /// Drains every producer concurrently, publishing accepted capture evidence.
-    ///
-    /// All producers drain together under the server's one shutdown deadline,
-    /// which cancels this future, so a tenant whose publication never settles
-    /// cannot keep another tenant from draining. Evidence still buffered when
-    /// a producer fails terminally is lost, which the capture contract permits
-    /// before Scribe acknowledgement. Once every producer has drained, the
-    /// producer, backlog, and retry gauges settle to what the drained
-    /// producers still hold.
-    pub(crate) async fn shutdown(&self) {
-        let producers = {
-            let _construction = self.construction.lock().await;
-            std::mem::take(&mut *Self::lock(&self.producers))
-                .into_values()
-                .collect::<Vec<_>>()
+/// Runs `attempt` until it is acknowledged, refused terminally, or
+/// `deadline` passes.
+///
+/// Each attempt receives its ordinal and is cancelled at `deadline`. A
+/// retryable refusal waits an exponentially growing pause, from
+/// [`RETRY_INITIAL`] up to [`RETRY_MAX`], before the next attempt; a pause
+/// that would reach the deadline ends delivery with that refusal instead.
+///
+/// # Errors
+///
+/// Returns a terminal refusal at once, and otherwise the latest retryable
+/// refusal once the deadline leaves no room for another attempt, or
+/// [`CaptureDrop::Unavailable`] when the first attempt itself outlives the
+/// deadline.
+async fn until_deadline<F, Fut>(deadline: Instant, mut attempt: F) -> Result<(), CaptureDrop>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<(), CaptureDrop>>,
+{
+    let mut pause = RETRY_INITIAL;
+    let mut latest = CaptureDrop::Unavailable;
+    for ordinal in 0.. {
+        latest = match tokio::time::timeout_at(deadline, attempt(ordinal)).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(refusal)) if refusal.is_retryable() => refusal,
+            Ok(Err(refusal)) => return Err(refusal),
+            Err(_) => return Err(latest),
         };
-        futures_util::future::join_all(producers.iter().map(|producer| Self::drain(producer)))
-            .await;
-        Self::record_gauges(0, producers.iter());
-    }
-
-    /// Shuts `producer` down, asking again while a retained batch awaits its
-    /// retry.
-    ///
-    /// A producer holding a batch whose ambiguous send awaits its retry answers
-    /// shutdown with `FlushTimeout` while its background owner keeps that
-    /// batch. The loop has no deadline of its own; cancelling the future ends
-    /// it. Any other failure is logged and ends the drain.
-    async fn drain(producer: &BifrostClient) {
-        loop {
-            match producer.shutdown().await {
-                Ok(()) => break,
-                // ponytail: fixed pause, since the queue exposes no retry-settled signal; await one if drain latency matters.
-                Err(BifrostClientError::Queue(WyrdQueueError::FlushTimeout)) => {
-                    tokio::time::sleep(CAPTURE_DRAIN_PAUSE).await;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "gateway capture producer did not drain");
-                    break;
-                }
-            }
+        if Instant::now() + pause >= deadline {
+            break;
         }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(RETRY_MAX);
     }
-
-    /// Installs `producer` for `tenant`, standing in for construction.
-    #[cfg(test)]
-    pub(crate) async fn install(&self, tenant: DataTenantId, producer: Arc<BifrostClient>) {
-        self.observe(&producer);
-        Self::lock(&self.producers).insert(tenant, producer);
-    }
+    Err(latest)
 }
 
 /// Request content of a call as capture sees it: the operation body, plus a
@@ -741,7 +1044,7 @@ pub(crate) async fn request_content(
         // persisted and verified; stream through `operator().writer` if
         // captured uploads ever outgrow one call's memory budget.
         let bytes = match &file.content {
-            UploadContent::Bytes(bytes) => bytes.to_vec(),
+            UploadContent::Bytes(bytes) => bytes.clone(),
             UploadContent::Spooled { file: spooled, len } => {
                 let mut reader = tokio::fs::File::from_std(spooled.try_clone()?);
                 reader.seek(std::io::SeekFrom::Start(0)).await?;
@@ -870,9 +1173,8 @@ impl PayloadObjects {
             let path = object_path(tenant, &reference.digest).ok_or(CaptureDrop::Storage)?;
             match state.storage.get_object(&path).await {
                 Ok(stored) if stored == *bytes => continue,
-                Ok(_) => return Err(CaptureDrop::Storage),
                 Err(StorageError::ObjectNotFound { .. }) => {}
-                Err(_) => return Err(CaptureDrop::Storage),
+                Ok(_) | Err(_) => return Err(CaptureDrop::Storage),
             }
             state
                 .storage
@@ -1179,29 +1481,31 @@ mod tests {
 
     use arrow::array::Array;
     use chrono::Utc;
-    use secrecy::SecretString;
     use serde_json::json;
-    use wyrd_auth_issue::IssuingKey;
-    use wyrd_auth_verify::Kid;
-    use wyrd_client::WyrdClient;
-    use wyrd_client::config::ClientConfig;
-    use wyrd_client::transport::credential::AccessTokenSource;
+    use tokio::time::{Duration, Instant};
+    use vala_bifrost_redux::contracts::ScribeError;
     use wyrd_gateway::{
         AttemptRecord, AttemptUsage, IngressDialect, MediaRequest, OpenAiMediaRoute, UploadContent,
         UploadFile,
     };
-    use wyrd_queue::{MockSink, QueueConfig};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId};
     use wyrd_spec::gateway::{
         GATEWAY_JSON_MAX_BYTES, GatewayCallId, GatewayCallOutcome, GatewayCaptureMode,
         GatewayCapturePolicy, GatewayOperation, GatewayPayloadField, ModelRef,
     };
     use wyrd_spec::ids::ProviderDeploymentName;
+    use wyrd_tonic::tonic::Code;
 
+    use tokio_util::sync::CancellationToken;
+    use wyrd_spec::ids::{CardUid, VerificationRunId};
+    use wyrd_spec::reference::CardRef;
+
+    use super::recording::RecordingScribe;
     use super::{
-        BifrostClient, CallCapture, CallFacts, CaptureDrop, CaptureTokenSource, GatewayCapture,
-        PayloadObjects, object_path, request_content,
+        CallCapture, CallFacts, CaptureBatch, CaptureDrop, CaptureRoute, CaptureTable,
+        GatewayCapture, PayloadObjects, VerifierAttribution, object_path, request_content,
+        until_deadline,
     };
 
     /// Secret planted under credential-shaped keys; must never be persisted.
@@ -1262,16 +1566,6 @@ mod tests {
             response: Ok(Some(json!({"id": "chatcmpl-1", "token": CANARY}))),
             objects: PayloadObjects::default(),
         }
-    }
-
-    /// Embedded client whose batches land in `sink` instead of gRPC.
-    fn producer(sink: Arc<MockSink>, config: QueueConfig) -> BifrostClient {
-        let client = WyrdClient::with_config(ClientConfig {
-            credential: Some(SecretString::from("secret")),
-            ..ClientConfig::default()
-        })
-        .expect("client assembles without IO");
-        BifrostClient::with_sink(&client, None, sink, config)
     }
 
     /// Proves `Metadata` writes a row with null payload and correlation
@@ -1481,340 +1775,457 @@ mod tests {
         }
     }
 
-    /// Proves the token source mints per-tenant tokens within the capture
-    /// lifetime ceiling.
+    /// Proves a capture encodes its row batch before its span batch, each
+    /// under the admitting request and an identity derived from tenant, call,
+    /// and destination alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batches, their order, or their identities differ.
     #[test]
-    fn token_source_mints_bounded_tenant_tokens() {
-        let key = IssuingKey::from_ed_pem(
-            IssuingKey::generate_ephemeral_pem().expect("pem"),
-            Kid::new("k1").expect("kid"),
-            "wyrd",
-        )
-        .expect("key");
-        let tenant = DataTenantId::new_v7();
-        let source =
-            CaptureTokenSource::new(Arc::new(key), tenant, uuid::Uuid::nil(), uuid::Uuid::nil());
-        assert_eq!(source.identity(), format!("gateway_capture:{tenant}"));
-        let before = Utc::now();
-        let minted = source.mint().expect("mints");
-        let lifetime = (minted.expires_at - before).num_seconds();
-        assert!((899..=900).contains(&lifetime), "{lifetime}");
-    }
-
-    /// Proves enqueue hands both batches to the queue without waiting, and a
-    /// refused byte budget drops the capture as saturated.
-    #[tokio::test]
-    async fn enqueue_is_non_waiting_and_saturation_drops() {
+    fn batches_carry_deterministic_ids_under_the_admitting_request() {
         let capture = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
             .expect("metadata projects");
-
-        let sink = Arc::new(MockSink::new());
-        let open = producer(Arc::clone(&sink), QueueConfig::default());
-        assert_eq!(capture.enqueue(&open), Ok(()));
-        open.shutdown().await.expect("producer drains");
-        let rows: u64 = sink.received().iter().map(|receipt| receipt.rows).sum();
-        assert_eq!(rows, 2, "one call row and one attempt span publish");
-
-        let full = producer(
-            Arc::new(MockSink::new()),
-            QueueConfig {
-                client_byte_limit_bytes: 1,
-                ..QueueConfig::default()
-            },
-        );
-        assert_eq!(capture.enqueue(&full), Err(CaptureDrop::Saturated));
-    }
-
-    /// Log output of the process-global test subscriber.
-    static LOGS: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
-
-    /// Appends formatted log output to [`LOGS`].
-    struct LogWriter;
-
-    impl std::io::Write for LogWriter {
-        /// Appends `bytes` to [`LOGS`].
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            LOGS.lock().expect("logs").extend_from_slice(bytes);
-            Ok(bytes.len())
+        let batches = capture.batches().expect("batches encode");
+        let tables = batches.iter().map(|batch| batch.table).collect::<Vec<_>>();
+        assert_eq!(tables, [CaptureTable::Calls, CaptureTable::Spans]);
+        let call = capture.payload.call_id;
+        for batch in &batches {
+            assert_eq!(batch.tenant, capture.tenant);
+            assert_eq!(batch.request_id, capture.request_id);
+            assert_eq!(
+                batch.batch_id,
+                CaptureBatch::derive_id(capture.tenant, call, batch.table)
+            );
+            assert_eq!(batch.batch_id.get_version_num(), 7);
         }
-
-        /// Nothing is buffered outside [`LOGS`].
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Process-global recorder keeping each counter and gauge cell by name,
-    /// since producers report losses from their own runtime threads.
-    #[derive(Default)]
-    struct NameRecorder(
-        std::sync::Mutex<std::collections::HashMap<String, Arc<metrics::atomics::AtomicU64>>>,
-    );
-
-    impl NameRecorder {
-        /// The cell of metric `name`, created on first use.
-        fn cell(&self, name: &str) -> Arc<metrics::atomics::AtomicU64> {
-            Arc::clone(
-                self.0
-                    .lock()
-                    .expect("metric cells")
-                    .entry(name.to_owned())
-                    .or_default(),
-            )
-        }
-
-        /// The raw value of counter or gauge `name`; a gauge stores `f64` bits.
-        fn raw(&self, name: &str) -> u64 {
-            self.cell(name).load(std::sync::atomic::Ordering::Acquire)
-        }
-    }
-
-    impl metrics::Recorder for NameRecorder {
-        /// Ignores descriptions.
-        fn describe_counter(
-            &self,
-            _: metrics::KeyName,
-            _: Option<metrics::Unit>,
-            _: metrics::SharedString,
-        ) {
-        }
-        /// Ignores descriptions.
-        fn describe_gauge(
-            &self,
-            _: metrics::KeyName,
-            _: Option<metrics::Unit>,
-            _: metrics::SharedString,
-        ) {
-        }
-        /// Ignores descriptions.
-        fn describe_histogram(
-            &self,
-            _: metrics::KeyName,
-            _: Option<metrics::Unit>,
-            _: metrics::SharedString,
-        ) {
-        }
-        /// Counts into the cell of the counter's name.
-        fn register_counter(
-            &self,
-            key: &metrics::Key,
-            _: &metrics::Metadata<'_>,
-        ) -> metrics::Counter {
-            metrics::Counter::from_arc(self.cell(key.name()))
-        }
-        /// Stores into the cell of the gauge's name.
-        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
-            metrics::Gauge::from_arc(self.cell(key.name()))
-        }
-        /// Discards histograms.
-        fn register_histogram(
-            &self,
-            _: &metrics::Key,
-            _: &metrics::Metadata<'_>,
-        ) -> metrics::Histogram {
-            metrics::Histogram::noop()
-        }
-    }
-
-    /// Proves a capture batch the sink terminally refuses after admission
-    /// settles once, with no later call: its row is counted on the gateway
-    /// loss counter and the producer, one payload-free warning carries the
-    /// admitting request, and shutdown settles the producer, backlog, and
-    /// retry gauges.
-    ///
-    /// Installs the process-global recorder and subscriber, which nextest's
-    /// process-per-test isolation keeps to this test.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a global is already installed or an assertion differs.
-    #[tokio::test]
-    async fn terminal_publication_loss_is_counted_logged_and_settled() {
-        let recorder: &'static NameRecorder = Box::leak(Box::default());
-        metrics::set_global_recorder(recorder).expect("this test process owns the recorder");
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::fmt()
-                .with_writer(|| LogWriter)
-                .with_ansi(false)
-                .finish(),
-        )
-        .expect("this test process owns the subscriber");
-        let capture = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
-            .expect("metadata projects");
-        let sink = Arc::new(MockSink::new());
-        sink.terminal_next(1);
-        let producer = Arc::new(producer(Arc::clone(&sink), QueueConfig::default()));
-        let owner = GatewayCapture::default();
-        owner.install(capture.tenant, Arc::clone(&producer)).await;
-        GatewayCapture::record_backlog(&owner.producers);
         assert_eq!(
-            f64::from_bits(recorder.raw("wyrd_gateway_capture_producers")),
-            1.0
+            capture.batches().expect("batches re-encode")[0].batch_id,
+            batches[0].batch_id,
+            "a re-encoded capture resubmits under the same identity"
         );
-
-        assert_eq!(capture.enqueue(&producer), Ok(()));
-        let lost = "wyrd_gateway_capture_publication_dropped_rows_total";
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while recorder.raw(lost) == 0 || sink.received().is_empty() {
-            assert!(std::time::Instant::now() < deadline, "the refusal settles");
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert_eq!(producer.metrics().dropped_rows, 1);
-
-        owner.shutdown().await;
-        assert_eq!(
-            recorder.raw(lost),
-            1,
-            "the refused row settles exactly once"
-        );
-        for gauge in [
-            "wyrd_gateway_capture_producers",
-            "wyrd_gateway_capture_backlog_bytes",
-            "wyrd_gateway_capture_retry_entries",
-        ] {
-            assert_eq!(recorder.raw(gauge), 0, "{gauge} settles at shutdown");
-        }
-        let logs = String::from_utf8(LOGS.lock().expect("logs").clone()).expect("utf-8 logs");
-        let warnings = logs
-            .lines()
-            .filter(|line| line.contains("bifrost rows lost"))
-            .collect::<Vec<_>>();
-        assert_eq!(warnings.len(), 1, "{logs}");
+        let other_call =
+            CaptureBatch::derive_id(capture.tenant, GatewayCallId::new_v7(), CaptureTable::Calls);
+        let other_tenant =
+            CaptureBatch::derive_id(DataTenantId::new_v7(), call, CaptureTable::Calls);
         assert!(
-            warnings[0].contains(capture.request_id.as_str())
-                && warnings[0].contains("WYRD_SPEC_400_VALIDATION")
-                && !warnings[0].contains("acme/a"),
-            "{logs}"
+            ![batches[1].batch_id, other_call, other_tenant].contains(&batches[0].batch_id),
+            "destination, call, and tenant each separate identities"
         );
     }
 
-    /// Proves a terminal refusal of a fresh batch and of a batch retained for
-    /// retry, with no later call and no shutdown, returns the backlog and
-    /// retry gauges to the producer's settled ownership as the loss settles.
-    ///
-    /// Each case first publishes a sample taken while ownership was held, so
-    /// only the loss notification can settle the gauges. Installs the
-    /// process-global recorder, which nextest's process-per-test isolation
-    /// keeps to this test.
+    /// Proves the in-process writer submits each batch under the reserved
+    /// capture principal, scoped to the call's tenant, with no permission.
     ///
     /// # Panics
     ///
-    /// Panics when the recorder is already installed, a loss does not settle,
-    /// or a gauge still reports released ownership.
+    /// Panics when a batch is not acknowledged or its frame differs.
     #[tokio::test]
-    async fn terminal_losses_settle_gauges_without_a_later_call() {
-        let recorder: &'static NameRecorder = Box::leak(Box::default());
-        metrics::set_global_recorder(recorder).expect("this test process owns the recorder");
+    async fn local_writer_submits_under_the_capture_principal() {
         let capture = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
             .expect("metadata projects");
-        let sink = Arc::new(MockSink::new());
-        let producer = Arc::new(producer(Arc::clone(&sink), QueueConfig::default()));
-        let owner = GatewayCapture::default();
-        owner.install(capture.tenant, Arc::clone(&producer)).await;
-        let lost = "wyrd_gateway_capture_publication_dropped_rows_total";
-
-        for (settled, retained) in [(1, false), (2, true)] {
-            if retained {
-                sink.fail_next(1);
-            }
-            sink.terminal_next(1);
-            metrics::gauge!("wyrd_gateway_capture_backlog_bytes").set(1024.0);
-            metrics::gauge!("wyrd_gateway_capture_retry_entries").set(1.0);
-            producer
-                .enqueue_batch(
-                    super::CALLS_TABLE,
-                    capture.calls_batch().expect("calls batch"),
-                    None,
-                )
-                .expect("batch admitted");
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while recorder.raw(lost) < settled {
-                assert!(std::time::Instant::now() < deadline, "the refusal settles");
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            assert_eq!(recorder.raw(lost), settled, "one loss event per refusal");
-            let metrics = producer.metrics();
-            assert_eq!((metrics.owned_bytes, metrics.retry_entries), (0, 0));
-            for gauge in [
-                "wyrd_gateway_capture_backlog_bytes",
-                "wyrd_gateway_capture_retry_entries",
-            ] {
-                assert_eq!(
-                    f64::from_bits(recorder.raw(gauge)),
-                    0.0,
-                    "{gauge} settles with the loss (retained: {retained})"
-                );
-            }
+        let scribe = Arc::new(RecordingScribe::default());
+        let writer = GatewayCapture::local(Arc::clone(&scribe) as _);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for batch in capture.batches().expect("batches encode") {
+            until_deadline(deadline, |attempt| writer.submit(&batch, attempt))
+                .await
+                .expect("the batch is acknowledged");
         }
-        assert_eq!(owner.producer_count().await, 1, "no shutdown ran");
-    }
-
-    /// Proves shutdown drains tenants concurrently under the one server
-    /// deadline: a tenant whose sink never recovers cannot keep a healthy
-    /// tenant from publishing and stopping before that deadline.
-    #[tokio::test]
-    async fn unavailable_tenant_cannot_delay_a_healthy_tenant_drain() {
-        let capture = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
-            .expect("metadata projects");
-        let unavailable_sink = Arc::new(MockSink::new());
-        unavailable_sink.fail_next(usize::MAX);
-        let unavailable = Arc::new(producer(
-            unavailable_sink,
-            QueueConfig {
-                flush_timeout_ms: 100,
-                ..QueueConfig::default()
-            },
-        ));
-        let healthy_sink = Arc::new(MockSink::new());
-        let healthy = Arc::new(producer(Arc::clone(&healthy_sink), QueueConfig::default()));
-        let owner = GatewayCapture::default();
-        owner
-            .install(DataTenantId::new_v7(), Arc::clone(&unavailable))
-            .await;
-        owner.install(capture.tenant, Arc::clone(&healthy)).await;
-        assert_eq!(capture.enqueue(&unavailable), Ok(()));
-        assert_eq!(capture.enqueue(&healthy), Ok(()));
-
-        let drained =
-            tokio::time::timeout(std::time::Duration::from_secs(2), owner.shutdown()).await;
-        assert!(drained.is_err(), "the unavailable tenant never drains");
-        let rows: u64 = healthy_sink
-            .received()
+        let received = scribe.received();
+        let tables = received
             .iter()
-            .map(|receipt| receipt.rows)
-            .sum();
-        assert_eq!(rows, 2, "the healthy tenant publishes before the deadline");
+            .map(|frame| frame.table.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tables, ["vala.gateway.calls", "vala.traces.spans"]);
+        assert_eq!(scribe.rows(), 2, "one call row and one attempt span");
+        for frame in &received {
+            assert_eq!(frame.principal, GATEWAY_CAPTURE_PRINCIPAL);
+            assert_eq!(frame.tenant, capture.tenant);
+            assert_eq!(frame.request_id, capture.request_id);
+        }
+    }
+
+    /// Proves a saturated Scribe is retried with backoff until it
+    /// acknowledges, and that saturation lasting to the deadline drops the
+    /// batch as saturated without another attempt past it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the retried batch is not acknowledged or the drop differs.
+    #[tokio::test(start_paused = true)]
+    async fn saturation_retries_until_acknowledged_or_the_deadline() {
+        let capture = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
+            .expect("metadata projects");
+        let batch = capture.batches().expect("batches encode").remove(0);
+        let busy = || ScribeError::IngestBusy {
+            table: "vala.gateway.calls".to_owned(),
+        };
+
+        let recovering = Arc::new(RecordingScribe::default());
+        recovering.refuse_next(busy());
+        recovering.refuse_next(busy());
+        let writer = GatewayCapture::local(Arc::clone(&recovering) as _);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            until_deadline(deadline, |attempt| writer.submit(&batch, attempt)).await,
+            Ok(())
+        );
+        assert_eq!(recovering.attempts(), 3, "two refusals, then the ACK");
+        assert_eq!(recovering.received().len(), 1);
+
+        let saturated = Arc::new(RecordingScribe::default());
+        for _ in 0..64 {
+            saturated.refuse_next(busy());
+        }
+        let writer = GatewayCapture::local(Arc::clone(&saturated) as _);
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        assert_eq!(
+            until_deadline(deadline, |attempt| writer.submit(&batch, attempt)).await,
+            Err(CaptureDrop::Saturated)
+        );
         assert!(
-            capture.enqueue(&healthy).is_err(),
-            "the healthy tenant's producer stopped before the deadline"
+            Instant::now() <= deadline,
+            "no attempt outlives the deadline"
+        );
+        assert!(saturated.received().is_empty());
+        assert!(
+            (2..64).contains(&saturated.attempts()),
+            "backoff paces the retries: {}",
+            saturated.attempts()
         );
     }
 
-    /// Proves shutdown publishes capture evidence accepted before it,
-    /// retrying a transient publication failure rather than dropping rows.
-    #[tokio::test]
-    async fn shutdown_publishes_accepted_evidence_through_retry() {
+    /// Proves a terminal refusal drops at once, a Scribe that never answers
+    /// drops as unavailable at the deadline, and a process with no Scribe
+    /// drops as unavailable without waiting.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any drop, attempt count, or wait differs.
+    #[tokio::test(start_paused = true)]
+    async fn terminal_parked_and_absent_scribes_drop_without_retry() {
         let capture = CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
             .expect("metadata projects");
-        let sink = Arc::new(MockSink::new());
-        sink.fail_next(1);
-        let producer = Arc::new(producer(Arc::clone(&sink), QueueConfig::default()));
-        let owner = GatewayCapture::default();
-        owner.install(capture.tenant, Arc::clone(&producer)).await;
-        assert_eq!(capture.enqueue(&producer), Ok(()));
+        let batch = capture.batches().expect("batches encode").remove(0);
+        let deadline = Instant::now() + Duration::from_secs(5);
 
-        owner.shutdown().await;
-        let rows: u64 = sink.received().iter().map(|receipt| receipt.rows).sum();
-        assert_eq!(rows, 2, "accepted row and span publish during shutdown");
-        assert!(
-            sink.attempted().len() > sink.received().len(),
-            "the failed send was retried"
-        );
-        assert_eq!(producer.metrics().dropped_rows, 0);
+        let refusing = Arc::new(RecordingScribe::default());
+        refusing.refuse_next(ScribeError::InvalidFrame);
+        let writer = GatewayCapture::local(Arc::clone(&refusing) as _);
         assert_eq!(
-            owner.producer_count().await,
-            0,
-            "shutdown releases producers"
+            until_deadline(deadline, |attempt| writer.submit(&batch, attempt)).await,
+            Err(CaptureDrop::Rejected)
         );
+        assert_eq!(
+            refusing.attempts(),
+            1,
+            "a terminal refusal is never retried"
+        );
+
+        let parked = Arc::new(RecordingScribe::default());
+        parked.park();
+        let writer = GatewayCapture::local(Arc::clone(&parked) as _);
+        assert_eq!(
+            until_deadline(deadline, |attempt| writer.submit(&batch, attempt)).await,
+            Err(CaptureDrop::Unavailable)
+        );
+        assert_eq!(
+            Instant::now(),
+            deadline,
+            "the parked attempt ends at the deadline"
+        );
+
+        let absent = GatewayCapture {
+            route: CaptureRoute::Unavailable,
+        };
+        let later = Instant::now() + Duration::from_millis(1);
+        assert_eq!(
+            until_deadline(later, |attempt| absent.submit(&batch, attempt)).await,
+            Err(CaptureDrop::Unavailable)
+        );
+    }
+
+    /// Proves a Verifier result batch is submitted under the tenant SYSTEM
+    /// principal scoped to exactly its Verifier, is retried through
+    /// saturation without a deadline until acknowledged, and stops only when
+    /// its lease is lost, with a terminal refusal ending it at once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the frame, its attribution, or a write outcome differs.
+    #[tokio::test(start_paused = true)]
+    async fn result_batches_submit_under_the_system_principal() {
+        let tenant = DataTenantId::new_v7();
+        let mut verifier: CardRef = "default/Verifier/drift-check@1.0.0"
+            .parse()
+            .expect("a Verifier reference");
+        verifier.uid = Some(CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid"));
+        let principal = PrincipalId::new(uuid::Uuid::now_v7());
+        let batch = CaptureBatch {
+            tenant,
+            table: CaptureTable::Results,
+            batch_id: uuid::Uuid::now_v7(),
+            request_id: wyrd_spec::request_id::RequestId::now_v7(),
+            ipc: CallCapture::from_facts(facts(policy(GatewayCaptureMode::Metadata, &[])))
+                .expect("metadata projects")
+                .batches()
+                .expect("batches encode")
+                .remove(0)
+                .ipc,
+            verifier: Some(VerifierAttribution {
+                run_id: VerificationRunId::new_v7(),
+                verifier: verifier.clone(),
+                principal,
+            }),
+        };
+        let busy = || ScribeError::IngestBusy {
+            table: "vala.verification.results".to_owned(),
+        };
+
+        let scribe = Arc::new(RecordingScribe::default());
+        for _ in 0..20 {
+            scribe.refuse_next(busy());
+        }
+        let writer = GatewayCapture::local(Arc::clone(&scribe) as _);
+        let started = Instant::now();
+        assert_eq!(
+            writer.write_result(&batch, &CancellationToken::new()).await,
+            Ok(())
+        );
+        assert!(
+            Instant::now() - started > Duration::from_secs(5),
+            "results outlast any capture deadline"
+        );
+        let received = scribe.received();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].table, "vala.verification.results");
+        assert_eq!(received[0].tenant, tenant);
+        assert_eq!(received[0].principal, principal);
+        assert_eq!(received[0].card_scope, [verifier]);
+
+        let saturated = Arc::new(RecordingScribe::default());
+        for _ in 0..1_000 {
+            saturated.refuse_next(busy());
+        }
+        let writer = GatewayCapture::local(Arc::clone(&saturated) as _);
+        let lost = CancellationToken::new();
+        let cancel = lost.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            cancel.cancel();
+        });
+        assert_eq!(
+            writer.write_result(&batch, &lost).await,
+            Err(CaptureDrop::Saturated)
+        );
+        assert!(saturated.received().is_empty());
+
+        let refusing = Arc::new(RecordingScribe::default());
+        refusing.refuse_next(ScribeError::InvalidFrame);
+        let writer = GatewayCapture::local(Arc::clone(&refusing) as _);
+        assert_eq!(
+            writer.write_result(&batch, &CancellationToken::new()).await,
+            Err(CaptureDrop::Rejected)
+        );
+        assert_eq!(refusing.attempts(), 1);
+    }
+
+    /// Proves in-process refusals and peer status codes classify into the
+    /// same retryable and terminal drops.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refusal classifies differently.
+    #[test]
+    fn scribe_refusals_and_peer_codes_classify_alike() {
+        let cases = [
+            (
+                ScribeError::IngestBusy {
+                    table: String::new(),
+                },
+                CaptureDrop::Saturated,
+            ),
+            (ScribeError::WalDiskFull, CaptureDrop::Saturated),
+            (ScribeError::IngressClosed, CaptureDrop::Unavailable),
+            (
+                ScribeError::Internal {
+                    detail: String::new(),
+                },
+                CaptureDrop::Unavailable,
+            ),
+            (ScribeError::InvalidFrame, CaptureDrop::Rejected),
+        ];
+        for (error, drop) in cases {
+            assert_eq!(CaptureDrop::from_scribe(&error), drop, "{error}");
+            let status = vala_bifrost_redux::gate::IngestError::from_scribe(error).into_status();
+            assert_eq!(CaptureDrop::from_code(status.code()), drop, "{status}");
+        }
+        assert_eq!(
+            CaptureDrop::from_code(Code::DeadlineExceeded),
+            CaptureDrop::Unavailable
+        );
+    }
+}
+
+/// A recording stand-in for a pod's own Scribe, shared by every capture test.
+#[cfg(test)]
+pub(crate) mod recording {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use arrow::ipc::reader::StreamReader;
+    use bytes::Bytes;
+    use vala_bifrost_redux::catalog::{TableRef, TableUid};
+    use vala_bifrost_redux::contracts::{
+        FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
+    };
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::request_id::RequestId;
+
+    /// One frame the recording Scribe acknowledged.
+    #[derive(Debug, Clone)]
+    pub(crate) struct Received {
+        /// Authenticated tenant of the frame.
+        pub(crate) tenant: DataTenantId,
+        /// Principal the frame was submitted under.
+        pub(crate) principal: PrincipalId,
+        /// Card scope of that principal, from which Scribe stamps `card_uid`.
+        pub(crate) card_scope: Vec<CardRef>,
+        /// Fully qualified destination table.
+        pub(crate) table: String,
+        /// Request the frame was admitted under.
+        pub(crate) request_id: RequestId,
+        /// Rows the frame's IPC stream carries.
+        pub(crate) rows: usize,
+        /// The frame's IPC stream.
+        pub(crate) ipc: Bytes,
+    }
+
+    /// Scribe that records acknowledged frames, refuses as scripted, and can
+    /// park every submission so it never answers.
+    #[derive(Default)]
+    pub(crate) struct RecordingScribe {
+        /// Frames acknowledged, in arrival order.
+        received: Mutex<Vec<Received>>,
+        /// Refusals answered to the next submissions, in order.
+        refusals: Mutex<VecDeque<ScribeError>>,
+        /// Submissions seen, acknowledged or not.
+        attempts: AtomicUsize,
+        /// Whether every submission parks forever.
+        parked: AtomicBool,
+    }
+
+    impl RecordingScribe {
+        /// Refuses the next unscripted submission with `error`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the refusal script lock is poisoned.
+        pub(crate) fn refuse_next(&self, error: ScribeError) {
+            self.refusals.lock().expect("refusals").push_back(error);
+        }
+
+        /// Parks every later submission so it never answers.
+        pub(crate) fn park(&self) {
+            self.parked.store(true, Ordering::Release);
+        }
+
+        /// Frames acknowledged so far.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the received lock is poisoned.
+        pub(crate) fn received(&self) -> Vec<Received> {
+            self.received.lock().expect("received").clone()
+        }
+
+        /// Submissions seen so far, acknowledged or not.
+        pub(crate) fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::Acquire)
+        }
+
+        /// Rows across every acknowledged frame.
+        pub(crate) fn rows(&self) -> usize {
+            self.received().iter().map(|frame| frame.rows).sum()
+        }
+
+        /// Every acknowledged IPC stream as lossy text, for content checks.
+        pub(crate) fn published(&self) -> String {
+            self.received()
+                .iter()
+                .map(|frame| String::from_utf8_lossy(&frame.ipc).into_owned())
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Scribe for RecordingScribe {
+        /// Parks, refuses as scripted, or records `frame` and acknowledges it.
+        ///
+        /// # Errors
+        ///
+        /// Returns the next scripted refusal.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the frame is not one readable Arrow IPC stream.
+        async fn ingest_frame(
+            &self,
+            frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            if self.parked.load(Ordering::Acquire) {
+                std::future::pending::<()>().await;
+            }
+            if let Some(error) = self.refusals.lock().expect("refusals").pop_front() {
+                return Err(error);
+            }
+            let IngressPayload::ArrowIpc(ipc) = frame.payload else {
+                panic!("capture submits Arrow IPC");
+            };
+            let rows = StreamReader::try_new(std::io::Cursor::new(ipc.clone()), None)
+                .expect("the capture stream opens")
+                .map(|batch| batch.expect("the capture batch decodes").num_rows())
+                .sum::<usize>();
+            self.received.lock().expect("received").push(Received {
+                tenant: frame.authenticated_tenant,
+                principal: frame.principal.id,
+                card_scope: frame
+                    .principal
+                    .card_ref_scope()
+                    .map(|scope| scope.as_slice().to_vec())
+                    .unwrap_or_default(),
+                table: frame.table.fqn(),
+                request_id: frame.request_id,
+                rows,
+                ipc,
+            });
+            Ok(FrameAdmission {
+                batch_id: frame.batch_id,
+                rows_accepted: u64::try_from(rows).unwrap_or(u64::MAX),
+                receipt_micros: 0,
+                first_commit: true,
+            })
+        }
+
+        /// Capture never resolves a table, so this always refuses.
+        ///
+        /// # Errors
+        ///
+        /// Always returns [`ScribeError::Internal`].
+        async fn resolve_write_table(
+            &self,
+            _tenant: DataTenantId,
+            _table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            Err(ScribeError::Internal {
+                detail: "the recording Scribe resolves no table".to_owned(),
+            })
+        }
     }
 }

@@ -17,7 +17,8 @@ use serde_json::error::Category;
 use wyrd_client::Gateway;
 use wyrd_spec::error::WyrdError;
 
-use crate::{NativeLifecycleResult, napi_error};
+use crate::NativeLifecycleResult;
+use crate::client::NativeWyrdClient;
 
 /// Tenant gateway administration handle over the shared `wyrd_client` Gateway.
 ///
@@ -33,34 +34,19 @@ pub struct NativeGateway {
     gateway: Gateway,
 }
 
-/// Builds one gateway administration handle without performing IO.
-///
-/// Omitted arguments resolve through the same shared client configuration
-/// chain as `connectCards`, so every capability authenticates identically.
-///
-/// # Errors
-///
-/// Returns a napi error when no credential resolves or the HTTP client cannot
-/// be built.
 #[napi]
-pub fn connect_gateway(
-    server_url: Option<String>,
-    credential: Option<String>,
-    tenant: Option<String>,
-) -> napi::Result<NativeGateway> {
-    let client = wyrd_client::bifrost::client_from_options(
-        server_url.as_deref(),
-        credential.as_deref(),
-        None,
-        tenant.as_deref(),
-    );
-    drop(server_url);
-    drop(credential);
-    drop(tenant);
-    let client = client.map_err(napi_error)?;
-    Ok(NativeGateway {
-        gateway: Gateway::new(client),
-    })
+impl NativeWyrdClient {
+    /// Builds one gateway administration handle that calls the server as this
+    /// client.
+    ///
+    /// No IO happens here; the public TypeScript `Gateway.connect` passes the
+    /// caller's client or the ambient one.
+    #[napi]
+    pub fn gateway(&self) -> NativeGateway {
+        NativeGateway {
+            gateway: Gateway::with_client(self.client.clone()),
+        }
+    }
 }
 
 #[napi]
@@ -267,7 +253,7 @@ impl NativeGateway {
 ///
 /// Returns the stable validation error naming `field` when the body does not
 /// match the contract, including any contract-level grammar violation.
-fn decode<T: DeserializeOwned>(json: &str, field: &str) -> Result<T, WyrdError> {
+pub(crate) fn decode<T: DeserializeOwned>(json: &str, field: &str) -> Result<T, WyrdError> {
     serde_json::from_str(json).map_err(|error| invalid(&error, field))
 }
 
@@ -276,7 +262,7 @@ fn decode<T: DeserializeOwned>(json: &str, field: &str) -> Result<T, WyrdError> 
 /// # Errors
 ///
 /// Returns the stable validation error for a name outside the grammar.
-fn decode_name<T: DeserializeOwned>(name: String) -> Result<T, WyrdError> {
+pub(crate) fn decode_name<T: DeserializeOwned>(name: String) -> Result<T, WyrdError> {
     serde_json::from_value(serde_json::Value::String(name)).map_err(|error| invalid(&error, "name"))
 }
 

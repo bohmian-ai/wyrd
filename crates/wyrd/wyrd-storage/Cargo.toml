@@ -61,21 +61,5 @@ temp-env = { workspace = true, features = ["async_closure"] }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }
 
-[[test]]
-name = "integration_rustfs"
-required-features = ["emulator"]
-
-[[test]]
-name = "integration_gcs"
-required-features = ["emulator"]
-
-[[test]]
-name = "integration_azurite"
-required-features = ["emulator"]
-
-[[test]]
-name = "handle_crud"
-required-features = ["emulator"]
-
 [lints]
 workspace = true

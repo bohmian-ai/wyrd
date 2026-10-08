@@ -1,105 +1,61 @@
-from __future__ import annotations
+"""A ModelCard's JSON envelope round-trips, and a Model Card file loads."""
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
-import yaml
-from _helpers import card_payload, model_metadata
-from test_modelcard_save_load import _sklearn_model
-from wyrd.model import ModelCard, SklearnInterface, WyrdError
+from wyrd.model import ModelCard, ModelCardMetadata, SklearnInterface, WyrdError
 
 
-@pytest.mark.wyrd_covers("python:ModelCard.model_dump_json")
-@pytest.mark.wyrd_covers("python:ModelCard.model_validate_json")
-def test_model_dump_json_round_trips_through_public_validator() -> None:
+def test_json_envelope_round_trips_the_card(
+    sklearn_model: Any, classifier_metadata: ModelCardMetadata
+) -> None:
     card = ModelCard(
-        SklearnInterface(model=_sklearn_model()),
+        SklearnInterface(model=sklearn_model),
         labels={"domain": "forecasting"},
         annotations={"acme.com/source": "notebook"},
-        metadata=model_metadata("binary_classification"),
+        metadata=classifier_metadata,
     )
 
     restored = ModelCard.model_validate_json(card.model_dump_json())
-    payload = card_payload(restored)
 
-    assert restored.interface.kind == "Sklearn"
-    assert restored.labels == {"domain": "forecasting"}
-    assert restored.annotations == {"acme.com/source": "notebook"}
+    assert (
+        restored.interface.kind,
+        restored.labels,
+        restored.annotations,
+        restored.signature.inputs[0].name,
+    ) == (
+        "Sklearn",
+        {"domain": "forecasting"},
+        {"acme.com/source": "notebook"},
+        "feature",
+    )
+
+
+def test_modelcard_str_is_pretty_card_json(
+    sklearn_model: Any, classifier_metadata: ModelCardMetadata
+) -> None:
+    payload = json.loads(
+        str(ModelCard(SklearnInterface(model=sklearn_model), metadata=classifier_metadata))
+    )
+
     assert payload["apiVersion"] == "wyrd/v1"
     assert payload["kind"] == "Model"
-    assert payload["spec"]["card_refs"] == []
-    assert "tags" not in payload["metadata"]
 
 
-def test_modelcard_str_is_pretty_card_json() -> None:
-    card = ModelCard(
-        SklearnInterface(model=_sklearn_model()),
-        metadata=model_metadata("binary_classification"),
+def test_data_card_file_is_refused_as_a_model_card(fixtures_dir: Path) -> None:
+    with pytest.raises(WyrdError) as exc:
+        ModelCard.from_path(fixtures_dir / "authoring" / "data" / "churn-features.yaml")
+
+    assert exc.value.code == "WYRD_MODEL_400_VALIDATION"
+
+
+def test_model_card_file_loads_its_identity_and_task(fixtures_dir: Path) -> None:
+    card = ModelCard.from_path(fixtures_dir / "authoring" / "model" / "churn-model.yaml")
+
+    assert (card.space, card.name, card.task_type) == (
+        "prod",
+        "churn-model",
+        "binary_classification",
     )
-    payload = json.loads(str(card))
-
-    assert payload["apiVersion"] == "wyrd/v1"
-    assert payload["kind"] == "Model"
-
-
-def test_model_validate_json_rejects_wrong_card_kind() -> None:
-    payload = {
-        "apiVersion": "wyrd/v1",
-        "kind": "Data",
-        "metadata": {"name": "model", "version": "1.0.0"},
-        "spec": {"schema": {"columns": []}},
-    }
-
-    with pytest.raises(WyrdError):
-        ModelCard.model_validate_json(json.dumps(payload))
-
-
-def test_modelcard_yaml_fixture_loads_through_public_surface() -> None:
-    payload = yaml.safe_load(
-        """
-apiVersion: wyrd/v1
-kind: Model
-metadata:
-  space: prod
-  name: churn-model
-  version: "1.0.0"
-  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00
-spec:
-  interface:
-    kind: Sklearn
-    meta:
-      framework_version: "1.5.0"
-      model_subtype: LogisticRegression
-  task_type: BinaryClassification
-  signature:
-    inputs:
-      - name: feature
-        dtype: float64
-        nullable: false
-    outputs:
-      - name: prediction
-        dtype: float64
-        nullable: false
-  card_refs: []
-relationships: []
-"""
-    )
-
-    card = ModelCard.model_validate_json(json.dumps(payload))
-
-    assert card.space == "prod"
-    assert card.name == "churn-model"
-    assert card.task_type == "binary_classification"
-
-
-def test_modelcard_yaml_round_trips_locked_envelope(tmp_path: Path) -> None:
-    card = ModelCard(
-        SklearnInterface(model=_sklearn_model()),
-        metadata=model_metadata("binary_classification"),
-    )
-    payload = yaml.safe_load(yaml.safe_dump(card_payload(card)))
-    restored = ModelCard.model_validate_json(json.dumps(payload))
-
-    assert restored.interface.kind == "Sklearn"
-    assert restored.signature.inputs[0].name == "feature"

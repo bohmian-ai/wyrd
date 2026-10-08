@@ -1,42 +1,24 @@
-"""Smoke tests for the wyrd.testing.WyrdTestServer context manager."""
+"""The ``wyrd.testing.WyrdTestServer`` harness refuses use outside its lifetime."""
+
+import os
 
 import pytest
-from wyrd._wyrd import WyrdError
+from wyrd import WyrdError
 from wyrd.testing import WyrdTestServer
 
 
-def test_import():
-    assert WyrdTestServer is not None
+def test_bootstrap_service_raises_without_context_manager() -> None:
+    with pytest.raises(WyrdError) as raised:
+        WyrdTestServer().bootstrap_service([])
+    assert raised.value.code == "WYRD_TESTING_500_HARNESS_START"
 
 
-def test_construct_default():
-    srv = WyrdTestServer()
-    assert srv is not None
-
-
-def test_construct_no_env_mutation():
-    srv = WyrdTestServer(mutate_env=False)
-    assert srv is not None
-
-
-def test_bootstrap_service_raises_without_context_manager():
-    srv = WyrdTestServer()
-    with pytest.raises(WyrdError, match="not started") as exc:
-        srv.bootstrap_service([])
-    assert exc.value.code == "WYRD_TESTING_500_HARNESS_START"
-
-
-def test_enter_fails_without_db():
-    """__enter__ must raise WyrdError when no Postgres is available.
-
-    Verifies the Rust-to-Python error path compiled correctly after the
-    ServerAuth/ServerAuthz state-abstraction refactor.
-    """
-    import os
-
-    if os.environ.get("WYRD_DATABASE_URL"):
-        pytest.skip("DB available — use py:test:testing with db:setup-roles for a full run")
-
-    with pytest.raises(WyrdError):
-        with WyrdTestServer():
-            pass
+@pytest.mark.skipif(
+    bool(os.environ.get("WYRD_DATABASE_URL")),
+    reason="needs no Postgres; py:test:testing runs it without one",
+)
+def test_enter_fails_without_db() -> None:
+    """Entering without a reachable Postgres raises ``WyrdError`` instead of hanging."""
+    with pytest.raises(WyrdError) as raised, WyrdTestServer():
+        pass
+    assert raised.value.code == "WYRD_TESTING_500_HARNESS_START"

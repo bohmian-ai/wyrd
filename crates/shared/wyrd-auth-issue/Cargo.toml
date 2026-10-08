@@ -8,14 +8,15 @@ repository = { workspace = true }
 authors = { workspace = true }
 
 [dependencies]
-ed25519-dalek = { workspace = true, features = ["pkcs8", "pem", "rand_core"] }
+ed25519-dalek = { workspace = true, features = ["pkcs8", "pem"] }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
-argon2 = { workspace = true }
-password-hash = { workspace = true }
+rand = { workspace = true }
 secrecy = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v7"] }
@@ -26,3 +27,6 @@ wyrd-runtime = { workspace = true }
 [dev-dependencies]
 workspace-hack.workspace = true
 wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }
+
+[lints]
+workspace = true

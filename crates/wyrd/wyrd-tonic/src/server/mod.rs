@@ -434,11 +434,11 @@ pub async fn drive_health_status<S: HealthSnapshot>(
     let mut last_ok: Option<bool> = Some(snapshot.load().all_ok());
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => {
+            () = shutdown.cancelled() => {
                 reporter.set_not_serving::<WyrdHealthSentinel>().await;
                 return;
             }
-            _ = tokio::time::sleep(HEALTH_CONSUMER_INTERVAL) => {}
+            () = tokio::time::sleep(HEALTH_CONSUMER_INTERVAL) => {}
         }
         let ok = snapshot.load().all_ok();
         if last_ok != Some(ok) {

@@ -8,9 +8,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
+use secrecy::SecretString;
 use tower::Service;
 use vala_bifrost_redux::contracts::DecodedOtlp;
-use vala_bifrost_redux::gate::IngestError;
+use vala_bifrost_redux::gate::auth::read_or_mint_request_id;
+use vala_bifrost_redux::gate::{AuthContext, IngestError};
+use wyrd_tonic::error::wyrd_error_to_status;
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
 use wyrd_tonic::otlp::metrics_service::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
@@ -26,6 +29,10 @@ use wyrd_tonic::tonic::metadata::MetadataMap;
 use wyrd_tonic::tonic::server::{Grpc, NamedService, UnaryService};
 use wyrd_tonic::tonic::{Request, Response, Status};
 
+use crate::AppState;
+use crate::auth::exchange_api_key::api_key_invalid;
+use crate::components::auth::routes::TokenGrants;
+use crate::components::auth::token_extract::{WYRD_ACCESS_TOKEN_HEADER, WYRD_API_KEY_HEADER};
 use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
 use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
 use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
@@ -132,16 +139,22 @@ fn record_codec_activity(stage: &str) {
 pub(super) struct TraceOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
     gate: Arc<Bifrost>,
+    /// Per-call authentication, including the OTLP API-key entrance.
+    authentication: OtlpGrpcAuthentication,
     /// Boot-frozen decode allowance owned only by Scribe OTLP services.
     decoding_limit: ScribeOtlpDecodingLimit,
 }
 
 impl TraceOtlpGrpcService {
     /// Couples the trace adapter to the process Gate selected during boot.
-    pub(super) fn new(gate: Arc<Bifrost>) -> Self {
+    pub(super) fn new(state: &AppState) -> Self {
+        let gate = Arc::clone(&state.bifrost);
         let decoding_limit = ScribeOtlpDecodingLimit::from_gate(&gate);
         Self {
             gate,
+            authentication: OtlpGrpcAuthentication {
+                state: state.clone(),
+            },
             decoding_limit,
         }
     }
@@ -178,11 +191,12 @@ where
         }
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Traces);
+        let authentication = self.authentication.clone();
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
+            let auth = match authentication.authenticate(&metadata).await {
                 Ok(auth) => auth,
-                Err(error) => return Ok(ingest_status(error).into_http()),
+                Err(status) => return Ok(status.into_http()),
             };
             let method = TraceExportUnary {
                 gate: Arc::clone(&gate),
@@ -226,6 +240,51 @@ impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
                 partial_success: outcome.partial_success(),
             }))
         })
+    }
+}
+
+/// Per-call OTLP/gRPC authentication shared by the three signal services.
+///
+/// It runs before any payload byte is decoded. A call carrying an access
+/// token, or no credential at all, is verified by Gate exactly as before. A
+/// call carrying only `x-wyrd-api-key` is verified through the same
+/// [`TokenGrants::api_key_principal`] the OTLP/HTTP routes use, and Gate then
+/// admits that principal under its own readiness rules.
+#[derive(Clone)]
+struct OtlpGrpcAuthentication {
+    /// Server state holding Gate, the auth owners, and the runtime store.
+    state: AppState,
+}
+
+impl OtlpGrpcAuthentication {
+    /// Authenticate one OTLP/gRPC call from its metadata.
+    ///
+    /// # Errors
+    /// Returns the API-key refusal as its canonical gRPC status, or Gate's
+    /// authentication or ingress-closed refusal through [`ingest_status`].
+    async fn authenticate(&self, metadata: &MetadataMap) -> Result<AuthContext, Status> {
+        let gate = self.state.bifrost.gate();
+        let api_key = match metadata.get(WYRD_API_KEY_HEADER.as_str()) {
+            Some(api_key) if !metadata.contains_key(WYRD_ACCESS_TOKEN_HEADER.as_str()) => api_key,
+            _ => {
+                return gate
+                    .authenticate_otlp_metadata(metadata)
+                    .map_err(ingest_status);
+            }
+        };
+        let api_key = api_key
+            .to_str()
+            .map_err(|_| wyrd_error_to_status(api_key_invalid(), None))?;
+        let request_id = read_or_mint_request_id(metadata);
+        let verified = TokenGrants {
+            state: &self.state,
+            request_id: request_id.as_str(),
+        }
+        .api_key_principal(&SecretString::from(api_key.to_owned()))
+        .await
+        .map_err(|error| wyrd_error_to_status(error, None))?;
+        gate.admit_otlp_verified(verified, metadata)
+            .map_err(ingest_status)
     }
 }
 
@@ -345,16 +404,22 @@ impl Decoder for TraceRequestDecoder {
 pub(super) struct MetricsOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
     gate: Arc<Bifrost>,
+    /// Per-call authentication, including the OTLP API-key entrance.
+    authentication: OtlpGrpcAuthentication,
     /// Boot-frozen decode allowance owned only by Scribe OTLP services.
     decoding_limit: ScribeOtlpDecodingLimit,
 }
 
 impl MetricsOtlpGrpcService {
     /// Couples the metrics adapter to the process Gate selected during boot.
-    pub(super) fn new(gate: Arc<Bifrost>) -> Self {
+    pub(super) fn new(state: &AppState) -> Self {
+        let gate = Arc::clone(&state.bifrost);
         let decoding_limit = ScribeOtlpDecodingLimit::from_gate(&gate);
         Self {
             gate,
+            authentication: OtlpGrpcAuthentication {
+                state: state.clone(),
+            },
             decoding_limit,
         }
     }
@@ -391,11 +456,12 @@ where
         }
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Metrics);
+        let authentication = self.authentication.clone();
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
+            let auth = match authentication.authenticate(&metadata).await {
                 Ok(auth) => auth,
-                Err(error) => return Ok(ingest_status(error).into_http()),
+                Err(status) => return Ok(status.into_http()),
             };
             let response = Grpc::new(MetricsOtlpCodec {
                 gate: Arc::clone(&gate),
@@ -516,16 +582,22 @@ impl Decoder for MetricsRequestDecoder {
 pub(super) struct LogsOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
     gate: Arc<Bifrost>,
+    /// Per-call authentication, including the OTLP API-key entrance.
+    authentication: OtlpGrpcAuthentication,
     /// Boot-frozen decode allowance owned only by Scribe OTLP services.
     decoding_limit: ScribeOtlpDecodingLimit,
 }
 
 impl LogsOtlpGrpcService {
     /// Couples the logs adapter to the process Gate selected during boot.
-    pub(super) fn new(gate: Arc<Bifrost>) -> Self {
+    pub(super) fn new(state: &AppState) -> Self {
+        let gate = Arc::clone(&state.bifrost);
         let decoding_limit = ScribeOtlpDecodingLimit::from_gate(&gate);
         Self {
             gate,
+            authentication: OtlpGrpcAuthentication {
+                state: state.clone(),
+            },
             decoding_limit,
         }
     }
@@ -562,11 +634,12 @@ where
         }
         let gate = Arc::clone(&self.gate);
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Logs);
+        let authentication = self.authentication.clone();
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.gate().authenticate_otlp_metadata(&metadata) {
+            let auth = match authentication.authenticate(&metadata).await {
                 Ok(auth) => auth,
-                Err(error) => return Ok(ingest_status(error).into_http()),
+                Err(status) => return Ok(status.into_http()),
             };
             let response = Grpc::new(LogsOtlpCodec {
                 gate: Arc::clone(&gate),

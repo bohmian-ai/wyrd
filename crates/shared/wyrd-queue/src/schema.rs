@@ -285,7 +285,6 @@ fn dtspec_from_arrow(dt: &DataType) -> DataTypeSpec {
         DataType::UInt64 => DataTypeSpec::UInt64,
         DataType::Float32 => DataTypeSpec::Float32,
         DataType::Float64 => DataTypeSpec::Float64,
-        DataType::Utf8 => DataTypeSpec::Utf8,
         DataType::LargeUtf8 => DataTypeSpec::LargeUtf8,
         DataType::Binary => DataTypeSpec::Binary,
         DataType::LargeBinary => DataTypeSpec::LargeBinary,

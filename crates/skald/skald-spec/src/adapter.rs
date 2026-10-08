@@ -165,8 +165,7 @@ impl<'a> ResponseAdapter<'a> {
                 .choices
                 .first()
                 .and_then(|choice| choice.finish_reason.as_deref())
-                .map(openai_finish_reason)
-                .unwrap_or(FinishReason::Other),
+                .map_or(FinishReason::Other, openai_finish_reason),
             ProviderResponse::OpenAiResponses(response) => {
                 if response
                     .output
@@ -185,14 +184,12 @@ impl<'a> ResponseAdapter<'a> {
             ProviderResponse::AnthropicMessage(response) => response
                 .stop_reason
                 .as_ref()
-                .map(anthropic_finish_reason)
-                .unwrap_or(FinishReason::Other),
+                .map_or(FinishReason::Other, anthropic_finish_reason),
             ProviderResponse::GeminiGenerateContent(response) => response
                 .candidates
                 .first()
                 .and_then(|candidate| candidate.finish_reason.as_ref())
-                .map(google_finish_reason)
-                .unwrap_or(FinishReason::Other),
+                .map_or(FinishReason::Other, google_finish_reason),
             ProviderResponse::OpenAiEmbeddings(_)
             | ProviderResponse::GoogleBatchEmbed(_)
             | ProviderResponse::VertexPredict(_)

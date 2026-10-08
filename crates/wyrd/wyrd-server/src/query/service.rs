@@ -12,7 +12,7 @@ use crate::AppState;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
-use crate::http::middleware::edge_timeout::QueryEdgeTimer;
+use crate::http::middleware::edge_timeout::EdgeTimer;
 
 /// Authorization and audit owner for one authenticated query-plane operation.
 ///
@@ -25,9 +25,9 @@ use crate::http::middleware::edge_timeout::QueryEdgeTimer;
 /// operations, which name their target by request ID rather than by object,
 /// take the exact decision here directly.
 ///
-/// Every refusal on either stage fails closed on its audit append: a denial
-/// that cannot be recorded is returned as audit-unavailable rather than as a
-/// plain rejection, so no refusal is silently unlogged.
+/// Every decision on either stage is staged on the process audit outbox before
+/// the refusal is returned or the operation proceeds; no query-plane request
+/// waits for, or fails on, the audit commit.
 pub(crate) struct QueryAuthority<'a> {
     /// Shared server state containing authorization and durable audit staging.
     state: &'a AppState,
@@ -80,9 +80,8 @@ impl<'a> QueryAuthority<'a> {
     ///
     /// # Errors
     ///
-    /// Returns the stable authorization denial, or audit-unavailable when that
-    /// denial cannot be durably recorded.
-    async fn admit_capability(&self) -> Result<(), WyrdError> {
+    /// Returns the stable authorization denial after staging it.
+    fn admit_capability(&self) -> Result<(), WyrdError> {
         if self
             .caller
             .principal
@@ -91,24 +90,22 @@ impl<'a> QueryAuthority<'a> {
         {
             return Ok(());
         }
-        Err(self
-            .deny(PermissionDenyReason::Rbac {
-                required: Box::new(self.permission.clone()),
-                principal: self.caller.principal.id,
-            })
-            .await)
+        Err(self.deny(PermissionDenyReason::Rbac {
+            required: Box::new(self.permission.clone()),
+            principal: self.caller.principal.id,
+        }))
     }
 
-    /// Authorizes one exact permission and durably audits a denial.
+    /// Authorizes one exact permission and stages a denial.
     ///
-    /// Successful authorization deliberately writes no read-decision row here:
-    /// retained Oracle commits the immutable visibility decision after planning
+    /// Successful authorization deliberately stages no read-decision row here:
+    /// retained Oracle stages the immutable visibility decision after planning
     /// and before any query data is read.
     ///
     /// # Errors
     ///
-    /// Returns the stable authorization denial or audit-unavailable error.
-    pub(crate) async fn authorize(&self) -> Result<(), WyrdError> {
+    /// Returns the stable authorization denial after staging it.
+    pub(crate) fn authorize(&self) -> Result<(), WyrdError> {
         match self
             .state
             .authz
@@ -116,106 +113,50 @@ impl<'a> QueryAuthority<'a> {
             .check(&self.caller.principal, &self.permission)
         {
             PermissionVerdict::Allow => Ok(()),
-            PermissionVerdict::Deny { reason } => Err(self.deny(reason).await),
+            PermissionVerdict::Deny { reason } => Err(self.deny(reason)),
         }
     }
 
-    /// Durably records one authorization denial and returns what the caller sees.
-    ///
-    /// A failed append substitutes audit-unavailable for the rejection, which is
-    /// the fail-closed outcome: the caller is still refused, and the refusal is
-    /// never reported as if it had been recorded.
-    async fn deny(&self, reason: PermissionDenyReason) -> WyrdError {
-        match self.append(AuditOutcome::Denied).await {
-            Ok(()) => permission_deny_reason_to_wyrd(reason),
-            Err(error) => error,
-        }
+    /// Stages one authorization denial and returns what the caller sees.
+    fn deny(&self, reason: PermissionDenyReason) -> WyrdError {
+        self.stage(AuditOutcome::Denied);
+        permission_deny_reason_to_wyrd(reason)
     }
 
-    /// Durably records the authoritative object denial Oracle already decided.
+    /// Stages the authoritative object denial Oracle already decided.
     ///
     /// The row carries only the caller, the operation, and the operation-only
     /// permission token. The refused table never enters the audit payload: the
     /// object identity stays inside Oracle, exactly as the raw SQL does.
     ///
-    /// Returns audit-unavailable when the append fails, and otherwise the
-    /// caller's original stable query-forbidden error unchanged.
-    pub(crate) async fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
-        #[cfg(feature = "test-support")]
-        if self
-            .state
-            .query_control_audit_fault
-            .as_ref()
-            .is_some_and(crate::state::QueryControlAuditFaultController::object_denials_fail)
-        {
-            return wyrd_spec::vala::error::BifrostError::AuditUnavailable {
-                detail: "object denial audit unavailable".to_owned(),
-            }
-            .into();
-        }
-        match self.append(AuditOutcome::Denied).await {
-            Ok(()) => denial,
-            Err(error) => error,
-        }
+    /// Returns the caller's original stable query-forbidden error unchanged.
+    pub(crate) fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
+        self.stage(AuditOutcome::Denied);
+        denial
     }
 
-    /// Appends one decision row for this operation to the tenant audit staging.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit-unavailable when the tenant append cannot commit.
-    async fn append(&self, outcome: AuditOutcome) -> Result<(), WyrdError> {
-        let event = audit::audit_event(
-            self.caller,
-            self.operation,
-            &self.resource,
-            &self.permission.to_string(),
-            outcome,
-        );
-        audit::record_audit_owned(
-            self.state.postgres.vala().clone(),
-            self.caller.data_tenant_id,
-            event,
-        )
-        .await
-    }
-
-    /// Durably records the allowed decision before the owner is dispatched.
+    /// Stages the allowed decision before the lifecycle owner is dispatched.
     ///
     /// A lifecycle operation has no later Oracle read decision to carry its
-    /// `allowed` row, so the boundary writes it here, before dispatch. The row
+    /// `allowed` row, so the boundary stages it here, before dispatch. The row
     /// states only that the caller was permitted; whether the owner then
     /// succeeded is lifecycle state, not an authorization decision.
-    ///
-    /// # Errors
-    ///
-    /// Returns audit-unavailable before the lifecycle owner is called.
-    async fn record_admission(&self) -> Result<(), WyrdError> {
-        #[cfg(feature = "test-support")]
-        if self
-            .state
-            .query_control_audit_fault
-            .as_ref()
-            .is_some_and(crate::state::QueryControlAuditFaultController::cancel_attempts_fail)
-        {
-            return Err(wyrd_spec::vala::error::BifrostError::AuditUnavailable {
-                detail: "lifecycle audit gate unavailable before dispatch".to_owned(),
-            }
-            .into());
-        }
-        let event = audit::audit_event(
-            self.caller,
-            self.operation,
-            &self.resource,
-            &self.permission.to_string(),
-            AuditOutcome::Allowed,
-        );
-        audit::record_audit_owned(
-            self.state.postgres.vala().clone(),
+    fn record_admission(&self) {
+        self.stage(AuditOutcome::Allowed);
+    }
+
+    /// Stages one decision row for this operation on the process audit outbox.
+    fn stage(&self, outcome: AuditOutcome) {
+        self.state.audit_outbox.stage(
             self.caller.data_tenant_id,
-            event,
-        )
-        .await
+            audit::audit_event(
+                self.caller,
+                self.operation,
+                &self.resource,
+                &self.permission.to_string(),
+                outcome,
+            ),
+        );
     }
 }
 
@@ -247,26 +188,26 @@ pub(crate) fn oracle_context(caller: &Caller) -> Result<AuthorizedQueryContext, 
 /// availability. The returned stream owns admission, cancellation, and cleanup
 /// guards, so dropping it on transport cancellation stops query work.
 ///
-/// An HTTP caller passes its [`QueryEdgeTimer`]; it is handed off only after
+/// An HTTP caller passes its [`EdgeTimer`]; it is handed off only after
 /// capability admission, immediately before Gate dispatch synchronously reaches
 /// the forwarder that captures the request's query deadline. Earlier work stays
 /// bounded by the generic edge timeout. gRPC and MCP callers pass `None`.
 ///
 /// # Errors
 ///
-/// Returns authorization/audit errors, Oracle role unavailable, or a stable
+/// Returns authorization errors, Oracle role unavailable, or a stable
 /// pre-stream Oracle query error.
 pub async fn stream_query(
     state: AppState,
     caller: Caller,
     request: BifrostQueryRequest,
-    edge_timer: Option<&QueryEdgeTimer>,
+    edge_timer: Option<&EdgeTimer>,
 ) -> Result<OracleQueryStream, WyrdError> {
     let authority = QueryAuthority::new(&state, &caller, "vala.query.sync", "vala.query");
-    authority.admit_capability().await?;
+    authority.admit_capability()?;
     let context = oracle_context(&caller)?;
     if let Some(edge_timer) = edge_timer {
-        edge_timer.hand_off_to_oracle();
+        edge_timer.hand_off();
     }
     match state.bifrost.query_sql(context, request).await {
         Ok(stream) => Ok(stream),
@@ -274,7 +215,7 @@ pub async fn stream_query(
         // scan set. The tenant and principal are verified here, so the refusal
         // is recorded on the same audited boundary as a coarse route denial.
         Err(denial @ wyrd_spec::vala::error::BifrostError::QueryForbidden) => {
-            Err(authority.record_object_denial(denial.into()).await)
+            Err(authority.record_object_denial(denial.into()))
         }
         Err(other) => Err(other.into()),
     }
@@ -287,14 +228,14 @@ pub async fn stream_query(
 ///
 /// # Errors
 ///
-/// Returns stable authorization, audit, role-availability, or owner-control errors.
+/// Returns stable authorization, role-availability, or owner-control errors.
 pub async fn list_running_queries(
     state: &AppState,
     caller: &Caller,
 ) -> Result<Vec<RunningQuerySummary>, WyrdError> {
     let audit = QueryAuthority::lifecycle(state, caller, "vala.query.running.list", None);
-    audit.authorize().await?;
-    audit.record_admission().await?;
+    audit.authorize()?;
+    audit.record_admission();
     match state.bifrost.query_controls() {
         Some(controls) => controls.list(caller.data_tenant_id).await,
         None => Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into()),
@@ -308,7 +249,7 @@ pub async fn list_running_queries(
 ///
 /// # Errors
 ///
-/// Returns stable authorization, audit, role-availability, not-found, or conflict errors.
+/// Returns stable authorization, role-availability, not-found, or conflict errors.
 pub async fn get_running_query(
     state: &AppState,
     caller: &Caller,
@@ -316,8 +257,8 @@ pub async fn get_running_query(
 ) -> Result<RunningQuerySummary, WyrdError> {
     let audit =
         QueryAuthority::lifecycle(state, caller, "vala.query.running.get", Some(&request_id));
-    audit.authorize().await?;
-    audit.record_admission().await?;
+    audit.authorize()?;
+    audit.record_admission();
     match state.bifrost.query_controls() {
         Some(controls) => controls.get(caller.data_tenant_id, request_id).await,
         None => Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into()),
@@ -331,7 +272,7 @@ pub async fn get_running_query(
 ///
 /// # Errors
 ///
-/// Returns stable authorization, audit, role-availability, not-found, or conflict errors.
+/// Returns stable authorization, role-availability, not-found, or conflict errors.
 pub async fn cancel_running_query(
     state: &AppState,
     caller: &Caller,
@@ -343,8 +284,8 @@ pub async fn cancel_running_query(
         "vala.query.running.cancel",
         Some(&request_id),
     );
-    audit.authorize().await?;
-    audit.record_admission().await?;
+    audit.authorize()?;
+    audit.record_admission();
     match state.bifrost.query_controls() {
         Some(controls) => controls
             .cancel(caller.data_tenant_id, request_id)
@@ -358,7 +299,7 @@ pub async fn cancel_running_query(
 }
 
 /// operators.
-pub(crate) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
+pub(crate) fn arrow_decode_error(error: QueryIpcDecodeError) -> WyrdError {
     WyrdError::Internal {
         message: "failed to decode Oracle Arrow batch".to_owned(),
         details: serde_json::json!({ "detail": error.to_string() }),
@@ -381,7 +322,6 @@ pub(crate) fn terminal_error_to_bifrost(
             BifrostError::QueryReconciliationInvariant
         }
         QueryTerminalErrorCode::QueryPeerSecurity => BifrostError::QueryPeerSecurity,
-        QueryTerminalErrorCode::QueryAuditUnavailable => BifrostError::QueryAuditUnavailable,
         QueryTerminalErrorCode::CatalogUnreachable => BifrostError::CatalogUnreachable {
             detail: "Oracle typed query catalog unavailable".to_owned(),
         },
@@ -407,8 +347,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the shared fixture tenant cannot be resolved.
-    async fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
-        let tenant = crate::test_support::test_tenant().await;
+    fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {
+        let tenant = crate::test_support::test_tenant();
         Caller {
             data_tenant_id: tenant,
             principal: Principal::new(
@@ -431,8 +371,8 @@ mod tests {
     /// Panics when shared Postgres, storage, or catalog fixtures cannot start.
     async fn state_without_oracle() -> AppState {
         crate::test_support::test_app_state(
-            crate::test_support::test_server_postgres().await,
-            crate::test_support::test_storage().await,
+            crate::test_support::test_server_postgres(),
+            crate::test_support::test_storage(),
             crate::test_support::test_catalog().await,
         )
     }
@@ -447,12 +387,13 @@ mod tests {
         wyrd_runtime::runtime().block_on(async {
             let state = state_without_oracle().await;
             let request = BifrostQueryRequest {
+                params: Vec::new(),
                 sql: "SELECT 1".to_owned(),
                 deadline_ms: Some(1_000),
             };
             let allowed = stream_query(
                 state.clone(),
-                caller_with([Permission::bifrost_query_read()]).await,
+                caller_with([Permission::bifrost_query_read()]),
                 request.clone(),
                 None,
             )
@@ -460,7 +401,7 @@ mod tests {
             .expect_err("absent Oracle must fail before stream");
             assert_eq!(allowed.status(), 503);
 
-            let denied = stream_query(state, caller_with([]).await, request, None)
+            let denied = stream_query(state, caller_with([]), request, None)
                 .await
                 .expect_err("under-privileged caller must be denied");
             assert_eq!(

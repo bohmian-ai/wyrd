@@ -3,7 +3,9 @@ use std::process::ExitCode;
 use clap::Args;
 use reqwest::Method;
 use url::Url;
+use wyrd_client::WyrdClient;
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 
 use crate::error::WyrdCliError;
@@ -41,6 +43,78 @@ pub struct IssueKeyArgs {
     pub server: Url,
 }
 
+/// Issue an API key bound to one exact Card and return it.
+///
+/// The in-process form of `wyrd auth issue-key`. The request runs as
+/// `client`, or, when it is omitted, as the ambient credential chain. The response carries the plaintext key exactly once, behind a
+/// redacting `Debug`; the caller owns where it goes next.
+///
+/// # Errors
+/// Returns `WYRD_SPEC_400_VALIDATION` when the coordinates do not form a
+/// `CardRef`, a `WYRD_CLIENT_*` error for a rejected endpoint or missing
+/// credential, and the server's stable Wyrd error when the caller is
+/// unauthorized or the card is unknown.
+pub async fn issue_key(
+    kind: &str,
+    name: &str,
+    version: &str,
+    space: &str,
+    label: Option<&str>,
+    expires_in_seconds: Option<u32>,
+    client: Option<WyrdClient>,
+) -> Result<IssueKeyResponse, WyrdError> {
+    let card_ref = card_ref(kind, name, version, space)?;
+    let client = crate::client::explicit_or_ambient(client)?;
+    request(client, card_ref, label, expires_in_seconds)
+        .await
+        .map_err(WyrdError::from)
+}
+
+/// Parse the bound card's coordinates into one exact `CardRef`.
+///
+/// # Errors
+/// Returns [`WyrdCliError::InvalidArgument`] naming `card` when the
+/// coordinates do not form a `CardRef`.
+pub(crate) fn card_ref(
+    kind: &str,
+    name: &str,
+    version: &str,
+    space: &str,
+) -> Result<CardRef, WyrdCliError> {
+    let card_ref = format!("{space}/{kind}/{name}@{version}");
+    card_ref
+        .parse()
+        .map_err(|error| WyrdCliError::InvalidArgument {
+            field: "card".to_owned(),
+            value: card_ref.clone(),
+            expected: format!("a card ref: {error}"),
+        })
+}
+
+/// Send one issue-key request as `client`.
+///
+/// # Errors
+/// Returns [`WyrdCliError::Server`] for the server's refusal.
+async fn request(
+    client: WyrdClient,
+    card_ref: CardRef,
+    label: Option<&str>,
+    expires_in_seconds: Option<u32>,
+) -> Result<IssueKeyResponse, WyrdCliError> {
+    client
+        .request_json(
+            Method::POST,
+            "/auth/issue-key",
+            Some(&IssueKeyRequest {
+                card_ref,
+                label: label.map(str::to_owned),
+                expires_in_seconds,
+            }),
+        )
+        .await
+        .map_err(|source| WyrdCliError::Server { source })
+}
+
 /// Issue a card-bound API key and print it once.
 ///
 /// The plaintext key crosses this surface exactly here, in the response that
@@ -52,31 +126,15 @@ pub struct IssueKeyArgs {
 /// the server's stable Wyrd error when the caller is unauthorized or the card is
 /// unknown.
 pub async fn dispatch(args: IssueKeyArgs) -> Result<ExitCode, WyrdCliError> {
-    let card_ref_str = format!(
-        "{}/{}/{}@{}",
-        args.space, args.kind, args.name, args.version
-    );
-    let card_ref: CardRef =
-        card_ref_str
-            .parse()
-            .map_err(|error| WyrdCliError::InvalidArgument {
-                field: "card".to_owned(),
-                value: card_ref_str.clone(),
-                expected: format!("a card ref: {error}"),
-            })?;
-
-    let response: IssueKeyResponse = crate::client::from_global(Some(args.server.as_str()))?
-        .request_json(
-            Method::POST,
-            "/auth/issue-key",
-            Some(&IssueKeyRequest {
-                card_ref,
-                label: args.label,
-                expires_in_seconds: args.expires_in_seconds,
-            }),
-        )
-        .await
-        .map_err(|source| WyrdCliError::Server { source })?;
+    let card_ref = card_ref(&args.kind, &args.name, &args.version, &args.space)?;
+    let client = crate::client::from_global(Some(args.server.as_str()))?;
+    let response = request(
+        client,
+        card_ref,
+        args.label.as_deref(),
+        args.expires_in_seconds,
+    )
+    .await?;
 
     println!("key_id:     {}", response.key_id);
     println!("key:        {}", response.key.expose());

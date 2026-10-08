@@ -168,22 +168,18 @@ not a passive integration or inventory product.
     `card_ref_scope` authorization set derived at mint time, while a tenant
     administrative or tenant-created automation principal is representable
     with no Card and therefore no emit scope. `User` is the marker for human
-    identity. `System` is a tenant-local server identity used only for
-    canonical verification-result publication and the fixed Drift observation
-    read. It has no public credential, role, refresh, workload, delegation, or
-    principal-management path; the server mints each short-lived token with
-    exactly one UID-bearing Verifier scope and exactly one fixed capability:
-    result write, or `bifrost_query:read` scoped to the tenant's registered
-    `vala.drift.observations` table. No token carries both. Platform authority
+    identity. `System` is a tenant-local server identity that attributes
+    verification results and authorizes Verifier input reads in-process. It
+    never appears in a token: no issuer mints one, every verifier rejects a
+    `system` claim set, and it has no public credential, role, refresh,
+    workload, delegation, or principal-management path. Platform authority
     is a grant held at platform scope, not a property of a kind, and neither
-    plane's credential or token is accepted by the other. Gateway capture runs
-    as the reserved
-    `GATEWAY_CAPTURE_PRINCIPAL`: a tenant-bound, card-free `Service` with an
-    empty `card_ref_scope`, only the informational `gateway_capture` Role, no
-    delegation, and a token of at most 900 s minted only by internal server
-    paths; no public credential, workload, refresh, delegation, or
-    impersonation flow can issue it, and it never replaces the invocation
-    caller in audit. `wyrd apply -f service.yaml` (or an Agent card) creates
+    plane's credential or token is accepted by the other. Gateway capture is a
+    server-internal write, not a principal that authenticates: captured rows
+    carry the reserved `GATEWAY_CAPTURE_PRINCIPAL`, which, like
+    `PLATFORM_AUDIT_PRINCIPAL`, never appears in a token. Every issuer refuses
+    it, every verifier rejects a token naming it, and it never replaces the
+    invocation caller in audit. `wyrd apply -f service.yaml` (or an Agent card) creates
     or updates the principal row idempotently, keyed on
     `(tenant_id, card_kind, card_uid)`; re-apply preserves the same
     `principal_id`. No secret is returned. Credentials are issued out-of-band
@@ -601,8 +597,10 @@ platform plane, and neither plane's credential or token is accepted by the
 other.
 
 Both planes write their authorization decisions to the one canonical audit
-path: `vala.audit_staging` in the deciding transaction, then `AuditPublisher`
-into `vala.system.audit_log`. A decision records the deciding principal's
+path: `vala.audit_staging`, then `AuditPublisher` into
+`vala.system.audit_log`. Permissions are blocking; audits are non-blocking:
+a decision is staged on the shared audit outbox and never delays or fails
+the operation. A decision records the deciding principal's
 stored kind and, when its token was minted from a credential, that
 credential's non-secret id.
 
@@ -611,14 +609,21 @@ credential's non-secret id.
 Wyrd principals are UUID-backed runtime identities that exist independently of
 any credential: issuing, rotating, revoking, or losing a credential never
 creates, destroys, or alters a principal or its role grants. The reserved
-`GATEWAY_CAPTURE_PRINCIPAL` is the one card-free `Service` the server mints
-itself: a short-lived (at most 900 s) token binding one tenant and only that
-tenant's exactly two Bifrost record-write grants, for its `vala.gateway.calls`
-and `vala.traces.spans` table UIDs, in the signed `permissions` claim (the
-`gateway_capture` Role it carries is informational and has no stored row).
-Gate reserves `vala.gateway.calls` to it and confines it to those two tables;
-a capture table recreated under a new UID stays denied until a server restart
-rebuilds the capture producer.
+`GATEWAY_CAPTURE_PRINCIPAL` is not a credential-bearing identity: it is the
+id Scribe stamps on rows gateway capture writes server-internally, holding no
+token, role, or grant. Each `wyrd-server` process owns one capture writer,
+chosen from pod topology (`WYRD_TARGET`): it submits in-process when Scribe
+runs in the pod, and otherwise over the peer plane through a capture-only RPC
+to a live, ready Scribe. A capture is delivered when Scribe acknowledges it
+before the call's deadline; backpressure and an unavailable Scribe are retried
+with bounded backoff until then, and anything else drops the capture with a
+counted reason without changing the call. No per-tenant client, queue, or
+backlog outlives the call. The same writer submits Verifier results to the
+three result tables, attributed to the tenant's `System` principal and the
+run's exact Verifier Card, which Scribe stamps as `principal_id` and
+`card_uid`; a result batch is never dropped for time and is retried under its
+own batch id until Scribe acknowledges it. Gate refuses every public write to
+`vala.gateway.calls` and the three result tables.
 `Service` and
 `Agent` principal is always card-bound and a deployed `Service` carries its
 Card — the `card_ref` is discriminated on `PrincipalKind`, and the JWT carries a
@@ -653,6 +658,18 @@ grants at issuance as its only authority, and for delegated tokens (token
 exchange) an RFC 8693 `act` chain naming the actors, the outermost being the
 current one. A delegated token's audience is `wyrd` or `bifrost`; a `bifrost`
 token is accepted only on the Bifrost ingest and query surfaces.
+
+OTLP is the one exception to exchange-first. A stock OpenTelemetry exporter
+carries static headers and cannot renew a token, so the OTLP/HTTP and OTLP/gRPC
+endpoints also accept the API key itself in an `x-wyrd-api-key` header. On
+**every** such request, before any payload is decoded, the server verifies the
+key exactly as the `/auth/token` API-key grant does and resolves the principal,
+permissions, and tenant scope that grant's token would carry, without minting
+or signing one; the request then runs under the same authorization, audit,
+and limits as a bearer caller. A revoked key fails at its next export. `x-wyrd-access-token`
+remains valid on OTLP, and no other route accepts `x-wyrd-api-key`. An exporter
+is configured only with standard settings, for example
+`OTEL_EXPORTER_OTLP_HEADERS=x-wyrd-api-key=<key>`; no SDK exporter helper exists.
 
 Env vars in deployed services:
 
@@ -767,6 +784,21 @@ observation emission. Card lookup and authorization remain strict. The scope
 does not create, end, flush, or persist a Run or span. Signal-specific log and
 metric enrichment is not implied.
 
+A view identifies itself by the alias it was opened with (`alias`; the root
+Service view is `root`); the state returns the exact typed `CardRef` for an
+alias. `run.observe.verify(verifier, input)` judges the view's subject in real
+time: the client resolves the named Verifier among those bound in
+`verified_by` to that subject in the hydrated graph, shapes the input for the
+Verifier's kind (one Eval context, or Drift feature rows), and calls
+`POST /v1/verification/execute` once, without replay, returning the typed
+`Judgment`. An unbound name (`WYRD_SDK_404_UNKNOWN_VERIFIER`) or a wrongly
+shaped input (`WYRD_SDK_400_INVALID_OBSERVATION`) fails locally before any
+network IO, and a `failed` verdict is an ordinary return. Judging records no
+observation, run, dispatch, or Bifrost row and does not require Bifrost
+startup. SDKs carry no separate verification handle; binding and run
+operations remain server HTTP and MCP surfaces, and verification history is
+read with parameterized SQL through the Bifrost client.
+
 Every accepted row carries authenticated publisher and request identity; Card
 and Run correlation are optional per-row values:
 
@@ -799,12 +831,14 @@ Consequences, stated so they stop drifting:
   never splits a batch by card or run. The server therefore authorizes every
   present `card_ref` **per row** (every distinct asserted Card in the batch must
   be in the principal's scope),
-  validates the client-generated UUIDv7 `wyrd_batch_id`, stamps
-  request-scoped `data_tenant_id`, `wyrd_request_id`, and
-  `wyrd_ingested_at`, validates caller-supplied `wyrd_event_time` against a
-  bounded acceptance window and rejects out-of-range values (never clamps or
-  normalizes them). Row identity is batch-level; no per-row position is
-  stamped.
+  validates the client-generated UUIDv7 `wyrd_batch_id` request field (the
+  idempotency key; it is not a row column), stamps request-scoped
+  `wyrd_request_id` and `wyrd_ingested_at` — the PostgreSQL admission instant,
+  read once per batch and never caller-supplied — and validates
+  caller-supplied `wyrd_event_time` against a bounded acceptance window around
+  that instant, rejecting out-of-range values (never clamping or normalizing
+  them). A row without `wyrd_event_time` takes `wyrd_ingested_at`. Row
+  identity is batch-level; no per-row position is stamped.
 
 - **`card_ref` is optional and authorized, not trusted.** Its absence is valid
   generic telemetry and produces null `card_uid`; the authenticated publisher
@@ -1125,6 +1159,31 @@ not the Drift or Eval implementation, creates dispatches; each Operator owns
 its own delivery. A Verifier run never creates another Trigger. Direct
 Verifier invocation is analysis-only and dispatches nothing.
 
+The runner drains `wyrd.verifier_runs` in claim rounds. Each round considers
+every tenant with a claimable run, oldest first, with no tenant limit, and
+claims at most one run per tenant. Execution has no count limit. The shared
+resources that already admit work bound it: the Postgres pool, Oracle
+admission and memory, and the Bifrost memory budget. A run refused by one of
+them returns to the queue without consuming an attempt, and the process
+claims nothing new until one of its running runs finishes. The claim
+transaction also returns the Verifier Card's status, its spec on a cache miss,
+and any fitted Drift baseline. Parsed Verifiers are cached per process by
+tenant and Card UID in a fixed 64 MiB least-recently-used cache that is never
+shared across tenants. A deleted Verifier terminates the run `errored`.
+
+A run's result is decided once. When execution completes, the runner encodes
+the result and stores it, with its result ID, event time, batch IDs, and
+Arrow IPC bytes, in `wyrd.verifier_run_results` in one lease-fenced
+transaction before writing any of it. A stale lease stores nothing. Any later
+claimant of a run with a stored result writes those stored batches instead of
+executing again, so Scribe's batch fence absorbs every repeat. The settlement
+that completes or terminates the run deletes the stored result. While a run is
+in flight, one statement per tenant renews its leases on the PostgreSQL clock
+once a third of the lease has passed. An expired lease is never revived, and a
+renewal that no longer finds a run's token cancels that run's work. A run
+holds a connection only to claim, store, settle, and renew. The store and the
+settlement retry with backoff while the lease holds.
+
 #### Drift implementation
 Subject-less observation definition. The implementation is orthogonal: signal +
 condition + math. Subject identity is supplied by the publisher at
@@ -1409,6 +1468,15 @@ implementation. A Trigger never fires on its own: nothing runs merely because
 a Trigger Card is registered, and one schedule occurrence shared by two
 subjects creates two subject-scoped runs, never one mixed-subject run.
 
+Eval run creation follows Scribe's acknowledgement and never delays it.
+After the ack, the server puts one run request per committed record into an
+in-process outbox. One writer drains it, one multi-row insert per tenant,
+keyed by binding and record, so a repeated request inserts nothing. The
+outbox has no count limit and never drops a request because PostgreSQL is
+slow or down: a failed write keeps its batch and retries with backoff.
+Graceful shutdown flushes the outbox. A hard kill loses only unwritten
+requests, and every loss the process observes is counted and logged.
+
 External pushes are deliberately not an activation — Rule 7 ("Wyrd reads, it
 does not push") means external data enters through a `Source`.
 
@@ -1449,7 +1517,7 @@ protocol-versioned additions):
 | Channel     | Carries                                                                            |
 |-------------|------------------------------------------------------------------------------------|
 | `Slack`     | `connection`, `channel_id`, `text` — `chat.postMessage` with the bot token; success is JSON `ok` |
-| `PagerDuty` | `connection`, `route`, `severity`, `summary`, `dedup_key?` — Events API v2 trigger; the default dedup key is the dispatch ID |
+| `PagerDuty` | `connection`, `route`, `severity`, `summary`, `dedup_key?` — one Events API v2 `trigger` event sent with the tenant connection's PagerDuty Global Integration key. The authored `route` travels as `payload.custom_details.wyrd_route` for the tenant to match in PagerDuty Service Routes; `payload.source` is the subject Card ref. The `dedup_key` is the rendered authored value or, by default, the dispatch ID, and stays the same across retries of one dispatch. PagerDuty owns service routing and escalation; Wyrd maps no escalation, provisions no per-team key, and does not treat Events API acceptance as proof that an incident or page was created |
 
 `HttpMethod`: closed enum — `Get | Post | Put | Patch | Delete`.
 

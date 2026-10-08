@@ -98,8 +98,10 @@ impl PyAgentCard {
     /// Create an Agent Card from a Python `PromptReference`.
     #[new]
     #[pyo3(signature = (prompt, space=None, name=None, version=None, uid=None, labels=None, annotations=None))]
-    // justification: pyo3 #[new] signature mirrors the complete Python AgentCard constructor
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new] signature mirrors the complete Python AgentCard constructor"
+    )]
     pub fn __new__(
         prompt: &Bound<'_, PromptReference>,
         space: Option<&str>,
@@ -166,11 +168,32 @@ impl PyAgentCard {
         Ok(serde_json::to_string(&self.inner.to_envelope()?)?)
     }
 
+    /// Project a local, possibly unregistered Agent Card envelope.
+    ///
+    /// `Agent.to_card()` routes here: an Agent that was never registered has
+    /// no UID, so this path skips the persisted-UID requirement that
+    /// `model_validate_json` enforces. Envelope validation still runs.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the JSON is not a valid Agent Card envelope.
+    #[staticmethod]
+    #[pyo3(name = "_from_draft_json")]
+    pub fn from_draft_json_py(py: Python<'_>, json_string: &str) -> CardPyResult<Self> {
+        Self::from_native(
+            py,
+            AgentCard::from_envelope(WyrdPyError::parse_json_input(json_string)?)?,
+        )
+    }
+
     /// Hydrate an Agent Card from a complete JSON envelope.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SPEC_400_VALIDATION` when the JSON is malformed, or the
+    /// envelope validation error when it is not a valid Agent Card.
     #[staticmethod]
     #[pyo3(name = "model_validate_json")]
     pub fn model_validate_json_py(py: Python<'_>, json_string: &str) -> CardPyResult<Self> {
-        Self::from_card(py, serde_json::from_str(json_string)?)
+        Self::from_card(py, WyrdPyError::parse_json_input(json_string)?)
     }
 
     /// Return the Agent Card space.
@@ -247,8 +270,6 @@ impl PyAgentCard {
         )
     }
 
-    // justification: PyO3 requires owned Python objects for the GC visitor
-    #[allow(clippy::needless_pass_by_value)]
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(prompt_ref) = self.prompt_ref.as_ref() {
             visit.call(prompt_ref)?;

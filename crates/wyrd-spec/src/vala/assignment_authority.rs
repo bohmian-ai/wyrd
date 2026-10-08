@@ -17,10 +17,12 @@ use sha2::{Digest, Sha256};
 
 /// Closed scalar literal vocabulary for a supported comparison predicate.
 ///
-/// Only these six variants may appear as the literal operand of a supported
+/// Only these seven variants may appear as the literal operand of a supported
 /// leaf predicate. `F64Bits` carries the IEEE-754 bit pattern (via
 /// [`f64::to_bits`]) rather than a raw `f64` so equality, hashing, and the
-/// digest encoding stay exact instead of floating-point-approximate.
+/// digest encoding stay exact instead of floating-point-approximate. `Bytes`
+/// carries a binary or fixed-size binary literal (for example a trace id)
+/// losslessly, so binary identifiers never round-trip through UTF-8.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum ScanLiteral {
@@ -36,12 +38,15 @@ pub enum ScanLiteral {
     Utf8(String),
     /// Microsecond-precision UTC timestamp literal.
     TimestampMicros(i64),
+    /// Binary literal compared byte-for-byte against binary and fixed-size
+    /// binary columns.
+    Bytes(Vec<u8>),
 }
 
 impl ScanLiteral {
     /// Returns the digest literal-type tag defined by the assignment-authority
     /// encoding (`Bool` 0, `I64` 1, `U64` 2, `F64Bits` 3, `Utf8` 4,
-    /// `TimestampMicros` 5).
+    /// `TimestampMicros` 5, `Bytes` 6).
     #[must_use]
     pub fn digest_tag(&self) -> u8 {
         match self {
@@ -51,6 +56,7 @@ impl ScanLiteral {
             ScanLiteral::F64Bits(_) => 3,
             ScanLiteral::Utf8(_) => 4,
             ScanLiteral::TimestampMicros(_) => 5,
+            ScanLiteral::Bytes(_) => 6,
         }
     }
 }
@@ -165,12 +171,6 @@ pub struct AssignmentDigestInput<'a> {
     pub required_columns: &'a [String],
     /// Closed leaf predicates, in filter order.
     pub predicates: &'a [ScanPredicate],
-    /// Exact protected snapshot cut this follower is authorized to read.
-    ///
-    /// Signed with the rest of the assignment so a follower cannot be steered
-    /// onto a different snapshot, a different table's identity, or a different
-    /// epoch than the leader planned under.
-    pub reader_cut: &'a crate::vala::api::FollowerReaderCut,
 }
 
 /// Digest encoding failure for one assignment-authority input.
@@ -179,10 +179,6 @@ pub enum AssignmentDigestError {
     /// The schema fingerprint was not exactly 64 lowercase hex characters.
     #[error("schema fingerprint must be 64 lowercase hex characters, got {0:?}")]
     InvalidSchemaFingerprint(String),
-    /// The reader cut's ancestry digest was not exactly 64 lowercase hex
-    /// characters, so the cut cannot be bound to a table identity.
-    #[error("reader-cut ancestry digest must be 64 lowercase hex characters, got {0:?}")]
-    InvalidAncestryDigest(String),
     /// A string field or list exceeded `u32::MAX` bytes/elements.
     #[error("{field} exceeds the u32 length domain encodable by the digest")]
     LengthOverflow {
@@ -191,7 +187,12 @@ pub enum AssignmentDigestError {
     },
 }
 
-/// Domain separator for the v6 assignment-authority digest.
+/// Domain separator for the v7 assignment-authority digest.
+///
+/// v7 drops the follower reader cut: followers no longer establish snapshot
+/// protection, because the leader's committed active table read covers every
+/// descendant fragment it plans. The assignment is v6 without the cut, and the
+/// domain differs so a v6 signature can never validate against v7 bytes.
 ///
 /// v6 drops the Scribe cut's batch-count and retained-byte limits: the cut is
 /// the writer epoch and the two partitions. Every other rule is unchanged from
@@ -199,7 +200,7 @@ pub enum AssignmentDigestError {
 /// bytes.
 ///
 /// v5 appended the required
-/// [`crate::vala::api::FollowerReaderCut`] to every assignment, so a signed
+/// follower reader cut to every assignment, so a signed
 /// fragment names the exact protected snapshot the follower may read. The
 /// domain differs from v4 so a v4 signature — which carried no cut — can never
 /// validate against v5 bytes.
@@ -211,15 +212,32 @@ pub enum AssignmentDigestError {
 /// the declared event-time bounds. Every other count, length, option,
 /// predicate, projection, cut, and numeric rule is unchanged from v3, and the
 /// domain differs so a v3 signature can never validate against v4 bytes.
-const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v6\0";
+const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v7\0";
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
+///
+/// # Errors
+///
+/// Returns [`AssignmentDigestError::LengthOverflow`] when the string
+/// exceeds the `u32` length domain.
 fn push_string(buffer: &mut Vec<u8>, value: &str) -> Result<(), AssignmentDigestError> {
-    let bytes = value.as_bytes();
-    let len = u32::try_from(bytes.len()).map_err(|_| AssignmentDigestError::LengthOverflow {
-        field: "string length",
-    })?;
+    push_bytes(buffer, value.as_bytes(), "string length")
+}
+
+/// Appends a big-endian `u32` byte length followed by the raw bytes.
+///
+/// # Errors
+///
+/// Returns [`AssignmentDigestError::LengthOverflow`] naming `field` when the
+/// slice exceeds the `u32` length domain.
+fn push_bytes(
+    buffer: &mut Vec<u8>,
+    bytes: &[u8],
+    field: &'static str,
+) -> Result<(), AssignmentDigestError> {
+    let len =
+        u32::try_from(bytes.len()).map_err(|_| AssignmentDigestError::LengthOverflow { field })?;
     buffer.extend_from_slice(&len.to_be_bytes());
     buffer.extend_from_slice(bytes);
     Ok(())
@@ -254,15 +272,28 @@ fn push_option<T>(
     Ok(())
 }
 
+/// Appends one scan literal as its digest tag followed by its typed
+/// payload.
+///
+/// Fixed-width values are big-endian, booleans one byte, and UTF-8 and byte
+/// literals length-prefixed, so two literals of different types or values
+/// never encode identically.
+///
+/// # Errors
+///
+/// Returns [`AssignmentDigestError::LengthOverflow`] when a UTF-8 or byte
+/// literal exceeds the `u32` length domain.
 fn push_literal(buffer: &mut Vec<u8>, literal: &ScanLiteral) -> Result<(), AssignmentDigestError> {
     buffer.push(literal.digest_tag());
     match literal {
         ScanLiteral::Bool(value) => buffer.push(u8::from(*value)),
-        ScanLiteral::I64(value) => buffer.extend_from_slice(&value.to_be_bytes()),
+        ScanLiteral::I64(value) | ScanLiteral::TimestampMicros(value) => {
+            buffer.extend_from_slice(&value.to_be_bytes());
+        }
         ScanLiteral::U64(value) => buffer.extend_from_slice(&value.to_be_bytes()),
         ScanLiteral::F64Bits(bits) => buffer.extend_from_slice(&bits.to_be_bytes()),
         ScanLiteral::Utf8(value) => push_string(buffer, value)?,
-        ScanLiteral::TimestampMicros(value) => buffer.extend_from_slice(&value.to_be_bytes()),
+        ScanLiteral::Bytes(value) => push_bytes(buffer, value, "bytes length")?,
     }
     Ok(())
 }
@@ -351,6 +382,10 @@ fn push_time_partition(buffer: &mut Vec<u8>, partition: crate::vala::api::TimePa
 /// # Errors
 ///
 /// Never fails; the `Result` is the shape `push_option` requires.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Result is the callback shape push_option requires"
+)]
 fn push_scribe_cut(
     buffer: &mut Vec<u8>,
     cut: &crate::vala::api::ScribeProviderCut,
@@ -390,64 +425,9 @@ fn decode_schema_fingerprint(hex: &str) -> Result<[u8; 32], AssignmentDigestErro
 ///
 /// # Errors
 ///
-/// Returns [`AssignmentDigestError`] when the schema fingerprint or the reader
-/// cut's ancestry digest is not canonical hex, or when any length exceeds the
-/// `u32` domain the encoding uses.
-/// Appends the reader cut's canonical digest bytes.
-///
-/// Every field is signed, including the ancestry path element by element: a
-/// follower that validated the signature has validated the exact lineage it
-/// will have to protect, not merely the snapshot's identifier.
-///
-/// # Errors
-///
-/// Returns [`AssignmentDigestError::InvalidAncestryDigest`] when the digest is
-/// not 64 lowercase hex characters, and
-/// [`AssignmentDigestError::LengthOverflow`] when the ancestry path exceeds the
-/// `u32` count domain.
-fn push_reader_cut(
-    buffer: &mut Vec<u8>,
-    cut: &crate::vala::api::FollowerReaderCut,
-) -> Result<(), AssignmentDigestError> {
-    buffer.extend_from_slice(cut.table_uid.as_bytes());
-    buffer.extend_from_slice(&cut.snapshot_id.to_be_bytes());
-    buffer.extend_from_slice(&cut.snapshot_timestamp_ms.to_be_bytes());
-    buffer.extend_from_slice(&cut.retained_head_snapshot_id.to_be_bytes());
-    push_count(buffer, cut.ancestry_path.len(), "ancestry_path")?;
-    for snapshot_id in &cut.ancestry_path {
-        buffer.extend_from_slice(&snapshot_id.to_be_bytes());
-    }
-    buffer.extend_from_slice(&cut.ancestry_digest_version.to_be_bytes());
-    let digest = decode_ancestry_digest(&cut.ancestry_digest_hex)?;
-    buffer.extend_from_slice(&digest);
-    buffer.extend_from_slice(&cut.target_epoch_fence.to_be_bytes());
-    Ok(())
-}
-
-/// Decodes the reader cut's canonical lowercase 64-hex ancestry digest.
-///
-/// # Errors
-///
-/// Returns [`AssignmentDigestError::InvalidAncestryDigest`] when the input is
-/// not exactly 64 lowercase hex characters.
-fn decode_ancestry_digest(hex: &str) -> Result<[u8; 32], AssignmentDigestError> {
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(AssignmentDigestError::InvalidAncestryDigest(
-            hex.to_string(),
-        ));
-    }
-    let mut out = [0u8; 32];
-    for (index, chunk) in out.iter_mut().enumerate() {
-        *chunk = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
-            .map_err(|_| AssignmentDigestError::InvalidAncestryDigest(hex.to_string()))?;
-    }
-    Ok(out)
-}
-
+/// Returns [`AssignmentDigestError`] when the schema fingerprint is not
+/// canonical hex, or when any length exceeds the `u32` domain the encoding
+/// uses.
 fn push_assignment(
     buffer: &mut Vec<u8>,
     assignment: &AssignmentDigestInput<'_>,
@@ -471,7 +451,6 @@ fn push_assignment(
     for column in assignment.required_columns {
         push_string(buffer, column)?;
     }
-    push_reader_cut(buffer, assignment.reader_cut)?;
     push_count(buffer, assignment.predicates.len(), "predicates")?;
     for predicate in assignment.predicates {
         push_predicate(buffer, predicate)?;
@@ -532,30 +511,6 @@ pub fn hex_lower(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// The normative v5 reader cut every fixture assignment is signed with.
-    ///
-    /// Table `0a0b0c0d-...`, snapshot `8_675_309` at `1_787_497_200_000`,
-    /// retained head `8_675_311`, a three-element ancestry, digest version 1,
-    /// an `0x22`-filled ancestry digest, and epoch fence 9. Held as one shared
-    /// value so every vector below signs the same cut and any digest change a
-    /// test observes is attributable to the field it varied.
-    static NORMATIVE_READER_CUT: std::sync::LazyLock<crate::vala::api::FollowerReaderCut> =
-        std::sync::LazyLock::new(normative_reader_cut);
-
-    /// Builds the normative v5 reader cut.
-    fn normative_reader_cut() -> crate::vala::api::FollowerReaderCut {
-        crate::vala::api::FollowerReaderCut {
-            table_uid: uuid::Uuid::parse_str("0a0b0c0d-0e0f-1011-1213-141516171819")
-                .expect("fixture table identity parses"),
-            snapshot_id: 8_675_309,
-            snapshot_timestamp_ms: 1_787_497_200_000,
-            retained_head_snapshot_id: 8_675_311,
-            ancestry_path: vec![8_675_311, 8_675_310, 8_675_309],
-            ancestry_digest_version: 1,
-            ancestry_digest_hex: "22".repeat(32),
-            target_epoch_fence: 9,
-        }
-    }
     use crate::vala::api::{ScribeProviderCut, TimeGranularityWire, TimePartitionWire};
 
     /// Builds the normative v3 Scribe cut: writer epoch 7, the two hourly
@@ -609,22 +564,27 @@ mod tests {
             .expect("fixture start is canonical")
     }
 
-    /// Normative v6 vector: one assignment for tenant
+    /// Normative v7 vector: one assignment for tenant
     /// `00112233-4455-6677-8899-aabbccddeeff`, table `logs.records`, fingerprint
     /// `00..1f`, one typed hot descriptor, three required columns carried once
     /// on the assignment, a single `Eq(service_name, "api")` predicate, and the
-    /// normative Scribe cut and reader cut must encode to exactly 460 bytes and
-    /// hash to the fixed digest below. Asserting both the byte length and the
-    /// hash prevents a compensating pair of layout mistakes from passing.
+    /// normative Scribe cut must encode to exactly 348 bytes and hash to the
+    /// fixed digest below. Asserting both the byte length and the hash prevents
+    /// a compensating pair of layout mistakes from passing.
     ///
-    /// The 112-byte growth over v4's 360 is exactly the reader cut: 16 table
+    /// v7 is exactly 112 bytes shorter than v6's 460: the reader cut's 16 table
     /// uuid + 8 snapshot + 8 snapshot timestamp + 8 retained head + 4 ancestry
     /// count + 24 for its three entries + 4 digest version + 32 digest + 8
-    /// epoch fence. v6 is 12 bytes shorter than v5's 472: the Scribe cut no
-    /// longer carries its `u32` batch count and `u64` retained-byte limit.
+    /// epoch fence are gone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture identifier fails to parse, encoding fails, or the
+    /// encoded vector differs from the normative 348-byte length or fixed
+    /// digest.
     #[test]
     fn normative_vector_encodes_to_fixed_length_and_digest() {
-        let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
+        let fingerprint = hex::encode((0u8..32).collect::<Vec<_>>());
         let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
         let files = vec![normative_hot_descriptor()];
         let required_columns = vec![
@@ -647,153 +607,20 @@ mod tests {
             scribe_cut: Some(&cut),
             required_columns: &required_columns,
             predicates: &predicates,
-            reader_cut: &NORMATIVE_READER_CUT,
         };
 
         let bytes = encode_assignment_authority_bytes(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             bytes.len(),
-            460,
-            "normative vector must encode to exactly 460 bytes"
+            348,
+            "normative vector must encode to exactly 348 bytes"
         );
 
         let digest = assignment_authority_digest(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             digest,
-            "6e6cc4d337dc9706ae4ac3fca2cbef3db2023be2ef683e903e7c3acd4c3f6d38"
+            "82ba611135f393fff2757dc27b7b87b81b092aca16cf35c9ca8cb0565d597be4"
         );
-    }
-
-    /// Every reader-cut field independently moves the assignment digest.
-    ///
-    /// The cut is the follower's entire authority over which snapshot it may
-    /// read. If any field could be changed without invalidating the signature,
-    /// a peer could redirect a follower onto a different table's snapshot, a
-    /// different point in the same table's history, or the same snapshot under
-    /// a stale epoch fence, and still present a valid assignment.
-    ///
-    /// Ancestry is checked element by element and by length, because coverage
-    /// is decided from the path: a truncated or reordered path would let a
-    /// follower protect less than it reads.
-    #[test]
-    fn follower_reader_cut_changes_assignment_digest() {
-        use crate::vala::api::FollowerReaderCut;
-
-        let (fingerprint, tenant_uuid, files, required_columns, predicates) = base_vector();
-        let scribe_cut = normative_scribe_cut();
-        let digest_with = |cut: &FollowerReaderCut| {
-            let input = AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files: &files,
-                scribe_cut: Some(&scribe_cut),
-                required_columns: &required_columns,
-                predicates: &predicates,
-                reader_cut: cut,
-            };
-            assignment_authority_digest(std::slice::from_ref(&input))
-                .expect("fixture reader cut is canonical")
-        };
-
-        let baseline = digest_with(&NORMATIVE_READER_CUT);
-        let mutations: Vec<(&str, FollowerReaderCut)> = vec![
-            (
-                "table_uid",
-                FollowerReaderCut {
-                    table_uid: uuid::Uuid::nil(),
-                    ..normative_reader_cut()
-                },
-            ),
-            (
-                "snapshot_id",
-                FollowerReaderCut {
-                    snapshot_id: 8_675_308,
-                    ..normative_reader_cut()
-                },
-            ),
-            (
-                "snapshot_timestamp_ms",
-                FollowerReaderCut {
-                    snapshot_timestamp_ms: 1_787_497_200_001,
-                    ..normative_reader_cut()
-                },
-            ),
-            (
-                "retained_head_snapshot_id",
-                FollowerReaderCut {
-                    retained_head_snapshot_id: 8_675_312,
-                    ..normative_reader_cut()
-                },
-            ),
-            (
-                "ancestry_path truncated",
-                FollowerReaderCut {
-                    ancestry_path: vec![8_675_311, 8_675_309],
-                    ..normative_reader_cut()
-                },
-            ),
-            (
-                "ancestry_path reordered",
-                FollowerReaderCut {
-                    ancestry_path: vec![8_675_311, 8_675_309, 8_675_310],
-                    ..normative_reader_cut()
-                },
-            ),
-            (
-                "ancestry_digest_version",
-                FollowerReaderCut {
-                    ancestry_digest_version: 2,
-                    ..normative_reader_cut()
-                },
-            ),
-            (
-                "ancestry_digest",
-                FollowerReaderCut {
-                    ancestry_digest_hex: "23".repeat(32),
-                    ..normative_reader_cut()
-                },
-            ),
-            (
-                "target_epoch_fence",
-                FollowerReaderCut {
-                    target_epoch_fence: 10,
-                    ..normative_reader_cut()
-                },
-            ),
-        ];
-        for (field, mutated) in mutations {
-            assert_ne!(
-                digest_with(&mutated),
-                baseline,
-                "reader-cut field {field} must move the assignment digest"
-            );
-        }
-
-        // A non-canonical ancestry digest is refused rather than hashed as
-        // whatever bytes it happens to contain.
-        let malformed = FollowerReaderCut {
-            ancestry_digest_hex: "NOT-HEX".to_string(),
-            ..normative_reader_cut()
-        };
-        let input = AssignmentDigestInput {
-            scan_id: "scan-1",
-            tenant_uuid,
-            namespace: "logs",
-            table: "records",
-            schema_fingerprint_hex: &fingerprint,
-            files: &files,
-            scribe_cut: Some(&scribe_cut),
-            required_columns: &required_columns,
-            predicates: &predicates,
-            reader_cut: &malformed,
-        };
-        assert!(matches!(
-            assignment_authority_digest(std::slice::from_ref(&input)),
-            Err(AssignmentDigestError::InvalidAncestryDigest(_))
-        ));
     }
 
     /// Every descriptor field and the descriptor order are independently
@@ -826,7 +653,6 @@ mod tests {
                 scribe_cut: Some(&cut),
                 required_columns: &required_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         };
         let baseline = digest_with(&files);
@@ -938,7 +764,6 @@ mod tests {
                 scribe_cut: Some(cut),
                 required_columns: &required_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         };
         let baseline = digest_with(&baseline_cut);
@@ -980,7 +805,7 @@ mod tests {
         Vec<String>,
         Vec<ScanPredicate>,
     ) {
-        let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
+        let fingerprint = hex::encode((0u8..32).collect::<Vec<_>>());
         let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
         let files = vec![normative_hot_descriptor()];
         let required_columns = vec![
@@ -1007,13 +832,17 @@ mod tests {
             scribe_cut: None,
             required_columns: &required_columns,
             predicates,
-            reader_cut: &NORMATIVE_READER_CUT,
         })
     }
 
     /// Every mutation class the packet requires must change the digest:
     /// scan id, tenant, namespace, table, fingerprint bytes, file path bytes,
     /// list reordering, float bits, and predicate operator/column/literal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when encoding fails or any required field-class mutation leaves
+    /// the digest unchanged.
     #[test]
     fn every_field_class_mutation_changes_the_digest() {
         let predicates = vec![ScanPredicate::Eq(
@@ -1036,7 +865,6 @@ mod tests {
                 scribe_cut: None,
                 required_columns: &required_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         );
 
@@ -1054,7 +882,6 @@ mod tests {
                 scribe_cut: None,
                 required_columns: &required_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         );
 
@@ -1071,7 +898,6 @@ mod tests {
                 scribe_cut: None,
                 required_columns: &required_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         );
 
@@ -1088,7 +914,6 @@ mod tests {
                 scribe_cut: None,
                 required_columns: &required_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         );
 
@@ -1107,7 +932,6 @@ mod tests {
                 scribe_cut: None,
                 required_columns: &required_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         );
 
@@ -1131,7 +955,6 @@ mod tests {
                 scribe_cut: None,
                 required_columns: &required_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         );
 
@@ -1153,7 +976,6 @@ mod tests {
                 scribe_cut: None,
                 required_columns: &reordered_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         );
 
@@ -1185,9 +1007,21 @@ mod tests {
         )]);
         let float_mutated = baseline_digest(&[ScanPredicate::Gt(
             "duration_ms".to_string(),
-            ScanLiteral::F64Bits(1.0000001_f64.to_bits()),
+            ScanLiteral::F64Bits(1.000_000_1_f64.to_bits()),
         )]);
         assert_ne!(float_baseline, float_mutated);
+
+        // binary literal: distinct from its UTF-8 spelling and from other bytes
+        let bytes_baseline = baseline_digest(&[ScanPredicate::Eq(
+            "service_name".to_string(),
+            ScanLiteral::Bytes(b"api".to_vec()),
+        )]);
+        assert_ne!(baseline, bytes_baseline);
+        let bytes_mutated = baseline_digest(&[ScanPredicate::Eq(
+            "service_name".to_string(),
+            ScanLiteral::Bytes(vec![0xff, 0x00, 0x01]),
+        )]);
+        assert_ne!(bytes_baseline, bytes_mutated);
     }
 
     #[test]
@@ -1203,7 +1037,6 @@ mod tests {
             scribe_cut: None,
             required_columns: &required_columns,
             predicates: &predicates,
-            reader_cut: &NORMATIVE_READER_CUT,
         });
         let cut = normative_scribe_cut();
         let with_cut = digest_of(&AssignmentDigestInput {
@@ -1216,7 +1049,6 @@ mod tests {
             scribe_cut: Some(&cut),
             required_columns: &required_columns,
             predicates: &predicates,
-            reader_cut: &NORMATIVE_READER_CUT,
         });
         assert_ne!(no_cut, with_cut);
 
@@ -1232,7 +1064,6 @@ mod tests {
             scribe_cut: Some(&mutated_cut),
             required_columns: &required_columns,
             predicates: &predicates,
-            reader_cut: &NORMATIVE_READER_CUT,
         });
         assert_ne!(with_cut, with_mutated_cut);
 
@@ -1256,7 +1087,6 @@ mod tests {
                 scribe_cut: Some(&cut),
                 required_columns: &reordered_columns,
                 predicates: &predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         );
 
@@ -1277,7 +1107,6 @@ mod tests {
                 scribe_cut: Some(&cut),
                 required_columns: &required_columns,
                 predicates: &widened_predicates,
-                reader_cut: &NORMATIVE_READER_CUT,
             })
         );
     }
@@ -1295,7 +1124,6 @@ mod tests {
             scribe_cut: None,
             required_columns: &required_columns,
             predicates: &predicates,
-            reader_cut: &NORMATIVE_READER_CUT,
         };
         assert!(matches!(
             assignment_authority_digest(std::slice::from_ref(&assignment)),

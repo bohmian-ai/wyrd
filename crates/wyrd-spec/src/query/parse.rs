@@ -171,7 +171,7 @@ impl Lexer<'_> {
         while self
             .bytes
             .get(self.pos)
-            .is_some_and(|byte| byte.is_ascii_whitespace())
+            .is_some_and(u8::is_ascii_whitespace)
         {
             self.pos += 1;
         }
@@ -240,36 +240,21 @@ impl Lexer<'_> {
         let start = self.pos;
         if self.bytes[self.pos] == b'-' {
             self.pos += 1;
-            if !self
-                .bytes
-                .get(self.pos)
-                .is_some_and(|byte| byte.is_ascii_digit())
-            {
+            if !self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
                 return Err(syntax("expected digit after '-'", start, "digit", "-"));
             }
         }
-        while self
-            .bytes
-            .get(self.pos)
-            .is_some_and(|byte| byte.is_ascii_digit())
-        {
+        while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
             self.pos += 1;
         }
 
         let mut is_float = false;
         if self.bytes.get(self.pos) == Some(&b'.')
-            && self
-                .bytes
-                .get(self.pos + 1)
-                .is_some_and(|byte| byte.is_ascii_digit())
+            && self.bytes.get(self.pos + 1).is_some_and(u8::is_ascii_digit)
         {
             is_float = true;
             self.pos += 1;
-            while self
-                .bytes
-                .get(self.pos)
-                .is_some_and(|byte| byte.is_ascii_digit())
-            {
+            while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
                 self.pos += 1;
             }
         }
@@ -279,7 +264,7 @@ impl Lexer<'_> {
         while self
             .bytes
             .get(unit_end)
-            .is_some_and(|byte| byte.is_ascii_alphabetic())
+            .is_some_and(u8::is_ascii_alphabetic)
         {
             unit_end += 1;
         }

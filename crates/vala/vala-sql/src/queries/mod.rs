@@ -12,6 +12,7 @@ pub mod audit_staging;
 pub mod cluster_nodes;
 pub mod file_list;
 pub mod forge_catalog_operator;
+pub mod forge_leader;
 pub mod forge_operations;
 pub mod forge_tasks;
 pub mod maintenance_leases;

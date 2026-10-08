@@ -2,6 +2,7 @@
 //!
 //! Load order: env overrides > TOML file > compiled defaults.
 
+use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fmt::{self, Debug, Formatter};
@@ -238,30 +239,10 @@ pub struct ForgeRuntimeConfig {
     /// set. Default 1.
     #[serde(default)]
     pub per_tenant_active_cap: Option<usize>,
-    /// Age (seconds) after which old Iceberg snapshots become eligible for
-    /// expiry. Must be positive when set. Default 432000 (120 hours).
-    #[serde(default)]
-    pub snapshot_retention_secs: Option<u64>,
-    /// Number of snapshots retained along each current/ref ancestry. Must be
-    /// positive and must not exceed the internal retained-snapshot traversal
-    /// cap. Default 1.
-    #[serde(default)]
-    pub retain_last: Option<usize>,
     /// Age (seconds) after which an unreferenced object may be deleted by
     /// orphan GC. Must be positive when set. Default 86400 (24 hours).
     #[serde(default)]
     pub orphan_gc_ttl_secs: Option<u64>,
-    /// Count of accumulated commits past `retain_last` that makes snapshot
-    /// expiry due on its own, independent of compaction backlog. Must be at
-    /// least 1 when set. Default 32.
-    #[serde(default)]
-    pub maintenance_trigger_snapshot_count: Option<usize>,
-    /// Oldest-retained-snapshot age (seconds) past which snapshot expiry
-    /// becomes due when at least one commit exists past `retain_last`. Paired
-    /// with `maintenance_trigger_snapshot_count` as a count-OR-interval
-    /// trigger. Must be positive when set. Default 3600 (1 hour).
-    #[serde(default)]
-    pub maintenance_trigger_interval_secs: Option<u64>,
     /// Maximum object-store listing pages one orphan-GC candidate scan walks
     /// before yielding cleanly to a successor run. Must be at least 1 when set.
     /// Default 1024.
@@ -271,8 +252,9 @@ pub struct ForgeRuntimeConfig {
     /// Partial. Must be positive when set. Default 120 (2 minutes).
     #[serde(default)]
     pub orphan_gc_run_budget_secs: Option<u64>,
-    /// Interval (seconds) between Forge maintenance scheduler ticks. Must be
-    /// positive when set. Default 60.
+    /// Interval (seconds) between the Forge leader's manifest-rewrite,
+    /// snapshot-expiry and cleanup passes. Must be positive when set.
+    /// Default 3600 (1 hour).
     #[serde(default)]
     pub maintenance_interval_secs: Option<u64>,
     /// Soft rewrite file target for every table that declares no
@@ -527,6 +509,18 @@ fn default_oracle_max_frame_bytes() -> usize {
     8 * 1024 * 1024
 }
 
+impl OracleRuntimeConfig {
+    /// Returns the total deadline a query without `deadline_ms` runs under.
+    ///
+    /// Boot resolves it once from this configuration for both the local Oracle
+    /// engine and the public forwarder, so neither path can fall back to the
+    /// built-in default while the other honors the configured value.
+    #[must_use]
+    pub const fn default_query_deadline(&self) -> Duration {
+        Duration::from_millis(self.default_query_deadline_ms)
+    }
+}
+
 impl Default for OracleRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -756,11 +750,10 @@ fn checked_floor_u32(value: f64, name: &str) -> Result<u32, String> {
     if !value.is_finite() || value < 0.0 {
         return Err(format!("{name} must be finite and non-negative"));
     }
-    let floored = value.floor();
-    if floored > f64::from(u32::MAX) {
-        return Err(format!("{name} exceeds u32"));
-    }
-    u32::try_from(floored as u64).map_err(|_| format!("{name} exceeds u32"))
+    value
+        .floor()
+        .to_u32()
+        .ok_or_else(|| format!("{name} exceeds u32"))
 }
 
 /// Converts and validates one measured class minimum.
@@ -801,9 +794,9 @@ fn proposal_u64(table: &toml::Table, path: &str) -> Result<u64, String> {
     let value = calibration_evidence_value(table, path)?;
     value
         .as_integer()
-        .or_else(|| value.as_float().map(|value| value as i64))
+        .or_else(|| value.as_float().and_then(|value| value.to_i64()))
         .filter(|value| *value > 0)
-        .map(|value| value as u64)
+        .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| format!("proposal.{path}.value must be positive"))
 }
 
@@ -1103,7 +1096,9 @@ impl BifrostRuntimeConfig {
 /// Oracle, and Forge in-process and opens no private socket. Peer mode is
 /// enabled by supplying both `address` and `tls_dir`, even for the first of
 /// several replicas; each replica publishes its own address through the
-/// existing fenced `vala.cluster_nodes` membership.
+/// existing fenced `vala.cluster_nodes` membership. A dedicated `forge-worker`
+/// opens no listener, so it takes `tls_dir` alone: its credentials only dial
+/// the elected Forge leader's peer route.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BifrostPeerConfig {
@@ -1173,13 +1168,35 @@ impl BifrostPeerConfig {
         }))
     }
 
-    /// Validates the explicit peer-mode inputs.
+    /// Validates the explicit peer-mode inputs for a process that does, or
+    /// does not, serve a peer listener.
+    ///
+    /// A listening target needs both `address` and `tls_dir` or neither. A
+    /// dial-only target (`listens == false`, the dedicated Forge worker) may
+    /// name `tls_dir` alone and never an `address`, because it publishes no
+    /// endpoint for anyone to dial.
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Invalid`] when only one of `address` and
-    /// `tls_dir` is supplied, or when `address` is not a bare `host:port`.
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Returns [`ConfigError::Invalid`] when a listening target supplies only
+    /// one of `address` and `tls_dir`, a dial-only target supplies an
+    /// `address`, `tls_dir` is empty, or `address` is not a bare `host:port`.
+    fn validate(&self, listens: bool) -> Result<(), ConfigError> {
+        if !listens {
+            if self.address.is_some() {
+                return Err(ConfigError::Invalid {
+                    message: "the forge-worker target serves no peer listener; \
+                              unset WYRD_PEER_ADDRESS and keep only WYRD_PEER_TLS_DIR"
+                        .to_owned(),
+                });
+            }
+            return match &self.tls_dir {
+                Some(tls_dir) if tls_dir.as_os_str().is_empty() => Err(ConfigError::Invalid {
+                    message: "WYRD_PEER_TLS_DIR must name a directory".to_owned(),
+                }),
+                _ => Ok(()),
+            };
+        }
         let (address, tls_dir) = match (&self.address, &self.tls_dir) {
             (None, None) => return Ok(()),
             (Some(address), Some(tls_dir)) => (address, tls_dir),
@@ -1631,13 +1648,6 @@ pub struct VerificationConfig {
     /// durable queue, so every replica may run them.
     #[serde(default = "default_verification_enabled")]
     pub enabled: bool,
-    /// Scribe-bearing gRPC endpoint Verifier results are published through.
-    ///
-    /// When unset, a process that hosts a Scribe and serves plaintext gRPC
-    /// publishes through its own listener; any other process runs no Verifier
-    /// runner until this is set.
-    #[serde(default)]
-    pub ingest_endpoint: Option<String>,
     /// Where the key-encryption keys that protect Operator connection
     /// credentials come from.
     #[serde(default)]
@@ -1650,11 +1660,10 @@ fn default_verification_enabled() -> bool {
 }
 
 impl Default for VerificationConfig {
-    /// The runtime is enabled and publishes through the local Scribe.
+    /// The runtime is enabled with the default Operator key source.
     fn default() -> Self {
         Self {
             enabled: default_verification_enabled(),
-            ingest_endpoint: None,
             operator_keys: OperatorKeysConfig::default(),
         }
     }
@@ -1958,11 +1967,10 @@ impl OperatorKeysConfig {
             );
         }
         match self.source {
-            OperatorKeySource::Env => Ok(()),
             OperatorKeySource::File if self.dir.is_none() => {
                 invalid("source = \"file\" requires dir (WYRD_OPERATOR_KEK_DIR)")
             }
-            OperatorKeySource::File => Ok(()),
+            OperatorKeySource::Env | OperatorKeySource::File => Ok(()),
             OperatorKeySource::Vault => {
                 let Some(vault) = &self.vault else {
                     return invalid(
@@ -2082,8 +2090,7 @@ impl MetricsConfig {
     #[must_use]
     pub fn is_public_bind(&self, http_bind: SocketAddr) -> bool {
         self.resolved_bind(http_bind)
-            .map(|addr| !addr.ip().is_loopback())
-            .unwrap_or(false)
+            .is_some_and(|addr| !addr.ip().is_loopback())
     }
 }
 
@@ -3203,11 +3210,6 @@ impl WyrdServerConfig {
             self.verification.enabled = parse_flag(&val, "WYRD_VERIFICATION_ENABLED")?;
         }
 
-        // verification.ingest_endpoint
-        if let Some(val) = env_opt("WYRD_VERIFICATION_INGEST_ENDPOINT")? {
-            self.verification.ingest_endpoint = Some(val);
-        }
-
         // verification.operator_keys (WYRD_OPERATOR_KEK_*)
         self.verification.operator_keys.apply_env()?;
 
@@ -3316,21 +3318,15 @@ impl WyrdServerConfig {
             self.workflow.validate()?;
         }
 
-        // Peer mode is explicit and all-or-nothing. A split Scribe or Oracle
-        // target cannot reach its counterpart in-process and needs it; a Forge
-        // worker keeps its durable assignment path and never opens the socket.
-        self.bifrost.peer.validate()?;
+        // Peer mode is explicit and all-or-nothing for a listening target. A
+        // split Scribe or Oracle target cannot reach its counterpart
+        // in-process and needs it; a Forge worker never opens the socket and
+        // takes only the credentials it dials the Forge leader with.
+        self.bifrost.peer.validate(serves_api)?;
         if self.role.requires_peer() && !self.bifrost.peer.is_enabled() {
             return Err(ConfigError::Invalid {
                 message: "split oracle and scribe targets require peer mode \
                           (WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR)"
-                    .to_owned(),
-            });
-        }
-        if !serves_api && self.bifrost.peer.is_enabled() {
-            return Err(ConfigError::Invalid {
-                message: "the forge-worker target serves no peer listener; \
-                          unset WYRD_PEER_ADDRESS and WYRD_PEER_TLS_DIR"
                     .to_owned(),
             });
         }
@@ -3702,17 +3698,15 @@ where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
 {
-    env_opt(key)?
-        .map(|value| {
-            value
-                .parse::<T>()
-                .map(Some)
-                .map_err(|error| ConfigError::BadEnvVar {
-                    key: key.to_owned(),
-                    message: error.to_string(),
-                })
-        })
-        .unwrap_or(Ok(current))
+    env_opt(key)?.map_or(Ok(current), |value| {
+        value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|error| ConfigError::BadEnvVar {
+                key: key.to_owned(),
+                message: error.to_string(),
+            })
+    })
 }
 
 /// Load Wyrd's own signing-key PEM from the environment.
@@ -4027,11 +4021,7 @@ mod tests {
         let config = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
         let forge = &config.forge;
         assert_eq!(forge.per_tenant_active_cap, None);
-        assert_eq!(forge.snapshot_retention_secs, None);
-        assert_eq!(forge.retain_last, None);
         assert_eq!(forge.orphan_gc_ttl_secs, None);
-        assert_eq!(forge.maintenance_trigger_snapshot_count, None);
-        assert_eq!(forge.maintenance_trigger_interval_secs, None);
         assert_eq!(forge.orphan_gc_max_list_pages, None);
         assert_eq!(forge.orphan_gc_run_budget_secs, None);
         assert_eq!(forge.maintenance_interval_secs, None);
@@ -4041,26 +4031,18 @@ mod tests {
     /// `config.forge`.
     #[test]
     fn forge_operational_fields_parse_from_toml() {
-        let toml = r#"
+        let toml = r"
 [forge]
 per_tenant_active_cap = 2
-snapshot_retention_secs = 7200
-retain_last = 3
 orphan_gc_ttl_secs = 3600
-maintenance_trigger_snapshot_count = 8
-maintenance_trigger_interval_secs = 900
 orphan_gc_max_list_pages = 64
 orphan_gc_run_budget_secs = 30
 maintenance_interval_secs = 45
-"#;
+";
         let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("forge section parses");
         let forge = &config.forge;
         assert_eq!(forge.per_tenant_active_cap, Some(2));
-        assert_eq!(forge.snapshot_retention_secs, Some(7200));
-        assert_eq!(forge.retain_last, Some(3));
         assert_eq!(forge.orphan_gc_ttl_secs, Some(3600));
-        assert_eq!(forge.maintenance_trigger_snapshot_count, Some(8));
-        assert_eq!(forge.maintenance_trigger_interval_secs, Some(900));
         assert_eq!(forge.orphan_gc_max_list_pages, Some(64));
         assert_eq!(forge.orphan_gc_run_budget_secs, Some(30));
         assert_eq!(forge.maintenance_interval_secs, Some(45));
@@ -4413,6 +4395,7 @@ maintenance_interval_secs = 45
 
     /// Builds one complete schema-v2 profile for activation-policy tests.
     fn complete_oracle_calibration(status: &str) -> String {
+        use std::fmt::Write as _;
         let mut profile = format!(
             r#"schema_version = 2
 status = "{status}"
@@ -4452,8 +4435,9 @@ minimum_slots = 2
 "#
         );
         for path in ORACLE_CALIBRATION_PROPOSALS {
-            profile.push_str(&format!(
-                "\n[proposal.{path}]\nvalue = {}\nevidence_case_id = \"case-{path}\"\n",
+            let _ = writeln!(
+                profile,
+                "\n[proposal.{path}]\nvalue = {}\nevidence_case_id = \"case-{path}\"",
                 // The Analytical per-tenant cap is one Analytical query's slot
                 // cost, which is the smallest value the class can grant.
                 if *path == "distribution.max_workers_per_query"
@@ -4463,12 +4447,13 @@ minimum_slots = 2
                 } else {
                     1
                 }
-            ));
+            );
         }
         for path in ORACLE_CALIBRATION_MEASUREMENTS {
-            profile.push_str(&format!(
-                "\n[measurements.{path}]\nvalue = 1\nevidence_case_id = \"case-{path}\"\n"
-            ));
+            let _ = writeln!(
+                profile,
+                "\n[measurements.{path}]\nvalue = 1\nevidence_case_id = \"case-{path}\""
+            );
         }
         profile
     }
@@ -4726,6 +4711,54 @@ minimum_slots = 2
         );
     }
 
+    /// A dedicated Forge worker takes peer credentials without an address and
+    /// reads them to dial the leader; a listening target may not.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a dial-only worker is refused or reads no bundle, or when a
+    /// listening target accepts credentials without an address.
+    #[test]
+    fn forge_worker_takes_dial_only_peer_credentials() {
+        let dir = tempfile::tempdir().expect("peer TLS directory");
+        for (name, contents) in [("ca.crt", "ca"), ("tls.crt", "leaf"), ("tls.key", "key")] {
+            std::fs::write(dir.path().join(name), contents).expect("peer TLS file");
+        }
+        let dial_only = BifrostPeerConfig {
+            tls_dir: Some(dir.path().to_path_buf()),
+            ..BifrostPeerConfig::default()
+        };
+        let mut config = WyrdServerConfig {
+            role: BifrostTarget::ForgeWorker,
+            ..WyrdServerConfig::default()
+        };
+        config.bifrost.peer = dial_only.clone();
+        config
+            .validate()
+            .expect("a Forge worker dials the leader with credentials alone");
+        assert_eq!(config.bifrost.peer.advertised_uri(), None);
+        let bundle = config
+            .bifrost
+            .peer
+            .read_bundle()
+            .expect("the dial-only bundle reads")
+            .expect("dial-only credentials are peer mode");
+        assert_eq!(bundle.certificate_chain, b"leaf");
+
+        config.bifrost.peer.tls_dir = Some(PathBuf::new());
+        assert!(
+            config.validate().is_err(),
+            "an empty dial-only directory is refused"
+        );
+
+        config.role = BifrostTarget::Server;
+        config.bifrost.peer = dial_only;
+        assert!(
+            config.validate().is_err(),
+            "a listening target needs an address with its credentials"
+        );
+    }
+
     /// Proves the canonical peer environment names land on the validated fields.
     #[test]
     fn peer_environment_names_land_on_validated_fields() {
@@ -4837,7 +4870,7 @@ minimum_slots = 2
         assert_eq!(geometry.shard_count(), 1);
         assert_eq!(geometry.shard_generation_rotation_bytes(), 512 * MIB);
         assert_eq!(geometry.wal_segment_bytes(), 512 * MIB);
-        assert_eq!(geometry.generation_max_age(), Duration::from_secs(600));
+        assert_eq!(geometry.generation_max_age(), Duration::from_mins(10));
         assert_eq!(geometry.staging_target_file_size_bytes(), 512 * MIB);
 
         // Staging assembles to the smaller of the on-disk size and Forge's
@@ -4968,9 +5001,9 @@ minimum_slots = 2
 
     #[test]
     fn unknown_toml_field_fails_parse_toml() {
-        let toml = r#"
+        let toml = r"
             port = 9090
-        "#;
+        ";
         let err = from_toml_str_with_dev_oracle_opt_in(toml).expect_err("unknown field must fail");
         assert!(
             matches!(err, ConfigError::ParseToml { .. }),
@@ -5062,10 +5095,10 @@ minimum_slots = 2
 
     #[test]
     fn shutdown_drain_ms_over_cap_invalid() {
-        let toml = r#"
+        let toml = r"
             [shutdown]
             drain_ms = 999999
-        "#;
+        ";
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("must fail");
         assert!(
@@ -5092,10 +5125,10 @@ minimum_slots = 2
 
     #[test]
     fn tick_ms_too_low_invalid() {
-        let toml = r#"
+        let toml = r"
             [readiness]
             tick_ms = 10
-        "#;
+        ";
         let cfg = from_toml_str_with_dev_oracle_opt_in(toml).expect("parses ok");
         let err = cfg.validate().expect_err("must fail");
         assert!(
@@ -6288,17 +6321,17 @@ api_key = "plaintext"
                 c.max_dependency_edges_per_run = 0;
             }),
             ("max_resolved_graph_bytes", |c| {
-                c.max_resolved_graph_bytes = 0
+                c.max_resolved_graph_bytes = 0;
             }),
             ("max_input_bytes", |c| c.max_input_bytes = 0),
             ("max_step_result_bytes", |c| c.max_step_result_bytes = 0),
             ("max_run_bytes", |c| c.max_run_bytes = 0),
             ("default_timeout_seconds", |c| {
-                c.default_timeout_seconds = 7201
+                c.default_timeout_seconds = 7201;
             }),
             ("max_active_per_tenant", |c| c.max_active_per_tenant = 33),
             ("max_retained_per_tenant", |c| {
-                c.max_retained_per_tenant = 129
+                c.max_retained_per_tenant = 129;
             }),
             ("max_step_result_bytes", |c| c.max_run_bytes = 1024),
         ];

@@ -40,7 +40,7 @@ use crate::support::JourneyError;
 const MEMBERSHIP_DEADLINE: Duration = Duration::from_secs(45);
 
 /// How long one pod may take to report every readiness probe passing.
-const READY_DEADLINE: Duration = Duration::from_secs(60);
+const READY_DEADLINE: Duration = Duration::from_mins(1);
 
 /// Interval between readiness observations.
 const READY_POLL: Duration = Duration::from_millis(100);
@@ -53,7 +53,7 @@ const READY_POLL: Duration = Duration::from_millis(100);
 const STATEMENT_DEADLINE_MS: i64 = 240_000;
 
 /// [`STATEMENT_DEADLINE_MS`] as the bound on waiting for an armed pause.
-const STATEMENT_DEADLINE: Duration = Duration::from_millis(240_000);
+const STATEMENT_DEADLINE: Duration = Duration::from_mins(4);
 
 /// How long a statement's graph may take to settle after its terminal.
 const SETTLEMENT_WAIT: Duration = Duration::from_secs(30);
@@ -512,7 +512,6 @@ impl PeerCluster {
                 ],
                 tenant: self.tenant(),
                 physical_layout: None,
-                audit: None,
             })
             .await?;
         Ok(())
@@ -878,15 +877,9 @@ impl PeerCluster {
     /// active query cuts.
     ///
     /// `total` and `latest_cut_fingerprint` are shared by every pod; the
-    /// active cuts are the ones pod `index`'s running-query registry retains.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when the pod is not running.
-    pub(crate) fn physical_build_evidence(
-        &self,
-        index: usize,
-    ) -> Result<PhysicalBuildEvidence, JourneyError> {
+    /// active cuts are the ones pod `index`'s running-query registry retains;
+    /// a pod that is not running contributes none.
+    pub(crate) fn physical_build_evidence(&self, index: usize) -> PhysicalBuildEvidence {
         let (total, latest_cut_fingerprint) =
             vala_bifrost_redux::oracle::physical_build_observation_for_test();
         let tenant = self.tenant();
@@ -905,11 +898,11 @@ impl PeerCluster {
             }
             Err(_) => Vec::new(),
         };
-        Ok(PhysicalBuildEvidence {
+        PhysicalBuildEvidence {
             total,
             latest_cut_fingerprint,
             active_cut_fingerprints,
-        })
+        }
     }
 
     /// Arms pod `index`'s one-shot refusal of its next distributed physical build.
@@ -1620,6 +1613,7 @@ async fn drive_sql(
         .query_sql(
             context,
             wyrd_spec::vala::api::BifrostQueryRequest {
+                params: Vec::new(),
                 sql,
                 deadline_ms: Some(STATEMENT_DEADLINE_MS),
             },

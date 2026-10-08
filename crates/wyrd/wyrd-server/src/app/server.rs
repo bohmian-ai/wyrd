@@ -17,7 +17,7 @@ use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{
     TaskExit, TaskId, classify_first_exit_with_shutdown, drain_with_shutdown_hooks, fallible_task,
-    worker_task,
+    restarting_worker, worker_task,
 };
 use crate::boot::{
     ServerBootError, check_card_recovery_pool, spawn_maintenance_scheduler, spawn_storage_sweeper,
@@ -45,14 +45,24 @@ fn shutdown_deadline_active(deadline: std::time::Instant) -> bool {
 /// only on the clean path so a lifecycle failure can never be mistaken for a
 /// completed drain. A supervisor terminal message and a Bifrost lifecycle error
 /// both remain terminal, with the Bifrost error taking precedence because it
-/// describes the state the process is actually leaving behind.
+/// describes the state the process is actually leaving behind. When both are
+/// present the supervisor message is appended to the Bifrost error, so the
+/// exit reason still names the failure that triggered the shutdown.
+///
+/// # Errors
+///
+/// Returns [`BootExit::Other`] when either a supervisor terminal message or a
+/// Bifrost lifecycle error is present.
 fn server_shutdown_result(
     terminal: Option<String>,
     bifrost_error: Option<wyrd_spec::vala::error::BifrostError>,
     report: BifrostShutdownReport,
 ) -> Result<BifrostShutdownReport, BootExit> {
     match (terminal, bifrost_error) {
-        (_, Some(error)) => Err(BootExit::Other(Box::new(error))),
+        (Some(message), Some(error)) => Err(BootExit::Other(
+            format!("{error}; shutdown was triggered by: {message}").into(),
+        )),
+        (None, Some(error)) => Err(BootExit::Other(Box::new(error))),
         (Some(message), None) => Err(BootExit::Other(
             Box::<dyn std::error::Error + Send + Sync>::from(message),
         )),
@@ -310,20 +320,17 @@ impl WyrdServer {
         // public sockets. Binding it here is what lets a bind failure surface
         // as a boot error and what lets readiness wait on the address the
         // listener actually holds rather than the configured one.
-        let (peer_listener, peer_addr) = match self.peer_router.is_some() {
-            true => {
-                let bind = self.config.bifrost.peer.bind;
-                let listener = TcpListener::bind(bind).await.map_err(|e| {
-                    BootExit::Other(
-                        format!("Bifrost peer listener failed to bind {bind}: {e}").into(),
-                    )
-                })?;
-                let addr = listener
-                    .local_addr()
-                    .map_err(|e| BootExit::Other(Box::new(e)))?;
-                (Some(listener), Some(addr))
-            }
-            false => (None, None),
+        let (peer_listener, peer_addr) = if self.peer_router.is_some() {
+            let bind = self.config.bifrost.peer.bind;
+            let listener = TcpListener::bind(bind).await.map_err(|e| {
+                BootExit::Other(format!("Bifrost peer listener failed to bind {bind}: {e}").into())
+            })?;
+            let addr = listener
+                .local_addr()
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
+            (Some(listener), Some(addr))
+        } else {
+            (None, None)
         };
 
         Ok(BoundServer {
@@ -439,18 +446,15 @@ impl BoundServer {
 
     /// Compose this process's verification runtime from its configuration.
     ///
-    /// Results publish through `verification.ingest_endpoint` when set, and
-    /// otherwise through this process's own plaintext gRPC listener when it
-    /// hosts a Scribe. The drain grace is clipped inside the server's shutdown
-    /// budget so released leases settle before teardown aborts the task.
+    /// Results are written through the process's capture writer. The drain
+    /// grace is clipped inside the server's shutdown budget so released
+    /// leases settle before teardown aborts the task.
     fn verification_runtime(&self) -> Option<VerificationRuntime> {
         let limits = RuntimeLimits::default()
             .within_server_drain(Duration::from_millis(self.config.shutdown.drain_ms));
-        let mut builder = VerificationRuntime::builder(&self.state).limits(limits);
-        if let Some(endpoint) = &self.config.verification.ingest_endpoint {
-            builder = builder.ingest_endpoint(endpoint.clone());
-        }
-        builder.local_ingest(self.grpc_addr).build()
+        VerificationRuntime::builder(&self.state)
+            .limits(limits)
+            .build()
     }
 
     /// The bound gRPC address, or `None` when the mode does not serve gRPC.
@@ -499,6 +503,10 @@ impl BoundServer {
     /// Returns [`BootExit::Other`] on a terminal task error, a Bifrost
     /// lifecycle failure, or if the process-global metrics recorder fails to
     /// install.
+    ///
+    /// # Panics
+    /// Panics if a bound peer listener has no peer router. Binding sets both
+    /// together, so this is an invariant violation, not a runtime condition.
     pub async fn run(mut self) -> Result<BifrostShutdownReport, BootExit> {
         // A production deployment without the Wyrd operator pool cannot run the
         // Card recovery sweep, so stale precommits would leak indefinitely.
@@ -564,7 +572,7 @@ impl BoundServer {
                     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
-                            _ = scanner_shutdown.cancelled() => break,
+                            () = scanner_shutdown.cancelled() => break,
                             _ = ticks.tick() => scanner.check_age(std::time::Instant::now()),
                         }
                     }
@@ -581,9 +589,9 @@ impl BoundServer {
                     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tokio::select! {
-                            _ = shutdown.cancelled() => break,
+                            () = shutdown.cancelled() => break,
                             _ = ticks.tick() => tokio::select! {
-                                _ = shutdown.cancelled() => break,
+                                () = shutdown.cancelled() => break,
                                 result = scribe.publish_due() => if let Err(error) = result {
                                     tracing::warn!(%error, "Scribe due publication failed; next tick retries");
                                 },
@@ -619,24 +627,41 @@ impl BoundServer {
                 }
             }));
         }
-        // One supervised Redux Forge worker owns compaction, expiry, reconciliation,
-        // live-set rebuild, and orphan GC for this process.
-        if let Some(scheduler) = spawn_maintenance_scheduler(&self.state, shutdown.clone())
-            .map_err(|e| BootExit::Other(Box::new(e)))?
-        {
-            set.spawn(fallible_task(
-                TaskId::Worker("maintenance_scheduler"),
-                scheduler,
-            ));
+        // One supervised Redux Forge scheduler owns compaction, expiry,
+        // reconciliation, live-set rebuild, and orphan GC for this process. A
+        // Forge failure costs only maintenance on this pod, so the scheduler and
+        // the embedded worker restart in place instead of stopping the API.
+        if self.state.forge_handle().is_some() {
+            let state = self.state.clone();
+            let scheduler = restarting_worker(
+                "maintenance_scheduler",
+                shutdown.clone(),
+                move |token| {
+                    spawn_maintenance_scheduler(&state, token)?.ok_or_else(|| {
+                        ServerBootError::ForgeSchedulerRequired {
+                            detail: "Forge maintenance owner is no longer composed".to_owned(),
+                        }
+                    })
+                },
+                vala_bifrost_redux::forge::ForgeTelemetry::record_scheduler_restart,
+            )
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
+            set.spawn(scheduler);
         }
         // `All` owns one bounded Forge worker in addition to the scheduler;
         // `Server` intentionally schedules maintenance without executing it.
         // The dedicated `ForgeWorker` process is composed by
         // `run_forge_worker_process` and never reaches this serving owner.
         if self.config.role == BifrostTarget::All {
-            let worker = crate::boot::spawn_forge_worker(&self.state, shutdown.clone())
-                .map_err(|e| BootExit::Other(Box::new(e)))?;
-            set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
+            let state = self.state.clone();
+            let worker = restarting_worker(
+                "forge_worker",
+                shutdown.clone(),
+                move |token| crate::boot::spawn_forge_worker(&state, token),
+                vala_bifrost_redux::forge::ForgeTelemetry::record_worker_restart,
+            )
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
+            set.spawn(worker);
         }
 
         if let Some(operator) = self.state.postgres.operator_pool() {
@@ -804,15 +829,6 @@ impl BoundServer {
         let gateway_drained = tokio::time::timeout_at(deadline, self.state.gateway_tasks.wait())
             .await
             .is_ok();
-        // Drained calls have enqueued their capture; publish it within the
-        // same deadline. Evidence still buffered at the deadline may be lost,
-        // which capture permits before Scribe acknowledgement.
-        if tokio::time::timeout_at(deadline, self.state.gateway_capture.shutdown())
-            .await
-            .is_err()
-        {
-            tracing::warn!("gateway capture did not drain before the shutdown deadline");
-        }
         let terminal = match terminal {
             Some(message) => Some(message),
             None if !workflows_drained => {
@@ -890,6 +906,21 @@ impl BoundServer {
                 }),
             )
         };
+        // Gate has closed and Scribe has drained, so no acknowledgement can
+        // still stage a run request; write what the run outbox holds. Losses
+        // are counted and logged by the outbox.
+        if let Some(outbox) = self.state.bifrost.observation_runs() {
+            outbox.shutdown(deadline).await;
+        }
+        // Every request has finished and Oracle has drained, so no decision
+        // can still be staged; commit what the shared outbox holds.
+        let uncommitted = self.state.audit_outbox.shutdown(deadline).await;
+        if uncommitted != 0 {
+            tracing::warn!(
+                uncommitted,
+                "audit outbox did not drain before the shutdown deadline"
+            );
+        }
 
         tracing::info!("wyrd-server shutdown complete");
         server_shutdown_result(terminal, bifrost_shutdown_error, report)
@@ -938,7 +969,7 @@ mod pg_tests {
     use crate::config::WyrdServerConfig;
     use crate::postgres::ServerPostgres;
 
-    async fn test_state_with_auth() -> AppState {
+    fn test_state_with_auth() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
@@ -997,7 +1028,7 @@ mod pg_tests {
             // readiness, transport, Oracle, and Scribe shutdown phases.
             config.role = BifrostTarget::Server;
             let probe = ShutdownTestProbe::new(stall);
-            let server = WyrdServer::new(config, test_state_with_auth().await)
+            let server = WyrdServer::new(config, test_state_with_auth())
                 .expect("test server builds")
                 .with_shutdown_probe(probe.clone())
                 .spawn_worker("shutdown_trigger", async {});
@@ -1033,11 +1064,11 @@ mod pg_tests {
         let mut config = WyrdServerConfig::default();
         config.metrics.enabled = false;
 
-        let state1 = test_state_with_auth().await;
+        let state1 = test_state_with_auth();
         let server1 = WyrdServer::new(config.clone(), state1)
             .expect("first WyrdServer construction succeeds");
 
-        let state2 = test_state_with_auth().await;
+        let state2 = test_state_with_auth();
         let server2 =
             WyrdServer::new(config, state2).expect("second WyrdServer construction succeeds");
 
@@ -1047,7 +1078,8 @@ mod pg_tests {
         drop(server2);
     }
 
-    /// Preserves an observable Bifrost lifecycle failure after the required abort.
+    /// Preserves an observable Bifrost lifecycle failure after the required
+    /// abort, together with the supervisor failure that triggered it.
     #[tokio::test]
     async fn bound_server_run_preserves_bifrost_shutdown_failure_after_abort() {
         let result = server_shutdown_result(
@@ -1061,6 +1093,9 @@ mod pg_tests {
         else {
             panic!("Bifrost lifecycle failure must use the runtime error channel");
         };
-        assert_eq!(error.to_string(), "Scribe role unavailable");
+        assert_eq!(
+            error.to_string(),
+            "Scribe role unavailable; shutdown was triggered by: worker exited"
+        );
     }
 }

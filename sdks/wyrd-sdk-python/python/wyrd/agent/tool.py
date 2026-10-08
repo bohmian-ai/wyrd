@@ -10,7 +10,9 @@ from contextlib import contextmanager
 from typing import Any
 
 from .._schema import annotation_to_schema as _annotation_to_schema
-from .._wyrd.tool import (
+
+# The native ``_wyrd.tool`` submodule is private and has no stub.
+from .._wyrd.tool import (  # ty: ignore[unresolved-import]
     _pop_tool_registry_scope,
     _push_tool_registry_scope,
     _register_tool,
@@ -18,7 +20,11 @@ from .._wyrd.tool import (
 
 
 class _ToolCallable:
-    """User-visible decorated callable."""
+    """Callable returned by ``tool()`` and ``Agent.as_tool()``.
+
+    Calling it calls ``fn``. ``name``, ``description``, ``input_schema``, and
+    ``output_schema`` are what the model sees when the tool is attached.
+    """
 
     def __init__(
         self,
@@ -47,10 +53,31 @@ def tool(
     name: str | None = None,
     description: str | None = None,
 ):
-    """Decorate and register a runtime-local tool."""
+    """Decorate a function as a runtime-local tool and register it.
+
+    The input schema comes from the parameters' annotations (parameters without
+    defaults are required) and the output schema from the return annotation.
+    The model's arguments are passed as keyword arguments, and the return value
+    must be JSON-compatible. The returned callable still calls ``fn`` directly.
+    Registration goes to the innermost ``local_registry()`` on this thread, or
+    the process-wide registry outside one.
+
+    Args:
+        fn: the function to decorate. Omitted, returns a decorator, so both
+            ``@tool`` and ``@tool(name=...)`` work.
+        name: the tool name the model sees. Omitted, ``fn.__name__``.
+        description: the description the model sees. Omitted, ``fn``'s
+            docstring, or ``""`` without one.
+
+    Raises:
+        WyrdError: ``WYRD_TOOL_409_NAME_TAKEN`` when the active registry
+            already holds a tool with that name.
+    """
 
     def wrap(f: Callable) -> _ToolCallable:
-        tool_name = name or f.__name__
+        tool_name = name or getattr(f, "__name__", None)
+        if not tool_name:
+            raise TypeError(f"tool() needs name= for a callable without __name__: {f!r}")
         tool_description = description or (inspect.getdoc(f) or "").strip()
         input_schema = _schema_from_signature(f)
         output_schema = _schema_from_return(f)
@@ -64,6 +91,14 @@ def tool(
 
 @contextmanager
 def local_registry():
+    """Scope tool registration to a temporary, thread-local registry.
+
+    Tools decorated inside the ``with`` block register into a fresh registry
+    that is discarded on exit, so names may repeat across blocks (useful in
+    tests). Nested blocks stack. ``Agent.from_yaml()`` and
+    ``Agent.model_validate_json()`` still resolve tool names against the
+    process-wide registry.
+    """
     _push_tool_registry_scope()
     try:
         yield

@@ -75,17 +75,16 @@ If a tenant has redaction enabled (server-side policy), Scribe zeroes the sensit
 
 ## Tenant and correlation stamping
 
-Gate stamps:
+Scribe stamps, once per batch at admission:
 
-- `wyrd_event_time`: first observation timestamp in the batch (or `wyrd_ingested_at` if absent).
-- `wyrd_batch_id`: UUIDv7 unique per batch.
+- `wyrd_ingested_at`: when Wyrd accepted the batch, read once from PostgreSQL (`statement_timestamp()`) and identical on every row of the batch. The same value is stored on the batch's durable commit fence. A caller can never supply it.
+- `wyrd_event_time`: when the observed thing happened. A row may supply it; the value must fall inside the acceptance window around `wyrd_ingested_at`. A row that supplies none gets `wyrd_ingested_at`.
+- `wyrd_request_id`: the request that wrote the row, for point lookups and joins to audit.
 - `run_id`, `card_uid`, `principal_id`: from the row's optional `Correlation` and the authenticated principal.
 
-Scribe stamps:
+The batch's `wyrd_batch_id` is the request's idempotency key; it is not stored on rows.
 
-- `wyrd_ingested_at`: wall clock at seal time.
-
-Callers cannot override system columns. Any batch that contains rows with system column values set is rejected with `400 WYRD_VALA_400_SYSTEM_COLUMN_VIOLATION`.
+Callers cannot override the other system columns. Any batch that contains rows with system column values set is rejected with `400 WYRD_VALA_400_SYSTEM_COLUMN_VIOLATION`.
 
 ## Schema validation
 

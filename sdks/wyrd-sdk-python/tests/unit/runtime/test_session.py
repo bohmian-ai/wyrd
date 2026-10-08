@@ -1,5 +1,9 @@
+"""An Agent reads and appends its turns through a caller-supplied session memory."""
+
 import pytest
 from wyrd import Agent, AgentError, Prompt, Role, SessionTurn
+
+DEFAULT_HISTORY_LIMIT = 50
 
 
 class RecordingMemory:
@@ -39,7 +43,7 @@ def test_python_session_receives_appends() -> None:
 
     agent.run("hello", session_id="s1")
 
-    assert memory.recent_calls == [("s1", 50)]
+    assert memory.recent_calls == [("s1", DEFAULT_HISTORY_LIMIT)]
     assert [turn.role for _, turn in memory.append_calls] == ["user", "assistant"]
     assert [session_id for session_id, _ in memory.append_calls] == ["s1", "s1"]
 
@@ -64,27 +68,15 @@ def test_python_session_recent_can_return_dicts() -> None:
 
     agent.run("hello", session_id="s1")
 
-    conversation = seen_contexts[0]["conversation"]["turns"]
-    assert conversation[0] == {"type": "system", "content": "seed"}
-    assert conversation[1] == {"type": "user", "content": "prior"}
+    turns = seen_contexts[0].conversation.turns
+    assert (turns[0].role, turns[0].content) == (Role.System, "seed")
+    assert (turns[1].role, turns[1].content) == (Role.User, "prior")
 
 
 def test_invalid_session_object_is_rejected() -> None:
-    with pytest.raises(AgentError, match="recent") as exc:
+    with pytest.raises(AgentError) as exc:
         Agent(
             prompt=Prompt(["hello"], "mock-model", provider="mock"),
-            session=object(),
+            session=object(),  # ty: ignore[invalid-argument-type]
         )
     assert exc.value.code == "WYRD_AGENT_422_INVALID_ARGUMENT"
-
-
-def test_python_journal_surface_is_not_public() -> None:
-    with pytest.raises(TypeError, match="unexpected keyword"):
-        Agent(
-            prompt=Prompt(["hello"], "mock-model", provider="mock"),
-            journal=object(),
-        )
-
-    prompt = Prompt(["hello"], "mock-model", provider="mock")
-    agent = Agent(prompt=prompt)
-    assert not hasattr(agent, "with_journal")

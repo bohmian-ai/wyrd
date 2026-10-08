@@ -311,10 +311,18 @@ fn scrape_staging(
 /// the staging owner, the persisted ready time, or the committed files.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn staged_backlog_survives_abrupt_restart() {
-    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
-        .await
-        .expect("the one-pod mixed cluster starts");
+    // The insertion counter is pod-wide, so the tenant's audit table must not
+    // insert rows inside the resend window.
+    let mut cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::one_mixed().without_audit_publication_for_test(),
+    )
+    .await
+    .expect("the one-pod mixed cluster starts");
     let telemetry = cluster.telemetry().clone();
     let tenant = cluster.data_tenant_id();
     let name = unique_table("staged_restart");
@@ -444,6 +452,10 @@ async fn staged_backlog_survives_abrupt_restart() {
 /// durable fact observed beside it.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn scribe_hot_path_telemetry_reconciles() {
     let (_telemetry_guard, telemetry) =
         shared_process_telemetry_for_test().expect("process production telemetry");
@@ -527,9 +539,14 @@ async fn scribe_hot_path_telemetry_reconciles() {
         "the write traces carry each request's batch id"
     );
     print_trace(&written, &writes[0].trace_id, "write_success");
+    // The ambient WYRD_LOG filter decides whether DEBUG spans are captured, so
+    // the level is read from each span rather than inferred from its absence.
+    let wal_appends = spans_named(&written, "bifrost.scribe.wal.append");
     assert!(
-        spans_named(&written, "bifrost.scribe.wal.append").is_empty(),
-        "per-append WAL spans are DEBUG detail, not routine operation traces"
+        wal_appends
+            .iter()
+            .all(|span| attribute(span, "level") == Some("DEBUG")),
+        "per-append WAL spans are DEBUG detail, not routine operation traces: {wal_appends:?}"
     );
     assert_no_routine_info(&written, "a successful write");
 

@@ -66,6 +66,10 @@ mod pg_tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed MCP journey lane"]
     async fn agent_administers_redacted_gateway_configuration() -> Result<(), McpJourneyError> {
+        // The scoped write tool is the managed-secret submission path: the
+        // same tool, a write-only source, and a unit view in every answer.
+        const SUBMITTED: &str = "sk-live-mcp-submission";
+        const ROTATED: &str = "sk-live-mcp-rotation";
         let server = WyrdTestServer::start_bound().await?;
         let admin = server
             .bootstrap_user("mcp-gateway-admin", &["admin"])
@@ -74,7 +78,7 @@ mod pg_tests {
             .jwt()
             .ok_or("admin bootstrap issues a jwt")?
             .to_owned();
-        let gateway = Gateway::new(http_client(&server, &admin_jwt)?);
+        let gateway = Gateway::with_client(http_client(&server, &admin_jwt)?);
         let credential_admin = CredentialWriter::new(http_client(&server, &admin_jwt)?);
         credential_admin
             .put_credential(&serde_json::from_value(serde_json::json!({
@@ -144,10 +148,6 @@ mod pg_tests {
         )?;
         assert_eq!(credential, credentials["items"][0]);
 
-        // The scoped write tool is the managed-secret submission path: the
-        // same tool, a write-only source, and a unit view in every answer.
-        const SUBMITTED: &str = "sk-live-mcp-submission";
-        const ROTATED: &str = "sk-live-mcp-rotation";
         let submit = |secret: &'static str| {
             let client = &client;
             async move {

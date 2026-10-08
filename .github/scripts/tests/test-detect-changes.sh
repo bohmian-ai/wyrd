@@ -88,16 +88,16 @@ else
 fi
 rm -f "$metadata_failure" "$metadata_failure.files"
 
-# A package the lane map does not own must not produce an empty test plan.
+# A package outside every family directory must not produce an empty test plan.
 orphan="$(mktemp -d)"
 cat > "$orphan/metadata.json" <<JSON
 {"workspace_root": "$(git rev-parse --show-toplevel)",
  "workspace_members": ["orphan"],
  "packages": [{"id": "orphan", "name": "orphan",
-   "manifest_path": "$(git rev-parse --show-toplevel)/crates/shared/orphan/Cargo.toml",
+   "manifest_path": "$(git rev-parse --show-toplevel)/crates/orphan/Cargo.toml",
    "dependencies": []}]}
 JSON
-printf '%s\n' "crates/shared/orphan/src/lib.rs" > "$orphan/files"
+printf '%s\n' "crates/orphan/src/lib.rs" > "$orphan/files"
 WYRD_CARGO_METADATA="$orphan/metadata.json" WYRD_CHANGED_FILES="$orphan/files" \
   GITHUB_OUTPUT="$orphan/outputs" bash "$DETECT" > /dev/null
 if grep -qx 'full_gate=true' "$orphan/outputs"; then
@@ -185,8 +185,7 @@ job() {
 ci_job="$(job lints-test.yml ci)"
 if grep -q 'timed gate$' <<< "$ci_job" \
   && grep -q 'timed check$' <<< "$ci_job" \
-  && grep -q 'timed check:client-tier$' <<< "$ci_job" \
-  && grep -q 'timed check:pyo3-scope$' <<< "$ci_job" \
+  && grep -q 'timed check:deps$' <<< "$ci_job" \
   && grep -q 'for lane in $CI_LANES' <<< "$ci_job" \
   && ! grep -q 'test:rust' <<< "$ci_job" \
   && grep -q 'WYRD_TEST_PACKAGES' <<< "$ci_job"; then

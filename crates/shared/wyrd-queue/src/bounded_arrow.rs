@@ -30,6 +30,10 @@ pub struct ArrowIpcMaterialFacts {
 
 /// A checked allocation plan for one simultaneous Arrow normalization and IPC result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "every field is a byte count; the shared suffix names the unit"
+)]
 pub struct ArrowIpcMaterialPlan {
     /// Input bytes that remain live through construction.
     retained_input_bytes: usize,
@@ -81,7 +85,7 @@ impl ArrowIpcMaterialPlan {
             ipc_output_bytes,
         ]
         .into_iter()
-        .try_fold(0usize, |sum, bytes| sum.checked_add(bytes))
+        .try_fold(0usize, usize::checked_add)
         .ok_or(ArrowIpcMaterialError::Overflow)?;
 
         Ok(Self {

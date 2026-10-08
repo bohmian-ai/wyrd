@@ -5,9 +5,7 @@
 //! reading a journey does not mean reading this file first. Contains no
 //! tests.
 
-use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, Int64Array, StringArray, TimestampMicrosecondArray,
-};
+use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use chrono::Utc;
@@ -21,7 +19,8 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use vala_bifrost_redux::parquet::footer::tenant_key_value;
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
-use vala_bifrost_redux::schema::with_managed_columns;
+use vala_bifrost_redux::tables::CorrelationPolicy;
+use vala_bifrost_redux::tables::managed_columns::ensure_managed_columns;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -119,7 +118,6 @@ pub(crate) async fn register_table(
             ],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     Ok(())
@@ -141,11 +139,11 @@ pub(crate) async fn client_for_tenant(
     let bootstrap = server
         .bootstrap_service_in_tenant(tenant, name, &["admin"])
         .await?;
-    client_from_bootstrap(server, bootstrap).await
+    client_from_bootstrap(server, bootstrap)
 }
 
 /// Build a client while retaining the bootstrap principal for exact audit correlation.
-pub(crate) async fn client_from_bootstrap(
+pub(crate) fn client_from_bootstrap(
     server: &wyrd_testing::WyrdTestServer,
     bootstrap: Bootstrap,
 ) -> Result<WyrdClient, JourneyError> {
@@ -307,13 +305,14 @@ pub(crate) async fn seed_foreign_hot_row(
 ) -> Result<(), JourneyError> {
     let table_ref = TableRef::new(BifrostNamespace::Bifrost, table);
     let binding = TenantTableBinding::resolve((owner, table_ref))?;
-    let schema = Arc::new(Schema::new(with_managed_columns(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("filter_key", DataType::Utf8, false),
-        Field::new("unused_payload", DataType::Utf8, false),
-    ])));
-    let mut batch_ids = FixedSizeBinaryBuilder::with_capacity(1, 16);
-    batch_ids.append_value(uuid::Uuid::now_v7().as_bytes())?;
+    let schema = Arc::new(Schema::new(ensure_managed_columns(
+        vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("filter_key", DataType::Utf8, false),
+            Field::new("unused_payload", DataType::Utf8, false),
+        ],
+        CorrelationPolicy::Observation,
+    )));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -326,7 +325,6 @@ pub(crate) async fn seed_foreign_hot_row(
             Arc::new(StringArray::from(vec![RequestId::now_v7().to_string()])),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_000_i64]).with_timezone("UTC")),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_001_i64]).with_timezone("UTC")),
-            Arc::new(batch_ids.finish()),
         ],
     )?;
     let mut parquet = Vec::new();
@@ -388,6 +386,7 @@ pub(crate) async fn seed_foreign_hot_row(
 pub(crate) async fn query_rows(client: &WyrdClient, table: &str) -> Result<u64, JourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!(
                 "SELECT id, filter_key, unused_payload FROM vala.bifrost.{table} ORDER BY id"
             ),
@@ -546,9 +545,9 @@ const UNUSED_PAYLOAD_CHARS: usize = 4096;
 /// cannot collapse it to near-zero bytes. A payload that compressed away would
 /// make a projection proof measure nothing.
 pub(crate) fn unused_payload(id: i64) -> String {
-    #[allow(clippy::cast_sign_loss)]
+    use std::fmt::Write as _;
     let mut state = 0x9E37_79B9_7F4A_7C15_u64
-        .wrapping_mul(id as u64)
+        .wrapping_mul(id.cast_unsigned())
         .wrapping_add(1);
     let mut out = String::with_capacity(UNUSED_PAYLOAD_CHARS);
     while out.len() < UNUSED_PAYLOAD_CHARS {
@@ -557,7 +556,7 @@ pub(crate) fn unused_payload(id: i64) -> String {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
-        out.push_str(&format!("{z:016x}"));
+        let _ = write!(out, "{z:016x}");
     }
     out.truncate(UNUSED_PAYLOAD_CHARS);
     out
@@ -574,7 +573,7 @@ pub(crate) fn unused_payload(id: i64) -> String {
 /// failed with nothing compacted and no time elapsed. Generous, because a pass
 /// may claim nothing, retry, or lose a lease race; finite, because a stalled
 /// Forge must fail the journey rather than hang it.
-const COMPACTION_BUDGET: Duration = Duration::from_secs(180);
+const COMPACTION_BUDGET: Duration = Duration::from_mins(3);
 
 /// Longest one requested pass is waited on before the loop re-reads the truth.
 const COMPACTION_PASS_WAIT: Duration = Duration::from_secs(30);
@@ -584,26 +583,40 @@ const COMPACTION_PASS_WAIT: Duration = Duration::from_secs(30);
 /// spinning on them for the whole budget.
 const COMPACTION_POLL_FLOOR: Duration = Duration::from_millis(100);
 
-/// Compacts every sealed file already written for `table`, so that a later
-/// query reads them through the Iceberg snapshot rather than the hot manifest.
+/// Waits until Forge has promoted every sealed file already written for
+/// `table`, so that a later query reads them through the Iceberg snapshot
+/// rather than the hot manifest.
 ///
-/// Three things have to happen for that, and none of them are automatic:
+/// "Compacted" here is the durable `vala.file_list.compacted` flag, which
+/// promotion settlement sets when a hot object is fast-appended unchanged into
+/// an Iceberg snapshot. No rewrite is involved: promotion has no partition or
+/// age gate, and Forge already promotes each object on the Scribe publication
+/// hint, often before this helper runs. The helper only drives and observes
+/// that route until it has finished for `expected` inputs:
 ///
-/// * The event-day partition holding the batch has to close. Forge does not
-///   rewrite a partition it may still receive writes for, so the test clock is
-///   advanced past it first.
-/// * A planning pass has to run, and the worker it hands the task to has to
-///   finish. The supervisor's own ticker is a minute long, so passes are
-///   requested explicitly; the wait is on the worker completion observer,
-///   because a planning pass returns as soon as the task is claimed.
-/// * A task that lands in `retryable` has to become eligible again. Real
-///   backoff is minutes; `release_forge_retries` moves the durable
-///   `next_eligible_at` back instead of sleeping, leaving the failure
-///   classification untouched.
+/// * Every node's Forge clock is advanced one day first. Promotion does not
+///   read it, but every time-based Forge decision does — the compaction
+///   interval's due rule and snapshot-expiration age among them — so a caller
+///   that measures files exactly as Scribe sealed them disables compaction on
+///   its table.
+/// * Each iteration requests one production scheduler pass. The leader also
+///   sweeps promotion debt on its own 10-second heartbeat, but a requested
+///   pass retries a promotion that was deferred behind the table's active
+///   attempt without waiting for that tick. The wait is on the worker
+///   completion observer, which reports inline coordinator promotions and
+///   claimed attempts alike.
+/// * A promotion that lands in `retryable` has to become eligible again. Real
+///   backoff is a minute or more; `release_forge_retries` moves the durable
+///   `next_eligible_at` back instead of sleeping, leaving the attempt count
+///   and failure classification untouched.
+///
+/// A caller holding a promotion commit parked at the commit seam must release
+/// it first; while it is parked every promotion of the table defers behind it
+/// and this helper exhausts its budget.
 ///
 /// The loop is bounded by [`COMPACTION_BUDGET`] and its exit condition is the
 /// durable `compacted` flag, not a pass or completion count: a pass that
-/// claimed nothing, and a completion that rewrote some other table, must not be
+/// promoted nothing, and a completion for some other table, must not be
 /// mistaken for this batch having moved tiers — nor, since the budget is a wall
 /// clock, allowed to consume the time this batch is waiting for.
 ///

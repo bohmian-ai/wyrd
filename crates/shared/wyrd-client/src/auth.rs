@@ -234,6 +234,12 @@ impl TokenExchange {
     /// authenticated transport does: the provider is process-global and the
     /// first client to build must be the one that sets it.
     ///
+    /// # Arguments
+    /// * `base_url` - Deployment URL; must be HTTPS or loopback HTTP without userinfo. Only its
+    ///   origin is kept.
+    /// * `timeout_ms` - Total per-request timeout in milliseconds for every `/auth` call; must
+    ///   be nonzero.
+    ///
     /// # Errors
     /// Returns [`WyrdClientError::Config`] for an empty, unparsable, remote
     /// cleartext, or userinfo-carrying `base_url` or a zero timeout, and [`WyrdClientError::TransportDown`]
@@ -293,6 +299,9 @@ impl TokenExchange {
     /// Cancellation: the credential is not consumed, so a dropped or failed
     /// call loses at most one short-lived session and is safe to retry.
     ///
+    /// # Arguments
+    /// * `credential` - Platform API key presented as the RFC 8693 subject token; not consumed.
+    ///
     /// # Errors
     /// Returns [`AuthError::Server`] with the plane's indistinguishable
     /// refusal for every credential rejection, and [`AuthError::Client`] for a
@@ -321,6 +330,10 @@ impl TokenExchange {
     /// Cancellation: a dropped or failed call may leave an unused device code
     /// on the server, which grants nothing and expires; retrying begins a new
     /// login.
+    ///
+    /// # Arguments
+    /// * `tenant` - Tenant route key the login is for, sent as the `tenant` extension
+    ///   parameter.
     ///
     /// # Errors
     /// Returns [`AuthError::Server`] when the tenant offers no SSO login or
@@ -353,6 +366,10 @@ impl TokenExchange {
     /// response gets `invalid_grant`; the caller starts a new login. The
     /// unreachable refresh token expires unused.
     ///
+    /// # Arguments
+    /// * `device` - Response of [`Self::device_authorization`] whose device code, interval, and
+    ///   expiry drive the poll.
+    ///
     /// # Errors
     /// Returns [`AuthError::Server`] carrying the RFC error in
     /// `details.error` for every terminal refusal, including `access_denied`
@@ -381,6 +398,9 @@ impl TokenExchange {
     /// renewal under the saved-login file lock so concurrent processes never
     /// present the same token twice.
     ///
+    /// # Arguments
+    /// * `refresh_token` - Current refresh token; the server retires it on receipt.
+    ///
     /// # Errors
     /// Returns [`AuthError::Server`] when the server refuses the refresh
     /// token, and [`AuthError::Client`] for a transport or decode failure.
@@ -408,6 +428,9 @@ impl TokenExchange {
     /// Revocation is idempotent (RFC 7009 §2.2): a dropped or failed call may
     /// or may not have revoked the login, and repeating it is safe. Logout
     /// treats a failure as unconfirmed and clears the local login anyway.
+    ///
+    /// # Arguments
+    /// * `refresh_token` - Refresh token of the login to revoke.
     ///
     /// # Errors
     /// Returns [`AuthError::Server`] for a non-success status and
@@ -657,6 +680,11 @@ impl AuthMiddleware {
     /// `credentials.toml` beside that same API key is loaded as the initial
     /// cache, so the token survives process restarts.
     ///
+    /// # Arguments
+    /// * `config` - Client configuration supplying the HTTP base URL, timeout, token-cache
+    ///   mode, and environment.
+    /// * `credential` - Resolved credential this middleware exchanges or presents.
+    ///
     /// # Errors
     /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
     /// already owns the process or the underlying Reqwest client cannot be
@@ -666,16 +694,17 @@ impl AuthMiddleware {
         credential: ResolvedCredential,
     ) -> Result<Arc<Self>, WyrdClientError> {
         let credentials = if config.token_cache == TokenCacheMode::Disk {
-            CredentialsFile::locate()
+            config.environment.config_dir().map(CredentialsFile::at)
         } else {
             None
         };
         Self::build(config, credential, credentials)
     }
 
-    /// Construct over a resolved credential file. `new` locates the user's
-    /// `credentials.toml`; tests inject one in a temporary directory so they
-    /// never touch the process environment (and stay parallel-safe).
+    /// Construct over a resolved credential file. `new` locates
+    /// `credentials.toml` in the configuration directory of
+    /// [`ClientConfig::environment`]; tests inject one in a temporary
+    /// directory.
     ///
     /// # Errors
     ///
@@ -734,6 +763,10 @@ impl AuthMiddleware {
     /// presents this middleware's current bearer as the RFC 8693 actor token,
     /// so the actor's own refresh keeps working underneath. No network call is
     /// made here.
+    ///
+    /// # Arguments
+    /// * `subject_token` - Inbound principal's token presented as the RFC 8693 subject token.
+    /// * `audience` - Surface the delegated token is bound to.
     #[must_use]
     pub fn on_behalf_of(
         self: &Arc<Self>,
@@ -758,12 +791,10 @@ impl AuthMiddleware {
     /// The credential this middleware authenticates with.
     ///
     /// Exposed so a client-tier owner can fingerprint the secret material it
-    /// is already bound to — the Bifrost [`ClientScope`] keys its producer
+    /// is already bound to — the Bifrost `ClientScope` keys its producer
     /// pool on `(base URL, credential fingerprint)` — without re-resolving the
     /// credential chain and risking a different answer than the live transport
     /// uses.
-    ///
-    /// [`ClientScope`]: crate::bifrost::ClientScope
     #[must_use]
     pub fn credential(&self) -> &ResolvedCredential {
         &self.credential
@@ -993,6 +1024,10 @@ impl AuthMiddleware {
     ///
     /// The id spine is independent of `traceparent`. A non-empty `inbound` id is
     /// forwarded verbatim; otherwise a new UUIDv7 is minted.
+    ///
+    /// # Arguments
+    /// * `inbound` - Caller-supplied request id; `None` or an empty string mints a fresh
+    ///   UUIDv7.
     #[must_use]
     pub fn request_id(&self, inbound: Option<&str>) -> String {
         let id = match inbound {
@@ -1639,7 +1674,7 @@ mod tests {
 
     impl AccessTokenSource for CountingSource {
         /// Names the fixed test identity.
-        fn identity(&self) -> &str {
+        fn identity(&self) -> &'static str {
             "test-system-producer"
         }
 
@@ -1725,7 +1760,7 @@ mod tests {
             let exchange = TokenExchange::new(origin, 1_000).expect("exchange builds");
             AuthMiddleware::new(
                 &config_for(origin.to_owned(), TokenCacheMode::InMemory),
-                ResolvedCredential::Renewable(store.source(&login, exchange)),
+                ResolvedCredential::Renewable(store.renewing_source(&login, exchange)),
             )
             .expect("middleware builds")
         };

@@ -32,7 +32,10 @@ pub async fn exchange_jwt_bearer(
 ) -> Result<ExchangedToken, WyrdErrorResponse> {
     let tenant_id = resolve_workload_tenant(state, headers, tenant).await?;
     let service = wyrd_auth::jwt_bearer::JwtBearer {
-        issuer: state.auth.tenant_issuer().ok_or_else(auth_not_configured)?,
+        issuer: state
+            .auth
+            .tenant_issuer(&state.audit_outbox)
+            .ok_or_else(auth_not_configured)?,
         verifier: state
             .auth
             .external_verifier
@@ -195,7 +198,6 @@ mod pg_tests {
         .expect("jwt-bearer exchange succeeds");
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
-            .await
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
@@ -209,7 +211,7 @@ mod pg_tests {
             "workload jwt-bearer grant must not issue a refresh token"
         );
 
-        let rows = audit_rows(&fixture, tenant).await;
+        let rows = audit_rows(&fixture, &state, tenant).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subject_principal_id, rows[0].actor_principal_id);
         assert_eq!(rows[0].error_tag, "");
@@ -258,7 +260,6 @@ mod pg_tests {
         .expect("jwt-bearer exchange succeeds");
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
-            .await
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
@@ -307,7 +308,7 @@ mod pg_tests {
         .expect_err("wrong audience rejected");
         assert!(matches!(error.0, WyrdError::InvalidToken { .. }));
 
-        let rows = audit_rows(&fixture, tenant).await;
+        let rows = audit_rows(&fixture, &state, tenant).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subject_principal_id, Uuid::nil());
         assert_eq!(rows[0].actor_principal_id, Uuid::nil());
@@ -471,7 +472,6 @@ mod pg_tests {
         .expect("cloud workload exchange succeeds");
 
         let verified = verify_issued_token(&state, tenant, exchanged.access_token.expose_secret())
-            .await
             .expect("issued token verifies");
         assert!(matches!(
             &verified.principal.kind,
@@ -540,7 +540,10 @@ mod pg_tests {
             .await
             .expect("tenant conn opens");
         let exchanged = crate::auth::exchange_api_key::ExchangeApiKey {
-            issuer: state.auth.tenant_issuer().expect("issuing key configured"),
+            issuer: state
+                .auth
+                .tenant_issuer(&state.audit_outbox)
+                .expect("issuing key configured"),
         }
         .execute(&mut conn, SecretString::from(token), "req-api-key")
         .await
@@ -625,7 +628,7 @@ mod pg_tests {
         let external_verifier = ExternalVerifier::new(
             Arc::new(JwksCache::new(
                 wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
-                StdDuration::from_secs(300),
+                StdDuration::from_mins(5),
                 StdDuration::from_secs(5),
             )),
             Arc::clone(&issuer_resolver),
@@ -774,7 +777,7 @@ mod pg_tests {
         let principal_id = row.0;
         conn.commit().await.expect("principal lookup commits");
         let key = WyrdApiKey::generate(tenant);
-        let key_hash = wyrd_auth_issue::hash_api_key(&key.secret).expect("api key hashes");
+        let key_hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
         let created_by = insert_creator_user(fixture, tenant)
             .await
             .expect("creator user inserts");
@@ -790,7 +793,7 @@ mod pg_tests {
             &prefix,
             &key_hash,
             created_by,
-            Some(std::time::Duration::from_secs(30 * 24 * 60 * 60)),
+            Some(std::time::Duration::from_hours(720)),
         )
         .await
         .expect("api key inserts");
@@ -798,7 +801,22 @@ mod pg_tests {
         key.secret.expose_secret().to_owned()
     }
 
-    async fn audit_rows(fixture: &PgFixture, tenant: DataTenantId) -> Vec<AuditRow> {
+    /// Staged `auth.token.exchange` events for `tenant`, newest first, read
+    /// after `state`'s audit outbox settles.
+    ///
+    /// # Panics
+    /// Panics when the outbox does not settle or the query fails.
+    async fn audit_rows(
+        fixture: &PgFixture,
+        state: &AppState,
+        tenant: DataTenantId,
+    ) -> Vec<AuditRow> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            state.audit_outbox.settle(deadline).await,
+            0,
+            "audit settles"
+        );
         let mut conn = fixture
             .tenant_conn_for(tenant)
             .await
@@ -840,7 +858,7 @@ mod pg_tests {
             .collect()
     }
 
-    async fn verify_issued_token(
+    fn verify_issued_token(
         state: &AppState,
         tenant: DataTenantId,
         token: &str,
@@ -919,7 +937,7 @@ mod pg_tests {
             tenant_id: tenant,
             issuer: IssuerUrl::new(EXTERNAL_ISSUER).expect("issuer URL is valid"),
             subject: subject.to_owned(),
-            audience: audience.map(|audience| audience.to_owned()),
+            audience: audience.map(std::borrow::ToOwned::to_owned),
             card_ref: card_ref(card_kind, name),
         }
     }
@@ -940,7 +958,7 @@ mod pg_tests {
             group_role_map: HashMap::new(),
             default_roles: Vec::new(),
             principal_kind: IssuerTokenPolicy::Workload,
-            jwks_ttl: StdDuration::from_secs(300),
+            jwks_ttl: StdDuration::from_mins(5),
         }
     }
 

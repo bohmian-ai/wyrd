@@ -26,7 +26,9 @@ pub use delete::{
     CardDeleteState, soft_delete_card, soft_delete_card_by_ref, soft_delete_card_with_kind,
     soft_delete_card_with_state,
 };
-pub use get::{find_card_by_ref, get_card_by_ref, get_card_by_uid, get_card_for_reconciliation};
+pub use get::{
+    fetch_card_row, find_card_by_ref, get_card_by_ref, get_card_by_uid, get_card_for_reconciliation,
+};
 pub use lifecycle::{
     CardManifestCompletionRow, CardReconcileClaim, MAX_RECONCILE_ATTEMPTS, RECONCILE_KIND_BLOB,
     RECONCILE_KIND_CLEANUP, RECONCILE_KIND_FINALIZATION, RECONCILE_KIND_REGISTRATION,

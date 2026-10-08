@@ -283,6 +283,7 @@ impl GenAiSpanRecord {
     /// # Errors
     /// Returns [`WyrdError::Validation`] when any invariant fails.
     pub fn validate(&self) -> Result<(), WyrdError> {
+        const MAX_BLOB_BYTES: usize = 1_048_576;
         if self.provider_name.is_empty() {
             return Err(WyrdError::Validation {
                 message: "gen_ai_span.provider_name must be non-empty".to_string(),
@@ -322,7 +323,6 @@ impl GenAiSpanRecord {
             });
         }
 
-        const MAX_BLOB_BYTES: usize = 1_048_576;
         for (field, value) in [
             ("input_messages", &self.input_messages),
             ("output_messages", &self.output_messages),
@@ -334,7 +334,7 @@ impl GenAiSpanRecord {
             ("memory_records", &self.memory_records),
         ] {
             if let Some(v) = value {
-                let size = serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0);
+                let size = serde_json::to_vec(v).map_or(0, |b| b.len());
                 if size > MAX_BLOB_BYTES {
                     return Err(WyrdError::Validation {
                         message: format!(

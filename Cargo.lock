@@ -3574,7 +3574,6 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
- "rand_core 0.6.4",
  "serde",
  "sha2 0.10.9",
  "subtle",
@@ -4094,33 +4093,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gcp_auth"
-version = "0.12.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d27dbcc645b60b8e7f6e2868a9d7102ece97d1bb49c1288b5321fcc67f7260"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "http 1.4.2",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "ring",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-futures",
- "url",
-]
-
-[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4614,7 +4586,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4673,7 +4645,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-glue"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4686,30 +4658,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-catalog-rest"
-version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chrono",
- "gcp_auth",
- "http 1.4.2",
- "iceberg",
- "itertools 0.13.0",
- "reqwest 0.12.28",
- "serde",
- "serde_derive",
- "serde_json",
- "tokio",
- "typed-builder",
- "uuid",
-]
-
-[[package]]
 name = "iceberg-catalog-sql"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4720,7 +4671,7 @@ dependencies = [
 [[package]]
 name = "iceberg-compaction-core"
 version = "0.1.0"
-source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=6773e192c995d4d9423536f44f05f99b6ea81e5a#6773e192c995d4d9423536f44f05f99b6ea81e5a"
+source = "git+https://github.com/bohmian-ai/iceberg-compaction?rev=4e9f325d993d900bcdec2fa74239c6a6173f49cd#4e9f325d993d900bcdec2fa74239c6a6173f49cd"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4731,7 +4682,6 @@ dependencies = [
  "futures",
  "iceberg",
  "iceberg-catalog-glue",
- "iceberg-catalog-rest",
  "iceberg-datafusion",
  "itertools 0.13.0",
  "mixtrics",
@@ -4750,7 +4700,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4766,7 +4716,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=330fe331b5a312ed60d9ff6760100137a83a934f#330fe331b5a312ed60d9ff6760100137a83a934f"
+source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=97c32f6377cbdfe51dbeb69e77a2a726669de93a#97c32f6377cbdfe51dbeb69e77a2a726669de93a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5686,6 +5636,8 @@ dependencies = [
  "napi-sys",
  "nohash-hasher",
  "rustc-hash",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -5950,7 +5902,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.2",
@@ -8075,7 +8027,6 @@ dependencies = [
  "aws-lc-rs",
  "log",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -10014,16 +9965,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tracing-futures"
-version = "0.2.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97d095ae15e245a057c8e8451bab9b3ee1e1f68e9ba2b4fbc18d0ac5237835f2"
-dependencies = [
- "pin-project",
- "tracing",
-]
-
-[[package]]
 name = "tracing-log"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10409,6 +10350,7 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "num-traits",
  "serde",
  "serde_json",
  "statrs",
@@ -10474,8 +10416,10 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "vala-sql",
  "workspace-hack",
  "wyrd-dev-fixtures",
+ "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
  "wyrd-sql",
@@ -11053,7 +10997,6 @@ dependencies = [
  "deranged",
  "digest 0.10.7",
  "digest 0.11.3",
- "ed25519-dalek",
  "either",
  "elliptic-curve",
  "errno",
@@ -11104,7 +11047,6 @@ dependencies = [
  "opentelemetry-proto",
  "opentelemetry_sdk",
  "parking_lot",
- "password-hash",
  "percent-encoding",
  "petgraph 0.8.3",
  "pkcs8",
@@ -11128,7 +11070,6 @@ dependencies = [
  "rsa",
  "rustix",
  "rustls",
- "rustls-webpki",
  "secrecy",
  "security-framework-sys",
  "semver",
@@ -11234,13 +11175,14 @@ dependencies = [
 name = "wyrd-auth-issue"
 version = "0.0.1"
 dependencies = [
- "argon2",
  "chrono",
  "ed25519-dalek",
  "jsonwebtoken 9.3.1",
- "password-hash",
+ "rand 0.9.5",
  "secrecy",
  "serde",
+ "sha2 0.10.9",
+ "subtle",
  "thiserror 2.0.18",
  "tracing",
  "ulid",
@@ -11335,7 +11277,6 @@ dependencies = [
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
- "wyrd-test-contract-macros",
  "wyrd-utils",
 ]
 
@@ -11352,7 +11293,6 @@ dependencies = [
  "clap",
  "indicatif",
  "predicates",
- "pyo3",
  "reqwest 0.13.4",
  "secrecy",
  "serde",
@@ -11413,12 +11353,12 @@ dependencies = [
  "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
+ "skald-agent",
  "skald-providers",
  "skald-runtime",
  "skald-spec",
  "skald-tool",
  "skald-workflow",
- "sqlx 0.9.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -11606,7 +11546,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-trait",
- "crossbeam-queue",
+ "futures-util",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -11622,10 +11562,13 @@ name = "wyrd-runtime"
 version = "0.0.1"
 dependencies = [
  "chrono",
+ "metrics",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
  "workspace-hack",
  "wyrd-semver",
@@ -11661,6 +11604,7 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "arrow-schema",
+ "chrono",
  "futures-util",
  "pyo3",
  "secrecy",
@@ -11693,20 +11637,21 @@ name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
  "arrow",
- "base64 0.22.1",
- "chrono",
- "parquet",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest 0.13.4",
  "secrecy",
  "serde",
  "serde_json",
- "sha2 0.10.9",
- "skald-workflow",
  "tempfile",
  "tokio",
- "uuid",
  "wiremock",
  "workspace-hack",
+ "wyrd-cli",
  "wyrd-client",
+ "wyrd-sdk-rust",
+ "wyrd-spec",
  "wyrd-testing",
 ]
 
@@ -11723,6 +11668,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wyrd-cli",
  "wyrd-client",
  "wyrd-queue",
  "wyrd-semver",
@@ -11738,8 +11684,12 @@ dependencies = [
  "napi-build",
  "napi-derive",
  "secrecy",
+ "serde",
+ "serde_json",
  "url",
  "vala-bifrost-redux",
+ "wyrd-cli",
+ "wyrd-client",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-testing",
@@ -11782,9 +11732,11 @@ dependencies = [
  "insta",
  "jsonschema",
  "jsonwebtoken 9.3.1",
+ "lru",
  "metrics",
  "metrics-exporter-prometheus",
  "mimalloc",
+ "num-traits",
  "oauth2 5.0.0",
  "opendal 0.57.0",
  "rand 0.9.5",
@@ -11831,7 +11783,6 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
- "wyrd-cli",
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
@@ -11973,16 +11924,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wyrd-test-contract-macros"
-version = "0.0.1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
- "workspace-hack",
-]
-
-[[package]]
 name = "wyrd-testing"
 version = "0.0.1"
 dependencies = [
@@ -11993,6 +11934,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "clap",
  "datafusion-proto",
  "ed25519-dalek",
  "futures-util",
@@ -12004,6 +11946,7 @@ dependencies = [
  "iceberg",
  "metrics",
  "metrics-exporter-prometheus",
+ "num-traits",
  "opendal 0.57.0",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -12013,6 +11956,7 @@ dependencies = [
  "rcgen",
  "reqwest 0.13.4",
  "rmcp",
+ "rustls",
  "secrecy",
  "serde",
  "serde_jcs",
@@ -12026,6 +11970,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tokio-util",
  "tower",
@@ -12034,6 +11979,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-bifrost-redux",
+ "vala-eval",
  "vala-sql",
  "wiremock",
  "workspace-hack",

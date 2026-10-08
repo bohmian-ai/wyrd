@@ -2,7 +2,7 @@
 //!
 //! The focused owners in this binary each prove one seam. This module proves
 //! they integrate: four tenants driving both a registered dynamic table and the
-//! lazy built-in `vala.traces.spans` through public clients, across adjacent
+//! built-in `vala.traces.spans` through public clients, across adjacent
 //! partitions and disjoint key ranges — and reading exactly what they acknowledged at every authority
 //! the rows pass through.
 
@@ -34,7 +34,7 @@ const BATCHES_PER_TABLE: usize = 8;
 const ROWS_PER_BATCH: i64 = 16;
 /// First value one tenant owns, so no two tenants can share a row identity.
 const TENANT_KEY_STRIDE: i64 = 100_000;
-/// The lazy built-in every tenant writes beside its own dynamic table.
+/// The built-in every tenant writes beside its own dynamic table.
 const SYSTEM_TABLE: &str = "vala.traces.spans";
 
 /// One tenant's public participation in the journey.
@@ -115,7 +115,7 @@ impl Participant {
 /// Sustained four-tenant ingest stays exact through every hot-read authority.
 ///
 /// This is the integration proof for the focused owners in this binary. Four
-/// tenants each drive a registered dynamic table and the lazy built-in
+/// tenants each drive a registered dynamic table and the built-in
 /// `vala.traces.spans` through public authenticated clients: disjoint key
 /// ranges so no tenant can be credited another's row, two adjacent hour
 /// partitions so the physical layout is not a single cell, and sixty-four
@@ -310,7 +310,7 @@ async fn drive_sustained_ingest(participants: &mut [Participant]) {
                 let rows = batch_values(ordinal, batch);
                 // Consecutive batches alternate between two adjacent hours, so
                 // one table's rows span two physical partitions.
-                let event_time = base + chrono::Duration::hours((batch % 2) as i64);
+                let event_time = base + chrono::Duration::hours(i64::from(batch % 2 != 0));
                 until_admitted(&format!("tenant {ordinal} dynamic {batch}"), || {
                     append_values_at(
                         &client,
@@ -351,7 +351,9 @@ async fn drive_sustained_ingest(participants: &mut [Participant]) {
 /// and batch. That is what lets a read-back comparison detect a row credited to
 /// the wrong tenant as well as a lost or duplicated one.
 fn batch_values(tenant_ordinal: usize, batch: usize) -> Vec<i64> {
-    let base = tenant_ordinal as i64 * TENANT_KEY_STRIDE + batch as i64 * ROWS_PER_BATCH;
+    let tenant_ordinal = i64::try_from(tenant_ordinal).expect("test row ordinals fit i64");
+    let batch = i64::try_from(batch).expect("test row ordinals fit i64");
+    let base = tenant_ordinal * TENANT_KEY_STRIDE + batch * ROWS_PER_BATCH;
     (base..base + ROWS_PER_BATCH).collect()
 }
 

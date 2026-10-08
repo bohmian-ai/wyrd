@@ -22,6 +22,10 @@ pub use crate::spec::VersionSpec;
 
 /// Initial seed version used when registering a card with no prior version in
 /// the (kind, space, name) scope.
+///
+/// # Panics
+///
+/// Panics if the seed literal fails to parse, which a valid literal cannot cause.
 #[must_use]
 pub fn seed_version() -> VersionBlock {
     VersionBlock::parse("0.1.0").expect("seed version literal is a valid semver triple")

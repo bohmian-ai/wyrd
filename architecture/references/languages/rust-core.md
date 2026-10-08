@@ -595,13 +595,12 @@ operator work. A callee receiving `&mut TenantConn<'_>` never commits or rolls
 back: the caller owns the transaction so several domain operations can compose
 atomically.
 
-Audit follows evaluated permission decisions. Append exactly one allowed or
-denied event for every verdict a receiving boundary reaches, inside the
-transaction that commits the authorized operation when one exists, and fail
-closed when the append fails. Oracle read decisions and gateway invocation
-decisions commit that same staging event from a tracked, non-blocking task:
-authorization still completes before protected work, but a failed append is
-counted and logged instead of reversing the verdict. A transition that
+Audit follows evaluated permission decisions. Stage exactly one allowed or
+denied event for every verdict a receiving boundary reaches on the process
+audit outbox (`AuditOutbox::stage`), never inside the operation's transaction.
+Authorization still completes before protected work, but the operation never
+waits for, or is reversed by, the audit commit; the outbox retries a failed
+commit and counts it in `outbox_write_failures_total{outbox="audit"}`. A transition that
 evaluates no permission — a Scribe batch commit, Forge maintenance, audit
 publication, a reconciliation or storage lifecycle step — records lineage in
 its own operational table and structured tracing, never canonical audit. Forge operator lineage remains behind

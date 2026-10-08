@@ -18,6 +18,9 @@ pub const GRPC_DEFAULT_PORT: u16 = 50051;
 /// the gRPC listener of the same deployment. An unparseable or host-less
 /// `server_url` is returned unchanged so the transport reports it rather than
 /// silently dialing a different address.
+///
+/// # Arguments
+/// * `server_url` - HTTP base URL whose scheme and host the gRPC endpoint keeps.
 #[must_use]
 pub fn grpc_endpoint_for(server_url: &str) -> String {
     match reqwest::Url::parse(server_url) {
@@ -119,6 +122,9 @@ impl GrpcConfig {
     /// Validate the config. Returns `Err` if `endpoint` is empty or
     /// `timeout_ms` is zero. `connect_retries == 0` is permitted; it means
     /// fail on the first connect attempt.
+    ///
+    /// # Errors
+    /// Returns [`WyrdClientError::Config`] when `endpoint` is empty or `timeout_ms` is zero.
     pub fn validate(&self) -> Result<(), WyrdClientError> {
         if self.endpoint.is_empty() {
             return Err(WyrdClientError::Config {
@@ -347,7 +353,7 @@ impl TransportConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::HttpConfig;
+    use super::{GrpcConfig, HttpConfig, MockConfig, TransportConfig};
     use crate::error::WyrdClientError;
     use wyrd_spec::operator_connection::HttpsOrigin;
 
@@ -423,5 +429,91 @@ mod tests {
         ] {
             assert_eq!(origin(url).expect(url).as_str(), expected, "{url}");
         }
+    }
+
+    /// Each invalid field is refused by [`TransportConfig::validate`] with the
+    /// config path of that field and the reason a caller can act on.
+    ///
+    /// # Panics
+    /// Panics when a listed config validates, or its refusal names another
+    /// field or reason.
+    #[test]
+    fn validate_refuses_each_invalid_field() {
+        for (config, field, reason) in [
+            (
+                TransportConfig::Grpc(GrpcConfig {
+                    endpoint: String::new(),
+                    ..GrpcConfig::default()
+                }),
+                "grpc_config.endpoint",
+                "must not be empty",
+            ),
+            (
+                TransportConfig::Grpc(GrpcConfig {
+                    timeout_ms: 0,
+                    ..GrpcConfig::default()
+                }),
+                "grpc_config.timeout_ms",
+                "must be at least 1",
+            ),
+            (
+                TransportConfig::Http(HttpConfig {
+                    base_url: String::new(),
+                    ..HttpConfig::default()
+                }),
+                "http_config.base_url",
+                "must not be empty",
+            ),
+            (
+                TransportConfig::Http(HttpConfig {
+                    timeout_ms: 0,
+                    ..HttpConfig::default()
+                }),
+                "http_config.timeout_ms",
+                "must be at least 1",
+            ),
+        ] {
+            let error = config.validate().expect_err(field);
+            assert!(
+                matches!(&error, WyrdClientError::Config { field: f, reason: r } if f == field && r == reason),
+                "{field}: {error:?}"
+            );
+        }
+    }
+
+    /// Defaults, a zero gRPC retry count (fail on the first attempt), an
+    /// HTTPS base URL, and every mock config are valid.
+    ///
+    /// # Panics
+    /// Panics when any listed config is refused.
+    #[test]
+    fn validate_accepts_defaults_and_boundary_values() {
+        for config in [
+            TransportConfig::Grpc(GrpcConfig::default()),
+            TransportConfig::Grpc(GrpcConfig {
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            }),
+            TransportConfig::Http(HttpConfig::default()),
+            TransportConfig::Http(HttpConfig {
+                base_url: "https://example.com".to_owned(),
+                ..HttpConfig::default()
+            }),
+            TransportConfig::Mock(MockConfig::default()),
+        ] {
+            assert!(config.validate().is_ok(), "{}", config.name());
+        }
+    }
+
+    /// A mock config naming an unknown field is refused rather than ignored.
+    ///
+    /// # Panics
+    /// Panics when the unknown field deserializes.
+    #[test]
+    fn mock_config_rejects_unknown_fields() {
+        let parsed = serde_json::from_str::<MockConfig>(
+            r#"{"label":"buf","fail_on_drain":null,"extra":true}"#,
+        );
+        assert!(parsed.is_err());
     }
 }

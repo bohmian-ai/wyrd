@@ -32,30 +32,30 @@ use crate::queries::verifier_runs::{
 use crate::{OperatorPool, TenantConn};
 
 /// Insert a registration's pending baseline, due at PostgreSQL's statement time.
-const INSERT_PENDING_SQL: &str = r#"
+const INSERT_PENDING_SQL: &str = r"
     INSERT INTO wyrd.drift_baselines (
         data_tenant_id, verifier_uid, data_card_uid, max_attempts,
         next_attempt_at, created_at, updated_at
     ) VALUES (wyrd.current_tenant(), $1, $2, $3,
               statement_timestamp(), statement_timestamp(), statement_timestamp())
     ON CONFLICT DO NOTHING
-"#;
+";
 
 /// Settle every expired lease whose attempts are exhausted as a final failure.
-const EXHAUST_EXPIRED_SQL: &str = r#"
+const EXHAUST_EXPIRED_SQL: &str = r"
     UPDATE wyrd.drift_baselines
        SET state = 'failed', error = $1, lease_expires_at = NULL,
            next_attempt_at = NULL, updated_at = statement_timestamp()
      WHERE state = 'building'
        AND lease_expires_at <= statement_timestamp()
        AND attempts >= max_attempts
-"#;
+";
 
 /// Claim the oldest due, retry-due, or lease-expired fit under a fresh lease.
 ///
 /// `$2` is only the lease length in milliseconds; availability, expiry, and
 /// the new deadline are PostgreSQL's statement time.
-const CLAIM_SQL: &str = r#"
+const CLAIM_SQL: &str = r"
     WITH candidate AS (
         SELECT verifier_uid
           FROM wyrd.drift_baselines
@@ -72,61 +72,61 @@ const CLAIM_SQL: &str = r#"
       FROM candidate
      WHERE b.verifier_uid = candidate.verifier_uid
     RETURNING b.verifier_uid, b.data_card_uid, b.attempts, b.max_attempts
-"#;
+";
 
 /// Settle a leased fit `ready` with its fitted profile.
-const COMPLETE_SQL: &str = r#"
+const COMPLETE_SQL: &str = r"
     UPDATE wyrd.drift_baselines
        SET state = 'ready', fitted = $3, error = NULL, lease_expires_at = NULL,
            updated_at = statement_timestamp()
      WHERE verifier_uid = $1 AND lease_token = $2 AND state = 'building'
-"#;
+";
 
 /// Settle a leased fit `failed`; `$4` is the retry delay in milliseconds, or
 /// NULL for a final failure.
-const FAIL_SQL: &str = r#"
+const FAIL_SQL: &str = r"
     UPDATE wyrd.drift_baselines
        SET state = 'failed', error = $3, lease_expires_at = NULL,
            next_attempt_at = statement_timestamp() + ($4::bigint * INTERVAL '1 millisecond'),
            updated_at = statement_timestamp()
      WHERE verifier_uid = $1 AND lease_token = $2 AND state = 'building'
     RETURNING next_attempt_at
-"#;
+";
 
 /// Lock a leased fit's attempt budget before deciding retry or exhaustion.
-const LEASED_ATTEMPTS_SQL: &str = r#"
+const LEASED_ATTEMPTS_SQL: &str = r"
     SELECT attempts, max_attempts
       FROM wyrd.drift_baselines
      WHERE verifier_uid = $1 AND lease_token = $2 AND state = 'building'
        FOR UPDATE
-"#;
+";
 
 /// Return a leased fit to `pending` immediately, refunding its attempt.
-const RELEASE_SQL: &str = r#"
+const RELEASE_SQL: &str = r"
     UPDATE wyrd.drift_baselines
        SET state = 'pending', attempts = attempts - 1, lease_expires_at = NULL,
            next_attempt_at = statement_timestamp(), updated_at = statement_timestamp()
      WHERE verifier_uid = $1 AND lease_token = $2 AND state = 'building'
-"#;
+";
 
 /// Read one Verifier's baseline status with its exact Data Card identity.
-const STATUS_SQL: &str = r#"
+const STATUS_SQL: &str = r"
     SELECT b.state, b.error,
            jsonb_build_object('kind', d.kind, 'space', d.space, 'name', d.name,
                               'version', d.version, 'uid', d.card_uid) AS data
       FROM wyrd.drift_baselines b
       JOIN wyrd.cards d ON d.card_uid = b.data_card_uid
      WHERE b.verifier_uid = $1
-"#;
+";
 
 /// Read one Verifier's fitted profile when it is ready.
-const FITTED_SQL: &str = r#"
+const FITTED_SQL: &str = r"
     SELECT fitted FROM wyrd.drift_baselines
      WHERE verifier_uid = $1 AND state = 'ready'
-"#;
+";
 
 /// List tenants with claimable fits, longest-waiting tenant first.
-const DUE_TENANTS_SQL: &str = r#"
+const DUE_TENANTS_SQL: &str = r"
     SELECT data_tenant_id
       FROM wyrd.drift_baselines
      WHERE (state IN ('pending', 'failed') AND next_attempt_at <= statement_timestamp())
@@ -134,7 +134,7 @@ const DUE_TENANTS_SQL: &str = r#"
      GROUP BY data_tenant_id
      ORDER BY min(COALESCE(next_attempt_at, lease_expires_at)), data_tenant_id
      LIMIT $1
-"#;
+";
 
 /// The identity a fitter settles a claimed baseline with.
 #[derive(Debug, Clone, PartialEq, Eq)]

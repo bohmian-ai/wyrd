@@ -506,7 +506,7 @@ fn decode_histogram_point(
             Ok(true)
         }
         Field::Sum => {
-            output.sum = decode_optional(cursor, |cursor| cursor.f64())?;
+            output.sum = decode_optional(cursor, super::otlp_json::JsonCursor::f64)?;
             Ok(true)
         }
         Field::BucketCounts => {
@@ -526,11 +526,11 @@ fn decode_histogram_point(
             Ok(true)
         }
         Field::Min => {
-            output.min = decode_optional(cursor, |cursor| cursor.f64())?;
+            output.min = decode_optional(cursor, super::otlp_json::JsonCursor::f64)?;
             Ok(true)
         }
         Field::Max => {
-            output.max = decode_optional(cursor, |cursor| cursor.f64())?;
+            output.max = decode_optional(cursor, super::otlp_json::JsonCursor::f64)?;
             Ok(true)
         }
         _ => Ok(false),
@@ -567,7 +567,7 @@ fn decode_exponential_histogram_point(
             Ok(true)
         }
         Field::Sum => {
-            output.sum = decode_optional(cursor, |cursor| cursor.f64())?;
+            output.sum = decode_optional(cursor, super::otlp_json::JsonCursor::f64)?;
             Ok(true)
         }
         Field::Scale => {
@@ -595,11 +595,11 @@ fn decode_exponential_histogram_point(
             Ok(true)
         }
         Field::Min => {
-            output.min = decode_optional(cursor, |cursor| cursor.f64())?;
+            output.min = decode_optional(cursor, super::otlp_json::JsonCursor::f64)?;
             Ok(true)
         }
         Field::Max => {
-            output.max = decode_optional(cursor, |cursor| cursor.f64())?;
+            output.max = decode_optional(cursor, super::otlp_json::JsonCursor::f64)?;
             Ok(true)
         }
         Field::ZeroThreshold => {

@@ -28,3 +28,6 @@ flate2 = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 workspace-hack.workspace = true
 wiremock = { workspace = true }
+
+[lints]
+workspace = true

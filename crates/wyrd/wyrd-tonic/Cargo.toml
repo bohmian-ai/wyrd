@@ -57,3 +57,6 @@ workspace-hack.workspace = true
 # `default = []` leaves the server and client conversions uncompiled, so the
 # tests that cover them own their feature union here rather than in a lane.
 wyrd-tonic = { path = ".", features = ["server", "client"] }
+
+[lints]
+workspace = true

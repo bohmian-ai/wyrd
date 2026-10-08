@@ -22,7 +22,7 @@ use wyrd_tonic::frame_codec::FrameEncoder;
 
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
-use crate::http::middleware::edge_timeout::QueryEdgeTimer;
+use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::query::service;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
@@ -98,16 +98,14 @@ pub fn router() -> OpenApiRouter<AppState> {
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 409, description = "The query's owner moved while the request was in \
           flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "The query-control or Oracle role is unavailable, the \
-          decision could not be audited, or no verifier is configured for the access token \
+        (status = 503, description = "The query-control or Oracle role is unavailable, or \
+          no verifier is configured for the access token \
           (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
-          WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
           stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
-          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED)",
          body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
@@ -147,16 +145,14 @@ pub(crate) async fn list_running_queries(
           tenant (WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 409, description = "The query's owner moved while the request was in \
           flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "The query-control or Oracle role is unavailable, the \
-          decision could not be audited, or no verifier is configured for the access token \
+        (status = 503, description = "The query-control or Oracle role is unavailable, or \
+          no verifier is configured for the access token \
           (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
-          WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
           stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
-          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED)",
          body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
@@ -204,16 +200,14 @@ pub(crate) async fn get_running_query(
           tenant (WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 409, description = "The query's owner moved while the request was in \
           flight (WYRD_VALA_409_RUNNING_QUERY_CONFLICT)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = 503, description = "The query-control or Oracle role is unavailable, the \
-          decision could not be audited, or no verifier is configured for the access token \
+        (status = 503, description = "The query-control or Oracle role is unavailable, or \
+          no verifier is configured for the access token \
           (WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE, WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
-          WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
           stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
-          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED)",
          body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
@@ -271,16 +265,15 @@ pub(crate) async fn cancel_running_query(
           unacceptable credentials (WYRD_PERMISSION_403_DENIED_RBAC, \
           WYRD_VALA_403_QUERY_PEER_SECURITY)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "The Oracle role is unavailable, visibility could not be \
-          resolved, the decision could not be audited, no verifier is configured for \
+          resolved, no verifier is configured for \
           the access token, or the admitted query exhausted its execution memory and \
           must not be retried unchanged (WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE, \
-          WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE, \
+          WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE, \
           WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = "default", description = "Any other query refusal, each carrying its own \
           stable code (WYRD_VALA_429_QUERY_QUEUE_FULL, WYRD_VALA_429_QUERY_ADMISSION_REJECTED, \
           WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE, WYRD_VALA_413_QUERY_RESULT_TOO_LARGE, \
-          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED, \
-          WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+          WYRD_VALA_504_QUERY_TIMEOUT, WYRD_VALA_500_QUERY_EXECUTION_FAILED)",
          body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Bifrost"
@@ -291,7 +284,7 @@ pub(crate) async fn cancel_running_query(
 /// request timeout; once the query is dispatched, its own deadline governs.
 pub(crate) async fn sync_query(
     State(state): State<AppState>,
-    edge_timer: Option<Extension<QueryEdgeTimer>>,
+    edge_timer: Option<Extension<EdgeTimer>>,
     caller: Caller,
     Json(body): Json<BifrostQueryRequest>,
 ) -> Response {
@@ -305,13 +298,13 @@ pub(crate) async fn sync_query(
     let fault = state
         .query_stream_fault
         .as_ref()
-        .and_then(|controller| controller.claim());
+        .and_then(super::super::state::QueryStreamFaultController::claim);
     #[cfg(feature = "test-support")]
     let stall = match fault {
         Some(crate::state::QueryStreamFault::StallAfterSchema) => state
             .query_stream_fault
             .as_ref()
-            .and_then(|controller| controller.claim_stall()),
+            .and_then(super::super::state::QueryStreamFaultController::claim_stall),
         _ => None,
     };
     // Passive: the capture reads this query's probe and returns the stream
@@ -321,7 +314,7 @@ pub(crate) async fn sync_query(
         && let Some(capture) = state
             .query_stream_fault
             .as_ref()
-            .and_then(|controller| controller.claim_capture())
+            .and_then(super::super::state::QueryStreamFaultController::claim_capture)
     {
         capture.bind(result.resource_probe_for_test());
     }
@@ -597,8 +590,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the shared fixture tenant cannot be resolved.
-    async fn query_caller() -> Caller {
-        let tenant = crate::test_support::test_tenant().await;
+    fn query_caller() -> Caller {
+        let tenant = crate::test_support::test_tenant();
         Caller {
             data_tenant_id: tenant,
             principal: Principal::new(
@@ -621,8 +614,8 @@ mod tests {
     /// Panics when shared Postgres, storage, or catalog fixtures cannot start.
     async fn state_without_oracle() -> AppState {
         crate::test_support::test_app_state(
-            crate::test_support::test_server_postgres().await,
-            crate::test_support::test_storage().await,
+            crate::test_support::test_server_postgres(),
+            crate::test_support::test_storage(),
             crate::test_support::test_catalog().await,
         )
     }
@@ -782,8 +775,9 @@ mod tests {
             let response = sync_query(
                 State(state_without_oracle().await),
                 None,
-                query_caller().await,
+                query_caller(),
                 Json(BifrostQueryRequest {
+                    params: Vec::new(),
                     sql: "SELECT 1".to_owned(),
                     deadline_ms: Some(1_000),
                 }),

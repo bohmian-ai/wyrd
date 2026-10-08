@@ -1,0 +1,17 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: ask-prompt
+  version: 1.0.0
+  space: default
+spec:
+  model: gpt-4o
+  request:
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-4o
+      messages:
+        - role: user
+          content: "{{question}}"
+  variables: [question]
+  response_type: text

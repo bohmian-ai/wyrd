@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use tracing::Span;
 
+use super::planner::ActiveReadClaim;
 use super::telemetry::AnalyticalAttemptOutcome;
 
 use super::*;
@@ -241,50 +242,8 @@ pub(super) struct QueryStreamInput {
     pub(super) gate_lifecycle: Option<Arc<QueryStreamLifecycle>>,
     /// Exactly-once owner-local registry settlement retained through terminal output.
     pub(super) running_query: Option<RunningQueryTerminalOwner>,
-    /// Reader-epoch protection retained until every descendant has joined.
-    pub(super) reader_protection: Option<ReaderProtectedQueryTerminalOwner>,
-}
-
-/// Terminal owner of one query's reader-epoch protection.
-///
-/// The guard and permit are held here, beside the running-query owner and the
-/// distributed settlement, for exactly one reason: release must not happen
-/// while any descendant can still read. Because the frame stream owns this
-/// value, and the frame stream joins its remote settlement before it is
-/// dropped, the narrowing command the guard enqueues on drop cannot be
-/// enqueued while leader-local or remote IO is still reachable.
-pub(super) struct ReaderProtectedQueryTerminalOwner {
-    /// This query's durable claim on every snapshot it planned against.
-    _guard: super::reader_pins::ReaderQueryGuard,
-    /// The permit every read of those snapshots presented.
-    ///
-    /// Retained rather than dropped after provider construction so the permit
-    /// and the protection it depends on end together: a clone handed to a
-    /// provider stays valid for exactly as long as this owner lives.
-    _permit: super::reader_pins::ReaderIoPermit,
-}
-
-impl std::fmt::Debug for ReaderProtectedQueryTerminalOwner {
-    /// Prints the owner without its guard's per-table holdings.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ReaderProtectedQueryTerminalOwner")
-            .finish_non_exhaustive()
-    }
-}
-
-impl ReaderProtectedQueryTerminalOwner {
-    /// Takes ownership of one query's complete protection for its lifetime.
-    #[must_use]
-    pub(super) fn new(
-        guard: super::reader_pins::ReaderQueryGuard,
-        permit: super::reader_pins::ReaderIoPermit,
-    ) -> Self {
-        Self {
-            _guard: guard,
-            _permit: permit,
-        }
-    }
+    /// Active table reads released only after every descendant has joined.
+    pub(super) active_reads: Option<ActiveReadClaim>,
 }
 
 /// Exactly-once terminal owner for one inserted running-query entry.
@@ -371,11 +330,10 @@ struct FrameBuildInput {
     stream_telemetry_cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Exactly-once active-registry terminal owner.
     running_query: Option<RunningQueryTerminalOwner>,
-    /// Reader-epoch protection released only when this stream is finished.
-    reader_protection: Option<ReaderProtectedQueryTerminalOwner>,
+    /// Active table reads released only when this stream is finished.
+    active_reads: Option<ActiveReadClaim>,
 }
 
-/// Builds the lazy frame stream that owns terminal cleanup state.
 /// Resolves the next event one frame loop iteration acts on.
 ///
 /// Cancellation is checked before anything is taken from the plan, so a
@@ -440,7 +398,25 @@ fn encode_frame(
     Ok(Some(frame))
 }
 
-fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameStream>> {
+/// Builds the lazy leader frame stream that owns every terminal cleanup duty.
+///
+/// The returned stream yields the schema frame first, then one batch frame per
+/// encoded batch, and always ends with exactly one terminal frame. It pulls
+/// the next event through [`next_frame_event`], so stream cancellation,
+/// request cancellation, and the query deadline are observed before another
+/// batch is taken from the plan. On exhaustion, failure, or cancellation it
+/// drops the plan's batch stream and then settles through
+/// [`settle_and_finish_stream`], which releases admission, finishes the
+/// running-query registry entry, and awaits the active-read claim's release
+/// before the terminal frame is yielded.
+///
+/// A consumer that drops the stream at any await skips that settlement. The
+/// admission guard and the active-read claim are therefore moved into one
+/// [`LeaderStreamOwners`] value before the generator is built, whose `Drop`
+/// revokes the query's Analytical graph before starting the claim's release,
+/// so Forge can never destroy objects a still-running follower or local driver
+/// may read.
+fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
     let FrameBuildInput {
         query_class,
         schema_frame,
@@ -456,12 +432,16 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         request_cancellation,
         stream_telemetry_cancelled,
         mut running_query,
-        reader_protection,
+        active_reads,
     } = input;
+    let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
+    // Built before the generator, never inside it: a stream dropped before its
+    // first poll drops only its captures, in an unspecified order, so the two
+    // owners must already be one captured value whose `Drop` fixes the order.
+    let owners = LeaderStreamOwners::new(admitted, active_reads);
     let frames = async_stream::stream! {
-        let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
-        let mut admitted = Some(admitted);
-        // Re-bound after `admitted` on purpose. When a consumer walks away the
+        let mut owners = owners;
+        // Re-bound after `owners` on purpose. When a consumer walks away the
         // generator state is dropped in reverse declaration order, so the plan's
         // `RecordBatch` stream must be declared last to release its memory-pool
         // reservations before the analytical envelope that granted them. The
@@ -485,7 +465,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                     match encode_frame(
                         &batch,
                         &mut ipc,
-                        admitted.as_ref(),
+                        owners.admitted.as_ref(),
                         &mut query_telemetry,
                         &mut row_count,
                     ) {
@@ -498,7 +478,8 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                         Ok(Some(frame)) => {
                             yield Ok(QueryStreamFrame::Batch(frame));
                             #[cfg(feature = "test-support")]
-                            if let Some(probe) = admitted
+                            if let Some(probe) = owners
+                                .admitted
                                 .as_ref()
                                 .and_then(|admitted| admitted.resource_probe.clone())
                                 && let Some(refusal) = probe.park_after_rows().await
@@ -531,19 +512,53 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
             request_cancellation: &request_cancellation,
             stream_cancellation: &stream_cancellation,
             distributed_settlement: &distributed_settlement,
-            admitted: &mut admitted,
+            admitted: &mut owners.admitted,
             ipc: &mut ipc,
             query_telemetry: &mut query_telemetry,
             gate_lifecycle: gate_lifecycle.as_ref(),
             running_query: &mut running_query,
             query_class,
             row_count,
-            reader_protection,
+            active_reads: &mut owners.active_reads,
         })
         .await;
         yield Ok(QueryStreamFrame::Terminal(terminal));
     };
     Box::pin(frames)
+}
+
+/// The two leader-stream owners whose release order is load-bearing.
+///
+/// A consumer may drop the frame stream at any await, including mid-settlement.
+/// The admission guard carries the query's Analytical graph lifecycle, whose
+/// drop revokes every follower grant and aborts every local driver before it
+/// returns; the active-read claim's drop starts its release. Releasing the
+/// claim first would let Forge destroy objects a still-running follower or
+/// local driver may read, so this value's `Drop` fixes the order explicitly
+/// instead of leaving it to generator-state drop order.
+struct LeaderStreamOwners {
+    /// Admission guard, and through it the Analytical graph lifecycle.
+    admitted: Option<AdmittedQueryGuard>,
+    /// Active table reads, released only after `admitted` is gone.
+    active_reads: Option<ActiveReadClaim>,
+}
+
+impl LeaderStreamOwners {
+    /// Takes ownership of the stream's admission guard and active-read claim.
+    const fn new(admitted: AdmittedQueryGuard, active_reads: Option<ActiveReadClaim>) -> Self {
+        Self {
+            admitted: Some(admitted),
+            active_reads,
+        }
+    }
+}
+
+impl Drop for LeaderStreamOwners {
+    /// Revokes the Analytical graph first, then starts the claim's release.
+    fn drop(&mut self) {
+        drop(self.admitted.take());
+        drop(self.active_reads.take());
+    }
 }
 
 /// Ordered degradation observed by one distributed query.
@@ -621,8 +636,12 @@ struct StreamSettlementInputs<'a> {
     query_class: QueryClass,
     /// Rows emitted before the terminal, reported on every outcome.
     row_count: u64,
-    /// Reader-epoch protection released only once nothing can read again.
-    reader_protection: Option<ReaderProtectedQueryTerminalOwner>,
+    /// Active table reads released only once nothing can read again.
+    ///
+    /// Borrowed from the stream's [`LeaderStreamOwners`] rather than moved, so
+    /// a settlement dropped mid-await leaves the claim where that owner's
+    /// `Drop` releases it after the Analytical graph is revoked.
+    active_reads: &'a mut Option<ActiveReadClaim>,
 }
 
 /// Settles every owner the drained stream holds and assembles its terminal.
@@ -648,7 +667,7 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         running_query,
         query_class,
         row_count,
-        reader_protection,
+        active_reads,
     } = inputs;
     let outcome = candidate.outcome;
     let failed_outcome = settle_failed_cancellation(
@@ -685,9 +704,11 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         owner.finish(terminal.outcome);
     }
     // Released only here. Every leader-local batch source was dropped by the
-    // caller and the distributed settlement has joined, so no descendant of
-    // this query can read the protected snapshots again.
-    drop(reader_protection);
+    // caller and the distributed and Analytical settlements have joined, so
+    // no descendant of this query can read its cut again.
+    if let Some(claim) = active_reads.take() {
+        claim.release().await;
+    }
     terminal
 }
 
@@ -790,9 +811,8 @@ async fn settle_distributed(
 /// the point at which it is merely no longer awaited. Followers stop when the
 /// settlement closes their grant streams and free their own graphs afterwards.
 ///
-/// Signalling and awaiting is the whole of this stream's part in settlement:
-/// the graph's lifecycle task owns the cleanup order, and reproducing any of it
-/// here would be a second, racing sequence.
+/// The graph's lifecycle, owned by this stream, holds the one cleanup order;
+/// this only hands it the outcome and runs it inline.
 ///
 /// Reports what one stream's Analytical settlement did with its two owners.
 ///
@@ -808,12 +828,11 @@ pub(super) struct AnalyticalStreamSettlement {
 
 /// Settles this stream's Analytical attempt after moving admission to its graph.
 ///
-/// The transfer happens *before* settlement is signalled and awaited, not
-/// after: the lifecycle task may already have settled by the time this observes
-/// the outcome, and a permit handed over afterwards would arrive at a graph that
-/// no longer exists. Releasing it here instead would decrement class, tenant,
-/// and active-query accounting — waking a queued waiter — while a failed
-/// cleanup still holds this query's whole envelope.
+/// The transfer happens *before* settlement runs, not after: a successful
+/// settlement removes the graph, and a permit handed over afterwards would
+/// arrive at a graph that no longer exists. Releasing it here instead would
+/// decrement class, tenant, and active-query accounting — waking a queued
+/// waiter — while a failed cleanup still holds this query's whole envelope.
 ///
 /// Taking the Analytical ownership out of the guard first is what makes the
 /// transfer sound: the ownership names the supervisor that would then hold the
@@ -1307,8 +1326,6 @@ fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTermi
         QueryTerminalErrorCode::QueryTenantInvariant
     } else if message.contains("reconciliation invariant") {
         QueryTerminalErrorCode::QueryReconciliationInvariant
-    } else if message.contains("audit unavailable") {
-        QueryTerminalErrorCode::QueryAuditUnavailable
     } else {
         QueryTerminalErrorCode::QueryExecutionFailed
     }
@@ -1480,6 +1497,11 @@ impl OracleQueryStream {
     }
 
     /// Builds a test stream through the production telemetry and admission owners.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the IPC encoder cannot encode `schema` into the opening schema
+    /// frame.
     #[cfg(test)]
     pub(super) fn test_from_physical(
         schema: &arrow::datatypes::SchemaRef,
@@ -1503,7 +1525,7 @@ impl OracleQueryStream {
             scan_stats,
             gate_lifecycle: None,
             running_query: None,
-            reader_protection: None,
+            active_reads: None,
         })
     }
 
@@ -1528,7 +1550,7 @@ impl OracleQueryStream {
             scan_stats,
             gate_lifecycle,
             running_query,
-            reader_protection,
+            active_reads,
         } = input;
         #[cfg(feature = "test-support")]
         let mut admitted = admitted;
@@ -1558,7 +1580,7 @@ impl OracleQueryStream {
             request_cancellation,
             stream_telemetry_cancelled,
             running_query,
-            reader_protection,
+            active_reads,
         });
         let frames = polled_in_span(frames, span);
         let stream = Self::assemble(
@@ -2101,6 +2123,12 @@ mod tests {
     }
 
     /// A success terminal is observable only after local ownership is released.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a terminal frame is observed while the admission registry still
+    /// counts the query active, when no terminal frame is emitted, or when the
+    /// query is still active after the stream ends.
     #[tokio::test]
     async fn success_terminal_requires_completed_local_release() {
         let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
@@ -2123,7 +2151,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            reader_protection: None,
+            active_reads: None,
         });
         let mut terminal_seen = false;
         while let Some(Ok(frame)) = stream.frames.next().await {
@@ -2137,6 +2165,12 @@ mod tests {
     }
 
     /// A typed stale object observed after schema output fails without replacement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the first frame is not the schema frame, when the stale batch
+    /// does not produce a failed terminal next, when that terminal carries a
+    /// stale-cut replan warning, or when the query is still admitted afterwards.
     #[tokio::test]
     async fn post_output_typed_stale_object_is_terminal_without_replan() {
         let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
@@ -2161,7 +2195,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            reader_protection: None,
+            active_reads: None,
         });
         assert!(matches!(
             stream.frames.next().await,
@@ -2177,6 +2211,12 @@ mod tests {
     }
 
     /// Caller cancellation reaches the production stream without canceling siblings.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the first frame is not the schema frame, when request
+    /// cancellation does not yield a terminal frame within one second, or when the
+    /// query is still admitted afterwards.
     #[tokio::test]
     async fn request_cancellation_interrupts_production_stream() {
         let (admitted, shared, request_cancellation) = admitted_guard_for_test();
@@ -2198,7 +2238,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            reader_protection: None,
+            active_reads: None,
         });
         assert!(matches!(
             stream.frames.next().await,

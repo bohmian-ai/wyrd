@@ -1,0 +1,14 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: default
+  name: seeded-prompt
+  version: 0.1.0
+spec:
+  provider: openai
+  model: gpt-4o
+  messages: hello
+  model_settings:
+    seed: 123
+    future_knob:
+      enabled: true

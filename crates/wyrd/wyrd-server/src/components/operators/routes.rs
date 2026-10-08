@@ -72,8 +72,6 @@ pub(crate) fn decode_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, WyrdErr
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "A connection of this provider and name exists \
           (WYRD_OPERATOR_409_CONNECTION_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "No active connection key is readable, or the \
           registry is unavailable (WYRD_OPERATOR_503_KEY_UNAVAILABLE, \
           WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
@@ -111,8 +109,6 @@ async fn create_connection(
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
         (status = 403, description = "The principal lacks operators:read \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -149,8 +145,6 @@ async fn list_connections(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such connection in the caller's tenant \
           (WYRD_OPERATOR_404_CONNECTION_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
     ),
@@ -193,8 +187,6 @@ async fn get_connection(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such connection in the caller's tenant \
           (WYRD_OPERATOR_404_CONNECTION_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "No active connection key is readable, or the \
           registry is unavailable (WYRD_OPERATOR_503_KEY_UNAVAILABLE, \
           WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
@@ -241,8 +233,6 @@ async fn update_connection(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such connection in the caller's tenant \
           (WYRD_OPERATOR_404_CONNECTION_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
     ),

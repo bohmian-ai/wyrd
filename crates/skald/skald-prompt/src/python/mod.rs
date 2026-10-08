@@ -13,17 +13,30 @@
 //! sub-files. Each sub-module owns a `register` helper that adds its
 //! `#[pyclass]` types to the parent Python module.
 
-// justification: PyO3 `__repr__` methods must take `&self` even when they return a static string.
-#![allow(clippy::unused_self)]
-// justification: PyO3 bridge code uses match-let patterns that predate `let…else` and are clearer inline.
-#![allow(clippy::manual_let_else)]
-// justification: large bridge file; exhaustive single-remaining-variant matches are overly verbose.
-#![allow(clippy::match_wildcard_for_single_variants)]
-// justification: `|v| v.len()` is clearer than `Vec::len` in closure context here.
-#![allow(clippy::redundant_closure_for_method_calls)]
-// justification: WyrdPyResult return types are intentionally uniform across the bridge, even when infallible.
-#![allow(clippy::unnecessary_wraps)]
-#![allow(missing_docs)]
+#![allow(
+    clippy::unused_self,
+    reason = "PyO3 `__repr__` methods must take `&self` even when they return a static string."
+)]
+#![allow(
+    clippy::manual_let_else,
+    reason = "PyO3 bridge code uses match-let patterns that predate `let…else` and are clearer inline."
+)]
+#![allow(
+    clippy::match_wildcard_for_single_variants,
+    reason = "large bridge file; exhaustive single-remaining-variant matches are overly verbose."
+)]
+#![allow(
+    clippy::redundant_closure_for_method_calls,
+    reason = "`|v| v.len()` is clearer than `Vec::len` in closure context here."
+)]
+#![allow(
+    clippy::unnecessary_wraps,
+    reason = "WyrdPyResult return types are intentionally uniform across the bridge, even when infallible."
+)]
+#![allow(
+    missing_docs,
+    reason = "the Python-facing docs of these PyO3 wrappers live in the generated stubs"
+)]
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;

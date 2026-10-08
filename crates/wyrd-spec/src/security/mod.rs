@@ -19,10 +19,10 @@ mod schema_drift_tests {
     //! Schema drift guard for `wyrd-spec::security`.
     //!
     //! Regenerates each type's JSON schema and compares against the golden files
-    //! committed under `crates/wyrd-spec/tests/schemas/`. A drift means a public
+    //! committed under `crates/wyrd-spec/schemas/`. A drift means a public
     //! wire contract changed; updating the golden is a deliberate sign-off.
     //!
-    //! To regenerate goldens (writes both `schemas/` and `tests/schemas/`):
+    //! To regenerate goldens:
     //!   cargo run --locked -p wyrd-spec --example gen_schemas --features server
     //!
     //! `test-utils` MUST be off during schema generation. This module is
@@ -45,7 +45,7 @@ mod schema_drift_tests {
     }
 
     fn load_golden(name: &str) -> String {
-        let path = format!("{}/tests/schemas/{}.json", env!("CARGO_MANIFEST_DIR"), name);
+        let path = format!("{}/schemas/{}.json", env!("CARGO_MANIFEST_DIR"), name);
         fs::read_to_string(&path).unwrap_or_else(|_| {
             panic!(
                 "golden missing: {path}\n\
@@ -119,7 +119,7 @@ mod secret_ref_tests {
     // `feature = "test-utils"` in the library, so these tests MUST be gated on
     // `feature = "test-utils"` ONLY — not `any(test, feature = "test-utils")` —
     // or the no-`test-utils` build (`cargo test -p wyrd-spec --no-default-features
-    // --features server --tests security`, used by `check:security-inline-gate`)
+    // --features server --tests security`, as `check:deps` runs it)
     // will try to compile references to `InlineSecret` / `SecretRef::Inline` that
     // the library does not export.
 
@@ -145,7 +145,7 @@ mod secret_ref_tests {
     fn inline_secret_debug_is_redacted() {
         use crate::security::InlineSecret;
         let s = InlineSecret::new("supersecret");
-        let dbg = format!("{:?}", s);
+        let dbg = format!("{s:?}");
         assert!(
             dbg.contains("<redacted>"),
             "Debug must redact plaintext, got {dbg}"

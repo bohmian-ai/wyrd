@@ -14,16 +14,18 @@ use crate::cards::error::RegistryEngineError;
 /// Validate source bytes before any registration network call and stamp the
 /// manifest hash that the server validates at the registration boundary.
 ///
-/// Entries are sorted in place, and the manifest hash is stamped only after
-/// every present source matches its declared size and digest.
+/// Entries are sorted in place. An entry authored without `size_bytes` or
+/// `sha256` takes the value computed from its source; a declared value must
+/// match it. The manifest hash is stamped only after every present source is
+/// filled in or matched.
 ///
 /// # Errors
 ///
 /// Returns an IO error when a source cannot be opened or read,
 /// `RegistrySpecTooLarge` when a source size overflows `u64`,
 /// `RegistryManifestHashMismatch` when a source's size or SHA-256 differs from
-/// its entry, and a serialization error when the manifest cannot be
-/// canonicalized.
+/// a value its entry declares, and a serialization error when the manifest
+/// cannot be canonicalized.
 ///
 /// # Cancellation
 ///
@@ -36,23 +38,24 @@ pub(crate) async fn validate_and_stamp(
     submission
         .artifacts
         .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    for artifact in &submission.artifacts {
+    for artifact in &mut submission.artifacts {
         let Some(source) = sources.get(&artifact.relative_path) else {
             continue;
         };
         let (actual_size, actual_sha256) = hash_source(source).await?;
-        if actual_size != artifact.size_bytes {
+        let declared_size = *artifact.size_bytes.get_or_insert(actual_size);
+        if actual_size != declared_size {
             return Err(WyrdError::RegistryManifestHashMismatch {
                 message: "local artifact size does not match its manifest".to_owned(),
                 details: serde_json::json!({
                     "relative_path": artifact.relative_path,
-                    "expected_size_bytes": artifact.size_bytes,
+                    "expected_size_bytes": declared_size,
                     "actual_size_bytes": actual_size,
                 }),
             }
             .into());
         }
-        if actual_sha256 != artifact.sha256 {
+        if *artifact.sha256.get_or_insert_with(|| actual_sha256.clone()) != actual_sha256 {
             return Err(WyrdError::RegistryManifestHashMismatch {
                 message: "local artifact digest does not match its manifest".to_owned(),
                 details: serde_json::json!({ "relative_path": artifact.relative_path }),
@@ -92,7 +95,7 @@ async fn hash_source(source: &Path) -> Result<(u64, String), RegistryEngineError
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = reader.read(&mut buffer).await?;
         if read == 0 {
@@ -139,8 +142,8 @@ mod tests {
                 bump: None,
                 space: Some("default".parse().expect("test space is valid")),
                 uid: None,
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::default(),
+                annotations: BTreeMap::default(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,
@@ -162,8 +165,10 @@ mod tests {
         let relative_path = RelativeArtifactPath::new("weights.bin").expect("path is valid");
         let entry = ArtifactManifestEntry {
             relative_path: relative_path.clone(),
-            sha256: base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes)),
-            size_bytes: u64::try_from(bytes.len()).expect("test bytes length fits u64"),
+            sha256: Some(
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes)),
+            ),
+            size_bytes: Some(u64::try_from(bytes.len()).expect("test bytes length fits u64")),
             content_type: None,
         };
         let mut card = submission(entry);
@@ -174,6 +179,57 @@ mod tests {
             .expect("manifest validates");
 
         assert!(card.metadata.artifact_hash.is_some());
+    }
+
+    /// An entry authored without digest or size gets both from its source and
+    /// a stamped manifest hash; a declared digest that differs from the
+    /// source is still refused.
+    #[tokio::test]
+    async fn missing_metadata_is_computed_and_declared_mismatch_is_refused() {
+        let directory = tempdir().expect("temporary directory creates");
+        let source = directory.path().join("weights.bin");
+        tokio::fs::write(&source, b"weights")
+            .await
+            .expect("artifact writes");
+        let relative_path = RelativeArtifactPath::new("weights.bin").expect("path is valid");
+        let entry = ArtifactManifestEntry {
+            relative_path: relative_path.clone(),
+            sha256: None,
+            size_bytes: None,
+            content_type: None,
+        };
+        let sources = BTreeMap::from([(relative_path, source)]);
+        let mut card = submission(entry.clone());
+
+        validate_and_stamp(&mut card, &sources)
+            .await
+            .expect("missing metadata is computed");
+
+        let computed = &card.artifacts[0];
+        assert_eq!(computed.size_bytes, Some(7));
+        assert_eq!(
+            computed.sha256.as_deref(),
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(sha2::Sha256::digest(b"weights"))
+                    .as_str()
+            )
+        );
+        assert!(card.metadata.artifact_hash.is_some());
+
+        let mut wrong = submission(ArtifactManifestEntry {
+            sha256: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()),
+            ..entry
+        });
+        let error = validate_and_stamp(&mut wrong, &sources)
+            .await
+            .expect_err("declared digest mismatch must fail");
+        assert!(matches!(
+            error,
+            RegistryEngineError::Wyrd(
+                wyrd_spec::error::WyrdError::RegistryManifestHashMismatch { .. }
+            )
+        ));
     }
 
     /// A digest mismatch between the declared entry and the file is refused before upload.
@@ -187,8 +243,8 @@ mod tests {
         let relative_path = RelativeArtifactPath::new("weights.bin").expect("path is valid");
         let entry = ArtifactManifestEntry {
             relative_path: relative_path.clone(),
-            sha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
-            size_bytes: 6,
+            sha256: Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()),
+            size_bytes: Some(6),
             content_type: None,
         };
         let mut card = submission(entry);
@@ -217,9 +273,10 @@ mod tests {
             let relative_path = RelativeArtifactPath::new("weights.bin").expect("path is valid");
             let entry = ArtifactManifestEntry {
                 relative_path: relative_path.clone(),
-                sha256: base64::engine::general_purpose::STANDARD
-                    .encode(sha2::Sha256::digest(bytes)),
-                size_bytes: expected_size,
+                sha256: Some(
+                    base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes)),
+                ),
+                size_bytes: Some(expected_size),
                 content_type: None,
             };
             let mut card = submission(entry);

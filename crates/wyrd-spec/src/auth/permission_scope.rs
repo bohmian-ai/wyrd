@@ -78,10 +78,10 @@ impl GatewayAccess {
     #[must_use]
     pub fn covers(&self, required: &Self) -> bool {
         match (self, required) {
-            (Self::Provider { provider }, Self::Provider { provider: required })
-            | (
+            (
                 Self::Provider { provider },
-                Self::Model {
+                Self::Provider { provider: required }
+                | Self::Model {
                     provider: required, ..
                 },
             ) => provider == required,

@@ -136,16 +136,20 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
 /// Returns a client-construction error for a rejected endpoint and the server's
 /// stable Wyrd error when the caller is unauthorized or the read fails.
 async fn list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
-    let mut query = url::form_urlencoded::Serializer::new(String::new());
-    if let Some(ref issuer) = args.issuer {
-        query.append_pair("issuer", issuer);
-    }
-    if let Some(ref subject) = args.subject {
-        query.append_pair("subject", subject);
-    }
+    // The serializer is not `Send`, so the path is finished before any await.
+    let path = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        if let Some(ref issuer) = args.issuer {
+            query.append_pair("issuer", issuer);
+        }
+        if let Some(ref subject) = args.subject {
+            query.append_pair("subject", subject);
+        }
+        path_with_query(&query.finish())
+    };
 
     let views: Vec<WorkloadBindingView> = crate::client::from_global(Some(args.server.as_str()))?
-        .request_json::<(), _>(Method::GET, &path_with_query(&query.finish()), None)
+        .request_json::<(), _>(Method::GET, &path, None)
         .await
         .map_err(|source| WyrdCliError::Server { source })?;
 

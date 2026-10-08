@@ -9,13 +9,15 @@ use std::result::Result as StdResult;
 
 use napi::Result;
 use napi_derive::napi;
-use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode, ListCardsRequest};
+use wyrd_client::cards::{CardKind, CardSelector, Cards, HydrationMode, ListCardsRequest};
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Run};
 use wyrd_client::state::WyrdState;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 
+use crate::client::NativeWyrdClient;
 use crate::workflow::{NativeWorkflowLoad, parse_workflow_selector};
 use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
 
@@ -26,46 +28,33 @@ pub struct NativeCards {
     cards: Cards,
 }
 
-/// Closed result of building one Card registry handle: a handle or a catalog error.
-#[napi(object, object_from_js = false)]
-pub struct NativeCardsConnection {
-    /// Registry handle when construction succeeded.
-    pub cards: Option<NativeCards>,
-    /// Catalog failure when no credential resolves or the client cannot be built.
-    pub error: Option<NativeWyrdError>,
-}
-
-/// Builds one Card registry handle without performing IO.
-///
-/// Omitted arguments resolve through the same shared client configuration
-/// chain as `connectBifrost`, so both capabilities authenticate identically.
-/// Credential and configuration failures are returned as catalog metadata.
 #[napi]
-pub fn connect_cards(
-    server_url: Option<String>,
-    credential: Option<String>,
-    tenant: Option<String>,
-) -> NativeCardsConnection {
-    let client = wyrd_client::bifrost::client_from_options(
-        server_url.as_deref(),
-        credential.as_deref(),
-        None,
-        tenant.as_deref(),
-    );
-    drop(server_url);
-    drop(credential);
-    drop(tenant);
-    match client {
-        Ok(client) => NativeCardsConnection {
-            cards: Some(NativeCards {
-                cards: Cards::with_client(client),
-            }),
-            error: None,
-        },
-        Err(error) => NativeCardsConnection {
-            cards: None,
-            error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
-        },
+impl NativeWyrdClient {
+    /// Builds one Card registry handle that calls the server as this client.
+    ///
+    /// No IO happens here; the public TypeScript `Cards.connect` passes the
+    /// caller's client or the ambient one.
+    #[napi]
+    pub fn cards(&self) -> NativeCards {
+        NativeCards {
+            cards: Cards::with_client(self.client.clone()),
+        }
+    }
+
+    /// Loads and validates one hydrated bundle whose server calls run as this
+    /// client.
+    ///
+    /// The state's identity is fixed here: Bifrost startup and every verify
+    /// go through this client, and the ambient configuration is never read.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The hydrated bundle directory.
+    #[napi]
+    pub fn open_wyrd_state(&self, path: String) -> NativeWyrdState {
+        NativeWyrdState {
+            state: WyrdState::from_path_with_client(path, self.client.clone()),
+        }
     }
 }
 
@@ -117,6 +106,44 @@ impl NativeCards {
         NativeLifecycleResult::outcome(result)
     }
 
+    /// Resolves the latest Active version of one named Card to its exact
+    /// reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `kind` - The Card kind, such as `Model`.
+    /// * `space` - The Card space.
+    /// * `name` - The Card name.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the reference cannot be serialized; a
+    /// malformed kind, space, or name (`WYRD_SPEC_400_VALIDATION`), no Active
+    /// version, and registry failures are returned in the result.
+    #[napi]
+    pub async fn resolve_latest(
+        &self,
+        kind: String,
+        space: String,
+        name: String,
+    ) -> Result<NativeLifecycleResult> {
+        let invalid = |field: &str, error: &dyn std::fmt::Display| WyrdError::Validation {
+            message: format!("{field} is invalid: {error}"),
+            details: serde_json::json!({ "field": field }),
+        };
+        let parsed = (
+            serde_json::from_value::<CardKind>(serde_json::Value::String(kind))
+                .map_err(|error| invalid("kind", &error)),
+            SpaceName::new(space).map_err(|error| invalid("space", &error)),
+            CardName::new(name).map_err(|error| invalid("name", &error)),
+        );
+        let result = match parsed {
+            (Ok(kind), Ok(space), Ok(name)) => self.cards.resolve_latest(kind, space, name).await,
+            (Err(error), ..) | (_, Err(error), _) | (.., Err(error)) => Err(error),
+        };
+        NativeLifecycleResult::outcome(result)
+    }
+
     /// Hydrates one Card graph into a published local bundle.
     ///
     /// `metadata_only` skips artifact payload downloads. A failed hydration
@@ -140,12 +167,10 @@ impl NativeCards {
         };
         let result = match parse_card_ref(&card_ref) {
             Ok(card_ref) => {
-                let hydrator = CardGraphHydrator::new(self.cards.registry_context());
-                Box::pin(hydrator.hydrate(
-                    &CardSelector::exact(card_ref),
-                    Path::new(&destination),
-                    mode,
-                ))
+                Box::pin(
+                    self.cards
+                        .hydrate(CardSelector::exact(card_ref), &destination, mode),
+                )
                 .await
             }
             Err(error) => Err(error),
@@ -202,11 +227,14 @@ pub struct NativeWyrdState {
 }
 
 /// Loads and validates one hydrated bundle without contacting Wyrd.
+///
+/// The state resolves the ambient client once, at its first server call, and
+/// keeps it; [`NativeWyrdClient::open_wyrd_state`] fixes the client instead.
 #[napi]
 pub fn open_wyrd_state(path: String) -> NativeWyrdState {
-    let state = WyrdState::from_path(Path::new(&path));
-    drop(path);
-    NativeWyrdState { state }
+    NativeWyrdState {
+        state: WyrdState::from_path(path),
+    }
 }
 
 #[napi]
@@ -219,6 +247,17 @@ impl NativeWyrdState {
     #[napi]
     pub fn root_ref(&self) -> Result<NativeLifecycleResult> {
         self.read(|state| NativeLifecycleResult::outcome(Ok(state.root_ref())))
+    }
+
+    /// Returns the stored envelope of the root Card the bundle was hydrated
+    /// from.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the envelope cannot be serialized.
+    #[napi]
+    pub fn service(&self) -> Result<NativeLifecycleResult> {
+        self.read(|state| NativeLifecycleResult::outcome(Ok(state.service())))
     }
 
     /// Returns every persisted alias in stable sorted order.
@@ -282,57 +321,129 @@ impl NativeWyrdState {
         result
     }
 
+    /// Returns the stored envelope of the Verifier Card an alias names.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the envelope cannot be serialized; an
+    /// unknown alias and another kind are returned in the result.
+    #[napi]
+    pub fn verifier(&self, alias: String) -> Result<NativeLifecycleResult> {
+        self.read(|state| {
+            NativeLifecycleResult::outcome(state.verifier(&alias).and_then(|_| state.card(&alias)))
+        })
+    }
+
+    /// Returns the stored envelope of the Workflow Card an alias names.
+    ///
+    /// # Errors
+    ///
+    /// As [`NativeWyrdState::verifier`].
+    #[napi]
+    pub fn workflow(&self, alias: String) -> Result<NativeLifecycleResult> {
+        self.read(|state| {
+            NativeLifecycleResult::outcome(state.workflow(&alias).and_then(|_| state.card(&alias)))
+        })
+    }
+
+    /// Returns the stored envelope of the Agent Card an alias names.
+    ///
+    /// # Errors
+    ///
+    /// As [`NativeWyrdState::verifier`].
+    #[napi]
+    pub fn agent(&self, alias: String) -> Result<NativeLifecycleResult> {
+        self.read(|state| {
+            NativeLifecycleResult::outcome(state.agent(&alias).and_then(|_| state.card(&alias)))
+        })
+    }
+
+    /// Returns the stored envelope of the Prompt Card an alias names.
+    ///
+    /// # Errors
+    ///
+    /// As [`NativeWyrdState::verifier`].
+    #[napi]
+    pub fn prompt(&self, alias: String) -> Result<NativeLifecycleResult> {
+        self.read(|state| {
+            NativeLifecycleResult::outcome(state.prompt(&alias).and_then(|_| state.card(&alias)))
+        })
+    }
+
+    /// Returns the stored envelope of the Model Card an alias names.
+    ///
+    /// # Errors
+    ///
+    /// As [`NativeWyrdState::verifier`].
+    #[napi]
+    pub fn model(&self, alias: String) -> Result<NativeLifecycleResult> {
+        self.read(|state| {
+            NativeLifecycleResult::outcome(state.model(&alias).and_then(|_| state.card(&alias)))
+        })
+    }
+
+    /// Returns the stored envelope of the Data Card an alias names.
+    ///
+    /// # Errors
+    ///
+    /// As [`NativeWyrdState::verifier`].
+    #[napi]
+    pub fn data(&self, alias: String) -> Result<NativeLifecycleResult> {
+        self.read(|state| {
+            NativeLifecycleResult::outcome(state.data(&alias).and_then(|_| state.card(&alias)))
+        })
+    }
+
     /// Connects this state's one Bifrost writer and describes the fixed tables.
     ///
-    /// The transport arguments are `connectBifrost`'s and resolve through the
-    /// same chain when omitted. Startup describes both fixed observation tables
-    /// before succeeding, so a run can never enqueue against a missing,
-    /// unauthorized, or incompatible system table.
+    /// Runs as the state's client: the one it was opened with, else the
+    /// ambient client it resolves once. Startup describes both fixed
+    /// observation tables before succeeding, so a run can never enqueue
+    /// against a missing, unauthorized, or incompatible system table.
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - The serialized active write table, or `None` for none.
+    /// * `client_byte_limit_bytes` - The handle-wide ingestion byte budget, or
+    ///   `None` for the 256 MiB default.
     ///
     /// # Errors
     ///
     /// Returns a napi error when `table` is not one serialized `TableConfig`;
-    /// a second start, a closed state, and credential, dial, and fixed-table
-    /// failures are returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; generated object and string arguments arrive owned
-    #[allow(clippy::needless_pass_by_value)]
+    /// a second start, a closed state, and credential, byte-budget, dial, and
+    /// fixed-table failures are returned in [`NativeLifecycleResult`].
     #[napi]
     pub async fn start_bifrost(
         &self,
         table: Option<NativeTableConfig>,
-        server_url: Option<String>,
-        credential: Option<String>,
-        grpc_url: Option<String>,
-        tenant: Option<String>,
+        client_byte_limit_bytes: Option<i64>,
     ) -> Result<NativeLifecycleResult> {
         let state = match &self.state {
             Ok(state) => state,
             Err(error) => return Ok(NativeLifecycleResult::from_wyrd(error)),
         };
         let table = table.map(|table| table.parse()).transpose()?;
-        let client = match wyrd_client::bifrost::client_from_options(
-            server_url.as_deref(),
-            credential.as_deref(),
-            grpc_url.as_deref(),
-            tenant.as_deref(),
-        ) {
-            Ok(client) => client,
-            Err(error) => {
-                return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::from(&error)));
-            }
-        };
-        NativeLifecycleResult::outcome(Box::pin(state.start_bifrost_with(&client, table)).await)
+        NativeLifecycleResult::outcome(
+            Box::pin(
+                state
+                    .start_bifrost_with_config(table, crate::queue_config(client_byte_limit_bytes)),
+            )
+            .await,
+        )
     }
 
-    /// Opens one invocation over this state, targeting the root Service Card.
+    /// Opens one invocation over this state, targeting `alias` or the root Service.
     ///
     /// Local only: no network IO, no server-side Run resource, and no Verifier
-    /// execution.
+    /// execution. An `alias` resolves in the hydrated graph before the run
+    /// mints its `run_id`; an unknown alias is returned as the outcome's
+    /// `WYRD_SDK_404_UNKNOWN_ALIAS` error and nothing is opened.
     #[napi]
-    pub fn run(&self) -> NativeRunOpen {
-        NativeRunOpen::outcome(match &self.state {
-            Ok(state) => Ok(state.run()),
-            Err(error) => Err(error.clone()),
+    pub fn run(&self, alias: Option<String>) -> NativeRunOpen {
+        NativeRunOpen::outcome(match (&self.state, alias) {
+            (Ok(state), Some(alias)) => state.run_for_card(&alias),
+            (Ok(state), None) => Ok(state.run()),
+            (Err(error), _) => Err(error.clone()),
         })
     }
 
@@ -411,7 +522,7 @@ fn parse_card_ref(value: &str) -> StdResult<CardRef, WyrdError> {
 ///
 /// Opening cannot be projected through [`NativeLifecycleResult`] because the run
 /// is a native class rather than a serializable value, so it follows the same
-/// handle-or-error shape as [`NativeCardsConnection`].
+/// handle-or-error shape as [`NativeWorkflowLoad`].
 #[napi(object, object_from_js = false)]
 pub struct NativeRunOpen {
     /// The scoped run when the bundle and alias resolved.
@@ -454,16 +565,13 @@ impl NativeRun {
         self.run.run_id().as_str().to_owned()
     }
 
-    /// The exact Card reference this view observes.
+    /// The alias this view was opened with.
     #[napi(getter)]
-    pub fn card_ref(&self) -> String {
-        self.run.card_ref().to_string()
+    pub fn alias(&self) -> String {
+        self.run.alias().to_owned()
     }
 
     /// An immutable sibling view scoped to a registered alias.
-    // justification: napi boundary; a JavaScript string is primitive and cannot
-    // be passed by reference, so the generated binding requires an owned String
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn for_card(&self, alias: String) -> NativeRunOpen {
         NativeRunOpen::outcome(self.run.for_card(&alias))
@@ -476,8 +584,6 @@ impl NativeRun {
     /// Returns a napi error only when the outcome cannot be projected; a
     /// malformed feature map, the lifecycle refusals, and queue saturation are
     /// returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; JavaScript strings arrive owned
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn drift(
         &self,
@@ -502,8 +608,6 @@ impl NativeRun {
     /// Returns a napi error only when the outcome cannot be projected; malformed
     /// identifiers, a span without its trace, the lifecycle refusals, and queue
     /// saturation are returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; JavaScript strings arrive owned
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn eval(
         &self,
@@ -526,6 +630,44 @@ impl NativeRun {
         NativeLifecycleResult::outcome(self.run.observe().eval_json(&context_json, options))
     }
 
+    /// Judges this view's subject with a bound Verifier from JSON input.
+    ///
+    /// `input_json` is one Eval context object or one array of Drift feature
+    /// rows; `media_json` is one JSON array of media descriptors. One server
+    /// call, never replayed; nothing is observed, recorded, or dispatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; an
+    /// unbound Verifier, input of the wrong shape, malformed media, and the
+    /// server's verification refusals are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn verify(
+        &self,
+        verifier: String,
+        input_json: String,
+        media_json: Option<String>,
+    ) -> Result<NativeLifecycleResult> {
+        let media = match media_json.as_deref().map(serde_json::from_str).transpose() {
+            Ok(media) => media.unwrap_or_default(),
+            Err(error) => {
+                return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
+                    message: format!("media is invalid: {error}"),
+                    details: serde_json::json!({ "field": "media", "reason": error.to_string() }),
+                }));
+            }
+        };
+        NativeLifecycleResult::outcome(
+            Box::pin(
+                self.run
+                    .observe()
+                    .verify_json(&verifier, &input_json, media),
+            )
+            .await,
+        )
+    }
+
     /// Emits one row into a registered `vala.datasets` table.
     ///
     /// Asynchronous because the first call for a table describes it; later calls
@@ -536,8 +678,6 @@ impl NativeRun {
     /// Returns a napi error only when the outcome cannot be projected; a
     /// reserved, unknown, or unauthorized table and the lifecycle refusals are
     /// returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; JavaScript strings arrive owned
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub async fn record(&self, table: String, row_json: String) -> Result<NativeLifecycleResult> {
         NativeLifecycleResult::outcome(

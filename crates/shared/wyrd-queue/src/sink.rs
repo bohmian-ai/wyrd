@@ -200,6 +200,10 @@ impl MockSink {
     }
 
     /// Returns assertion receipts rather than cloneable owned batches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a thread panicked while holding the receipt lock.
     #[must_use]
     pub fn received(&self) -> Vec<BatchReceipt> {
         self.received
@@ -209,6 +213,10 @@ impl MockSink {
     }
 
     /// Returns every attempted identity, including retained ambiguous attempts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a thread panicked while holding the attempt lock.
     #[must_use]
     pub fn attempted(&self) -> Vec<[u8; 16]> {
         self.attempted

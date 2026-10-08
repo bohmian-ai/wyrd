@@ -2,7 +2,8 @@
 //!
 //! Creating a tenant is one authorized operation that yields a *usable* tenant:
 //! the directory row, its administrative principal, that principal's role, its
-//! first credential, and the tenant's builtin roles. Nothing partial is ever
+//! first credential, the tenant's builtin roles, and every canonical Bifrost
+//! built-in table. Nothing partial is ever
 //! presented as live — the tenant is promoted only once every piece exists.
 //!
 //! Provisioning necessarily crosses two boundaries. The directory row sits at
@@ -37,7 +38,10 @@ use wyrd_sql::row_types::platform::TenantRow;
 use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::components::auth::PlatformCaller;
+use crate::components::platform::builtins::BuiltinTables;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
+use std::sync::Arc;
+use vala_sql::audit_outbox::AuditOutbox;
 
 /// Role a tenant administrative principal is granted at provisioning.
 ///
@@ -52,8 +56,7 @@ const TENANT_ADMIN_ROLE: &str = "admin";
 /// not configure it immediately. Rotating it to something shorter-lived is the
 /// tenant administrator's first available action.
 /// Lifetime of the initial tenant-administrator credential.
-const INITIAL_CREDENTIAL_LIFETIME: std::time::Duration =
-    std::time::Duration::from_secs(365 * 24 * 60 * 60);
+const INITIAL_CREDENTIAL_LIFETIME: std::time::Duration = std::time::Duration::from_hours(8760);
 
 /// Tenant provisioning failure.
 #[derive(Debug, thiserror::Error)]
@@ -64,9 +67,6 @@ pub enum ProvisionError {
     /// The slug is already taken by another tenant.
     #[error("tenant slug is already in use")]
     SlugTaken,
-    /// Authorization could not be recorded, so provisioning did not proceed.
-    #[error("provisioning could not be audited: {0}")]
-    AuditUnavailable(String),
     /// The named tenant is not one that may be acted on: it does not exist,
     /// is soft-deleted, or is in a lifecycle state other than active. The
     /// causes deliberately share one variant so a refusal cannot be used to
@@ -81,17 +81,13 @@ pub enum ProvisionError {
 impl From<PlatformAuthzError> for ProvisionError {
     /// Carry an authorization outcome into the provisioning vocabulary.
     ///
-    /// The three arms stay distinct on purpose: a denial is the caller's
-    /// answer, an unrecordable decision is a refusal to proceed at all, and a
-    /// transaction failure is a store fault that leaves the tenant visibly
-    /// incomplete. Collapsing any pair would make a provisioning attempt
+    /// The two arms stay distinct on purpose: a denial is the caller's answer,
+    /// and a transaction failure is a store fault that leaves the tenant
+    /// visibly incomplete. Collapsing them would make a provisioning attempt
     /// indistinguishable from a refused one.
     fn from(error: PlatformAuthzError) -> Self {
         match error {
             PlatformAuthzError::Denied { .. } => Self::Denied,
-            PlatformAuthzError::AuditUnavailable(error) => {
-                Self::AuditUnavailable(error.to_string())
-            }
             PlatformAuthzError::Transaction(error) => Self::Store(error.to_string()),
         }
     }
@@ -110,6 +106,10 @@ pub struct TenantProvisioning {
     /// lent to it as an already-acquired [`TenantConn`], so provisioning
     /// cannot open a transaction against a tenant its caller did not name.
     operator: OperatorPool,
+    /// Process audit outbox every platform decision is staged on.
+    audit: Arc<AuditOutbox>,
+    /// Built-in table inventory every tenant receives before promotion.
+    builtins: BuiltinTables,
 }
 
 impl Debug for TenantProvisioning {
@@ -120,10 +120,20 @@ impl Debug for TenantProvisioning {
 }
 
 impl TenantProvisioning {
-    /// Bind provisioning to the platform boundary it owns.
+    /// Bind provisioning to the platform boundary it owns, the process audit
+    /// outbox its decisions are staged on, and the built-in inventory a new
+    /// tenant receives.
     #[must_use]
-    pub const fn new(operator: OperatorPool) -> Self {
-        Self { operator }
+    pub const fn new(
+        operator: OperatorPool,
+        audit: Arc<AuditOutbox>,
+        builtins: BuiltinTables,
+    ) -> Self {
+        Self {
+            operator,
+            audit,
+            builtins,
+        }
     }
 
     /// Claim the directory row and report which tenant the work belongs to.
@@ -134,8 +144,8 @@ impl TenantProvisioning {
     /// attempt's id rather than the proposed one, and a connection bound to the
     /// discarded proposal would write the new tenant's rows nowhere useful.
     ///
-    /// The authorization decision and the directory row commit together, so a
-    /// tenant never exists without a recorded decision permitting it. On
+    /// The authorization decision is staged on the process audit outbox before
+    /// the directory row is written. On
     /// return the tenant exists but is not usable; the caller acquires a
     /// [`TenantConn`] for the returned id and passes it to [`Self::provision`],
     /// which owns every outcome from here including marking the tenant failed.
@@ -143,9 +153,7 @@ impl TenantProvisioning {
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks
     /// `tenants:write`, [`ProvisionError::SlugTaken`] when the slug is in use,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded — in which case nothing is created — and
-    /// [`ProvisionError::Store`] when a write fails.
+    /// and [`ProvisionError::Store`] when a write fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(slug = %request.slug), err)]
     pub async fn claim(
         &self,
@@ -155,7 +163,7 @@ impl TenantProvisioning {
         let data_tenant_id = DataTenantId::new_v7();
 
         // The handle must outlive the transaction it lends out.
-        let authz = PlatformAuthorization::new(self.operator.clone());
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
         let mut conn = authz
             .authorize(
                 &caller.context,
@@ -250,17 +258,19 @@ impl TenantProvisioning {
         Err(error)
     }
 
-    /// Establish the tenant's administration, then promote it to active.
+    /// Establish the tenant's administration and built-in tables, then
+    /// promote it to active.
     ///
     /// Promotion is the last stage and is part of what can fail: a tenant
     /// whose rows exist but that never became active is as unusable as one
-    /// that never got its administrator, so both failures reach the caller's
-    /// single failure path.
+    /// that never got its administrator or its built-in tables, so every
+    /// failure reaches the caller's single failure path.
     ///
     /// # Errors
     /// Returns [`ProvisionError::Store`] when a tenant-scoped write fails,
-    /// when the directory row left `provisioning` before it could be promoted,
-    /// or when the promotion write fails.
+    /// when a built-in table cannot be ensured, when the directory row left
+    /// `provisioning` before it could be promoted, or when the promotion write
+    /// fails.
     async fn establish_and_promote(
         &self,
         conn: TenantConn<'_>,
@@ -270,6 +280,10 @@ impl TenantProvisioning {
         let admin = self
             .establish_tenant_administration(conn, data_tenant_id, created_by)
             .await?;
+        self.builtins
+            .ensure_tenant(data_tenant_id)
+            .await
+            .map_err(|error| ProvisionError::Store(error.to_string()))?;
         match mark_tenant_active(&self.operator, data_tenant_id).await {
             Ok(true) => Ok(admin),
             Ok(false) => Err(ProvisionError::Store(
@@ -287,8 +301,7 @@ impl TenantProvisioning {
     ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded, and [`ProvisionError::Store`] when the read fails.
+    /// and [`ProvisionError::Store`] when the read fails.
     #[tracing::instrument(level = "info", skip(self, caller), err)]
     pub async fn list(
         &self,
@@ -316,9 +329,8 @@ impl TenantProvisioning {
     ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
-    /// [`ProvisionError::TenantUnavailable`] when no such row exists,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded, and [`ProvisionError::Store`] when the read fails.
+    /// [`ProvisionError::TenantUnavailable`] when no such row exists, and
+    /// [`ProvisionError::Store`] when the read fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
     pub async fn inspect(
         &self,
@@ -346,9 +358,7 @@ impl TenantProvisioning {
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks
     /// `tenants:suspend`, [`ProvisionError::TenantUnavailable`] when the tenant
-    /// is not in the state the transition requires,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded — in which case nothing changes — and
+    /// is not in the state the transition requires, and
     /// [`ProvisionError::Store`] when the write fails.
     #[tracing::instrument(level = "info", skip(self, caller), fields(tenant = %tenant_id), err)]
     pub async fn set_suspended(
@@ -358,7 +368,7 @@ impl TenantProvisioning {
         suspended: bool,
     ) -> Result<(), ProvisionError> {
         // The handle must outlive the transaction it lends out.
-        let authz = PlatformAuthorization::new(self.operator.clone());
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
         let mut decision = authz
             .authorize(
                 &caller.context,
@@ -398,14 +408,13 @@ impl TenantProvisioning {
     ///
     /// # Errors
     /// Returns [`ProvisionError::Denied`] when the caller lacks `tenants:read`,
-    /// [`ProvisionError::AuditUnavailable`] when the decision cannot be
-    /// recorded, and [`ProvisionError::Store`] when the commit fails.
+    /// and [`ProvisionError::Store`] when the commit fails.
     async fn authorize_read(
         &self,
         caller: &PlatformCaller,
         resource: &str,
     ) -> Result<(), ProvisionError> {
-        let authz = PlatformAuthorization::new(self.operator.clone());
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
         let decision = authz
             .authorize(
                 &caller.context,
@@ -448,41 +457,38 @@ impl TenantProvisioning {
         // created by the failed one. Reusing it is what keeps the tenant's
         // identity stable across the retry; creating a second would leave the
         // first behind holding the same role.
-        let principal_id = match tenant_admin_principal_id(&mut conn)
+        let principal_id = if let Some(existing) = tenant_admin_principal_id(&mut conn)
             .await
             .map_err(|e| ProvisionError::Store(e.to_string()))?
         {
-            Some(existing) => {
-                // The failed attempt may have committed a credential before it
-                // stopped, and its plaintext was never disclosed to anyone. A
-                // retry returns exactly one usable way in, so every credential
-                // this principal already holds is retired first rather than
-                // left live and unaccounted for.
-                for credential in list_api_key_metadata(&mut conn, existing)
-                    .await
-                    .map_err(|e| ProvisionError::Store(e.to_string()))?
-                {
-                    revoke_api_key(&mut conn, credential.id)
-                        .await
-                        .map_err(|e| ProvisionError::Store(e.to_string()))?;
-                }
-                existing
-            }
-            None => {
-                let principal_id = Uuid::now_v7();
-                insert_service_account(
-                    &mut conn,
-                    principal_id,
-                    "tenant_admin",
-                    None,
-                    "tenant-admin",
-                    Some("Tenant administrative principal"),
-                    created_by,
-                )
+            // The failed attempt may have committed a credential before it
+            // stopped, and its plaintext was never disclosed to anyone. A
+            // retry returns exactly one usable way in, so every credential
+            // this principal already holds is retired first rather than
+            // left live and unaccounted for.
+            for credential in list_api_key_metadata(&mut conn, existing)
                 .await
-                .map_err(|e| ProvisionError::Store(e.to_string()))?;
-                principal_id
+                .map_err(|e| ProvisionError::Store(e.to_string()))?
+            {
+                revoke_api_key(&mut conn, credential.id)
+                    .await
+                    .map_err(|e| ProvisionError::Store(e.to_string()))?;
             }
+            existing
+        } else {
+            let principal_id = Uuid::now_v7();
+            insert_service_account(
+                &mut conn,
+                principal_id,
+                "tenant_admin",
+                None,
+                "tenant-admin",
+                Some("Tenant administrative principal"),
+                created_by,
+            )
+            .await
+            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+            principal_id
         };
 
         let role = role_by_name(&mut conn, TENANT_ADMIN_ROLE)
@@ -494,11 +500,7 @@ impl TenantProvisioning {
             .map_err(|e| ProvisionError::Store(e.to_string()))?;
 
         let plaintext = wyrd_auth::issue_api_key::WyrdApiKey::generate(data_tenant_id);
-        let raw = plaintext.secret.clone();
-        let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-            .await
-            .map_err(|e| ProvisionError::Store(e.to_string()))?
-            .map_err(|e| ProvisionError::Store(e.to_string()))?;
+        let key_hash = wyrd_auth_issue::hash_secret(plaintext.secret.expose_secret());
         insert_api_key(
             &mut conn,
             Uuid::now_v7(),

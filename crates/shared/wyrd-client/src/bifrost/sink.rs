@@ -16,19 +16,26 @@ pub trait IngestTransport<G>: Send + Sync + 'static {
     /// durable commit ambiguous, or when stable no-write
     /// `WYRD_VALA_429_INGEST_BUSY` requires retry. In both cases the queue
     /// retains the exact UUID, bytes, allocation guard, and retry permit.
-    /// Terminal failure lets the queue consume that owner; a transport that
-    /// owns a bounded retry budget returns it once that budget is exhausted.
+    /// Terminal failure lets the queue consume that owner. A transport that
+    /// owns a bounded retry budget still returns the retryable ambiguity once
+    /// that budget is exhausted, so the queue keeps the owner.
     async fn insert_batch(&self, batch: &SealedBatch<G>) -> Result<DurableBatchAck, SinkError>;
 }
 
 /// The Record queue sink that forwards each non-cloneable batch to gRPC.
 pub struct BifrostIngestSink {
-    transport: Arc<dyn IngestTransport<ClientByteGuard>>,
+    /// The transport every sealed batch is forwarded to; crate-visible so the
+    /// facade assembles the sink without the internal-only constructor.
+    pub(crate) transport: Arc<dyn IngestTransport<ClientByteGuard>>,
 }
 
 impl BifrostIngestSink {
     /// Builds a sink over the ordinary Rust owned-batch transport.
+    ///
+    /// # Arguments
+    /// * `transport` - The gRPC ingest transport each sealed batch is forwarded to.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn new(transport: Arc<dyn IngestTransport<ClientByteGuard>>) -> Self {
         Self { transport }
     }

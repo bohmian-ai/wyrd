@@ -14,9 +14,6 @@ description = "Wyrd command-line interface."
 name = "wyrd_cli"
 path = "src/lib.rs"
 
-[features]
-python = ["dep:pyo3"]
-
 [[bin]]
 name = "wyrd"
 path = "src/main.rs"
@@ -32,7 +29,6 @@ chrono = { workspace = true }
 clap = { workspace = true }
 indicatif = { workspace = true }
 reqwest = { workspace = true }
-pyo3 = { workspace = true, optional = true }
 secrecy = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
@@ -46,7 +42,7 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 vala-eval = { workspace = true }
 webbrowser = { workspace = true }
-wyrd-client = { workspace = true }
+wyrd-client = { workspace = true, features = ["internal"] }
 wyrd-error-derive = { workspace = true }
 
 wyrd-loader = { workspace = true }
@@ -71,3 +67,6 @@ wyrd-server = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-testing = { workspace = true }
+
+[lints]
+workspace = true

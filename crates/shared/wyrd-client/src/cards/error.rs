@@ -65,22 +65,20 @@ mod tests {
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::registry::ListCardsRequest;
 
-    use crate::cards::Cards;
+    use wyrd_spec::error::WyrdError;
 
-    /// Credential variables the shared chain consults before the home file.
-    const CREDENTIAL_VARS: [&str; 4] = [
-        "WYRD_ACCESS_TOKEN",
-        "WYRD_WORKLOAD_TOKEN",
-        "WYRD_TENANT",
-        "WYRD_API_KEY",
-    ];
+    use crate::cards::Cards;
+    use crate::config::ClientConfig;
+    use crate::environment::Environment;
+    use crate::{GlobalConfig, WyrdClient};
 
     /// Public `Cards` construction and operations report shared client failures
     /// with the same `WYRD_CLIENT_*` code and status as `Bifrost`.
     ///
-    /// The credential chain is emptied under the crate env lock with `HOME`
-    /// redirected to an empty directory, so only the explicit arguments decide
-    /// each outcome.
+    /// Each client is built from an environment naming only an empty home
+    /// directory and, optionally, a tenant selector, so no credential tier or
+    /// saved login exists and only the explicit credential decides each
+    /// outcome.
     ///
     /// # Panics
     ///
@@ -88,35 +86,32 @@ mod tests {
     #[tokio::test]
     async fn cards_client_failures_keep_client_catalog_identity() {
         let home = tempfile::tempdir().expect("temporary home is created");
-        let env = crate::ENV_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            for name in CREDENTIAL_VARS {
-                std::env::remove_var(name);
-            }
-            std::env::set_var("HOME", home.path());
-        }
+        let home = home.path().to_str().expect("utf-8 path");
+        let cards_in = |tenant: Option<&str>, credential: Option<&str>| {
+            let environment = match tenant {
+                Some(tenant) => Environment::from([("HOME", home), ("WYRD_TENANT", tenant)]),
+                None => Environment::from([("HOME", home)]),
+            };
+            let mut config = ClientConfig::from_environment(
+                environment,
+                &GlobalConfig::default(),
+                Some("http://127.0.0.1:1"),
+                None,
+            );
+            config.credential = credential.map(SecretString::from);
+            WyrdClient::with_config(config)
+                .map(Cards::with_client)
+                .map_err(WyrdError::from)
+        };
 
-        let missing = Cards::new(Some("http://127.0.0.1:1"), None, None)
+        let missing = cards_in(None, None)
             .err()
             .expect("an empty credential chain is refused");
-        let invalid = Cards::new(Some(""), Some(SecretString::from("wyrd_sk_t_v_s")), None)
+        let invalid = cards_in(Some("acme"), Some("wyrd_sk_t_v_s"))
             .err()
-            .expect("an empty explicit server URL is refused");
-        let cards = Cards::new(
-            Some("http://127.0.0.1:1"),
-            Some(SecretString::from("wyrd_sk_t_v_s")),
-            None,
-        )
-        .expect("a complete offline configuration constructs without network");
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("HOME");
-        }
-
-        drop(env);
+            .expect("a tenant selector beside an API key is refused");
+        let cards = cards_in(None, Some("wyrd_sk_t_v_s"))
+            .expect("a complete offline configuration constructs without network");
         let down = cards
             .list(ListCardsRequest {
                 kind: Some(CardKind::Prompt),
@@ -147,7 +142,11 @@ mod tests {
         assert_eq!(missing.problem().details, serde_json::json!({}));
         assert_eq!(
             invalid.problem().details,
-            serde_json::json!({ "field": "server_url", "reason": "must not be empty" })
+            serde_json::json!({
+                "field": "tenant",
+                "reason": "this credential already names its tenant; remove the tenant selector \
+                           acme (client tenant option, client.tenant, or WYRD_TENANT)"
+            })
         );
         assert_eq!(
             down.problem().details,

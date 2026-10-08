@@ -55,11 +55,20 @@ impl GrpcConnection {
     /// condition per-request as [`WyrdError::Internal`][wyrd_spec::error::WyrdError::Internal]
     /// (500). The divergence is intentional and documented in both modules.
     ///
+    /// # Arguments
+    /// * `config` - Endpoint, timeouts, connect-retry budget, keepalive, and message-size
+    ///   settings.
+    /// * `auth` - Shared authentication middleware that supplies each call's bearer.
+    ///
     /// # Errors
     /// Returns [`WyrdClientError::TransportDown`] when another Rustls provider
     /// already owns the process, the endpoint URI is invalid, or the dial fails
     /// (DNS, TCP, or TLS) on all attempts. Cancellation stops retries and drops
     /// the in-progress channel without retaining a connection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the retry loop ends without an attempt, which its nonzero attempt bound rules out.
     pub async fn connect(
         config: &GrpcConfig,
         auth: Arc<AuthMiddleware>,
@@ -186,5 +195,95 @@ fn build_endpoint(config: &GrpcConfig) -> Result<Endpoint, WyrdClientError> {
             })
     } else {
         Ok(endpoint)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use secrecy::SecretString;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
+
+    use super::GrpcConnection;
+    use crate::auth::AuthMiddleware;
+    use crate::config::ClientConfig;
+    use crate::error::WyrdClientError;
+    use crate::transport::config::GrpcConfig;
+    use crate::transport::credential::ResolvedCredential;
+
+    /// Auth middleware over a fixed bearer token; nothing is exchanged.
+    ///
+    /// # Panics
+    /// Panics when the auth HTTP client cannot be built.
+    fn auth() -> Arc<AuthMiddleware> {
+        let credential = ResolvedCredential::BearerToken(SecretString::from("test-token"));
+        AuthMiddleware::new(&ClientConfig::default(), credential).expect("auth client builds")
+    }
+
+    /// A loopback listener that completes just enough of the HTTP/2 server
+    /// handshake (an empty SETTINGS frame) for the dial to succeed, holding
+    /// the connection open for the rest of the test.
+    ///
+    /// # Panics
+    /// Panics when the listener cannot bind.
+    async fn h2_stub() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("stub binds");
+        let addr = listener.local_addr().expect("stub has an address");
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let settings = [0x00_u8, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00];
+                let _ = stream.write_all(&settings).await;
+                std::future::pending::<()>().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A config dialing `endpoint` once with a short deadline.
+    fn config(endpoint: String) -> GrpcConfig {
+        GrpcConfig {
+            endpoint,
+            timeout_ms: 2_000,
+            connect_retries: 0,
+            ..GrpcConfig::default()
+        }
+    }
+
+    /// An endpoint that is not a URI fails as a gRPC transport outage.
+    ///
+    /// # Panics
+    /// Panics when the dial succeeds or fails with another error.
+    #[tokio::test]
+    async fn invalid_endpoint_fails_as_grpc_transport_down() {
+        let error = GrpcConnection::connect(&config("not a valid uri".to_owned()), auth())
+            .await
+            .expect_err("an invalid URI cannot dial");
+        assert!(
+            matches!(&error, WyrdClientError::TransportDown { transport, .. } if transport == "grpc"),
+            "{error:?}"
+        );
+    }
+
+    /// A dialed connection shares the caller's auth middleware and reports
+    /// the configured message size.
+    ///
+    /// # Panics
+    /// Panics when the dial fails, the auth is a copy, or the size differs.
+    #[tokio::test]
+    async fn connection_keeps_the_callers_auth_and_message_size() {
+        let auth = auth();
+        let connection = GrpcConnection::connect(
+            &GrpcConfig {
+                max_message_bytes: 8 * 1024 * 1024,
+                ..config(h2_stub().await)
+            },
+            Arc::clone(&auth),
+        )
+        .await
+        .expect("the stub accepts the dial");
+        assert!(Arc::ptr_eq(&auth, &connection.auth()));
+        assert_eq!(connection.max_message_bytes(), 8 * 1024 * 1024);
     }
 }

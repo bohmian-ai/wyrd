@@ -697,6 +697,7 @@ async fn coordinate_public_query(
     let client = public_client(node, api_key)?;
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT id FROM vala.bifrost.{table} ORDER BY id"),
             deadline_ms: None,
         })

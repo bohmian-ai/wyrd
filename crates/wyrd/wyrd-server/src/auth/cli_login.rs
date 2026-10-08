@@ -36,7 +36,10 @@ pub(crate) fn cli_logins(state: &AppState) -> Result<CliLogins, WyrdError> {
     let missing = || auth_not_configured().0;
     Ok(CliLogins::new(
         state.auth.human_connections.clone().ok_or_else(missing)?,
-        state.auth.tenant_issuer().ok_or_else(missing)?,
+        state
+            .auth
+            .tenant_issuer(&state.audit_outbox)
+            .ok_or_else(missing)?,
     ))
 }
 

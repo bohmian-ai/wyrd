@@ -47,6 +47,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn fixed_returns_value() {
         let threshold = compute_psi_threshold(&PsiThreshold::Fixed { value: 0.25 }, 10, 1_000)
             .expect("fixed threshold");

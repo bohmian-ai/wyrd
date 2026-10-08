@@ -7,10 +7,9 @@
 //! in `wyrd.auth_trusted_issuers` never authorizes a human login.
 //!
 //! Every mutation opens one tenant transaction, takes the tenant's connection
-//! slot lock, appends the caller's already-evaluated canonical audit decision,
-//! validates against the locked state, and writes. A refusal reached after the
-//! decision commits the decision alone; a failed audit append aborts before any
-//! write, so no change is ever durable without its audit row. Provider network
+//! slot lock, stages the caller's already-evaluated canonical audit decision on
+//! the process audit outbox, validates against the locked state, and writes.
+//! Staging never waits for, or fails on, the audit commit. Provider network
 //! IO (discovery and the signing-key check that begin a candidate test) runs
 //! before any transaction and outside any lock.
 //!
@@ -57,7 +56,9 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
-use crate::audit::{append_auth_audit, principal_event, principal_kind_tag};
+use vala_sql::audit_outbox::AuditOutbox;
+
+use crate::audit::{principal_event, principal_kind_tag};
 use crate::error::{relying_party_error, store_error};
 use crate::exchange_api_key::{ExchangeError, role_refs, verify_api_key};
 use crate::issuance::resolve_permissions;
@@ -100,6 +101,8 @@ pub struct HumanConnections {
     relying_party: RelyingParty,
     /// `{public_origin}/auth/callback`, or `None` without a public origin.
     callback_url: Option<Url>,
+    /// Process audit outbox every connection decision is staged on.
+    audit: Arc<AuditOutbox>,
 }
 
 impl Debug for HumanConnections {
@@ -144,8 +147,8 @@ pub struct ActiveHumanConnection {
 }
 
 impl HumanConnections {
-    /// Build the owner over the runtime store, keyring, screened HTTP, and
-    /// public origin.
+    /// Build the owner over the runtime store, keyring, screened HTTP, public
+    /// origin, and the process audit outbox its decisions are staged on.
     ///
     /// The callback URL is `{public_origin}/auth/callback`; it is `None` when
     /// the deployment configures no public origin, in which case staging,
@@ -156,12 +159,14 @@ impl HumanConnections {
         keyring: Option<Arc<SealingKeyring>>,
         http: ScreenedHttp,
         public_origin: Option<&Url>,
+        audit: Arc<AuditOutbox>,
     ) -> Self {
         Self {
             postgres,
             keyring,
             relying_party: RelyingParty::new(http),
             callback_url: public_origin.and_then(|origin| origin.join(CALLBACK_PATH).ok()),
+            audit,
         }
     }
 
@@ -184,16 +189,15 @@ impl HumanConnections {
     /// Read the tenant's Active and Candidate connections as redacted views.
     ///
     /// # Errors
-    /// Returns [`WyrdError::AuditUnavailable`] when the decision cannot be
-    /// appended, [`WyrdError::AuthVerifyUnavailable`] when the store fails, and
+    /// Returns [`WyrdError::AuthVerifyUnavailable`] when the store fails, and
     /// [`WyrdError::Internal`] when a stored row does not decode.
     pub async fn list(
         &self,
         tenant: DataTenantId,
         decision: &AuditEvent,
     ) -> Result<HumanConnectionsResponse, WyrdError> {
+        self.audit.stage(tenant, decision.clone());
         let mut conn = self.begin(tenant).await?;
-        append_auth_audit(&mut conn, decision).await?;
         let rows = live_human_connections(&mut conn)
             .await
             .map_err(store_error)?;
@@ -431,17 +435,15 @@ impl HumanConnections {
     /// One tenant transaction takes the connection slot lock and re-checks the
     /// tester's authority from the store — still an active principal of this
     /// tenant whose stored roles grant `identity_connections:write` — then
-    /// appends that Allowed or Denied [`CANDIDATE_TESTED_OPERATION`] decision.
-    /// A denial commits the decision alone. An allowed decision stamps only
+    /// stages that Allowed or Denied [`CANDIDATE_TESTED_OPERATION`] decision.
+    /// A denial writes nothing. An allowed decision stamps only
     /// the bound revision, and only while it is still the Candidate. Nothing
     /// else is written: no User, session, or credential.
     ///
     /// # Errors
     /// Returns [`WyrdError::PermissionDeniedRbac`] when the tester is no
     /// longer authorized, [`WyrdError::ConnectionConflict`] when the candidate
-    /// changed during the sign-in, [`WyrdError::AuditUnavailable`] when the
-    /// decision cannot be appended — leaving the candidate untested —
-    /// [`WyrdError::RoleCorrupt`] when a stored role does not decode, and the
+    /// changed during the sign-in, [`WyrdError::RoleCorrupt`] when a stored role does not decode, and the
     /// store errors of [`Self::list`].
     pub(crate) async fn stamp_test_sign_in(
         &self,
@@ -473,7 +475,7 @@ impl HumanConnections {
                 },
             )
         };
-        append_auth_audit(&mut conn, &decision).await?;
+        self.audit.stage(tenant, decision);
         if !allowed {
             return commit_refusal(
                 conn,
@@ -515,18 +517,17 @@ impl HumanConnections {
     /// retired and the candidate promoted, in the same transaction; sessions
     /// bound to the retired revision stop renewing once it commits.
     ///
-    /// Two decisions are audited on that transaction: the bearer caller's
-    /// `decision`, appended when the lock is taken, and — whenever the
+    /// Two decisions are staged on the audit outbox: the bearer caller's
+    /// `decision`, staged when the lock is taken, and — whenever the
     /// recovery key resolves to an active principal — that principal's own
-    /// Allowed or Denied decision on `identity_connections:write`, appended
-    /// before promotion or the committed refusal.
+    /// Allowed or Denied decision on `identity_connections:write`, staged
+    /// before promotion or the refusal.
     ///
     /// # Errors
     /// Returns [`WyrdError::ConnectionConflict`] for a missing or stale
     /// candidate or an invalid recovery key, [`WyrdError::ConnectionNotTested`]
-    /// when the stamp is missing or expired, [`WyrdError::AuditUnavailable`]
-    /// when either decision cannot be appended — leaving the Active and
-    /// Candidate unchanged — and the store errors of [`Self::list`].
+    /// when the stamp is missing or expired, and the store errors of
+    /// [`Self::list`].
     pub async fn activate(
         &self,
         tenant: DataTenantId,
@@ -551,7 +552,7 @@ impl HumanConnections {
         {
             return commit_refusal(conn, not_tested("the candidate has no current test")).await;
         }
-        if !recovery_key_authorizes(&mut conn, &recovery_key, decision).await? {
+        if !recovery_key_authorizes(&mut conn, &self.audit, &recovery_key, decision).await? {
             return commit_refusal(
                 conn,
                 conflict(
@@ -700,12 +701,11 @@ impl HumanConnections {
         self.postgres.tenant_conn(tenant).await.map_err(store_error)
     }
 
-    /// Open a tenant transaction, take the slot lock, and append `decision`.
+    /// Open a tenant transaction, take the slot lock, and stage `decision` on
+    /// the audit outbox.
     ///
     /// # Errors
-    /// Returns the store error when the transaction or lock fails, and
-    /// [`WyrdError::AuditUnavailable`] when the append fails — before any
-    /// mutation, so nothing becomes durable.
+    /// Returns the store error when the transaction or lock fails.
     async fn begin_locked(
         &self,
         tenant: DataTenantId,
@@ -715,7 +715,7 @@ impl HumanConnections {
         lock_human_connection_slot(&mut conn)
             .await
             .map_err(store_error)?;
-        append_auth_audit(&mut conn, decision).await?;
+        self.audit.stage(tenant, decision.clone());
         Ok(conn)
     }
 
@@ -829,24 +829,24 @@ async fn tester_authorized(
 /// and audit the recovery principal's permission decision.
 ///
 /// Reuses the API-key exchange's verification, so the key must parse, name
-/// this tenant, and match a live key row by Argon2 with every refusal still
-/// running one verification; the owning principal must then be active and
+/// this tenant, and match a live key row's SHA-256 verifier; the owning
+/// principal must then be active and
 /// hold permissions covering `identity_connections:write`.
 ///
 /// A key that resolves to an active principal reaches a real permission
 /// decision, so one Allowed or Denied event attributed to that principal and
-/// its verified credential id is appended on `conn`, sharing `bearer`'s
-/// request, operation, and resource. Malformed, unknown, cross-tenant,
-/// mismatched, and inactive keys resolve no decision and append nothing, so
-/// their refusals stay indistinguishable.
+/// its verified credential id is staged on `audit` for `conn`'s tenant,
+/// sharing `bearer`'s request, operation, and resource. Malformed, unknown,
+/// cross-tenant, mismatched, and inactive keys resolve no decision and stage
+/// nothing, so their refusals stay indistinguishable.
 ///
 /// # Errors
 /// Returns [`WyrdError::AuthVerifyUnavailable`] when a store read fails,
 /// [`WyrdError::RoleCorrupt`] when a stored role document does not decode,
-/// [`WyrdError::AuditUnavailable`] when the decision cannot be appended, and
-/// [`WyrdError::Internal`] when verification cannot run.
+/// and [`WyrdError::Internal`] when verification cannot run.
 async fn recovery_key_authorizes(
     conn: &mut TenantConn<'_>,
+    audit: &AuditOutbox,
     presented: &SecretString,
     bearer: &AuditEvent,
 ) -> Result<bool, WyrdError> {
@@ -884,11 +884,11 @@ async fn recovery_key_authorizes(
         detail: None,
         ..bearer.clone()
     };
-    append_auth_audit(conn, &recovery).await?;
+    audit.stage(conn.data_tenant_id(), recovery);
     Ok(allowed)
 }
 
-/// Commit the already-appended decision alone, then return `refusal`.
+/// Commit the refused transaction, which wrote nothing, then return `refusal`.
 ///
 /// # Errors
 /// Always returns an error: `refusal`, or the store error when the commit

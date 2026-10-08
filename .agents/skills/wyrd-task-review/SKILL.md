@@ -196,9 +196,8 @@ Rust, Python, TypeScript, server, contract, test, documentation, or tooling
 rules that independently apply.
 
 Inspect actual SQL capability types in production signatures and fields.
-`check:from-pools-allowlist` covers construction, not raw-pool propagation;
-a green check cannot excuse `PgPool` where `OperatorPool` or `TenantConn` is
-required. Include materially changed test helpers and rustdoc in the same
+`check:tenant-isolation` covers only the directories it scans; a green check
+cannot excuse `PgPool` where `OperatorPool` or `TenantConn` is required. Include materially changed test helpers and rustdoc in the same
 standards pass, so documentation corrections do not become separate rounds.
 
 The `repo-rev` returns:

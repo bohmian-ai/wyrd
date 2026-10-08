@@ -48,14 +48,16 @@ pub enum QueryOutputFormat {
 
 /// Executes one query and writes data and diagnostics to their dedicated streams.
 ///
+/// Rows stream to the unlocked, `Send` stdout handle as they arrive, so the
+/// future stays `Send` for embedding runtimes; each write takes the stream's
+/// lock only for its own duration.
+///
 /// # Errors
 ///
 /// Returns a typed CLI error for missing configuration, input IO, client
 /// construction, stream validation, Arrow encoding, or stdout failures.
 pub async fn dispatch(command: QueryCommand) -> Result<std::process::ExitCode, CliBoundaryError> {
-    let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr().lock();
-    execute(command, &mut stdout, &mut stderr).await?;
+    execute(command, &mut io::stdout(), &mut io::stderr()).await?;
     Ok(std::process::ExitCode::SUCCESS)
 }
 
@@ -66,8 +68,8 @@ pub async fn dispatch(command: QueryCommand) -> Result<std::process::ExitCode, C
 /// Returns a typed CLI error under the same conditions as [`dispatch`].
 pub async fn execute(
     command: QueryCommand,
-    stdout: &mut dyn Write,
-    stderr: &mut dyn Write,
+    stdout: &mut (dyn Write + Send),
+    stderr: &mut (dyn Write + Send),
 ) -> Result<(), CliBoundaryError> {
     let request = request(&command).map_err(CliBoundaryError::Local)?;
     let client = client(&command).map_err(CliBoundaryError::Local)?;
@@ -117,6 +119,7 @@ fn request(command: &QueryCommand) -> Result<BifrostQueryRequest, WyrdCliError> 
         }
     };
     Ok(BifrostQueryRequest {
+        params: Vec::new(),
         sql,
         deadline_ms: None,
     })
@@ -150,7 +153,7 @@ fn client(command: &QueryCommand) -> Result<WyrdClient, WyrdCliError> {
 /// stdout pipes, and never reports truncated output as success.
 async fn write_jsonl(
     stream: &mut QueryResultStream,
-    stdout: &mut dyn Write,
+    stdout: &mut (dyn Write + Send),
 ) -> Result<(), CliBoundaryError> {
     let mut writer = LineDelimitedWriter::new(stdout);
     while let Some(batch) = stream.next_batch().await.map_err(CliBoundaryError::from)? {
@@ -172,7 +175,7 @@ async fn write_jsonl(
 /// Returns a query error for stream, schema, Arrow IPC, or stdout failures.
 async fn write_arrow(
     stream: &mut QueryResultStream,
-    stdout: &mut dyn Write,
+    stdout: &mut (dyn Write + Send),
 ) -> Result<(), CliBoundaryError> {
     let first = stream.next_batch().await.map_err(CliBoundaryError::from)?;
     let schema = stream.schema().cloned().ok_or_else(|| {

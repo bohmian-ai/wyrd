@@ -121,6 +121,7 @@ mod tests {
     use crate::envelope::{CardKind, Metadata, Spec};
     use crate::registry::CardSubmission;
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     /// Project resolved references into deterministic server-owned relationships.
     #[test]
@@ -163,8 +164,8 @@ mod tests {
                 bump: None,
                 space: Some(space.parse().expect("test space is valid")),
                 uid: None,
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::default(),
+                annotations: BTreeMap::default(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,

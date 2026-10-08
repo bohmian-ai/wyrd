@@ -1,6 +1,6 @@
 //! Generic, reusable write-buffering substrate for Wyrd observation surfaces.
 //!
-//! `wyrd-queue` owns the DX write-buffering layer and nothing else: a bounded,
+//! `wyrd-queue` owns the DX write-buffering layer and nothing else: a byte-budgeted,
 //! two-stage in-process queue; a background flush task; the [`BatchBuilder`]
 //! that turns buffered JSON rows into one user-only Arrow IPC batch; the
 //! [`BatchSink`] trait the sealed batch is drained into; the pure

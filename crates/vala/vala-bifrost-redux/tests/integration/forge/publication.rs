@@ -14,7 +14,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use iceberg::Catalog;
-use vala_bifrost_redux::forge::{ForgeClock, ForgeObjectStore};
+use vala_bifrost_redux::forge::{
+    ForgeClock, ForgeCompactionOutcome, ForgeCompactionType, ForgeObjectStore, ForgeTableKey,
+};
+use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 
 use super::rewrite_support::PromotedRewriteFixture;
 use super::support::{
@@ -22,90 +25,52 @@ use super::support::{
     PromotionIntegrationFixture, SupervisedPromotion, manual_clock,
 };
 
-/// Asserts the settled table carries exactly one fully bound rewrite task.
+/// Builds the leader-schedule key of the fixture's one table.
 ///
-/// The binding is the whole point of the enqueue: a worker may only claim a
-/// task whose base snapshot, input identities, and canonical plan hash were
-/// durable before the claim, so all of that is checked here against the table's
-/// live cut. Returns the bound task's identity so the caller can prove a second
-/// scheduling pass reuses it.
-async fn assert_one_bound_rewrite(fixture: &PromotionIntegrationFixture) -> uuid::Uuid {
-    let live = fixture.live_data_paths().await;
-    let current = fixture
-        .catalog
-        .iceberg_catalog()
-        .load_table(&fixture.binding.table_ident())
-        .await
-        .expect("the promoted fixture table")
-        .metadata()
-        .current_snapshot_id()
-        .expect("the promoted table has a current snapshot");
-    let rewrites = fixture
-        .forge_tasks()
-        .await
-        .into_iter()
-        .filter(|task| task.strategy == "small_files")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        rewrites.len(),
-        1,
-        "a settled table plans exactly one rewrite: {rewrites:?}"
-    );
-    let rewrite = &rewrites[0];
-    assert_eq!(
-        rewrite.state, "ready",
-        "the bound rewrite is schedulable and unclaimed"
-    );
-    assert_eq!(
-        rewrite.base_snapshot_id, current,
-        "the rewrite is bound to the snapshot it was planned against"
-    );
-    assert_eq!(
-        rewrite.plan_hash.len(),
-        32,
-        "the durable plan carries its canonical hash"
-    );
-    let inputs = rewrite
-        .plan
-        .get("inputs")
-        .and_then(serde_json::Value::as_array)
-        .expect("the durable plan binds its inputs")
-        .iter()
-        .map(|input| {
-            input
-                .as_str()
-                .expect("a plan input is an object path")
-                .to_owned()
-        })
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        inputs, live,
-        "the rewrite binds exactly the live data files it was planned over"
-    );
-    rewrite.task_id
+/// # Panics
+///
+/// Panics when the fixture namespace and table name do not form a valid
+/// Forge task table identity.
+fn table_key(fixture: &PromotionIntegrationFixture) -> ForgeTableKey {
+    ForgeTableKey {
+        tenant: fixture.tenant,
+        table: ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            fixture.binding.table_ref.namespace.as_str(),
+            &fixture.binding.table_ref.name,
+        )
+        .expect("fixture table identity"),
+    }
 }
 
-/// Dispatch is authorized twice: at planning, and again before any effect.
+/// Dispatch is authorized twice: at the leader, and again before any effect.
 ///
 /// The scheduling half and the publication half are one rule — a rewrite acts
-/// only while it still holds the authority it was planned under — so they share
-/// one scenario.
+/// only while it still holds the authority it was dispatched under — so they
+/// share one scenario.
 ///
-/// Planning first. A table that still owes Scribe a publication must not start
+/// Dispatch first. A table that still owes Scribe a publication must not start
 /// a rewrite, or the rewrite would reason about a live set that is about to
-/// change underneath it, so the pass that sees both demands plans the
-/// promotion. Once nothing is owed, the pass binds exactly one rewrite task,
-/// and it binds it completely: the base snapshot, the exact input identities,
-/// and the canonical plan hash are all durable before any worker can claim it.
-/// A second pass over the same unchanged table must add nothing, because the
-/// table may carry only one active publication attempt at a time.
+/// change underneath it, so the pass that promotes binds nothing else. Once
+/// the promotion commits, the leader offers exactly one table-level dispatch
+/// naming the table and its compaction type — never files — and offers no
+/// second one while that dispatch is in flight, because the table may carry
+/// only one active publication attempt at a time.
 ///
-/// Then publication. A bound task's plan is evidence, not standing permission:
-/// the table stays open to every other writer while managed execution runs. So
+/// Then publication. A dispatch is evidence, not standing permission: the
+/// table stays open to every other writer while managed execution runs. So
 /// each held-authority phase mutates the real owner of one authority dimension
 /// at the only point where the distinction is observable — outputs exist,
 /// nothing has been derived, audited, or submitted — and requires the attempt
 /// to refuse with no effect at all.
+///
+/// # Panics
+///
+/// Panics when a table still owing promotion is offered a rewrite, the
+/// leader pull or report fails, the pull does not offer exactly one
+/// default-type dispatch, an in-flight table is dispatched twice, dispatch
+/// writes an object, or any held-authority mutation fails to refuse the
+/// attempt without effect.
 #[tokio::test]
 async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
     let telemetry = ForgeTelemetryCheckpoint::install();
@@ -126,7 +91,7 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         "the rewrite route starts from a promoted live set: {promoted:?}"
     );
 
-    // Promotion outranks the rewrite debt that live set already owes.
+    // The leader's pass that promotes the new hot objects binds no rewrite.
     fixture.seal_more(2).await;
     supervisor.schedule_only().await;
     let planned = fixture.forge_tasks().await;
@@ -137,48 +102,40 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         "a table that still owes a promotion cannot start a rewrite: {planned:?}"
     );
     assert!(
-        planned.iter().any(|task| task.state == "ready"),
-        "the outstanding promotion demand planned a schedulable task: {planned:?}"
-    );
-
-    // Settle that promotion through the production worker, without a planning
-    // pass: a pass taken while the promotion is still in flight can bind a
-    // rewrite against the pre-promotion snapshot, and the next statement is
-    // about exactly one rewrite bound to the settled cut.
-    supervisor.restart_worker();
-    supervisor.settle_one_success().await;
-    assert!(
         fixture.file_rows().await.iter().all(|row| row.compacted),
-        "the table owes no further promotion"
+        "the pass promoted every outstanding hot object"
     );
 
-    // With nothing owed, one pass binds exactly one fully bound rewrite task.
-    supervisor.schedule_only().await;
-    let bound = assert_one_bound_rewrite(&fixture).await;
-
-    // The same table cannot acquire a second active publication attempt.
-    supervisor.schedule_only().await;
-    let after = fixture
-        .forge_tasks()
+    // The promotion commit made the table due: one dispatch names the table
+    // and its type, and a second pull offers nothing while it is in flight.
+    let forge = supervisor.forge();
+    let dispatches = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(
+        dispatches
+            .iter()
+            .map(|dispatch| (dispatch.key.clone(), dispatch.compaction_type))
+            .collect::<Vec<_>>(),
+        vec![(table_key(&fixture), ForgeCompactionType::Full)],
+        "one table-level dispatch of the default type: {dispatches:?}"
+    );
+    assert!(
+        forge
+            .pull_compaction(4)
+            .await
+            .expect("leader pull")
+            .is_empty(),
+        "an in-flight table is not dispatched twice"
+    );
+    forge
+        .report_compaction(&dispatches[0], ForgeCompactionOutcome::NotStarted)
         .await
-        .into_iter()
-        .filter(|task| task.strategy == "small_files")
-        .collect::<Vec<_>>();
-    assert_eq!(
-        after.len(),
-        1,
-        "a second pass over an unchanged table binds no second rewrite: {after:?}"
-    );
-    assert_eq!(
-        after[0].task_id, bound,
-        "the idempotent enqueue keeps the identity the first pass bound"
-    );
+        .expect("leader report");
     supervisor.shutdown().await;
 
     assert_eq!(
         object_store.output_writers(),
         0,
-        "planning a rewrite writes no object"
+        "dispatching a rewrite writes no object"
     );
     assert!(
         !telemetry
@@ -190,7 +147,6 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
     for mutation in [
         HeldAuthorityMutation::LeaseExpired,
         HeldAuthorityMutation::AttemptCancelled,
-        HeldAuthorityMutation::DeadlineElapsed,
     ] {
         assert_held_authority_change_refuses(&telemetry, mutation).await;
     }
@@ -213,10 +169,16 @@ struct SharedDeleteState {
 
 /// Publishes one position delete and one equality delete over the promoted cut.
 ///
-/// Both deletes are committed through the real catalog so the rewrite meets
-/// them as ordinary table state. The position delete removes a row of the
+/// Both deletes are committed through the real catalog, each in its own
+/// commit, so the rewrite meets them as ordinary table state. The position delete removes a row of the
 /// chosen target object; the equality delete removes a row value that lives in
 /// the other object, which is what makes the two disposition rules separable.
+///
+/// # Panics
+///
+/// Panics when the promotion did not publish exactly two data objects,
+/// either object has no rows, or a delete commit fails or leaves no current
+/// snapshot.
 async fn seed_shared_deletes(promoted: &PromotedRewriteFixture) -> SharedDeleteState {
     let inputs = promoted
         .live_data_files()
@@ -237,8 +199,11 @@ async fn seed_shared_deletes(promoted: &PromotedRewriteFixture) -> SharedDeleteS
         .first()
         .copied()
         .expect("the second object has rows");
+    // Equality deletes are partition-scoped, so each delete is written into
+    // the partition of the object whose row it removes.
+    promoted.publish_deletes(&target, Some(0), None).await;
     promoted
-        .publish_deletes(&target, Some(0), Some(deleted_by_equality))
+        .publish_deletes(&other, None, Some(deleted_by_equality))
         .await;
     let mut expected = promoted
         .object_values(&inputs.iter().cloned().collect::<Vec<_>>())
@@ -482,11 +447,9 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
     })
     .await;
 
-    // The retry the rule grants is bounded by the same absolute deadline the
-    // initial call started under, so the two phases below take that budget away
-    // in the only two ways it can end: entirely, and almost entirely.
-    assert_expired_deadline_makes_no_second_call().await;
-    assert_retry_inherits_only_the_remaining_budget().await;
+    // A call the catalog never answers is ended by the request timeout, and
+    // that end is ambiguity, never a refusal.
+    assert_unanswered_call_ends_at_the_request_timeout().await;
 }
 
 /// Everything the spent-retry phase needs from the run that preceded it.
@@ -526,8 +489,9 @@ async fn assert_spent_retry_closes_every_operation(phase: SpentRetryPhase<'_>) {
         published_plans,
         telemetry,
     } = phase;
-    // Every plan refused twice: each spends its one retry, so no plan commits
-    // and the attempt has no partial progress to report as success.
+    // Every submission refused: each plan spends its whole retry schedule, so
+    // no plan commits and the attempt has no partial progress to report as
+    // success.
     catalog.reject_next_commits(usize::MAX);
     supervisor.restart_worker();
     let error = supervisor.run_one_failure().await;
@@ -579,105 +543,31 @@ async fn assert_spent_retry_closes_every_operation(phase: SpentRetryPhase<'_>) {
     );
 }
 
-/// One publication whose deadline elapses while its first call is in flight.
+/// One publication whose catalog call is never answered.
 ///
-/// The retry a definite conflict buys is not unconditional: it is permitted
-/// only while the publication's one absolute deadline still has budget left.
-/// Advancing the manual clock past that deadline while the first call is parked
-/// makes this exact: the catalog then answers with a definite refusal — proof
-/// nothing landed — and the follow-up must still refuse to submit again,
-/// recording the operation as definitely uncommitted rather than spending a
-/// retry the deadline no longer covers.
+/// Each catalog call is bounded by the configured request timeout, so a parked
+/// call that is never released is ended by that timeout alone. A submitted call
+/// that timed out claims no outcome: its operation stays Prepared for durable
+/// recovery and is never resubmitted, while every sibling plan the catalog then
+/// refuses spends exactly its bounded retry schedule and is reset.
 ///
 /// # Panics
 ///
-/// Panics when the fixture cannot start, a deterministic bound is missed, or a
-/// second catalog call was made.
-async fn assert_expired_deadline_makes_no_second_call() {
-    let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_deadline_spent").await;
+/// Panics when the fixture cannot start, the timed-out plan was resubmitted or
+/// settled, a sibling made a call past its schedule, or anything was published.
+async fn assert_unanswered_call_ends_at_the_request_timeout() {
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("rewrite_request_timeout").await;
+    promoted.fixture.config.catalog_request_timeout = std::time::Duration::from_secs(2);
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
     );
-    let (clock, control) = manual_clock();
     let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
-        clock,
-    );
-    supervisor.run_one_success().await;
-    let standing = live_data_paths(&promoted).await;
-
-    let attempts_before = catalog.attempts();
-    catalog.park_next_commit();
-    supervisor.restart_worker();
-    let supervisor = supervisor
-        .run_one_failure_while(async {
-            catalog.wait_for_parked_commit().await;
-            control
-                .set(expired_publication_deadline(&promoted, &control))
-                .expect("manual Forge clock advances");
-            catalog.reject_parked_commit();
-            // The plans this one does not represent must not publish either,
-            // or the attempt would report their success instead of this
-            // plan's refusal.
-            catalog.reject_remaining_commits();
-        })
-        .await;
-    supervisor.shutdown().await;
-
-    let phases = promoted.fixture.rewrite_phases().await;
-    assert_eq!(
-        catalog.attempts() - attempts_before,
-        1,
-        "a conflict answered past the publication deadline buys no second call, \
-         and a sibling plan under the same spent budget never submits at all: \
-         {phases:?}"
-    );
-    assert_eq!(
-        phases,
-        vec!["reset".to_owned(); phases.len()],
-        "the refused publication is recorded as definitely uncommitted"
-    );
-    assert_eq!(
-        live_data_paths(&promoted).await,
-        standing,
-        "no replacement was published past the deadline"
-    );
-}
-
-/// The permitted retry inherits only what the first call left of the deadline.
-///
-/// A retry that restarted the configured budget would be a second publication
-/// wearing the first one's identity: it could still be in flight long after the
-/// window its Prepared record promised. So the clock is advanced to just short
-/// of the deadline while the first call is parked. The retry that follows then
-/// has about a second of budget, and the parked second call is never released —
-/// only the production deadline can end it. It does, leaving acceptance
-/// unknown, which is the honest answer for a call that was submitted: the
-/// attempt is released with its operation still Prepared for durable recovery,
-/// and no third call is made.
-///
-/// # Panics
-///
-/// Panics when the fixture cannot start, a deterministic bound is missed — a
-/// renewed budget would miss it by minutes — or the publication claimed an
-/// outcome it could not know.
-async fn assert_retry_inherits_only_the_remaining_budget() {
-    let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_deadline_remainder").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
-    let catalog = PromotionCatalogSeam::new(
-        promoted.fixture.catalog.iceberg_catalog(),
-        object_store.read_counter(),
-    );
-    let (clock, control) = manual_clock();
-    let mut supervisor = SupervisedPromotion::start_serial(
-        &promoted.fixture,
-        Arc::clone(&catalog) as Arc<dyn Catalog>,
-        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
-        clock,
+        ForgeClock::system(),
     );
     supervisor.run_one_success().await;
     let standing = live_data_paths(&promoted).await;
@@ -688,17 +578,6 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
     let supervisor = supervisor
         .run_one_release_while(async {
             catalog.wait_for_parked_commit().await;
-            // Three seconds short of the deadline, not one: the retry the
-            // conflict buys is owed a one-second backoff first, and a margin
-            // that only just covers it would leave whether the retry is
-            // submitted or truncated to rounding.
-            let nearly_spent =
-                expired_publication_deadline(&promoted, &control) - chrono::Duration::seconds(3);
-            control
-                .set(nearly_spent)
-                .expect("manual Forge clock advances");
-            catalog.reject_parked_commit_and_park_next();
-            catalog.wait_for_parked_commit().await;
             catalog.wait_for_parked_commit_drop().await;
             catalog.reject_remaining_commits();
         })
@@ -706,42 +585,28 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
     supervisor.shutdown().await;
 
     let phases = promoted.fixture.rewrite_phases().await;
+    let reset = phases.iter().filter(|phase| *phase == "reset").count();
+    assert_eq!(
+        phases.iter().filter(|phase| *phase == "prepared").count(),
+        1,
+        "the timed-out call claims no outcome and stays Prepared: {phases:?}"
+    );
+    assert_eq!(
+        phases.len(),
+        1 + reset,
+        "every sibling the catalog refused is definitely uncommitted: {phases:?}"
+    );
     assert_eq!(
         catalog.attempts() - attempts_before,
-        2 * phases.len(),
-        "the publication made its initial call and exactly one retry, and every \
-         sibling plan got the same two calls out of what the attempt's one \
-         shared budget still had left: {phases:?}"
-    );
-    // A submitted call that ran out of budget claims no outcome. The attempt is
-    // released rather than settled, and the row stays open until the durable
-    // takeover proves what happened to that exact operation. Nothing here may
-    // report the commit as accepted.
-    assert!(
-        phases
-            .iter()
-            .all(|phase| phase == "prepared" || phase == "reset"),
-        "a submitted call that ran out of budget claims no outcome: {phases:?}"
+        1 + 4 * reset,
+        "the timed-out call is never resubmitted, and each refused sibling \
+         spends exactly its bounded retry schedule: {phases:?}"
     );
     assert_eq!(
         live_data_paths(&promoted).await,
         standing,
-        "the abandoned retry published nothing"
+        "the unanswered publication published nothing"
     );
-}
-
-/// The first instant at which one publication's deadline has certainly passed.
-///
-/// Derived from the configured Iceberg budget rather than a literal, so the
-/// scenario stays correct if that budget is retuned.
-fn expired_publication_deadline(
-    promoted: &PromotedRewriteFixture,
-    control: &vala_bifrost_redux::forge::ForgeClockControl,
-) -> chrono::DateTime<chrono::Utc> {
-    control.now().expect("manual Forge clock")
-        + chrono::Duration::from_std(promoted.fixture.config.iceberg_total_retry_timeout)
-            .expect("the Iceberg retry budget is representable")
-        + chrono::Duration::seconds(1)
 }
 
 /// Asserts a cancelled in-flight commit left no claim on any outcome.
@@ -905,8 +770,6 @@ enum HeldAuthorityMutation {
     LeaseExpired,
     /// The worker's own cancellation token is cancelled.
     AttemptCancelled,
-    /// The manual Forge clock passes the publication's absolute deadline.
-    DeadlineElapsed,
 }
 
 impl HeldAuthorityMutation {
@@ -919,7 +782,6 @@ impl HeldAuthorityMutation {
         match self {
             Self::LeaseExpired => "rewrite_hold_lease",
             Self::AttemptCancelled => "rewrite_hold_cancel",
-            Self::DeadlineElapsed => "rewrite_hold_deadline",
         }
     }
 
@@ -933,7 +795,6 @@ impl HeldAuthorityMutation {
         match self {
             Self::LeaseExpired => "LeaseLost",
             Self::AttemptCancelled => "Cancelled",
-            Self::DeadlineElapsed => "Deadline",
         }
     }
 }
@@ -991,7 +852,7 @@ async fn assert_held_authority_change_refuses(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
     );
-    let (clock, control) = manual_clock();
+    let (clock, _control) = manual_clock();
     let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
@@ -1014,7 +875,7 @@ async fn assert_held_authority_change_refuses(
     let worker_stop = supervisor.worker_stop();
     let error = supervisor
         .run_one_failure_holding_handoff(async {
-            apply_held_authority_mutation(mutation, &promoted, &control, &worker_stop).await;
+            apply_held_authority_mutation(mutation, &promoted, &worker_stop).await;
         })
         .await;
     let possible_outputs = supervisor.last_possible_rewrite_outputs();
@@ -1071,12 +932,10 @@ async fn assert_held_authority_change_refuses(
 ///
 /// # Panics
 ///
-/// Panics when the fixture cannot apply the mutation or the manual clock
-/// cannot represent the phase's deadline.
+/// Panics when the fixture cannot apply the mutation.
 async fn apply_held_authority_mutation(
     mutation: HeldAuthorityMutation,
     promoted: &PromotedRewriteFixture,
-    control: &vala_bifrost_redux::forge::ForgeClockControl,
     worker_stop: &tokio_util::sync::CancellationToken,
 ) {
     match mutation {
@@ -1085,13 +944,6 @@ async fn apply_held_authority_mutation(
         }
         HeldAuthorityMutation::AttemptCancelled => {
             worker_stop.cancel();
-        }
-        HeldAuthorityMutation::DeadlineElapsed => {
-            let elapsed = control.now().expect("manual Forge clock")
-                + chrono::Duration::from_std(promoted.fixture.config.iceberg_total_retry_timeout)
-                    .expect("the Iceberg retry budget is representable")
-                + chrono::Duration::seconds(1);
-            control.set(elapsed).expect("manual Forge clock advances");
         }
     }
 }
@@ -1210,7 +1062,7 @@ async fn assert_refused_publication_left_no_trace(aftermath: HeldAuthorityAfterm
 ///
 /// # Panics
 ///
-/// Panics when the held rewrite is not left retryable, its lease is not
+/// Panics when the held rewrite's row is not closed failed, its lease is not
 /// released, it did not report exactly one task span, or a catalog commit span
 /// was reported for an attempt that never committed.
 async fn assert_refused_attempt_settled_and_reported(
@@ -1228,9 +1080,11 @@ async fn assert_refused_attempt_settled_and_reported(
         .filter(|task| task.strategy == "small_files")
         .collect::<Vec<_>>();
     assert_eq!(tasks.len(), 1, "one rewrite task was held: {tasks:?}");
+    // The leader owns a dispatched rewrite's retry, so the refused attempt's
+    // row closes rather than becoming claimable by a second owner.
     assert_eq!(
-        tasks[0].state, "retryable",
-        "a coordination refusal leaves the held rewrite retryable ({mutation:?}): {tasks:?}"
+        tasks[0].state, "failed",
+        "a coordination refusal closes the held rewrite for the leader to retry ({mutation:?}): {tasks:?}"
     );
     assert_eq!(
         promoted.fixture.live_leases().await,

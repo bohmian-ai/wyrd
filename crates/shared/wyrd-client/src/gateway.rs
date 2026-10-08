@@ -53,13 +53,34 @@ pub struct Gateway {
 }
 
 impl Gateway {
+    /// Bind the handle to the ambient client, as [`WyrdClient::from_global`]
+    /// resolves it.
+    ///
+    /// No network call or token exchange happens here; the first request does
+    /// the exchange.
+    ///
+    /// # Errors
+    /// Returns the client configuration error when the global config file
+    /// cannot be read or parsed, or the credential resolution error.
+    pub fn from_env() -> Result<Self, WyrdError> {
+        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
+        Ok(Self::with_client(client))
+    }
+
     /// Bind the handle to an assembled client.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client every administration request is
+    ///   sent through, as its principal.
     #[must_use]
-    pub fn new(client: WyrdClient) -> Self {
+    pub fn with_client(client: WyrdClient) -> Self {
         Self { client }
     }
 
     /// Reads one redacted provider credential.
+    ///
+    /// # Arguments
+    /// * `name` - The provider credential to read.
     ///
     /// # Errors
     /// Returns the server's permission, not-found, or availability error.
@@ -81,6 +102,10 @@ impl Gateway {
 
     /// Creates or replaces a provider deployment.
     ///
+    /// # Arguments
+    /// * `deployment` - The full deployment to store; its `name` selects the one
+    ///   created or replaced.
+    ///
     /// # Errors
     /// Returns the server's permission, invalid-configuration, or availability
     /// error.
@@ -97,6 +122,9 @@ impl Gateway {
     }
 
     /// Reads one provider deployment.
+    ///
+    /// # Arguments
+    /// * `name` - The provider deployment to read.
     ///
     /// # Errors
     /// Returns the server's permission, not-found, or availability error.
@@ -118,6 +146,9 @@ impl Gateway {
 
     /// Deletes a provider deployment; an absent name succeeds.
     ///
+    /// # Arguments
+    /// * `name` - The provider deployment to delete.
+    ///
     /// # Errors
     /// Returns the server's invalid-name, permission, or availability error.
     pub async fn delete_deployment(&self, name: &ProviderDeploymentName) -> Result<(), WyrdError> {
@@ -126,6 +157,9 @@ impl Gateway {
     }
 
     /// Replaces the tenant fallback policy.
+    ///
+    /// # Arguments
+    /// * `policy` - The complete fallback policy that replaces the current one.
     ///
     /// # Errors
     /// Returns the server's permission, invalid-configuration, or availability
@@ -155,6 +189,9 @@ impl Gateway {
 
     /// Replaces the tenant governance policy.
     ///
+    /// # Arguments
+    /// * `policy` - The complete governance policy that replaces the current one.
+    ///
     /// # Errors
     /// Returns the server's permission, invalid-configuration, or availability
     /// error.
@@ -182,6 +219,9 @@ impl Gateway {
     }
 
     /// Replaces the tenant capture policy and returns its versioned view.
+    ///
+    /// # Arguments
+    /// * `policy` - The complete capture policy that replaces the current one.
     ///
     /// # Errors
     /// Returns the server's permission, invalid-configuration, or availability
@@ -211,7 +251,7 @@ impl Gateway {
         path: &str,
         body: Option<&S>,
     ) -> Result<D, WyrdError> {
-        self.client.request_json(method, path, body).await
+        self.client.http.request_json(method, path, body).await
     }
 }
 

@@ -9,8 +9,11 @@ authors = { workspace = true }
 [dependencies]
 chrono = { workspace = true }
 serde = { workspace = true }
+metrics = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true, features = ["std", "v5", "v7"] }
 wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 
@@ -18,3 +21,6 @@ wyrd-spec = { path = "../../wyrd-spec", version = "0.0.1" }
 workspace-hack.workspace = true
 serde_json = { workspace = true }
 wyrd-semver = { path = "../wyrd-semver", version = "0.0.1" }
+
+[lints]
+workspace = true

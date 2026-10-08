@@ -10,9 +10,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_spec::auth::{SecretBearer, TokenAudience};
-use wyrd_utils::config_dir::wyrd_config_dir;
 
 use crate::auth::AuthMiddleware;
+use crate::environment::Environment;
 use crate::error::WyrdClientError;
 
 /// One access token minted in-process, with the instant the server stops
@@ -160,6 +160,10 @@ impl CredentialSource {
     /// as a bearer access token. Routing it in one place is what keeps the
     /// Rust, Python, and TypeScript clients from disagreeing about what a
     /// credential is.
+    ///
+    /// # Arguments
+    /// * `credential` - Credential string; an [`API_KEY_PREFIX`] value is an API key, anything
+    ///   else an access token.
     #[must_use]
     pub fn explicit(credential: SecretString) -> Self {
         if credential.expose_secret().starts_with(API_KEY_PREFIX) {
@@ -217,24 +221,33 @@ impl CredentialChain {
 
     /// Build a credential chain using an optional file-configured tenant:
     /// [`Self::env_only`] followed by [`Self::credentials_file`].
+    ///
+    /// # Arguments
+    /// * `tenant_override` - Tenant for the workload-token tier; `None` or empty falls back to
+    ///   `WYRD_TENANT`.
     #[must_use]
     pub fn from_env_with_tenant(tenant_override: Option<&str>) -> Self {
-        let mut chain = Self::env_only(tenant_override);
-        chain.extend(Self::credentials_file());
+        let mut chain = Self::env_only(&Environment::Process, tenant_override);
+        chain.extend(Self::credentials_file(&Environment::Process));
         chain
     }
 
     /// The environment tiers alone — `WYRD_ACCESS_TOKEN`, then
-    /// `WYRD_WORKLOAD_TOKEN` with its tenant, then `WYRD_API_KEY` — without
-    /// the `credentials.toml` floor, so a caller can rank a saved user login
-    /// between them.
+    /// `WYRD_WORKLOAD_TOKEN` with its tenant, then `WYRD_API_KEY` — read from
+    /// `environment`, without the `credentials.toml` floor, so a caller can
+    /// rank a saved user login between them.
+    ///
+    /// # Arguments
+    /// * `environment` - Variables the tiers are read from.
+    /// * `tenant_override` - Tenant for the workload-token tier; `None` or empty falls back to
+    ///   `WYRD_TENANT`.
     #[must_use]
-    pub fn env_only(tenant_override: Option<&str>) -> Self {
+    pub fn env_only(environment: &Environment, tenant_override: Option<&str>) -> Self {
         Self {
             sources: [
-                explicit_token_from_env(),
-                workload_token_from_env(tenant_override),
-                api_key_from_env(),
+                explicit_token_from_env(environment),
+                workload_token_from_env(environment, tenant_override),
+                api_key_from_env(environment),
             ]
             .into_iter()
             .flatten()
@@ -242,21 +255,33 @@ impl CredentialChain {
         }
     }
 
-    /// The `credentials.toml` `[default].api_key` floor alone; empty when the
-    /// file is absent, unreadable, or has no key.
+    /// The `credentials.toml` `[default].api_key` floor alone, in the
+    /// configuration directory `environment` resolves; empty when the file is
+    /// absent, unreadable, or has no key.
+    ///
+    /// # Arguments
+    /// * `environment` - Variables that resolve the configuration directory.
     #[must_use]
-    pub fn credentials_file() -> Self {
+    pub fn credentials_file(environment: &Environment) -> Self {
         Self {
-            sources: api_key_from_credentials_file().into_iter().collect(),
+            sources: api_key_from_credentials_file(environment)
+                .into_iter()
+                .collect(),
         }
     }
 
     /// Append a credential source to the chain.
+    ///
+    /// # Arguments
+    /// * `source` - Source appended at the lowest priority.
     pub fn push(&mut self, source: CredentialSource) {
         self.sources.push(source);
     }
 
     /// Append all sources from `other` to the end of this chain.
+    ///
+    /// # Arguments
+    /// * `other` - Chain whose sources are appended in order, below this chain's.
     pub fn extend(&mut self, other: CredentialChain) {
         self.sources.extend(other.sources);
     }
@@ -271,7 +296,7 @@ impl CredentialChain {
     pub fn resolve(&self) -> Result<ResolvedCredential, WyrdClientError> {
         self.sources
             .first()
-            .map(|source| match source {
+            .map_or(Err(WyrdClientError::NoCredentials), |source| match source {
                 CredentialSource::ExplicitToken { token } => {
                     Ok(ResolvedCredential::BearerToken(token.clone()))
                 }
@@ -283,7 +308,6 @@ impl CredentialChain {
                 }
                 CredentialSource::ApiKey { key } => Ok(ResolvedCredential::ApiKey(key.clone())),
             })
-            .unwrap_or(Err(WyrdClientError::NoCredentials))
     }
 
     /// Returns `true` when the chain has no sources.
@@ -295,10 +319,8 @@ impl CredentialChain {
 
 /// Environment-based credential sources for the ADC chain.
 /// WYRD_ACCESS_TOKEN is an actual WYRD JWT access token, which is the highest-priority source.
-fn explicit_token_from_env() -> Option<CredentialSource> {
-    let token = std::env::var("WYRD_ACCESS_TOKEN")
-        .ok()
-        .filter(|v| !v.is_empty())?;
+fn explicit_token_from_env(environment: &Environment) -> Option<CredentialSource> {
+    let token = environment.var("WYRD_ACCESS_TOKEN")?;
     Some(CredentialSource::ExplicitToken {
         token: SecretString::from(token),
     })
@@ -311,14 +333,15 @@ fn explicit_token_from_env() -> Option<CredentialSource> {
 /// A configured tenant selector (`tenant_override`) routes the exchange ahead
 /// of an ambient `WYRD_TENANT`, so the tenant the caller selected is the one
 /// the server binds.
-fn workload_token_from_env(tenant_override: Option<&str>) -> Option<CredentialSource> {
-    let jwt = std::env::var("WYRD_WORKLOAD_TOKEN")
-        .ok()
-        .filter(|v| !v.is_empty())?;
+fn workload_token_from_env(
+    environment: &Environment,
+    tenant_override: Option<&str>,
+) -> Option<CredentialSource> {
+    let jwt = environment.var("WYRD_WORKLOAD_TOKEN")?;
     let tenant = tenant_override
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-        .or_else(|| std::env::var("WYRD_TENANT").ok().filter(|v| !v.is_empty()))?;
+        .or_else(|| environment.var("WYRD_TENANT"))?;
     Some(CredentialSource::WorkloadToken {
         jwt: SecretString::from(jwt),
         tenant,
@@ -329,10 +352,8 @@ fn workload_token_from_env(tenant_override: Option<&str>) -> Option<CredentialSo
 /// WYRD_API_KEY is a Wyrd API key, which is the third-highest-priority source.  It is exchanged for a Wyrd access token at call time.
 /// Often used in CI/CD pipelines or other environments where a long-lived API key is available.
 /// An api key is granted for all Service and Agent principals upon registration
-fn api_key_from_env() -> Option<CredentialSource> {
-    let key = std::env::var("WYRD_API_KEY")
-        .ok()
-        .filter(|v| !v.is_empty())?;
+fn api_key_from_env(environment: &Environment) -> Option<CredentialSource> {
+    let key = environment.var("WYRD_API_KEY")?;
     Some(CredentialSource::ApiKey {
         key: SecretString::from(key),
     })
@@ -342,8 +363,8 @@ fn api_key_from_env() -> Option<CredentialSource> {
 /// ~/.config/wyrd/credentials.toml is a file-based credential source, which is
 /// the lowest-priority source.  It is exchanged for a Wyrd access token at call time.
 /// This is often used in local development environments where a user has a credentials file with their API key.
-fn api_key_from_credentials_file() -> Option<CredentialSource> {
-    let key = read_credentials_toml_api_key()?;
+fn api_key_from_credentials_file(environment: &Environment) -> Option<CredentialSource> {
+    let key = read_credentials_toml_api_key(environment)?;
     Some(CredentialSource::ApiKey {
         key: SecretString::from(key),
     })
@@ -352,10 +373,7 @@ fn api_key_from_credentials_file() -> Option<CredentialSource> {
 /// Parse the resolved Wyrd `credentials.toml` and return `[default].api_key`.
 ///
 /// Returns `None` when the file is absent, unreadable, or has no key.
-fn read_credentials_toml_api_key() -> Option<String> {
-    let path = wyrd_config_dir()?.join("credentials.toml");
-    let content = std::fs::read_to_string(path).ok()?;
-
+fn read_credentials_toml_api_key(environment: &Environment) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct CredentialsFile {
         default: Option<DefaultProfile>,
@@ -366,6 +384,8 @@ fn read_credentials_toml_api_key() -> Option<String> {
         api_key: Option<String>,
     }
 
+    let path = environment.config_dir()?.join("credentials.toml");
+    let content = std::fs::read_to_string(path).ok()?;
     let parsed: CredentialsFile = toml::from_str(&content).ok()?;
     parsed.default?.api_key.filter(|k| !k.is_empty())
 }
@@ -375,6 +395,7 @@ mod tests {
     use secrecy::ExposeSecret;
 
     use super::{CredentialChain, CredentialSource, ResolvedCredential};
+    use crate::environment::Environment;
 
     /// One `credential` string routes to the grant its own prefix names.
     ///
@@ -544,86 +565,48 @@ mod tests {
         assert!(cred_debug.contains("REDACTED"));
     }
 
+    /// The `credentials.toml` floor under `$WYRD_CONFIG_HOME` resolves its
+    /// `[default].api_key` when no environment tier is set.
     #[test]
     fn credentials_toml_floor_resolves_api_key() {
-        use std::fs;
-
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-
-        let tmp = std::env::temp_dir().join(format!(
-            "wyrd_cred_test_{}_{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        fs::create_dir_all(tmp.join(".config/wyrd")).unwrap();
-        fs::write(
-            tmp.join(".config/wyrd/credentials.toml"),
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            home.path().join("credentials.toml"),
             "[default]\napi_key = \"file_floor_key\"\n",
         )
-        .unwrap();
+        .expect("writes credentials.toml");
+        let environment = Environment::from([(
+            "WYRD_CONFIG_HOME",
+            home.path().to_str().expect("utf-8 path"),
+        )]);
 
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_CONFIG_HOME", tmp.join(".config/wyrd"));
-            std::env::remove_var("WYRD_API_KEY");
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-            std::env::remove_var("WYRD_TENANT");
-        }
-
-        let chain = CredentialChain::from_env();
-        let cred = chain.resolve().expect("file floor resolves");
-
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_CONFIG_HOME");
-        }
-        fs::remove_dir_all(&tmp).ok();
+        let cred = CredentialChain::credentials_file(&environment)
+            .resolve()
+            .expect("file floor resolves");
 
         match cred {
-            ResolvedCredential::ApiKey(k) => {
-                assert_eq!(k.expose_secret(), "file_floor_key");
-            }
+            ResolvedCredential::ApiKey(k) => assert_eq!(k.expose_secret(), "file_floor_key"),
             _ => panic!("expected ApiKey from credentials.toml floor"),
         }
     }
 
+    /// `$XDG_CONFIG_HOME/wyrd/credentials.toml` is the floor when
+    /// `$WYRD_CONFIG_HOME` is unset.
     #[test]
     fn xdg_config_home_resolves_credentials_file() {
-        use std::fs;
-
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        let tmp = std::env::temp_dir().join(format!(
-            "wyrd_xdg_cred_test_{}_{}",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        fs::create_dir_all(tmp.join("wyrd")).unwrap();
-        fs::write(
-            tmp.join("wyrd/credentials.toml"),
+        let xdg = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(xdg.path().join("wyrd")).expect("creates wyrd dir");
+        std::fs::write(
+            xdg.path().join("wyrd/credentials.toml"),
             "[default]\napi_key = \"xdg_key\"\n",
         )
-        .unwrap();
+        .expect("writes credentials.toml");
+        let environment =
+            Environment::from([("XDG_CONFIG_HOME", xdg.path().to_str().expect("utf-8 path"))]);
 
-        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
-        unsafe {
-            std::env::remove_var("WYRD_CONFIG_HOME");
-            std::env::set_var("XDG_CONFIG_HOME", &tmp);
-            std::env::remove_var("HOME");
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-            std::env::remove_var("WYRD_TENANT");
-            std::env::remove_var("WYRD_API_KEY");
-        }
-
-        let chain = CredentialChain::from_env();
-        let credential = chain.resolve().expect("XDG credentials file resolves");
-
-        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
-        unsafe {
-            std::env::remove_var("XDG_CONFIG_HOME");
-        }
-        fs::remove_dir_all(&tmp).ok();
+        let credential = CredentialChain::credentials_file(&environment)
+            .resolve()
+            .expect("XDG credentials file resolves");
 
         match credential {
             ResolvedCredential::ApiKey(key) => assert_eq!(key.expose_secret(), "xdg_key"),

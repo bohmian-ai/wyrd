@@ -23,8 +23,6 @@ pub const TRACING_OUTPUT: &str = "wyrd.tracing.output";
 pub const TRACING_LABEL: &str = "wyrd.tracing.label";
 /// Originating `EvalRecord.record_id` UUID.
 pub const EVAL_RECORD_UID: &str = "wyrd.eval.record_uid";
-/// Originating `EvalCard.profile_uid` UUID.
-pub const EVAL_PROFILE_UID: &str = "wyrd.eval.profile_uid";
 /// Originating `ServiceCard` UID. Set by observation instrumentation.
 pub const SERVICE_CARD_UID: &str = "wyrd.service.card_uid";
 /// Tenant partition key. Mirrors the typed `DataTenantId` column on the
@@ -210,7 +208,6 @@ pub const WYRD_KEYS: &[&str] = &[
     TRACING_OUTPUT,
     TRACING_LABEL,
     EVAL_RECORD_UID,
-    EVAL_PROFILE_UID,
     SERVICE_CARD_UID,
     DATA_TENANT_ID,
 ];

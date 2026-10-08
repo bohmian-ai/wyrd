@@ -8,20 +8,35 @@ order: 31
 
 # Observe
 
-<Aside title="Reserved — coming when Drift verification ships" data-variant="not">
+Drift verification ships as a server-run `Verifier` with
+`implementation.kind: drift`. Drift is a Verifier implementation, not a
+separate card kind.
 
-Observe recipes will be added as the Drift verification and audit runtime
-contracts ship. Drift is a `Verifier` implementation (`implementation.kind:
-drift`), not a separate card kind. The Verifier and `AuditCard` specs are
-authored; the runtime implementation is not yet available.
+## How Drift verification runs
 
-</Aside>
+1. Attach a Drift Verifier to a Service, component, or Agent through a
+   `verified_by` binding. The binding names one Verifier, one `schedule`
+   Trigger, and zero or more `on_failure` Operators. Registering it requires
+   `cards:write`, plus `operators:invoke` when it names an Operator.
+2. Write Drift observations for the subject through the SDK's Bifrost client.
+   They land in [`vala.drift.observations`](/bifrost/schema/), one row per
+   observed feature, attributed to the subject Card.
+3. On each scheduled tick the server runs the Verifier over its analysis
+   window and writes one row to `vala.verification.results` plus one row per
+   feature to `vala.drift.result_features`.
+4. A `failed` verdict creates one durable dispatch per `on_failure` Operator.
+   See [Operator connections](/how-to/operate/operator-connections/).
 
-Observe capability covers:
+## Reading status and results
 
-- Reading drift signals for a registered model or prompt
-- Querying the audit trail for a card or run
-- Streaming observability events from Skald agents
+- `GET /v1/verification/bindings/{binding_id}` reads a binding's schedule,
+  readiness, and last activation (`cards:read`).
+- `POST /v1/verification/runs` enqueues a manual Drift run over an explicit
+  window, against a binding or a Verifier directly (`evals:run` plus scope over
+  the target); `GET /v1/verification/runs/{run_id}` reads its
+  status, result pointer, and Operator dispatches (`cards:read`).
+- Query `vala.verification.results` and `vala.drift.result_features` through
+  Bifrost for verdicts and per-feature scores (`bifrost_query:read`).
 
-These how-to pages will be added alongside the Drift verification runtime. See what runs
-today in the [Overview](/overview/).
+Audit trail recipes are not written yet. See what runs today in the
+[Overview](/overview/).

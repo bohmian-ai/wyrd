@@ -13,7 +13,7 @@ pub async fn reap_idempotency_keys(
     batch_size: i64,
 ) -> Result<u64, SqlError> {
     let result = sqlx::query(
-        r#"
+        r"
         WITH expired AS (
             SELECT data_tenant_id, idempotency_key
             FROM wyrd.storage_idempotency_keys
@@ -25,7 +25,7 @@ pub async fn reap_idempotency_keys(
         USING expired
         WHERE target.data_tenant_id = expired.data_tenant_id
           AND target.idempotency_key = expired.idempotency_key
-        "#,
+        ",
     )
     .bind(batch_size)
     .execute(operator.pool())

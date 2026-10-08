@@ -26,7 +26,7 @@ pub use wyrd_spec::operator_connection::{
 
 /// Cheap-to-clone, tenant-scoped Operator connection handle.
 ///
-/// Shaped like [`Verification`](crate::Verification): one `Arc`-shared
+/// Shaped like [`Principals`](crate::Principals): one `Arc`-shared
 /// authenticated client and discoverable inherent methods.
 #[derive(Clone)]
 pub struct OperatorConnections {
@@ -45,6 +45,10 @@ impl Debug for OperatorConnections {
 
 impl OperatorConnections {
     /// Construct a handle around an already assembled client.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client every request is sent through, as
+    ///   its principal.
     #[must_use]
     pub fn with_client(client: WyrdClient) -> Self {
         Self {
@@ -52,17 +56,22 @@ impl OperatorConnections {
         }
     }
 
-    /// Construct a handle from the ambient client configuration.
+    /// Construct a handle from the ambient client, as
+    /// [`WyrdClient::from_global`] resolves it.
     ///
     /// # Errors
-    /// Returns a Wyrd error when the local configuration or credential cannot
-    /// be resolved.
+    /// Returns a Wyrd error when the global config file cannot be read or
+    /// parsed, or when no credential can be resolved.
     pub fn from_env() -> Result<Self, WyrdError> {
-        let client = WyrdClient::from_env().map_err(WyrdError::from)?;
+        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
         Ok(Self::with_client(client))
     }
 
     /// Create one connection and return its redacted view.
+    ///
+    /// # Arguments
+    /// * `request` - The provider-tagged connection: its name, configuration, and
+    ///   secret.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks `operators:write`, the body
@@ -73,6 +82,7 @@ impl OperatorConnections {
         request: &CreateOperatorConnectionRequest,
     ) -> Result<OperatorConnectionView, WyrdError> {
         self.client
+            .http
             .request_json(Method::POST, "/v1/operator-connections", Some(request))
             .await
     }
@@ -84,11 +94,15 @@ impl OperatorConnections {
     /// request fails.
     pub async fn list(&self) -> Result<Vec<OperatorConnectionView>, WyrdError> {
         self.client
+            .http
             .request_json::<(), _>(Method::GET, "/v1/operator-connections", None)
             .await
     }
 
     /// Read one connection, redacted.
+    ///
+    /// # Arguments
+    /// * `connection_id` - The connection to read.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks `operators:read`, the
@@ -98,12 +112,18 @@ impl OperatorConnections {
         connection_id: &OperatorConnectionId,
     ) -> Result<OperatorConnectionView, WyrdError> {
         self.client
+            .http
             .request_json::<(), _>(Method::GET, &Self::path(connection_id), None)
             .await
     }
 
     /// Patch one connection: omitted fields are preserved, a supplied secret
     /// replaces the stored one, and `status` disables or re-enables it.
+    ///
+    /// # Arguments
+    /// * `connection_id` - The connection to patch.
+    /// * `request` - The provider-tagged changes; its provider must match the
+    ///   stored one, and omitted fields keep their stored values.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks `operators:write`, the
@@ -115,11 +135,15 @@ impl OperatorConnections {
         request: &UpdateOperatorConnectionRequest,
     ) -> Result<OperatorConnectionView, WyrdError> {
         self.client
+            .http
             .request_json(Method::PATCH, &Self::path(connection_id), Some(request))
             .await
     }
 
     /// Disable one connection; it is never deleted.
+    ///
+    /// # Arguments
+    /// * `connection_id` - The connection to disable.
     ///
     /// # Errors
     /// Returns a Wyrd error when the caller lacks `operators:write`, the
@@ -129,6 +153,7 @@ impl OperatorConnections {
         connection_id: &OperatorConnectionId,
     ) -> Result<OperatorConnectionView, WyrdError> {
         self.client
+            .http
             .request_json::<(), _>(Method::DELETE, &Self::path(connection_id), None)
             .await
     }

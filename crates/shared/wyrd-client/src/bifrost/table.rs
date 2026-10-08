@@ -15,8 +15,8 @@ use arrow_schema::SchemaRef;
 use serde::{Deserialize, Serialize};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::{
-    BifrostTableDescription, FieldSpec, PhysicalLayoutWire, RegisterTableRequest,
-    RegisterTableResponse,
+    BifrostTableDescription, CompactionTypeWire, FieldSpec, PhysicalLayoutWire,
+    RegisterTableRequest, RegisterTableResponse,
 };
 use wyrd_spec::vala::ids::RunId;
 
@@ -60,6 +60,9 @@ pub struct TableConfig {
     /// Explicit Forge compaction file target; `None` follows the deployment
     /// default.
     compaction_target_file_size_bytes: Option<u64>,
+    /// Explicit Forge compaction type; `None` compacts with the `small-files`
+    /// default.
+    compaction_type: Option<CompactionTypeWire>,
     /// Server-assigned once registered or described; `None` while inert.
     resolved: Option<ResolvedTable>,
 }
@@ -70,6 +73,10 @@ impl TableConfig {
     /// The precision path: a caller who needs `Int32`, a non-UTC timezone,
     /// `Decimal128`, or `FixedSizeBinary` supplies Arrow directly, exactly as
     /// [`wyrd_queue::arrow_schema_to_fieldspec`] documents.
+    ///
+    /// # Arguments
+    /// * `fqn` - The table's `<namespace>.<name>`.
+    /// * `schema` - The user columns, excluding reserved and correlation columns.
     ///
     /// # Errors
     ///
@@ -86,6 +93,7 @@ impl TableConfig {
             user_schema: schema,
             physical_layout: None,
             compaction_target_file_size_bytes: None,
+            compaction_type: None,
             resolved: None,
         })
     }
@@ -97,6 +105,10 @@ impl TableConfig {
     /// [`wyrd_queue::json_schema_to_arrow`], the single owner of the
     /// JSON-Schema-to-Arrow table, so all three languages agree on the columns
     /// one model produces.
+    ///
+    /// # Arguments
+    /// * `fqn` - The table's `<namespace>.<name>`.
+    /// * `schema` - A JSON Schema object document describing the user columns.
     ///
     /// # Errors
     ///
@@ -122,6 +134,9 @@ impl TableConfig {
     /// struct fields; `schemars` emits a `$ref` for a nested type, which the
     /// shared mapper resolves only from a `$defs` section.
     ///
+    /// # Arguments
+    /// * `fqn` - The table's `<namespace>.<name>`.
+    ///
     /// # Errors
     ///
     /// As [`TableConfig::from_json_schema`].
@@ -141,6 +156,10 @@ impl TableConfig {
     /// table never restates a schema it does not own. The returned config is
     /// already resolved and carries the server's own physical layout.
     ///
+    /// # Arguments
+    /// * `client` - The authenticated client the describe request is sent over.
+    /// * `fqn` - The registered table's `<namespace>.<name>`.
+    ///
     /// # Errors
     ///
     /// Returns the stable not-found, authentication, authorization,
@@ -159,6 +178,9 @@ impl TableConfig {
     }
 
     /// As [`TableConfig::describe`], resolving the transport itself.
+    ///
+    /// # Arguments
+    /// * `fqn` - The registered table's `<namespace>.<name>`.
     ///
     /// # Errors
     ///
@@ -189,6 +211,7 @@ impl TableConfig {
             user_schema: Arc::new(user_schema),
             physical_layout: Some(description.physical_layout.clone()),
             compaction_target_file_size_bytes: description.compaction_target_file_size_bytes,
+            compaction_type: description.compaction_type,
             resolved: Some(ResolvedTable {
                 table_uid: description.entry.table_uid.clone(),
                 fingerprint: description.entry.fingerprint.clone(),
@@ -200,6 +223,9 @@ impl TableConfig {
     ///
     /// Omitted, the server resolves `hour(wyrd_event_time)`, `wyrd_event_time`
     /// descending nulls-last, and the managed Bloom floor.
+    ///
+    /// # Arguments
+    /// * `layout` - The partitioning, sort, and Bloom layout to request at register.
     #[must_use]
     pub fn with_layout(mut self, layout: PhysicalLayoutWire) -> Self {
         self.physical_layout = Some(layout);
@@ -213,6 +239,9 @@ impl TableConfig {
     /// row-group target with `WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET`,
     /// and a re-register whose target differs from the stored one with
     /// `WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`.
+    ///
+    /// # Arguments
+    /// * `bytes` - The soft compaction file target, in bytes; at least 128 MiB.
     #[must_use]
     pub fn with_compaction_target_file_size_bytes(mut self, bytes: u64) -> Self {
         self.compaction_target_file_size_bytes = Some(bytes);
@@ -223,6 +252,27 @@ impl TableConfig {
     #[must_use]
     pub fn compaction_target_file_size_bytes(&self) -> Option<u64> {
         self.compaction_target_file_size_bytes
+    }
+
+    /// Declare the physical compaction type Forge applies to this table.
+    ///
+    /// Omitted, the table stores no type and Forge compacts it `small-files`. A
+    /// copy-on-write table compacts `full` whatever it declares. The server
+    /// refuses a re-register whose type differs from the stored one with
+    /// `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.
+    ///
+    /// # Arguments
+    /// * `compaction_type` - The compaction type Forge applies to this table.
+    #[must_use]
+    pub fn with_compaction_type(mut self, compaction_type: CompactionTypeWire) -> Self {
+        self.compaction_type = Some(compaction_type);
+        self
+    }
+
+    /// The explicit compaction type, when declared or described.
+    #[must_use]
+    pub fn compaction_type(&self) -> Option<CompactionTypeWire> {
+        self.compaction_type
     }
 
     /// `<namespace>.<name>` — the name SQL and `SealedBatch.table` both use.
@@ -264,6 +314,7 @@ impl TableConfig {
             fields: wyrd_queue::arrow_schema_to_fieldspec(&self.user_schema),
             physical_layout: self.physical_layout.clone(),
             compaction_target_file_size_bytes: self.compaction_target_file_size_bytes,
+            compaction_type: self.compaction_type,
         }
     }
 
@@ -296,6 +347,9 @@ struct TableConfigWire {
     /// The explicit compaction file target, when one was declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compaction_target_file_size_bytes: Option<u64>,
+    /// The explicit compaction type, when one was declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compaction_type: Option<CompactionTypeWire>,
     /// The server-minted identity, when the config is already resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resolved: Option<ResolvedTable>,
@@ -310,6 +364,7 @@ impl From<TableConfig> for TableConfigWire {
             fields: wyrd_queue::arrow_schema_to_fieldspec(&config.user_schema),
             physical_layout: config.physical_layout,
             compaction_target_file_size_bytes: config.compaction_target_file_size_bytes,
+            compaction_type: config.compaction_type,
             resolved: config.resolved,
         }
     }
@@ -331,6 +386,7 @@ impl TryFrom<TableConfigWire> for TableConfig {
             user_schema: Arc::new(wyrd_queue::fieldspec_to_arrow(&wire.fields)?),
             physical_layout: wire.physical_layout,
             compaction_target_file_size_bytes: wire.compaction_target_file_size_bytes,
+            compaction_type: wire.compaction_type,
             resolved: wire.resolved,
         })
     }
@@ -339,7 +395,7 @@ impl TryFrom<TableConfigWire> for TableConfig {
 /// One table this connected writer has described, with its cached user schema.
 ///
 /// Holding this value is the proof that the table was described once for this
-/// writer's lifetime, which is what lets [`crate::bifrost::Bifrost::insert_into`]
+/// writer's lifetime, which is what lets `Bifrost::insert_into`
 /// stay a synchronous, IO-free enqueue: there is no way to name a destination
 /// the writer has not already resolved, so no insert path can smuggle in a
 /// per-observation describe or a caller-supplied schema.

@@ -50,3 +50,6 @@ wyrd-telemetry = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 serde_json = { workspace = true }
 skald-providers = { workspace = true }
+
+[lints]
+workspace = true

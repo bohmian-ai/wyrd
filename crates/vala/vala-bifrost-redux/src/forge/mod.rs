@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::time::Duration;
 
 use iceberg::Catalog;
+use uuid::Uuid;
+
+use leadership::ForgeLeadership;
 
 mod clock;
 pub(crate) mod compact;
@@ -17,7 +20,10 @@ pub(crate) mod error;
 pub(crate) mod expire;
 mod expiry_gates;
 mod expiry_policy;
+mod gc;
 mod identity;
+mod leader;
+mod leadership;
 pub(crate) mod lease;
 mod live_reconcile;
 mod live_replace;
@@ -27,12 +33,12 @@ pub(crate) mod orphan_gc;
 mod path;
 mod phase;
 mod planner;
-mod planning_scheduler;
 mod protection_roots;
 pub(crate) mod publication;
-mod reader_protection;
 mod scheduler;
 pub(crate) mod scribe_promotion;
+mod settings;
+mod table_authority;
 mod worker;
 
 pub use clock::ForgeClock;
@@ -40,21 +46,34 @@ pub use clock::ForgeClock;
 pub use clock::ForgeClockControl;
 pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore};
 pub use error::ForgeError;
+#[cfg(feature = "test-support")]
+pub use leader::ForgeTrackView;
+pub use leader::{
+    DEFAULT_REPORT_TIMEOUT, ForgeCommitNotice, ForgeCompactionDispatch, ForgeCompactionOutcome,
+    ForgeSchedule, ForgeTableKey,
+};
+pub use leadership::{
+    ForgeHeldTerm, ForgeLeaderPeer, dispatch_from_wire, dispatch_to_wire, outcome_from_wire,
+    outcome_to_wire, table_key_from_wire,
+};
 pub use managed::{
     ForgeManagedRewrite, ForgePlannedAttempt, ForgePlannedRewrite, ForgeRewriteEvidence,
     ForgeRewriteOutcome, ForgeTablePolicy, ForgeUnsettledOutput, RewriteHandoff,
 };
 pub use metrics::ForgeTelemetry;
 pub use planner::{ForgePlanCandidate, PlannedForgeTask};
-pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 #[cfg(feature = "test-support")]
 pub use scheduler::ForgeSchedulerTrigger;
+pub(crate) use settings::COMPACTION_TYPE_PROPERTY;
+pub use settings::{ForgeCompactionType, ForgeTableSettings};
 #[cfg(feature = "test-support")]
 pub use worker::{ForgeLifecycleEvent, ForgeWorkerCompletionObserver};
 pub use worker::{ForgeWorker, ForgeWorkerConfig};
 
 #[cfg(feature = "test-support")]
 pub use expiry_gates::ExpiryTestControls;
+#[cfg(feature = "test-support")]
+pub use gc::cleanup_projection;
 #[cfg(feature = "test-support")]
 pub use lease::{ForgeLease, forge_lease_key};
 #[cfg(feature = "test-support")]
@@ -165,10 +184,10 @@ pub struct ForgeBuildConfig {
     ///
     /// A restarted process that reclaims the same identity reclaims its own
     /// live lease immediately instead of waiting out the lease TTL on standby,
-    /// which would leave a sole coordinator unready for that whole TTL. The
+    /// which would leave planning stalled for that whole TTL. The
     /// identity must never be shared by two live processes, the same
     /// invariant the worker's claim owner already relies on.
-    pub scheduler_owner: uuid::Uuid,
+    pub scheduler_owner: Uuid,
     /// Concrete wall clock captured once by each Forge work batch.
     pub clock: ForgeClock,
     /// Optional test-only observer of successful supervised task completion.
@@ -189,6 +208,8 @@ pub struct Forge {
     hints: tokio::sync::Mutex<crate::maintenance::StagingFileInbox>,
     /// Rejects a second directly supervised scheduler loop.
     running: AtomicBool,
+    /// This coordinator's leader term, its volatile schedule, and notice routing.
+    leadership: ForgeLeadership,
 }
 
 /// Immutable dependency graph shared by one Forge owner.
@@ -211,8 +232,6 @@ pub(crate) struct ForgeCore {
     config: ForgeConfig,
     /// Delay between periodic scheduler ticks.
     maintenance_interval: Duration,
-    /// Durable process identity that owns the singleton scheduler fence.
-    scheduler_owner: uuid::Uuid,
     /// Wall clock shared by periodic and hinted maintenance batches.
     clock: ForgeClock,
     /// Optional observer notified only after a supervised worker returns success.
@@ -245,6 +264,18 @@ impl Forge {
             });
         }
         build.config.validate()?;
+        #[cfg(feature = "test-support")]
+        let leader_owner = build
+            .scheduler_trigger
+            .as_ref()
+            .and_then(ForgeSchedulerTrigger::owner_for_test)
+            .unwrap_or(build.scheduler_owner);
+        #[cfg(not(feature = "test-support"))]
+        let leader_owner = build.scheduler_owner;
+        let leadership = ForgeLeadership::new(
+            vala_sql::queries::forge_leader::ForgeLeaderElection::new(build.operator_pool.clone()),
+            leader_owner,
+        );
         let core = ForgeCore {
             resources: build.resources,
             spill_root: build.spill_root,
@@ -255,7 +286,6 @@ impl Forge {
             object_store: build.object_store,
             config: build.config,
             maintenance_interval: build.maintenance_interval,
-            scheduler_owner: build.scheduler_owner,
             clock: build.clock,
             #[cfg(feature = "test-support")]
             completion_observer: build.completion_observer,
@@ -271,7 +301,111 @@ impl Forge {
             core: Arc::new(core),
             hints: tokio::sync::Mutex::new(build.hints),
             running: AtomicBool::new(false),
+            leadership,
         })
+    }
+
+    /// Publishes `peer` with every leader term this coordinator acquires.
+    ///
+    /// Without it the coordinator can lead only in-process: remote replicas
+    /// find no route and drop their commit notices.
+    #[must_use]
+    pub fn with_leader_peer(mut self, peer: ForgeLeaderPeer) -> Self {
+        self.leadership.set_peer(peer);
+        self
+    }
+
+    /// Returns the leader term this coordinator holds, if any.
+    #[must_use]
+    pub fn held_leader_term(&self) -> Option<Arc<ForgeHeldTerm>> {
+        self.leadership.held()
+    }
+
+    /// Applies one remote commit notice addressed to the term `fencing_token`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when this coordinator does not hold
+    /// that term, and clock errors.
+    pub fn accept_commit_notice(
+        &self,
+        fencing_token: i64,
+        notice: ForgeCommitNotice,
+    ) -> Result<(), ForgeError> {
+        self.leadership
+            .accept(Some(fencing_token), notice, self.core.clock.now()?)
+    }
+
+    /// Answers one remote compactor pull addressed to the term `fencing_token`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when this coordinator does not hold
+    /// that term, and clock errors.
+    pub fn serve_compaction_pull(
+        &self,
+        fencing_token: i64,
+        limit: usize,
+    ) -> Result<Vec<ForgeCompactionDispatch>, ForgeError> {
+        self.leadership
+            .serve_pull(Some(fencing_token), limit, self.core.clock.now()?)
+    }
+
+    /// Applies one remote compactor report addressed to the term `fencing_token`.
+    ///
+    /// Returns whether the report matched the table's current task.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when this coordinator does not hold
+    /// that term, and clock errors.
+    pub fn serve_compaction_report(
+        &self,
+        fencing_token: i64,
+        key: &ForgeTableKey,
+        task_id: Uuid,
+        outcome: ForgeCompactionOutcome,
+    ) -> Result<bool, ForgeError> {
+        self.leadership.serve_report(
+            Some(fencing_token),
+            key,
+            task_id,
+            outcome,
+            self.core.clock.now()?,
+        )
+    }
+
+    /// Pulls at most `limit` table-level compaction tasks from the live leader.
+    ///
+    /// This is a compactor's pull: in-process when this replica holds the
+    /// term, otherwise over the peer route to the elected leader. No live or
+    /// reachable leader yields no work.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock and SQL errors, and [`ForgeError::LeaderPeer`] for a
+    /// transport failure, a refusal, or a malformed task.
+    pub async fn pull_compaction(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ForgeCompactionDispatch>, ForgeError> {
+        self.leadership.pull(limit, self.core.clock.now()?).await
+    }
+
+    /// Reports one pulled task's outcome to the live leader, by the same route.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock and SQL errors, and [`ForgeError::LeaderPeer`] for a
+    /// transport failure.
+    pub async fn report_compaction(
+        &self,
+        dispatch: &ForgeCompactionDispatch,
+        outcome: ForgeCompactionOutcome,
+    ) -> Result<(), ForgeError> {
+        self.leadership
+            .report(dispatch, outcome, self.core.clock.now()?)
+            .await
     }
 
     /// Returns this Forge clock for test-only fixture reconstruction.

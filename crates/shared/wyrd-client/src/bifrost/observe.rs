@@ -20,6 +20,13 @@ use crate::bifrost::table::Correlation;
 /// client's active binding: an instrumented process writes its signals
 /// alongside whatever the application is writing, and must not disturb — or be
 /// disturbed by — the table the application has bound.
+///
+/// # Arguments
+/// * `bifrost` - The client whose pooled producers and drop counter are used.
+/// * `table` - The destination table's `<namespace>.<name>`.
+/// * `schema` - The table's user schema the row is checked against at seal.
+/// * `json` - One JSON-encoded row.
+/// * `correlation` - The card and run identities stamped onto the row.
 pub fn record(
     bifrost: &Bifrost,
     table: &str,

@@ -52,7 +52,6 @@ pub(super) async fn register_table(
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await
         .expect("the catalog registers the table");
@@ -164,6 +163,11 @@ pub(super) async fn append_values(
 /// # Errors
 ///
 /// Returns the stable Wyrd error the public ingest route produced.
+///
+/// # Panics
+///
+/// Panics when the public ingest transport cannot connect or the batch
+/// cannot be IPC-encoded.
 pub(super) async fn append_batch(
     client: &wyrd_client::WyrdClient,
     table: &str,
@@ -175,6 +179,7 @@ pub(super) async fn append_batch(
         .expect("public ingest transport connects")
         .insert(table, batch_id, encode_ipc(batch))
         .await
+        .map(|_request_id| ())
 }
 
 /// Appends one batch whose rows all carry the caller's chosen event time.
@@ -220,6 +225,7 @@ pub(super) async fn read_values(client: &wyrd_client::WyrdClient, table: &str) -
 pub(super) async fn read_sql(client: &wyrd_client::WyrdClient, sql: &str) -> Vec<i64> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(120_000),
         })
@@ -320,7 +326,7 @@ pub(super) const INGEST_BUSY: &str = "WYRD_VALA_429_INGEST_BUSY";
 /// in any case depends on how long a turn took, only on whether every
 /// participant eventually got one. A participant that reaches this bound has
 /// not lost a race, it has been passed over indefinitely.
-const ADMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+const ADMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Longest pause between two retries of a refused append.
 ///

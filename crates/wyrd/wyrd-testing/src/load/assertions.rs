@@ -112,6 +112,10 @@ pub const fn reconcile_row_counts(
 /// This deliberately panics because a tenant leak is a hard test failure, not
 /// a workload measurement. The panic includes the row ID and both tenant
 /// values so a failing sustained-load case is immediately reproducible.
+///
+/// # Panics
+///
+/// Panics on a cross-tenant leak; that is the assertion.
 pub fn assert_no_cross_tenant_leak(
     principal_tenant: DataTenantId,
     rows: &[Value],

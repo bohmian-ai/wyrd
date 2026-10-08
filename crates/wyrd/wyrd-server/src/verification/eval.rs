@@ -21,29 +21,30 @@ use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
 use skald_runtime::ProviderRegistry;
 use tokio_util::sync::CancellationToken;
-use vala_bifrost_redux::oracle::AuthorizedQueryContext;
+use tracing::Instrument as _;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+
 use vala_eval::orchestrator::{
-    AgentCardResolver, MediaResolver, PromptCardResolver, ScenarioScoring, SkaldJudgeInvoker,
+    AgentCardResolver, MediaResolver, OrchestratorError, PromptCardResolver, ScenarioScoring,
+    SkaldJudgeInvoker,
 };
 use vala_eval::sampling::RecordSample;
-use vala_eval::{EvalReport, InMemoryTraceSource, JudgeError};
-use vala_sql::queries::olap_catalog::get_by_fqn;
-use wyrd_runtime::permission::PermissionSet;
-use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
-use wyrd_runtime::{
-    Action, BifrostPermissionScope, BifrostTableScope, Permission, PermissionScope,
+use vala_eval::{
+    EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,
 };
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
+
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::VerificationRunId;
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::reference::CardRefScope;
-use wyrd_spec::request_id::RequestId;
+use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::storage::StorageBackendKind;
-use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest};
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::eval::media::MediaRef as EvalMediaRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
@@ -53,7 +54,6 @@ use wyrd_spec::vala::trace::{
     InstrumentationScope, Resource, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus,
 };
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
-use wyrd_sql::queries::auth::system_principal_id;
 use wyrd_sql::queries::cards::{get_card_by_ref, get_card_by_uid};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 use wyrd_storage::tenant_path;
@@ -61,7 +61,9 @@ use wyrd_storage::{StorageError, StorageHandle};
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValueList, any_value};
 use wyrd_tonic::prost::Message as _;
 
+use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
 use super::engines::{EngineOutcome, VerifierReport};
+use super::telemetry::{ExecutionTelemetry, Phase, WaitSink};
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
 
@@ -129,12 +131,15 @@ impl EvalEngine {
     /// waits for its trace when a trace task needs it, then scores it and maps
     /// the report to the common verdict. Read, sampling, and scoring failures
     /// retry, except that a read refused at Bifrost admission defers; a
-    /// non-Eval input or an unplannable spec terminates `errored`.
+    /// non-Eval input or an unplannable spec terminates `errored`. The record
+    /// and trace reads are `input_read` intervals on `telemetry` and their
+    /// query streams are waits.
     pub async fn execute(
         &self,
         tenant: DataTenantId,
         run: &ClaimedRun,
         spec: &EvalSpec,
+        telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
         let RunInput::EvalRecord {
             record_id,
@@ -147,9 +152,29 @@ impl EvalEngine {
             ));
         };
         let run_id = run.lease.run_id;
-        let reader = match BifrostReader::new(&self.state, tenant).await {
-            Ok(reader) => reader,
-            Err(error) => {
+        let read = telemetry
+            .phase(Phase::InputRead, async {
+                let reader = BifrostReader::new(
+                    &self.state,
+                    tenant,
+                    run.system_principal,
+                    telemetry.waits(),
+                )
+                .await
+                .map_err(ReadStart::Authority)?;
+                let record = Box::pin(reader.record(
+                    &run.subject_card_uid.to_string(),
+                    record_id,
+                    *event_time,
+                ))
+                .await
+                .map_err(ReadStart::Record)?;
+                Ok::<_, ReadStart>((reader, record))
+            })
+            .await;
+        let (reader, record) = match read {
+            Ok(read) => read,
+            Err(ReadStart::Authority(error)) => {
                 return EngineOutcome::Retry(failed(
                     run_id,
                     RECORD_UNAVAILABLE,
@@ -157,13 +182,7 @@ impl EvalEngine {
                     &error,
                 ));
             }
-        };
-        let record = match reader
-            .record(&run.subject_card_uid.to_string(), record_id, *event_time)
-            .await
-        {
-            Ok(record) => record,
-            Err(error) => {
+            Err(ReadStart::Record(error)) => {
                 return error.outcome(run_id, RECORD_UNAVAILABLE, "the Eval record cannot be read");
             }
         };
@@ -186,7 +205,12 @@ impl EvalEngine {
         }
         let traces = InMemoryTraceSource::new();
         if let Some(trace_id) = record.trace_id.filter(|_| needs_trace(spec)) {
-            match reader.spans(trace_id, *event_time, self.trace_window).await {
+            match Box::pin(telemetry.phase(
+                Phase::InputRead,
+                reader.spans(trace_id, *event_time, self.trace_window),
+            ))
+            .await
+            {
                 Ok(spans) if spans.is_empty() => {
                     return EngineOutcome::AwaitingTrace(failure(
                         AWAITING_TRACE,
@@ -205,7 +229,8 @@ impl EvalEngine {
                 }
             }
         }
-        self.score(tenant, run, spec, &record, traces).await
+        self.score(tenant, run, spec, &record, traces, telemetry)
+            .await
     }
 
     /// Score `record` through the one Eval execution path and map its report.
@@ -219,7 +244,62 @@ impl EvalEngine {
         spec: &EvalSpec,
         record: &EvalRecordObservation,
         traces: InMemoryTraceSource,
+        telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
+        let run_id = run.lease.run_id;
+        let eval_run = RunId::from_string(run_id.to_string());
+        match self
+            .judge_record(tenant, eval_run, spec, record, traces, telemetry)
+            .await
+        {
+            Ok(report) => EngineOutcome::Completed(report),
+            Err(ScoreFailure::Plan(error)) => terminal(failed(
+                run_id,
+                SPEC_INVALID,
+                "the Eval spec cannot be planned",
+                &error,
+            )),
+            Err(ScoreFailure::Execute(error)) if error.awaits_trace() => {
+                EngineOutcome::AwaitingTrace(failure(
+                    AWAITING_TRACE,
+                    "the record's trace has not landed",
+                ))
+            }
+            Err(ScoreFailure::Execute(error)) => EngineOutcome::Retry(failed(
+                run_id,
+                EXECUTION_FAILED,
+                "the Eval tasks cannot be executed",
+                &error,
+            )),
+            Err(ScoreFailure::Capture(error)) => EngineOutcome::Retry(failed(
+                run_id,
+                EXECUTION_FAILED,
+                "the Eval report cannot be captured",
+                &error,
+            )),
+        }
+    }
+
+    /// Score one `record` of `tenant` under `spec` and map its report.
+    ///
+    /// The one Eval execution path of queued runs and direct execution: it
+    /// judges through the production Skald invoker over the tenant's registry
+    /// and media, with `traces` as the only trace source. Plan construction
+    /// is the `prepare` phase and every judge invocation is a wait on
+    /// `telemetry`.
+    ///
+    /// # Errors
+    /// Returns [`ScoreFailure`] naming whether planning, task execution, or
+    /// context capture failed.
+    pub async fn judge_record(
+        &self,
+        tenant: DataTenantId,
+        eval_run: RunId,
+        spec: &EvalSpec,
+        record: &EvalRecordObservation,
+        traces: InMemoryTraceSource,
+        telemetry: &ExecutionTelemetry,
+    ) -> Result<VerifierReport, ScoreFailure> {
         let registry = Arc::new(TenantRegistry {
             state: self.state.clone(),
             tenant,
@@ -234,45 +314,39 @@ impl EvalEngine {
             registry,
         )
         .with_media_resolver(media);
-        let scoring = match ScenarioScoring::new(
-            Arc::new(spec.clone()),
-            Arc::new(judge),
-            Arc::new(traces),
-            Duration::from_millis(READ_DEADLINE_MS),
-        ) {
-            Ok(scoring) => scoring,
-            Err(error) => {
-                return terminal(failed(
-                    run.lease.run_id,
-                    SPEC_INVALID,
-                    "the Eval spec cannot be planned",
-                    &error,
-                ));
-            }
+        let judge = TimedJudge {
+            inner: judge,
+            waits: telemetry.waits(),
         };
-        let eval_run = RunId::from_string(run.lease.run_id.to_string());
-        match scoring.score_record(eval_run, None, record).await {
-            Ok(report) => match VerifierReport::eval(report, spec) {
-                Ok(report) => EngineOutcome::Completed(report),
-                Err(error) => EngineOutcome::Retry(failed(
-                    run.lease.run_id,
-                    EXECUTION_FAILED,
-                    "the Eval report cannot be captured",
-                    &error,
-                )),
-            },
-            Err(error) if error.awaits_trace() => EngineOutcome::AwaitingTrace(failure(
-                AWAITING_TRACE,
-                "the record's trace has not landed",
-            )),
-            Err(error) => EngineOutcome::Retry(failed(
-                run.lease.run_id,
-                EXECUTION_FAILED,
-                "the Eval tasks cannot be executed",
-                &error,
-            )),
-        }
+        let scoring = telemetry
+            .prepare(async {
+                ScenarioScoring::new(
+                    Arc::new(spec.clone()),
+                    Arc::new(judge),
+                    Arc::new(traces),
+                    Duration::from_millis(READ_DEADLINE_MS),
+                )
+            })
+            .await
+            .map_err(ScoreFailure::Plan)?;
+        let report = scoring
+            .score_record(eval_run, None, record)
+            .instrument(tracing::info_span!("verification.score"))
+            .await
+            .map_err(ScoreFailure::Execute)?;
+        VerifierReport::eval(report, spec).map_err(ScoreFailure::Capture)
     }
+}
+
+/// Why scoring one Eval record produced no report.
+#[derive(Debug)]
+pub enum ScoreFailure {
+    /// The spec cannot be planned into stages.
+    Plan(OrchestratorError),
+    /// A task could not be executed, such as a judge that exhausted its retries.
+    Execute(EvalExecError),
+    /// An observed value could not be captured into the report.
+    Capture(EvalExecError),
 }
 
 /// Whether any task of `spec` asserts over the record's trace.
@@ -402,147 +476,53 @@ impl From<WyrdError> for ReadError {
     }
 }
 
-/// Logical schema and table of each tenant table continuous Eval reads its
-/// inputs from: committed observations and their trace spans. The System read
-/// authority reaches exactly these tables and nothing else.
-const EVAL_INPUT_TABLES: [(&str, &str); 2] = [("eval", "observations"), ("traces", "spans")];
-
-/// Why the tenant's System principal cannot be authorized to read Eval inputs.
-#[derive(Debug, thiserror::Error)]
-pub enum EvalReadAuthorityError {
-    /// The tenant has no active System principal with a `UUIDv7` id.
-    #[error("the tenant has no active System principal")]
-    SystemPrincipalMissing,
-    /// Reading the System principal or the input table identities failed.
-    #[error("the Eval read authority is unavailable: {0}")]
-    Unavailable(String),
-    /// The authorized context's tenant invariant does not hold.
-    #[error(transparent)]
-    Context(#[from] BifrostError),
-}
-
-/// The tenant's persisted System principal, authorized by the server to read
-/// exactly continuous Eval's input tables.
-///
-/// This is the same credentialless, role-free, per-tenant principal whose
-/// exact-Verifier `bifrost_record:write` token publishes verification results,
-/// with a separate server-minted read authority: one `bifrost_query:read`
-/// grant per existing [`EVAL_INPUT_TABLES`] table, scoped to that table's
-/// registered UID. It never carries a general query grant, never names a
-/// Verifier write scope, and is never issued as a token; Oracle authorizes and
-/// audits every read under it like any caller's.
-#[derive(Debug, Clone)]
-pub struct EvalReadAuthority {
-    /// The System principal's authorized query context for one tenant.
-    context: AuthorizedQueryContext,
-}
-
-impl EvalReadAuthority {
-    /// Resolve `tenant`'s System principal and mint its Eval input read scope.
-    ///
-    /// Reads the stored System principal id under the tenant's RLS bind, then
-    /// the registered UID of each Eval input table the tenant already has; a
-    /// table not yet created (a tenant's span table appears with its first
-    /// export) gets no grant, so a read of it stays not-found. Nothing is
-    /// written, so both transactions end without commit.
-    ///
-    /// # Errors
-    /// Returns [`EvalReadAuthorityError::SystemPrincipalMissing`] when the
-    /// tenant has no active `UUIDv7` System principal,
-    /// [`EvalReadAuthorityError::Unavailable`] when a control-plane read fails
-    /// or a stored table UID is malformed, and
-    /// [`EvalReadAuthorityError::Context`] when the context's tenant invariant
-    /// fails.
-    pub async fn resolve(
-        state: &AppState,
-        tenant: DataTenantId,
-    ) -> Result<Self, EvalReadAuthorityError> {
-        let unavailable =
-            |error: &dyn std::fmt::Display| EvalReadAuthorityError::Unavailable(error.to_string());
-        let mut conn = state
-            .postgres
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let id = system_principal_id(&mut conn)
-            .await
-            .map_err(|error| unavailable(&error))?
-            .filter(|id| id.get_version_num() == 7)
-            .ok_or(EvalReadAuthorityError::SystemPrincipalMissing)?;
-        drop(conn);
-        let mut conn = state
-            .postgres
-            .vala()
-            .tenant_conn(tenant)
-            .await
-            .map_err(|error| unavailable(&error))?;
-        let mut grants = Vec::with_capacity(EVAL_INPUT_TABLES.len());
-        for (schema, table) in EVAL_INPUT_TABLES {
-            let Some(row) = get_by_fqn(&mut conn, &format!("vala.{schema}.{table}"))
-                .await
-                .map_err(|error| unavailable(&error))?
-            else {
-                continue;
-            };
-            let table_uid =
-                uuid::Uuid::from_slice(&row.table_uid).map_err(|error| unavailable(&error))?;
-            grants.push(Permission {
-                resource: wyrd_runtime::Resource::BifrostQuery,
-                action: Action::Read,
-                scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-                    catalog: "vala".to_owned(),
-                    schema: schema.to_owned(),
-                    table_uid,
-                })),
-            });
-        }
-        let principal = Principal::new(
-            PrincipalId::new(id),
-            PrincipalKind::System {
-                card_ref_scope: CardRefScope::default(),
-            },
-            tenant,
-            Vec::new(),
-            PermissionSet::from_iter(grants),
-        );
-        let context = AuthorizedQueryContext::try_new(
-            principal,
-            tenant,
-            RequestId::now_v7(),
-            None,
-            AuthMethod::Internal,
-            Permission::bifrost_query_read(),
-        )?;
-        Ok(Self { context })
-    }
-
-    /// The System principal's authorized query context.
-    #[must_use]
-    pub const fn context(&self) -> &AuthorizedQueryContext {
-        &self.context
-    }
+/// Each tenant table continuous Eval reads its inputs from: committed
+/// observations and their trace spans. The SYSTEM read authority reaches
+/// exactly these tables and nothing else.
+fn eval_input_tables() -> [TableRef; 2] {
+    [
+        TableRef::new(BifrostNamespace::Eval, "observations"),
+        TableRef::new(BifrostNamespace::Traces, "spans"),
+    ]
 }
 
 /// Tenant-scoped Bifrost reads of Eval inputs through the ordinary query entry.
 struct BifrostReader {
-    /// Caller bound to the tenant System principal's Eval input read authority.
+    /// Caller bound to the tenant SYSTEM principal's Eval input read authority.
     caller: ScheduledQueryCaller,
+    /// The executing run's wait sink every query stream is recorded on.
+    waits: WaitSink,
 }
 
 impl BifrostReader {
-    /// Bind a reader for `tenant` to its [`EvalReadAuthority`].
+    /// Bind a reader for `tenant` to the SYSTEM read authority over
+    /// [`eval_input_tables`], recording the authority resolution and every
+    /// later query on `waits`.
     ///
     /// # Errors
-    /// Returns every [`EvalReadAuthority::resolve`] failure; no read is
-    /// attempted without the System principal's authority.
-    async fn new(state: &AppState, tenant: DataTenantId) -> Result<Self, EvalReadAuthorityError> {
-        let authority = EvalReadAuthority::resolve(state, tenant).await?;
+    /// Returns every [`SystemReadAuthority::resolve`] failure; no read is
+    /// attempted without the SYSTEM principal's authority.
+    async fn new(
+        state: &AppState,
+        tenant: DataTenantId,
+        principal: Option<PrincipalId>,
+        waits: WaitSink,
+    ) -> Result<Self, SystemReadAuthorityError> {
+        let authority = waits
+            .wait(SystemReadAuthority::resolve(
+                state,
+                tenant,
+                principal,
+                &eval_input_tables(),
+            ))
+            .await?;
         Ok(Self {
             caller: ScheduledQueryCaller::new(
                 state.clone(),
-                authority.context,
+                authority.into_context(),
                 CancellationToken::new(),
             ),
+            waits,
         })
     }
 
@@ -550,20 +530,21 @@ impl BifrostReader {
     ///
     /// # Errors
     /// Returns the query failure.
+    #[tracing::instrument(name = "verification.evidence_read", skip_all)]
     async fn query(&self, sql: String) -> Result<Vec<RecordBatch>, WyrdError> {
         let mut batches = Vec::new();
-        self.caller
-            .run_with(
-                BifrostQueryRequest {
-                    sql,
-                    deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
-                },
-                |batch| {
-                    batches.push(batch);
-                    Ok(())
-                },
-            )
-            .await?;
+        Box::pin(self.waits.wait(self.caller.run_with(
+            BifrostQueryRequest {
+                params: Vec::new(),
+                sql,
+                deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
+            },
+            |batch| {
+                batches.push(batch);
+                Ok(())
+            },
+        )))
+        .await?;
         Ok(batches)
     }
 
@@ -581,18 +562,17 @@ impl BifrostReader {
         event_time: DateTime<Utc>,
     ) -> Result<EvalRecordObservation, ReadError> {
         let (start, end) = utc_day(event_time);
-        let batches = self
-            .query(format!(
-                "SELECT record_id, session_id, context, trace_id, span_id, created_at, media \
+        let batches = Box::pin(self.query(format!(
+            "SELECT record_id, session_id, context, trace_id, span_id, created_at, media \
                  FROM vala.eval.observations \
                  WHERE card_uid = '{}' AND record_id = '{}' \
                    AND wyrd_event_time >= TIMESTAMP '{start}' \
                    AND wyrd_event_time < TIMESTAMP '{end}' \
                  LIMIT 1",
-                quoted(subject),
-                quoted(record_id),
-            ))
-            .await?;
+            quoted(subject),
+            quoted(record_id),
+        )))
+        .await?;
         let batch = batches
             .iter()
             .find(|batch| batch.num_rows() > 0)
@@ -662,9 +642,8 @@ impl BifrostReader {
                 .checked_add_signed(window)
                 .ok_or("the trace window is out of range")?,
         );
-        let batches = match self
-            .query(format!(
-                "SELECT span_id, parent_span_id, trace_state, flags, name, kind, \
+        let batches = match Box::pin(self.query(format!(
+            "SELECT span_id, parent_span_id, trace_state, flags, name, kind, \
                         start_time_unix_nano, end_time_unix_nano, status_code, status_message, \
                         attributes, dropped_attributes_count, events, dropped_events_count, \
                         links, dropped_links_count, scope_name, service_name \
@@ -674,10 +653,10 @@ impl BifrostReader {
                    AND wyrd_event_time < TIMESTAMP '{end}' \
                  ORDER BY start_time_unix_nano, span_id \
                  LIMIT {}",
-                trace_id.to_hex(),
-                TRACE_SPAN_LIMIT + 1,
-            ))
-            .await
+            trace_id.to_hex(),
+            TRACE_SPAN_LIMIT + 1,
+        )))
+        .await
         {
             Ok(batches) => batches,
             // A tenant's span table is created by its first export, so its
@@ -977,6 +956,49 @@ fn int32(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<i32>, Str
         .downcast_ref::<Int32Array>()
         .ok_or_else(|| format!("column {name} is not an integer"))?;
     Ok(column.is_valid(row).then(|| column.value(row)))
+}
+
+/// The first failure of an Eval input read: authority or record.
+enum ReadStart {
+    /// The System principal's read authority could not be resolved.
+    Authority(SystemReadAuthorityError),
+    /// The frozen record could not be read.
+    Record(ReadError),
+}
+
+/// The production judge invoker, recording each invocation as one wait.
+///
+/// Wraps the Skald invoker the executor fans out on its task set; the
+/// shared [`WaitSink`] lets a wait measured inside a spawned task join its
+/// execution's overhead accounting.
+// ponytail: the wait spans the whole invocation, so judge Agent/Prompt
+// resolution and prompt rendering count as wait; split at the provider call
+// if that preparation ever shows up in profiles.
+struct TimedJudge {
+    /// The Skald invoker that resolves, renders, and calls the provider.
+    inner: SkaldJudgeInvoker,
+    /// The executing run's wait sink.
+    waits: WaitSink,
+}
+
+#[async_trait]
+impl JudgeInvoker for TimedJudge {
+    /// Invoke the inner judge once inside a `verification.judge` span,
+    /// recording the call as one wait.
+    ///
+    /// # Errors
+    /// Returns the inner invoker's [`JudgeError`] unchanged.
+    async fn invoke(
+        &self,
+        judge: &InlineableRef<AgentSpec>,
+        context: Value,
+        media: &MediaBindings,
+    ) -> Result<Value, JudgeError> {
+        self.waits
+            .wait(self.inner.invoke(judge, context, media))
+            .instrument(tracing::info_span!("verification.judge"))
+            .await
+    }
 }
 
 /// Resolves judge Agent and Prompt Cards from the run tenant's registry.
@@ -1459,7 +1481,7 @@ mod tests {
             StorageSettings {
                 backend,
                 require_encryption: false,
-                presign_ttl: std::time::Duration::from_secs(600),
+                presign_ttl: std::time::Duration::from_mins(10),
                 part_size_bytes: 16 * 1024 * 1024,
                 multipart_threshold_bytes: 100 * 1024 * 1024,
             },

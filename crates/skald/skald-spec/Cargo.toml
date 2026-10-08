@@ -26,3 +26,6 @@ serde_yaml = { workspace = true }
 [features]
 default = []
 schemars = ["dep:schemars"]
+
+[lints]
+workspace = true

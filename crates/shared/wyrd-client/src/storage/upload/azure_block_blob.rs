@@ -65,7 +65,7 @@ pub(crate) async fn upload(
         != expected
     {
         return Err(StorageClientError::SizeMismatch {
-            expected: *block_count_planned as u64,
+            expected: u64::from(*block_count_planned),
             actual,
         });
     }
@@ -85,6 +85,7 @@ pub(crate) async fn upload(
         let url = format!("{sas_url}&comp=block&blockid={block_id}");
         let headers = [("Idempotency-Key", hooks.idempotency_key)];
         let response = client
+            .http
             .request_external_stream(
                 reqwest::Method::PUT,
                 &url,

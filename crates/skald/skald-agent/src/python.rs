@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
 use skald_prompt::{Prompt, PyProviderRequest};
+use skald_runtime::python::PyMockProvider;
 use skald_spec::{ProviderRequest, ProviderResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
@@ -19,8 +20,8 @@ use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 use crate::error::AgentError;
 use crate::{
     AfterAgentFn, AfterModelFn, AfterToolFn, Agent, AgentContext, AgentRun, BeforeAgentFn,
-    BeforeModelFn, BeforeToolFn, CallbackOutcome, FinishReason, Role, RunConfig, SessionError,
-    SessionId, SessionMemory, SessionTurn, default_prompt_resolver,
+    BeforeModelFn, BeforeToolFn, CallbackOutcome, Conversation, ConversationTurn, FinishReason,
+    Role, RunConfig, SessionError, SessionId, SessionMemory, SessionTurn, default_prompt_resolver,
 };
 
 impl From<AgentError> for WyrdPyError {
@@ -81,12 +82,12 @@ impl Agent {
     ///     id (str | None): Optional stable runtime id.
     ///     tools (list | None): Optional runtime-local decorated tools.
     ///     run_config (RunConfig | None): Optional run configuration.
-    ///     before_agent_callback (Callable | None): Optional callback fired before the run starts. Return None to continue, return replacement input text, or raise to abort.
-    ///     after_agent_callback (Callable | None): Optional callback fired after the run completes. Return None to continue, return a replacement AgentRun, or raise to abort.
-    ///     before_model_callback (Callable | None): Optional callback fired before each model invocation. Return None to continue, return a ProviderRequest replacement, or raise to abort.
-    ///     after_model_callback (Callable | None): Optional callback fired after each model invocation. Return None to continue, return a ProviderResponse replacement, or raise to abort.
-    ///     before_tool_callback (Callable | None): Optional callback fired before each tool invocation. Return None to continue, return replacement tool arguments, or raise to abort.
-    ///     after_tool_callback (Callable | None): Optional callback fired after each tool invocation. Return None to continue, return replacement tool output, or raise to abort.
+    ///     before_agent_callback (Callable | None): Optional callback fired before the run starts. Return None to continue, return replacement input text, or raise to end the run CallbackAborted.
+    ///     after_agent_callback (Callable | None): Optional callback fired after the run completes. Return None to continue, return a mapping in the serialized AgentRun shape to replace the result, or raise to end the run CallbackAborted.
+    ///     before_model_callback (Callable | None): Optional callback fired before each model invocation. Return None to continue, return a ProviderRequest replacement, or raise to end the run CallbackAborted.
+    ///     after_model_callback (Callable | None): Optional callback fired after each model invocation. Return None to continue, return a ProviderResponse replacement, or raise to discard the response and end the run CallbackAborted.
+    ///     before_tool_callback (Callable | None): Optional callback fired before each tool invocation. Return None to continue, return replacement tool arguments, or raise to skip that call and report it to the model as failed.
+    ///     after_tool_callback (Callable | None): Optional callback fired after each tool invocation. Return None to continue, return replacement tool output, or raise to report that call to the model as failed.
     ///     session (SessionMemory | None): Optional session memory object with recent and append methods.
     ///     labels (dict[str, str] | None): Optional envelope labels.
     ///     annotations (dict[str, str] | None): Optional envelope annotations.
@@ -99,6 +100,9 @@ impl Agent {
     ///         Must be callable and accept keyword arguments matching the structured output
     ///         fields (typically a pydantic.BaseModel subclass). Does NOT inject a schema into
     ///         the provider request — use Prompt(output=...) for schema enforcement.
+    ///     mock_provider (MockProvider | None): Offline provider for `provider="mock"`
+    ///         prompts with caller-set canned responses. Cannot be combined with
+    ///         `provider_base_url`.
     ///
     /// Returns:
     ///     Agent: New Agent ready to run.
@@ -126,10 +130,13 @@ impl Agent {
         annotations = None,
         provider_base_url = None,
         provider_api_key = None,
-        output_type = None
+        output_type = None,
+        mock_provider = None
     ))]
-    // justification: pyo3 #[new] signature must match the Python API surface; the params correspond 1:1 to the exposed Python constructor
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "pyo3 #[new] signature must match the Python API surface; the params correspond 1:1 to the exposed Python constructor"
+    )]
     pub fn __new__(
         py: Python<'_>,
         prompt: &Bound<'_, PyAny>,
@@ -151,6 +158,7 @@ impl Agent {
         provider_base_url: Option<String>,
         provider_api_key: Option<String>,
         output_type: Option<&Bound<'_, PyAny>>,
+        mock_provider: Option<PyRef<'_, PyMockProvider>>,
     ) -> WyrdPyResult<Self> {
         let mut agent = agent_from_prompt_py(prompt)?;
 
@@ -216,6 +224,16 @@ impl Agent {
                 ))
             })?;
             agent = agent.with_provider_registry(Arc::new(registry));
+        }
+
+        if let Some(mock) = mock_provider {
+            if agent.provider_override.is_some() {
+                return Err(invalid_argument(
+                    "mock_provider",
+                    "cannot be combined with provider_base_url",
+                ));
+            }
+            agent = agent.with_provider_registry(Arc::new(mock.registry()));
         }
 
         agent.py_output_cls = output_cls_from_py(output_type)?;
@@ -293,12 +311,20 @@ impl Agent {
         Ok(Agent::to_yaml_string(self)?)
     }
 
-    /// Return this Agent Card as a JSON-serializable Python mapping.
+    /// Return this Agent as a typed `wyrd.cards.agent.AgentCard`.
+    ///
+    /// The native Agent Card is built here and handed to the Card package's
+    /// draft constructor by JSON, because Skald cannot depend on the Card
+    /// crate that owns the Python `AgentCard` class.
     #[pyo3(name = "to_card")]
     pub fn py_to_card(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        let card = Agent::to_card(self)?;
-        let value = serde_json::to_value(card).map_err(|error| boundary_internal(&error))?;
-        wyrd_utils::py::json_to_pyobject(py, &value).map_err(WyrdPyError::from)
+        let json = serde_json::to_string(&Agent::to_card(self)?)
+            .map_err(|error| boundary_internal(&error))?;
+        Ok(py
+            .import("wyrd._wyrd.cards.agent")?
+            .getattr("AgentCard")?
+            .call_method1("_from_draft_json", (json,))?
+            .unbind())
     }
 
     /// Return this Agent Card envelope as JSON.
@@ -722,6 +748,10 @@ pub fn python_register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<RunConfig>()?;
     module.add_class::<Role>()?;
     module.add_class::<SessionTurn>()?;
+    module.add_class::<AgentContext>()?;
+    module.add_class::<PyConversation>()?;
+    module.add_class::<PyConversationTurn>()?;
+    module.add_class::<PyMockProvider>()?;
     Ok(())
 }
 
@@ -837,19 +867,117 @@ fn callback_outcome<T>(
 }
 
 fn ctx_to_py(py: Python<'_>, ctx: &AgentContext) -> PyResult<Py<PyAny>> {
-    let dict = PyDict::new(py);
-    dict.set_item("agent_id", &ctx.agent_id)?;
-    dict.set_item("session_id", &ctx.session_id)?;
-    dict.set_item("iteration", ctx.iteration)?;
-    dict.set_item(
-        "conversation",
-        wyrd_utils::py::json_to_pyobject(
-            py,
-            &serde_json::to_value(ctx.conversation.as_ref())
-                .map_err(|error| PyErr::from(boundary_internal(&error)))?,
-        )?,
-    )?;
-    Ok(dict.into_any().unbind())
+    Ok(Py::new(py, ctx.clone())?.into_any())
+}
+
+#[pymethods]
+impl AgentContext {
+    /// Stable runtime id of the Agent whose callback is firing.
+    #[getter]
+    fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    /// Session id of the current run, or `None` without a session.
+    #[getter]
+    fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
+    /// Zero-based model/tool loop iteration.
+    #[getter]
+    const fn iteration(&self) -> u32 {
+        self.iteration
+    }
+
+    /// Read-only conversation snapshot at this callback fire point.
+    #[getter]
+    fn conversation(&self) -> PyConversation {
+        PyConversation(Conversation::clone(&self.conversation))
+    }
+}
+
+/// Python read-only view of one [`Conversation`] snapshot.
+///
+/// Kept as a boundary newtype because the serde-derived conversation must not
+/// carry `PyO3`-generated methods.
+#[pyclass(module = "wyrd.agent", name = "Conversation", frozen)]
+pub struct PyConversation(Conversation);
+
+#[pymethods]
+impl PyConversation {
+    /// Turns in insertion order.
+    #[getter]
+    fn turns(&self) -> Vec<PyConversationTurn> {
+        self.0
+            .turns
+            .iter()
+            .cloned()
+            .map(PyConversationTurn)
+            .collect()
+    }
+
+    /// Number of turns.
+    fn __len__(&self) -> usize {
+        self.0.turns.len()
+    }
+}
+
+/// Python projection of one [`ConversationTurn`].
+///
+/// The native turn is an enum whose assistant and tool payloads are
+/// provider-native JSON, so it is projected through explicit getters rather
+/// than as a PyO3 complex enum.
+#[pyclass(
+    module = "wyrd.agent",
+    name = "ConversationTurn",
+    frozen,
+    skip_from_py_object
+)]
+pub struct PyConversationTurn(ConversationTurn);
+
+#[pymethods]
+impl PyConversationTurn {
+    /// Role that produced the turn.
+    #[getter]
+    const fn role(&self) -> Role {
+        match self.0 {
+            ConversationTurn::System { .. } => Role::System,
+            ConversationTurn::User { .. } => Role::User,
+            ConversationTurn::Assistant { .. } => Role::Assistant,
+            ConversationTurn::ToolResult { .. } => Role::Tool,
+        }
+    }
+
+    /// Text content of a system or user turn; `None` for assistant and tool
+    /// turns, whose payloads are provider-native.
+    #[getter]
+    fn content(&self) -> Option<&str> {
+        match &self.0 {
+            ConversationTurn::System { content } | ConversationTurn::User { content } => {
+                Some(content)
+            }
+            ConversationTurn::Assistant { .. } | ConversationTurn::ToolResult { .. } => None,
+        }
+    }
+
+    /// Provider tool call id of a tool result turn.
+    #[getter]
+    fn call_id(&self) -> Option<&str> {
+        match &self.0 {
+            ConversationTurn::ToolResult { call_id, .. } => Some(call_id),
+            _ => None,
+        }
+    }
+
+    /// Return the turn as its JSON-compatible wire mapping.
+    ///
+    /// # Errors
+    /// Raises `WyrdError` when the turn cannot be converted to Python values.
+    fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        let value = serde_json::to_value(&self.0).map_err(|error| boundary_internal(&error))?;
+        wyrd_utils::py::json_to_pyobject(py, &value).map_err(WyrdPyError::from)
+    }
 }
 
 fn validate_callable_method(py: Python<'_>, obj: &Py<PyAny>, method: &str) -> WyrdPyResult<()> {
@@ -993,8 +1121,8 @@ fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Option<A
 /// Generic callable path: calls `cls(**structured_output_dict)`.
 ///
 /// Returns `WYRD_AGENT_422_STRUCTURED_DECODE` on instantiation failure.
-fn instantiate_parsed<'py>(
-    py: Python<'py>,
+fn instantiate_parsed(
+    py: Python<'_>,
     cls: &Py<PyAny>,
     output_text: &str,
     map: &serde_json::Map<String, serde_json::Value>,
@@ -1004,7 +1132,7 @@ fn instantiate_parsed<'py>(
     if bound.hasattr("model_validate_json").unwrap_or(false) {
         return bound
             .call_method1("model_validate_json", (output_text,))
-            .map(|r| r.unbind())
+            .map(pyo3::Bound::unbind)
             .map_err(|e| structured_decode_error(&e));
     }
 
@@ -1016,6 +1144,6 @@ fn instantiate_parsed<'py>(
         .map_err(|e| structured_decode_error(&e))?;
     bound
         .call((), Some(kwargs))
-        .map(|r| r.unbind())
+        .map(pyo3::Bound::unbind)
         .map_err(|e| structured_decode_error(&e))
 }

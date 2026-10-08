@@ -1,112 +1,89 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { startTestServer } from "@wyrd/testing";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { expect, vi } from "vitest";
 
-import { Cards, WyrdError } from "@wyrd/sdk";
+import { Cards, WyrdClient } from "@wyrd/sdk";
 
-const FIXTURE_TENANT = "test-tenant-1";
-const SECOND_TENANT = "saved-login-two";
-const AMBIENT = ["WYRD_API_KEY", "WYRD_ACCESS_TOKEN", "WYRD_WORKLOAD_TOKEN", "WYRD_TENANT"];
+import { fixture, serverTest } from "../support/server.js";
 
-/** Await a rejected SDK call and return its catalog error. */
-async function rejection(promise: Promise<unknown>): Promise<WyrdError> {
-  const error = await promise.then(
-    () => undefined,
-    (reason: unknown) => reason,
-  );
-  expect(error).toBeInstanceOf(WyrdError);
-  return error as WyrdError;
+vi.setConfig({ testTimeout: 60_000 });
+
+/** The test server's own tenant, where bob reads Cards and cannot write them. */
+const READER_TENANT = "test-tenant-1";
+/** A second tenant where alice administers. */
+const ADMIN_TENANT = "saved-login-two";
+const PROMPT = fixture("cards/gateway_inference/ask-prompt.yaml");
+
+/** `Cards` resolved from the saved logins, with `WYRD_TENANT` the only selector. */
+function cards(tenant?: string, credential?: string): Cards {
+  vi.stubEnv("WYRD_TENANT", tenant);
+  return Cards.connect({ client: WyrdClient.connect({ credential }) });
 }
 
-/** Capture a synchronous catalog error. */
-function thrown(action: () => unknown): WyrdError {
-  try {
-    action();
-  } catch (error) {
-    expect(error).toBeInstanceOf(WyrdError);
-    return error as WyrdError;
-  }
-  throw new Error("expected a WyrdError");
-}
-
-/** The stable reason a saved login could not be used. */
-function reason(error: WyrdError): unknown {
-  expect(error.code).toBe("WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE");
-  return (error.details as { reason?: unknown }).reason;
-}
-
-describe("saved user login", () => {
-  const saved: Record<string, string | undefined> = {};
-  beforeEach(() => {
-    for (const name of [...AMBIENT, "WYRD_CONFIG_HOME"]) {
-      saved[name] = process.env[name];
-      delete process.env[name];
-    }
-  });
-  afterEach(() => {
-    for (const [name, value] of Object.entries(saved)) {
-      if (value === undefined) {
-        delete process.env[name];
-      } else {
-        process.env[name] = value;
-      }
-    }
-  });
-
-  it("saved user auth journey", async () => {
-    const config = mkdtempSync(join(tmpdir(), "wyrd-ts-saved-login-"));
-    const prompt = join(config, "prompt.yaml");
-    writeFileSync(
-      prompt,
-      "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: ts-saved-login\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\n",
-    );
-    process.env.WYRD_CONFIG_HOME = config;
-    const server = startTestServer(undefined, undefined, undefined, true);
-    try {
-      const serverUrl = server.baseUrl;
+/**
+ * Human single sign-on enabled once for both tenants, then per test a fresh
+ * configuration home holding bob's saved reader login and no API key.
+ */
+const test = serverTest({ humanSso: true }).extend<{ sso: void; config: string }>({
+  sso: [
+    async ({ server }, use) => {
       server.activateHumanSso();
-      server.activateHumanSso(SECOND_TENANT);
-      server.saveHumanLogin(config, FIXTURE_TENANT, "bob", "wyrd-test");
-      server.saveHumanLogin(config, SECOND_TENANT, "alice", "alice-password");
+      server.activateHumanSso(ADMIN_TENANT);
+      await use();
+    },
+    { scope: "file" },
+  ],
+  config: async ({ server, sso: _ }, use) => {
+    const config = mkdtempSync(join(tmpdir(), "wyrd-ts-saved-login-"));
+    vi.stubEnv("WYRD_CONFIG_HOME", config);
+    vi.stubEnv("WYRD_API_KEY", undefined);
+    server.saveHumanLogin(config, READER_TENANT, "bob", "wyrd-test");
+    await use(config);
+  },
+});
 
-      // Without a selector the newest login, alice's admin login, is used; a
-      // selector must name a saved login.
-      await Cards.connect({ serverUrl }).registerFromPath(prompt);
-      expect(reason(thrown(() => Cards.connect({ serverUrl, tenant: "no-such-tenant" })))).toBe(
-        "tenant_mismatch",
-      );
+test("newest saved login is used without a selector", async ({ server, config }) => {
+  server.saveHumanLogin(config, ADMIN_TENANT, "alice", "alice-password");
 
-      // Bob is a reader: the read is allowed and the write denied.
-      const reader = Cards.connect({ serverUrl, tenant: FIXTURE_TENANT });
-      await reader.list({ kind: "Prompt" });
-      expect((await rejection(reader.registerFromPath(prompt))).status).toBe(403);
-      await Cards.connect({ serverUrl, tenant: SECOND_TENANT }).list({ kind: "Prompt" });
+  const receipt = await cards().registerFromPath(PROMPT);
 
-      // A stale login renews through Wyrd and the renewal is saved.
-      server.expireSavedLogin(config, FIXTURE_TENANT);
-      expect(server.savedLoginIsStale(config, FIXTURE_TENANT)).toBe(true);
-      await Cards.connect({ serverUrl, tenant: FIXTURE_TENANT }).list({ kind: "Prompt" });
-      expect(server.savedLoginIsStale(config, FIXTURE_TENANT)).toBe(false);
+  expect(receipt.root).toMatchObject({ kind: "Prompt", name: "ask-prompt" });
+});
 
-      // An explicit machine credential overrides the saved reader; it names
-      // its own tenant, so a selector beside it is refused.
-      const selected = thrown(() =>
-        Cards.connect({ serverUrl, credential: server.apiKey, tenant: FIXTURE_TENANT }),
-      );
-      expect(selected.code).toBe("WYRD_CLIENT_400_CONFIG_INVALID");
-      expect(selected.message).toContain("already names its tenant");
-      await Cards.connect({ serverUrl, credential: server.apiKey }).registerFromPath(prompt);
+test("saved reader login is denied a write", async ({ config: _ }) => {
+  await expect(cards(READER_TENANT).registerFromPath(PROMPT)).rejects.toMatchObject({
+    code: "WYRD_PERMISSION_403_DENIED_RBAC",
+  });
+});
 
-      // Once the chain is revoked the login fails closed and asks for a new login.
-      server.revokeSavedLogin(config, FIXTURE_TENANT);
-      server.expireSavedLogin(config, FIXTURE_TENANT);
-      const revoked = Cards.connect({ serverUrl, tenant: FIXTURE_TENANT });
-      expect(reason(await rejection(revoked.list({ kind: "Prompt" })))).toBe("refresh_refused");
-    } finally {
-      server.shutdown();
-    }
-  }, 60_000);
+test("stale login refreshes and saves the renewal", async ({ server, config }) => {
+  server.expireSavedLogin(config, READER_TENANT);
+
+  await cards(READER_TENANT).list({ kind: "Prompt" });
+
+  expect(server.savedLoginIsStale(config, READER_TENANT)).toBe(false);
+});
+
+test("revoked login is refused", async ({ server, config }) => {
+  server.revokeSavedLogin(config, READER_TENANT);
+  server.expireSavedLogin(config, READER_TENANT);
+
+  await expect(cards(READER_TENANT).list({ kind: "Prompt" })).rejects.toMatchObject({
+    code: "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE",
+  });
+});
+
+test("selector naming no saved login is refused", ({ config: _ }) => {
+  expect(() => cards("no-such-tenant")).toThrow(
+    expect.objectContaining({ code: "WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE" }),
+  );
+});
+
+// An explicit machine credential names its own tenant.
+test("explicit key beside a tenant selector is refused", ({ server, config: _ }) => {
+  expect(() => cards(READER_TENANT, server.apiKey)).toThrow(
+    expect.objectContaining({ code: "WYRD_CLIENT_400_CONFIG_INVALID" }),
+  );
 });

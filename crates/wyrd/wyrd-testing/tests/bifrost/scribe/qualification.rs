@@ -65,8 +65,8 @@ async fn scribe_512_mib_physical_object_qualifies() {
     let mut generator = PayloadGenerator::new(0x5eed_1234_9abc_def1);
     let mut expected: Vec<i64> = Vec::with_capacity(REQUESTS * ROWS_PER_REQUEST);
     for request in 0..REQUESTS {
-        let first = (request * ROWS_PER_REQUEST) as i64;
-        let values: Vec<i64> = (first..first + ROWS_PER_REQUEST as i64).collect();
+        let first = i64::try_from(request * ROWS_PER_REQUEST).expect("test row ordinals fit i64");
+        let values: Vec<i64> = (first..).take(ROWS_PER_REQUEST).collect();
         let batch = payload_batch(&values, &mut generator, event_time);
         append_batch(&client, &table, uuid::Uuid::now_v7(), &batch)
             .await
@@ -77,7 +77,7 @@ async fn scribe_512_mib_physical_object_qualifies() {
     // A physical 512 MiB assembly can outlast the harness's general 60s flush
     // bound; keep this qualification bounded without cancelling a live claim.
     let scribe = server.bifrost_scribe().expect("the server owns Scribe");
-    tokio::time::timeout(Duration::from_secs(180), scribe.flush_staged())
+    tokio::time::timeout(Duration::from_mins(3), scribe.flush_staged())
         .await
         .expect("the physical assembly settles within 180s")
         .expect("the staged members publish");
@@ -231,7 +231,6 @@ async fn register_payload_table(
             ],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await
         .expect("the catalog registers the payload table");

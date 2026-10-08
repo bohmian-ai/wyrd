@@ -258,6 +258,7 @@ mod pg_tests {
                 "gateway.delete_governance_policy",
                 "principals.revoke_credential",
                 "verification.start_run",
+                "verification.execute",
                 "operator_connections.create",
                 "operator_connections.update",
                 "operator_connections.disable",
@@ -436,6 +437,9 @@ mod pg_tests {
                 .contains("WYRD_PERMISSION_403_DENIED_RBAC"),
             "the RBAC denial reaches the client verbatim: {refusal}"
         );
+        server
+            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await?;
         let mut conn = server.tenant_conn_for(tenant).await?;
         let denial_rows: Vec<(String, uuid::Uuid, String, String)> = sqlx::query_as(
             "SELECT permission, principal_id, request_id, outcome \

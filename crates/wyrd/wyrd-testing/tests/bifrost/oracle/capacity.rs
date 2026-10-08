@@ -109,7 +109,7 @@ const INTERACTIVE_DEADLINE_MS: i64 = 60_000;
 const ANALYTICAL_WARMUP_FRAMES: usize = 4096;
 
 /// Bound on how long one awaited observation may take before it is a failure.
-const OBSERVATION_DEADLINE: Duration = Duration::from_secs(60);
+const OBSERVATION_DEADLINE: Duration = Duration::from_mins(1);
 
 /// Bound on polls waiting for a released query's gauge to settle.
 const PHYSICAL_EVIDENCE_POLLS: usize = 300;
@@ -131,7 +131,7 @@ const PHYSICAL_EVIDENCE_INTERVAL: Duration = Duration::from_millis(100);
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn lowest_rung_analytical_contention_preserves_two_interactive_tenants() {
-    prove_lowest_rung_contention()
+    Box::pin(prove_lowest_rung_contention())
         .await
         .expect("lowest-rung Oracle contention journey");
 }
@@ -214,6 +214,7 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         .query_sql(
             query_context(tenant_a)?,
             BifrostQueryRequest {
+                params: Vec::new(),
                 // A distributed join and grouped aggregate that fits its grant:
                 // this journey needs a live Analytical query holding its
                 // envelope, not one that must spill. Exceeding the grant and
@@ -304,10 +305,10 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
     }
 
     await_clean_nodes(&cluster).await?;
-    // Query-owned leases, including each query runtime's empty spill
-    // directory, live until coordinator end-of-stream and cache invalidation
-    // (bifrost-design.md), which can trail graph release. The exact baseline
-    // is therefore observed under the clean-node bound rather than sampled once.
+    // A graph releases only after every holder of its query runtime, and so
+    // its spill directory, has dropped. The exact baseline is still observed
+    // under the clean-node bound because an Interactive query's server-side
+    // stream is dropped after the client has read its terminal.
     let mut settled = ownership_baseline(&cluster).await?;
     for _ in 0..CLEAN_NODE_POLLS {
         if settled == baseline {
@@ -379,6 +380,7 @@ async fn prove_interactive_window(
 
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             // A flat bounded projection on purpose. Any global operator — a
             // sort, an aggregate, a join — is a "complex" plan, which the
             // planner classifies Analytical however few rows it reads, and an
@@ -775,7 +777,6 @@ async fn seed_fixture_table(
             ],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let (fingerprint, _) = catalog.table_registration(&table_ref, tenant).await?;
@@ -1262,6 +1263,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
         let holder_query = wyrd_client::Bifrost::query_only(&holder);
         let stream = holder_query
             .query(&BifrostQueryRequest {
+                params: Vec::new(),
                 sql: format!("SELECT id FROM vala.bifrost.{table}"),
                 deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
             })
@@ -1327,6 +1329,7 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     let next = client(server, "memory-refusal-next").await?;
     let mut stream = wyrd_client::Bifrost::query_only(&next)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT id FROM vala.bifrost.{table}"),
             deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
         })
@@ -1372,6 +1375,7 @@ async fn drain_query(query: &Bifrost, sql: &str) -> Result<u64, String> {
 async fn drain_query_within(query: &Bifrost, sql: &str, deadline_ms: i64) -> Result<u64, String> {
     let mut stream = query
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(deadline_ms),
         })
@@ -1386,7 +1390,7 @@ async fn drain_query_within(query: &Bifrost, sql: &str, deadline_ms: i64) -> Res
     loop {
         match stream.next_batch().await {
             Ok(Some(batch)) => {
-                rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX))
+                rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
             }
             Ok(None) => break,
             Err(error) => {
@@ -1466,12 +1470,13 @@ async fn prove_memory_failure_is_query_local() -> Result<(), JourneyError> {
     let health = server
         .state()
         .bifrost_resources()
-        .and_then(|resources| resources.oracle())
+        .and_then(vala_bifrost_redux::resources::BifrostRoleResources::oracle)
         .ok_or("node hosts no Oracle")?
         .health();
     let reader = client(&server, "memory-failure-reader").await?;
     let query = wyrd_client::Bifrost::query_only(&reader);
     let request = BifrostQueryRequest {
+        params: Vec::new(),
         sql: format!("SELECT id FROM vala.bifrost.{table}"),
         deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
     };
@@ -1715,10 +1720,6 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
         );
     }
     let borrowed = class_gauge(&cluster, "interactive")?;
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "four concurrent queries is exact in f64"
-    )]
     let expected = SCHEDULING_HOLDS as f64;
     if (borrowed - expected).abs() > f64::EPSILON {
         return Err(format!(
@@ -1741,10 +1742,6 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
     prove_rotation_serves_both_tenants(&clients, &tables).await?;
 
     for (index, envelope) in held.into_iter().enumerate() {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "at most four concurrent queries is exact in f64"
-        )]
         let remaining = (SCHEDULING_HOLDS - 2 - index) as f64;
         release_envelope(&cluster, envelope, "interactive", remaining).await?;
     }
@@ -1788,6 +1785,7 @@ async fn hold_envelope(
     server.stall_next_query_after_schema();
     let stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
         })
@@ -2276,7 +2274,7 @@ async fn prove_concurrent_snapshots_wait() -> Result<(), JourneyError> {
     server.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
 
-    let superuser = cluster.pg_fixture().superuser_pool().await?;
+    let superuser = cluster.pg_fixture().superuser_pool()?;
     let mut lock = superuser.begin().await?;
     sqlx::query("LOCK TABLE iceberg_catalog.iceberg_tables IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *lock)
@@ -2377,6 +2375,10 @@ async fn saturated_query_waits_on_http_and_grpc() {
 ///
 /// Panics when a production queue, active, wait, or admission series
 /// disagrees with the admission owner or the queries' observed endings.
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
     let cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::three_oracles_one_scribe()
@@ -2792,6 +2794,7 @@ async fn grpc_query(
     };
     let mut request = wyrd_tonic::tonic::Request::new(
         wyrd_tonic::wyrd::v1::BifrostQueryRequest::from(BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(deadline_ms),
         }),

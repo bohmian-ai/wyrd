@@ -41,6 +41,12 @@ impl EvalObservationOptions {
     /// arrive as text, so both boundaries parse here instead of each owning a
     /// copy of the identifier and media rules.
     ///
+    /// # Arguments
+    /// * `session_id` - The session UUID text, or `None` for no session.
+    /// * `media_json` - One JSON array of media descriptors, or `None` for no media.
+    /// * `trace_id` - The hex trace identifier, or `None` to use the active span.
+    /// * `span_id` - The hex span identifier within `trace_id`, or `None`.
+    ///
     /// # Errors
     /// Returns `WYRD_SPEC_400_VALIDATION` when `session_id` is not a UUID,
     /// `trace_id` or `span_id` is not its hex identifier, or `media_json` is not
@@ -69,6 +75,9 @@ impl EvalObservationOptions {
 }
 
 /// Parse an optional session identifier supplied by a foreign runtime.
+///
+/// # Arguments
+/// * `session_id` - The session UUID text, or `None`, which yields `Ok(None)`.
 ///
 /// # Errors
 /// Returns `WYRD_SPEC_400_VALIDATION` when the text is not a UUID.

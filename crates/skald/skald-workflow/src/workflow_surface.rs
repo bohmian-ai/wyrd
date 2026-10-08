@@ -100,7 +100,7 @@ impl std::fmt::Debug for Workflow {
             .field("version", &self.meta.version)
             .field("steps", &self.spec.steps.len())
             .field("cascade_children", &self.cascade_children.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -193,8 +193,10 @@ impl Workflow {
     ///
     /// # Errors
     /// Returns an error when the Agent's Card identity cannot be projected.
-    // justification: builder-pattern add() means append-a-workflow-step (returns Self for chaining), not std::ops::Add arithmetic
-    #[allow(clippy::should_implement_trait)]
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "builder-pattern add() means append-a-workflow-step (returns Self for chaining), not std::ops::Add arithmetic"
+    )]
     pub fn add(mut self, agent: Agent) -> WorkflowResult<Self> {
         self.append_agent_step(agent, Vec::new())?;
         Ok(self)
@@ -737,8 +739,10 @@ impl WorkflowBuilder {
     ///
     /// # Errors
     /// Returns when the resulting workflow cannot be appended to.
-    // justification: builder-pattern add() means append-a-workflow-step (returns Self for chaining), not std::ops::Add arithmetic
-    #[allow(clippy::should_implement_trait)]
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "builder-pattern add() means append-a-workflow-step (returns Self for chaining), not std::ops::Add arithmetic"
+    )]
     pub fn add(mut self, agent: Agent) -> WorkflowResult<Self> {
         self.wf.append_agent_step(agent, Vec::new())?;
         Ok(self)
@@ -1116,7 +1120,7 @@ mod tests {
                     ("level", "input.level"),
                 ]))
             })
-            .and_then(|b| b.build())
+            .and_then(super::WorkflowBuilder::build)
             .expect("explicit workflow builds");
 
         let provider = ScriptedProvider::new();
@@ -1157,7 +1161,7 @@ mod tests {
         let undeclared_text = Workflow::builder("no_input")
             .add(agent("only", "static", None))
             .and_then(|b| b.with_outputs(bindings(&[("out", "steps.only.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::WorkflowBuilder::build)
             .expect("static workflow builds");
         let provider = ScriptedProvider::new();
         let error = run_local(&undeclared_text, &provider, "loose text")
@@ -1175,7 +1179,7 @@ mod tests {
         let tooled = Workflow::builder("tooled")
             .add(agent("lookup_step", "lookup call", None).with_tool(declared_tool.clone()))
             .and_then(|b| b.with_outputs(bindings(&[("found", "steps.lookup_step.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::WorkflowBuilder::build)
             .expect("tooled workflow builds");
         let provider = ScriptedProvider::new();
         provider.on(
@@ -1205,7 +1209,7 @@ mod tests {
         let undeclared = Workflow::builder("undeclared")
             .add(agent("plain_step", "plain call", None))
             .and_then(|b| b.with_outputs(bindings(&[("plain", "steps.plain_step.output.text")])))
-            .and_then(|b| b.build())
+            .and_then(super::WorkflowBuilder::build)
             .expect("plain workflow builds");
         let provider = ScriptedProvider::new();
         provider.on(

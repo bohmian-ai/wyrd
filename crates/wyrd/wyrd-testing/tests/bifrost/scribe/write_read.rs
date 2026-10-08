@@ -105,10 +105,10 @@ async fn scribe_write_flush_read_user_journey() {
         "a disabled composition must positively record a bypass with reason disabled, observed {booted:?}"
     );
 
-    let uncached_run = cluster
-        .run_scribe_production_workload(&workload, ScribeCacheMode::Disabled)
-        .await
-        .expect("the production workload runs on public routes with the cache disabled");
+    let uncached_run =
+        Box::pin(cluster.run_scribe_production_workload(&workload, ScribeCacheMode::Disabled))
+            .await
+            .expect("the production workload runs on public routes with the cache disabled");
     uncached_run
         .evidence
         .assert_matches(&workload, ScribeCacheMode::Disabled)
@@ -124,10 +124,10 @@ async fn scribe_write_flush_read_user_journey() {
     )
     .await
     .expect("a fresh one-pod mixed cluster starts with the cache enabled");
-    let cached_run = cached_cluster
-        .run_scribe_production_workload(&cached, ScribeCacheMode::Enabled)
-        .await
-        .expect("the same record runs on public routes with the cache enabled");
+    let cached_run =
+        Box::pin(cached_cluster.run_scribe_production_workload(&cached, ScribeCacheMode::Enabled))
+            .await
+            .expect("the same record runs on public routes with the cache enabled");
     cached_run
         .evidence
         .assert_matches(&cached, ScribeCacheMode::Enabled)
@@ -291,6 +291,7 @@ async fn query_rows(
 ) -> Vec<RecordBatch> {
     let mut stream = wyrd_client::Bifrost::query_only(writer.client())
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(60_000),
         })
@@ -538,6 +539,7 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
     let reader = tenant_writer(server, tenant).await;
     let mut empty = wyrd_client::Bifrost::query_only(reader.client())
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT value FROM {table}"),
             deadline_ms: Some(60_000),
         })
@@ -645,7 +647,6 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
     let pool = server
         .pg_fixture()
         .superuser_pool()
-        .await
         .expect("system membership pool");
     sqlx::query(
         "UPDATE vala.cluster_nodes SET advertise_addr=$1, heartbeat_at=now(), ready=true \
@@ -664,6 +665,7 @@ async fn scribe_undialable_private_peer_degrades_live_coverage() {
     let window = telemetry.checkpoint().expect("query telemetry window");
     let mut stream = wyrd_client::Bifrost::query_only(writer.client())
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT value FROM {table}"),
             deadline_ms: Some(5_000),
         })
@@ -929,11 +931,7 @@ async fn declare_component_card(
     )
     .expect("the root Service spec declares its component");
 
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("registry pool");
+    let pool = server.pg_fixture().superuser_pool().expect("registry pool");
     let (component_hash, _) = component_spec
         .canonical_hash_with_bytes()
         .expect("component spec hashes");
@@ -1019,11 +1017,7 @@ async fn registry_card_uid(
     server: &wyrd_testing::WyrdTestServer,
     card: &wyrd_spec::reference::CardRef,
 ) -> String {
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("registry pool");
+    let pool = server.pg_fixture().superuser_pool().expect("registry pool");
     let uid: uuid::Uuid = sqlx::query_scalar(
         "SELECT card_uid FROM wyrd.cards WHERE kind = $1 AND space = $2 AND name = $3 \
          AND version = $4",
@@ -1048,6 +1042,11 @@ async fn registry_card_uid(
 /// # Errors
 ///
 /// Returns the stable Wyrd error the public ingest route produced.
+///
+/// # Panics
+///
+/// Panics when the batch cannot be built or IPC-encoded, or the public ingest
+/// transport cannot connect.
 async fn append_correlated(
     client: &wyrd_client::WyrdClient,
     table: &str,
@@ -1085,6 +1084,7 @@ async fn append_correlated(
         .expect("public ingest transport")
         .insert(table, uuid::Uuid::now_v7(), ipc)
         .await
+        .map(|_request_id| ())
 }
 
 /// Read every row's value, stamped Card UID, and publishing principal.
@@ -1100,6 +1100,7 @@ async fn read_correlation(
     let sql = format!("SELECT value, card_uid, principal_id FROM {table} ORDER BY value");
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.clone(),
             deadline_ms: Some(120_000),
         })
@@ -1156,6 +1157,10 @@ const MAX_REQUEST_ROWS: i64 = 300_000;
 /// the same data root, and a resend of the acknowledged batch must neither
 /// duplicate the rows nor publish them again.
 ///
+/// The audit publisher stays off. It writes `vala.system.audit_log` through
+/// the same Scribe, so a member it staged before the root fills would also be
+/// refused by that root and fail the flush for a table this case does not own.
+///
 /// # Panics
 ///
 /// Panics when the near-maximum request is refused, when a stage under a full
@@ -1169,6 +1174,7 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let builder = || {
         wyrd_testing::WyrdTestServer::builder()
             .with_durable_bifrost_data_root(data_root.path().to_path_buf())
+            .without_audit_publication_for_test()
     };
     let server = builder()
         .start_bound()
@@ -1199,10 +1205,10 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let occupant = server
         .state()
         .bifrost_resources()
-        .and_then(|resources| resources.forge())
+        .and_then(vala_bifrost_redux::resources::BifrostRoleResources::forge)
         .expect("the embedded pod hosts Forge")
         .occupy_root_for_test();
-    tokio::time::timeout(std::time::Duration::from_secs(60), server.flush_bifrost())
+    tokio::time::timeout(std::time::Duration::from_mins(1), server.flush_bifrost())
         .await
         .expect("a stage under a full root settles promptly instead of waiting for bytes")
         .expect("a refused stage attempt retains its generation rather than failing the pod");
@@ -1237,8 +1243,7 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
         "published rows retire the WAL segments that backed them: {retained:?}"
     );
 
-    let server = server
-        .restart_bound(builder())
+    let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("the pod restarts on its retained data root");
     let client = tenant_client(&server, tenant).await;

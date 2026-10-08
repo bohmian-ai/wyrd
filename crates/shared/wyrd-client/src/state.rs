@@ -5,7 +5,7 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::WyrdClient;
 use crate::bifrost::{Bifrost, QueueConfig, TableConfig};
@@ -15,19 +15,22 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(feature = "internal")]
 use skald_spec::Prompt;
 use wyrd_cards::data::DataCard;
 use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::agent::AgentCard;
-use wyrd_spec::card::verifier::VerifierSpec;
+use wyrd_spec::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
 use wyrd_spec::card::workflow::WorkflowCard;
 use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::{
     CardRef, registration_only_sibling_refs, scope_child_card_refs, unresolved_card_ref_paths,
 };
+#[cfg(feature = "internal")]
 use wyrd_spec::registry::{
     ArtifactManifestEntry, RelativeArtifactPath, canonical_artifact_manifest_hash,
 };
@@ -135,10 +138,12 @@ struct HydratedStateIndex {
     /// Persisted aliases mapped to canonical exact-reference keys.
     aliases: BTreeMap<String, String>,
     /// Sorted aliases grouped by canonical exact-reference key.
+    #[cfg(feature = "internal")]
     aliases_by_ref: BTreeMap<String, Vec<String>>,
     /// Verified artifact metadata grouped by canonical exact-reference key.
     artifacts_by_ref: BTreeMap<String, Vec<HydratedArtifact>>,
     /// Confined artifact directories grouped by canonical exact-reference key.
+    #[cfg(feature = "internal")]
     artifact_dirs_by_ref: BTreeMap<String, PathBuf>,
     /// Native typed Card holders grouped by canonical exact-reference key.
     typed: TypedCards,
@@ -163,21 +168,26 @@ impl HydratedStateIndex {
         let root_key = root_ref.to_string();
         let mut cards_by_ref = BTreeMap::new();
         let mut refs_by_key = BTreeMap::new();
+        #[cfg(feature = "internal")]
         let mut aliases_by_ref = BTreeMap::<String, Vec<String>>::new();
         let mut artifacts_by_ref = BTreeMap::new();
+        #[cfg(feature = "internal")]
         let mut artifact_dirs_by_ref = BTreeMap::new();
 
         for item in loaded {
             let key = item.key;
             refs_by_key.insert(key.clone(), item.card_ref);
             cards_by_ref.insert(key.clone(), item.card);
-            let mut item_aliases = item.aliases;
-            item_aliases.sort();
-            aliases_by_ref.insert(key.clone(), item_aliases);
-            artifacts_by_ref.insert(key.clone(), item.artifacts);
-            if let Some(artifact_dir) = item.artifact_dir {
-                artifact_dirs_by_ref.insert(key, artifact_dir);
+            #[cfg(feature = "internal")]
+            {
+                let mut item_aliases = item.aliases;
+                item_aliases.sort();
+                aliases_by_ref.insert(key.clone(), item_aliases);
+                if let Some(artifact_dir) = item.artifact_dir {
+                    artifact_dirs_by_ref.insert(key.clone(), artifact_dir);
+                }
             }
+            artifacts_by_ref.insert(key, item.artifacts);
         }
         if !cards_by_ref.contains_key(&root_key) {
             return Err(state_bundle_error(
@@ -192,8 +202,10 @@ impl HydratedStateIndex {
             cards_by_ref,
             refs_by_key,
             aliases,
+            #[cfg(feature = "internal")]
             aliases_by_ref,
             artifacts_by_ref,
+            #[cfg(feature = "internal")]
             artifact_dirs_by_ref,
             typed,
         })
@@ -253,6 +265,7 @@ impl HydratedStateIndex {
     ///
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated alias map.
+    #[cfg(feature = "internal")]
     fn aliases_by_key(&self, key: &str) -> Result<&[String], WyrdError> {
         self.aliases_by_ref
             .get(key)
@@ -289,6 +302,7 @@ impl HydratedStateIndex {
     ///
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated reference map.
+    #[cfg(feature = "internal")]
     fn artifact_dir_by_key(&self, key: &str) -> Result<Option<&Path>, WyrdError> {
         if !self.refs_by_key.contains_key(key) {
             return Err(state_bundle_error(
@@ -310,6 +324,7 @@ impl HydratedStateIndex {
     /// Returns an invalid-state-bundle error when the exact Card key is absent
     /// or an artifact path is not a valid wire path, and propagates
     /// canonicalization failures from `wyrd-spec`.
+    #[cfg(feature = "internal")]
     fn artifact_manifest_hash_by_key(&self, key: &str) -> Result<Option<String>, WyrdError> {
         let manifest = self
             .artifacts_by_key(key)?
@@ -317,14 +332,42 @@ impl HydratedStateIndex {
             .map(|artifact| {
                 Ok(ArtifactManifestEntry {
                     relative_path: RelativeArtifactPath::new(artifact.relative_path())?,
-                    sha256: artifact.sha256().to_owned(),
-                    size_bytes: artifact.size_bytes(),
+                    sha256: Some(artifact.sha256().to_owned()),
+                    size_bytes: Some(artifact.size_bytes()),
                     content_type: artifact.content_type().map(str::to_owned),
                 })
             })
             .collect::<Result<Vec<_>, WyrdError>>()?;
         canonical_artifact_manifest_hash(&manifest)
     }
+}
+
+/// The alias of the root Service view `WyrdState::run` opens.
+const ROOT_ALIAS: &str = "root";
+
+/// A Verifier bound to a subject, resolved for one direct execution.
+#[derive(Debug)]
+pub(crate) struct BoundVerifier<'a> {
+    /// The exact Verifier Card version.
+    pub(crate) verifier_uid: CardUid,
+    /// The exact subject Card version it judges.
+    pub(crate) subject_uid: CardUid,
+    /// The Verifier's Drift or Eval implementation, which fixes its input shape.
+    pub(crate) implementation: &'a VerifierImplementation,
+}
+
+/// The server-resolved UID a hydrated reference carries.
+///
+/// # Errors
+/// Returns `WYRD_SDK_400_INVALID_STATE_BUNDLE` when the reference has none,
+/// which a server-produced bundle always supplies.
+fn required_uid(card_ref: &CardRef) -> Result<CardUid, WyrdError> {
+    card_ref.uid.clone().ok_or_else(|| {
+        state_bundle_error(
+            "a hydrated Card reference carries no UID",
+            json!({ "card_ref": card_ref }),
+        )
+    })
 }
 
 /// A complete, local, non-executing Card graph, and its one Bifrost lifetime.
@@ -338,6 +381,11 @@ pub struct WyrdState {
     index: Arc<HydratedStateIndex>,
     /// The one Bifrost lifetime every observation of every run emits through.
     bifrost: Arc<BifrostLifecycle>,
+    /// The client every server call of this state goes through — Bifrost
+    /// startup and `observe.verify` — shared by every clone: the client the
+    /// state was created with, else one resolved from the ambient
+    /// configuration on first use and kept.
+    client: Arc<OnceLock<WyrdClient>>,
 }
 
 /// Private filesystem reader for one confined hydrated-bundle root.
@@ -401,72 +449,107 @@ impl<'a> HydratedBundleReader<'a> {
 impl WyrdState {
     /// Load and validate a complete hydrated bundle without contacting Wyrd.
     ///
+    /// The state has no client yet: its first server call resolves one from
+    /// the ambient configuration, as [`WyrdClient::from_global`] does, and keeps
+    /// it, so later environment changes do not change its principal.
+    ///
+    /// # Arguments
+    /// * `path` - The hydrated bundle directory, as [`crate::cards::Cards::hydrate`]
+    ///   publishes it.
+    ///
     /// # Errors
     ///
     /// Returns a stable SDK error when the bundle is incomplete, malformed,
     /// internally inconsistent, contains an unconfined path, or preserves a
     /// registration-only sibling reference.
-    pub fn from_path(path: &Path) -> Result<Self, WyrdError> {
-        let reader = HydratedBundleReader::new(path)?;
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, WyrdError> {
+        let reader = HydratedBundleReader::new(path.as_ref())?;
         let manifest = reader.read_manifest()?;
         reader.validate_manifest_header(&manifest)?;
         let index = reader.load_index(manifest)?;
         Ok(Self {
             index: Arc::new(index),
             bifrost: Arc::new(BifrostLifecycle::default()),
+            client: Arc::new(OnceLock::new()),
         })
     }
 
-    /// Connect this state's one Bifrost writer from the ambient environment.
+    /// Load and validate a complete hydrated bundle whose server calls run as
+    /// `client`.
     ///
-    /// Resolution is [`Bifrost::from_env`]'s: this adds no endpoint or
-    /// credential rule of its own. Startup describes both fixed observation
-    /// tables before reporting success, so a run can never enqueue against a
-    /// missing, unauthorized, or incompatible system table.
+    /// Identical to [`Self::from_path`], except that the state's identity is
+    /// fixed now: Bifrost startup and every `observe.verify` call go through
+    /// `client`, and the ambient configuration is never read.
+    ///
+    /// # Arguments
+    /// * `path` - The hydrated bundle directory.
+    /// * `client` - The client every server call of this state and its clones
+    ///   is sent through, as its principal.
+    ///
+    /// # Errors
+    /// As [`Self::from_path`].
+    pub fn from_path_with_client(
+        path: impl AsRef<Path>,
+        client: WyrdClient,
+    ) -> Result<Self, WyrdError> {
+        let state = Self::from_path(path)?;
+        let _ = state.client.set(client);
+        Ok(state)
+    }
+
+    /// Connect this state's one Bifrost writer as the state's client.
+    ///
+    /// The client is the one the state was created with, else the ambient
+    /// one [`WyrdState::from_path`] describes. Startup describes both fixed
+    /// observation tables before reporting success, so a run can never
+    /// enqueue against a missing, unauthorized, or incompatible system table.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_409_BIFROST_ALREADY_STARTED` when this state (or any
     /// clone of it) already started Bifrost, `WYRD_SDK_409_BIFROST_CLOSED`
-    /// after a successful shutdown, the transport or credential error from the
-    /// connect, and the server's error for either fixed table.
+    /// after a successful shutdown, the client configuration or credential
+    /// error, the transport error from the connect, and the server's error for
+    /// either fixed table.
     ///
     /// # Cancellation
     /// Abandoning the future releases the start claim, so a later
     /// `start_bifrost` on the same state is accepted rather than refused.
     pub async fn start_bifrost(&self) -> Result<(), WyrdError> {
-        let claim = self.bifrost.claim()?;
-        claim.complete(Bifrost::from_env().await?).await
+        self.start_bifrost_with_config(None, QueueConfig::default())
+            .await
     }
 
-    /// Connect this state's one Bifrost writer over an explicit client.
+    /// Connect this state's one Bifrost writer with an active write table.
     ///
-    /// The door every SDK boundary uses when the caller already resolved a
-    /// client. `table` retains its existing Bifrost meaning as the handle's
-    /// active write binding; it does not choose a run's destination and does not
+    /// `table` retains its existing Bifrost meaning as the handle's active
+    /// write binding; it does not choose a run's destination and does not
     /// replace a fixed system table. The queue keeps its default configuration;
     /// [`WyrdState::start_bifrost_with_config`] is the configured form.
+    ///
+    /// # Arguments
+    /// * `table` - The handle's active write table, or `None` for none.
     ///
     /// # Errors
     /// As [`WyrdState::start_bifrost`].
     ///
     /// # Cancellation
     /// As [`WyrdState::start_bifrost`].
-    pub async fn start_bifrost_with(
-        &self,
-        client: &WyrdClient,
-        table: Option<TableConfig>,
-    ) -> Result<(), WyrdError> {
-        self.start_bifrost_with_config(client, table, QueueConfig::default())
+    pub async fn start_bifrost_with(&self, table: Option<TableConfig>) -> Result<(), WyrdError> {
+        self.start_bifrost_with_config(table, QueueConfig::default())
             .await
     }
 
-    /// Connect this state's one Bifrost writer over an explicit client and queue
-    /// configuration.
+    /// Connect this state's one Bifrost writer with an active write table and
+    /// queue configuration.
     ///
-    /// Mirrors [`Bifrost::connect_with_config`] under the same start claim:
-    /// `queue` bounds the one producer queue every run of this state shares,
-    /// and `table` keeps the meaning described on
-    /// [`WyrdState::start_bifrost_with`].
+    /// Mirrors [`Bifrost::connect_with_config`] over the state's client, under
+    /// the same start claim.
+    ///
+    /// # Arguments
+    /// * `table` - The handle's active write table, or `None`, with the
+    ///   meaning described on [`WyrdState::start_bifrost_with`].
+    /// * `queue` - Bounds the one producer queue every run of this state
+    ///   shares.
     ///
     /// # Errors
     /// As [`WyrdState::start_bifrost`], plus the queue-configuration refusal of
@@ -476,14 +559,96 @@ impl WyrdState {
     /// As [`WyrdState::start_bifrost`].
     pub async fn start_bifrost_with_config(
         &self,
-        client: &WyrdClient,
         table: Option<TableConfig>,
         queue: QueueConfig,
     ) -> Result<(), WyrdError> {
         let claim = self.bifrost.claim()?;
+        let client = self.client()?;
         claim
             .complete(Bifrost::connect_with_config(client, table, queue).await?)
             .await
+    }
+
+    /// Pin the client this state's server calls go through, for server-free
+    /// tests that point it at a stub instead of the ambient configuration.
+    #[cfg(test)]
+    pub(crate) fn use_client_for_test(&self, client: WyrdClient) {
+        let _ = self.client.set(client);
+    }
+
+    /// The client this state's server calls go through.
+    ///
+    /// The client the state was created with when there is one; otherwise one
+    /// is resolved from the ambient configuration on first use and kept for
+    /// every clone, as [`WyrdClient::from_global`] resolves it. Resolution
+    /// performs no network IO.
+    ///
+    /// # Errors
+    /// Returns the client configuration error when the global config file
+    /// cannot be read or parsed, or the credential resolution error.
+    pub(crate) fn client(&self) -> Result<&WyrdClient, WyrdError> {
+        if let Some(client) = self.client.get() {
+            return Ok(client);
+        }
+        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
+        Ok(self.client.get_or_init(|| client))
+    }
+
+    /// Resolve the Verifier named `name` bound in `verified_by` to `subject`.
+    ///
+    /// A subject's bindings are the root Service's own when it is the root,
+    /// those of every Service component occurrence that references it, and a
+    /// standalone Agent's own. Each bound Verifier is in the hydrated graph,
+    /// so resolution is a local lookup with no network IO.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_VERIFIER` when no bound Verifier has that
+    /// name, and `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a bound Verifier or
+    /// the subject is absent from the graph or carries no UID.
+    pub(crate) fn bound_verifier(
+        &self,
+        subject: &CardRef,
+        name: &str,
+    ) -> Result<BoundVerifier<'_>, WyrdError> {
+        let subject_key = subject.to_string();
+        let mut bindings: Vec<&VerificationBinding> = Vec::new();
+        if let Spec::Service(service) = &self.service().spec {
+            if subject_key == self.index.root_key {
+                bindings.extend(&service.verified_by);
+            }
+            for component in &service.components {
+                if component.card_ref.as_card_ref() == Some(subject) {
+                    bindings.extend(&component.verified_by);
+                }
+            }
+        }
+        if let Spec::Agent(agent) = &self.index.card_by_key(&subject_key)?.spec {
+            bindings.extend(&agent.verified_by);
+        }
+        for binding in bindings {
+            let Some(verifier_ref) = binding.verifier.as_card_ref() else {
+                continue;
+            };
+            let card = self.index.card_by_key(&verifier_ref.to_string())?;
+            if card.metadata.name.as_str() != name {
+                continue;
+            }
+            let Spec::Verifier(spec) = &card.spec else {
+                return Err(state_bundle_error(
+                    "a verified_by binding names a Card that is not a Verifier",
+                    json!({ "verifier": verifier_ref }),
+                ));
+            };
+            return Ok(BoundVerifier {
+                verifier_uid: required_uid(verifier_ref)?,
+                subject_uid: required_uid(subject)?,
+                implementation: &spec.implementation,
+            });
+        }
+        Err(WyrdError::SdkUnknownVerifier {
+            message: format!("no Verifier named {name:?} is bound to {subject}"),
+            details: json!({ "verifier": name, "subject": subject }),
+        })
     }
 
     /// Open one invocation over this state, targeting the root Service Card.
@@ -492,7 +657,25 @@ impl WyrdState {
     /// execution. The run mints a UUIDv7 `run_id` that every view of it shares.
     #[must_use]
     pub fn run(&self) -> Run {
-        Run::new(self.clone())
+        Run::new(self.clone(), ROOT_ALIAS.to_owned(), self.root_ref().clone())
+    }
+
+    /// Open one invocation over this state whose first view observes `alias`.
+    ///
+    /// The concise single-Card form of `run().for_card(alias)`: the alias is
+    /// resolved locally in the hydrated graph before the run mints its UUIDv7
+    /// `run_id`, so no root view is constructed. Later [`Run::for_card`] views
+    /// share that `run_id`. No network IO and no server-side Run resource.
+    ///
+    /// # Arguments
+    /// * `alias` - The bundle alias of the Card the run's first view observes.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` when the alias is not registered in
+    /// this bundle; nothing is opened.
+    pub fn run_for_card(&self, alias: &str) -> Result<Run, WyrdError> {
+        let subject = self.card_ref(alias)?.clone();
+        Ok(Run::new(self.clone(), alias.to_owned(), subject))
     }
 
     /// Drain every producer of this state's writer without closing it.
@@ -549,6 +732,21 @@ impl WyrdState {
         self.bifrost.started()
     }
 
+    /// Point-in-time bounded-ownership accounting for this state's one writer.
+    ///
+    /// Test-harness only: a capacity benchmark samples `owned_bytes` while
+    /// runs emit through the state, which a separately connected `Bifrost`
+    /// cannot see because it owns a different writer. Reads atomics; no IO.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_400_BIFROST_NOT_STARTED` before startup and
+    /// `WYRD_SDK_409_BIFROST_CLOSED` after shutdown.
+    #[cfg(feature = "test-support")]
+    #[cfg(feature = "internal")]
+    pub fn bifrost_metrics(&self) -> Result<crate::bifrost::BifrostMetrics, WyrdError> {
+        Ok(self.started_bifrost()?.bifrost.metrics())
+    }
+
     /// Return the exact root Card reference.
     #[must_use]
     pub fn root_ref(&self) -> &CardRef {
@@ -574,6 +772,9 @@ impl WyrdState {
 
     /// Resolve an alias to its stored complete Card envelope.
     ///
+    /// # Arguments
+    /// * `alias` - The bundle alias to resolve.
+    ///
     /// # Errors
     ///
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias or an
@@ -589,6 +790,9 @@ impl WyrdState {
     }
 
     /// Resolve an alias to its exact Card reference.
+    ///
+    /// # Arguments
+    /// * `alias` - The bundle alias to resolve.
     ///
     /// # Errors
     ///
@@ -606,10 +810,14 @@ impl WyrdState {
 
     /// Return all aliases registered for an exact Card reference.
     ///
+    /// # Arguments
+    /// * `card_ref` - The exact Card reference whose aliases are listed.
+    ///
     /// # Errors
     ///
     /// Returns an invalid-state-bundle error when the reference is not present
     /// in the validated graph indexes.
+    #[cfg(feature = "internal")]
     pub fn aliases_for(&self, card_ref: &CardRef) -> Result<&[String], WyrdError> {
         let key = card_ref.to_string();
         self.index.aliases_by_key(&key).map_err(|_| {
@@ -622,27 +830,37 @@ impl WyrdState {
 
     /// Return verified artifacts for an alias.
     ///
+    /// # Arguments
+    /// * `alias` - The bundle alias whose verified artifacts are listed.
+    ///
     /// # Errors
     ///
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias or an
     /// invalid-state-bundle error if the artifact index is inconsistent.
     pub fn artifacts(&self, alias: &str) -> Result<&[HydratedArtifact], WyrdError> {
         let key = self.index.resolve_key(alias)?;
-        self.artifacts_by_key(key)
+        self.index.artifacts_by_key(key)
     }
 
     /// Return the confined artifact directory for an alias, when non-empty.
+    ///
+    /// # Arguments
+    /// * `alias` - The bundle alias whose artifact directory is returned.
     ///
     /// # Errors
     ///
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias or an
     /// invalid-state-bundle error if the artifact index is inconsistent.
+    #[cfg(feature = "internal")]
     pub fn artifact_dir(&self, alias: &str) -> Result<Option<&Path>, WyrdError> {
         let key = self.index.resolve_key(alias)?;
         self.artifact_dir_by_key(key)
     }
 
     /// Resolve an alias to a native Agent Card holder.
+    ///
+    /// # Arguments
+    /// * `alias` - The bundle alias of an Agent Card.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
@@ -660,6 +878,9 @@ impl WyrdState {
 
     /// Resolve an alias to a native Prompt Card holder.
     ///
+    /// # Arguments
+    /// * `alias` - The bundle alias of a Prompt Card.
+    ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
     /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
@@ -675,6 +896,9 @@ impl WyrdState {
     }
 
     /// Resolve an alias to a native Model Card holder.
+    ///
+    /// # Arguments
+    /// * `alias` - The bundle alias of a Model Card.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
@@ -692,6 +916,9 @@ impl WyrdState {
 
     /// Resolve an alias to a native Data Card holder.
     ///
+    /// # Arguments
+    /// * `alias` - The bundle alias of a Data Card.
+    ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
     /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
@@ -707,6 +934,9 @@ impl WyrdState {
     }
 
     /// Resolve an alias to a native Workflow Card holder.
+    ///
+    /// # Arguments
+    /// * `alias` - The bundle alias of a Workflow Card.
     ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
@@ -728,6 +958,9 @@ impl WyrdState {
     /// payload; there is no separate per-implementation accessor because
     /// `Verifier` is the only registrable verification kind.
     ///
+    /// # Arguments
+    /// * `alias` - The bundle alias of a Verifier Card.
+    ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
     /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
@@ -742,11 +975,15 @@ impl WyrdState {
     /// Resolve an Agent's inline or exact Prompt Card prompt without creating a
     /// Skald runtime Agent or resolving runtime-local tools.
     ///
+    /// # Arguments
+    /// * `alias` - The bundle alias of an Agent Card whose Prompt is resolved.
+    ///
     /// # Errors
     /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
     /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias is not an Agent,
     /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a prompt target is absent,
     /// not a Prompt Card, or remains an authored path.
+    #[cfg(feature = "internal")]
     pub fn agent_prompt(&self, alias: &str) -> Result<&Prompt, WyrdError> {
         let agent = self.agent(alias)?;
         match &agent.spec.prompt {
@@ -823,6 +1060,7 @@ impl WyrdState {
     }
 
     /// Iterate over every loaded Card keyed by its canonical exact `CardRef`.
+    #[cfg(feature = "internal")]
     pub fn cards(&self) -> impl Iterator<Item = (&str, &Card)> {
         self.index
             .cards_by_ref
@@ -831,6 +1069,10 @@ impl WyrdState {
     }
 
     /// Iterate over loaded Cards of one kind keyed by exact `CardRef`.
+    ///
+    /// # Arguments
+    /// * `kind` - The Card kind to keep.
+    #[cfg(feature = "internal")]
     pub fn cards_of_kind(&self, kind: CardKind) -> impl Iterator<Item = (&str, &Card)> {
         self.index
             .cards_by_ref
@@ -841,40 +1083,56 @@ impl WyrdState {
 
     /// Resolve a canonical exact `CardRef` key to its stored reference.
     ///
+    /// # Arguments
+    /// * `key` - A canonical exact `CardRef` string, as [`WyrdState::cards`] yields it.
+    ///
     /// # Errors
     ///
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated Card index.
+    #[cfg(feature = "internal")]
     pub fn card_ref_by_key(&self, key: &str) -> Result<&CardRef, WyrdError> {
         self.index.card_ref_by_key(key)
     }
 
     /// Resolve a canonical exact `CardRef` key to its aliases.
     ///
+    /// # Arguments
+    /// * `key` - A canonical exact `CardRef` string, as [`WyrdState::cards`] yields it.
+    ///
     /// # Errors
     ///
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated alias index.
+    #[cfg(feature = "internal")]
     pub fn aliases_by_key(&self, key: &str) -> Result<&[String], WyrdError> {
         self.index.aliases_by_key(key)
     }
 
     /// Resolve a canonical exact `CardRef` key to its verified artifacts.
     ///
+    /// # Arguments
+    /// * `key` - A canonical exact `CardRef` string, as [`WyrdState::cards`] yields it.
+    ///
     /// # Errors
     ///
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated artifact index.
+    #[cfg(feature = "internal")]
     pub fn artifacts_by_key(&self, key: &str) -> Result<&[HydratedArtifact], WyrdError> {
         self.index.artifacts_by_key(key)
     }
 
     /// Resolve a canonical exact `CardRef` key to its artifact directory.
     ///
+    /// # Arguments
+    /// * `key` - A canonical exact `CardRef` string, as [`WyrdState::cards`] yields it.
+    ///
     /// # Errors
     ///
     /// Returns an invalid-state-bundle error when the key is absent from the
     /// validated graph indexes.
+    #[cfg(feature = "internal")]
     pub fn artifact_dir_by_key(&self, key: &str) -> Result<Option<&Path>, WyrdError> {
         self.index.artifact_dir_by_key(key)
     }
@@ -885,10 +1143,14 @@ impl WyrdState {
     /// before an executable serializer can run. `None` means the Card has no
     /// declared artifacts.
     ///
+    /// # Arguments
+    /// * `key` - A canonical exact `CardRef` string, as [`WyrdState::cards`] yields it.
+    ///
     /// # Errors
     ///
     /// Returns an invalid-state-bundle or canonicalization error when the
     /// validated index cannot reproduce the Card artifact manifest.
+    #[cfg(feature = "internal")]
     pub fn artifact_manifest_hash_by_key(&self, key: &str) -> Result<Option<String>, WyrdError> {
         self.index.artifact_manifest_hash_by_key(key)
     }
@@ -1084,12 +1346,17 @@ impl HydratedBundleReader<'_> {
             }
         }
 
+        // The directory is validated above either way; only the `internal`
+        // introspection surface (`WyrdState::artifact_dir`) retains it.
+        #[cfg(not(feature = "internal"))]
+        let _ = artifact_dir;
         Ok(LoadedManifestCard {
             key: card_ref.to_string(),
             card_ref,
             card,
             aliases: entry.aliases.clone(),
             artifacts,
+            #[cfg(feature = "internal")]
             artifact_dir,
         })
     }
@@ -1322,6 +1589,7 @@ fn typed_hydration_error(card: &Card, source: &WyrdError) -> WyrdError {
 /// The helper remains free because it only formats deterministic details from
 /// its arguments; the graph-owning lookup remains on `WyrdState`.
 #[must_use]
+#[cfg(feature = "internal")]
 fn invalid_agent_prompt_target(
     alias: &str,
     card_ref: &CardRef,
@@ -1348,6 +1616,7 @@ fn invalid_agent_prompt_target(
 /// # Panics
 /// This helper never panics; paths are copied into structured error details.
 #[must_use]
+#[cfg(feature = "internal")]
 fn unresolved_prompt_path(alias: &str, path: &Path) -> WyrdError {
     state_bundle_error(
         "Agent prompt retains an unresolved path reference",
@@ -1789,6 +2058,7 @@ struct LoadedManifestCard {
     /// Verified artifacts owned by this Card.
     artifacts: Vec<HydratedArtifact>,
     /// Canonical artifact directory when the Card has artifacts.
+    #[cfg(feature = "internal")]
     artifact_dir: Option<PathBuf>,
 }
 
@@ -2000,7 +2270,7 @@ pub(crate) mod tests {
         ///
         /// # Panics
         /// Panics if fixture construction or serialization fails.
-        fn with_typed_cards() -> Self {
+        pub(crate) fn with_typed_cards() -> Self {
             let mut bundle = Self::complete_service();
             let prompt_ref = test_ref(CardKind::Prompt, "triage", 4);
             let inline_prompt_ref = test_ref(CardKind::Agent, "inline", 5);

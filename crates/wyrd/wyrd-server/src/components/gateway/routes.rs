@@ -137,7 +137,7 @@ fn object_not_found(digest: &str) -> WyrdErrorResponse {
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Payload and captured-table read permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Catalog or storage unavailable, or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -150,7 +150,7 @@ fn object_not_found(digest: &str) -> WyrdErrorResponse {
 /// a digest belonging to another tenant simply resolves to an absent object.
 /// Retrieval requires both tenant-wide `gateway_payload:read` and query access
 /// scoped to this tenant's registered `vala.gateway.calls`, and each decision
-/// is audited through the canonical path before the bytes are read. The table
+/// is staged on the process audit outbox before the bytes are read. The table
 /// UID is resolved by lookup alone, so a read provisions nothing. Because the
 /// bucket lifecycle owns expiration, a reference can outlive its object; that
 /// case returns the same stable not-found outcome as any absent object.
@@ -162,7 +162,7 @@ fn object_not_found(digest: &str) -> WyrdErrorResponse {
 /// Returns `GatewayResourceNotFound` for a non-canonical digest, a tenant with
 /// no registered calls table, and an absent or expired object; the mapped
 /// permission denial when either grant is missing; and the stable
-/// `ServiceUnavailable` for audit, catalog, or storage failure and for stored
+/// `ServiceUnavailable` for catalog or storage failure and for stored
 /// bytes that do not match the digest, without naming any storage locator.
 #[tracing::instrument(skip_all, fields(operation = PAYLOAD_OBJECT_OPERATION))]
 pub(crate) async fn gateway_payload_object(
@@ -179,8 +179,7 @@ pub(crate) async fn gateway_payload_object(
         &Permission::gateway_payload_read(),
         PAYLOAD_OBJECT_OPERATION,
         &resource,
-    )
-    .await?;
+    )?;
     let table = TableRef::new(BifrostNamespace::Gateway, "calls");
     let table_uid = state
         .bifrost
@@ -203,8 +202,7 @@ pub(crate) async fn gateway_payload_object(
         &scoped,
         PAYLOAD_OBJECT_OPERATION,
         &resource,
-    )
-    .await?;
+    )?;
     let bytes = state
         .storage
         .get_object(&path)
@@ -249,7 +247,7 @@ fn invalid_name() -> WyrdErrorResponse {
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -261,7 +259,7 @@ fn invalid_name() -> WyrdErrorResponse {
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid name, body, or source,
 /// `GatewayResourceConflict` for a revoked name or a provider change that
-/// would orphan a deployment, and authentication, permission, storage, or audit errors.
+/// would orphan a deployment, and authentication, permission, or storage errors.
 #[tracing::instrument(skip_all, fields(operation = "gateway.provider_credential.put"))]
 pub(crate) async fn put_credential(
     State(state): State<AppState>,
@@ -289,7 +287,7 @@ pub(crate) async fn put_credential(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -299,7 +297,7 @@ pub(crate) async fn put_credential(
 ///
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid name, `GatewayResourceNotFound`
-/// when absent, and authentication, permission, storage, or audit errors.
+/// when absent, and authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.provider_credential.get")
@@ -325,7 +323,7 @@ pub(crate) async fn get_credential(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -334,7 +332,7 @@ pub(crate) async fn get_credential(
 /// Lists the tenant's redacted credential views ordered by name.
 ///
 /// # Errors
-/// Returns authentication, permission, storage, or audit errors.
+/// Returns authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.provider_credential.list")
@@ -361,7 +359,7 @@ pub(crate) async fn list_credentials(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -371,7 +369,7 @@ pub(crate) async fn list_credentials(
 ///
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid name, `GatewayResourceNotFound`
-/// when absent, and authentication, permission, storage, or audit errors.
+/// when absent, and authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.provider_credential.revoke")
@@ -400,7 +398,7 @@ pub(crate) async fn revoke_credential(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -410,7 +408,7 @@ pub(crate) async fn revoke_credential(
 ///
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid name, `GatewayResourceConflict`
-/// while a deployment references it, and authentication, permission, storage, or audit errors.
+/// while a deployment references it, and authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.provider_credential.delete")
@@ -438,7 +436,7 @@ pub(crate) async fn delete_credential(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -448,7 +446,7 @@ pub(crate) async fn delete_credential(
 ///
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid name, document, or credential
-/// reference, and authentication, permission, storage, or audit errors.
+/// reference, and authentication, permission, or storage errors.
 #[tracing::instrument(skip_all, fields(operation = "gateway.provider_deployment.put"))]
 pub(crate) async fn put_deployment(
     State(state): State<AppState>,
@@ -476,7 +474,7 @@ pub(crate) async fn put_deployment(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -486,7 +484,7 @@ pub(crate) async fn put_deployment(
 ///
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid name, `GatewayResourceNotFound`
-/// when absent, and authentication, permission, storage, or audit errors.
+/// when absent, and authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.provider_deployment.get")
@@ -512,7 +510,7 @@ pub(crate) async fn get_deployment(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -521,7 +519,7 @@ pub(crate) async fn get_deployment(
 /// Lists the tenant's deployments ordered by name.
 ///
 /// # Errors
-/// Returns authentication, permission, storage, or audit errors.
+/// Returns authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.provider_deployment.list")
@@ -547,7 +545,7 @@ pub(crate) async fn list_deployments(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -556,7 +554,7 @@ pub(crate) async fn list_deployments(
 /// Deletes one deployment; an absent name succeeds with 204.
 ///
 /// # Errors
-/// Returns `GatewayInvalidConfiguration` for an invalid name, and authentication, permission, storage, or audit errors.
+/// Returns `GatewayInvalidConfiguration` for an invalid name, and authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.provider_deployment.delete")
@@ -583,7 +581,7 @@ pub(crate) async fn delete_deployment(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -593,7 +591,7 @@ pub(crate) async fn delete_deployment(
 ///
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid body or policy, and
-/// authentication, permission, storage, or audit errors.
+/// authentication, permission, or storage errors.
 #[tracing::instrument(skip_all, fields(operation = "gateway.fallback_policy.put"))]
 pub(crate) async fn put_fallback(
     State(state): State<AppState>,
@@ -616,7 +614,7 @@ pub(crate) async fn put_fallback(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -625,7 +623,7 @@ pub(crate) async fn put_fallback(
 /// Reads the tenant fallback policy, or the empty default.
 ///
 /// # Errors
-/// Returns authentication, permission, storage, or audit errors.
+/// Returns authentication, permission, or storage errors.
 #[tracing::instrument(skip(state, caller), fields(operation = "gateway.fallback_policy.get"))]
 pub(crate) async fn get_fallback(
     State(state): State<AppState>,
@@ -644,7 +642,7 @@ pub(crate) async fn get_fallback(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -653,7 +651,7 @@ pub(crate) async fn get_fallback(
 /// Restores the empty fallback policy; repeating succeeds.
 ///
 /// # Errors
-/// Returns authentication, permission, storage, or audit errors.
+/// Returns authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.fallback_policy.delete")
@@ -678,7 +676,7 @@ pub(crate) async fn delete_fallback(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -688,7 +686,7 @@ pub(crate) async fn delete_fallback(
 ///
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid body or policy or a changed
-/// pricing version, and authentication, permission, storage, or audit errors.
+/// pricing version, and authentication, permission, or storage errors.
 #[tracing::instrument(skip_all, fields(operation = "gateway.governance_policy.put"))]
 pub(crate) async fn put_governance(
     State(state): State<AppState>,
@@ -711,7 +709,7 @@ pub(crate) async fn put_governance(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -720,7 +718,7 @@ pub(crate) async fn put_governance(
 /// Reads the tenant governance policy with its pricing history.
 ///
 /// # Errors
-/// Returns authentication, permission, storage, or audit errors.
+/// Returns authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.governance_policy.get")
@@ -744,7 +742,7 @@ pub(crate) async fn get_governance(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -753,7 +751,7 @@ pub(crate) async fn get_governance(
 /// Clears limits and budgets and retires pricing; repeating succeeds.
 ///
 /// # Errors
-/// Returns authentication, permission, storage, or audit errors.
+/// Returns authentication, permission, or storage errors.
 #[tracing::instrument(
     skip(state, caller),
     fields(operation = "gateway.governance_policy.delete")
@@ -778,7 +776,7 @@ pub(crate) async fn delete_governance(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -788,7 +786,7 @@ pub(crate) async fn delete_governance(
 ///
 /// # Errors
 /// Returns `GatewayInvalidConfiguration` for an invalid body or mode/field combination,
-/// and authentication, permission, storage, or audit errors.
+/// and authentication, permission, or storage errors.
 #[tracing::instrument(skip_all, fields(operation = "gateway.capture_policy.put"))]
 pub(crate) async fn put_capture(
     State(state): State<AppState>,
@@ -811,7 +809,7 @@ pub(crate) async fn put_capture(
         (status = 401, description = "Authentication required (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 403, description = "Gateway permission required (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 503, description = "Administration store or token verification unavailable (WYRD_SERVER_503_SERVICE_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json"),
-        (status = "default", description = "Other gateway refusal, including an unauditable authorization decision (WYRD_SPEC_500_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem, content_type = "application/problem+json")
+        (status = "default", description = "Other gateway refusal (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem, content_type = "application/problem+json")
     ),
     tag = "Gateway"
 )]
@@ -820,7 +818,7 @@ pub(crate) async fn put_capture(
 /// Reads the capture policy, or the disabled version-1 default.
 ///
 /// # Errors
-/// Returns authentication, permission, storage, or audit errors.
+/// Returns authentication, permission, or storage errors.
 #[tracing::instrument(skip(state, caller), fields(operation = "gateway.capture_policy.get"))]
 pub(crate) async fn get_capture(
     State(state): State<AppState>,
@@ -1275,7 +1273,7 @@ async fn json_media(
     responses(
         (status = 200, description = "OpenAI model list of the exact `<provider>/<model>` projections configured for the tenant that the caller may invoke", body = GatewayModelList),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 503, description = "The server is draining, or configuration or audit is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, or configuration is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = "default", description = "Other gateway refusal as an OpenAI error envelope", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"
@@ -1405,7 +1403,7 @@ fn events_body(events: wyrd_gateway::EventStream) -> Body {
         (status = 413, description = "Form exceeds the request body limit (WYRD_SPEC_413_PAYLOAD_TOO_LARGE)", body = WyrdProblem, content_type = "application/problem+json"),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 503, description = "The server is draining, or storage or audit is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, or storage is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"
@@ -1449,7 +1447,7 @@ pub(crate) async fn upload_file(
         (status = 404, description = "Unknown file, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 503, description = "The server is draining, or storage or audit is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, or storage is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"
@@ -1482,7 +1480,7 @@ pub(crate) async fn get_file(
         (status = 502, description = "No provider attempt completed or the content exceeded its bound, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 503, description = "The server is draining, or storage or audit is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, or storage is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"
@@ -1517,7 +1515,7 @@ pub(crate) async fn file_content(
         (status = 404, description = "Unknown file, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 503, description = "The server is draining, or storage or audit is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, or storage is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"
@@ -1558,7 +1556,7 @@ pub(crate) async fn delete_file(
         (status = 504, description = "Deadline exceeded, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 503, description = "The server is draining, or storage or audit is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, or storage is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"
@@ -1588,7 +1586,7 @@ pub(crate) async fn create_batch(
         (status = 400, description = "Invalid cursor or limit, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 503, description = "The server is draining, or storage or audit is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, or storage is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"
@@ -1626,7 +1624,7 @@ pub(crate) async fn list_batches(
         (status = 404, description = "Unknown batch, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 503, description = "The server is draining, or storage or audit is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, or storage is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"
@@ -1660,7 +1658,7 @@ pub(crate) async fn get_batch(
         (status = 404, description = "Unknown batch, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 401, description = "Authentication required, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = 403, description = "Invoke permission required for the model, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
-        (status = 503, description = "The server is draining, or storage or audit is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
+        (status = 503, description = "The server is draining, or storage is unavailable, as an OpenAI error envelope", body = OpenAiErrorEnvelope),
         (status = "default", description = "Other gateway refusal as an OpenAI error envelope, or the refusing provider's status with its error body", body = OpenAiErrorEnvelope)
     ),
     tag = "Gateway"

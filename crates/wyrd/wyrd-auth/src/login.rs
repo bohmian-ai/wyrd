@@ -163,9 +163,11 @@ mod pg_tests {
     use wyrd_spec::TenantSlug;
     use wyrd_spec::auth::{ClientAuthorization, OAuthClientId};
 
+    use crate::audit::test_outbox::outbox;
     use crate::connections::HumanConnections;
 
-    /// A connection owner over `fixture` with a public origin and no keyring.
+    /// A connection owner over `fixture` with a public origin, no keyring, and
+    /// an audit outbox nothing in these tests stages on.
     ///
     /// # Panics
     /// Panics when the fixed origin does not parse.
@@ -176,6 +178,7 @@ mod pg_tests {
             None,
             ScreenedHttp::allowing_internal(),
             Some(&origin),
+            outbox(fixture),
         )
     }
 

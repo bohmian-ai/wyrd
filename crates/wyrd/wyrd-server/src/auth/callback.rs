@@ -27,7 +27,10 @@ pub async fn exchange_authorization_code(
     request_id: &str,
 ) -> Result<LoginCompletion, WyrdErrorResponse> {
     let service = wyrd_auth::callback::AuthorizationCodeExchange {
-        issuer: state.auth.tenant_issuer().ok_or_else(auth_not_configured)?,
+        issuer: state
+            .auth
+            .tenant_issuer(&state.audit_outbox)
+            .ok_or_else(auth_not_configured)?,
         connections: state
             .auth
             .human_connections
@@ -49,6 +52,7 @@ mod pg_tests {
     use crate::http::error::WyrdErrorResponse;
     use crate::state::AppState;
     use secrecy::{ExposeSecret as _, SecretString};
+    use serde_json::Value;
     use uuid::Uuid;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -187,7 +191,7 @@ mod pg_tests {
         .expect_err("missing state fails");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_400_INVALID_STATE");
-        assert!(audit_rows(&fixture).await.is_empty());
+        assert!(audit_rows(&fixture, &state).await.is_empty());
     }
 
     /// A state that was already consumed names no pending login, so its
@@ -312,7 +316,7 @@ mod pg_tests {
             .expect_err("the state was consumed once");
             assert_eq!(replay.0.code(), "WYRD_AUTH_400_INVALID_STATE");
         }
-        assert_nothing_persisted(&fixture).await;
+        assert_nothing_persisted(&fixture, &state).await;
     }
 
     /// A verified token for a consumed login issues only an authorization
@@ -352,9 +356,9 @@ mod pg_tests {
             0,
             "the callback mints nothing"
         );
-        assert!(audit_rows(&fixture).await.is_empty());
+        assert!(audit_rows(&fixture, &state).await.is_empty());
         assert_eq!(
-            operation_rows(&fixture, "auth.login").await,
+            operation_rows(&fixture, &state, "auth.login").await,
             vec![(
                 principal_id,
                 "allowed".to_owned(),
@@ -364,7 +368,7 @@ mod pg_tests {
         );
         let redeemed = redeem(&state, &completed).await.expect("the code redeems");
         assert_eq!(refresh_token_count(&fixture, principal_id).await, 1);
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, principal_id);
         assert_eq!(audit[0].1, "allowed");
@@ -409,7 +413,7 @@ mod pg_tests {
         .expect_err("a changed connection rejects");
 
         assert_eq!(error.0.code(), "WYRD_AUTH_401_INVALID_TOKEN");
-        let audit = audit_rows(&fixture).await;
+        let audit = audit_rows(&fixture, &state).await;
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].0, Uuid::nil());
         assert_eq!(audit[0].1, "denied");
@@ -541,18 +545,18 @@ mod pg_tests {
 
         let user = user_for(&fixture, EXTERNAL_SUBJECT).await.expect("user");
         assert_eq!(user_roles(&fixture, user).await, vec![SYNC_ROLE.to_owned()]);
-        let sync = operation_rows(&fixture, "auth.user.roles.sync").await;
+        let sync = operation_rows(&fixture, &state, "auth.user.roles.sync").await;
         assert_eq!(
             sync,
             vec![(user, "allowed".to_owned(), format!("principal:{user}"))]
         );
         assert_eq!(
-            audit_rows(&fixture).await.len(),
+            audit_rows(&fixture, &state).await.len(),
             2,
             "one exchange per redeemed login"
         );
         assert_eq!(
-            operation_rows(&fixture, "auth.login").await.len(),
+            operation_rows(&fixture, &state, "auth.login").await.len(),
             2,
             "one login outcome per callback"
         );
@@ -589,34 +593,33 @@ mod pg_tests {
         let user = user_for(&fixture, EXTERNAL_SUBJECT).await.expect("user");
         assert_eq!(device_approval(&fixture, device_id).await, Some(user));
         assert_eq!(
-            operation_rows(&fixture, "auth.login").await,
+            operation_rows(&fixture, &state, "auth.login").await,
             vec![(user, "allowed".to_owned(), format!("principal:{user}"))]
         );
         assert!(
-            operation_rows(&fixture, "auth.user.roles.sync")
+            operation_rows(&fixture, &state, "auth.user.roles.sync")
                 .await
                 .is_empty()
         );
     }
 
-    /// When the login outcome cannot be staged, the User, its role change,
-    /// and the authorization code or device approval all roll back together.
+    /// A login outcome whose commit fails never refuses the login: the User,
+    /// its role change, and the authorization code or device approval all
+    /// commit, and the staged outcomes stay queued until staging recovers.
     ///
     /// # Panics
-    /// Panics when either login succeeds or leaves anything behind.
+    /// Panics when either login is refused, its grant is missing, or its
+    /// outcome is dropped instead of retried.
     #[tokio::test]
-    async fn a_failed_login_audit_rolls_back_the_whole_login() {
+    async fn a_failed_login_audit_never_refuses_the_login() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let server = jwks_server().await;
         let state = test_state_with_human_connections(&fixture).await;
         let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
-            r#"CREATE OR REPLACE FUNCTION vala.test_fail_login_audit()
+            r"CREATE OR REPLACE FUNCTION vala.test_fail_login_audit()
                RETURNS trigger LANGUAGE plpgsql AS $$
                BEGIN
                  IF NEW.operation = 'auth.login' THEN
@@ -624,15 +627,15 @@ mod pg_tests {
                  END IF;
                  RETURN NEW;
                END;
-               $$;"#,
+               $$;",
         )
         .execute(&superuser)
         .await
         .expect("failure function installs");
         sqlx::query(
-            r#"CREATE TRIGGER test_fail_login_audit
+            r"CREATE TRIGGER test_fail_login_audit
                BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_login_audit()"#,
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_login_audit()",
         )
         .execute(&superuser)
         .await
@@ -642,7 +645,7 @@ mod pg_tests {
         let (device_hash, device_login, device_id) =
             pending_device_login(&fixture, 14, binding).await;
         for (hash, login) in [(&hash, &login), (&device_hash, &device_login)] {
-            let error = authorization_exchange_service(&state)
+            authorization_exchange_service(&state)
                 .finish_id_token_exchange(
                     hash,
                     &trusted,
@@ -651,18 +654,26 @@ mod pg_tests {
                     "req-login-audit-fail",
                 )
                 .await
-                .expect_err("an unrecordable login is refused");
-            assert_eq!(error.code(), "WYRD_AUDIT_503_UNAVAILABLE");
+                .expect("an unrecordable login outcome never refuses the login");
         }
 
-        assert_nothing_persisted(&fixture).await;
-        assert_eq!(device_approval(&fixture, device_id).await, None);
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let role_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.auth_user_roles")
-            .fetch_one(&mut **conn.transaction())
+        let user = user_for(&fixture, EXTERNAL_SUBJECT).await.expect("user");
+        assert_eq!(issued_codes(&fixture).await, 1, "the code was issued");
+        assert_eq!(device_approval(&fixture, device_id).await, Some(user));
+        assert_eq!(user_roles(&fixture, user).await, vec![SYNC_ROLE.to_owned()]);
+        assert!(
+            pending(&state).await >= 2,
+            "both login outcomes stay queued for retry"
+        );
+        sqlx::query("DROP TRIGGER test_fail_login_audit ON vala.audit_staging")
+            .execute(&superuser)
             .await
-            .expect("role count runs");
-        assert_eq!(role_rows, 0, "the role assignment rolled back");
+            .expect("failure trigger drops");
+        assert_eq!(
+            operation_rows(&fixture, &state, "auth.login").await.len(),
+            2,
+            "each login outcome commits once staging recovers"
+        );
     }
 
     /// Two concurrent callbacks for one existing User with disjoint mapped
@@ -749,7 +760,9 @@ mod pg_tests {
         }
         assert_eq!(user_roles(&fixture, user).await, vec![BETA.to_owned()]);
         assert_eq!(
-            operation_rows(&fixture, "auth.user.roles.sync").await.len(),
+            operation_rows(&fixture, &state, "auth.user.roles.sync")
+                .await
+                .len(),
             2,
             "each login changed the durable set once"
         );
@@ -785,25 +798,24 @@ mod pg_tests {
         .expect("the callbacks park behind the gate");
     }
 
-    /// When the role-sync event cannot be staged, the role change, session,
-    /// refresh row, and completion all roll back together.
+    /// A role-sync event whose commit fails never refuses the login: the
+    /// role change and authorization code commit, and the event stays queued
+    /// until staging recovers.
     ///
     /// # Panics
-    /// Panics when the login succeeds or leaves anything behind.
+    /// Panics when the login is refused, its grant is missing, or the event
+    /// is dropped instead of retried.
     #[tokio::test]
-    async fn a_failed_role_sync_audit_rolls_back_the_whole_login() {
+    async fn a_failed_role_sync_audit_never_refuses_the_login() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let server = jwks_server().await;
         let state = test_state_with_human_connections(&fixture).await;
         let trusted = sync_trusted(&fixture, &server).await;
         let binding = committed_active_binding(&fixture).await;
         let (hash, login) = pending_login(&fixture, state_hash(10), binding, "nonce").await;
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
-            r#"CREATE OR REPLACE FUNCTION vala.test_fail_roles_sync_audit()
+            r"CREATE OR REPLACE FUNCTION vala.test_fail_roles_sync_audit()
                RETURNS trigger LANGUAGE plpgsql AS $$
                BEGIN
                  IF NEW.operation = 'auth.user.roles.sync' THEN
@@ -811,21 +823,21 @@ mod pg_tests {
                  END IF;
                  RETURN NEW;
                END;
-               $$;"#,
+               $$;",
         )
         .execute(&superuser)
         .await
         .expect("failure function installs");
         sqlx::query(
-            r#"CREATE TRIGGER test_fail_roles_sync_audit
+            r"CREATE TRIGGER test_fail_roles_sync_audit
                BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_roles_sync_audit()"#,
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_roles_sync_audit()",
         )
         .execute(&superuser)
         .await
         .expect("failure trigger installs");
 
-        let error = authorization_exchange_service(&state)
+        authorization_exchange_service(&state)
             .finish_id_token_exchange(
                 &hash,
                 &trusted,
@@ -834,18 +846,24 @@ mod pg_tests {
                 "req-sync-fail",
             )
             .await
-            .expect_err("an unrecordable role change refuses the login");
+            .expect("an unrecordable role change never refuses the login");
 
-        assert_eq!(error.code(), "WYRD_AUDIT_503_UNAVAILABLE");
-        assert_nothing_persisted(&fixture).await;
-        let role_rows: i64 = {
-            let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-            sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.auth_user_roles")
-                .fetch_one(&mut **conn.transaction())
-                .await
-                .expect("role count runs")
-        };
-        assert_eq!(role_rows, 0, "the role assignment rolled back");
+        let user = user_for(&fixture, EXTERNAL_SUBJECT).await.expect("user");
+        assert_eq!(issued_codes(&fixture).await, 1, "the code was issued");
+        assert_eq!(user_roles(&fixture, user).await, vec![SYNC_ROLE.to_owned()]);
+        assert!(
+            pending(&state).await >= 1,
+            "the role-sync event stays queued for retry"
+        );
+        sqlx::query("DROP TRIGGER test_fail_roles_sync_audit ON vala.audit_staging")
+            .execute(&superuser)
+            .await
+            .expect("failure trigger drops");
+        assert_eq!(
+            operation_rows(&fixture, &state, "auth.user.roles.sync").await,
+            vec![(user, "allowed".to_owned(), format!("principal:{user}"))],
+            "the role-sync event commits once staging recovers"
+        );
     }
 
     /// A verified test sign-in marks only its bound candidate revision tested,
@@ -893,14 +911,14 @@ mod pg_tests {
             )
         );
         assert_eq!(
-            operation_rows(&fixture, "identity.oidc.candidate.tested").await,
+            operation_rows(&fixture, &state, "identity.oidc.candidate.tested").await,
             vec![(
                 tester.principal_id.as_uuid(),
                 "allowed".to_owned(),
                 "identity:oidc_connection".to_owned()
             )]
         );
-        assert_nothing_persisted(&fixture).await;
+        assert_nothing_persisted(&fixture, &state).await;
     }
 
     /// A tester whose stored roles no longer grant
@@ -940,7 +958,7 @@ mod pg_tests {
 
         assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
         assert_eq!(
-            operation_rows(&fixture, "identity.oidc.candidate.tested").await,
+            operation_rows(&fixture, &state, "identity.oidc.candidate.tested").await,
             vec![(
                 tester.principal_id.as_uuid(),
                 "denied".to_owned(),
@@ -948,17 +966,18 @@ mod pg_tests {
             )]
         );
         assert_eq!(candidate_stamp(&fixture).await, (None, None));
-        assert_nothing_persisted(&fixture).await;
+        assert_nothing_persisted(&fixture, &state).await;
     }
 
-    /// A tested decision that cannot be recorded fails closed: the stamp
-    /// shares its transaction, so the candidate stays untested.
+    /// A tested decision whose commit fails never refuses the test sign-in:
+    /// the candidate is stamped and the decision stays queued until staging
+    /// recovers.
     ///
     /// # Panics
-    /// Panics when the trigger cannot be installed, the test succeeds, or the
-    /// candidate is stamped.
+    /// Panics when the trigger cannot be installed, the test is refused, the
+    /// candidate is not stamped, or the decision is dropped.
     #[tokio::test]
-    async fn a_failed_tested_audit_leaves_the_candidate_untested() {
+    async fn a_failed_tested_audit_never_refuses_the_test() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let server = jwks_server().await;
         let state = test_state_with_human_connections(&fixture).await;
@@ -973,12 +992,9 @@ mod pg_tests {
             LoginInitiation::ConnectionTest(tester),
         )
         .await;
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
-            r#"CREATE OR REPLACE FUNCTION vala.test_fail_candidate_tested_audit()
+            r"CREATE OR REPLACE FUNCTION vala.test_fail_candidate_tested_audit()
                RETURNS trigger LANGUAGE plpgsql AS $$
                BEGIN
                  IF NEW.operation = 'identity.oidc.candidate.tested' THEN
@@ -986,21 +1002,21 @@ mod pg_tests {
                  END IF;
                  RETURN NEW;
                END;
-               $$;"#,
+               $$;",
         )
         .execute(&superuser)
         .await
         .expect("failure function installs");
         sqlx::query(
-            r#"CREATE TRIGGER test_fail_candidate_tested_audit
+            r"CREATE TRIGGER test_fail_candidate_tested_audit
                BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_candidate_tested_audit()"#,
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_candidate_tested_audit()",
         )
         .execute(&superuser)
         .await
         .expect("failure trigger installs");
 
-        let error = authorization_exchange_service(&state)
+        let completed = authorization_exchange_service(&state)
             .finish_id_token_exchange(
                 &hash,
                 &trusted,
@@ -1009,10 +1025,28 @@ mod pg_tests {
                 "req-test-audit-fail",
             )
             .await
-            .expect_err("an unrecordable tested decision refuses the test");
+            .expect("an unrecordable tested decision never refuses the test");
 
-        assert_eq!(error.code(), "WYRD_AUDIT_503_UNAVAILABLE");
-        assert_eq!(candidate_stamp(&fixture).await, (None, None));
+        assert!(matches!(completed, LoginCompletion::ConnectionTested));
+        assert_eq!(
+            candidate_stamp(&fixture).await.0,
+            Some(binding.connection_revision)
+        );
+        assert!(
+            pending(&state).await >= 1,
+            "the tested decision stays queued for retry"
+        );
+        sqlx::query("DROP TRIGGER test_fail_candidate_tested_audit ON vala.audit_staging")
+            .execute(&superuser)
+            .await
+            .expect("failure trigger drops");
+        assert_eq!(
+            operation_rows(&fixture, &state, "identity.oidc.candidate.tested")
+                .await
+                .len(),
+            1,
+            "the tested decision commits once staging recovers"
+        );
     }
 
     /// Seed and commit a password User of the fixture tenant to begin a
@@ -1150,11 +1184,11 @@ mod pg_tests {
     }
 
     /// Assert a refused login left no User, refresh row, authorization code,
-    /// or role-sync event behind.
+    /// or role-sync event behind once `state`'s audit outbox settles.
     ///
     /// # Panics
     /// Panics when anything persisted.
-    async fn assert_nothing_persisted(fixture: &PgFixture) {
+    async fn assert_nothing_persisted(fixture: &PgFixture, state: &AppState) {
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let (users, refresh): (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM wyrd.auth_users WHERE auth_type = 'oidc'),
@@ -1165,7 +1199,7 @@ mod pg_tests {
         .expect("persistence counts run");
         assert_eq!((users, refresh), (0, 0));
         assert!(
-            operation_rows(fixture, "auth.user.roles.sync")
+            operation_rows(fixture, state, "auth.user.roles.sync")
                 .await
                 .is_empty()
         );
@@ -1185,11 +1219,16 @@ mod pg_tests {
     }
 
     /// Staged events of `operation` as `(principal_id, outcome, resource)`,
-    /// oldest first.
+    /// oldest first, read after `state`'s audit outbox settles.
     ///
     /// # Panics
-    /// Panics when the query fails.
-    async fn operation_rows(fixture: &PgFixture, operation: &str) -> Vec<(Uuid, String, String)> {
+    /// Panics when the outbox does not settle or the query fails.
+    async fn operation_rows(
+        fixture: &PgFixture,
+        state: &AppState,
+        operation: &str,
+    ) -> Vec<(Uuid, String, String)> {
+        settle(state).await;
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         sqlx::query_as(
             "SELECT principal_id, outcome, resource
@@ -1226,7 +1265,7 @@ mod pg_tests {
             group_role_map,
             default_roles,
             principal_kind: IssuerTokenPolicy::Human,
-            jwks_ttl: StdDuration::from_secs(300),
+            jwks_ttl: StdDuration::from_mins(5),
         }
     }
 
@@ -1251,7 +1290,7 @@ mod pg_tests {
             group_role_map,
             default_roles,
             principal_kind: IssuerTokenPolicy::Human,
-            jwks_ttl: StdDuration::from_secs(300),
+            jwks_ttl: StdDuration::from_mins(5),
         }
     }
 
@@ -1444,12 +1483,11 @@ mod pg_tests {
             .map_err(WyrdErrorResponse::from);
         if let Err(error) = &result {
             audit_authorization_code_failure(
-                state.postgres.wyrd(),
+                &state.audit_outbox,
                 trusted.tenant_id,
                 "req",
                 &error.0,
-            )
-            .await;
+            );
         }
         result
     }
@@ -1462,7 +1500,7 @@ mod pg_tests {
         AuthorizationCodeExchange {
             issuer: state
                 .auth
-                .tenant_issuer()
+                .tenant_issuer(&state.audit_outbox)
                 .expect("test state has issuing key"),
             connections: state
                 .auth
@@ -1478,7 +1516,7 @@ mod pg_tests {
             .expect("wiremock URI is valid")
     }
 
-    fn ed_jwks_json(kid: &str) -> serde_json::Value {
+    fn ed_jwks_json(kid: &str) -> Value {
         serde_json::json!({
             "keys": [{
                 "kty": "OKP",
@@ -1536,28 +1574,31 @@ mod pg_tests {
             Arc::new(public_key_from_pem(PUBLIC_KEY_PEM).expect("public key parses")),
         );
         let verifier = TokenVerifier::new(local_keys, "wyrd", WyrdAuthVerifySettings::default());
-        test_state(fixture)
-            .await
-            .with_auth(crate::components::auth::ServerAuth {
-                issuing_key: Some(issuing_key),
-                token_verifier: Some(Arc::new(verifier)),
-                human_connections: Some(HumanConnections::new(
-                    fixture.wyrd_postgres().clone(),
-                    Some(Arc::clone(&sealing_key)),
-                    ScreenedHttp::allowing_internal(),
-                    None,
-                )),
-                sealing_key: Some(sealing_key),
-                ..crate::components::auth::ServerAuth::default()
-            })
+        let state = test_state(fixture).await;
+        let audit = Arc::clone(&state.audit_outbox);
+        state.with_auth(crate::components::auth::ServerAuth {
+            issuing_key: Some(issuing_key),
+            token_verifier: Some(Arc::new(verifier)),
+            human_connections: Some(HumanConnections::new(
+                fixture.wyrd_postgres().clone(),
+                Some(Arc::clone(&sealing_key)),
+                ScreenedHttp::allowing_internal(),
+                None,
+                audit,
+            )),
+            sealing_key: Some(sealing_key),
+            ..crate::components::auth::ServerAuth::default()
+        })
     }
 
     /// Staged `auth.token.exchange` events as `(principal_id, outcome, detail)`,
-    /// oldest first.
+    /// oldest first, read after `state`'s audit outbox settles.
     ///
     /// # Panics
-    /// Panics when the query fails or a detail is not JSON.
-    async fn audit_rows(fixture: &PgFixture) -> Vec<(Uuid, String, serde_json::Value)> {
+    /// Panics when the outbox does not settle, the query fails, or a detail is
+    /// not JSON.
+    async fn audit_rows(fixture: &PgFixture, state: &AppState) -> Vec<(Uuid, String, Value)> {
+        settle(state).await;
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
             "SELECT principal_id, outcome, detail
@@ -1576,8 +1617,28 @@ mod pg_tests {
             .collect()
     }
 
+    /// Wait for everything staged on `state`'s audit outbox to commit.
+    ///
+    /// # Panics
+    /// Panics when staged events remain after thirty seconds.
+    async fn settle(state: &AppState) {
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(30);
+        assert_eq!(
+            state.audit_outbox.settle(deadline).await,
+            0,
+            "audit settles"
+        );
+    }
+
+    /// How many staged events stay pending on `state`'s audit outbox after
+    /// one second of retrying.
+    async fn pending(state: &AppState) -> usize {
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(1);
+        state.audit_outbox.settle(deadline).await
+    }
+
     /// Canonical detail of a refused exchange with `error_code`.
-    fn auth_failure_detail(error_code: &str) -> serde_json::Value {
+    fn auth_failure_detail(error_code: &str) -> Value {
         serde_json::json!({ "kind": "auth_failure", "error_code": error_code })
     }
 

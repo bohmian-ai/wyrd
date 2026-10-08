@@ -12,23 +12,37 @@ description = "First-class Rust Wyrd SDK: a thin projection of wyrd-client."
 name = "wyrd_sdk"
 path = "src/lib.rs"
 
+[features]
+# Test-only surface: the in-process `wyrd` CLI commands (`wyrd_sdk::cli`),
+# the same implementation the executable renders. Never enabled by a
+# production build.
+testing = ["dep:wyrd-cli"]
+
 [dependencies]
+wyrd-cli = { workspace = true, optional = true }
 wyrd-client = { workspace = true }
+wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+# The journeys run the in-process CLI commands, `wyrd_sdk::cli`.
+wyrd-sdk-rust = { path = ".", features = ["testing"] }
+# Reads the Arrow batches a streamed Bifrost query yields.
 arrow = { workspace = true }
-base64 = { workspace = true }
-chrono = { workspace = true }
-parquet = { workspace = true, features = ["arrow"] }
+# The stock OpenTelemetry exporter the OTLP export story configures from
+# `OTEL_EXPORTER_OTLP_*`.
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+# The OpenAI-compatible Chat Completions caller of the gateway inference story.
+reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-skald-workflow = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-uuid = { workspace = true, features = ["v7"] }
+# Local judge, model upstream, and Operator hook the stories call through the
+# server.
 wiremock = { workspace = true }
 wyrd-testing = { workspace = true }
 

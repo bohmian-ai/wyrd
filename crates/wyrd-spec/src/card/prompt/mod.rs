@@ -24,8 +24,6 @@ pub use validate::{PromptError, validate};
 
 #[cfg(test)]
 pub(crate) mod prompt_support {
-    #![allow(dead_code)]
-
     use std::collections::BTreeMap;
 
     use crate::api_version::ApiVersion;
@@ -157,9 +155,8 @@ pub(crate) mod prompt_support {
     }
 
     pub fn anthropic_with_system(text: &str) -> ProviderRequest {
-        let mut request = match anthropic_request("hello") {
-            ProviderRequest::AnthropicMessage(request) => request,
-            _ => unreachable!("helper returns Anthropic"),
+        let ProviderRequest::AnthropicMessage(mut request) = anthropic_request("hello") else {
+            unreachable!("helper returns Anthropic")
         };
         request.system = Some(AnthropicSystem::Blocks(vec![AnthropicSystemBlock::Text {
             text: text.to_owned(),
@@ -172,9 +169,8 @@ pub(crate) mod prompt_support {
     }
 
     pub fn anthropic_with_tool_values() -> ProviderRequest {
-        let mut request = match anthropic_request("hello") {
-            ProviderRequest::AnthropicMessage(request) => request,
-            _ => unreachable!("helper returns Anthropic"),
+        let ProviderRequest::AnthropicMessage(mut request) = anthropic_request("hello") else {
+            unreachable!("helper returns Anthropic")
         };
         request.messages.push(AnthropicMessage {
             role: "assistant".to_owned(),
@@ -458,6 +454,9 @@ mod prompt_declarative_tests {
     use crate::envelope::{Card, CardKind, Spec};
     use crate::format;
     use skald_spec::{ProviderRequest, ResponseType};
+    use std::collections::BTreeMap;
+
+    use crate::envelope::Relationships;
 
     fn declarative_yaml() -> &'static str {
         r#"
@@ -501,14 +500,14 @@ mod prompt_declarative_tests {
                 bump: None,
                 space: None,
                 uid: None,
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::default(),
+                annotations: BTreeMap::default(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,
             },
             spec: Spec::Prompt(spec),
-            relationships: Default::default(),
+            relationships: Relationships::default(),
             status: None,
         };
         format::yaml::to_string(&card).unwrap()
@@ -567,7 +566,7 @@ mod prompt_declarative_tests {
 
     #[test]
     fn api_version_is_required() {
-        let yaml = r#"
+        let yaml = r"
     kind: Prompt
     metadata:
       name: test-prompt
@@ -577,14 +576,14 @@ mod prompt_declarative_tests {
       model: gpt-4o
       messages:
         - Hello
-    "#;
+    ";
         let result: Result<Card, _> = format::yaml::from_str(yaml);
         assert!(result.is_err(), "apiVersion must be explicit");
     }
 
     #[test]
     fn malformed_provider_raises_error_not_silent() {
-        let yaml = r#"
+        let yaml = r"
     kind: Prompt
     metadata:
       name: test-prompt
@@ -594,14 +593,14 @@ mod prompt_declarative_tests {
       model: gpt-4o
       messages:
         - Hello
-    "#;
+    ";
         let result: Result<Card, _> = format::yaml::from_str(yaml);
         assert!(result.is_err(), "unknown provider must produce an error");
     }
 
     #[test]
     fn anthropic_declarative_compiles() {
-        let yaml = r#"
+        let yaml = r"
     apiVersion: wyrd/v1
     kind: Prompt
     metadata:
@@ -613,7 +612,7 @@ mod prompt_declarative_tests {
       system: You are a helpful assistant.
       messages:
         - What is 2+2?
-    "#;
+    ";
         let card: Card = format::yaml::from_str(yaml).unwrap();
         let Spec::Prompt(spec) = &card.spec else {
             panic!()
@@ -861,7 +860,7 @@ mod prompt_schema_drift_tests {
             serde_json::to_string_pretty(&schema).expect("schema serializes")
         );
         let expected = std::fs::read_to_string(format!(
-            "{}/tests/schemas/{name}.json",
+            "{}/schemas/{name}.json",
             env!("CARGO_MANIFEST_DIR")
         ))
         .expect("golden schema exists");

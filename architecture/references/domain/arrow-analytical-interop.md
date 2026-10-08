@@ -11,10 +11,10 @@ names, Iceberg field IDs, logical types, nullability, metadata, decimal
 precision/scale, and timestamp units/timezones. Map by stable identity or name,
 never positional index when schemas can diverge.
 
-Reserved system columns and the immutable `wyrd_batch_id` stay
-present and non-null where the table contract requires them. The server stamps
-authenticated tenant, ingest time, and request identity; callers cannot
-override them. Schema fingerprints cover the canonical logical schema and are
+Reserved system columns stay present and non-null where the table contract
+requires them. The server stamps publisher, request identity, and the
+PostgreSQL ingestion instant; callers cannot override them. Tenant ownership
+is proven by the physical table and Parquet footer, not a row column. Schema fingerprints cover the canonical logical schema and are
 validated before append, staging recovery, promotion, and query.
 
 Use bounded `RecordBatch` values as ownership and backpressure units. Streaming

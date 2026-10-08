@@ -90,6 +90,7 @@ async fn complete_uploaded_card(
 ) -> Result<CreateCardResponse, RegistryEngineError> {
     let path = format!("/v1/cards/{uid}/complete");
     client
+        .http
         .submit_with_idempotency_key(reqwest::Method::POST, &path, &(), idempotency_key)
         .await
         .map_err(Into::into)

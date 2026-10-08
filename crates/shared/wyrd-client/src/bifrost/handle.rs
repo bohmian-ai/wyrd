@@ -8,11 +8,14 @@ use std::sync::{Condvar, Mutex, PoisonError};
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
+#[cfg(feature = "internal")]
+use wyrd_queue::ClientByteMetrics;
 use wyrd_queue::{
-    BatchSink, ClientByteBudget, ClientByteGuard, ClientByteMetrics, Producer, QueueConfig,
-    SealedBatchSender, WyrdQueueError,
+    BatchSink, ClientByteBudget, ClientByteGuard, Producer, QueueConfig, SealedBatchSender,
+    WyrdQueueError,
 };
 use wyrd_spec::reference::CardRef;
+#[cfg(feature = "internal")]
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
@@ -57,14 +60,10 @@ pub(crate) struct WriterPool {
 /// Point-in-time settlement accounting for one [`crate::bifrost::Bifrost`] client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BifrostMetrics {
-    /// Producers currently registered under the bounded handle pool.
+    /// Producers currently registered under the handle pool.
     pub producers: usize,
-    /// Bytes held by queued rows or a sealed batch owner.
+    /// Bytes held by queued rows, sealed frames, and retained batches.
     pub owned_bytes: usize,
-    /// Lifetime charges for constructed producer queue and control slots.
-    pub fixed_storage_bytes: usize,
-    /// Total handle reservation including dynamic ownership and fixed storage.
-    pub total_reserved_bytes: usize,
     /// Sealed batches not yet terminally acknowledged, cancelled, or poisoned.
     pub live_batches: usize,
     /// Ambiguous batches retained for a retry rather than released.
@@ -92,7 +91,7 @@ impl WriterPool {
             scope,
             sink,
             config,
-            budget: ClientByteBudget::new(config.client_byte_limit()),
+            budget: ClientByteBudget::for_config(&config),
             producers: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             direct_sends: Mutex::new(0),
@@ -104,6 +103,7 @@ impl WriterPool {
 
     /// The scope every producer in this handle is keyed under.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub(crate) fn scope(&self) -> &ClientScope {
         &self.scope
     }
@@ -124,31 +124,25 @@ impl WriterPool {
     ///
     /// This is a point-in-time telemetry view: concurrent inserts or background
     /// drains can change individual counters immediately after it is returned.
-    /// A durable batch ACK reports zero dynamic bytes, batches, retry entries,
-    /// and pending controls. Constructed producers retain their fixed storage
-    /// charge until [`Self::shutdown`] removes them; then total reservation is
-    /// also zero.
+    /// A durable batch ACK reports zero bytes, batches, retry entries, and
+    /// pending controls; an idle producer holds no bytes.
     ///
     /// # Panics
     ///
     /// Panics if the producer pool mutex is poisoned, which indicates an
     /// invariant-breaking panic in another handle operation.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub(crate) fn metrics(&self) -> BifrostMetrics {
         let ClientByteMetrics {
             owned_bytes,
-            fixed_storage_bytes,
-            total_reserved_bytes,
             live_batches,
             retry_entries,
-            ..
         } = self.budget.metrics();
         let producers = self.producers.lock().expect("producer pool poisoned");
         BifrostMetrics {
             producers: producers.len(),
             owned_bytes,
-            fixed_storage_bytes,
-            total_reserved_bytes,
             live_batches,
             retry_entries,
             pending_controls: producers
@@ -164,6 +158,7 @@ impl WriterPool {
 
     /// Registers the observer told the row count of every loss this handle's
     /// producers settle; see [`ClientByteBudget::observe_losses`].
+    #[cfg(feature = "internal")]
     pub(crate) fn observe_losses(&self, observer: impl Fn(u64) + Send + Sync + 'static) {
         self.budget.observe_losses(observer);
     }
@@ -176,7 +171,8 @@ impl WriterPool {
     ///
     /// Both correlation fields are optional. An omitted `card_ref` becomes a
     /// null in the sealed batch, which the server stores against the
-    /// authenticated principal with a null `card_uid`.
+    /// authenticated principal with a null `card_uid`. The row carries no
+    /// writer event time, as [`Self::insert_rows`] describes for `None`.
     ///
     /// The queue-domain [`WyrdQueueError`] is propagated verbatim (rather than
     /// projected onto the shared catalog) so the client-tier code —
@@ -195,8 +191,40 @@ impl WriterPool {
         card_ref: Option<CardRef>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
+        self.insert_rows(table, schema, vec![json], card_ref, run_id, None)
+    }
+
+    /// Enqueue every row of one logical record, or none of them, propagating
+    /// queue-full.
+    ///
+    /// The multi-row counterpart to [`Self::insert`], for a record that
+    /// projects to several rows sharing one correlation, such as a Drift
+    /// observation's tall feature rows. A refusal admits no row, so the caller
+    /// may resubmit the whole record without duplicating a prefix.
+    ///
+    /// `event_time_micros` is the record's `wyrd_event_time` (microseconds
+    /// since the Unix epoch, UTC), carried unchanged through batching, linger,
+    /// retry, and flush. Observations pass the client clock read at emit; a
+    /// plain write passes `None`, and the server stamps its receipt instant.
+    /// A row whose own JSON carries `wyrd_event_time` keeps that value instead.
+    ///
+    /// # Errors
+    /// Returns [`WyrdQueueError::QueueFull`] when the pool has closed or the
+    /// producer channel cannot take every row now,
+    /// [`WyrdQueueError::Backpressure`] when the producer ceiling or byte
+    /// budget cannot admit them, and [`WyrdQueueError::PayloadTooLarge`] when
+    /// the record has more rows than the channel can ever hold.
+    pub(crate) fn insert_rows(
+        &self,
+        table: &str,
+        schema: &SchemaRef,
+        rows: Vec<Vec<u8>>,
+        card_ref: Option<CardRef>,
+        run_id: Option<RunId>,
+        event_time_micros: Option<i64>,
+    ) -> Result<(), WyrdQueueError> {
         self.producer_for(table, schema)?
-            .enqueue(json, card_ref, run_id)
+            .enqueue_rows(rows, card_ref, run_id, event_time_micros)
     }
 
     /// Enqueue one owned Arrow batch for `table` without awaiting publication.
@@ -212,6 +240,7 @@ impl WriterPool {
     /// Returns [`WyrdQueueError::QueueFull`] when the pool has closed or the
     /// producer channel is full, and [`WyrdQueueError::Backpressure`] when the
     /// producer ceiling or handle byte budget cannot admit the batch.
+    #[cfg(feature = "internal")]
     pub(crate) fn enqueue_batch(
         &self,
         table: &str,
@@ -308,9 +337,9 @@ impl WriterPool {
     /// created or returned after the snapshot. Once each producer enters its
     /// draining state, new rows are rejected and buffered rows are sent before
     /// this method returns. Direct Arrow sends admitted before closure are
-    /// awaited until each settles. Terminally drained
-    /// producers are removed and release their fixed-storage guards; a timed
-    /// out ambiguous producer stays retained for a later shutdown retry.
+    /// awaited until each settles. Terminally drained producers are removed;
+    /// a producer still holding an ambiguous batch stays for a later shutdown
+    /// retry.
     ///
     /// # Errors
     /// Returns the first [`WyrdQueueError`] reported by a producer shutdown
@@ -374,9 +403,8 @@ impl WriterPool {
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdQueueError::QueueFull`] once the pool has closed,
-    /// [`WyrdQueueError::Backpressure`] when the producer ceiling is reached, and
-    /// the producer construction error otherwise.
+    /// Returns [`WyrdQueueError::QueueFull`] once the pool has closed, and the
+    /// producer construction error otherwise.
     ///
     /// # Panics
     ///
@@ -396,9 +424,6 @@ impl WriterPool {
                 .then(|| Arc::clone(producer))
         }) {
             return Ok(producer);
-        }
-        if pool.len() >= self.config.max_producers() {
-            return Err(WyrdQueueError::Backpressure);
         }
         let producer = Arc::new(Producer::with_budget(
             table,
@@ -574,7 +599,7 @@ mod tests {
         assert_eq!(acked_at_return, 1, "shutdown awaited the admitted send");
         assert_eq!(metrics.live_batches, 0);
         assert_eq!(metrics.owned_bytes, 0);
-        assert_eq!(metrics.total_reserved_bytes, 0);
+        assert_eq!(metrics.owned_bytes, 0);
         writer
             .await
             .expect("writer task")
@@ -652,6 +677,5 @@ mod tests {
         assert_eq!(metrics.producers, 0);
         assert_eq!(metrics.owned_bytes, 0);
         assert_eq!(metrics.live_batches, 0);
-        assert_eq!(metrics.total_reserved_bytes, 0);
     }
 }

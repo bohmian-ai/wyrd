@@ -1,0 +1,11 @@
+apiVersion: wyrd/v1
+kind: Operator
+metadata:
+  name: path-without-connection
+  version: 1.0.0
+  space: default
+spec:
+  description: A path-only URL has no origin unless auth names an http connection.
+  kind: http
+  method: post
+  url: /hooks/latency-shift

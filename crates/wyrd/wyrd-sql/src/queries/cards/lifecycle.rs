@@ -70,7 +70,7 @@ pub async fn claim_card_reconciliation(
 ) -> Result<Vec<CardReconcileClaim>, WyrdError> {
     let lease_owner = Uuid::now_v7();
     let rows = sqlx::query_as::<_, CardReconcileClaim>(
-        r#"WITH candidates AS (
+        r"WITH candidates AS (
                 SELECT card_uid, data_tenant_id
                   FROM wyrd.cards
                  WHERE (
@@ -112,7 +112,7 @@ pub async fn claim_card_reconciliation(
                    card.reconcile_lease_expires_at,
                    EXTRACT(EPOCH FROM (card.reconcile_lease_expires_at
                                        - statement_timestamp()))::double precision
-                       AS lease_remaining_seconds"#,
+                       AS lease_remaining_seconds",
     )
     .bind(lease_owner)
     .bind(limit)
@@ -134,13 +134,13 @@ pub async fn lock_card_reconciliation_lease(
     lease_owner: Uuid,
 ) -> Result<bool, WyrdError> {
     let found = sqlx::query_scalar::<_, bool>(
-        r#"SELECT true
+        r"SELECT true
              FROM wyrd.cards
             WHERE card_uid = $1
               AND reconcile_status = 'leased'
               AND reconcile_lease_owner = $2
               AND reconcile_lease_expires_at > statement_timestamp()
-            FOR UPDATE"#,
+            FOR UPDATE",
     )
     .bind(card_uid.as_uuid())
     .bind(lease_owner)
@@ -171,7 +171,7 @@ pub async fn schedule_card_reconciliation(
     error_message: &str,
 ) -> Result<bool, WyrdError> {
     let result = sqlx::query(
-        r#"UPDATE wyrd.cards
+        r"UPDATE wyrd.cards
               SET reconcile_kind = $2,
                   reconcile_status = 'pending',
                   reconcile_attempts = 0,
@@ -185,7 +185,7 @@ pub async fn schedule_card_reconciliation(
                   updated_at = now()
             WHERE card_uid = $1
               AND reconcile_status IN ('idle', 'pending')
-              AND status IN ('pending', 'failed', 'deleted')"#,
+              AND status IN ('pending', 'failed', 'deleted')",
     )
     .bind(card_uid.as_uuid())
     .bind(kind)
@@ -218,7 +218,7 @@ pub async fn reschedule_card_reconciliation(
     error_message: &str,
 ) -> Result<bool, WyrdError> {
     let result = sqlx::query(
-        r#"UPDATE wyrd.cards
+        r"UPDATE wyrd.cards
               SET reconcile_status = 'pending',
                   reconcile_attempts = GREATEST(reconcile_attempts - 1, 0),
                   reconcile_next_attempt_at =
@@ -230,7 +230,7 @@ pub async fn reschedule_card_reconciliation(
                   updated_at = now()
             WHERE card_uid = $1
               AND reconcile_status = 'leased'
-              AND reconcile_lease_owner = $2"#,
+              AND reconcile_lease_owner = $2",
     )
     .bind(card_uid.as_uuid())
     .bind(lease_owner)
@@ -255,7 +255,7 @@ pub async fn mark_card_reconciliation_succeeded(
     let result = match lease_owner {
         Some(lease_owner) => {
             sqlx::query(
-                r#"UPDATE wyrd.cards
+                r"UPDATE wyrd.cards
                   SET reconcile_kind = 'registration',
                       reconcile_status = 'idle',
                       reconcile_attempts = 0,
@@ -269,7 +269,7 @@ pub async fn mark_card_reconciliation_succeeded(
                 WHERE card_uid = $1
                   AND reconcile_status = 'leased'
                   AND reconcile_lease_owner = $2
-                  AND reconcile_lease_expires_at > statement_timestamp()"#,
+                  AND reconcile_lease_expires_at > statement_timestamp()",
             )
             .bind(card_uid.as_uuid())
             .bind(lease_owner)
@@ -278,7 +278,7 @@ pub async fn mark_card_reconciliation_succeeded(
         }
         None => {
             sqlx::query(
-                r#"UPDATE wyrd.cards
+                r"UPDATE wyrd.cards
                   SET reconcile_kind = 'registration',
                       reconcile_status = 'idle',
                       reconcile_attempts = 0,
@@ -290,7 +290,7 @@ pub async fn mark_card_reconciliation_succeeded(
                       reconcile_dead_lettered_at = NULL,
                       updated_at = now()
                 WHERE card_uid = $1
-                  AND reconcile_status <> 'dead_lettered'"#,
+                  AND reconcile_status <> 'dead_lettered'",
             )
             .bind(card_uid.as_uuid())
             .execute(&mut **conn.transaction())
@@ -321,7 +321,7 @@ pub async fn record_card_reconciliation_failure(
     error_message: &str,
 ) -> Result<bool, WyrdError> {
     let status = sqlx::query_scalar::<_, String>(
-        r#"UPDATE wyrd.cards
+        r"UPDATE wyrd.cards
               SET reconcile_status = CASE
                       WHEN reconcile_attempts >= $3 THEN 'dead_lettered'
                       ELSE 'pending'
@@ -343,7 +343,7 @@ pub async fn record_card_reconciliation_failure(
               AND reconcile_status = 'leased'
               AND reconcile_lease_owner = $2
               AND reconcile_lease_expires_at > statement_timestamp()
-         RETURNING reconcile_status"#,
+         RETURNING reconcile_status",
     )
     .bind(card_uid.as_uuid())
     .bind(lease_owner)
@@ -401,7 +401,7 @@ pub async fn manifest_completion_rows(
     card_uid: &CardUid,
 ) -> Result<Vec<CardManifestCompletionRow>, WyrdError> {
     sqlx::query_as::<_, CardManifestCompletionRow>(
-        r#"SELECT m.relative_path,
+        r"SELECT m.relative_path,
                   m.expected_sha256,
                   m.size_bytes AS expected_size_bytes,
                   m.upload_id,
@@ -420,7 +420,7 @@ pub async fn manifest_completion_rows(
               LEFT JOIN wyrd.storage_multipart_uploads u
                ON u.id = m.upload_id
             WHERE m.card_uid = $1
-            ORDER BY m.relative_path"#,
+            ORDER BY m.relative_path",
     )
     .bind(card_uid.as_uuid())
     .fetch_all(&mut **conn.transaction())
@@ -438,11 +438,11 @@ pub async fn mark_manifest_verified(
     upload_id: Uuid,
 ) -> Result<bool, WyrdError> {
     let result = sqlx::query(
-        r#"UPDATE wyrd.card_artifact_manifest
+        r"UPDATE wyrd.card_artifact_manifest
               SET upload_status = 'verified', verified_at = now()
             WHERE card_uid = $1
               AND upload_id = $2
-              AND upload_status IN ('pending', 'uploaded', 'verified')"#,
+              AND upload_status IN ('pending', 'uploaded', 'verified')",
     )
     .bind(card_uid.as_uuid())
     .bind(upload_id)
@@ -462,10 +462,10 @@ pub async fn record_card_blob(
     blob_uri: &str,
 ) -> Result<(), WyrdError> {
     sqlx::query(
-        r#"UPDATE wyrd.cards
+        r"UPDATE wyrd.cards
               SET card_blob_uri = $2, blob_failed_at = NULL, updated_at = now()
             WHERE card_uid = $1
-              AND status = 'pending'"#,
+              AND status = 'pending'",
     )
     .bind(card_uid.as_uuid())
     .bind(blob_uri)
@@ -487,10 +487,10 @@ pub async fn record_blob_failure(
     card_uid: &CardUid,
 ) -> Result<(), WyrdError> {
     sqlx::query(
-        r#"UPDATE wyrd.cards
+        r"UPDATE wyrd.cards
               SET blob_failed_at = now(), updated_at = now()
             WHERE card_uid = $1
-              AND status = 'pending'"#,
+              AND status = 'pending'",
     )
     .bind(card_uid.as_uuid())
     .execute(&mut **conn.transaction())
@@ -508,10 +508,10 @@ pub async fn lock_pending_card_for_activation(
     card_uid: &CardUid,
 ) -> Result<bool, WyrdError> {
     let status = sqlx::query_scalar::<_, String>(
-        r#"SELECT status
+        r"SELECT status
              FROM wyrd.cards
             WHERE card_uid = $1
-            FOR UPDATE"#,
+            FOR UPDATE",
     )
     .bind(card_uid.as_uuid())
     .fetch_optional(&mut **conn.transaction())
@@ -529,7 +529,7 @@ pub async fn activate_card(
     card_uid: &CardUid,
 ) -> Result<bool, WyrdError> {
     let result = sqlx::query(
-        r#"UPDATE wyrd.cards c
+        r"UPDATE wyrd.cards c
               SET status = 'active', finalized_at = now(), updated_at = now()
             WHERE c.card_uid = $1
               AND c.status = 'pending'
@@ -539,7 +539,7 @@ pub async fn activate_card(
                       FROM wyrd.card_artifact_manifest m
                      WHERE m.card_uid = c.card_uid
                        AND m.upload_status <> 'verified'
-              )"#,
+              )",
     )
     .bind(card_uid.as_uuid())
     .execute(&mut **conn.transaction())
@@ -554,7 +554,7 @@ pub async fn activate_card(
 /// Mark a pending Card failed after internal compensation.
 pub async fn fail_card(conn: &mut TenantConn<'_>, card_uid: &CardUid) -> Result<bool, WyrdError> {
     let result = sqlx::query(
-        r#"UPDATE wyrd.cards
+        r"UPDATE wyrd.cards
               SET status = 'failed',
                   reconcile_kind = 'cleanup',
                   reconcile_status = 'pending',
@@ -567,7 +567,7 @@ pub async fn fail_card(conn: &mut TenantConn<'_>, card_uid: &CardUid) -> Result<
                   reconcile_dead_lettered_at = NULL,
                   updated_at = now()
             WHERE card_uid = $1
-              AND status = 'pending'"#,
+              AND status = 'pending'",
     )
     .bind(card_uid.as_uuid())
     .execute(&mut **conn.transaction())

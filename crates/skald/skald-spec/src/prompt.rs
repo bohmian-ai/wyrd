@@ -96,6 +96,10 @@ pub enum TextSegment {
 /// Accepts both `${name}` and `{{name}}`. Names must match
 /// `[a-zA-Z_][a-zA-Z0-9_]*`. The `${media:name}` form is reserved for the
 /// media-bind path and is not matched here.
+///
+/// # Panics
+///
+/// Panics if the static text placeholder pattern fails to compile.
 pub fn text_placeholder_regex() -> &'static Regex {
     static TEXT_PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
     TEXT_PLACEHOLDER_RE.get_or_init(|| {
@@ -107,6 +111,10 @@ pub fn text_placeholder_regex() -> &'static Regex {
 }
 
 /// Returns the compiled `${media:name}` media placeholder regex.
+///
+/// # Panics
+///
+/// Panics if the static media placeholder pattern fails to compile.
 pub fn media_placeholder_regex() -> &'static Regex {
     static MEDIA_PLACEHOLDER_RE: OnceLock<Regex> = OnceLock::new();
     MEDIA_PLACEHOLDER_RE.get_or_init(
@@ -712,10 +720,10 @@ fn bind_media_openai_responses(
             continue;
         };
         for part in content {
-            let text = match part {
-                OpenAiResponseContentPart::InputText { text }
-                | OpenAiResponseContentPart::OutputText { text } => text,
-                _ => continue,
+            let (OpenAiResponseContentPart::InputText { text }
+            | OpenAiResponseContentPart::OutputText { text }) = part
+            else {
+                continue;
             };
             if text.trim() != sentinel {
                 continue;
@@ -810,7 +818,8 @@ fn build_openai_chat_part(media: &MediaRef) -> SkaldResult<OpenAiContentPart> {
                 },
             }
         }
-        (MediaKind::Image, MediaSource::File { uri, .. }) => OpenAiContentPart::File {
+        (MediaKind::Image, MediaSource::File { uri, .. })
+        | (MediaKind::Document, MediaSource::File { uri, .. }) => OpenAiContentPart::File {
             file: OpenAiFilePart {
                 file_id: Some(uri.clone()),
                 file_data: None,
@@ -833,13 +842,6 @@ fn build_openai_chat_part(media: &MediaRef) -> SkaldResult<OpenAiContentPart> {
                 },
             }
         }
-        (MediaKind::Document, MediaSource::File { uri, .. }) => OpenAiContentPart::File {
-            file: OpenAiFilePart {
-                file_id: Some(uri.clone()),
-                file_data: None,
-                filename: None,
-            },
-        },
     })
 }
 
@@ -932,8 +934,10 @@ fn build_google_part(media: &MediaRef, provider: ProviderName) -> SkaldResult<Go
             })
         }
         MediaSource::Url { url, mime_type } => {
-            let mime_type =
-                required_mime(mime_type, "Gemini URL media requires explicit mime_type")?;
+            let mime_type = required_mime(
+                mime_type.as_deref(),
+                "Gemini URL media requires explicit mime_type",
+            )?;
             if url.starts_with("gs://") || is_gemini_file_api_url(url) {
                 Ok(GooglePart::FileData {
                     file_data: GoogleFileData {
@@ -949,8 +953,10 @@ fn build_google_part(media: &MediaRef, provider: ProviderName) -> SkaldResult<Go
             }
         }
         MediaSource::File { uri, mime_type } => {
-            let mime_type =
-                required_mime(mime_type, "Gemini file URI requires explicit mime_type")?;
+            let mime_type = required_mime(
+                mime_type.as_deref(),
+                "Gemini file URI requires explicit mime_type",
+            )?;
             Ok(GooglePart::FileData {
                 file_data: GoogleFileData {
                     mime_type,
@@ -971,12 +977,12 @@ fn validate_mime(mime_type: &str) -> SkaldResult<()> {
     }
 }
 
-fn required_mime(mime_type: &Option<String>, message: &str) -> SkaldResult<String> {
+fn required_mime(mime_type: Option<&str>, message: &str) -> SkaldResult<String> {
     let Some(mime_type) = mime_type else {
         return Err(SkaldError::InvalidMediaType(message.to_owned()));
     };
     validate_mime(mime_type)?;
-    Ok(mime_type.clone())
+    Ok(mime_type.to_owned())
 }
 
 fn data_url(mime_type: &str, data: &str) -> String {
@@ -1008,7 +1014,7 @@ mod placeholder_syntax_tests {
             tools: None,
             tool_choice: None,
             parallel_tool_calls: None,
-            settings: Default::default(),
+            settings: OpenAiChatSettings::default(),
         })
     }
 

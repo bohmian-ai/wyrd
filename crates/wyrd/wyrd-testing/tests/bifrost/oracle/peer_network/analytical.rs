@@ -26,7 +26,7 @@ const SCRIBE: usize = 3;
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn graph_lease_owns_exact_resources_for_complete_graph() {
-    prove_graph_lease_owns_exact_resources()
+    Box::pin(prove_graph_lease_owns_exact_resources())
         .await
         .expect("graph lease journey");
 }
@@ -311,7 +311,7 @@ const EXCHANGE_COUNTERS: [&str; 2] = [
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn baseline_executes_join_group_sort_and_interchangeable_topology() {
-    prove_physical_analytical_baseline()
+    Box::pin(prove_physical_analytical_baseline())
         .await
         .expect("physical analytical baseline journey");
 }
@@ -594,7 +594,7 @@ async fn peer_planes_are_reachable_from_both_coordinators(
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn stage_graph_executes_representative_query_styles() {
-    prove_representative_query_styles()
+    Box::pin(prove_representative_query_styles())
         .await
         .expect("representative query style journey");
 }
@@ -1073,6 +1073,7 @@ async fn public_query(
 ) -> Result<Vec<std::collections::BTreeMap<String, String>>, PeerJourneyError> {
     let mut stream = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: None,
         })
@@ -1252,6 +1253,10 @@ async fn prove_remote_live_scribe_release() -> Result<(), PeerJourneyError> {
 /// # Panics
 ///
 /// Panics when an emitted fact disagrees with the ending the client observed.
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn assert_remote_query_telemetry(
     cluster: &PeerCluster,
     window: &BifrostTelemetryCheckpoint,
@@ -1428,7 +1433,9 @@ async fn prove_window_blocked_scribe_stop() -> Result<(), PeerJourneyError> {
     let api_key = cluster.provision_public_api_key("window-reader").await?;
     let table = format!("window_live_{}", uuid::Uuid::now_v7().simple());
     cluster.register_table(SCRIBE, &table).await?;
-    for start in (0..WINDOW_ROWS).step_by(INGEST_CHUNK as usize) {
+    for start in
+        (0..WINDOW_ROWS).step_by(usize::try_from(INGEST_CHUNK).expect("ingest chunk fits usize"))
+    {
         cluster
             .ingest_live_rows(SCRIBE, &table, start, INGEST_CHUNK, INGEST_GROUPS)
             .await?;
@@ -1440,6 +1447,7 @@ async fn prove_window_blocked_scribe_stop() -> Result<(), PeerJourneyError> {
     let query = wyrd_client::Bifrost::query_only(&client);
     let mut stream = query
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT id, filter_key FROM vala.bifrost.{table}"),
             deadline_ms: Some(LIVE_OPEN_DEADLINE_MS),
         })
@@ -1510,6 +1518,7 @@ async fn open_paused_remote_live(
     cluster.arm_live_production_pause();
     query
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: Some(deadline_ms),
         })

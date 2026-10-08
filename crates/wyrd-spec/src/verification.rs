@@ -1,19 +1,34 @@
 //! Wire contracts of the Verification control-plane API.
 //!
-//! Three HTTP operations — `GET /v1/verification/bindings/{binding_id}`,
-//! `POST /v1/verification/runs`, and `GET /v1/verification/runs/{run_id}` —
-//! and their Rust, Python, TypeScript, and MCP projections share these typed
-//! shapes. They carry durable control state owned by Postgres: binding
-//! activity and readiness, run execution status, the result pointer, and each
-//! Operator dispatch's delivery status. Verdicts and Drift/Eval details stay in
-//! Bifrost and are never copied here.
+//! Four HTTP operations — `GET /v1/verification/bindings/{binding_id}`,
+//! `POST /v1/verification/runs`, `GET /v1/verification/runs/{run_id}`, and
+//! `POST /v1/verification/execute` — and their Rust, Python, TypeScript, and
+//! MCP projections share these typed shapes. The first three carry durable
+//! control state owned by Postgres: binding activity and readiness, run
+//! execution status, the result pointer, and each Operator dispatch's delivery
+//! status; their verdicts and Drift/Eval details stay in Bifrost and are never
+//! copied here. Direct execution is the one exception: it returns its judgment
+//! inline and persists nothing but its audit decision.
+
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::PrincipalId;
+use crate::card::drift::{DriftMethod, DriftProfile};
+use crate::card::operator::VerifierCounts;
+use crate::card::verifier::VerifierImplementation;
 use crate::error::WyrdError;
-use crate::ids::{BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId};
+use crate::ids::{
+    BindingId, CardUid, FeatureName, OperatorDispatchId, VerificationExecutionId,
+    VerificationResultId, VerificationRunId,
+};
+use crate::reference::CardRef;
+use crate::vala::eval::EvalTask;
+use crate::vala::eval::ids::TaskId;
+use crate::vala::eval::media::MediaRef;
+use crate::vala::eval::result::AssertionResult;
 
 /// Longest manual Drift window a caller may request: 31 days.
 ///
@@ -362,6 +377,338 @@ pub struct VerificationRunStatus {
     pub dispatches: Vec<OperatorDispatchState>,
 }
 
+/// Largest direct execution request body: 1 MiB.
+pub const MAX_EXECUTE_BODY_BYTES: usize = 1024 * 1024;
+
+/// Most feature columns one `drift_samples` input may carry.
+pub const MAX_DRIFT_SAMPLE_COLUMNS: usize = 64;
+
+/// Most values one `drift_samples` column may carry.
+pub const MAX_DRIFT_SAMPLE_VALUES: usize = 100_000;
+
+/// Largest serialized `eval_record.context`: 256 KiB.
+pub const MAX_EVAL_CONTEXT_BYTES: usize = 256 * 1024;
+
+/// Server deadline of one direct execution, from Verifier load through
+/// judgment; past it the server answers `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT`.
+///
+/// Clients wait at least this long for an execute response so the server's
+/// timeout, not the client's, decides a slow judgment.
+pub const EXECUTION_DEADLINE: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// The closed `kind` of a Verifier execution.
+///
+/// Classifies an exact Verifier by its Drift profile or Eval task graph. It is
+/// the `kind` label of every verification execution metric and the `kind` of a
+/// direct execution response.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    strum::IntoStaticStr,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum VerifierKind {
+    /// Drift with a PSI profile.
+    DriftPsi,
+    /// Drift with an SPC profile.
+    DriftSpc,
+    /// Drift with a Custom profile.
+    DriftCustom,
+    /// Eval whose every task is a record assertion.
+    EvalAssertion,
+    /// Eval with at least one LLM judge; judge presence wins over every other task.
+    EvalLlmJudge,
+    /// A supported non-judge Eval graph with trace or agent assertions.
+    EvalOther,
+    /// An execution whose exact spec could not be resolved or classified.
+    Unknown,
+}
+
+impl VerifierKind {
+    /// Classify `implementation` by its Drift profile or its Eval task graph.
+    ///
+    /// A Drift spec without a profile cannot be classified and is
+    /// [`Unknown`](Self::Unknown); an empty Eval graph is
+    /// [`EvalOther`](Self::EvalOther), never a claimed assertion workload.
+    #[must_use]
+    pub fn of(implementation: &VerifierImplementation) -> Self {
+        match implementation {
+            VerifierImplementation::Drift(spec) => match &spec.profile {
+                Some(DriftProfile::Psi(_)) => Self::DriftPsi,
+                Some(DriftProfile::Spc(_)) => Self::DriftSpc,
+                Some(DriftProfile::Custom(_)) => Self::DriftCustom,
+                None => Self::Unknown,
+            },
+            VerifierImplementation::Eval(spec) => {
+                let mut tasks = spec.tasks.values();
+                if tasks
+                    .clone()
+                    .any(|task| matches!(task, EvalTask::LlmJudge(_)))
+                {
+                    Self::EvalLlmJudge
+                } else if !spec.tasks.is_empty()
+                    && tasks.all(|task| matches!(task, EvalTask::Assertion(_)))
+                {
+                    Self::EvalAssertion
+                } else {
+                    Self::EvalOther
+                }
+            }
+        }
+    }
+
+    /// The stable snake_case label.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// One supplied Drift sample: a number, a category, or null.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+pub enum DriftSample {
+    /// A numeric value.
+    Number(f64),
+    /// A categorical value.
+    Text(String),
+}
+
+/// The input a direct execution judges, supplied in the request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DirectVerificationInput {
+    /// One Eval record for an assertion-only or LLM-judge Eval.
+    EvalRecord {
+        /// The record context assertions select from and judges receive.
+        #[cfg_attr(feature = "server", schema(value_type = Object))]
+        context: serde_json::Map<String, serde_json::Value>,
+        /// Media a judge Prompt binds, by object-storage reference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "server", schema(value_type = Option<Vec<Object>>))]
+        media: Option<Vec<MediaRef>>,
+    },
+    /// Feature samples for a Drift Verifier, one column per feature.
+    DriftSamples {
+        /// Feature name to its samples in observation order.
+        columns: BTreeMap<String, Vec<Option<DriftSample>>>,
+    },
+}
+
+/// `POST /v1/verification/execute` request body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ExecuteVerificationRequest {
+    /// Exact Verifier Card version to execute.
+    pub verifier_uid: CardUid,
+    /// Exact subject Card the judgment is about.
+    pub subject_card_uid: CardUid,
+    /// The supplied input.
+    pub input: DirectVerificationInput,
+}
+
+impl ExecuteVerificationRequest {
+    /// Decode one direct execution request from its JSON wire value.
+    ///
+    /// HTTP, MCP, and every language binding decode through here, so a
+    /// malformed request is refused with the same stable code on every
+    /// surface.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::VerificationInputInvalid`] for any value that does
+    /// not match the wire contract.
+    pub fn decode(body: serde_json::Value) -> Result<Self, WyrdError> {
+        serde_json::from_value(body).map_err(|error| WyrdError::VerificationInputInvalid {
+            message: format!("verification execute request is invalid: {error}"),
+            details: serde_json::json!({}),
+        })
+    }
+
+    /// Check the input bounds decidable without IO.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::VerificationInputTooLarge`] for more than
+    /// [`MAX_DRIFT_SAMPLE_COLUMNS`] columns, a column over
+    /// [`MAX_DRIFT_SAMPLE_VALUES`] values, or a context over
+    /// [`MAX_EVAL_CONTEXT_BYTES`] serialized bytes.
+    pub fn validate(&self) -> Result<(), WyrdError> {
+        let too_large = |message: String| WyrdError::VerificationInputTooLarge {
+            message,
+            details: serde_json::json!({}),
+        };
+        match &self.input {
+            DirectVerificationInput::DriftSamples { columns } => {
+                if columns.len() > MAX_DRIFT_SAMPLE_COLUMNS {
+                    return Err(too_large(format!(
+                        "drift_samples may carry at most {MAX_DRIFT_SAMPLE_COLUMNS} columns"
+                    )));
+                }
+                if columns
+                    .values()
+                    .any(|values| values.len() > MAX_DRIFT_SAMPLE_VALUES)
+                {
+                    return Err(too_large(format!(
+                        "a drift_samples column may carry at most {MAX_DRIFT_SAMPLE_VALUES} values"
+                    )));
+                }
+            }
+            DirectVerificationInput::EvalRecord { context, .. } => {
+                let bytes = serde_json::to_vec(context).map_or(usize::MAX, |body| body.len());
+                if bytes > MAX_EVAL_CONTEXT_BYTES {
+                    return Err(too_large(format!(
+                        "eval_record.context may be at most {MAX_EVAL_CONTEXT_BYTES} bytes"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The engine report of a direct execution, by implementation.
+///
+/// Serialized as `{ "drift": DriftReport }` or `{ "eval": EvalReport }`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum VerificationExecutionDetail {
+    /// The Drift report of a Drift Verifier.
+    Drift(DriftReport),
+    /// The ran and skipped tasks of an Eval Verifier.
+    Eval(EvalReport),
+}
+
+/// The verdict of one Drift feature or of a whole Drift report.
+///
+/// Serialized in the Drift engine's own spelling (`NoDrift`, `Drift`,
+/// `Inconclusive`), so a report reads the same wherever it is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub enum DriftVerdict {
+    /// The score did not exceed its threshold.
+    NoDrift,
+    /// The score exceeded its threshold.
+    Drift,
+    /// The target data could not be scored.
+    Inconclusive,
+}
+
+/// The Drift engine's report of one direct execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct DriftReport {
+    /// The Drift method the Verifier's profile selected.
+    pub method: DriftMethod,
+    /// One report per scored feature, keyed by feature name.
+    pub features: BTreeMap<FeatureName, FeatureDriftReport>,
+    /// The aggregated verdict: `Drift` when any feature drifted.
+    pub verdict: DriftVerdict,
+}
+
+/// The Drift report of one feature.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct FeatureDriftReport {
+    /// The feature this report describes.
+    pub feature: FeatureName,
+    /// PSI score, total SPC chart signals, or absolute Custom delta; absent
+    /// when the feature is inconclusive.
+    pub score: Option<f64>,
+    /// The threshold `score` was compared against; absent when the feature is
+    /// inconclusive.
+    pub threshold: Option<f64>,
+    /// The feature's verdict.
+    pub verdict: DriftVerdict,
+    /// The method's evidence behind a scored PSI or SPC feature: frozen bins
+    /// with baseline and target counts, or chart limits and signals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<Object>))]
+    pub evidence: Option<serde_json::Value>,
+}
+
+/// The Eval engine's report of one direct execution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EvalReport {
+    /// The result of every task that ran, in stage order.
+    #[cfg_attr(feature = "server", schema(value_type = Vec<Object>))]
+    pub results: Vec<AssertionResult>,
+    /// Every task that did not run, with its reason.
+    pub skipped: Vec<SkippedTask>,
+}
+
+/// One Eval task that did not run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SkippedTask {
+    /// The skipped task.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    pub task_id: TaskId,
+    /// Why it did not run.
+    pub reason: SkipReason,
+    /// The skipped upstream task that caused a `dependency_skipped` skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    pub upstream_task_id: Option<TaskId>,
+}
+
+/// Why an Eval task did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// The task's own condition evaluated to false.
+    ConditionFalse,
+    /// A declared upstream dependency was skipped first.
+    DependencySkipped,
+}
+
+/// The judgment of one direct execution: `200 OK` to
+/// `POST /v1/verification/execute`, and what `observe.verify` returns.
+///
+/// A `failed` verdict is a successful response. Nothing here is persisted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct Judgment {
+    /// Transient identity of this execution, shared with its audit and trace.
+    pub execution_id: VerificationExecutionId,
+    /// The exact Verifier executed.
+    pub verifier: CardRef,
+    /// The exact subject judged.
+    pub subject: CardRef,
+    /// Classification of the Verifier.
+    pub kind: VerifierKind,
+    /// The common verdict.
+    pub verdict: VerificationVerdict,
+    /// Bounded human-readable summary of the verdict.
+    pub summary: String,
+    /// Count-only rollup of the judgment.
+    pub counts: VerifierCounts,
+    /// The engine report.
+    pub detail: VerificationExecutionDetail,
+}
+
+impl Judgment {
+    /// Whether the expectations held: true only for a `passed` verdict.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.verdict == VerificationVerdict::Passed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Synchronous wire validation of manual run requests.
@@ -480,5 +827,48 @@ mod tests {
         }
         let readiness: &'static str = VerifierReadiness::BaselineNotReady.into();
         assert_eq!(readiness, "baseline_not_ready");
+    }
+
+    /// Judge presence wins, an all-assertion graph is an assertion Eval, any
+    /// other graph is `eval_other`, and a profile-less Drift is `unknown`.
+    #[test]
+    fn kind_classification_follows_the_closed_precedence() {
+        let assertion = serde_json::json!({
+            "kind": "assertion", "id": "a", "context_path": "$.x",
+            "operator": "is_not_null", "expected": null
+        });
+        let judge = serde_json::json!({
+            "kind": "llm_judge", "id": "j",
+            "judge_ref": {"prompt": {
+                "kind": "Prompt", "name": "judge", "version": "1.0.0", "space": "default"
+            }},
+            "operator": "greater_than_or_equals", "expected": 0.5
+        });
+        let trace = serde_json::json!({
+            "kind": "trace_assertion", "id": "t", "span_selector": "$.spans",
+            "operator": "is_non_empty", "expected": null
+        });
+        let eval = |tasks: serde_json::Value| -> VerifierImplementation {
+            serde_json::from_value(serde_json::json!({"kind": "eval", "spec": {"tasks": tasks}}))
+                .expect("eval implementation decodes")
+        };
+        assert_eq!(
+            VerifierKind::of(&eval(serde_json::json!({"a": assertion}))),
+            VerifierKind::EvalAssertion
+        );
+        assert_eq!(
+            VerifierKind::of(&eval(
+                serde_json::json!({"a": assertion, "j": judge, "t": trace})
+            )),
+            VerifierKind::EvalLlmJudge
+        );
+        assert_eq!(
+            VerifierKind::of(&eval(serde_json::json!({"a": assertion, "t": trace}))),
+            VerifierKind::EvalOther
+        );
+        assert_eq!(
+            VerifierKind::of(&eval(serde_json::json!({}))),
+            VerifierKind::EvalOther
+        );
     }
 }

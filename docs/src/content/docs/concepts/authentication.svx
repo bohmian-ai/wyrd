@@ -188,15 +188,16 @@ page also stays available when SSO is active.
 ## API-key principal flow
 
 Service and Agent principals can authenticate with a long-lived API key. The
-key is shown in plaintext exactly once at issuance and stored only as an Argon2
-hash.
+key is shown in plaintext exactly once at issuance and stored only as a SHA-256
+hash. The key is a server-generated 256-bit secret, so a fast hash compared in
+constant time is enough; a slow password hash would add nothing.
 
 <WyrdSequenceDiagram
   title="API-key principal"
   participants={['Client', 'Wyrd server']}
   messages={[
     { from: 'Client', to: 'Wyrd server', label: 'POST /auth/issue-key · service_accounts:write' },
-    { from: 'Wyrd server', to: 'Wyrd server', label: 'mint wyrd_sk_… · store Argon2 hash' },
+    { from: 'Wyrd server', to: 'Wyrd server', label: 'mint wyrd_sk_… · store SHA-256 hash' },
     { from: 'Wyrd server', to: 'Client', label: 'plaintext key (shown once)', dashed: true },
     { from: 'Client', to: 'Wyrd server', label: 'POST /auth/token · token-exchange (API key)' },
     { from: 'Wyrd server', to: 'Wyrd server', label: 'verify hash · tenant · active · resolve roles' },
@@ -205,13 +206,13 @@ hash.
 />
 
 1. Admin sends `POST /auth/issue-key` (requires `service_accounts:write`). The
-   server mints a `wyrd_sk_<tenant>_<secret>` key, stores the Argon2 hash, and
+   server mints a `wyrd_sk_<tenant>_<secret>` key, stores its SHA-256 hash, and
    returns the plaintext once.
 2. Caller sends `POST /auth/token` with
    `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`,
    `subject_token_type=urn:wyrd:oauth:token-type:api_key`, and the raw key as
    `subject_token` (RFC 8693). A refused key answers `400 invalid_request`.
-3. Server parses the tenant prefix, verifies the Argon2 hash, checks the
+3. Server parses the tenant prefix, verifies the SHA-256 hash, checks the
    principal is active and scoped to the request tenant, resolves roles.
 4. Server issues an **access token only**. The key itself is the renewable
    authority: the client repeats this exchange when its access token expires or

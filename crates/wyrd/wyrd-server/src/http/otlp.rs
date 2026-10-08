@@ -27,8 +27,10 @@
 //! `RESOURCE_EXHAUSTED` (also retryable, per the OTLP spec's backpressure
 //! guidance). Every other ingest failure maps to its stable `WYRD_VALA_*`
 //! [`WyrdError`](wyrd_spec::error::WyrdError) and problem+json status. Authentication is enforced by the
-//! `require_authenticated` layer on the `/v1` group; the [`Caller`] extractor
-//! then yields the token-derived tenant/principal (never wire-derived).
+//! `require_otlp_authenticated` layer on this router, which also accepts a
+//! stock exporter's `x-wyrd-api-key` in place of an access token; the
+//! [`Caller`] extractor then yields the credential-derived tenant/principal
+//! (never wire-derived).
 //!
 //! `/v1/metrics` and `/v1/logs` share the same three-step shape as `/v1/traces`:
 //! bounded adapter decode, owner-backed Gate routing
@@ -207,8 +209,10 @@ where
         (status = 400, description = "The export could not be decoded, or an event time fell \
           outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
           WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token, or the token \
-          named no resolvable principal (WYRD_AUTH_401_UNAUTHENTICATED, \
+        (status = 401, description = "The request carried no usable access token, its \
+          `x-wyrd-api-key` (accepted on OTLP routes in place of an access token and verified on \
+          every request) is not valid, or the token named no resolvable principal \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_API_KEY_INVALID, \
           WYRD_VALA_401_INGEST_AUTH, WYRD_VALA_401_PRINCIPAL_UNRESOLVED)", body = WyrdProblem),
         (status = 403, description = "The principal may not write this table, or its card scope \
           does not cover the export (WYRD_PERMISSION_403_DENIED_RBAC, \
@@ -223,8 +227,8 @@ where
          body = WyrdProblem),
         (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
           was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
-        (status = 500, description = "Ingest failed internally, or the decision could not be \
-          audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+        (status = 500, description = "Ingest failed internally \
+          (WYRD_VALA_500_BIFROST_INTERNAL)",
          body = WyrdProblem),
         (status = 503, description = "The writer is unavailable, or no verifier is configured \
           for the access token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
@@ -319,8 +323,10 @@ async fn export_traces(
         (status = 400, description = "The export could not be decoded, or an event time fell \
           outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
           WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token, or the token \
-          named no resolvable principal (WYRD_AUTH_401_UNAUTHENTICATED, \
+        (status = 401, description = "The request carried no usable access token, its \
+          `x-wyrd-api-key` (accepted on OTLP routes in place of an access token and verified on \
+          every request) is not valid, or the token named no resolvable principal \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_API_KEY_INVALID, \
           WYRD_VALA_401_INGEST_AUTH, WYRD_VALA_401_PRINCIPAL_UNRESOLVED)", body = WyrdProblem),
         (status = 403, description = "The principal may not write this table, or its card scope \
           does not cover the export (WYRD_PERMISSION_403_DENIED_RBAC, \
@@ -335,8 +341,8 @@ async fn export_traces(
          body = WyrdProblem),
         (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
           was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
-        (status = 500, description = "Ingest failed internally, or the decision could not be \
-          audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+        (status = 500, description = "Ingest failed internally \
+          (WYRD_VALA_500_BIFROST_INTERNAL)",
          body = WyrdProblem),
         (status = 503, description = "The writer is unavailable, or no verifier is configured \
           for the access token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \
@@ -432,8 +438,10 @@ async fn export_metrics(
         (status = 400, description = "The export could not be decoded, or an event time fell \
           outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
           WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
-        (status = 401, description = "The request carried no usable access token, or the token \
-          named no resolvable principal (WYRD_AUTH_401_UNAUTHENTICATED, \
+        (status = 401, description = "The request carried no usable access token, its \
+          `x-wyrd-api-key` (accepted on OTLP routes in place of an access token and verified on \
+          every request) is not valid, or the token named no resolvable principal \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_API_KEY_INVALID, \
           WYRD_VALA_401_INGEST_AUTH, WYRD_VALA_401_PRINCIPAL_UNRESOLVED)", body = WyrdProblem),
         (status = 403, description = "The principal may not write this table, or its card scope \
           does not cover the export (WYRD_PERMISSION_403_DENIED_RBAC, \
@@ -448,8 +456,8 @@ async fn export_metrics(
          body = WyrdProblem),
         (status = 429, description = "Ingest is saturated; retry the whole export, none of it \
           was written (WYRD_VALA_429_INGEST_BUSY)", body = WyrdProblem),
-        (status = 500, description = "Ingest failed internally, or the decision could not be \
-          audited (WYRD_VALA_500_BIFROST_INTERNAL, WYRD_VALA_500_AUDIT_UNAVAILABLE)",
+        (status = 500, description = "Ingest failed internally \
+          (WYRD_VALA_500_BIFROST_INTERNAL)",
          body = WyrdProblem),
         (status = 503, description = "The writer is unavailable, or no verifier is configured \
           for the access token (WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE, \

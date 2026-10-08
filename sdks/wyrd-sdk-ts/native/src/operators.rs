@@ -17,7 +17,8 @@ use wyrd_client::operator_connections::{
 };
 use wyrd_spec::error::WyrdError;
 
-use crate::{NativeLifecycleResult, NativeWyrdError};
+use crate::NativeLifecycleResult;
+use crate::client::NativeWyrdClient;
 
 /// Decode one serialized JavaScript argument, naming only the argument and
 /// the decode category so a secret value is never echoed; shared by the
@@ -48,45 +49,18 @@ pub struct NativeOperatorConnections {
     connections: OperatorConnections,
 }
 
-/// Closed result of building one Operator connection handle: a handle or a catalog error.
-#[napi(object, object_from_js = false)]
-pub struct NativeOperatorConnectionsConnection {
-    /// Operator connection handle when construction succeeded.
-    pub connections: Option<NativeOperatorConnections>,
-    /// Catalog failure when no credential resolves or the client cannot be built.
-    pub error: Option<NativeWyrdError>,
-}
-
-/// Builds one Operator connection handle without performing IO.
-///
-/// Omitted arguments resolve through the same shared client configuration
-/// chain as `connectCards`.
 #[napi]
-pub fn connect_operator_connections(
-    server_url: Option<String>,
-    credential: Option<String>,
-    tenant: Option<String>,
-) -> NativeOperatorConnectionsConnection {
-    let client = wyrd_client::bifrost::client_from_options(
-        server_url.as_deref(),
-        credential.as_deref(),
-        None,
-        tenant.as_deref(),
-    );
-    drop(server_url);
-    drop(credential);
-    drop(tenant);
-    match client {
-        Ok(client) => NativeOperatorConnectionsConnection {
-            connections: Some(NativeOperatorConnections {
-                connections: OperatorConnections::with_client(client),
-            }),
-            error: None,
-        },
-        Err(error) => NativeOperatorConnectionsConnection {
-            connections: None,
-            error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
-        },
+impl NativeWyrdClient {
+    /// Builds one Operator connection handle that calls the server as this
+    /// client.
+    ///
+    /// No IO happens here; the public TypeScript `OperatorConnections.connect`
+    /// passes the caller's client or the ambient one.
+    #[napi]
+    pub fn operator_connections(&self) -> NativeOperatorConnections {
+        NativeOperatorConnections {
+            connections: OperatorConnections::with_client(self.client.clone()),
+        }
     }
 }
 

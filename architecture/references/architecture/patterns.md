@@ -176,10 +176,8 @@ facade mechanics; bindings must not publish or assemble them as sibling clients.
   transaction without ending it.
 - Cross-tenant operator work uses `OperatorPool` under explicit administrative
   authority and preserves tenant-qualified identities at every durable seam.
-- Card registry writes stay inside the caller's `TenantConn` transaction
-  (enforced by `check:registry-tx-coupling`).
-- Single `wyrd.cards` table; no per-kind shadow tables (enforced by
-  `check:registry-single-table`).
+- Card registry writes stay inside the caller's `TenantConn` transaction.
+- Single `wyrd.cards` table; no per-kind shadow tables.
 - Use local fixtures + emulators for storage tests; real cloud
   integration tests run separately.
 
@@ -250,21 +248,21 @@ transitions that evaluate no permission (Scribe batch commits, Forge
 maintenance, Oracle reader protection) are lineage in their own operational
 tables and are never audit.
 
-Except for the explicitly non-blocking paths named below, every audited
-decision appends through the canonical audit writer in the same transaction as
-the decision, before the operation proceeds or refuses, so both commit or roll
-back together. A decision that cannot be recorded that way fails closed. A
-workflow that evaluates permission more than once records each evaluation at
-its own commit boundary. Do not create parallel audit writers.
+Permissions block; audits do not. Every audited decision, on every surface,
+is staged on the one process audit outbox once the decision is known, outside
+the operation's transaction, and the operation proceeds or refuses without
+waiting for the commit. No request is refused or delayed by an audit write. A
+workflow that evaluates permission more than once stages each evaluation. Do
+not create parallel audit writers.
 
-Oracle read decisions, tenant tripwires, and gateway invocation decisions are
-the named exceptions. They use that same canonical append from a tracked,
-non-blocking task, so the decision's own latency does not depend on the write
-and an otherwise authorized call is not refused when it is slow. Abrupt
-process loss can lose an uncommitted event on those paths; no other audit
-table, WAL, relay, or log sink exists to prevent it. Gateway *administration*
-is not in this set: submitting, rotating, revoking, and deleting a credential
-stay transactional and fail closed.
+The outbox commits each tenant's decisions in order through the canonical
+append. A failed commit is retried at the front of its tenant's queue with
+backoff, never dropped, and only after Postgres transaction status confirms
+the earlier commit aborted, so a retry never stages a decision twice. A
+decision is lost only at abrupt process loss, when graceful shutdown reaches
+its deadline with it unwritten, or when Postgres no longer holds the status of
+its failed commit; no other audit table, WAL, relay, or log sink exists to
+prevent that.
 
 `vala.audit_staging` is transient write-ahead state with no external consumer.
 Contiguous, tenant-scoped ranges are projected idempotently into retained

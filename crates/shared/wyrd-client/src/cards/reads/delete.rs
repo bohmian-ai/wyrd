@@ -52,6 +52,7 @@ pub(crate) async fn delete(
         }
     };
     let _response: DeleteCardResponse = client
+        .http
         .request_json(reqwest::Method::DELETE, &path, None::<&()>)
         .await?;
     Ok(())

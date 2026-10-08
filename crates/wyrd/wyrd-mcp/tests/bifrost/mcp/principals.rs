@@ -298,7 +298,7 @@ mod pg_tests {
 
         // Listing an unknown principal is the stable, non-enumerating refusal,
         // and the permission it evaluated is still recorded.
-        let superuser = server.pg_fixture().superuser_pool().await?;
+        let superuser = server.pg_fixture().superuser_pool()?;
         let listed_decisions = || async {
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM vala.audit_staging
@@ -307,6 +307,9 @@ mod pg_tests {
             .fetch_one(&superuser)
             .await
         };
+        server
+            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await?;
         let before = listed_decisions().await?;
         let unknown = admin_client
             .call_tool(
@@ -326,6 +329,9 @@ mod pg_tests {
             rendered.contains("NOT_FOUND"),
             "an unknown principal is refused as not found: {rendered}"
         );
+        server
+            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await?;
         assert_eq!(
             listed_decisions().await?,
             before + 1,

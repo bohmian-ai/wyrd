@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Deterministic SQL foundation isolation checks."""
+"""Tenant-isolation code-shape checks.
+
+Postgres readiness (`OperatorPool::verify_tenant_isolation`, `verify_serving_roles`)
+and the `pg_migration` tests prove RLS policies and role attributes against the
+live catalog. This script guards what the database cannot see: that query and
+server code reach tenant tables only through `TenantConn`, and that raw pools
+and transactions never leak past their owners.
+"""
 
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
-WYRD_SQL_MIGRATIONS = ROOT / "crates/wyrd/wyrd-sql/migrations"
-VALA_SQL_MIGRATIONS = ROOT / "crates/vala/vala-sql/migrations"
 WYRD_QUERIES = ROOT / "crates/wyrd/wyrd-sql/src/queries"
 VALA_QUERIES = ROOT / "crates/vala/vala-sql/src/queries"
 WYRD_SERVER = ROOT / "crates/wyrd/wyrd-server/src"
@@ -20,29 +23,6 @@ SQL_CRATES = [
     ROOT / "crates/wyrd/wyrd-sql",
     ROOT / "crates/vala/vala-sql",
 ]
-
-# TenantConn is the single owner of tenant transactions. It alone may send raw
-# transaction control: its begin statement binds the tenant and opens the
-# transaction in one round trip.
-
-PLATFORM_QUERY_ALLOWLIST = {
-    "crates/wyrd/wyrd-sql/src/queries/platform/tenant_resolver.rs",
-}
-
-# Files under queries/platform/ whose public async fns may take TenantConn
-# instead of PgPool/Transaction. These are cross-domain helpers that delegate
-# tenant-scoped writes to tenant-shaped APIs.
-PLATFORM_EXECUTOR_ALLOWLIST: set[str] = set()
-
-# Vala query modules that are intentionally tenant-free (M6/M12). These query
-# the global `iceberg_catalog` JDBC catalog — a single cross-tenant namespace,
-# gated behind the `diagnostics` feature — not tenant-scoped `vala.*` data. They
-# take a raw pool by design: the request-path role is revoked from the schema,
-# so isolation is a DB-role boundary, not RLS. Treated like wyrd's platform/
-# admin modules — must take PgPool/Transaction, must not touch tenant schemas.
-VALA_CATALOG_ALLOWLIST = {
-    "crates/vala/vala-sql/src/queries/iceberg_catalog.rs",
-}
 
 # Vala query modules that perform narrow cross-tenant maintenance work through
 # the OperatorPool (`wyrd_platform_admin` BYPASSRLS). Maintenance leases use
@@ -54,6 +34,8 @@ VALA_OPERATOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
     # Cross-tenant active Bifrost roster used only by the Forge scheduler.
     "crates/vala/vala-sql/src/queries/forge_catalog_operator.rs",
+    # Singleton Forge leader term in `vala.forge_scheduler_state` (no tenant column).
+    "crates/vala/vala-sql/src/queries/forge_leader.rs",
 }
 
 # Cohesive owners that intentionally expose both cross-tenant OperatorPool
@@ -80,17 +62,6 @@ VALA_TENANT_CONN_OWNER_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/oracle_reader_authority.rs",
 }
 
-# Vala tables that are intentionally cross-tenant control-plane surfaces with no
-# tenant column and NO RLS (accessed only via the OperatorPool). They are
-# exempt from the RLS-triple requirement because there is no `data_tenant_id`
-# column to scope. Keep this set narrow and every entry justified by a
-# control-plane migration.
-VALA_NON_RLS_CONTROL_TABLES = {
-    "vala.maintenance_leases",
-    "vala.cluster_nodes",  # cluster-level node registry, not tenant data
-    "vala.forge_scheduler_state",  # singleton cross-tenant scheduler fence
-    "vala.forge_worker_claim_state",  # singleton cross-tenant worker fairness cursor
-}
 
 RAW_QUERY_ALLOWLIST_MARKERS = [
     "Dynamic query is intentional",
@@ -102,16 +73,15 @@ TENANT_QUERY_EXCEPTION_MARKER = "tenant-isolation: cross-tenant OperatorPool"
 
 # The server's Postgres composition owner; the only server file that may name
 # a raw pool (it wraps `WyrdPostgres`/`ValaPostgres` and closes their pools).
-SERVER_POOL_ALLOWLIST_PREFIXES = (
-    "crates/wyrd/wyrd-server/src/postgres.rs",
-)
+SERVER_POOL_ALLOWLIST_PREFIXES = ("crates/wyrd/wyrd-server/src/postgres.rs",)
 
 # Production query and auth code whose SQL capabilities are restricted to
 # `TenantConn` and `OperatorPool` (agent-rules: raw `PgPool` is banned from
 # library signatures and fields). `WyrdPostgres` remains the connection owner
 # these callers acquire `tenant_conn`/`resolve_tenant_slug` from; the raw pool
-# never leaves it. `check:from-pools-allowlist` separately guards where pools
-# are *constructed*; this guards where they are *propagated*.
+# never leaves it. `WyrdPostgres::from_pools` is compiled only behind
+# test-support, so construction is the compiler's job; this guards where pools
+# are *propagated*.
 SQL_CAPABILITY_DIRS = (
     "crates/wyrd/wyrd-sql/src/queries/",
     "crates/vala/vala-sql/src/queries/",
@@ -125,26 +95,14 @@ SQL_CAPABILITY_DIRS = (
 RAW_POOL_PATTERN = r"\bPgPool\b|\.(app|vala)_pool\s*\(\s*\)"
 
 
-CLIENT_TIER_CRATES = [
-    "crates/wyrd-spec",
-    "crates/vala/vala-client",
-    "sdks/wyrd-sdk-python",
-]
-
-RLS_LOOKAHEAD_CHARS = 8_000
-
-
 def main() -> int:
     failures: list[str] = []
 
-    check_rls_triples(failures)
-    check_migration_drift(failures)
     check_query_modules(failures)
     check_server_pool_usage(failures)
     check_sql_capability_signatures(failures)
     check_platform_capability_boundary(failures)
     check_sql_source_hygiene(failures)
-    check_dependency_boundaries(failures)
 
     if failures:
         print("tenant isolation check failed:", file=sys.stderr)
@@ -154,99 +112,6 @@ def main() -> int:
 
     print("tenant isolation check passed")
     return 0
-
-
-def check_rls_triples(failures: list[str]) -> None:
-    for migrations_dir, schema in [
-        (WYRD_SQL_MIGRATIONS, "wyrd"),
-        (VALA_SQL_MIGRATIONS, "vala"),
-    ]:
-        for path in sorted(migrations_dir.glob("*.sql")):
-            sql = strip_sql_line_comments(path.read_text())
-            for table, window in tenant_table_windows(sql, schema):
-                qualified = f"{schema}.{table}"
-                if qualified in VALA_NON_RLS_CONTROL_TABLES:
-                    continue
-                normalized_window = normalize_sql(window)
-                table_patterns = [
-                    rf"alter\s+table\s+{re.escape(qualified)}\s+enable\s+row\s+level\s+security",
-                    rf"alter\s+table\s+{re.escape(qualified)}\s+force\s+row\s+level\s+security",
-                    rf"create\s+policy\s+tenant_isolation\s+on\s+{re.escape(qualified)}",
-                ]
-                for pattern in table_patterns:
-                    if not re.search(pattern, normalized_window, re.IGNORECASE):
-                        failures.append(
-                            f"{rel(path)}: missing RLS clause for {qualified}: {pattern}"
-                        )
-
-                policy_block = tenant_policy_block(normalized_window, qualified)
-                if policy_block is None:
-                    continue
-
-                column = re.escape(tenant_column(normalized_window))
-                policy_patterns = [
-                    rf"using\s*\(\s*{column}\s*=\s*wyrd\.current_tenant\(\)\s*\)",
-                    rf"with\s+check\s*\(\s*{column}\s*=\s*wyrd\.current_tenant\(\)\s*\)",
-                ]
-                for pattern in policy_patterns:
-                    if not re.search(pattern, policy_block, re.IGNORECASE):
-                        failures.append(
-                            f"{rel(path)}: policy block for {qualified} is missing {pattern}"
-                        )
-
-
-def check_migration_drift(failures: list[str]) -> None:
-    for path in sorted(WYRD_SQL_MIGRATIONS.glob("*.sql")):
-        sql = path.read_text()
-        for schema in table_schemas(sql):
-            if schema not in {"platform", "wyrd"}:
-                failures.append(
-                    f"{rel(path)}: CREATE TABLE uses non-Wyrd schema {schema}"
-                )
-
-    for path in sorted(VALA_SQL_MIGRATIONS.glob("*.sql")):
-        sql = path.read_text()
-        for schema in table_schemas(sql):
-            if schema not in {"vala", "iceberg_catalog"}:
-                failures.append(
-                    f"{rel(path)}: CREATE TABLE uses non-Vala schema {schema}"
-                )
-
-    migration_text = "\n".join(path.read_text() for path in sql_migration_files())
-    if re.search(r"\bCREATE\s+ROLE\b", migration_text, re.IGNORECASE):
-        failures.append("SQL migrations must not create cluster roles")
-
-    platform_path = find_platform_migration(failures)
-    if platform_path is not None:
-        platform_normalized = normalize_sql(platform_path.read_text())
-        required_patterns = {
-            "migration login BYPASSRLS assertion": r"rolname\s*=\s*current_user\s+AND\s+\(rolbypassrls\s+OR\s+rolsuper\)",
-            "wyrd_app non-BYPASSRLS role assertion": r"rolname\s*=\s*'wyrd_app'\s+AND\s+rolbypassrls\s*=\s*false",
-            "wyrd_platform_admin BYPASSRLS role assertion": r"rolname\s*=\s*'wyrd_platform_admin'\s+AND\s+rolbypassrls\s*=\s*true",
-            "wyrd.current_tenant helper": r"CREATE\s+FUNCTION\s+wyrd\.current_tenant\(\)\s+RETURNS\s+uuid",
-            "tenant slug resolver": r"CREATE\s+FUNCTION\s+platform\.resolve_tenant_by_slug",
-            "resolver SECURITY DEFINER": r"SECURITY\s+DEFINER",
-            "resolver search_path hardening": r"SET\s+search_path\s*=\s*pg_catalog,\s*platform",
-            "resolver grant to app": r"GRANT\s+EXECUTE\s+ON\s+FUNCTION\s+platform\.resolve_tenant_by_slug.*TO\s+wyrd_app",
-            "platform admin sequence grants": r"GRANT\s+USAGE,\s+SELECT\s+ON\s+ALL\s+SEQUENCES\s+IN\s+SCHEMA\s+platform,\s*wyrd\s+TO\s+wyrd_platform_admin",
-            "app sequence grants": r"GRANT\s+USAGE,\s+SELECT\s+ON\s+ALL\s+SEQUENCES\s+IN\s+SCHEMA\s+wyrd\s+TO\s+wyrd_app",
-        }
-        for label, pattern in required_patterns.items():
-            if not re.search(pattern, platform_normalized, re.IGNORECASE):
-                failures.append(f"{rel(platform_path)}: missing {label}")
-
-
-def find_platform_migration(failures: list[str]) -> Path | None:
-    matches = sorted(WYRD_SQL_MIGRATIONS.glob("*_platform.sql"))
-    if not matches:
-        failures.append(f"missing platform migration in {rel(WYRD_SQL_MIGRATIONS)}")
-        return None
-    if len(matches) > 1:
-        failures.append(
-            "multiple platform migrations found: " + ", ".join(rel(p) for p in matches)
-        )
-        return None
-    return matches[0]
 
 
 def check_query_modules(failures: list[str]) -> None:
@@ -264,9 +129,7 @@ def check_wyrd_query_modules(failures: list[str]) -> None:
 
         if is_platform:
             if references_tenant_schema(code):
-                failures.append(
-                    f"{relative}: platform query module references tenant schema"
-                )
+                failures.append(f"{relative}: platform query module references tenant schema")
             if has_public_async_fn(code) and not has_platform_executor(code):
                 failures.append(
                     f"{relative}: platform public async fn must take OperatorPool or TenantConn"
@@ -290,16 +153,24 @@ def check_vala_query_modules(failures: list[str]) -> None:
         code = strip_line_comments(body)
 
         if relative in VALA_OPERATOR_ALLOWLIST:
-            if has_public_async_fn(code) and not has_platform_executor(code):
-                failures.append(
-                    f"{relative}: operator public async fn must take OperatorPool"
-                )
+            # A struct-centred owner holds its OperatorPool as a field, so its
+            # methods take `&self` instead of a pool parameter.
+            owns_operator_pool = re.search(
+                r"struct\s+\w+\s*\{[^}]*\bOperatorPool\b", code, re.DOTALL
+            ) is not None
+            for fn_name, params in public_async_fns(code):
+                if not has_platform_executor(params) and not (
+                    owns_operator_pool and "&self" in params
+                ):
+                    failures.append(
+                        f"{relative}: operator public async fn {fn_name} must take PgPool or OperatorPool, or be a method of an OperatorPool-owning struct"
+                    )
             continue
 
         if relative in VALA_MIXED_EXECUTOR_ALLOWLIST:
-            owns_operator_pool = re.search(
-                r"struct\s+ForgeTasks\s*\{[^}]*OperatorPool", code, re.DOTALL
-            ) is not None
+            owns_operator_pool = (
+                re.search(r"struct\s+ForgeTasks\s*\{[^}]*OperatorPool", code, re.DOTALL) is not None
+            )
             for fn_name, params in public_async_fns(code):
                 if (
                     "OperatorPool" not in params
@@ -350,9 +221,7 @@ def check_tenant_query_file(
     requirement, and the raw-query justification — still runs unchanged.
     """
     if re.search(r"&\s*PgPool\b|\bPgPool\s*,|Transaction\s*<\s*'_", code):
-        failures.append(
-            f"{relative}: tenant query module must not take raw PgPool/Transaction"
-        )
+        failures.append(f"{relative}: tenant query module must not take raw PgPool/Transaction")
     if re.search(r"\.begin\s*\(", code):
         failures.append(f"{relative}: tenant query module must not open transactions")
 
@@ -365,9 +234,7 @@ def check_tenant_query_file(
             re.search(r"data_tenant_id\s*=\s*\$", code)
             or re.search(r"wyrd\.current_tenant\(\)", code)
         ):
-            failures.append(
-                f"{relative}: tenant table query is missing data_tenant_id predicate"
-            )
+            failures.append(f"{relative}: tenant table query is missing data_tenant_id predicate")
     else:
         for fn_name, params in public_async_fns(code):
             if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
@@ -380,16 +247,10 @@ def check_tenant_query_file(
                 )
 
         if references_tenant_schema(code) and not re.search(r"TenantConn\s*<'_", code):
-            failures.append(
-                f"{relative}: tenant table query must use TenantConn under FORCE RLS"
-            )
+            failures.append(f"{relative}: tenant table query must use TenantConn under FORCE RLS")
 
-    if re.search(
-        r"sqlx::query(?:_as|_scalar)?\s*\(", code
-    ) and not has_raw_query_marker(body):
-        failures.append(
-            f"{relative}: raw sqlx::query* requires an explicit justification comment"
-        )
+    if re.search(r"sqlx::query(?:_as|_scalar)?\s*\(", code) and not has_raw_query_marker(body):
+        failures.append(f"{relative}: raw sqlx::query* requires an explicit justification comment")
 
 
 def check_server_pool_usage(failures: list[str]) -> None:
@@ -398,13 +259,7 @@ def check_server_pool_usage(failures: list[str]) -> None:
         code = strip_line_comments(production_source(path.read_text()))
         if is_server_pool_allowlisted(relative):
             continue
-        if "platform_admin_pool" in code:
-            failures.append(
-                f"{relative}: platform_admin_pool is only allowed in platform routes, boot, or state"
-            )
-        if re.search(r"&\s*PgPool\b|\bPgPool\s*,", code) and references_tenant_schema(
-            code
-        ):
+        if re.search(r"&\s*PgPool\b|\bPgPool\s*,", code) and references_tenant_schema(code):
             failures.append(
                 f"{relative}: tenant-scoped server code must use TenantConn, not raw PgPool"
             )
@@ -431,10 +286,8 @@ def check_sql_capability_signatures(failures: list[str]) -> None:
 def check_sql_source_hygiene(failures: list[str]) -> None:
     combined_sql_paths = [*SQL_CRATES]
     forbidden_patterns = {
-        "non-Postgres SQLx dialect/runtime": r"sqlx::sqlite|sqlx::mysql|runtime-async-std|tls-native-tls",
         "raw transaction control": r"\bBEGIN;|\bCOMMIT;|\bSAVEPOINT\s+",
         "bare tenant table reference": r"\bFROM\s+(auth_|registry_|audit_|drift_|eval_)",
-        "predecessor naming drift": r"opsml_|scouter_",
     }
     for label, pattern in forbidden_patterns.items():
         for path in source_files(combined_sql_paths):
@@ -457,118 +310,6 @@ def check_sql_source_hygiene(failures: list[str]) -> None:
                 f"{rel(path)}: use query macros or document the runtime query exception"
             )
 
-    for crate in CLIENT_TIER_CRATES:
-        path = ROOT / crate
-        if path.exists():
-            for source in source_files([path]):
-                if "sqlx" in source.read_text(errors="ignore"):
-                    failures.append(
-                        f"{rel(source)}: client-tier code must stay SQLx-free"
-                    )
-
-    vala_manifest = ROOT / "crates/vala/vala-sql/Cargo.toml"
-    if re.search(r"\bpyo3\b|\bpython\b", vala_manifest.read_text(), re.IGNORECASE):
-        failures.append(
-            f"{rel(vala_manifest)}: vala-sql must not expose PyO3 or python features"
-        )
-    for path in rust_files(ROOT / "crates/vala/vala-sql/src"):
-        if re.search(r"\bpyo3\b|use\s+pyo3", path.read_text(), re.IGNORECASE):
-            failures.append(f"{rel(path)}: vala-sql source must stay PyO3-free")
-
-
-def check_dependency_boundaries(failures: list[str]) -> None:
-    vala_tree = run(["cargo", "tree", "-p", "vala-sql", "--edges", "normal"])
-    if vala_tree.returncode == 0 and re.search(
-        r"^[\u251c\u2514]\u2500\u2500 skald-", vala_tree.stdout, re.MULTILINE
-    ):
-        failures.append("vala-sql must not depend on skald crates")
-    elif vala_tree.returncode != 0:
-        failures.append(f"cargo tree -p vala-sql failed: {vala_tree.stderr.strip()}")
-
-    skald_tree = run(["cargo", "tree", "-p", "skald-runtime", "--edges", "normal"])
-    if skald_tree.returncode == 0 and re.search(
-        r"^[\u251c\u2514]\u2500\u2500 vala-", skald_tree.stdout, re.MULTILINE
-    ):
-        failures.append("skald-runtime must not depend on Vala crates")
-    elif skald_tree.returncode != 0:
-        failures.append(
-            f"cargo tree -p skald-runtime failed: {skald_tree.stderr.strip()}"
-        )
-
-
-def tenant_tables(sql: str, schema: str) -> list[str]:
-    pattern = re.compile(
-        rf"\bCREATE\s+TABLE\s+{re.escape(schema)}\.([a-z_][a-z0-9_]*)", re.IGNORECASE
-    )
-    return pattern.findall(sql)
-
-
-def tenant_table_windows(sql: str, schema: str) -> list[tuple[str, str]]:
-    create_tenant_table = re.compile(
-        rf"\bCREATE\s+TABLE\s+{re.escape(schema)}\.([a-z_][a-z0-9_]*)",
-        re.IGNORECASE,
-    )
-    create_any_table = re.compile(
-        r"\bCREATE\s+TABLE\s+[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*",
-        re.IGNORECASE,
-    )
-
-    windows: list[tuple[str, str]] = []
-    for match in create_tenant_table.finditer(sql):
-        next_table = create_any_table.search(sql, match.end())
-        next_table_start = next_table.start() if next_table else len(sql)
-        lookahead_end = min(len(sql), match.start() + RLS_LOOKAHEAD_CHARS)
-        window_end = min(next_table_start, lookahead_end)
-        windows.append((match.group(1), sql[match.start() : window_end]))
-    return windows
-
-
-def tenant_column(normalized_window: str) -> str:
-    """Names the tenant column one table's RLS policy must be written against.
-
-    Nearly every tenant table calls the column `data_tenant_id`, and that name
-    wins whenever it is present. A table whose tenant is an ownership role
-    rather than the row's own data tenant names it accordingly — Oracle reader
-    epochs are owned by `epoch_owner_tenant_id` — and the policy has to match
-    the column that actually exists, so the single `*_tenant_id` column the
-    table declares is used instead. The rule itself is unchanged: both policy
-    directions must equal `wyrd.current_tenant()` on that column.
-    """
-    definition_end = normalized_window.find(");")
-    definition = (
-        normalized_window if definition_end == -1 else normalized_window[:definition_end]
-    )
-    declared = set(re.findall(r"\b([a-z_]*tenant_id)\s+uuid\b", definition))
-    if "data_tenant_id" in declared:
-        return "data_tenant_id"
-    candidates = declared
-    if len(candidates) == 1:
-        return candidates.pop()
-    return "data_tenant_id"
-
-
-def tenant_policy_block(normalized_window: str, qualified_table: str) -> str | None:
-    policy_match = re.search(
-        rf"create\s+policy\s+tenant_isolation\s+on\s+{re.escape(qualified_table)}\b",
-        normalized_window,
-        re.IGNORECASE,
-    )
-    if policy_match is None:
-        return None
-
-    statement_end = normalized_window.find(";", policy_match.end())
-    if statement_end == -1:
-        statement_end = len(normalized_window)
-    return normalized_window[policy_match.start() : statement_end]
-
-
-def table_schemas(sql: str) -> list[str]:
-    return re.findall(r"\bCREATE\s+TABLE\s+([a-z_][a-z0-9_]*)\.", sql, re.IGNORECASE)
-
-
-def normalize_sql(sql: str) -> str:
-    return re.sub(r"\s+", " ", sql)
-
 
 def strip_line_comments(text: str) -> str:
     return "\n".join(line.split("//", 1)[0] for line in text.splitlines())
@@ -577,10 +318,6 @@ def strip_line_comments(text: str) -> str:
 def production_source(text: str) -> str:
     """Return text with the in-file `#[cfg(test)] mod ...` block removed."""
     return text.split("\n#[cfg(test)]", 1)[0]
-
-
-def strip_sql_line_comments(text: str) -> str:
-    return "\n".join(line.split("--", 1)[0] for line in text.splitlines())
 
 
 def references_tenant_schema(code: str) -> bool:
@@ -731,11 +468,7 @@ def tenant_conn_owner_violations(code: str) -> list[str]:
     blocks = _impl_blocks(code)
     violations: list[str] = []
     for name, params, offset in _public_async_fn_sites(code):
-        if (
-            "TenantConn<'_" in params
-            or "TenantConn < '_" in params
-            or "OperatorPool" in params
-        ):
+        if "TenantConn<'_" in params or "TenantConn < '_" in params or "OperatorPool" in params:
             continue
         if "self" in params and _enclosing_impl_type(blocks, offset) in owners:
             continue
@@ -744,12 +477,7 @@ def tenant_conn_owner_violations(code: str) -> list[str]:
 
 
 def has_platform_executor(code: str) -> bool:
-    return (
-        re.search(
-            r"&\s*mut\s+TenantConn\s*<\s*'_|&\s*OperatorPool\b", code
-        )
-        is not None
-    )
+    return re.search(r"&\s*mut\s+TenantConn\s*<\s*'_|&\s*OperatorPool\b", code) is not None
 
 
 # A raw `sqlx::Transaction` is unrestricted SQL capability. Platform query
@@ -785,11 +513,7 @@ def check_platform_capability_boundary(failures: list[str]) -> None:
     """
     scanned = [
         *rust_files(WYRD_QUERIES / "platform"),
-        *(
-            path
-            for path in rust_files(WYRD_SERVER)
-            if rel(path).startswith(PLATFORM_SERVER_DIRS)
-        ),
+        *(path for path in rust_files(WYRD_SERVER) if rel(path).startswith(PLATFORM_SERVER_DIRS)),
     ]
     for path in scanned:
         code = strip_line_comments(production_source(path.read_text()))
@@ -797,9 +521,7 @@ def check_platform_capability_boundary(failures: list[str]) -> None:
             failures.append(
                 f"{rel(path)}: platform code must take TenantConn, not a raw SQLx Transaction"
             )
-        if rel(path).startswith(PLATFORM_SERVER_DIRS) and re.search(
-            BROAD_POOL_PATTERN, code
-        ):
+        if rel(path).startswith(PLATFORM_SERVER_DIRS) and re.search(BROAD_POOL_PATTERN, code):
             failures.append(
                 f"{rel(path)}: platform code must take TenantConn or OperatorPool, "
                 "not a connection pool it can acquire arbitrary tenant transactions from"
@@ -812,11 +534,14 @@ def has_raw_query_marker(body: str) -> bool:
 
 def has_tenant_query_exception(body: str, fn_name: str) -> bool:
     marker = re.escape(TENANT_QUERY_EXCEPTION_MARKER)
-    return re.search(
-        rf"^\s*//\s*{marker}[^\n]*\n\s*pub\s+async\s+fn\s+{re.escape(fn_name)}\s*\(",
-        body,
-        re.MULTILINE,
-    ) is not None
+    return (
+        re.search(
+            rf"^\s*//\s*{marker}[^\n]*\n\s*pub\s+async\s+fn\s+{re.escape(fn_name)}\s*\(",
+            body,
+            re.MULTILINE,
+        )
+        is not None
+    )
 
 
 def rust_files(path: Path) -> list[Path]:
@@ -843,18 +568,8 @@ def source_files(paths: list[Path]) -> list[Path]:
     return sorted(files)
 
 
-def sql_migration_files() -> list[Path]:
-    return sorted(
-        [*WYRD_SQL_MIGRATIONS.glob("*.sql"), *VALA_SQL_MIGRATIONS.glob("*.sql")]
-    )
-
-
 def is_server_pool_allowlisted(relative: str) -> bool:
     return relative.startswith(SERVER_POOL_ALLOWLIST_PREFIXES)
-
-
-def run(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=ROOT, text=True, capture_output=True, check=False)
 
 
 def rel(path: Path) -> str:

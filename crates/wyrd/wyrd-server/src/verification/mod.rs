@@ -9,21 +9,26 @@
 //! runtime holds no process-local registry, so any process may crash and
 //! another reclaims its leases.
 
+pub mod authority;
+mod cache;
 mod claims;
+pub mod direct;
 pub mod drift;
 pub mod engines;
 pub mod eval;
+#[cfg(feature = "test-support")]
+pub mod fault;
 pub mod fitter;
 pub mod health;
+mod leases;
 pub mod observations;
 pub mod operators;
 pub mod permits;
-pub mod publisher;
 pub mod results;
 pub mod runner;
 pub mod scheduler;
+pub mod telemetry;
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,13 +41,11 @@ use wyrd_sql::queries::verifier_runs::VerifierRunQueue;
 use crate::state::AppState;
 
 use self::drift::DriftEngine;
+#[cfg(feature = "test-support")]
+use self::fault::PublicationFault;
 use self::fitter::BaselineFitter;
 use self::health::{RuntimeCapability, VerificationHealth};
 use self::operators::{OperatorDelivery, OperatorWorker, ProviderEndpoints};
-use self::permits::VerifierPermits;
-#[cfg(feature = "test-support")]
-use self::publisher::PublicationFault;
-use self::publisher::ResultPublisher;
 #[cfg(feature = "test-support")]
 use self::runner::EngineScript;
 use self::runner::{VerifierEngines, VerifierRunner};
@@ -51,19 +54,17 @@ use self::scheduler::VerificationScheduler;
 /// Bounds every runtime loop, lease, and drain obeys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeLimits {
-    /// Process-wide ceiling of concurrent Verifier executions.
-    pub global_permits: usize,
-    /// Ceiling of concurrent executions for one tenant.
-    pub tenant_permits: usize,
-    /// How long one claim holds a run before another process may reclaim it.
-    ///
-    /// Must exceed `execution_timeout + publication_timeout`, so a live
-    /// attempt always settles before its lease can be reclaimed.
+    /// Process-wide ceiling of concurrent Operator deliveries.
+    pub operator_global_permits: usize,
+    /// Ceiling of concurrent Operator deliveries for one tenant.
+    pub operator_tenant_permits: usize,
+    /// How long one claim or renewal holds a run before another process may
+    /// reclaim it. The runner renews a live run's lease once a third of it
+    /// has passed, so a run outlives its lease only when its process stops
+    /// renewing.
     pub lease: Duration,
     /// Deadline of one engine execution; exceeding it settles `timed_out`.
     pub execution_timeout: Duration,
-    /// Deadline of one result publication attempt; exceeding it retries.
-    pub publication_timeout: Duration,
     /// How long shutdown waits for in-flight runs and baseline fits before
     /// releasing them.
     pub drain_grace: Duration,
@@ -98,30 +99,29 @@ pub struct RuntimeLimits {
 }
 
 impl Default for RuntimeLimits {
-    /// Production bounds: 16 global and 4 per-tenant executions, a ten-minute
-    /// lease over a five-minute execution and one-minute publication, a
+    /// Production bounds: 16 process-wide and 4 per-tenant Operator deliveries, a ten-minute
+    /// renewed lease over a five-minute execution, a
     /// thirty-second drain, Eval traces polled every five seconds for up to
     /// five minutes, and a five-minute rewrap interval whose passes stop after
     /// two minutes and thirty seconds per tenant.
     fn default() -> Self {
         Self {
-            global_permits: 16,
-            tenant_permits: 4,
-            lease: Duration::from_secs(600),
-            execution_timeout: Duration::from_secs(300),
-            publication_timeout: Duration::from_secs(60),
+            operator_global_permits: 16,
+            operator_tenant_permits: 4,
+            lease: Duration::from_mins(10),
+            execution_timeout: Duration::from_mins(5),
             drain_grace: Duration::from_secs(30),
             poll_interval: Duration::from_secs(1),
             restart_backoff: Duration::from_secs(1),
             trace_poll: Duration::from_secs(5),
-            trace_deadline: Duration::from_secs(300),
+            trace_deadline: Duration::from_mins(5),
             operator_attempts: 3,
-            operator_deadline: Duration::from_secs(300),
+            operator_deadline: Duration::from_mins(5),
             operator_lease: Duration::from_secs(45),
             operator_attempt_timeout: Duration::from_secs(30),
-            operator_backoff: [Duration::from_secs(30), Duration::from_secs(120)],
-            rewrap_interval: Duration::from_secs(300),
-            rewrap_pass_budget: Duration::from_secs(120),
+            operator_backoff: [Duration::from_secs(30), Duration::from_mins(2)],
+            rewrap_interval: Duration::from_mins(5),
+            rewrap_pass_budget: Duration::from_mins(2),
             rewrap_tenant_budget: Duration::from_secs(30),
         }
     }
@@ -227,7 +227,6 @@ impl VerificationRuntime {
             state,
             limits: RuntimeLimits::default(),
             providers: None,
-            ingest_endpoint: None,
             endpoints: ProviderEndpoints::default(),
             #[cfg(feature = "test-support")]
             publication_fault: None,
@@ -304,14 +303,12 @@ impl VerificationRuntime {
 /// Composes a [`VerificationRuntime`] from server state and wiring choices.
 pub struct VerificationRuntimeBuilder<'a> {
     /// Server state supplying the Wyrd Postgres owner, the operator pool,
-    /// the token issuer, and health.
+    /// the capture writer, and health.
     state: &'a AppState,
     /// Runtime bounds.
     limits: RuntimeLimits,
-    /// Model providers Eval judges call; the process default when `None`.
+    /// Model providers Eval judges call; the state's judge providers when `None`.
     providers: Option<Arc<skald_runtime::ProviderRegistry>>,
-    /// Scribe-bearing gRPC endpoint results are published through.
-    ingest_endpoint: Option<String>,
     /// Slack and PagerDuty endpoints Operators deliver to.
     endpoints: ProviderEndpoints,
     /// Test-only publication faults.
@@ -333,42 +330,11 @@ impl VerificationRuntimeBuilder<'_> {
         self
     }
 
-    /// Judge Eval runs through `providers` instead of the process default
-    /// registry built from the environment.
+    /// Judge Eval runs through `providers` instead of the state's
+    /// [`judge_providers`](AppState::judge_providers).
     #[must_use]
     pub fn providers(mut self, providers: Arc<skald_runtime::ProviderRegistry>) -> Self {
         self.providers = Some(providers);
-        self
-    }
-
-    /// Publish results through `endpoint`, a Scribe-bearing gRPC URL.
-    #[must_use]
-    pub fn ingest_endpoint(mut self, endpoint: String) -> Self {
-        self.ingest_endpoint = Some(endpoint);
-        self
-    }
-
-    /// Publish results through this process's own gRPC listener at `addr`.
-    ///
-    /// Applies only when no explicit endpoint was configured and this process
-    /// hosts a Scribe; the listener is always plaintext because public TLS
-    /// terminates at the edge. Otherwise the runner stays uncomposed unless an
-    /// explicit endpoint is set.
-    #[must_use]
-    pub fn local_ingest(mut self, addr: Option<SocketAddr>) -> Self {
-        if self.ingest_endpoint.is_none()
-            && self.state.bifrost_ingest().is_some()
-            && let Some(mut addr) = addr
-        {
-            if addr.ip().is_unspecified() {
-                addr.set_ip(if addr.is_ipv4() {
-                    Ipv4Addr::LOCALHOST.into()
-                } else {
-                    Ipv6Addr::LOCALHOST.into()
-                });
-            }
-            self.ingest_endpoint = Some(format!("http://{addr}"));
-        }
         self
     }
 
@@ -380,7 +346,7 @@ impl VerificationRuntimeBuilder<'_> {
         self
     }
 
-    /// Inject test-only publication faults.
+    /// Write results through `fault` wrapped around this pod's own Scribe.
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn publication_fault(mut self, fault: PublicationFault) -> Self {
@@ -409,12 +375,12 @@ impl VerificationRuntimeBuilder<'_> {
     ///
     /// The scheduler and the Drift baseline fitter need the operator pool;
     /// the fitter also reads Data Card artifacts from server storage. The
-    /// runner additionally needs the tenant token issuer and an ingest
-    /// endpoint, and reads Drift observations through the ordinary query
-    /// service, local or peer-forwarded; without the issuer or endpoint it is not
-    /// composed and therefore not required, so health is not degraded by an
-    /// intentionally absent capability. Every composed capability is marked
-    /// required on the shared health.
+    /// runner additionally needs the process's capture writer to reach a
+    /// Scribe, in-process or over the peer plane, and reads its inputs through
+    /// the ordinary query service, local or peer-forwarded; without a
+    /// reachable Scribe it is not composed and therefore not required, so
+    /// health is not degraded by an intentionally absent capability. Every
+    /// composed capability is marked required on the shared health.
     #[must_use]
     pub fn build(self) -> Option<VerificationRuntime> {
         let Some(operator) = self.state.postgres.operator_pool() else {
@@ -434,15 +400,10 @@ impl VerificationRuntimeBuilder<'_> {
             Some(crash) => scheduler.with_crash(crash.clone()),
             None => scheduler,
         };
-        let permits = Arc::new(VerifierPermits::new(
-            self.limits.global_permits,
-            self.limits.tenant_permits,
-        ));
         let fitter = BaselineFitter::new(
             postgres.clone(),
             operator.clone(),
             Arc::clone(&self.state.storage),
-            Arc::clone(&permits),
             &self.limits,
         );
         #[cfg(feature = "test-support")]
@@ -470,56 +431,46 @@ impl VerificationRuntimeBuilder<'_> {
             Capability::Fitter(Arc::new(fitter)),
             Capability::OperatorWorker(Arc::new(worker)),
         ];
-        match (self.state.auth.tenant_issuer(), self.ingest_endpoint) {
-            (Some(issuer), Some(endpoint)) => {
-                let drift = DriftEngine::new(
-                    self.state.clone(),
-                    issuer.clone(),
-                    self.limits.execution_timeout,
-                );
-                let publisher = ResultPublisher::new(postgres.clone(), issuer, endpoint);
-                #[cfg(feature = "test-support")]
-                let publisher = match self.publication_fault {
-                    Some(fault) => publisher.with_fault(fault),
-                    None => publisher,
-                };
-                let runner = VerifierRunner::new(
-                    postgres.clone(),
-                    operator,
-                    queue,
-                    permits,
-                    publisher,
-                    VerifierEngines::new(
-                        drift,
-                        self::eval::EvalEngine::new(
-                            self.state.clone(),
-                            self.providers
-                                .unwrap_or_else(skald_runtime::default_registry),
-                            self.limits.trace_deadline,
-                        ),
+        let writer = Arc::clone(&self.state.gateway_capture);
+        #[cfg(feature = "test-support")]
+        let writer = match (self.publication_fault, self.state.bifrost.scribe()) {
+            (Some(fault), Some(scribe)) => {
+                Arc::new(crate::components::gateway::GatewayCapture::local(Arc::new(
+                    fault.wrap(Arc::clone(scribe.scribe()) as _),
+                )))
+            }
+            _ => writer,
+        };
+        if writer.reaches_scribe() {
+            let runner = VerifierRunner::new(
+                postgres.clone(),
+                operator,
+                queue,
+                writer,
+                VerifierEngines::new(
+                    DriftEngine::new(self.state.clone(), self.limits.execution_timeout),
+                    self::eval::EvalEngine::new(
+                        self.state.clone(),
+                        self.providers
+                            .unwrap_or_else(|| Arc::clone(&self.state.judge_providers)),
+                        self.limits.trace_deadline,
                     ),
-                    self.limits,
-                );
-                #[cfg(feature = "test-support")]
-                let runner = match self.engine_script {
-                    Some(script) => runner.with_engine_script(script),
-                    None => runner,
-                };
-                #[cfg(feature = "test-support")]
-                let runner = match self.crash {
-                    Some(crash) => runner.with_crash(crash),
-                    None => runner,
-                };
-                capabilities.push(Capability::Runner(Arc::new(runner)));
-            }
-            (None, _) => {
-                tracing::warn!("Verifier runner not composed: no tenant token issuer");
-            }
-            (_, None) => {
-                tracing::warn!(
-                    "Verifier runner not composed: no Scribe-bearing ingest endpoint; set verification.ingest_endpoint"
-                );
-            }
+                ),
+                self.limits,
+            );
+            #[cfg(feature = "test-support")]
+            let runner = match self.engine_script {
+                Some(script) => runner.with_engine_script(script),
+                None => runner,
+            };
+            #[cfg(feature = "test-support")]
+            let runner = match self.crash {
+                Some(crash) => runner.with_crash(crash),
+                None => runner,
+            };
+            capabilities.push(Capability::Runner(Arc::new(runner)));
+        } else {
+            tracing::warn!("Verifier runner not composed: this pod reaches no Scribe");
         }
         let health = Arc::clone(&self.state.verification);
         for capability in &capabilities {
@@ -557,6 +508,38 @@ mod tests {
                 .within_server_drain(Duration::from_secs(15))
                 .drain_grace,
             Duration::from_secs(14)
+        );
+    }
+
+    /// Production defaults retain 16 process-wide and 4 per-tenant Operator
+    /// deliveries, a 30-second drain, and Operator
+    /// dispatches of three attempts, each capped at 30 seconds, retried after
+    /// 30 seconds and then two minutes, inside a five-minute deadline.
+    #[test]
+    fn production_defaults_are_the_specified_ceilings() {
+        let limits = RuntimeLimits::default();
+        assert_eq!(
+            (
+                limits.operator_global_permits,
+                limits.operator_tenant_permits
+            ),
+            (16, 4)
+        );
+        assert_eq!(limits.drain_grace, Duration::from_secs(30));
+        assert_eq!(limits.operator_attempts, 3);
+        assert_eq!(limits.operator_attempt_timeout, Duration::from_secs(30));
+        assert_eq!(limits.operator_deadline, Duration::from_mins(5));
+        assert_eq!(
+            [1, 2, 3].map(|attempt| limits.operator_backoff(attempt)),
+            [
+                Duration::from_secs(30),
+                Duration::from_mins(2),
+                Duration::from_mins(2)
+            ]
+        );
+        assert!(
+            limits.operator_lease > limits.operator_attempt_timeout,
+            "a live attempt settles before its lease can be reclaimed"
         );
     }
 }

@@ -590,13 +590,11 @@ impl From<OpenAiUsage> for TokenUsage {
         let cache_read = u
             .prompt_tokens_details
             .as_ref()
-            .map(|details| details.cached_tokens)
-            .unwrap_or(0);
+            .map_or(0, |details| details.cached_tokens);
         let reasoning = u
             .completion_tokens_details
             .as_ref()
-            .map(|details| details.reasoning_tokens)
-            .unwrap_or(0);
+            .map_or(0, |details| details.reasoning_tokens);
         Self {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
@@ -850,7 +848,7 @@ mod openai_wire {
         let response: OpenAiResponsesResponse = serde_json::from_value(json!({
             "id": "resp_123",
             "object": "response",
-            "created_at": 1741476777,
+            "created_at": 1_741_476_777,
             "status": "completed",
             "model": "gpt-4o-2024-08-06",
             "output": [
@@ -888,7 +886,7 @@ mod openai_wire {
             "response": {
                 "id": "resp_123",
                 "object": "response",
-                "created_at": 1740855869,
+                "created_at": 1_740_855_869,
                 "status": "failed",
                 "completed_at": null,
                 "error": {
@@ -919,7 +917,7 @@ mod openai_wire {
                     object: "response".to_string(),
                     model: "gpt-4o-2024-08-06".to_string(),
                     status: "completed".to_string(),
-                    created_at: 1740855869,
+                    created_at: 1_740_855_869,
                     output: Vec::new(),
                     usage: None,
                     previous_response_id: None,

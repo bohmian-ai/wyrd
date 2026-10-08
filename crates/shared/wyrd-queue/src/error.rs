@@ -12,15 +12,17 @@ use wyrd_spec::error::WyrdError;
 /// Concrete error produced by the producer, queue, and batch builder.
 #[derive(thiserror::Error, Debug)]
 pub enum WyrdQueueError {
-    /// The bounded ingestion channel is saturated and, after bounded backoff,
-    /// still cannot accept the row (or the queue has been drained and is closed).
-    /// Client-tier `WYRD_CLIENT_429_QUEUE_FULL`. Always paired with a drop-counter
-    /// bump — never a silent drop.
-    #[error("queue full: ingestion channel saturated")]
+    /// The producer has been drained and is closed, so it admits nothing.
+    /// Client-tier `WYRD_CLIENT_429_QUEUE_FULL`. Always paired with a
+    /// drop-counter bump — never a silent drop.
+    #[error("queue full: the producer is closed to admission")]
     QueueFull,
 
-    /// The handle-wide byte, producer, control, or retry envelope refused work
-    /// before adding a registry entry or material buffer.
+    /// The handle-wide byte budget cannot hold every row of the record now,
+    /// or a producer's one control slot is occupied. Admission is immediate
+    /// and all-or-none: no row of the refused record was admitted, so the
+    /// caller may flush or back off and resubmit it without duplication.
+    /// Client-tier `WYRD_CLIENT_429_QUEUE_FULL`.
     #[error("queue backpressure: handle-wide bounded envelope is saturated")]
     Backpressure,
 
@@ -29,11 +31,23 @@ pub enum WyrdQueueError {
     #[error("flush timed out before the drain deadline")]
     FlushTimeout,
 
-    /// A single sealed batch (or a single row that alone exceeds the ceiling)
-    /// cannot fit under `max_message_bytes`. Client-tier
-    /// `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`.
-    #[error("payload too large: sealed row exceeds max_message_bytes")]
+    /// A single row alone cannot fit under `max_message_bytes`, or one
+    /// record is larger than the whole admission budget. Retrying cannot
+    /// succeed. Client-tier `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`.
+    #[error(
+        "payload too large: a row exceeds max_message_bytes or a record exceeds the client byte budget"
+    )]
     PayloadTooLarge,
+
+    /// The queue configuration cannot admit and seal one message.
+    /// Client-tier `WYRD_CLIENT_400_CONFIG_INVALID`.
+    #[error("queue configuration invalid: {field}: {reason}")]
+    ConfigInvalid {
+        /// The `QueueConfig` field that was refused.
+        field: &'static str,
+        /// Why the value was refused.
+        reason: String,
+    },
 
     /// A schema could not be mapped, or a row value failed its column's
     /// `DataTypeSpec` at build time. Serialization-domain `WYRD_VALA_400_SCHEMA_PARSE`.
@@ -56,10 +70,10 @@ impl WyrdQueueError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
-            Self::QueueFull => "WYRD_CLIENT_429_QUEUE_FULL",
-            Self::Backpressure => "WYRD_CLIENT_429_QUEUE_FULL",
+            Self::QueueFull | Self::Backpressure => "WYRD_CLIENT_429_QUEUE_FULL",
             Self::FlushTimeout => "WYRD_CLIENT_504_FLUSH_TIMEOUT",
             Self::PayloadTooLarge => "WYRD_CLIENT_413_PAYLOAD_TOO_LARGE",
+            Self::ConfigInvalid { .. } => "WYRD_CLIENT_400_CONFIG_INVALID",
             Self::SchemaParse(_) => "WYRD_VALA_400_SCHEMA_PARSE",
             Self::ReservedColumn(_) => "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
             Self::Sink(err) => err.code(),

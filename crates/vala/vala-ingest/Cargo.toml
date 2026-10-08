@@ -11,9 +11,12 @@ authors.workspace = true
 bytes = { workspace = true }
 vala-bifrost-redux = { workspace = true }
 # tonic / prost / tonic-types are consumed ONLY through wyrd-tonic re-exports
-# (check:no-tonic-outside-wyrd-tonic forbids direct deps here).
+# (only wyrd-tonic depends on tonic directly).
 wyrd-tonic = { workspace = true, features = ["server"] }
 arrow = { workspace = true, features = ["ipc"] }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+
+[lints]
+workspace = true

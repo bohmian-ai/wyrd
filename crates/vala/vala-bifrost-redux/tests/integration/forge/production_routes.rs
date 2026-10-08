@@ -1,23 +1,25 @@
 //! Tier-2 coverage for Forge's independent production routes.
 //!
-//! One table has exactly one active-task slot, so the scheduler must choose
-//! between the strategies rather than run them together. These tests pin that
-//! arbitration order and the immutability of the orphan plan it produces.
+//! One table has exactly one active-task slot. The elected leader dispatches
+//! each strategy as its own task: promotions and compaction on demand, and
+//! manifest rewrite, snapshot expiry, and cleanup on its maintenance timer.
 
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::Duration as ChronoDuration;
+use iceberg::spec::{FormatVersion, Operation};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 use vala_bifrost_redux::forge::{
-    ForgeClock, ForgeRoleReadiness, ForgeScheduler, ForgeSchedulerTrigger, ForgeWorker,
+    DEFAULT_REPORT_TIMEOUT, Forge, ForgeClock, ForgeCommitNotice, ForgeCompactionDispatch,
+    ForgeCompactionOutcome, ForgeCompactionType, ForgeObjectStore, ForgeRoleReadiness,
+    ForgeSchedulerTrigger, ForgeTableKey, ForgeTableSettings, ForgeTrackView, ForgeWorker,
     ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
-use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
-use vala_sql::row_types::forge_tasks::{
-    ForgePlanningDemand, ForgePlanningDemandSource, ForgeTaskStrategy, ForgeTaskTableIdentity,
-    NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION,
-};
+use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask};
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::timeout;
@@ -25,31 +27,31 @@ use wyrd_bench::BenchmarkMetricSnapshot;
 
 use super::rewrite_support::PromotedRewriteFixture;
 use super::snapshot_expiration::object_exists;
-use super::snapshot_expiration::{
-    ExpirableTable, expirable_table, head_watermark, seed_ready_expiry_task,
-};
+use super::snapshot_expiration::{ExpirableTable, expirable_table, head_watermark, maintain_once};
 use super::support::{
     CountingObjectStore, ForgeTelemetryCheckpoint, PromotionCatalogSeam,
-    PromotionIntegrationFixture, SupervisedPromotion, manual_clock,
+    PromotionIntegrationFixture, SupervisedPromotion, manual_clock, remove_table_properties,
+    set_table_properties,
 };
 
 /// Maximum diagnostic wait for a claimed ownership episode.
 const OWNERSHIP_BOUND: Duration = Duration::from_secs(15);
 
-/// Starts one expirable table whose only planner candidate is expiration.
+/// Promotes three times under `properties` and ages the clock past retention.
 ///
-/// The shared expirable fixture also owes a small-file rewrite, which would
-/// make every pass in this test choose that candidate. Raising the small-file
-/// threshold to one byte removes the rewrite candidate at its source without
-/// disabling any route, so the arbitration order stays the thing under test.
+/// Each promotion is a fast append that adds one small data manifest, so the
+/// head carries three fragmented manifests and two expirable ancestors.
+/// Compaction is disabled so the leader owes the table no rewrite and every
+/// maintenance step of the pass runs.
 ///
 /// # Panics
 ///
 /// Panics when a fixture dependency, promotion, or clock advance fails.
-async fn expirable_table_without_rewrite_debt(name: &str) -> ExpirableTable {
-    let mut fixture = PromotionIntegrationFixture::start(name).await;
-    fixture.config.snapshot_expiry_enabled = true;
-    fixture.config.small_file_threshold_bytes = 1;
+async fn fragmented_table(name: &str, properties: &[(&str, &str)]) -> ExpirableTable {
+    let fixture = PromotionIntegrationFixture::start(name).await;
+    let mut all = vec![("wyrd.forge.enable-compaction", "false")];
+    all.extend_from_slice(properties);
+    set_table_properties(&fixture.catalog, &fixture.binding, &all).await;
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
@@ -60,9 +62,11 @@ async fn expirable_table_without_rewrite_debt(name: &str) -> ExpirableTable {
         clock,
     );
     supervised.run_one_success().await;
-    fixture.seal_more(2).await;
-    supervised.restart_worker();
-    supervised.run_one_success().await;
+    for _ in 0..2 {
+        fixture.seal_more(2).await;
+        supervised.restart_worker();
+        supervised.run_one_success().await;
+    }
     control
         .advance(ChronoDuration::hours(48))
         .expect("manual clock advance");
@@ -77,7 +81,126 @@ async fn expirable_table_without_rewrite_debt(name: &str) -> ExpirableTable {
     }
 }
 
+/// The leader timer merges fragmented manifests, then expires the old head.
+///
+/// The pass rewrites the three small manifests into one `replace` snapshot
+/// first, so expiry runs against that new head and can retire the pre-pass
+/// head. Had expiry run first, the pre-pass head would have been current at
+/// expiry and survived. A retained member whose table does not exist fails in
+/// the same pass without stopping the real table's maintenance.
+///
+/// # Panics
+///
+/// Panics when the missing-table identity is invalid, the head was not
+/// fragmented, the pass did not commit one merged `replace` manifest, or
+/// expiry did not retire the pre-pass head.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn leader_timer_rewrites_manifests_before_expiry() {
+    let table = fragmented_table(
+        "timer_rewrite",
+        &[
+            ("wyrd.forge.enable-manifest-rewrite", "true"),
+            ("commit.manifest.min-count-to-merge", "2"),
+        ],
+    )
+    .await;
+    let forge = table.supervised.forge();
+    let missing = ForgeTableKey {
+        tenant: table.fixture.tenant,
+        table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "aaa_missing")
+            .expect("valid nonexistent identity"),
+    };
+    forge
+        .held_leader_term()
+        .expect("the supervisor's pass holds the leader term")
+        .schedule()
+        .refresh_membership(
+            &missing,
+            &ForgeTableSettings {
+                manifest_rewrite_enabled: true,
+                ..ForgeTableSettings::default()
+            },
+        );
+
+    let (before, after) = maintain_once(&table).await;
+    assert!(
+        before.data_manifests >= 3,
+        "three fast appends fragment the head: {before:?}"
+    );
+    assert_eq!(after.operation, Operation::Replace, "{after:?}");
+    assert_eq!(after.data_manifests, 1, "small manifests merged: {after:?}");
+    assert!(
+        !after.snapshots.contains(&before.snapshot_id),
+        "expiry ran after the rewrite and retired the pre-pass head: {before:?} -> {after:?}"
+    );
+    assert!(after.snapshots.contains(&after.snapshot_id));
+}
+
+/// Without the manifest-rewrite opt-in the pass leaves manifests alone.
+///
+/// Snapshot expiry is on by default, so the same pass still retires the aged
+/// ancestors of the unchanged head.
+///
+/// # Panics
+///
+/// Panics when the pass committed a rewrite, changed the manifest count, or
+/// retired no aged ancestor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn leader_timer_skips_manifest_rewrite_when_disabled() {
+    let table = fragmented_table("timer_no_rewrite", &[]).await;
+    let (before, after) = maintain_once(&table).await;
+    assert_eq!(after.snapshot_id, before.snapshot_id, "no rewrite commit");
+    assert_eq!(after.data_manifests, before.data_manifests);
+    assert!(
+        after.snapshots.len() < before.snapshots.len(),
+        "default expiry still retired aged ancestors: {before:?} -> {after:?}"
+    );
+}
+
+/// A format-v3 table is skipped by manifest rewrite, as `RisingWave` does.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or upgraded to format v3, or when
+/// the pass committed a rewrite or changed the manifest count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn leader_timer_skips_manifest_rewrite_on_format_v3() {
+    let table = fragmented_table(
+        "timer_v3",
+        &[
+            ("wyrd.forge.enable-manifest-rewrite", "true"),
+            ("commit.manifest.min-count-to-merge", "2"),
+            ("wyrd.forge.enable-snapshot-expiration", "false"),
+        ],
+    )
+    .await;
+    let catalog = table.fixture.catalog.iceberg_catalog();
+    let loaded = catalog
+        .load_table(&table.fixture.binding.table_ident())
+        .await
+        .expect("fixture table loads");
+    let tx = Transaction::new(&loaded);
+    tx.upgrade_table_version()
+        .set_format_version(FormatVersion::V3)
+        .apply(tx)
+        .expect("upgrade applies")
+        .commit(catalog.as_ref())
+        .await
+        .expect("the table upgrades to v3");
+    let (before, after) = maintain_once(&table).await;
+    assert_eq!(after.snapshot_id, before.snapshot_id, "no rewrite commit");
+    assert_eq!(after.data_manifests, before.data_manifests);
+}
+
 /// Builds the validated logical identity of the fixture's one table.
+///
+/// # Panics
+///
+/// Panics when the fixture namespace and table name do not form a valid
+/// Forge task table identity.
 fn identity(fixture: &PromotionIntegrationFixture) -> ForgeTaskTableIdentity {
     ForgeTaskTableIdentity::new(
         "wyrd-redux",
@@ -85,128 +208,6 @@ fn identity(fixture: &PromotionIntegrationFixture) -> ForgeTaskTableIdentity {
         &fixture.binding.table_ref.name,
     )
     .expect("fixture table identity")
-}
-
-/// Builds one authoritative demand generation fixed at `observed`.
-///
-/// Arbitration consumes a demand row, so constructing it directly is what lets
-/// this test hold `last_requested_at` still while the clock moves around it.
-fn demand(
-    fixture: &PromotionIntegrationFixture,
-    observed: chrono::DateTime<Utc>,
-) -> ForgePlanningDemand {
-    ForgePlanningDemand {
-        data_tenant_id: fixture.tenant,
-        table_ref: identity(fixture),
-        first_requested_at: observed,
-        last_requested_at: observed,
-        last_source: ForgePlanningDemandSource::Hint,
-        generation: 1,
-        acknowledged_snapshot_id: None,
-        acknowledged_commit_count: None,
-    }
-}
-
-/// Runs one production arbitration pass and returns the single chosen task.
-///
-/// # Panics
-///
-/// Panics when arbitration fails or does not fill the one active-task slot.
-async fn chosen(table: &ExpirableTable, demand: &ForgePlanningDemand) -> NewForgeTask {
-    let forge = table.supervised.forge();
-    let mut tasks = ForgeScheduler::with_owner_for_test(&forge, Uuid::now_v7())
-        .expect("fixture scheduler")
-        .arbitrate_demand_for_test(demand)
-        .await
-        .expect("production arbitration runs");
-    assert_eq!(tasks.len(), 1, "one table fills one active-task slot");
-    tasks.pop().expect("exactly one task was just asserted")
-}
-
-/// Orphan cleanup is chosen last and carries one immutable planning cut.
-///
-/// Three passes over the same table exercise the fixed arbitration order: a
-/// committed expiration handoff, then the existing planner's own candidate,
-/// then the always-due orphan fallback. The third pass proves the orphan plan
-/// is a pure function of the demand generation the pass observed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn orphan_cleanup_is_last_and_uses_one_demand_cutoff() {
-    let table = expirable_table_without_rewrite_debt("orphan_last").await;
-    let observed = Utc::now();
-
-    // Pass one: the existing planner still owes this table a snapshot
-    // expiration, so its own candidate fills the slot and orphan work is not
-    // considered.
-    let planner_choice = chosen(&table, &demand(&table.fixture, observed)).await;
-    assert_eq!(planner_choice.strategy, ForgeTaskStrategy::SnapshotExpiry);
-
-    // Pass two: a real expiration commits and leaves an unconsumed cleanup
-    // handoff, which outranks both fresh planning and orphan work.
-    let expiry = seed_ready_expiry_task(&table.fixture, table.watermark, "55").await;
-    let worker = vala_bifrost_redux::forge::ForgeWorker::new(
-        table.supervised.forge(),
-        vala_bifrost_redux::forge::ForgeWorkerConfig::default(),
-        Uuid::now_v7(),
-    )
-    .expect("fixture Forge worker");
-    let claim = worker
-        .claim_for_test()
-        .await
-        .expect("claim transaction runs")
-        .expect("the ready expiry task is claimable");
-    assert_eq!(claim.task_id, expiry);
-    worker
-        .execute_snapshot_expiry_claim_for_test(claim, &tokio_util::sync::CancellationToken::new())
-        .await
-        .expect("the expiration settles");
-    let cleanup_choice = chosen(&table, &demand(&table.fixture, observed)).await;
-    assert_eq!(cleanup_choice.strategy, ForgeTaskStrategy::ExpiredCleanup);
-
-    // Consume the handoff exactly the way production does, so the third pass
-    // has neither a handoff nor a planner candidate left.
-    enqueue(&table.fixture, &cleanup_choice, observed, Uuid::now_v7()).await;
-
-    // Pass three: the clock moves after the demand is observed, and the plan
-    // must not move with it.
-    let observed_demand = demand(&table.fixture, observed);
-    table
-        .control
-        .advance(ChronoDuration::hours(6))
-        .expect("manual clock advance");
-    let orphan = chosen(&table, &observed_demand).await;
-    assert_eq!(orphan.strategy, ForgeTaskStrategy::OrphanCleanup);
-
-    let cutoff = observed
-        .checked_sub_signed(
-            ChronoDuration::from_std(table.fixture.config.orphan_gc_ttl).expect("TTL converts"),
-        )
-        .expect("cutoff is representable")
-        .timestamp_millis();
-    assert_eq!(
-        orphan.plan.parameters,
-        serde_json::json!({
-            "version": ORPHAN_CLEANUP_PAYLOAD_VERSION,
-            "kind": "orphan_cleanup",
-            "age_cutoff_ms": cutoff,
-        })
-    );
-
-    // The worker's own validators accept the plan, and repeated hashing of the
-    // same observed demand is byte-identical.
-    let payload = orphan
-        .plan
-        .orphan_cleanup_payload(ForgeTaskStrategy::OrphanCleanup, false)
-        .expect("the worker validator accepts the plan");
-    assert_eq!(payload.age_cutoff_ms, cutoff);
-    orphan
-        .plan
-        .orphan_cleanup_prefix(false)
-        .expect("the plan names one normalized scan prefix");
-    let replanned = chosen(&table, &observed_demand).await;
-    assert_eq!(replanned.plan_hash, orphan.plan_hash);
-    assert_eq!(replanned.plan.parameters, orphan.plan.parameters);
-    assert_eq!(replanned.plan.inputs, orphan.plan.inputs);
 }
 
 /// Reads the settled states of every promotion bound to one base snapshot.
@@ -228,52 +229,29 @@ async fn promotions_on_snapshot(
         .collect()
 }
 
-/// Enqueues one arbitrated task through the production transaction.
-///
-/// `owner` is the scheduler identity the enqueue takes the singleton fence
-/// under. A caller that drives its own [`ForgeScheduler`] passes that
-/// scheduler's owner, because the singleton lease admits only one identity at a
-/// time: taking it under a fresh owner leaves the caller's scheduler on standby
-/// for the remaining lease, planning nothing it asks for afterwards.
+/// Inserts one ready task through the production enqueue statement.
 ///
 /// # Panics
 ///
-/// Panics when the scheduler fence cannot be taken or the insert is refused.
-async fn enqueue(
-    fixture: &PromotionIntegrationFixture,
-    task: &NewForgeTask,
-    observed: chrono::DateTime<Utc>,
-    owner: Uuid,
-) {
-    let tasks = ForgeTasks::new(fixture.operator_pool.clone());
-    sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at = now() - interval '1 hour'")
-        .execute(fixture.operator_pool.pool())
+/// Panics when the insert is refused.
+async fn enqueue(fixture: &PromotionIntegrationFixture, task: &NewForgeTask) {
+    ForgeTasks::new(fixture.operator_pool.clone())
+        .enqueue(task)
         .await
-        .expect("the live scheduler fence ages out");
-    let fence = tasks
-        .acquire_scheduler(owner, 30)
+        .expect("the task enqueues");
+}
+
+/// Returns the exact promotion the fixture table owes.
+///
+/// # Panics
+///
+/// Panics when the task cannot be built or nothing is owed.
+async fn owed_promotion(fixture: &PromotionIntegrationFixture, forge: &Forge) -> NewForgeTask {
+    forge
+        .promotion_task_for_test(fixture.tenant, &identity(fixture))
         .await
-        .expect("scheduler lease")
-        .expect("uncontended fence");
-    let (demands, _) = tasks
-        .planning_demands(owner, fence, 8)
-        .await
-        .expect("demands");
-    let acknowledged = demands
-        .into_iter()
-        .find(|value| value.table_ref == identity(fixture))
-        .unwrap_or_else(|| demand(fixture, observed));
-    tasks
-        .enqueue_and_acknowledge(
-            owner,
-            fence,
-            &acknowledged,
-            ForgeEnqueueBatch {
-                executable: std::slice::from_ref(task),
-            },
-        )
-        .await
-        .expect("the arbitrated task enqueues");
+        .expect("promotion task builds")
+        .expect("the sealed rows are owed a promotion")
 }
 
 /// Reads every Forge task this fixture's tenant owns, in creation order.
@@ -292,6 +270,32 @@ async fn settled_tasks(fixture: &PromotionIntegrationFixture) -> Vec<(Uuid, Stri
     .expect("Forge tasks are readable")
 }
 
+/// Advances the fixture table by one production step.
+///
+/// While the leader owes the table a compaction, a worker pulls and settles
+/// it; otherwise one leader maintenance pass runs expiry and cleanup.
+///
+/// # Panics
+///
+/// Panics when the step misses its deterministic bound or fails.
+async fn advance_routes(table: &mut ExpirableTable) {
+    let key = ForgeTableKey {
+        tenant: table.fixture.tenant,
+        table: identity(&table.fixture),
+    };
+    let owed = table
+        .supervised
+        .forge()
+        .held_leader_term()
+        .is_some_and(|term| term.schedule().owes_compaction(&key));
+    if owed {
+        table.supervised.restart_worker();
+        table.supervised.run_one_success().await;
+    } else {
+        table.supervised.maintain_only().await;
+    }
+}
+
 /// Four strategies plan, dispatch, and settle as four independent tasks.
 ///
 /// One supervised coordinator plans against real Postgres, Iceberg, and object
@@ -300,35 +304,47 @@ async fn settled_tasks(fixture: &PromotionIntegrationFixture) -> Vec<(Uuid, Stri
 /// produced its own durable task, which is only reachable when each strategy is
 /// admitted, dispatched to its own owner, and settled without borrowing another
 /// strategy's effect.
+///
+/// # Panics
+///
+/// Panics when a route never owns or settles its own task, two routes share
+/// a task identity, expiry evidence is unreadable, or an expiration deleted
+/// candidates instead of handing them off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn four_strategies_schedule_dispatch_and_settle_independently() {
-    let mut table = expirable_table("four_routes", true).await;
+    let mut table = expirable_table("four_routes").await;
     // Promotion already settled twice while the fixture started, so the routes
     // still owed are compaction, expiration, expired cleanup, and orphan work.
+    // Stopping the worker after each held attempt releases any sibling claim
+    // it took meanwhile back to `retryable`, so a route is done only once every
+    // row it owns has settled, not merely once it exists.
     let mut deletes_before_expiry = None;
-    for _ in 0..8 {
+    for _ in 0..12 {
         let settled = settled_tasks(&table.fixture).await;
         let seen = settled
             .iter()
             .map(|(_, strategy, _)| strategy.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        if [
+        let routes = [
             "small_files",
             "snapshot_expiry",
             "expired_cleanup",
             "orphan_cleanup",
-        ]
-        .iter()
-        .all(|strategy| seen.contains(strategy))
+        ];
+        if routes.iter().all(|strategy| seen.contains(strategy))
+            && settled
+                .iter()
+                .filter(|(_, strategy, _)| routes.contains(&strategy.as_str()))
+                .all(|(_, _, state)| state == "succeeded")
         {
             break;
         }
         if deletes_before_expiry.is_none() && seen.contains("small_files") {
             deletes_before_expiry = Some(table.store.deletes());
         }
-        table.supervised.restart_worker();
-        table.supervised.run_one_success().await;
+        table.fixture.clear_task_backoff().await;
+        advance_routes(&mut table).await;
     }
 
     let settled = settled_tasks(&table.fixture).await;
@@ -363,35 +379,30 @@ async fn four_strategies_schedule_dispatch_and_settle_independently() {
 
     // Snapshot expiration leaves durable cleanup demand rather than performing
     // the deletion itself, so the exact objects it retired are only removed
-    // once the separate cleanup task claims them.
-    let expiry = settled
+    // once the separate cleanup task claims them. A compaction the leader
+    // dispatches after an expiry retires the head that expiry kept, which is
+    // new retention debt, so every expiry — not exactly one — hands off its own.
+    for (task_id, _, _) in settled
         .iter()
-        .find(|(_, strategy, _)| strategy == "snapshot_expiry")
-        .expect("the expiration route settled");
-    assert_eq!(
-        settled
-            .iter()
-            .filter(|(_, strategy, _)| strategy == "snapshot_expiry")
-            .count(),
-        1,
-        "one expiration settled the retention debt: {settled:?}"
-    );
-    let evidence: Option<serde_json::Value> =
-        sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id = $1")
-            .bind(expiry.0)
-            .fetch_one(table.fixture.operator_pool.pool())
-            .await
-            .expect("expiry evidence is readable");
-    let candidates = evidence
-        .as_ref()
-        .and_then(|value| value.get("cleanup_candidates"))
-        .and_then(serde_json::Value::as_array)
-        .map(Vec::len)
-        .unwrap_or_default();
-    assert!(
-        candidates > 0,
-        "the expiration handed off its candidates instead of deleting them"
-    );
+        .filter(|(_, strategy, _)| strategy == "snapshot_expiry")
+    {
+        let evidence: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id = $1")
+                .bind(task_id)
+                .fetch_one(table.fixture.operator_pool.pool())
+                .await
+                .expect("expiry evidence is readable");
+        let candidates = evidence
+            .as_ref()
+            .and_then(|value| value.get("cleanup_candidates"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        assert!(
+            candidates > 0,
+            "every expiration handed off its candidates instead of deleting them"
+        );
+    }
 }
 
 /// Sums every recorded counter series of one family carrying all given labels.
@@ -431,24 +442,6 @@ fn duration_count(snapshot: &BenchmarkMetricSnapshot) -> u64 {
         .filter(|(name, _)| name.starts_with("bifrost_forge_task_duration_seconds{"))
         .map(|(_, value)| value.count)
         .sum()
-}
-
-/// Checks exact integer debt values representable by these small real fixtures.
-///
-/// # Panics
-/// Panics when a fixture exceeds the exact conversion bound or a gauge differs.
-fn assert_inventory(snapshot: &BenchmarkMetricSnapshot, files: u32, bytes: u64) {
-    let bytes = u32::try_from(bytes).expect("fixture debt fits exact floating-point conversion");
-    for (name, expected) in [
-        ("bifrost_forge_compaction_debt_files", files),
-        ("bifrost_forge_compaction_debt_bytes", bytes),
-    ] {
-        assert!(
-            (snapshot.gauges[name] - f64::from(expected)).abs() < f64::EPSILON,
-            "{name}: actual={}, expected={expected}",
-            snapshot.gauges[name]
-        );
-    }
 }
 
 /// Verifies one completed ownership episode and returns its measured nanoseconds.
@@ -508,7 +501,7 @@ fn assert_completed_episode(
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn forge_metrics_describe_real_data_flow() {
     let telemetry = ForgeTelemetryCheckpoint::install();
-    let mut table = expirable_table("telemetry_exits", true).await;
+    let mut table = expirable_table("telemetry_exits").await;
     // Promotion settles while the fixture starts, and the checkpoint is already
     // installed, so all five production routes are observable from one capture.
     let routes = [
@@ -527,8 +520,7 @@ async fn forge_metrics_describe_real_data_flow() {
         if routes.iter().all(|strategy| seen.contains(*strategy)) {
             break;
         }
-        table.supervised.restart_worker();
-        table.supervised.run_one_success().await;
+        advance_routes(&mut table).await;
     }
 
     let snapshot = telemetry.snapshot();
@@ -604,8 +596,6 @@ async fn forge_metrics_describe_real_data_flow() {
         "bifrost_forge_task_attempts_total",
         "bifrost_forge_task_duration_seconds",
         "bifrost_forge_active_tasks",
-        "bifrost_forge_pending_tasks",
-        "bifrost_forge_planning_demands",
     ]);
 }
 
@@ -721,16 +711,6 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
     assert!(
         cursors.windows(2).all(|pair| pair[0] < pair[1]),
         "a restarted worker replayed or rewound its durable cursor: {cursors:?}"
-    );
-
-    // No destructive sibling route ran: the table never owed an expiration or a
-    // cleanup handoff, so nothing but collection could have removed an object.
-    let observed = settled_tasks(&promoted.fixture).await;
-    assert!(
-        observed
-            .iter()
-            .all(|(_, strategy, _)| strategy != "snapshot_expiry" && strategy != "expired_cleanup"),
-        "a sibling destructive route ran beside collection: {observed:?}"
     );
 
     // Identity is orphan-only: no other route wrote an operation row while
@@ -855,7 +835,8 @@ fn assert_route_data_flow(
 /// Drives the real coordinator and worker until an orphan-cleanup task settles.
 ///
 /// Earlier passes still owe compaction, so this also proves the orphan route is
-/// reached without pre-empting the strategies ahead of it. Returns the settled
+/// reached without pre-empting the strategies ahead of it: the worker runs
+/// whenever a row is claimable or the leader still owes the table a rewrite. Returns the settled
 /// task id and every distinct durable cursor observed along the way.
 ///
 /// # Panics
@@ -869,6 +850,7 @@ async fn drive_until_orphan_settles(
     let mut cursors: Vec<String> = Vec::new();
     for _ in 0..64 {
         supervisor.schedule_only().await;
+        supervisor.maintain_only().await;
         let tasks = settled_tasks(fixture).await;
         if let Some((task_id, _, _)) = tasks
             .iter()
@@ -888,7 +870,15 @@ async fn drive_until_orphan_settles(
         .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("claimable Forge tasks are readable");
-        if claimable > 0 {
+        // An owed compaction lives only in the leader's schedule until a
+        // worker pulls it, so it is pending work exactly like a queued row.
+        let owed = supervisor.forge().held_leader_term().is_some_and(|term| {
+            term.schedule().owes_compaction(&ForgeTableKey {
+                tenant: fixture.tenant,
+                table: identity(fixture),
+            })
+        });
+        if claimable > 0 || owed {
             supervisor.restart_worker();
             supervisor.settle_some_success().await;
         }
@@ -940,289 +930,6 @@ async fn assert_only_the_rowless_generation_is_gone(
     }
 }
 
-/// A retained nonexistent-table demand cannot hide the authoritative roster or
-/// monopolize the next bounded page; a closed failed cycle retries it later.
-///
-/// # Panics
-/// Panics when healthy discovery starves or a failed cycle publishes inventory.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn scheduler_discovers_roster_despite_failed_demand() {
-    let _telemetry = ForgeTelemetryCheckpoint::install();
-    let mut fixture = PromotionIntegrationFixture::start("cycle_healthy").await;
-    fixture.config.max_hints_per_wake = 1;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
-    let forge = fixture.build_forge_for_test(
-        fixture.catalog.iceberg_catalog(),
-        store,
-        vala_bifrost_redux::forge::ForgeClock::system(),
-        vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::default(),
-        vala_bifrost_redux::forge::ForgeSchedulerTrigger::default(),
-    );
-    let tasks = ForgeTasks::new(fixture.operator_pool.clone());
-    let missing = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "missing")
-        .expect("valid nonexistent identity");
-    tasks
-        .upsert_periodic(fixture.tenant, &missing)
-        .await
-        .expect("failing demand");
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
-    let stop = tokio_util::sync::CancellationToken::new();
-    let first = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("first bounded wake");
-    assert!(
-        first.incomplete,
-        "missing table invalidates cycle: {first:?}"
-    );
-    let second = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("second bounded wake");
-    assert_eq!(
-        second.demands_acknowledged, 1,
-        "healthy roster member must be planned: {first:?}, {second:?}"
-    );
-    assert!(
-        second.incomplete,
-        "earlier failure remains sticky: {second:?}"
-    );
-    let remaining: Vec<String> =
-        sqlx::query_scalar("SELECT table_name FROM vala.forge_planning_demands")
-            .fetch_all(fixture.operator_pool.pool())
-            .await
-            .expect("remaining demand");
-    assert_eq!(
-        remaining,
-        vec!["missing"],
-        "healthy demand acknowledged without deleting failure"
-    );
-    let third = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("fresh retry cycle");
-    assert_eq!(third.demands_seen, 1);
-    assert_eq!(
-        third.demands_acknowledged, 0,
-        "failed demand retried in next cycle: {third:?}"
-    );
-    assert!(third.incomplete);
-    assert_eq!(scheduler.complete_publications_for_test(), 0);
-}
-
-/// Inventory includes live rewrite inputs even while promotion has admission priority.
-///
-/// # Panics
-/// Panics when exact production-discovered debt or its published gauge differs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn scheduler_debt_includes_rewrite_and_promotion() {
-    let telemetry = ForgeTelemetryCheckpoint::install();
-    let fixture = PromotionIntegrationFixture::start("cycle_debt").await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
-    let forge = fixture.build_forge_for_test(
-        fixture.catalog.iceberg_catalog(),
-        store,
-        ForgeClock::system(),
-        ForgeWorkerCompletionObserver::default(),
-        ForgeSchedulerTrigger::default(),
-    );
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
-    let stop = CancellationToken::new();
-    let bytes: i64 = sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list")
-        .fetch_one(fixture.operator_pool.pool())
-        .await
-        .expect("exact sealed input bytes");
-    let promotion = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("promotion discovery");
-    assert!(!promotion.incomplete);
-    assert_eq!(
-        (
-            promotion.compaction_debt_files,
-            promotion.compaction_debt_bytes
-        ),
-        (2, u64::try_from(bytes).expect("nonnegative file bytes"))
-    );
-    let worker = ForgeWorker::new(
-        Arc::clone(&forge),
-        ForgeWorkerConfig::default(),
-        Uuid::now_v7(),
-    )
-    .expect("production worker");
-    assert!(
-        worker
-            .execute_one_for_test(&stop)
-            .await
-            .expect("real promotion"),
-        "the promotion task is claimed; tasks at {}: {:?}",
-        chrono::Utc::now(),
-        fixture.forge_tasks().await
-    );
-    let executed = telemetry.snapshot();
-    assert_eq!(
-        counter_total(&executed, "bifrost_forge_task_attempts_total", &[]),
-        1,
-        "the execute-one fixture adapter observes exactly one ordinary episode"
-    );
-    assert_eq!(
-        counter_total(
-            &executed,
-            "bifrost_forge_task_attempts_total",
-            &[("result", "succeeded")]
-        ),
-        1
-    );
-    let rewrite = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("rewrite discovery");
-    assert!(!rewrite.incomplete);
-    assert_eq!(
-        (rewrite.compaction_debt_files, rewrite.compaction_debt_bytes),
-        (2, u64::try_from(bytes).expect("nonnegative file bytes")),
-        "live rewrite debt survives hot promotion settlement"
-    );
-    fixture.seal_more(2).await;
-    let combined_bytes: i64 =
-        sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list")
-            .fetch_one(fixture.operator_pool.pool())
-            .await
-            .expect("hot plus live bytes");
-    let combined = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("simultaneous candidates");
-    assert!(!combined.incomplete);
-    assert_eq!(
-        (
-            combined.compaction_debt_files,
-            combined.compaction_debt_bytes
-        ),
-        (
-            4,
-            u64::try_from(combined_bytes).expect("nonnegative file bytes")
-        )
-    );
-    let snapshot = telemetry.snapshot();
-    assert_inventory(
-        &snapshot,
-        4,
-        u64::try_from(combined_bytes).expect("file bytes"),
-    );
-    eprintln!("debt promotion/rewrite=(2,{bytes}); simultaneous=(4,{combined_bytes})");
-}
-
-/// Bounded pages replace a complete inventory only after all unequal table debts
-/// are observed; failed cycles retain it, and an empty complete roster clears it.
-///
-/// # Panics
-/// Panics on a page subtotal, lost sticky failure, or a stale empty inventory.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn scheduler_publishes_complete_cycle_inventory() {
-    let telemetry = ForgeTelemetryCheckpoint::install();
-    let mut fixture = PromotionIntegrationFixture::start("a_inventory").await;
-    fixture.config.max_hints_per_wake = 1;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
-    let forge = fixture.build_forge_for_test(
-        fixture.catalog.iceberg_catalog(),
-        store,
-        ForgeClock::system(),
-        ForgeWorkerCompletionObserver::default(),
-        ForgeSchedulerTrigger::default(),
-    );
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
-    let stop = CancellationToken::new();
-    let previous = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("initial complete inventory");
-    assert!(!previous.incomplete);
-    assert_eq!(previous.compaction_debt_files, 2);
-    fixture.seal_more(1).await;
-    fixture.register_and_seal_table("b_inventory", 4).await;
-    let expected_bytes: i64 =
-        sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list")
-            .fetch_one(fixture.operator_pool.pool())
-            .await
-            .expect("all seven real input sizes");
-    let first = scheduler.schedule_once(&stop).await.expect("first page");
-    assert!(first.incomplete);
-    assert_eq!(first.demands_acknowledged, 1);
-    assert_inventory(&telemetry.snapshot(), 2, previous.compaction_debt_bytes);
-    let second = scheduler.schedule_once(&stop).await.expect("second page");
-    assert!(!second.incomplete);
-    assert_eq!(second.demands_acknowledged, 1);
-    assert_eq!(
-        (second.compaction_debt_files, second.compaction_debt_bytes),
-        (
-            7,
-            u64::try_from(expected_bytes).expect("nonnegative file bytes")
-        )
-    );
-    assert_inventory(
-        &telemetry.snapshot(),
-        7,
-        u64::try_from(expected_bytes).expect("file bytes"),
-    );
-    // A missing table remains demanded across closed failed cycles. Its absence
-    // from the roster must not remove it from the attempted exclusion set.
-    let tasks = ForgeTasks::new(fixture.operator_pool.clone());
-    let missing = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "missing_inventory")
-        .expect("identity");
-    tasks
-        .upsert_periodic(fixture.tenant, &missing)
-        .await
-        .expect("missing demand");
-    for _ in 0..3 {
-        let failed = scheduler
-            .schedule_once(&stop)
-            .await
-            .expect("failed cycle page");
-        assert!(
-            failed.incomplete,
-            "failure sticks through exhaustion: {failed:?}"
-        );
-        assert_inventory(
-            &telemetry.snapshot(),
-            7,
-            u64::try_from(expected_bytes).expect("file bytes"),
-        );
-    }
-    // Retire the tables and the intentionally nonexistent fixture demand to
-    // present a genuinely empty authoritative roster to a new complete cycle.
-    let admin = fixture
-        .database
-        .superuser_pool()
-        .await
-        .expect("fixture administrator");
-    sqlx::query("UPDATE vala.bifrost_tables SET status='deprecated'")
-        .execute(&admin)
-        .await
-        .expect("retired roster");
-    sqlx::query("DELETE FROM vala.forge_planning_demands")
-        .execute(fixture.operator_pool.pool())
-        .await
-        .expect("retire fixture demands");
-    let empty = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("empty complete cycle");
-    assert!(!empty.incomplete);
-    assert_eq!(
-        (empty.compaction_debt_files, empty.compaction_debt_bytes),
-        (0, 0)
-    );
-    assert_inventory(&telemetry.snapshot(), 0, 0);
-    eprintln!(
-        "inventory previous=(2,{}); first page retains previous; complete=(7,{expected_bytes}); failed pages retain complete; empty=(0,0)",
-        previous.compaction_debt_bytes
-    );
-}
-
 /// A malformed known payload terminalizes and reports exactly one durable refusal
 /// through the same entrypoint used by fixture adapters.
 ///
@@ -1241,12 +948,9 @@ async fn worker_malformed_known_payload_observes_one_refusal() {
         ForgeWorkerCompletionObserver::default(),
         ForgeSchedulerTrigger::default(),
     );
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
     let stop = CancellationToken::new();
-    scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("real promotion plan");
+    let promotion = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &promotion).await;
     sqlx::query("UPDATE vala.forge_tasks SET plan=jsonb_set(plan,'{inputs}','[]')")
         .execute(fixture.operator_pool.pool())
         .await
@@ -1325,12 +1029,9 @@ async fn worker_prepared_recovery_observes_one_ownership_episode() {
         observer.clone(),
         ForgeSchedulerTrigger::default(),
     );
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
     let stop = CancellationToken::new();
-    scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("real promotion plan");
+    let promotion = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &promotion).await;
     fixture.prepare_recovery_episode(&forge, &stop).await;
     let state = "prepared";
     observer.hold_after_claims_for_test(1);
@@ -1407,7 +1108,7 @@ async fn worker_pre_execution_cancellation_reports_durable_retry() {
     let observer = ForgeWorkerCompletionObserver::default();
     observer.hold_after_claims_for_test(1);
     let stop = CancellationToken::new();
-    let worker = fixture.plan_worker_for_test(observer.clone(), &stop).await;
+    let worker = fixture.plan_worker_for_test(observer.clone()).await;
     let mut work = AbortOnDropHandle::new(tokio::spawn(
         worker.run(stop.clone(), ForgeRoleReadiness::default()),
     ));
@@ -1493,7 +1194,7 @@ async fn worker_duration_includes_claim_and_failed_release() {
     observer.hold_after_next_attempt_for_test();
     observer.fail_next_lease_release();
     let stop = CancellationToken::new();
-    let worker = fixture.plan_worker_for_test(observer.clone(), &stop).await;
+    let worker = fixture.plan_worker_for_test(observer.clone()).await;
     let mut work = AbortOnDropHandle::new(tokio::spawn(
         worker.run(stop.clone(), ForgeRoleReadiness::default()),
     ));
@@ -1589,66 +1290,73 @@ async fn worker_duration_includes_claim_and_failed_release() {
     );
 }
 
-/// A complete roster observation removes disappeared debt and admits new tables
-/// into an open cycle without replaying its already attempted demand identities.
+/// A worker whose operator database stops answering backs off and recovers.
+///
+/// The worker's operator pool is narrowed to one connection, which the test
+/// then holds past the pool's acquire timeout. Every loop read times out
+/// without reaching the database, so the worker retracts readiness and keeps
+/// running instead of stopping its process; once the connection is released
+/// the next answered turn advertises it again.
 ///
 /// # Panics
-/// Panics when an open cycle publishes missing-table debt or omits a new member.
+///
+/// Panics when the worker stops, never withdraws readiness while the database
+/// is unreachable, or never advertises it again once the database answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn scheduler_open_cycle_tracks_roster_changes() {
-    let mut fixture = PromotionIntegrationFixture::start("a_disappears").await;
-    fixture.config.max_hints_per_wake = 1;
-    fixture.register_and_seal_table("b_remains", 2).await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
-    let forge = fixture.build_forge_for_test(
-        fixture.catalog.iceberg_catalog(),
-        store,
-        ForgeClock::system(),
-        ForgeWorkerCompletionObserver::default(),
-        ForgeSchedulerTrigger::default(),
+async fn worker_backs_off_while_the_operator_database_is_unreachable() {
+    let fixture = PromotionIntegrationFixture::start("unreachable_operator_db").await;
+    let narrow = vala_sql::OperatorPool::from(
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_with((*fixture.operator_pool.pool().connect_options()).clone())
+            .await
+            .expect("narrow operator pool"),
     );
-    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
+    let forge = fixture.build_forge_over_operator_pool_for_test(narrow.clone());
+    let worker =
+        ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7()).expect("worker");
+    let readiness = ForgeRoleReadiness::default();
     let stop = CancellationToken::new();
-    let first = scheduler
-        .schedule_once(&stop)
+    let work = AbortOnDropHandle::new(tokio::spawn(worker.run(stop.clone(), readiness.clone())));
+    let ready = |expected: bool| {
+        let readiness = readiness.clone();
+        async move {
+            timeout(OWNERSHIP_BOUND, async {
+                while readiness.is_ready() != expected {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+    };
+    assert!(ready(true).await, "the worker starts ready");
+
+    let held = narrow
+        .pool()
+        .acquire()
         .await
-        .expect("first roster page");
-    assert!(first.incomplete);
-    assert_eq!(first.compaction_debt_files, 2);
-    let admin = fixture
-        .database
-        .superuser_pool()
-        .await
-        .expect("fixture administrator");
-    sqlx::query(
-        "UPDATE vala.bifrost_tables SET status='deprecated' WHERE fqn='vala.bifrost.a_disappears'",
-    )
-    .execute(&admin)
-    .await
-    .expect("retire observed table");
-    fixture.register_and_seal_table("c_joins", 3).await;
-    let second = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("new roster member joins open cycle");
-    assert!(second.incomplete);
-    assert_eq!(
-        second.compaction_debt_files, 2,
-        "disappeared observation removed before publication"
+        .expect("the test holds the only operator connection");
+    assert!(
+        ready(false).await,
+        "an unreachable database withdraws readiness"
     );
-    let third = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("new member completes cycle");
-    assert!(!third.incomplete);
-    let bytes: i64 = sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list WHERE table_name IN ('b_remains','c_joins')")
-        .fetch_one(fixture.operator_pool.pool()).await.expect("surviving roster bytes");
-    assert_eq!(
-        (third.compaction_debt_files, third.compaction_debt_bytes),
-        (5, u64::try_from(bytes).expect("nonnegative file bytes"))
+    assert!(!work.is_finished(), "the worker keeps running");
+    drop(held);
+    assert!(
+        ready(true).await,
+        "the worker advertises again once the database answers: finished={}",
+        work.is_finished()
     );
-    eprintln!("roster debt pages: 2, 2 (removed old member), 5/{bytes} bytes complete");
+
+    stop.cancel();
+    timeout(OWNERSHIP_BOUND, work)
+        .await
+        .expect("the worker drains")
+        .expect("the worker task joins")
+        .expect("the worker stops cleanly");
 }
 
 /// A running slot discovering invalid Prepared evidence closes readiness before
@@ -1670,11 +1378,8 @@ async fn worker_prepared_fatal_closes_before_release_and_observation() {
         ForgeSchedulerTrigger::default(),
     );
     let stop = CancellationToken::new();
-    ForgeScheduler::new(&forge)
-        .expect("scheduler")
-        .schedule_once(&stop)
-        .await
-        .expect("plan");
+    let promotion = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &promotion).await;
     fixture.prepare_recovery_episode(&forge, &stop).await;
     sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=now()+interval '1 hour', evidence=jsonb_set(evidence,'{committed_snapshot_id}','999999')")
         .execute(fixture.operator_pool.pool()).await.expect("live foreign Prepared claim");
@@ -1812,33 +1517,10 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
         ForgeSchedulerTrigger::default(),
     );
     let stop = CancellationToken::new();
-    let observed = Utc::now();
-    // One scheduler identity owns the singleton planning lease for the whole
-    // scenario. Every pass this test drives, and the mid-scenario enqueue that
-    // takes the fence, run under it, so no phase can find the lease held by a
-    // stranger and return standby instead of planning.
-    let scheduler_owner = Uuid::now_v7();
     // Captured before the promotion runs: once it settles SQL these rows are no
     // longer promotable, so arbitration would produce nothing to rebind.
-    let planned = ForgeScheduler::with_owner_for_test(&forge, scheduler_owner)
-        .expect("fixture scheduler")
-        .arbitrate_demand_for_test(&demand(&fixture, observed))
-        .await
-        .expect("production arbitration runs")
-        .into_iter()
-        .find(|task| task.strategy == ForgeTaskStrategy::ScribePromotion)
-        .expect("the sealed rows are owed a promotion");
-
-    let mut scheduler =
-        ForgeScheduler::with_owner_for_test(&forge, scheduler_owner).expect("scheduler");
-    let discovery = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("promotion discovery");
-    assert!(
-        !discovery.standby,
-        "this scheduler owns the planning lease for the discovery pass: {discovery:?}"
-    );
+    let planned = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &planned).await;
     let worker = ForgeWorker::new(
         Arc::clone(&forge),
         ForgeWorkerConfig::default(),
@@ -1862,7 +1544,7 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
         base_snapshot_id: current_snapshot_id(&fixture).await,
         ..planned
     };
-    enqueue(&fixture, &in_window, observed, scheduler_owner).await;
+    enqueue(&fixture, &in_window).await;
     assert!(
         worker
             .execute_one_for_test(&stop)
@@ -1883,14 +1565,8 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
     );
 
     fixture.seal_more(2).await;
-    let replan = scheduler
-        .schedule_once(&stop)
-        .await
-        .expect("the remaining demand is replanned");
-    assert!(
-        !replan.standby,
-        "this scheduler still owns the planning lease for the replanning pass: {replan:?}"
-    );
+    let replan = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &replan).await;
     assert!(
         worker
             .execute_one_for_test(&stop)
@@ -1902,4 +1578,1042 @@ async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
         fixture.live_data_paths().await.len() > promoted.len(),
         "demand sealed after the superseded task is promoted"
     );
+}
+
+/// The leader counts a promotion only once its Iceberg commit has returned.
+///
+/// The fixture's sealed hot objects are Scribe publication alone. The new
+/// leader's acquisition sweep promotes them inline, and the catalog seam parks
+/// that fast append: while parked the leader holds its term but tracks
+/// nothing. Releasing the append yields exactly one pending commit, and a
+/// later pass with no debt left adds none.
+///
+/// # Panics
+///
+/// Panics when the leader counts hot publication, misses the committed
+/// promotion, or counts it twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn promotion_notification_only_after_iceberg_commit() {
+    let fixture = PromotionIntegrationFixture::start("notify_after_commit").await;
+    let catalog = fixture.catalog.iceberg_catalog();
+    let loaded = catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table");
+    let tx = Transaction::new(&loaded);
+    let tx = tx
+        .update_table_properties()
+        .set("wyrd.forge.enable-compaction".to_owned(), "true".to_owned())
+        .apply(tx)
+        .expect("Forge table settings");
+    tx.commit_once(catalog.as_ref())
+        .await
+        .expect("Forge table settings commit");
+
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let seam = PromotionCatalogSeam::new(catalog, store.read_counter());
+    seam.park_next_commit();
+    let supervised = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
+        store as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    let first = supervised.request_pass();
+    timeout(OWNERSHIP_BOUND, seam.wait_for_parked_commit())
+        .await
+        .expect("the acquisition sweep reaches the promotion commit");
+
+    let forge = supervised.forge();
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(&fixture),
+    };
+    let term = forge
+        .held_leader_term()
+        .expect("the pass acquired the term");
+    assert!(
+        term.schedule().track_for_test(&key).is_none(),
+        "hot publication alone is not an Iceberg commit"
+    );
+
+    seam.release_parked_commit();
+    supervised.await_pass(first).await;
+    let counted = term
+        .schedule()
+        .track_for_test(&key)
+        .expect("the committed promotion is counted");
+    assert_eq!(
+        counted.pending_commits, 1,
+        "one promotion is one notification"
+    );
+    assert!(
+        fixture
+            .file_rows()
+            .await
+            .iter()
+            .all(|row| row.committed_snapshot_id.is_some()),
+        "the sweep promoted every hot object"
+    );
+
+    supervised.schedule_only().await;
+    assert_eq!(
+        term.schedule()
+            .track_for_test(&key)
+            .map(|track| track.pending_commits),
+        Some(1),
+        "a pass with no promotion debt counts nothing"
+    );
+}
+
+/// Plans one fresh managed attempt of `compaction_type` over the fixture table.
+///
+/// # Panics
+///
+/// Panics when the attempt context cannot be built or planning fails.
+async fn planned_paths(
+    promoted: &PromotedRewriteFixture,
+    forge: &Forge,
+    compaction_type: ForgeCompactionType,
+) -> (i64, Vec<BTreeSet<String>>) {
+    let cancel = CancellationToken::new();
+    let planned = forge
+        .managed_rewrite(
+            &promoted.fixture.binding,
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            &cancel,
+        )
+        .expect("the attempt context builds")
+        .plan(compaction_type)
+        .await
+        .expect("planning the current head succeeds");
+    let groups = planned
+        .plans
+        .iter()
+        .map(|planned| {
+            planned
+                .plan
+                .file_group
+                .data_files
+                .iter()
+                .map(|task| task.data_file_path.clone())
+                .collect()
+        })
+        .collect();
+    (planned.evidence.base_snapshot_id, groups)
+}
+
+/// A dispatched worker plans from the table's current Iceberg head.
+///
+/// The leader names a table and a task type, never files, so every file
+/// decision is the worker's, made against the head it loads. Full consumes
+/// every live file at that head; `SmallFiles`, the default, consumes small
+/// files in groups of two or more, which here is all of them because every
+/// day holds a pair; Auto keeps upstream's five-small-file
+/// floor; `FilesWithDelete` finds nothing on a table without deletes; and a
+/// copy-on-write table plans one table-wide Full group whatever type it names.
+/// Through the production worker, a type that finds nothing still reports
+/// success and publishes no snapshot. A real rewrite then draws on the shared
+/// root: with every byte held, growth is refused or spilled, and once released
+/// the rewrite completes and returns every Forge byte and spill file. The
+/// held Scribe charge beside Forge growth and spill placement are proven at
+/// the pool itself by `rewrite_pool_charges_root_and_releases_on_cancel`,
+/// because Scribe's charge entry point is crate-private.
+///
+/// # Panics
+///
+/// Panics when planning ignores the current head or the requested type, when
+/// a no-plan dispatch fails or publishes, or when a rewrite leaves governed
+/// bytes or spill files behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_selects_current_iceberg_files() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    // Each fixture object is alone in its day; a same-day partner for each
+    // makes every live file a member of a small-files group.
+    let promoted = PromotedRewriteFixture::start_unpromoted("worker_selects").await;
+    for day in 0..2 {
+        promoted
+            .fixture
+            .seal_partition_files(day, 2, 1, 1_000 * day.unsigned_abs())
+            .await;
+    }
+    let mut promotion = SupervisedPromotion::start(
+        &promoted.fixture,
+        promoted.fixture.catalog.iceberg_catalog(),
+        CountingObjectStore::new(Arc::clone(&promoted.fixture.staging))
+            as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    promotion.run_one_success().await;
+    promotion.shutdown().await;
+    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let forge = promoted.forge(
+        promoted.fixture.catalog.iceberg_catalog(),
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+    );
+    let live = promoted.fixture.live_data_paths().await;
+    let head = promoted
+        .load_table()
+        .await
+        .metadata()
+        .current_snapshot()
+        .expect("a promoted head")
+        .snapshot_id();
+    assert!(
+        (2..5).contains(&live.len()),
+        "the fixture offers small files below Auto's floor: {live:?}"
+    );
+
+    for compaction_type in [ForgeCompactionType::Full, ForgeCompactionType::SmallFiles] {
+        let (base, groups) = planned_paths(&promoted, &forge, compaction_type).await;
+        assert_eq!(base, head, "{compaction_type:?} plans the current head");
+        assert_eq!(
+            groups.iter().flatten().cloned().collect::<BTreeSet<_>>(),
+            live,
+            "{compaction_type:?} consumes every live small file"
+        );
+    }
+    for compaction_type in [
+        ForgeCompactionType::Auto,
+        ForgeCompactionType::FilesWithDelete,
+    ] {
+        let (base, groups) = planned_paths(&promoted, &forge, compaction_type).await;
+        assert_eq!(base, head, "{compaction_type:?} plans the current head");
+        assert!(
+            groups.is_empty(),
+            "{compaction_type:?} selects nothing here: {groups:?}"
+        );
+    }
+    set_table_properties(
+        &promoted.fixture.catalog,
+        &promoted.fixture.binding,
+        &[("write.delete.mode", "copy-on-write")],
+    )
+    .await;
+    let cow_head = promoted
+        .load_table()
+        .await
+        .metadata()
+        .current_snapshot()
+        .expect("a head")
+        .snapshot_id();
+    let (base, groups) =
+        planned_paths(&promoted, &forge, ForgeCompactionType::FilesWithDelete).await;
+    assert_eq!(base, cow_head, "copy-on-write plans the current head");
+    assert_eq!(
+        groups,
+        vec![live.clone()],
+        "copy-on-write plans one table-wide Full group whatever type it names"
+    );
+
+    assert_rewrite_draws_on_shared_root(&promoted, &forge).await;
+}
+
+/// Runs a real rewrite under a full shared root, then under a free one.
+///
+/// With every byte held, the rewrite's growth is refused and the attempt
+/// fails holding nothing; once released, the rewrite completes and returns
+/// every Forge byte and spill file.
+///
+/// # Panics
+///
+/// Panics when the full root admits the rewrite, the free root refuses it, or
+/// a finished rewrite leaves governed bytes or spill files behind.
+async fn assert_rewrite_draws_on_shared_root(
+    promoted: &PromotedRewriteFixture,
+    forge: &Arc<Forge>,
+) {
+    let occupant = promoted.fixture.forge_resources.occupy_root_for_test();
+    let refused = promoted
+        .run_attempt(forge, Uuid::now_v7(), CancellationToken::new())
+        .await;
+    let occupied = promoted
+        .fixture
+        .forge_resources
+        .snapshot()
+        .expect("held snapshot");
+    drop(occupant);
+    assert!(
+        refused.failure.is_some(),
+        "a rewrite cannot grow through a full shared root: {:?}",
+        refused.handoffs
+    );
+    assert_eq!(
+        occupied.forge_memory_used_bytes, occupied.governed_memory_used_bytes,
+        "the occupant is the only holder once the refused rewrite returned"
+    );
+    drop(refused);
+    let run = promoted
+        .run_attempt(forge, Uuid::now_v7(), CancellationToken::new())
+        .await;
+    assert!(
+        run.failure.is_none(),
+        "the released root admits the rewrite: {:?}",
+        run.failure
+    );
+    drop(run);
+    let released = promoted
+        .fixture
+        .forge_resources
+        .snapshot()
+        .expect("released snapshot");
+    assert_eq!(
+        (
+            released.forge_memory_used_bytes,
+            released.governed_memory_used_bytes
+        ),
+        (0, 0),
+        "a finished rewrite returns every Forge byte"
+    );
+    assert_eq!(
+        std::fs::read_dir(&promoted.fixture.forge_spill)
+            .expect("the Forge spill root is readable")
+            .count(),
+        0,
+        "a finished rewrite leaves nothing under the Forge spill root"
+    );
+}
+
+/// A dispatched task type that finds nothing reports success and publishes nothing.
+///
+/// # Panics
+///
+/// Panics when the dispatch fails, publishes a snapshot, or stays owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_reports_no_plan_dispatch_as_success() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("no_plan_dispatch").await;
+    set_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[("wyrd.forge.compaction.type", "files-with-delete")],
+    )
+    .await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let mut supervisor = SupervisedPromotion::start_serial(
+        &fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.run_one_success().await;
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(&fixture),
+    };
+    let owes = |supervisor: &SupervisedPromotion| {
+        supervisor
+            .forge()
+            .held_leader_term()
+            .is_some_and(|term| term.schedule().owes_compaction(&key))
+    };
+    assert!(
+        owes(&supervisor),
+        "the promotion commit makes the table owe compaction"
+    );
+    let snapshots = snapshot_count(&fixture).await;
+
+    supervisor.restart_worker();
+    supervisor.settle_one_success().await;
+
+    assert!(
+        !owes(&supervisor),
+        "a no-plan success settles the owed compaction"
+    );
+    assert_eq!(
+        snapshot_count(&fixture).await,
+        snapshots,
+        "a dispatch that planned nothing publishes nothing"
+    );
+    assert_eq!(store.output_writers(), 0, "planning nothing writes nothing");
+    supervisor.shutdown().await;
+}
+
+/// Shutdown after a dispatch's durable claim, before its episode, stays leader-owned.
+///
+/// The worker pulls the promoted table, records the dispatch as its own claimed
+/// row, and is held there while shutdown is signalled. The row must close as
+/// `cancelled` — never `retryable`, where a fair claim would give the accepted
+/// dispatch a second owner — and the leader must receive the one `NotStarted`
+/// report that clears its in-flight task while keeping every pending commit.
+///
+/// # Panics
+///
+/// Panics when the claim gate is missed, the row becomes fair-claimable, or
+/// the leader still holds the dispatch in flight or lost a commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn dispatch_shutdown_before_episode_closes_and_reports_not_started() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("dispatch_shutdown").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let mut supervisor = SupervisedPromotion::start_serial(
+        &fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.run_one_success().await;
+    let owed = track(&supervisor, &fixture);
+    assert_eq!(owed.in_flight, None, "nothing is dispatched yet");
+
+    supervisor.restart_worker();
+    supervisor.observer().hold_after_claims_for_test(1);
+    let stop = supervisor.worker_stop();
+    supervisor.start_worker();
+    timeout(
+        OWNERSHIP_BOUND,
+        supervisor.observer().wait_for_claims_for_test(),
+    )
+    .await
+    .expect("the dispatch's claim gate");
+    let task_id = track(&supervisor, &fixture)
+        .in_flight
+        .expect("the held claim is the leader's in-flight dispatch");
+    let held: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+        .bind(task_id)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("the dispatch's durable claim");
+    assert_eq!(held, "claimed", "the dispatch is durably claimed");
+
+    stop.cancel();
+    supervisor.observer().release_claims_for_test();
+    supervisor.join_worker().await;
+
+    let closed: (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state,attempt_id FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(task_id)
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("the closed dispatch");
+    assert_eq!(
+        closed,
+        ("cancelled".to_owned(), None),
+        "an accepted dispatch never becomes fair-claimable"
+    );
+    let reported = track(&supervisor, &fixture);
+    assert_eq!(
+        (reported.in_flight, reported.pending_commits),
+        (None, owed.pending_commits),
+        "one NotStarted report clears the dispatch and keeps every commit"
+    );
+    supervisor.shutdown().await;
+}
+
+/// Counts the fixture table's Iceberg snapshots.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded.
+async fn snapshot_count(fixture: &PromotionIntegrationFixture) -> usize {
+    fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table")
+        .metadata()
+        .snapshots()
+        .count()
+}
+
+/// Reads the leader's view of the fixture table's compaction track.
+///
+/// # Panics
+///
+/// Panics when the supervisor holds no leader term or the table has no track.
+fn track(
+    supervisor: &SupervisedPromotion,
+    fixture: &PromotionIntegrationFixture,
+) -> ForgeTrackView {
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(fixture),
+    };
+    supervisor
+        .forge()
+        .held_leader_term()
+        .expect("the supervisor's pass holds the leader term")
+        .schedule()
+        .track_for_test(&key)
+        .expect("the promoted table is tracked")
+}
+
+/// Reports settle only the commits a dispatch captured, and stale ones nothing.
+///
+/// Every step goes through the production promotion, pull, and report routes
+/// under a manual clock, so a commit can land while a dispatch is in flight and
+/// a report can arrive after its dispatch timed out. Success subtracts only the
+/// count the dispatch captured, so a commit that arrived during execution stays
+/// pending and the table is due again at once. A report naming any task but
+/// the in-flight one changes nothing — neither a task the leader never issued
+/// nor one whose report deadline elapsed and was redispatched.
+///
+/// # Panics
+///
+/// Panics when a later commit is lost, a stale or late report applies, or a
+/// timed-out dispatch is not reconsidered on the next pull.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn report_preserves_later_commits_and_ignores_stale() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("report_accounting").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let (clock, control) = manual_clock();
+    let supervisor = SupervisedPromotion::start_serial(
+        &fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    let forge = supervisor.forge();
+
+    supervisor.schedule_only().await;
+    assert_eq!(track(&supervisor, &fixture).pending_commits, 1);
+    let first = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(first.len(), 1, "the promoted table is due: {first:?}");
+
+    // A commit lands while the dispatch is in flight.
+    fixture.seal_more(2).await;
+    supervisor.schedule_only().await;
+    assert_eq!(track(&supervisor, &fixture).pending_commits, 2);
+
+    let unknown = ForgeCompactionDispatch {
+        task_id: Uuid::now_v7(),
+        ..first[0].clone()
+    };
+    forge
+        .report_compaction(&unknown, ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+    let after_unknown = track(&supervisor, &fixture);
+    assert_eq!(
+        (after_unknown.pending_commits, after_unknown.in_flight),
+        (2, Some(first[0].task_id)),
+        "a report for a task the leader never issued changes nothing"
+    );
+
+    forge
+        .report_compaction(&first[0], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+    assert_eq!(
+        track(&supervisor, &fixture).pending_commits,
+        1,
+        "success consumes only the captured commit"
+    );
+    let second = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(second.len(), 1, "the surviving commit is due at once");
+
+    // The second dispatch's report deadline elapses before it reports.
+    control
+        .advance(ChronoDuration::from_std(DEFAULT_REPORT_TIMEOUT).expect("report timeout fits"))
+        .expect("manual clock advances");
+    let redispatched = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(
+        redispatched.len(),
+        1,
+        "a timed-out dispatch is reconsidered on the next pull"
+    );
+    assert_ne!(redispatched[0].task_id, second[0].task_id);
+    forge
+        .report_compaction(&second[0], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+    let after_late = track(&supervisor, &fixture);
+    assert_eq!(
+        (after_late.pending_commits, after_late.in_flight),
+        (1, Some(redispatched[0].task_id)),
+        "the timed-out dispatch's late report is stale"
+    );
+
+    // A late commit during the redispatch also survives its success.
+    fixture.seal_more(1).await;
+    supervisor.schedule_only().await;
+    forge
+        .report_compaction(&redispatched[0], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+    let settled = track(&supervisor, &fixture);
+    assert_eq!(
+        (settled.pending_commits, settled.in_flight),
+        (1, None),
+        "the redispatch consumes only what it captured"
+    );
+    supervisor.shutdown().await;
+}
+
+/// Tables the leader tracks in the decision-cost scenario.
+const DECISION_TABLES: usize = 10_000;
+/// Tracked tables whose commit makes them due in that scenario.
+const DECISION_DUE_TABLES: usize = 1_000;
+/// Concurrent compactors pulling from the leader in that scenario.
+const DECISION_PULLERS: usize = 32;
+
+/// Returns the `permille`-th per-mille element of `samples`, sorting them in place.
+fn quantile(samples: &mut [Duration], permille: usize) -> Duration {
+    samples.sort_unstable();
+    let last = samples.len().saturating_sub(1);
+    samples[(last * permille).div_ceil(1000).min(last)]
+}
+
+/// Pulls and reports from `pullers` OS threads until nothing is due.
+///
+/// Each thread pulls four tasks at a time through the leader's peer-facing
+/// routes and reports every dispatch it received as succeeded, so the one
+/// schedule lock sees the contention of a sustained backlog.
+///
+/// Returns every pull's latency and every dispatched table.
+///
+/// # Panics
+///
+/// Panics when a route refuses the held term or a dispatch's own report does
+/// not apply.
+fn pull_until_drained(
+    forge: &Forge,
+    token: i64,
+    pullers: usize,
+) -> (Vec<Duration>, Vec<ForgeTableKey>) {
+    std::thread::scope(|scope| {
+        let handles = (0..pullers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut pulls = Vec::new();
+                    let mut dispatched = Vec::new();
+                    loop {
+                        let pulled = Instant::now();
+                        let tasks = forge
+                            .serve_compaction_pull(token, 4)
+                            .expect("the held term serves the pull");
+                        pulls.push(pulled.elapsed());
+                        if tasks.is_empty() {
+                            return (pulls, dispatched);
+                        }
+                        for task in tasks {
+                            assert!(
+                                forge
+                                    .serve_compaction_report(
+                                        token,
+                                        &task.key,
+                                        task.task_id,
+                                        ForgeCompactionOutcome::Succeeded,
+                                    )
+                                    .expect("the held term serves the report"),
+                                "the dispatch's own report applies"
+                            );
+                            dispatched.push(task.key);
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("puller thread"))
+            .fold((Vec::new(), Vec::new()), |(mut pulls, mut keys), (p, k)| {
+                pulls.extend(p);
+                keys.extend(k);
+                (pulls, keys)
+            })
+    })
+}
+
+/// Names the decision scenario's tracked tables, the first due ones first.
+///
+/// # Panics
+///
+/// Panics when a generated name is not a valid table identity.
+fn decision_keys(fixture: &PromotionIntegrationFixture) -> Vec<ForgeTableKey> {
+    (0..DECISION_TABLES)
+        .map(|index| ForgeTableKey {
+            tenant: fixture.tenant,
+            table: ForgeTaskTableIdentity::new(
+                "wyrd-redux",
+                fixture.binding.table_ref.namespace.as_str(),
+                format!("decision_{index}"),
+            )
+            .expect("decision table identity"),
+        })
+        .collect()
+}
+
+/// The leader decides commits, pulls, and reports from memory alone.
+///
+/// The leader's routes — the ones a peer compactor reaches — are driven
+/// directly, without a worker, over a fixture whose catalog and object store
+/// count every load and read. Ten thousand tables are tracked; one thousand
+/// are due. Thirty-two OS threads then pull and report concurrently until
+/// nothing is due, which is the contention the one schedule lock sees under a
+/// sustained backlog. Every due table is dispatched exactly once, and not one
+/// catalog load or object read happens anywhere on the leader's side. The
+/// per-stage p50/p99, table count, commit rate, and puller count are printed as
+/// evidence; latency gates belong to the release-built capacity benchmark.
+///
+/// # Panics
+///
+/// Panics when a leader decision touches the catalog or object store, a due
+/// table is dispatched twice or never, or a route refuses the held term.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn leader_decision_has_no_catalog_io() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("leader_decision").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
+    let supervisor = SupervisedPromotion::start_serial(
+        &fixture,
+        Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.schedule_only().await;
+    let forge = supervisor.forge();
+    let token = forge
+        .held_leader_term()
+        .expect("the pass acquired the term")
+        .fencing_token();
+    let (loads, attempts, reads) = (seam.loads(), seam.attempts(), store.stats());
+
+    let due = ForgeTableSettings {
+        compaction_enabled: true,
+        trigger_snapshot_count: 1,
+        ..ForgeTableSettings::default()
+    };
+    let idle = ForgeTableSettings {
+        compaction_enabled: true,
+        ..ForgeTableSettings::default()
+    };
+    let keys = decision_keys(&fixture);
+    let notify = |index: usize, snapshot_id: i64| {
+        forge
+            .accept_commit_notice(
+                token,
+                ForgeCommitNotice {
+                    key: keys[index].clone(),
+                    snapshot_id,
+                    settings: if index < DECISION_DUE_TABLES {
+                        due.clone()
+                    } else {
+                        idle.clone()
+                    },
+                },
+            )
+            .expect("the held term accepts the notice");
+    };
+    for index in DECISION_DUE_TABLES..DECISION_TABLES {
+        notify(index, 1);
+    }
+    let started = Instant::now();
+    let mut commit_updates = (DECISION_DUE_TABLES..DECISION_TABLES)
+        .map(|index| {
+            let warm = Instant::now();
+            notify(index, 2);
+            warm.elapsed()
+        })
+        .collect::<Vec<_>>();
+    let commit_rate = f64::from(u32::try_from(commit_updates.len()).expect("bounded table count"))
+        / started.elapsed().as_secs_f64();
+    for index in 0..DECISION_DUE_TABLES {
+        notify(index, 1);
+    }
+
+    let (mut pulls, dispatched) = pull_until_drained(&forge, token, DECISION_PULLERS);
+
+    // The fixture's own promoted table is due as well.
+    let promoted = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(&fixture),
+    };
+    let expected = keys[..DECISION_DUE_TABLES]
+        .iter()
+        .chain([&promoted])
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        dispatched.len(),
+        expected.len(),
+        "no due table is dispatched twice"
+    );
+    assert_eq!(
+        dispatched.iter().collect::<BTreeSet<_>>(),
+        expected,
+        "every due table is dispatched, and only due tables"
+    );
+    assert_eq!(
+        (seam.loads(), seam.attempts(), store.stats()),
+        (loads, attempts, reads),
+        "leader decisions perform no catalog or object-store IO"
+    );
+    eprintln!(
+        "evidence forge-leader tables={DECISION_TABLES} due={DECISION_DUE_TABLES} \
+         pullers={DECISION_PULLERS} commit_updates_per_s={commit_rate:.0} \
+         commit_update_p50={:?} commit_update_p99={:?} pulls={} pull_p50={:?} pull_p99={:?} \
+         pull_max={:?}",
+        quantile(&mut commit_updates, 500),
+        quantile(&mut commit_updates, 990),
+        pulls.len(),
+        quantile(&mut pulls, 500),
+        quantile(&mut pulls, 990),
+        quantile(&mut pulls, 1000),
+    );
+    supervisor.shutdown().await;
+}
+
+/// A table that declares no Forge property is compacted on the default interval.
+///
+/// The fixture's compaction opt-in, count trigger, and type are removed before the
+/// first promotion, so the table carries exactly the properties registration
+/// writes. Its first commit must open a compaction track, the track must stay
+/// idle for the whole default one-hour interval, and the leader must dispatch
+/// it at the interval boundary.
+///
+/// # Panics
+///
+/// Panics when a fixture dependency fails, the commit opens no track, or the
+/// leader dispatches before or misses the interval boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn property_less_table_is_compacted_after_the_default_interval() {
+    let fixture = PromotionIntegrationFixture::start("default_compaction").await;
+    let cleared = remove_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[
+            "wyrd.forge.enable-compaction",
+            "wyrd.forge.compaction.trigger-snapshot-count",
+            "wyrd.forge.compaction.type",
+        ],
+    )
+    .await;
+    assert!(
+        !cleared
+            .metadata()
+            .properties()
+            .keys()
+            .any(|key| key.starts_with("wyrd.forge.")),
+        "the table declares no Forge property: {:?}",
+        cleared.metadata().properties()
+    );
+
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
+    let (clock, control) = manual_clock();
+    let mut supervised = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    supervised.join_worker().await;
+    supervised.schedule_only().await;
+
+    let forge = supervised.forge();
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            fixture.binding.table_ref.namespace.as_str(),
+            &fixture.binding.table_ref.name,
+        )
+        .expect("fixture table identity"),
+    };
+    let track = forge
+        .held_leader_term()
+        .expect("the supervisor's pass holds the leader term")
+        .schedule()
+        .track_for_test(&key)
+        .expect("the first commit opens a compaction track by default");
+    assert_eq!(track.pending_commits, 1, "{track:?}");
+
+    control
+        .advance(ChronoDuration::seconds(3599))
+        .expect("manual clock advance");
+    assert!(
+        forge
+            .pull_compaction(4)
+            .await
+            .expect("leader pull")
+            .is_empty(),
+        "one commit waits out the one-hour default interval"
+    );
+    control
+        .advance(ChronoDuration::seconds(1))
+        .expect("manual clock advance");
+    let due = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(due.len(), 1, "the interval boundary dispatches: {due:?}");
+    assert_eq!(due[0].compaction_type, ForgeCompactionType::SmallFiles);
+}
+
+/// Builds one coordinator over `fixture` whose scheduler passes a test requests.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot produce a validated Forge graph.
+fn coordinator(fixture: &PromotionIntegrationFixture) -> (Arc<Forge>, ForgeSchedulerTrigger) {
+    let trigger = ForgeSchedulerTrigger::with_owner_for_test(Uuid::now_v7());
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        CountingObjectStore::new(Arc::clone(&fixture.staging)),
+        ForgeClock::system(),
+        ForgeWorkerCompletionObserver::new(),
+        trigger.clone(),
+    );
+    (forge, trigger)
+}
+
+/// Requests one scheduler pass and waits until `expected` passes completed.
+///
+/// A requested pass renews or contends for the term before it records
+/// completion, so on return the coordinator's term state is settled.
+///
+/// # Panics
+///
+/// Panics when the pass misses its diagnostic bound.
+async fn contend(trigger: &ForgeSchedulerTrigger, expected: usize) {
+    trigger.request_pass();
+    timeout(OWNERSHIP_BOUND, trigger.wait_for_passes_at_least(expected))
+        .await
+        .expect("the requested scheduler pass completes");
+}
+
+/// Asserts that notify, pull and report all refuse `fencing_token` on `forge`.
+///
+/// # Panics
+///
+/// Panics when any leader handler still serves the term.
+fn assert_handlers_refuse(
+    forge: &Forge,
+    fixture: &PromotionIntegrationFixture,
+    fencing_token: i64,
+) {
+    let key = ForgeTableKey {
+        tenant: fixture.tenant,
+        table: identity(fixture),
+    };
+    let notify = forge.accept_commit_notice(
+        fencing_token,
+        ForgeCommitNotice {
+            key: key.clone(),
+            snapshot_id: 1,
+            settings: ForgeTableSettings::default(),
+        },
+    );
+    let pull = forge.serve_compaction_pull(fencing_token, 4).map(|_| ());
+    let report = forge
+        .serve_compaction_report(
+            fencing_token,
+            &key,
+            Uuid::now_v7(),
+            ForgeCompactionOutcome::Failed,
+        )
+        .map(|_| ());
+    for (handler, result) in [("notify", notify), ("pull", pull), ("report", report)] {
+        assert!(
+            matches!(
+                result,
+                Err(vala_bifrost_redux::forge::ForgeError::FenceLost { .. })
+            ),
+            "{handler} under an ended scheduler's term: {result:?}"
+        );
+    }
+}
+
+/// A failed scheduler ends its term before the same-pod restart backoff.
+///
+/// The scheduler panics after acquiring the term. While nothing runs on that
+/// pod, its term is revoked and gone, so notify, pull and report all refuse
+/// it. Once the abandoned row lapses a standby acquires, and the rebuilt
+/// scheduler contends like any other replica and stays a standby. A rebuilt
+/// scheduler that later holds the term and is dropped ends it the same way.
+///
+/// # Panics
+///
+/// Panics when an ended scheduler's term stays held or serves a handler, when
+/// the standby cannot take over, or when the rebuilt scheduler takes the live
+/// term from the standby.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn failed_scheduler_ends_its_term_before_restart() {
+    let fixture = PromotionIntegrationFixture::start("scheduler_unwind").await;
+    let (old, old_trigger) = coordinator(&fixture);
+    let fail = CancellationToken::new();
+    let first = tokio::spawn({
+        let old = Arc::clone(&old);
+        let fail = fail.clone();
+        async move {
+            tokio::select! {
+                result = old.run(CancellationToken::new(), ForgeRoleReadiness::detached()) => {
+                    panic!("the scheduler stopped on its own: {result:?}")
+                }
+                () = fail.cancelled() => panic!("forced scheduler failure after acquisition"),
+            }
+        }
+    });
+    contend(&old_trigger, 1).await;
+    let term = old
+        .held_leader_term()
+        .expect("the first scheduler holds the term");
+    fail.cancel();
+    let failed = first.await.expect_err("the scheduler task fails");
+    assert!(failed.is_panic(), "the scheduler unwound: {failed}");
+
+    // Restart backoff: no scheduler runs on this pod, and its term is over.
+    assert!(term.is_revoked());
+    assert!(old.held_leader_term().is_none());
+    assert_handlers_refuse(&old, &fixture, term.fencing_token());
+
+    // The abandoned row lapses at its own expiry; a standby then acquires.
+    sqlx::query(
+        "UPDATE vala.forge_scheduler_state SET expires_at = statement_timestamp() WHERE singleton",
+    )
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("the abandoned term lapses");
+    let (standby, standby_trigger) = coordinator(&fixture);
+    let standby_stop = CancellationToken::new();
+    let standby_run = tokio::spawn({
+        let standby = Arc::clone(&standby);
+        let stop = standby_stop.clone();
+        async move { standby.run(stop, ForgeRoleReadiness::detached()).await }
+    });
+    contend(&standby_trigger, 1).await;
+    let successor = standby.held_leader_term().expect("the standby takes over");
+    assert!(successor.fencing_token() > term.fencing_token());
+
+    // The rebuilt scheduler contends for the live term and stays a standby.
+    let rebuilt = AbortOnDropHandle::new(tokio::spawn({
+        let old = Arc::clone(&old);
+        async move {
+            old.run(CancellationToken::new(), ForgeRoleReadiness::detached())
+                .await
+        }
+    }));
+    contend(&old_trigger, 2).await;
+    assert!(
+        old.held_leader_term().is_none(),
+        "the live term is not taken"
+    );
+    assert!(!successor.is_revoked());
+
+    // After the standby resigns, the rebuilt scheduler acquires; dropping it
+    // then ends that term at once.
+    standby_stop.cancel();
+    standby_run
+        .await
+        .expect("standby scheduler task")
+        .expect("standby scheduler stops cleanly");
+    contend(&old_trigger, 3).await;
+    let rebuilt_term = old
+        .held_leader_term()
+        .expect("the rebuilt scheduler acquires the resigned term");
+    rebuilt.abort();
+    let dropped = rebuilt.await.expect_err("the rebuilt scheduler is dropped");
+    assert!(dropped.is_cancelled());
+    assert!(rebuilt_term.is_revoked());
+    assert!(old.held_leader_term().is_none());
+    assert_handlers_refuse(&old, &fixture, rebuilt_term.fencing_token());
 }

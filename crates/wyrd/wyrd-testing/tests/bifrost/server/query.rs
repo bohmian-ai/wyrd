@@ -4,6 +4,7 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, QueryIpcDecoder};
+use wyrd_client::bifrost::Correlation;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
@@ -24,6 +25,7 @@ const FIXTURE_VALUES: [i64; 4] = [1, 2, 3, 4];
 /// Builds one published-only strict request with an explicit deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
+        params: Vec::new(),
         sql: sql.to_owned(),
         deadline_ms: Some(30_000),
     }
@@ -252,7 +254,6 @@ async fn signed_forwarding_preserves_shorter_absolute_deadline() -> Result<(), S
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let query = request(&format!("SELECT value FROM vala.bifrost.{table}"));
@@ -289,10 +290,10 @@ async fn signed_forwarding_preserves_shorter_absolute_deadline() -> Result<(), S
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup() {
-    prove_shared_query_surfaces()
+    Box::pin(prove_shared_query_surfaces())
         .await
         .expect("shared gRPC and scheduled query journey");
-    prove_scheduled_analytical_peer_loss()
+    Box::pin(prove_scheduled_analytical_peer_loss())
         .await
         .expect("scheduled Analytical peer-loss journey");
 }
@@ -342,7 +343,6 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let sql = format!("SELECT value FROM vala.bifrost.{table} ORDER BY value");
@@ -607,7 +607,6 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
 
@@ -656,6 +655,12 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
     );
     prove_scheduled_analytical_completion(&cluster, &sql).await?;
 
+    // Counted before the pause is armed: the count is itself an audited
+    // Analytical read, and a stage it placed on the paused follower would
+    // stall it instead of the statement under test.
+    let leader = cluster.server(0).ok_or("missing leader node")?;
+    let reads_before = audit_rows(leader, tenant, "bifrost.query.read_decision").await?;
+
     // The pause is armed on one follower before the statement runs, so the
     // peer this phase kills is provably holding an activated stage rather than
     // racing the query's own completion.
@@ -674,9 +679,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
         .worker()
         .bind_execute_pause_for_test(std::sync::Arc::clone(&pause));
 
-    let leader = cluster.server(0).ok_or("missing leader node")?;
     let leader_state = leader.state().clone();
-    let reads_before = audit_rows(leader, tenant, "bifrost.query.read_decision").await?;
 
     let scheduled = {
         let context = scheduled_context(tenant)?;
@@ -921,9 +924,7 @@ async fn await_clean_analytical(
 /// the resolved tables before any row is read.
 ///
 /// The journey also proves the denial is durable: one refusal writes exactly one
-/// tenant-bound denial event and no accepted-read event, and a refusal whose own
-/// audit append fails is reported as audit-unavailable rather than as a plain
-/// rejection. Finally a schema-scoped bearer is presented directly on the
+/// tenant-bound denial event and no accepted-read event. Finally a schema-scoped bearer is presented directly on the
 /// generated gRPC query service: its covered query drains and an uncovered one
 /// is refused before a response stream opens.
 ///
@@ -941,8 +942,6 @@ async fn tenant_scoped_roles_reach_only_their_granted_bifrost_tables() {
 
 /// Stable code a principal receives for a table its grants do not cover.
 const QUERY_FORBIDDEN: &str = "WYRD_VALA_403_QUERY_FORBIDDEN";
-/// Stable code substituted when a refusal's own audit append cannot commit.
-const AUDIT_UNAVAILABLE: &str = "WYRD_VALA_500_AUDIT_UNAVAILABLE";
 /// Audited operation name the public query route decides under.
 const QUERY_OPERATION: &str = "vala.query.sync";
 /// Audited operation name Oracle commits one accepted read decision under.
@@ -1054,13 +1053,6 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
         .into());
     }
 
-    // The denial fails closed on its own append: an unrecordable refusal is
-    // reported as audit-unavailable, never as a plain rejection.
-    server.fail_query_object_denial_audit();
-    refuses_with(&analyst, TRACES_SQL, AUDIT_UNAVAILABLE).await?;
-    server.restore_query_object_denial_audit();
-    refuses(&analyst, TRACES_SQL).await?;
-
     prove_scoped_bearer_over_grpc(&server, &analyst).await?;
 
     server.shutdown().await?;
@@ -1143,7 +1135,7 @@ async fn prove_scoped_bearer_over_grpc(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn service_b_acts_for_service_a_with_only_a_table_authority() {
-    prove_service_b_acts_for_service_a()
+    Box::pin(prove_service_b_acts_for_service_a())
         .await
         .expect("service B acts for service A with only A's table authority");
 }
@@ -1261,6 +1253,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         }],
         physical_layout: None,
         compaction_target_file_size_bytes: None,
+        compaction_type: None,
     };
     let refused = delegated
         .request_json::<_, serde_json::Value>(
@@ -1303,7 +1296,7 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     let described = wyrd_client::bifrost::TableConfig::describe(&b_client, events).await?;
     let delegated_writer =
         wyrd_client::Bifrost::connect_with_table(&delegated, described.clone()).await?;
-    delegated_writer.insert(br#"{"value": 1}"#.to_vec(), Default::default())?;
+    delegated_writer.insert(br#"{"value": 1}"#.to_vec(), Correlation::default())?;
     let denied_write = delegated_writer
         .flush()
         .await
@@ -1317,11 +1310,11 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
         "the delegated native write is refused for A's missing record write: {denied_write}"
     );
     let own_writer = wyrd_client::Bifrost::connect_with_table(&b_client, described).await?;
-    own_writer.insert(br#"{"value": 2}"#.to_vec(), Default::default())?;
+    own_writer.insert(br#"{"value": 2}"#.to_vec(), Correlation::default())?;
     own_writer.flush().await?;
     server.flush_bifrost().await?;
     let written = own_writer
-        .sql(&format!("SELECT value FROM {events}"))
+        .sql(&format!("SELECT value FROM {events}"), &[])
         .await?;
     let values: Vec<i64> = written
         .batches()
@@ -1720,7 +1713,6 @@ async fn query_edge_timeout_yields_to_oracle_deadline() -> Result<(), ServerJour
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let base = server.base_url().ok_or("missing HTTP URL")?.to_owned();
@@ -1833,7 +1825,6 @@ async fn silent_remote_oracle_delivery_yields_typed_query_timeout() -> Result<()
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await?;
     cluster.refresh_oracle_snapshots().await?;
@@ -2017,4 +2008,93 @@ async fn problem_code(response: reqwest::Response) -> Result<String, ServerJourn
         .as_str()
         .ok_or_else(|| format!("problem without code: {problem}"))?
         .to_owned())
+}
+
+/// Non-default Oracle deadline the shared-deadline journey configures.
+const CONFIGURED_DEADLINE_MS: i64 = 600_000;
+
+/// Explicit request deadline longer than both the configured and built-in defaults.
+const EXPLICIT_DEADLINE_MS: i64 = 9_000_000;
+
+/// Proves local and forwarded entry share the configured default deadline.
+///
+/// A role-separated cluster boots with a non-default Oracle default deadline.
+/// The same deadline-less statement is issued on the Scribe ingress, which
+/// forwards it, and on the Oracle node, which executes it locally. Both
+/// streams pin the configured deadline rather than the built-in two hours. A
+/// request carrying a longer explicit deadline keeps it on both paths, so no
+/// cap is imposed.
+///
+/// # Errors
+/// Returns cluster setup, catalog, or query errors.
+///
+/// # Panics
+/// Panics when a pinned deadline falls outside the configured or explicit window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn configured_default_deadline_is_shared_by_local_and_forwarded_queries()
+-> Result<(), ServerJourneyError> {
+    let cluster = wyrd_testing::bifrost::WyrdTestCluster::start_spec(
+        wyrd_testing::bifrost::BifrostClusterSpec::role_separated().with_oracle_runtime_for_test(
+            wyrd_server::config::OracleRuntimeConfig {
+                default_query_deadline_ms: CONFIGURED_DEADLINE_MS.unsigned_abs(),
+                ..wyrd_server::config::OracleRuntimeConfig::default()
+            },
+        ),
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let table = format!("shared_deadline_{}", uuid::Uuid::now_v7().simple());
+    let ingress = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing Scribe ingress")?;
+    assert!(
+        ingress.state().bifrost.oracle().is_none(),
+        "the ingress must forward"
+    );
+    let local = cluster
+        .servers()
+        .find(|server| server.state().bifrost.oracle().is_some())
+        .ok_or("missing Oracle node")?;
+    ingress
+        .state()
+        .bifrost_catalog()
+        .ok_or("missing catalog")?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table),
+            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            tenant,
+            physical_layout: None,
+        })
+        .await?;
+    let sql = format!("SELECT value FROM vala.bifrost.{table}");
+    for (path, server) in [("forwarded", ingress), ("local", local)] {
+        for (requested, expected) in [
+            (None, CONFIGURED_DEADLINE_MS),
+            (Some(EXPLICIT_DEADLINE_MS), EXPLICIT_DEADLINE_MS),
+        ] {
+            let mut query = request(&sql);
+            query.deadline_ms = requested;
+            let before = chrono::Utc::now().timestamp_millis();
+            let mut stream = server
+                .state()
+                .bifrost
+                .query_sql(scheduled_context(tenant)?, query)
+                .await?;
+            let after = chrono::Utc::now().timestamp_millis();
+            // The deadline is pinned between the two reads; one millisecond on
+            // each side absorbs the truncation of sub-millisecond instants.
+            assert!(
+                (before + expected - 1..=after + expected + 1).contains(&stream.deadline_ms),
+                "{path} query with {requested:?} pinned {} ms, outside {expected} ms of [{before}, {after}]",
+                stream.deadline_ms
+            );
+            while let Some(frame) = stream.frames.next().await {
+                frame?;
+            }
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
 }

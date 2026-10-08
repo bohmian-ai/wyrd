@@ -33,7 +33,12 @@ absorb the other, so both exist.
 ## Layout
 
 Both trees use the same shape: a capability directory whose `main.rs` is the
-`[[test]]` target and whose siblings are ordinary directory modules.
+`[[test]]` target and whose siblings are ordinary directory modules. Every other
+crate has exactly one integration target, `tests/integration/main.rs`, with one
+module per surface; lanes select a surface with `-E 'test(/^<module>::/)'`.
+Each target statically links the crate's whole dependency cone, so one target
+per crate keeps link time, linker memory, and `target/` size proportional to
+crates rather than to test files.
 
 ```
 crates/wyrd/wyrd-testing/tests/bifrost/oracle/
@@ -77,6 +82,18 @@ mise run test:bifrost:journey:scribe:production-geometry  # scheduled 512 MiB ob
 #                     :sdk :forge :scribe :oracle :otlp :server :mcp :python :typescript
 ```
 
+### SDKs
+
+```bash
+mise run verify:python-sdk               # checks + unit, TensorFlow, harness, every integration journey, identity
+mise run verify:rust-sdk                 # checks + wyrd-sdk-rust unit and every story journey, identity
+mise run verify:typescript-sdk           # checks + napi/package/types, unit, every integration journey, identity
+```
+
+Each also runs `test:identity:journey` against Keycloak and Dex, so Docker must
+be available. One run owns those containers at a time, so the three tasks share
+that one dependency and `gate`, which runs all three, runs it once.
+
 ### Everything else
 
 ```bash
@@ -112,7 +129,7 @@ For scoped verification (`gate` already includes its checks):
 ```bash
 mise run fmt lints                       # relevant Rust format and lint checks
 mise run codegen:check                   # contracts, schemas, stubs
-mise run check:client-tier | check:pyo3-scope | check:unwrap-audit
+mise run check:deps                      # crate boundaries on the dependency graph
 ```
 
 ## Family lanes vs. gated journeys
@@ -157,7 +174,17 @@ Two things the lanes deliberately do **not** do:
 
 ## Writing a test
 
-Follow `AGENTS.md` §16 for style, and these two rules specifically:
+Tests are maintained as product code. A reader must be able to understand the
+user behavior, setup, action, and expected outcome in one pass without tracing
+through unrelated helpers or knowing the task that introduced the test.
+
+Prefer the most ergonomic public surface that represents how a user actually
+works. A test that passes only through awkward setup, private APIs, internal
+state inspection, or a test-only workaround is evidence of a product or
+harness gap, not a successful user journey. Fix that gap or move the assertion
+to the internal tier that owns it.
+
+Follow `AGENTS.md` §16 for style, and these rules specifically:
 
 - **A test must assert.** A test that calls another test and prints a marker
   proves nothing, silently pays that test's full runtime a second time, and
@@ -166,8 +193,66 @@ Follow `AGENTS.md` §16 for style, and these two rules specifically:
 - **A test must not name a plan.** Task, case, and hypothesis identifiers
   (`T13`, `P27`, `D85`, `H1`) are meaningless once the plan closes and send a
   reader hunting for a document that may be private. Describe the behavior.
+- **A test must read as behavior.** Keep setup proportional, call the owning
+  public API directly, and assert typed outcomes. A helper earns its place only
+  when it removes genuine repetition without hiding the action or expectation.
+- **A test must demonstrate the intended ergonomics.** Do not preserve an
+  awkward public workflow merely because it can be made to pass. Client-facing
+  tests are executable examples of the API Wyrd intends users to adopt.
 
 Python tests use top-level `def test_*` only — never `class TestFoo:`.
+
+### Client-facing tests (Rust, Python, TypeScript SDKs)
+
+SDK tests are the product's public examples. Review every client-facing test
+against this checklist:
+
+- [ ] **One story per file, one outcome per test.** The test name states what
+  the user gets (`agent_answer_passes_its_verifier`). A story uses the same
+  file name, test names, and fixtures in all three SDKs.
+- [ ] **Checked-in YAML only.** Cards come from `fixtures/cards/<story>/` at
+  the repository root. Test code never builds or edits YAML, JSON, digests, or
+  URLs.
+- [ ] **Deployment-shaped server.** The session `WyrdTestServer` exports its
+  address and key the way a deployment's environment does; SDK and CLI calls
+  resolve them without arguments. Only a credentials test passes them.
+- [ ] **A second principal is an explicit client.** A test acting as anyone
+  but the session administrator builds a `WyrdClient` from that principal's
+  key and passes it as the surface's one `client` argument; a state acting as
+  a Service is created with that client (`WyrdState.from_path(path,
+  client=...)`) and starts Bifrost with no identity argument. Server URLs,
+  credentials, and gRPC URLs go only to the `WyrdClient` constructor, and no
+  test switches principals by editing the environment.
+- [ ] **Public surfaces only.** Public SDK modules, the in-process CLI
+  functions, the narrowly scoped test controls (`wait_for_baseline` and
+  `make_binding_due`), and the server's credential
+  fixtures for principals that are not Card keys. A Service or Agent key
+  comes from the CLI `issue_key` and holds `workload`; a Role beyond it is
+  assigned through the public `Principals` surface and takes effect for a
+  client built from the key after the assignment. No private or extension import,
+  subprocess, raw HTTP, SQL against server tables, digest computation, YAML or
+  JSON parsing of results, sleep, or polling loop.
+- [ ] **Readable without repository archaeology.** The test body shows the
+  user action and typed assertion directly. Support code uses domain names,
+  stays close to the story, and does not force a reader through generic
+  builders, nested wrappers, or implementation-detail fixtures to understand
+  the behavior.
+- [ ] **Setup is fixtures that return domain objects** (a `WyrdState`, a
+  registered Card), not helper functions in the test file. The body acts on
+  the SDK and asserts on typed results.
+- [ ] **Errors assert one exact catalog code** on the raised `WyrdError`. No
+  message matching, no "any of these codes".
+- [ ] **Fixed, meaningful names.** No uuid or time suffixes; registering a
+  fixture again is idempotent.
+- [ ] **Value tables** use `parametrize` / `it.each` / a table loop with one
+  assertion shape, never branching inside the loop.
+- [ ] **Engine mathematics and internals stay in Rust tests**: PSI bins, SPC
+  limits, judge scoring, cache and fence counters, audit staging.
+- [ ] **Type-only checks are compile-time**: `expectTypeOf` in `*.test-d.ts`,
+  `ty` fixtures outside pytest collection.
+- [ ] **Written to be owned.** Fixtures, fixture YAML, `conftest`, and
+  `tests/support` are minimal, realistic, typed, and named for the domain.
+  Fixture YAML reads as the Card a user would author.
 
 ## Where to look next
 

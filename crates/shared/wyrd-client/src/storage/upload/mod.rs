@@ -86,6 +86,10 @@ pub struct FileSource {
 
 impl FileSource {
     /// Create a source by path. The file is opened when the upload starts.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - File to upload; opened only when the upload starts.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -95,6 +99,14 @@ impl FileSource {
     }
 
     /// Open a source and capture its size without reading its contents.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - File to upload; its metadata supplies the size hint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageClientError::Io`] when the file metadata cannot be read.
     pub async fn open(path: impl Into<PathBuf>) -> Result<Self, StorageClientError> {
         let path = path.into();
         let size = tokio::fs::metadata(&path).await?.len();

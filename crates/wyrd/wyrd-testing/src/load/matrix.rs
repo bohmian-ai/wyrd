@@ -42,7 +42,7 @@ use crate::server::BifrostQueryResourceSnapshot;
 /// Stable table name provisioned independently inside every tenant.
 const TABLE_NAME: &str = "bifrost_cluster_load";
 /// Whole-scenario progress ceiling, not a latency SLO.
-const DEFAULT_SCENARIO_DEADLINE: Duration = Duration::from_secs(60);
+const DEFAULT_SCENARIO_DEADLINE: Duration = Duration::from_mins(1);
 
 /// Budget granted to cluster shutdown, independent of the scenario deadline.
 ///
@@ -212,7 +212,7 @@ pub struct ClusterLoadProfile {
     /// Bounded public writer tasks per tenant.
     pub writers_per_tenant: usize,
     /// Bounded strict reader tasks per tenant.
-    pub readers_per_tenant: usize,
+    pub readers_per_tenant: u32,
     /// Minimum completed reads required per tenant.
     pub minimum_reads_per_tenant: u32,
     /// Deadlock/progress ceiling for one scenario.
@@ -260,7 +260,7 @@ impl ClusterLoadProfile {
             || self.writers_per_tenant != 2
             || self.readers_per_tenant != 2
             || ![
-                self.readers_per_tenant as u32,
+                self.readers_per_tenant,
                 self.measured_batches_per_tenant.saturating_mul(2),
             ]
             .contains(&self.minimum_reads_per_tenant)
@@ -399,9 +399,9 @@ impl BifrostClusterLoad {
     /// when validation or role-complete startup fails.
     pub async fn start(profile: ClusterLoadProfile) -> Result<Self, ClusterLoadError> {
         profile.validate()?;
-        let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+        let cluster = Box::pin(WyrdTestCluster::start_spec_with_forge_completion_observer(
             profile.topology.spec_for_test(),
-        )
+        ))
         .await
         .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
         let telemetry = cluster.telemetry().clone();
@@ -414,11 +414,19 @@ impl BifrostClusterLoad {
 
     /// Run all warmup, measured, reconciliation, and cleanup phases.
     ///
+    /// # Panics
+    ///
+    /// Panics if the cluster was already taken by an earlier run.
+    ///
     /// Measured writes and reads use only the public Rust SDK. Administrative
     /// table creation and tenant/bootstrap setup happen before the phase
     /// barrier and are excluded from operation counts.
     pub async fn run(mut self) -> Result<BifrostClusterLoadSummary, ClusterLoadError> {
-        let result = tokio::time::timeout(self.profile.scenario_deadline, self.run_inner()).await;
+        let result = Box::pin(tokio::time::timeout(
+            self.profile.scenario_deadline,
+            self.run_inner(),
+        ))
+        .await;
         let result = match result {
             Ok(result) => result,
             Err(_) => Err(ClusterLoadError::Assertion(
@@ -447,8 +455,7 @@ impl BifrostClusterLoad {
                 summary.cleanup.supervised_tasks = shutdown_inspection.supervised_tasks;
                 Ok(summary)
             }
-            (Err(error), Ok(_)) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => Err(error),
             (Err(error), Err(shutdown_error)) => Err(ClusterLoadError::Cluster(format!(
                 "{error}; {shutdown_error}"
             ))),
@@ -474,6 +481,7 @@ impl BifrostClusterLoad {
         wyrd_client::Bifrost::query_only(&setup_client)
             .collect_bounded(
                 &BifrostQueryRequest {
+                    params: Vec::new(),
                     sql: format!("SELECT id, tenant, batch FROM {table} LIMIT 0"),
                     deadline_ms: Some(5_000),
                 },
@@ -484,8 +492,14 @@ impl BifrostClusterLoad {
             )
             .await
             .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
-        let results =
-            run_public_matrix(&self.telemetry, cluster, &self.profile, &tenants, &table).await?;
+        let results = Box::pin(run_public_matrix(
+            &self.telemetry,
+            cluster,
+            &self.profile,
+            &tenants,
+            &table,
+        ))
+        .await?;
         let fairness = jain_fairness(results.values().map(|result| result.acknowledged_rows));
         if fairness < 0.95 {
             return Err(ClusterLoadError::Assertion(format!(
@@ -642,6 +656,7 @@ async fn exercise_query_cancellation(
         query
             .collect_bounded(
                 &BifrostQueryRequest {
+                    params: Vec::new(),
                     sql,
                     deadline_ms: Some(5_000),
                 },
@@ -721,7 +736,6 @@ async fn provision_tables(
                 user_fields: fields.clone(),
                 tenant: *tenant,
                 physical_layout: None,
-                audit: None,
             })
             .await
             .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
@@ -843,7 +857,7 @@ async fn run_public_matrix(
     .map_err(|error| ClusterLoadError::Telemetry(format!("warmup: {error}")))?;
     let warmup_owners = phase_owner_checkpoint(cluster, tenants).await?;
     let warmup_owner_delta = owner_delta(matrix_owners, warmup_owners)?;
-    let (_, measured) = sampled_phase(
+    let ((), measured) = sampled_phase(
         telemetry,
         ClusterTelemetryExpectation {
             topology: profile.topology,
@@ -869,7 +883,7 @@ async fn run_public_matrix(
             result.map_err(|error| ClusterLoadError::Client(error.to_string()))??;
         results.insert(tenant, report);
     }
-    let (_, publication) = sampled_phase(
+    let ((), publication) = sampled_phase(
         telemetry,
         ClusterTelemetryExpectation {
             topology: profile.topology,
@@ -883,7 +897,7 @@ async fn run_public_matrix(
     .await?;
     let publication_owners = phase_owner_checkpoint(cluster, tenants).await?;
     let publication_owner_delta = owner_delta(measured_owners, publication_owners)?;
-    let (_, final_verification) = sampled_phase(telemetry, ClusterTelemetryExpectation {
+    let ((), final_verification) = sampled_phase(telemetry, ClusterTelemetryExpectation {
         topology: profile.topology,
         required_binding_ids: FINAL_BINDINGS,
         required_dependency_ids: QUERY_DEPENDENCIES,
@@ -911,6 +925,7 @@ async fn run_public_matrix(
         // already holds rather than by guessing at the newest staged row.
         let final_stream = query
             .query(&BifrostQueryRequest {
+                params: Vec::new(),
                 sql: final_sql,
                 deadline_ms: Some(5_000),
             })
@@ -989,7 +1004,8 @@ async fn run_public_matrix(
             .bifrost_read_decision_for_request(tenant, &final_request_id)
             .await
             .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?
-            as u64;
+            .try_into()
+            .map_err(|_| ClusterLoadError::Assertion("audit row count is negative".to_owned()))?;
         if report.tenant_audit_rows != 1 {
             return Err(ClusterLoadError::Assertion(format!(
                 "tenant {tenant} final read request {final_request_id} produced {} audit rows, expected one",
@@ -1712,6 +1728,14 @@ impl PhaseProgress {
 }
 
 /// Execute one tenant's synchronized warmup, measured, and read phases.
+///
+/// # Errors
+///
+/// Returns [`ClusterLoadError::Client`] when a payload cannot be built, a
+/// write or read fails outside the retried refusals, or a phase task cannot be
+/// joined; [`ClusterLoadError::Assertion`] when the tenant completes fewer
+/// strict reads than its target or a phase barrier is abandoned after another
+/// tenant fails.
 async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, ClusterLoadError> {
     let TenantRunContext {
         tenant,
@@ -1752,7 +1776,8 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
         let table = table.clone();
         tasks.spawn(async move {
             let mut result = TenantLoadResult::default();
-            for batch in (writer_index as u32..profile.measured_batches_per_tenant)
+            for batch in (0..profile.measured_batches_per_tenant)
+                .skip(writer_index)
                 .step_by(profile.writers_per_tenant)
             {
                 let payload = ipc_payload(tenant, tenant_index, batch + 2, profile.rows_per_batch)?;
@@ -1769,7 +1794,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                     )
                     .await
                 {
-                    Ok(()) => {
+                    Ok(_request_id) => {
                         result.acknowledged_batches += 1;
                         result.acknowledged_rows += u64::from(profile.rows_per_batch);
                         result.acknowledged_bytes += payload.len() as u64;
@@ -1793,7 +1818,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
         let table = table.clone();
         tasks.spawn(async move {
             let mut result = TenantLoadResult::default();
-            let target = min_reads / profile.readers_per_tenant as u32;
+            let target = min_reads / profile.readers_per_tenant;
             let mut attempts = 0_u32;
             while result.completed_reads < target
                 && attempts < target.saturating_mul(32).max(target)
@@ -1810,6 +1835,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                 let response = query
                     .collect_bounded(
                         &BifrostQueryRequest {
+                            params: Vec::new(),
                             sql,
                             deadline_ms: Some(deadline_ms),
                         },
@@ -1891,7 +1917,6 @@ fn is_retryable_read_error(error: &BifrostClientError) -> bool {
         // A role or source that has not converged yet on this node.
         "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE",
         "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE",
-        "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE",
         "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
     ]
     .contains(&wyrd_spec::error::WyrdError::from(error).code())
@@ -1912,8 +1937,10 @@ fn ipc_payload(
         Field::new("tenant", DataType::Utf8, false),
         Field::new("batch", DataType::Utf8, false),
     ]));
+    let tenant_index = i64::try_from(tenant_index)
+        .map_err(|_| ClusterLoadError::Profile("tenant index exceeds i64".to_owned()))?;
     let ids = (0..rows)
-        .map(|row| (tenant_index as i64) * 1_000_000 + (batch as i64) * 1_000 + row as i64)
+        .map(|row| tenant_index * 1_000_000 + i64::from(batch) * 1_000 + i64::from(row))
         .collect::<Vec<_>>();
     let tenant_values = vec![tenant.to_string(); rows as usize];
     let batch_values = vec![batch.to_string(); rows as usize];
@@ -1976,12 +2003,13 @@ fn deterministic_batch_id(seed: u64, tenant_index: usize, batch: u32) -> [u8; 16
         .saturating_add(u64::from(batch));
     let entropy =
         (u128::from(seed) << 64) | (u128::from(tenant_index as u64) << 32) | u128::from(batch);
+    let entropy = entropy.to_be_bytes();
     let mut bytes = [0_u8; 16];
     bytes[..6].copy_from_slice(&millis.to_be_bytes()[2..]);
-    bytes[6] = 0x70 | ((entropy >> 56) as u8 & 0x0f);
-    bytes[7] = (entropy >> 48) as u8;
-    bytes[8] = 0x80 | ((entropy >> 56) as u8 & 0x3f);
-    bytes[9..].copy_from_slice(&entropy.to_be_bytes()[9..]);
+    bytes[6] = 0x70 | (entropy[8] & 0x0f);
+    bytes[7] = entropy[9];
+    bytes[8] = 0x80 | (entropy[8] & 0x3f);
+    bytes[9..].copy_from_slice(&entropy[9..]);
     bytes
 }
 
@@ -2156,11 +2184,11 @@ mod tests {
         assert_eq!(json["readers_per_tenant"], 2);
         assert_eq!(json["minimum_reads_per_tenant"], 2);
         assert_eq!(
-            profile.minimum_reads_per_tenant / profile.readers_per_tenant as u32,
+            profile.minimum_reads_per_tenant / profile.readers_per_tenant,
             1
         );
         assert_eq!(
-            profile.minimum_reads_per_tenant % profile.readers_per_tenant as u32,
+            profile.minimum_reads_per_tenant % profile.readers_per_tenant,
             0
         );
     }

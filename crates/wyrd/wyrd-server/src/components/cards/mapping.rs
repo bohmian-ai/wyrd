@@ -53,7 +53,7 @@ pub fn existing_row_to_response(
 }
 
 /// Convert the SQL lifecycle enum without stringly response mapping.
-const fn lifecycle_status(status: CardStatus) -> CardLifecycleStatus {
+pub(crate) const fn lifecycle_status(status: CardStatus) -> CardLifecycleStatus {
     match status {
         CardStatus::Pending => CardLifecycleStatus::Pending,
         CardStatus::Active => CardLifecycleStatus::Active,

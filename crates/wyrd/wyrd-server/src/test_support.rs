@@ -23,7 +23,7 @@ use wyrd_storage::settings::{BackendConfig, StorageSettings};
 /// Owns the repository-managed Postgres fixture and warehouse tempdir for the lifetime of
 /// the test process so the shared catalog's connections stay live.
 struct SharedCatalog {
-    _fixture: PgFixture,
+    fixture: PgFixture,
     _warehouse: TempDir,
     catalog: Arc<BifrostCatalog>,
     storage: Arc<StorageHandle>,
@@ -32,12 +32,12 @@ struct SharedCatalog {
 impl SharedCatalog {
     /// Borrow the fixture's Wyrd Postgres handle for typed SQL capabilities.
     fn wyrd_postgres(&self) -> &WyrdPostgres {
-        self._fixture.wyrd_postgres()
+        self.fixture.wyrd_postgres()
     }
 
     /// Borrow the fixture's Vala Postgres handle used by the Redux catalog.
     fn vala_postgres(&self) -> &ValaPostgres {
-        self._fixture.vala_postgres()
+        self.fixture.vala_postgres()
     }
 }
 
@@ -53,7 +53,7 @@ async fn build_shared() -> SharedCatalog {
             root: warehouse.path().to_path_buf(),
         },
         require_encryption: false,
-        presign_ttl: std::time::Duration::from_secs(600),
+        presign_ttl: std::time::Duration::from_mins(10),
         part_size_bytes: 16 * 1024 * 1024,
         multipart_threshold_bytes: 100 * 1024 * 1024,
     })
@@ -79,7 +79,7 @@ async fn build_shared() -> SharedCatalog {
     .expect("Redux catalog builds against repository-managed Postgres");
 
     SharedCatalog {
-        _fixture: fixture,
+        fixture,
         _warehouse: warehouse,
         catalog: Arc::new(catalog),
         storage,
@@ -154,7 +154,7 @@ pub fn test_app_state(
 }
 
 /// Return a server Postgres owner over the shared fixture's exact runtime handles.
-pub(crate) async fn test_server_postgres() -> Arc<crate::postgres::ServerPostgres> {
+pub(crate) fn test_server_postgres() -> Arc<crate::postgres::ServerPostgres> {
     Arc::new(crate::postgres::ServerPostgres::from_parts(
         shared().wyrd_postgres().clone(),
         shared().vala_postgres().clone(),
@@ -162,7 +162,7 @@ pub(crate) async fn test_server_postgres() -> Arc<crate::postgres::ServerPostgre
 }
 
 /// Return the process-lifetime local storage handle used by the test catalog.
-pub(crate) async fn test_storage() -> Arc<StorageHandle> {
+pub(crate) fn test_storage() -> Arc<StorageHandle> {
     Arc::clone(&shared().storage)
 }
 
@@ -170,9 +170,8 @@ pub(crate) async fn test_storage() -> Arc<StorageHandle> {
 /// RLS. Its connections take reactor affinity from the process-wide persistent
 /// runtime that initialized the fixture, so DB-acquiring tests must run on that
 /// runtime via `wyrd_runtime::runtime().block_on(..)`.
-#[allow(dead_code)]
-pub(crate) async fn test_pool() -> sqlx::PgPool {
-    shared()._fixture.app_pool().clone()
+pub(crate) fn test_pool() -> sqlx::PgPool {
+    shared().fixture.app_pool().clone()
 }
 
 /// Return the fixture's seeded data tenant.
@@ -181,7 +180,30 @@ pub(crate) async fn test_pool() -> sqlx::PgPool {
 /// the embedded fixture seeds exactly this one tenant. Unit tests that register
 /// a `TenantOwned` table must bind this tenant: a freshly minted `DataTenantId`
 /// is absent from `platform.tenants`, so the register INSERT FK-violates.
-#[allow(dead_code)]
-pub(crate) async fn test_tenant() -> wyrd_spec::DataTenantId {
-    shared()._fixture.data_tenant_id()
+pub(crate) fn test_tenant() -> wyrd_spec::DataTenantId {
+    shared().fixture.data_tenant_id()
+}
+
+/// Waits up to thirty seconds until the process audit outbox has counted a
+/// failed write in `outbox_write_failures_total{outbox="audit"}`.
+///
+/// Audit-failure tests call this before restoring staging, so the retried
+/// decision they then observe is proven to have failed at least once first.
+/// The process recorder is the shared test recorder.
+///
+/// # Panics
+///
+/// Panics when no failed audit write is counted in time.
+pub(crate) async fn await_audit_write_failure() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !crate::app::metrics::test_prometheus_handle()
+        .render()
+        .contains("outbox_write_failures_total{outbox=\"audit\"}")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no failed audit write was counted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }

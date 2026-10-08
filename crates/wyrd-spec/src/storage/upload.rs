@@ -137,8 +137,9 @@ pub enum VerificationGuarantee {
 pub fn backend_verification_guarantee(backend: StorageBackendKind) -> VerificationGuarantee {
     match backend {
         StorageBackendKind::S3 => VerificationGuarantee::ServerVerifiedAgainstClient,
-        StorageBackendKind::Gcs => VerificationGuarantee::ClientDeclared,
-        StorageBackendKind::Azure => VerificationGuarantee::ClientDeclared,
+        StorageBackendKind::Gcs | StorageBackendKind::Azure => {
+            VerificationGuarantee::ClientDeclared
+        }
         StorageBackendKind::Local => VerificationGuarantee::ServerComputed,
     }
 }

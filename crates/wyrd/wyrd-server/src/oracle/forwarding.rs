@@ -4,7 +4,7 @@ use std::future::Future;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use futures_util::StreamExt;
 #[cfg(feature = "test-support")]
@@ -150,7 +150,7 @@ impl vala_bifrost_redux::contracts::OracleQueryDispatch for ReadyOracleForwarder
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
-        self.forward(context, request).await
+        Box::pin(self.forward(context, request)).await
     }
 }
 
@@ -168,7 +168,7 @@ pub struct ReadyOracleForwarderInputs {
     pub tls: Option<BifrostPeerTls>,
     /// Receiver-side envelope checks.
     pub authority: Arc<OraclePeerAuthority>,
-    /// Query floor and classification configuration.
+    /// Query floor, classification, and boot-resolved default deadline.
     pub config: OracleConfig,
 }
 
@@ -222,13 +222,7 @@ impl ReadyOracleForwarder {
     ) -> Result<OracleQueryStream, BifrostError> {
         Self::validate_context(&context)?;
         self.planner.validate_query(&request)?;
-        let duration = request
-            .deadline_ms
-            .and_then(|deadline| u64::try_from(deadline).ok())
-            .map_or(
-                OracleConfig::default().default_deadline,
-                Duration::from_millis,
-            );
+        let duration = self.planner.request_deadline(request.deadline_ms);
         let monotonic_deadline = Instant::now()
             .checked_add(duration)
             .ok_or(BifrostError::QueryTimeout)?;
@@ -309,7 +303,6 @@ impl ReadyOracleForwarder {
         let claims = self
             .authority
             .verify_forward_query(&context, self.local_node_id, fence, chrono::Utc::now())
-            .await
             .map_err(|_| BifrostError::QueryPeerSecurity)?;
         self.execute_local(claims).await
     }
@@ -439,12 +432,9 @@ impl ReadyOracleForwarder {
             let mut converter = QueryStreamConverter::new();
             let mut ipc = ForwardedQueryIpc::new();
             while let Some(frame) = wire.next().await {
-                let frame = match frame {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        yield Err(BifrostError::QueryExecutionFailed);
-                        break;
-                    }
+                let Ok(frame) = frame else {
+                    yield Err(BifrostError::QueryExecutionFailed);
+                    break;
                 };
                 let counted = match frame.frame.as_ref() {
                     Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Schema(schema)) => {
@@ -760,6 +750,7 @@ impl ForwardedQueryIpc {
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use super::*;
     use wyrd_runtime::permission::PermissionSet;
@@ -909,6 +900,7 @@ mod tests {
         )
         .expect("tenant-bound query context");
         let request = BifrostQueryRequest {
+            params: Vec::new(),
             sql: "SELECT value FROM vala.bifrost.events".to_owned(),
             deadline_ms: Some(5_000),
         };

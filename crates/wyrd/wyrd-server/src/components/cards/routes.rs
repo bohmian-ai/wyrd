@@ -19,7 +19,6 @@ use wyrd_spec::registry::{
     GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
 };
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
-use wyrd_spec::vala::api::AuditEvent;
 
 use crate::audit;
 use crate::components::auth::Caller;
@@ -60,8 +59,6 @@ pub fn cards_router() -> OpenApiRouter<AppState> {
          body = WyrdProblem),
         (status = 404, description = "No such Card is visible to this tenant \
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -88,8 +85,7 @@ async fn get_card_http(
 /// # Errors
 /// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
 /// [`WyrdError::RegistryCardNotFound`] when the UID is absent or of another
-/// kind, [`WyrdError::AuditUnavailable`] when the decision cannot be recorded,
-/// and the registry errors of [`service::get_card_by_uid`].
+/// kind, and the registry errors of [`service::get_card_by_uid`].
 pub(crate) async fn get_card_for(
     state: &AppState,
     caller: &Caller,
@@ -102,8 +98,7 @@ pub(crate) async fn get_card_for(
         &Permission::card_read(),
         "card.read.uid",
         &format!("card:{card_uid}"),
-    )
-    .await?;
+    )?;
     let response = service::get_card_by_uid(state, caller, card_uid).await?;
     if &response.card.kind != kind {
         return Err(WyrdError::registry_card_not_found(
@@ -134,8 +129,6 @@ pub(crate) async fn get_card_for(
          body = WyrdProblem),
         (status = 404, description = "No such Card is visible to this tenant \
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -161,7 +154,6 @@ async fn get_card_by_ref_http(
 ///
 /// # Errors
 /// Returns [`WyrdError::PermissionDeniedRbac`] without `cards:read`,
-/// [`WyrdError::AuditUnavailable`] when the decision cannot be recorded,
 /// [`WyrdError::RegistryCardNotFound`] when the named UID is another Card's,
 /// and the errors of [`service::get_card_by_ref`].
 pub(crate) async fn get_card_by_ref_for(
@@ -175,8 +167,7 @@ pub(crate) async fn get_card_by_ref_for(
         &Permission::card_read(),
         "card.read.ref",
         &card_resource(card_ref),
-    )
-    .await?;
+    )?;
     let response = service::get_card_by_ref(state, caller, card_ref).await?;
     if let Some(uid) = &card_ref.uid
         && response.card.metadata.uid.as_ref() != Some(uid)
@@ -208,8 +199,6 @@ pub(crate) async fn get_card_by_ref_for(
          body = WyrdProblem),
         (status = 404, description = "No such Card is visible to this tenant \
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -231,8 +220,7 @@ async fn get_latest_card_http(
         &caller,
         "card.read.latest",
         &format!("card:{}/{space}/{name}", kind.wire_name()),
-    )
-    .await?;
+    )?;
     service::get_latest_card(&state, &caller, kind, space, name)
         .await
         .map(Json)
@@ -258,8 +246,6 @@ async fn get_latest_card_http(
         (status = 403, description = "The principal may not read Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -281,8 +267,7 @@ async fn list_versions_http(
         &caller,
         "card.read.versions",
         &format!("card:{}/{space}/{name}", kind.wire_name()),
-    )
-    .await?;
+    )?;
     service::list_card_versions(&state, &caller, kind, space, name, query.include_prerelease)
         .await
         .map(Json)
@@ -313,8 +298,6 @@ async fn list_versions_http(
         (status = 403, description = "The principal may not read Cards \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)",
          body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -327,7 +310,7 @@ async fn list_cards_http(
     caller: Caller,
     Query(query): Query<ListCardsRequest>,
 ) -> Result<Json<ListCardsResponse>, WyrdErrorResponse> {
-    authorize_card_read(&state, &caller, "card.read.list", "cards").await?;
+    authorize_card_read(&state, &caller, "card.read.list", "cards")?;
     service::list_cards(&state, &caller, query)
         .await
         .map(Json)
@@ -351,8 +334,6 @@ async fn list_cards_http(
          body = WyrdProblem),
         (status = 404, description = "No such Card is visible to this tenant \
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -371,8 +352,7 @@ async fn list_artifacts_http(
         &caller,
         "card.read.artifacts",
         &format!("card:{card_uid}"),
-    )
-    .await?;
+    )?;
     service::list_card_artifacts(&state, &caller, &card_uid)
         .await
         .map(Json)
@@ -402,8 +382,6 @@ async fn list_artifacts_http(
           WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
         (status = 422, description = "A declared dependency does not resolve \
           (WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -428,16 +406,13 @@ async fn list_artifacts_http(
 /// registering caller is the one authorized to create that outbound action.
 /// Operator-free registration evaluates `card:write` alone.
 ///
-/// Every allowed verdict is recorded exactly once: inside the service's
-/// registration transaction when that transaction commits the Card, and
-/// standalone otherwise — a missing or invalid `Idempotency-Key`, an exact
-/// replay, a lost idempotency race, a later permission denial, or any failure
-/// before commit. A denial is recorded standalone by the evaluation itself.
+/// Every verdict is staged exactly once on the process audit outbox as soon as
+/// it is decided, before the `Idempotency-Key` is read or the registration
+/// runs, so it is recorded whatever the registration's outcome.
 ///
 /// # Errors
 /// Returns `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, or without
-/// `operators:invoke` for an Operator-bearing request, the
-/// audit-unavailable error when the verdict cannot be recorded, a validation
+/// `operators:invoke` for an Operator-bearing request, a validation
 /// error for a missing or invalid `Idempotency-Key` or Card body, an
 /// idempotency or version conflict, and registry or storage unavailability.
 pub(crate) async fn register_card_http(
@@ -450,33 +425,18 @@ pub(crate) async fn register_card_http(
     // access token and the `Caller` extractor has materialized its principal.
     // This check is intentionally route-local: authentication answers "who is
     // calling?" while this capability check answers "may they register cards?".
-    let mut allowed =
-        vec![allow_card_write(&state, &caller, "card.registration.create", "cards").await?];
+    authorize_card_write(&state, &caller, "card.registration.create", "cards")?;
     if service::dispatches_operators(&body) {
-        match audit::authorize_recording_denial(
+        audit::authorize(
             &state,
             &caller,
             &Permission::operator_invoke(),
             "card.registration.create",
             "operators",
-        )
-        .await
-        {
-            Ok(invoke) => allowed.push(invoke),
-            Err(error) => {
-                service::record_allowed(&state, &caller, &allowed).await?;
-                return Err(error.into());
-            }
-        }
+        )?;
     }
-    let idempotency_key = match extract_required_idempotency_key(&headers) {
-        Ok(key) => key,
-        Err(error) => {
-            service::record_allowed(&state, &caller, &allowed).await?;
-            return Err(error);
-        }
-    };
-    service::register_card(&state, &caller, idempotency_key.as_str(), body, &allowed)
+    let idempotency_key = extract_required_idempotency_key(&headers)?;
+    service::register_card(&state, &caller, idempotency_key.as_str(), body)
         .await
         .map(|response| (StatusCode::CREATED, Json(response)))
         .map_err(WyrdErrorResponse::from)
@@ -510,8 +470,6 @@ pub(crate) async fn register_card_http(
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
         (status = 410, description = "The pending registration expired before completion \
           (WYRD_REGISTRY_410_OPERATION_EXPIRED)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -535,8 +493,7 @@ async fn complete_card_http(
         &caller,
         "card.registration.complete",
         &format!("card:{card_uid}"),
-    )
-    .await?;
+    )?;
     let outcome = service::complete_card(&state, &caller, &card_uid, idempotency_key.as_str())
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -545,14 +502,12 @@ async fn complete_card_http(
 
 /// Delete one Card by its exact UID.
 ///
-/// The `card:write` verdict commits inside the soft-delete transaction; a delete
-/// that commits nothing (not found, inbound references, or a failure) records it
-/// standalone exactly once. Storage cleanup runs after that commit.
+/// The `card:write` verdict is staged exactly once before the soft-delete
+/// runs, whatever its outcome. Storage cleanup runs after the delete commits.
 ///
 /// # Errors
 /// Returns a validation error for an invalid kind or UID,
-/// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, the audit-unavailable
-/// error when the verdict cannot be recorded, not found, an inbound-reference
+/// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, not found, an inbound-reference
 /// conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
     delete,
@@ -574,8 +529,6 @@ async fn complete_card_http(
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "Another Card still references this one \
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -597,14 +550,13 @@ async fn delete_card_http(
         ))
     })?;
     let card_uid = parse_card_uid(&card_uid)?;
-    let allowed = allow_card_write(
+    authorize_card_write(
         &state,
         &caller,
         "card.registration.delete",
         &format!("card:{card_uid}"),
-    )
-    .await?;
-    service::delete_card_with_kind(&state, &caller, &card_uid, kind, &allowed)
+    )?;
+    service::delete_card_with_kind(&state, &caller, &card_uid, kind)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -612,14 +564,12 @@ async fn delete_card_http(
 
 /// Delete one Card by its exact kind/space/name/version identity.
 ///
-/// The `card:write` verdict commits inside the soft-delete transaction; a delete
-/// that commits nothing (not found, inbound references, or a failure) records it
-/// standalone exactly once. Storage cleanup runs after that commit.
+/// The `card:write` verdict is staged exactly once before the soft-delete
+/// runs, whatever its outcome. Storage cleanup runs after the delete commits.
 ///
 /// # Errors
 /// Returns a validation error for an invalid kind, space, name, or version,
-/// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, the audit-unavailable
-/// error when the verdict cannot be recorded, not found, an inbound-reference
+/// `WYRD_PERMISSION_403_DENIED_RBAC` without `card:write`, not found, an inbound-reference
 /// conflict, registry unavailability, and incomplete storage cleanup.
 #[utoipa::path(
     delete,
@@ -643,8 +593,6 @@ async fn delete_card_http(
           (WYRD_REGISTRY_404_CARD_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "Another Card still references this one \
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token \
           (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
@@ -661,14 +609,13 @@ async fn delete_card_by_ref_http(
     Query(query): Query<DeleteCardRefQuery>,
 ) -> Result<Json<DeleteCardResponse>, WyrdErrorResponse> {
     let card_ref = query.into_card_ref()?;
-    let allowed = allow_card_write(
+    authorize_card_write(
         &state,
         &caller,
         "card.registration.delete",
         &card_resource(&card_ref),
-    )
-    .await?;
-    service::delete_card_by_ref(&state, &caller, &card_ref, &allowed)
+    )?;
+    service::delete_card_by_ref(&state, &caller, &card_ref)
         .await
         .map(Json)
         .map_err(WyrdErrorResponse::from)
@@ -771,9 +718,11 @@ fn card_resource(card_ref: &CardRef) -> String {
 ///
 /// The route-local check answers "may this principal change cards?" after
 /// authentication answered "who is calling?". Delegating to [`audit::authorize`]
-/// is what makes the verdict durable exactly once, before the route proceeds or
-/// refuses, and fail-closed when the decision cannot be recorded.
-async fn authorize_card_write(
+/// stages the verdict exactly once, before the route proceeds or refuses.
+///
+/// # Errors
+/// Returns the public permission error when the caller lacks `card:write`.
+fn authorize_card_write(
     state: &AppState,
     caller: &Caller,
     operation: &str,
@@ -786,49 +735,23 @@ async fn authorize_card_write(
         operation,
         resource,
     )
-    .await
-    .map_err(WyrdErrorResponse::from)
-}
-
-/// Evaluate `card:write`, audit a denial, and hand back the allowed verdict.
-///
-/// Registration and deletion own a SQL transaction the verdict must commit
-/// with, so the allowed row is returned for the service to append there
-/// rather than recorded here.
-///
-/// # Errors
-/// Returns the public permission error for a denial, and
-/// [`WyrdError::AuditUnavailable`] when the denial cannot be recorded.
-async fn allow_card_write(
-    state: &AppState,
-    caller: &Caller,
-    operation: &str,
-    resource: &str,
-) -> Result<AuditEvent, WyrdErrorResponse> {
-    audit::authorize_recording_denial(
-        state,
-        caller,
-        &Permission::card_write(),
-        operation,
-        resource,
-    )
-    .await
     .map_err(WyrdErrorResponse::from)
 }
 
 /// Evaluate and audit `card:read` for one receiving registry route.
 ///
 /// Reads are audited on the same terms as writes: the decision row is the only
-/// durable evidence that a principal was permitted to see a Card, so an allowed
-/// read that cannot be recorded is refused rather than served.
-async fn authorize_card_read(
+/// durable evidence that a principal was permitted to see a Card.
+///
+/// # Errors
+/// Returns the public permission error when the caller lacks `card:read`.
+fn authorize_card_read(
     state: &AppState,
     caller: &Caller,
     operation: &str,
     resource: &str,
 ) -> Result<(), WyrdErrorResponse> {
     audit::authorize(state, caller, &Permission::card_read(), operation, resource)
-        .await
         .map_err(WyrdErrorResponse::from)
 }
 

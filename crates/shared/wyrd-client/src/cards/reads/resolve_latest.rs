@@ -33,6 +33,7 @@ pub(crate) async fn resolve_latest(
         urlencoding::encode(name.as_str()),
     );
     let response: GetCardResponse = client
+        .http
         .request_json(reqwest::Method::GET, &path, None::<&()>)
         .await?;
     card_ref_from_card(&response.card)

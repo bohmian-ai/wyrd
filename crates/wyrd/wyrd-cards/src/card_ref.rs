@@ -116,14 +116,18 @@ impl Kind {
 impl Kind {
     /// Native Wyrd kind wire name.
     #[getter]
-    // justification: pyo3 #[pymethods] on a #[pyclass(eq_int)] enum require &self; taking self by value would consume the Python-owned instance
-    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "pyo3 #[pymethods] on a #[pyclass(eq_int)] enum require &self; taking self by value would consume the Python-owned instance"
+    )]
     fn name(&self) -> &'static str {
         self.wire_name()
     }
 
-    // justification: pyo3 #[pymethods] on a #[pyclass(eq_int)] enum require &self; taking self by value would consume the Python-owned instance
-    #[allow(clippy::trivially_copy_pass_by_ref)]
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "pyo3 #[pymethods] on a #[pyclass(eq_int)] enum require &self; taking self by value would consume the Python-owned instance"
+    )]
     fn __repr__(&self) -> String {
         format!("CardKind.{}", self.wire_name())
     }
@@ -212,6 +216,25 @@ impl CardRefPy {
     #[getter]
     fn uid(&self) -> Option<String> {
         self.0.uid.as_ref().map(ToString::to_string)
+    }
+
+    /// Return this reference as its JSON-compatible `CardRef` mapping.
+    ///
+    /// This makes `CardRef` satisfy the Python `CardRefLike` protocol, so it
+    /// is accepted wherever a boundary takes a `CardRefLike`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when serialization or Python conversion fails.
+    fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        Ok(wyrd_utils::py::json_to_pyobject(
+            py,
+            &serde_json::to_value(&self.0)?,
+        )?)
+    }
+
+    /// The canonical `space/Kind/name@version` text of this reference.
+    fn __str__(&self) -> String {
+        self.0.to_string()
     }
 
     fn __repr__(&self) -> String {

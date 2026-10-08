@@ -6,6 +6,10 @@ use wyrd_spec::request_id::RequestId;
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Mint a fresh UUID v7 request ID.
+///
+/// # Panics
+///
+/// Panics if a generated UUIDv7 fails `RequestId` validation, which would be a validator bug.
 #[must_use]
 pub fn mint() -> RequestId {
     let raw = uuid::Uuid::now_v7().to_string();

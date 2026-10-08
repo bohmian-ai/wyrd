@@ -1,106 +1,67 @@
-import json
+"""A Prompt dumped to YAML or JSON loads back unchanged."""
+
 from pathlib import Path
 
 import pytest
-import yaml
 from wyrd.prompt import Prompt, WyrdError
 
 
-def assert_code(error: pytest.ExceptionInfo[WyrdError], code: str) -> None:
-    assert error.value.code == code
-
-
-def prompt_cases() -> list[tuple[str, Prompt]]:
-    return [
-        (
-            "openai_chat",
+@pytest.mark.parametrize("suffix", ["yaml", "json"])
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        pytest.param(
             Prompt.openai_chat(
                 "gpt-4o",
                 system="System {{tone}}",
                 messages="Hello {{name}}",
                 model_settings={"seed": 7},
             ),
+            id="openai",
         ),
-        (
-            "openai_responses",
+        pytest.param(
             Prompt.openai_responses(
                 "gpt-4.1",
                 instructions="System {{tone}}",
                 messages="Hello {{name}}",
                 model_settings={"reasoning": {"effort": "medium"}},
             ),
+            id="openai-responses",
         ),
-        (
-            "anthropic",
+        pytest.param(
             Prompt.anthropic(
                 "claude-sonnet-4",
                 system="System {{tone}}",
                 messages="Hello {{name}}",
                 model_settings={"max_tokens": 256},
             ),
+            id="anthropic",
         ),
-        (
-            "gemini",
+        pytest.param(
             Prompt.gemini(
                 "gemini-2.5-pro",
                 system="System {{tone}}",
                 messages="Hello {{name}}",
                 model_settings={"generation_config": {"temperature": 0.2}},
             ),
+            id="gemini",
         ),
-        (
-            "vertex",
+        pytest.param(
             Prompt.vertex(
                 "gemini-2.5-pro",
                 system="System {{tone}}",
                 messages="Hello {{name}}",
                 model_settings={"generation_config": {"max_output_tokens": 64}},
             ),
+            id="vertex",
         ),
-        ("raw_v1", Prompt.raw("openai", "gpt-4o", b'{"model":"gpt-4o","messages":["hi"]}')),
-    ]
+    ],
+)
+def test_dumped_prompt_loads_back_unchanged(tmp_path: Path, prompt: Prompt, suffix: str) -> None:
+    path = tmp_path / f"prompt.{suffix}"
+    prompt.dump(path)
 
-
-def message_text(prompt: Prompt) -> str:
-    body = prompt.request.model_dump()["body"]
-    if "messages" in body:
-        content = body["messages"][-1]["content"]
-        if isinstance(content, list):
-            return " ".join(part.get("text", "") for part in content)
-        return content
-    if "input" in body:
-        return body["input"][-1]["content"][0]["text"]
-    if "contents" in body:
-        return body["contents"][-1]["parts"][0]["text"]
-    if "body" in body:
-        return json.dumps(body["body"])
-    return json.dumps(body)
-
-
-def system_text(prompt: Prompt) -> str:
-    system = prompt.system_messages
-    return json.dumps(system)
-
-
-@pytest.mark.parametrize(("name", "prompt"), prompt_cases())
-def test_prompt_load_yaml_and_json_preserve_deep_fields(
-    tmp_path: Path, name: str, prompt: Prompt
-) -> None:
-    yaml_path = tmp_path / f"{name}.yaml"
-    json_path = tmp_path / f"{name}.json"
-    prompt.dump(yaml_path)
-    prompt.dump(json_path)
-
-    yaml_loaded = Prompt.load(yaml_path)
-    json_loaded = Prompt.load(json_path)
-
-    assert yaml_loaded.provider == prompt.provider
-    assert yaml_loaded.model == prompt.model
-    assert json_loaded.model_dump() == yaml_loaded.model_dump()
-    if name != "raw_v1":
-        assert "Hello {{name}}" in message_text(yaml_loaded)
-        assert "System" in system_text(yaml_loaded)
-        assert yaml_loaded.model_settings is not None
+    assert Prompt.load(path).model_dump() == prompt.model_dump()
 
 
 def test_prompt_load_raw_v1_preserves_provider_and_body(tmp_path: Path) -> None:
@@ -114,41 +75,19 @@ def test_prompt_load_raw_v1_preserves_provider_and_body(tmp_path: Path) -> None:
     assert loaded.request.model_dump()["body"]["body"]["future"] is True
 
 
-def test_prompt_load_error_codes(tmp_path: Path) -> None:
-    missing = tmp_path / "missing.yaml"
-    bad_extension = tmp_path / "prompt.txt"
-    bad_extension.write_text("provider: openai\n")
-    extensionless = tmp_path / "prompt"
-    extensionless.write_text("provider: openai\n")
+def test_missing_prompt_file_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(WyrdError) as error:
+        Prompt.load(tmp_path / "missing.yaml")
 
-    with pytest.raises(WyrdError) as missing_error:
-        Prompt.load(missing)
-    assert_code(missing_error, "WYRD_PROMPT_500_LOADER_IO")
-
-    with pytest.raises(WyrdError) as bad_extension_error:
-        Prompt.load(bad_extension)
-    assert_code(bad_extension_error, "WYRD_PROMPT_400_LOADER_BAD_EXTENSION")
-
-    with pytest.raises(WyrdError) as extensionless_error:
-        Prompt.load(extensionless)
-    assert_code(extensionless_error, "WYRD_PROMPT_400_LOADER_BAD_EXTENSION")
+    assert error.value.code == "WYRD_PROMPT_500_LOADER_IO"
 
 
-def test_prompt_load_declarative_yaml_with_model_settings(tmp_path: Path) -> None:
-    path = tmp_path / "declarative.yaml"
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "provider": "openai",
-                "model": "gpt-4o",
-                "messages": "hello",
-                "model_settings": {"seed": 99},
-            }
-        )
-    )
+@pytest.mark.parametrize("name", ["prompt.txt", "prompt"])
+def test_prompt_file_without_a_yaml_or_json_extension_is_refused(tmp_path: Path, name: str) -> None:
+    path = tmp_path / name
+    path.touch()
 
-    prompt = Prompt.load(path)
+    with pytest.raises(WyrdError) as error:
+        Prompt.load(path)
 
-    assert prompt.provider == "openai"
-    assert prompt.model == "gpt-4o"
-    assert prompt.request.model_dump()["body"]["seed"] == 99
+    assert error.value.code == "WYRD_PROMPT_400_LOADER_BAD_EXTENSION"

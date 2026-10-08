@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
+use wyrd_client::WyrdClient;
+use wyrd_client::bifrost::CompactionTypeWire;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::RegisterOutcome;
 use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
@@ -12,8 +14,8 @@ use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, assert_tenant_scoped_not_found, canonical_order,
-    public_rows_returned, read_managed_rows, register_table, rows_digest, tenant_client,
-    unique_table,
+    enable_compaction, public_rows_returned, read_managed_rows, register_table, rows_digest,
+    set_table_properties, tenant_client, unique_table,
 };
 
 /// Longest a journey waits for one production Forge attempt to return.
@@ -29,7 +31,7 @@ const ATTEMPT_BOUND: Duration = Duration::from_secs(15);
 /// retry schedules against the refusing catalog is not released until the last
 /// of them returns, so this bound covers the whole schedule rather than one
 /// catalog call.
-const RELEASE_BOUND: Duration = Duration::from_secs(120);
+const RELEASE_BOUND: Duration = Duration::from_mins(2);
 
 /// How many production scheduler passes one drain phase may take.
 ///
@@ -37,6 +39,12 @@ const RELEASE_BOUND: Duration = Duration::from_secs(120);
 /// pod holding several tables needs more than one pass to owe nothing; the
 /// budget bounds that without asserting how many passes it actually took.
 const DRAIN_PASS_BUDGET: usize = 24;
+/// Compaction interval, in seconds, of the recovery journey's owner table.
+///
+/// Two and a half days outlasts the journey's two one-day partition closes, so
+/// no promotion makes the table due; the two-day advance after uncertainty is
+/// armed is what crosses it.
+const REWRITE_INTERVAL_SECS: &str = "216000";
 
 /// Reads the durable Forge operation phases for one tenant's live rewrites.
 ///
@@ -792,7 +800,7 @@ async fn rewrite_operation_phase(cluster: &WyrdTestCluster, operation: Uuid) -> 
 ///
 /// Panics when the public read differs from the acknowledged rows in any way.
 async fn assert_public_rows(
-    client: &wyrd_client::WyrdClient,
+    client: &WyrdClient,
     table: &JourneyTable,
     expected: &[ManagedRow],
     cut: &str,
@@ -813,9 +821,7 @@ async fn assert_public_rows(
 }
 
 /// Forge families the journey and recovery windows print as evidence.
-const FORGE_FAMILIES: [&str; 12] = [
-    "bifrost_forge_pending_tasks",
-    "bifrost_forge_oldest_pending_task_timestamp_seconds",
+const FORGE_FAMILIES: [&str; 10] = [
     "bifrost_forge_active_tasks",
     "bifrost_forge_tasks_created_total",
     "bifrost_forge_task_attempts_total",
@@ -843,13 +849,17 @@ struct RecoveryTelemetry {
     /// Plans the attempt admitted, each of which publishes independently and
     /// is therefore the ceiling on how many catalog commits it may submit.
     plans: usize,
-    /// Live data files the operation promised to remove.
+    /// Live data files the recovered operation promised to remove, plus those
+    /// the recovering dispatch's own later rewrites removed.
     input_files: u64,
-    /// Managed data files the operation promised to add.
+    /// Managed data files the recovered operation promised to add, plus those
+    /// the recovering dispatch's own later rewrites added.
     output_files: u64,
-    /// Byte volume the landed snapshot recorded as removed.
+    /// Byte volume the landed snapshot and the later rewrites recorded as
+    /// removed.
     input_bytes: u64,
-    /// Byte volume the landed snapshot recorded as added.
+    /// Byte volume the landed snapshot and the later rewrites recorded as
+    /// added.
     output_bytes: u64,
     /// Rows public appends acknowledged inside the journey window.
     acknowledged_rows: u64,
@@ -1024,7 +1034,7 @@ fn assert_recovery_telemetry(
 
     // 3b. A result is what a settlement committed, never a Rust `Ok`. The
     //     released attempt wrote nothing durable, so its trace names no
-    //     result; the task's last settled execution names its durable state.
+    //     result.
     for span in executions
         .iter()
         .filter(|span| attribute(span, "attempt_id") == Some(facts.attempt_id.to_string().as_str()))
@@ -1046,10 +1056,13 @@ fn assert_recovery_telemetry(
         .iter()
         .rev()
         .find_map(|span| attribute(span, "result"));
+    // The leader owns a dispatched task's retry: the lapsed claim is closed by
+    // reclaim rather than re-run, and the recovery settles under the leader's
+    // next dispatch, whose success 3c observes.
     assert_eq!(
         (settled_result, facts.task_state.as_str()),
-        (Some("succeeded"), "succeeded"),
-        "the task's last settled execution reports the durable state it committed: {executions:?}"
+        (None, "cancelled"),
+        "the released task is closed by reclaim, not settled by a second owner: {executions:?}"
     );
 
     // 3c. Each settled small-files execution is one trace and one counted
@@ -1129,7 +1142,9 @@ fn assert_recovery_telemetry(
         "the reconciliation settled the recovered small-files attempt: {recovered}"
     );
 
-    // 5. The counted recovery volume is the manifest-derived volume.
+    // 5. The counted recovery volume is the manifest-derived volume: the
+    //    recovered operation counted once, plus whatever the recovering
+    //    dispatch then rewrote under its own operations.
     for (family, expected) in [
         ("bifrost_forge_input_files_total", facts.input_files),
         ("bifrost_forge_input_bytes_total", facts.input_bytes),
@@ -1219,11 +1234,7 @@ fn assert_recovery_telemetry(
 /// family reintroduced outside the catalog fails here rather than reaching an
 /// operator dashboard.
 const APPROVED_FORGE_FAMILIES: &[&str] = &[
-    "bifrost_forge_planning_demands",
-    "bifrost_forge_oldest_planning_demand_timestamp_seconds",
     "bifrost_forge_tasks_created_total",
-    "bifrost_forge_pending_tasks",
-    "bifrost_forge_oldest_pending_task_timestamp_seconds",
     "bifrost_forge_active_tasks",
     "bifrost_forge_task_attempts_total",
     "bifrost_forge_task_duration_seconds",
@@ -1236,6 +1247,17 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
     "bifrost_forge_snapshots_expired_total",
     "bifrost_forge_compaction_debt_files",
     "bifrost_forge_compaction_debt_bytes",
+    "bifrost_forge_leader_held",
+    "bifrost_forge_leader_acquisitions_total",
+    "bifrost_forge_leader_renewals_total",
+    "bifrost_forge_leader_renewal_seconds",
+    "bifrost_forge_leader_revocations_total",
+    "bifrost_forge_worker_ready",
+    "bifrost_forge_worker_backoffs_total",
+    "bifrost_forge_worker_restarts_total",
+    "bifrost_forge_worker_restart_backoff_seconds",
+    "bifrost_forge_scheduler_restarts_total",
+    "bifrost_forge_expired_cleanup_refusals_total",
 ];
 
 /// Promoted rows survive a rewrite whose acceptance the committer never learned.
@@ -1286,6 +1308,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         WyrdTestCluster::start_embedded_forge_uncertainty_for_test(Duration::from_secs(30))
             .await
             .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
     let observer = cluster
         .forge_completion_observer()
         .expect("the journey pod carries a Forge completion observer");
@@ -1306,6 +1329,27 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let shared_name = unique_table("rewrite_recovery");
     let shared = register_table(server, owner, &shared_name).await;
     let neighbour_shared = register_table(server, neighbour, &shared_name).await;
+    // Compaction is on for every table by default; the neighbour's tables opt
+    // out so the only rewrite in flight is the owner's, which is the one the
+    // injected uncertainty must land on.
+    set_table_properties(
+        server,
+        &neighbour_shared.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
+    // The owner's table compacts on RisingWave's interval rule alone, so its
+    // promotions accumulate commits and the rewrite becomes due only when this
+    // journey moves the Forge clock past the interval, after arming uncertainty.
+    set_table_properties(
+        server,
+        &shared.binding,
+        &[
+            ("wyrd.forge.enable-compaction", "true"),
+            ("wyrd.forge.compaction-interval-sec", REWRITE_INTERVAL_SECS),
+        ],
+    )
+    .await;
     assert_eq!(
         shared.qualified, neighbour_shared.qualified,
         "both tenants must be registering the identical table name"
@@ -1315,6 +1359,12 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         "one logical name must resolve to two disjoint physical tables"
     );
     let neighbour_only = register_table(server, neighbour, &unique_table("neighbour_only")).await;
+    set_table_properties(
+        server,
+        &neighbour_only.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
     let owner_client = tenant_client(server, owner).await;
     let neighbour_client = tenant_client(server, neighbour).await;
 
@@ -1324,7 +1374,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let mut owner_expected: Vec<ManagedRow> = Vec::new();
     let owner_values: Vec<i64> = (0..24).collect();
     let neighbour_values: Vec<i64> = (1_000..1_024).collect();
-    // Each neighbour table has one file, so it owes no independent small-file
+    // Each neighbour table has compaction opted out, so it owes no independent
     // rewrite while we assert its exact cut survives the owner's recovery.
     let neighbour_shared_expected = canonical_order(
         append_values(
@@ -1453,7 +1503,10 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     uncertainty.fail_after_next_commit();
     let errors_before = observer.returned_errors().len();
     release_retries(&cluster, owner).await;
-    cluster.request_forge_scheduler_pass_for_test();
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(2))
+        .expect("the owner's compaction interval elapses");
     let mut unsettled = Vec::new();
     // Roster discovery can admit legitimate sibling maintenance first, so this
     // waits for *this* owner's unsettled rewrite rather than for any attempt.
@@ -1780,6 +1833,11 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     })
     .await
     .expect("the owner releases the attempt it cannot account for");
+    // Recovery is a fresh leader dispatch that reconciles from retained
+    // evidence and then publishes its own rewrite, so the lost-response fault
+    // ends with the attempt it simulated; left armed, it would refuse that
+    // rewrite too.
+    uncertainty.resolve_uncertainty();
 
     let mut settled = false;
     for _ in 0..DRAIN_PASS_BUDGET {
@@ -1850,25 +1908,37 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         phase, "recovered",
         "the successor settles its predecessor's own operation as recovered"
     );
+    // Recovery is the leader's next dispatch: it settles the landed operation
+    // from evidence and may then compact the table's current files under its
+    // own operation. What it must never do is publish the landed rewrite again.
     let recovered = rewrite_snapshots(&cluster, &shared.binding).await;
-    assert_eq!(
-        recovered.len(),
-        rewrites_after_commit,
-        "recovery published no second rewrite snapshot: {recovered:?}"
-    );
     let still = recovered
         .iter()
         .find(|snapshot| snapshot.snapshot_id == rewrite_snapshot_id)
         .expect("the recovered snapshot is the one the uncertain commit landed");
     assert_eq!(
         still.added_data, landed.added_data,
-        "recovery produced no new managed output"
+        "the landed rewrite's own output is unchanged by recovery"
     );
-    assert_eq!(
-        live_cut(&cluster, &shared.binding).await,
-        rewritten_cut,
-        "recovery left the live cut exactly as the uncertain commit did"
+    assert!(
+        recovered
+            .iter()
+            .filter(|other| other.snapshot_id != rewrite_snapshot_id)
+            .all(|later| later.added_data.is_disjoint(&landed.added_data)
+                && later.summary.get("forge.operation_id")
+                    != landed.summary.get("forge.operation_id")),
+        "recovery never republishes the landed operation: {recovered:?}"
     );
+    // Rewrites the recovering dispatch published after the landed one; their
+    // volume is counted in the recovery window alongside the recovered one's.
+    let successors = recovered
+        .iter()
+        .filter(|later| {
+            published
+                .iter()
+                .all(|before| before.snapshot_id != later.snapshot_id)
+        })
+        .collect::<Vec<_>>();
 
     // Tenant isolation across the whole recovery, at the platform layer too.
     assert_eq!(
@@ -1940,10 +2010,18 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
             task_state: durable_task_state(&cluster, landed_task).await,
             attempt_id: landed_attempt,
             plans: attempt_plan_count(&observer, landed_attempt),
-            input_files: landed.removed_data.len() as u64,
-            output_files: landed.added_data.len() as u64,
-            input_bytes: landed.removed_bytes,
-            output_bytes: landed.added_bytes,
+            input_files: (landed.removed_data.len()
+                + successors
+                    .iter()
+                    .map(|s| s.removed_data.len())
+                    .sum::<usize>()) as u64,
+            output_files: (landed.added_data.len()
+                + successors.iter().map(|s| s.added_data.len()).sum::<usize>())
+                as u64,
+            input_bytes: landed.removed_bytes
+                + successors.iter().map(|s| s.removed_bytes).sum::<u64>(),
+            output_bytes: landed.added_bytes
+                + successors.iter().map(|s| s.added_bytes).sum::<u64>(),
             acknowledged_rows: (owner_expected.len()
                 + neighbour_shared_expected.len()
                 + neighbour_only_expected.len()) as u64,
@@ -2060,6 +2138,7 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
         .await
         .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
     let observer = cluster
         .forge_completion_observer()
         .expect("the journey pod carries a Forge completion observer");
@@ -2113,6 +2192,8 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
             .expect("undeclared registration"),
         RegisterOutcome::Created
     );
+    enable_compaction(server, &declared.binding).await;
+    enable_compaction(server, &undeclared.binding).await;
     let described = |table: &JourneyTable| {
         let client = &client;
         let fqn = table.qualified.clone();
@@ -2219,6 +2300,533 @@ async fn compaction_target_registers_describes_and_steers_forge_rewrites() {
     }
 }
 
+/// A table registered through the public client with no options is compacted.
+///
+/// Compaction is on for every table by default, so the journey registers one
+/// table with nothing but its schema, never touches its Iceberg properties,
+/// and proves the table declares no Forge setting at all. Two flushed public
+/// appends are promoted by the pod's own Forge; the leader then owes the table
+/// nothing until the default one-hour interval has passed since its first
+/// commit, after which it dispatches the rewrite. The committed rewrite
+/// replaces the promoted inputs and the public read returns exactly the
+/// acknowledged rows.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start, a public call fails, the table declares a
+/// Forge property, Forge leaves work owed or commits no rewrite, or the rows
+/// differ.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn property_less_public_table_is_compacted_by_default() {
+    let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("the journey pod carries a Forge completion observer");
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let tenant = cluster.data_tenant_id();
+    let client = tenant_client(server, tenant).await;
+    let name = unique_table("default_compaction");
+    let table = JourneyTable {
+        qualified: format!("vala.datasets.{name}"),
+        name: name.clone(),
+        binding: TenantTableBinding::resolve((
+            tenant,
+            vala_bifrost_redux::catalog::TableRef::new(
+                vala_bifrost_redux::namespaces::BifrostNamespace::Datasets,
+                &name,
+            ),
+        ))
+        .expect("the journey table resolves to its physical binding"),
+    };
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let config = wyrd_client::bifrost::TableConfig::from_arrow(&table.qualified, schema)
+        .expect("the journey schema is a table config");
+    assert_eq!(
+        wyrd_client::Bifrost::connect_with_table(&client, config)
+            .await
+            .expect("the public Bifrost client connects")
+            .register()
+            .await
+            .expect("option-less registration"),
+        RegisterOutcome::Created
+    );
+    let properties = server
+        .bifrost_catalog()
+        .iceberg_catalog()
+        .load_table(&table.binding.table_ident())
+        .await
+        .expect("the journey table loads through the production catalog")
+        .metadata()
+        .properties()
+        .clone();
+    assert!(
+        !properties.keys().any(|key| key.starts_with("wyrd.forge.")),
+        "an option-less registration declares no Forge setting: {properties:?}"
+    );
+
+    let mut rows = Vec::new();
+    for half in 0..2_i64 {
+        let values: Vec<i64> = (half * 8..half * 8 + 8).collect();
+        rows.extend(append_values(&client, &table.qualified, Uuid::now_v7(), &values).await);
+        server
+            .flush_bifrost()
+            .await
+            .expect("the pod publishes its staged rows");
+    }
+    let expected = canonical_order(rows);
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the written partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+    let promoted = live_cut(&cluster, &table.binding).await;
+    assert!(
+        rewrite_targets(&cluster, &table.binding).await.is_empty(),
+        "no rewrite runs before the default interval"
+    );
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the default compaction interval passes");
+    await_committed_rewrites(&cluster, &observer, &[&table.binding]).await;
+    assert_ne!(
+        live_cut(&cluster, &table.binding).await.data,
+        promoted.data,
+        "the rewrite outputs replaced the promoted inputs"
+    );
+    assert_public_rows(&client, &table, &expected, "after default compaction").await;
+}
+
+/// Waits until the pod's Forge worker readiness bit reads `expected`.
+///
+/// Readiness is a published atomic with no change notification, so this polls
+/// it under [`RELEASE_BOUND`], which covers the restart backoff plus the fresh
+/// worker's startup recovery.
+///
+/// # Panics
+///
+/// Panics when the bit never reaches `expected` within the bound.
+async fn await_worker_readiness(cluster: &WyrdTestCluster, expected: bool, label: &str) {
+    let readiness = cluster
+        .server(0)
+        .expect("the embedded pod is running")
+        .state()
+        .forge()
+        .expect("the embedded pod composes Forge")
+        .worker_readiness();
+    tokio::time::timeout(RELEASE_BOUND, async {
+        while readiness.is_ready() != expected {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label}: worker readiness never reached {expected}"));
+}
+
+/// Writes two flushed eight-row commits into `table` and returns their rows.
+///
+/// # Panics
+///
+/// Panics when a public append or the pod's flush fails.
+async fn write_two_commits(
+    cluster: &WyrdTestCluster,
+    client: &WyrdClient,
+    table: &JourneyTable,
+) -> Vec<ManagedRow> {
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let mut rows = Vec::new();
+    for half in 0..2_i64 {
+        let values: Vec<i64> = (half * 8..half * 8 + 8).collect();
+        rows.extend(append_values(client, &table.qualified, Uuid::now_v7(), &values).await);
+        server
+            .flush_bifrost()
+            .await
+            .expect("the pod publishes its staged rows");
+    }
+    canonical_order(rows)
+}
+
+/// A failed Forge worker is rebuilt on the same pod while the API keeps serving.
+///
+/// A one-shot lease-release fault makes the worker's first rewrite fatal. While
+/// the failing worker is held at that fatal point the pod reports Forge not
+/// ready and the public read still serves. Once released, the supervisor
+/// rebuilds the worker after its backoff, readiness returns, and a second
+/// table written afterwards is compacted by the fresh worker. The production
+/// metrics then show one leader acquisition and renewals, one worker restart
+/// after a one-second backoff, a ready worker and held term, and, once the pod
+/// shuts down, one `shutdown` revocation with both gauges back at zero.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start, the fault never fires, readiness does not
+/// drop and recover, a public call fails, the fresh worker commits no rewrite,
+/// or the leader and worker metrics disagree with that story.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these counters and gauges as whole numbers, so f64 equality is exact"
+)]
+async fn failed_worker_restarts_while_the_api_serves() {
+    let (_telemetry_guard, telemetry) =
+        shared_process_telemetry_for_test().expect("process production telemetry");
+    let checkpoint = telemetry
+        .checkpoint()
+        .expect("production telemetry baseline");
+    let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("the journey pod carries a Forge completion observer");
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let tenant = cluster.data_tenant_id();
+    let client = tenant_client(server, tenant).await;
+    await_worker_readiness(&cluster, true, "first worker").await;
+
+    let failing = register_table(server, tenant, &unique_table("restart_failing")).await;
+    let failing_rows = write_two_commits(&cluster, &client, &failing).await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the written partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+
+    observer.hold_before_fatal_observation_for_test();
+    observer.fail_next_lease_release();
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the default compaction interval passes");
+    cluster.request_forge_scheduler_pass_for_test();
+    tokio::time::timeout(
+        RELEASE_BOUND,
+        observer.wait_for_fatal_observation_for_test(),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the rewrite release fault never fired: {:?}",
+            observer.returned_errors()
+        )
+    });
+    assert!(
+        !observer.lease_release_failure_armed(),
+        "the rewrite consumed the release fault"
+    );
+    await_worker_readiness(&cluster, false, "failing worker").await;
+    assert_public_rows(&client, &failing, &failing_rows, "while the worker fails").await;
+
+    observer.release_fatal_observation_for_test();
+    await_worker_readiness(&cluster, true, "rebuilt worker").await;
+    assert_public_rows(&client, &failing, &failing_rows, "after the restart").await;
+
+    let fresh = register_table(server, tenant, &unique_table("restart_fresh")).await;
+    let fresh_rows = write_two_commits(&cluster, &client, &fresh).await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the second partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::hours(1))
+        .expect("the second compaction interval passes");
+    await_committed_rewrites(&cluster, &observer, &[&fresh.binding]).await;
+    assert_public_rows(
+        &client,
+        &fresh,
+        &fresh_rows,
+        "compacted by the rebuilt worker",
+    )
+    .await;
+
+    // The leader and worker lifecycle is visible on the production metrics:
+    // one acquisition renewed by the requested passes, one restart after the
+    // first one-second backoff, and a worker and leader that ended ready.
+    let running = telemetry
+        .delta_since(&checkpoint)
+        .expect("production telemetry window");
+    println!(
+        "{}",
+        running.evidence(&[
+            "bifrost_forge_leader_acquisitions_total",
+            "bifrost_forge_leader_renewals_total",
+            "bifrost_forge_worker_restarts_total",
+            "bifrost_forge_worker_restart_backoff_seconds",
+            "bifrost_forge_worker_ready",
+            "bifrost_forge_leader_held",
+        ])
+    );
+    assert_eq!(
+        counter_delta(&running, "bifrost_forge_leader_acquisitions_total", &[]),
+        1.0
+    );
+    assert!(
+        counter_delta(
+            &running,
+            "bifrost_forge_leader_renewals_total",
+            &[("outcome", "ok")]
+        ) >= 1.0
+    );
+    assert_eq!(
+        counter_delta(&running, "bifrost_forge_worker_restarts_total", &[]),
+        1.0,
+        "the injected failure restarted the worker exactly once"
+    );
+    assert_eq!(
+        gauge_final(&running, "bifrost_forge_worker_restart_backoff_seconds"),
+        1.0
+    );
+    assert_eq!(gauge_final(&running, "bifrost_forge_worker_ready"), 1.0);
+    assert_eq!(gauge_final(&running, "bifrost_forge_leader_held"), 1.0);
+
+    let running_end = telemetry
+        .checkpoint()
+        .expect("production telemetry shutdown baseline");
+    cluster.shutdown().await.expect("the pod drains");
+    let stopped = telemetry
+        .delta_since(&running_end)
+        .expect("production telemetry shutdown window");
+    assert_eq!(
+        counter_delta(
+            &stopped,
+            "bifrost_forge_leader_revocations_total",
+            &[("reason", "shutdown")]
+        ),
+        1.0,
+        "shutdown resigned the one held term"
+    );
+    assert_eq!(gauge_final(&stopped, "bifrost_forge_leader_held"), 0.0);
+    assert_eq!(gauge_final(&stopped, "bifrost_forge_worker_ready"), 0.0);
+}
+
+/// Reads one unlabelled gauge's value at the close of a telemetry window.
+///
+/// # Panics
+///
+/// Panics when the window rendered no sample of the gauge.
+fn gauge_final(delta: &BifrostTelemetryDelta, family: &str) -> f64 {
+    delta
+        .gauge_final
+        .iter()
+        .find(|sample| sample.family == family)
+        .unwrap_or_else(|| panic!("the window rendered no {family} sample"))
+        .value
+}
+
+/// Reads the compaction type of every leader-dispatched Forge task of one table.
+///
+/// A leader dispatch writes its table's type into the claimed attempt's plan
+/// parameters, so this is the durable evidence of the type a worker planned
+/// with.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails.
+async fn dispatched_compaction_types(
+    cluster: &WyrdTestCluster,
+    tenant: DataTenantId,
+    table: &JourneyTable,
+) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT plan->'parameters'->>'compaction_type' FROM vala.forge_tasks \
+         WHERE data_tenant_id = $1 AND table_name = $2 \
+           AND plan->'parameters' ? 'compaction_type'",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&table.name)
+    .fetch_all(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge dispatched-type inspection")
+}
+
+/// A caller-declared compaction type is stored, described, fenced, and
+/// dispatched by Forge, while an undeclared table is dispatched with the
+/// `small-files` default.
+///
+/// Both tables are registered through the public client. The declared table
+/// declares `full`, the type that differs from the default, stores it as its
+/// `wyrd.forge.compaction.type` Iceberg property and describes it back;
+/// re-registering it with the same type or with none is idempotent, and a
+/// different type is refused with
+/// `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH` without changing it. The
+/// undeclared table stores no type. Each table then receives two flushed
+/// public appends, and the pod's own Forge promotes and rewrites them: every
+/// dispatched attempt of the declared table names `full`, every one of the
+/// undeclared table names `small-files`, and both read back exactly.
+///
+/// # Panics
+///
+/// Panics when the pod cannot start, a public call fails or is not refused as
+/// described, Forge leaves work owed, or a type or row set differs.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn compaction_type_registers_describes_and_steers_forge_dispatch() {
+    let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
+        .await
+        .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
+    let observer = cluster
+        .forge_completion_observer()
+        .expect("the journey pod carries a Forge completion observer");
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let tenant = cluster.data_tenant_id();
+    let client = tenant_client(server, tenant).await;
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+    ]));
+    let journey_table = |name: &str| JourneyTable {
+        qualified: format!("vala.datasets.{name}"),
+        name: name.to_owned(),
+        binding: TenantTableBinding::resolve((
+            tenant,
+            vala_bifrost_redux::catalog::TableRef::new(
+                vala_bifrost_redux::namespaces::BifrostNamespace::Datasets,
+                name,
+            ),
+        ))
+        .expect("the journey table resolves to its physical binding"),
+    };
+    let declared = journey_table(&unique_table("declared_type"));
+    let undeclared = journey_table(&unique_table("default_type"));
+    let register = |table: &JourneyTable, kind: Option<CompactionTypeWire>| {
+        let config =
+            wyrd_client::bifrost::TableConfig::from_arrow(&table.qualified, schema.clone())
+                .expect("the journey schema is a table config");
+        let config = match kind {
+            Some(kind) => config.with_compaction_type(kind),
+            None => config,
+        };
+        let client = &client;
+        async move {
+            wyrd_client::Bifrost::connect_with_table(client, config)
+                .await
+                .expect("the public Bifrost client connects")
+                .register()
+                .await
+        }
+    };
+    assert_eq!(
+        register(&declared, Some(CompactionTypeWire::Full))
+            .await
+            .expect("declared registration"),
+        RegisterOutcome::Created
+    );
+    assert_eq!(
+        register(&undeclared, None)
+            .await
+            .expect("undeclared registration"),
+        RegisterOutcome::Created
+    );
+    enable_compaction(server, &declared.binding).await;
+    enable_compaction(server, &undeclared.binding).await;
+    let described = |table: &JourneyTable| {
+        let client = &client;
+        let fqn = table.qualified.clone();
+        async move {
+            wyrd_client::bifrost::TableConfig::describe(client, &fqn)
+                .await
+                .expect("the table describes")
+                .compaction_type()
+        }
+    };
+    let stored_type = |table: &JourneyTable| {
+        let binding = table.binding.clone();
+        async move {
+            server
+                .bifrost_catalog()
+                .iceberg_catalog()
+                .load_table(&binding.table_ident())
+                .await
+                .expect("the journey table loads through the production catalog")
+                .metadata()
+                .properties()
+                .get("wyrd.forge.compaction.type")
+                .cloned()
+        }
+    };
+    assert_eq!(described(&declared).await, Some(CompactionTypeWire::Full));
+    assert_eq!(described(&undeclared).await, None);
+    assert_eq!(
+        stored_type(&declared).await.as_deref(),
+        Some("full"),
+        "the declared type is stored in Forge's own property spelling"
+    );
+    assert_eq!(
+        stored_type(&undeclared).await,
+        None,
+        "an omitted type writes no Iceberg property"
+    );
+    assert_eq!(
+        register(&declared, Some(CompactionTypeWire::Full))
+            .await
+            .expect("same-value registration"),
+        RegisterOutcome::AlreadyExists
+    );
+    assert_eq!(
+        register(&declared, None)
+            .await
+            .expect("omitted-on-existing registration"),
+        RegisterOutcome::AlreadyExists
+    );
+    let conflict = register(&declared, Some(CompactionTypeWire::SmallFiles))
+        .await
+        .expect_err("a different type is refused");
+    let wyrd_client::bifrost::BifrostClientError::Transport(conflict) = conflict else {
+        panic!("the conflict is a typed server refusal: {conflict}");
+    };
+    assert_eq!(
+        (conflict.code(), conflict.status()),
+        ("WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH", 409),
+        "the conflict is the typed mismatch refusal"
+    );
+    assert_eq!(described(&declared).await, Some(CompactionTypeWire::Full));
+
+    let mut expected = BTreeMap::new();
+    for table in [&declared, &undeclared] {
+        let mut rows = Vec::new();
+        for half in 0..2_i64 {
+            let values: Vec<i64> = (half * 8..half * 8 + 8).collect();
+            rows.extend(append_values(&client, &table.qualified, Uuid::now_v7(), &values).await);
+            server
+                .flush_bifrost()
+                .await
+                .expect("the pod publishes its staged rows");
+        }
+        expected.insert(table.name.clone(), canonical_order(rows));
+    }
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("the written partition closes");
+    drain_forge_backlog(&cluster, &observer, &[tenant]).await;
+    await_committed_rewrites(
+        &cluster,
+        &observer,
+        &[&declared.binding, &undeclared.binding],
+    )
+    .await;
+
+    for (table, dispatched) in [(&declared, "full"), (&undeclared, "small-files")] {
+        let types = dispatched_compaction_types(&cluster, tenant, table).await;
+        assert!(
+            !types.is_empty() && types.iter().all(|kind| kind == dispatched),
+            "{} is dispatched {dispatched}: {types:?}",
+            table.qualified
+        );
+        assert_public_rows(&client, table, &expected[&table.name], "after compaction").await;
+    }
+}
+
 /// A Forge rewrite attempt refused by a full shared memory root fails only that
 /// attempt, and the durable task retries once memory returns and publishes one
 /// complete rewrite snapshot, never a partial one.
@@ -2243,12 +2851,14 @@ async fn failed_memory_attempt_retries_without_partial_publication() {
     let cluster = WyrdTestCluster::start_with_embedded_forge_observer()
         .await
         .expect("one bound embedded Bifrost pod starts");
+    cluster.lead_forge_for_test().await;
     let observer = cluster
         .forge_completion_observer()
         .expect("the journey pod carries a Forge completion observer");
     let server = cluster.server(0).expect("the embedded pod is running");
     let tenant = cluster.data_tenant_id();
     let table = register_table(server, tenant, &unique_table("memory_retry")).await;
+    enable_compaction(server, &table.binding).await;
     let client = tenant_client(server, tenant).await;
     let mut expected = Vec::new();
     for half in 0..2_i64 {
@@ -2275,7 +2885,7 @@ async fn failed_memory_attempt_retries_without_partial_publication() {
     let occupant = server
         .state()
         .bifrost_resources()
-        .and_then(|resources| resources.forge())
+        .and_then(vala_bifrost_redux::resources::BifrostRoleResources::forge)
         .expect("the embedded pod hosts Forge")
         .occupy_root_for_test();
     let errors_before = observer.returned_errors().len();

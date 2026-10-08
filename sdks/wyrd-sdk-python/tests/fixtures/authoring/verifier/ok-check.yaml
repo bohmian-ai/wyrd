@@ -1,0 +1,19 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: ok-check
+  version: 1.0.0
+  space: tests
+spec:
+  implementation:
+    kind: eval
+    spec:
+      tasks:
+        ok_check:
+          kind: assertion
+          id: ok_check
+          context_path: $.ok
+          operator: equals
+          expected: true
+      pass_gate:
+        kind: all_pass

@@ -16,7 +16,9 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value as JsonValue;
+use std::sync::Arc;
 use uuid::Uuid;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth::pg_resolvers::{client_auth_label, seal_platform_client_secret};
 use wyrd_auth::platform_authz::{
     PLATFORM_ADMINS_RESOURCE, PLATFORM_CONNECTION_RESOURCE, PlatformAuthorization,
@@ -107,10 +109,10 @@ pub(super) fn operator(state: &AppState) -> Result<OperatorPool, WyrdErrorRespon
 
 /// Authorize one platform identity operation and hand back its open decision.
 ///
-/// The returned transaction already carries the allowance row, so the caller
-/// performs its mutation on it and commits once through [`commit_decision`].
-/// A read-only caller commits it immediately: there is no effect to pair the
-/// record with.
+/// The decision is already staged on the process audit outbox when this
+/// returns, so the caller performs its mutation on the returned transaction
+/// and commits once through [`commit_decision`]. A read-only caller commits it
+/// immediately: there is no effect to perform.
 ///
 /// The authorization handle owns the pool the transaction borrows from, so it
 /// is returned alongside and must outlive the connection. `resource` is the
@@ -118,8 +120,8 @@ pub(super) fn operator(state: &AppState) -> Result<OperatorPool, WyrdErrorRespon
 ///
 /// # Errors
 /// Returns a permission error when the grant does not cover `required`, and an
-/// internal error when the decision cannot be recorded — in which case nothing
-/// is performed.
+/// internal error when the transaction cannot be opened — in which case
+/// nothing is performed.
 pub(super) async fn authorize<'a>(
     authz: &'a PlatformAuthorization,
     caller: &PlatformCaller,
@@ -137,11 +139,11 @@ pub(super) async fn authorize<'a>(
         .map_err(|error| platform_authz_error(&error, required))
 }
 
-/// Commit an allowance together with whatever the caller wrote on it.
+/// Commit whatever the caller wrote on an authorized transaction.
 ///
 /// # Errors
-/// Returns an internal error when the commit fails, in which case neither the
-/// effect nor the allowance is durable.
+/// Returns an internal error when the commit fails, in which case the effect
+/// is not durable; the decision was staged separately and is still recorded.
 pub(super) async fn commit_decision(decision: TenantConn<'_>) -> Result<(), WyrdErrorResponse> {
     decision.commit().await.map_err(|error| {
         WyrdErrorResponse::from(internal_failure(
@@ -151,21 +153,23 @@ pub(super) async fn commit_decision(decision: TenantConn<'_>) -> Result<(), Wyrd
     })
 }
 
-/// Authorize a read and release its record immediately.
+/// Authorize a read and release its transaction immediately.
 ///
-/// A read has no effect to pair the allowance with, so holding the transaction
-/// open across it would buy nothing.
+/// A read has no effect to commit, so holding the transaction open across it
+/// would buy nothing. The decision is staged on `audit`, the
+/// process audit outbox.
 ///
 /// # Errors
 /// Returns a permission error when the grant does not cover `required`, and an
-/// internal error when the decision cannot be recorded or committed.
+/// internal error when the transaction cannot be opened or committed.
 pub(super) async fn authorize_read(
     pool: &OperatorPool,
+    audit: &Arc<AuditOutbox>,
     caller: &PlatformCaller,
     required: &Permission,
     resource: &str,
 ) -> Result<(), WyrdErrorResponse> {
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(audit));
     let decision = authorize(&authz, caller, required, resource).await?;
     commit_decision(decision).await
 }
@@ -197,8 +201,8 @@ pub(super) async fn authorize_read(
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
+        (status = 500, description = "A platform store read or write failed \
+          (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem),
         (status = 503, description = "The issuer could not be reached, or its discovery document \
           or key set is unavailable, undecodable, or names another issuer \
           (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE)", body = WyrdProblem)
@@ -213,7 +217,7 @@ async fn configure_connection(
 ) -> Result<Json<PlatformOidcConnectionView>, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     let mut decision = authorize(
         &authz,
         &caller,
@@ -311,8 +315,7 @@ async fn configure_connection(
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -324,6 +327,7 @@ async fn read_connection(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
+        &state.audit_outbox,
         &caller,
         &Permission::platform_identity_read(),
         PLATFORM_CONNECTION_RESOURCE,
@@ -368,8 +372,7 @@ async fn read_connection(
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No connection configured (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -380,7 +383,7 @@ async fn remove_connection(
 ) -> Result<StatusCode, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     let mut decision = authorize(
         &authz,
         &caller,
@@ -434,8 +437,7 @@ async fn remove_connection(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "Name or matching claim already registered \
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -453,7 +455,7 @@ async fn register_admin(
     // the name an operator would retry with.
     //
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     // The id is minted before the decision so the record names the principal
     // this request creates. Nothing has adopted an existing row here — unlike
     // tenant provisioning — so the minted id is the one that is written.
@@ -534,8 +536,7 @@ async fn register_admin(
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Platform identity administration required \
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -547,6 +548,7 @@ async fn list_platform_admins(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
+        &state.audit_outbox,
         &caller,
         &Permission::platform_identity_read(),
         PLATFORM_ADMINS_RESOURCE,
@@ -600,8 +602,7 @@ async fn list_platform_admins(
         (status = 404, description = "Platform principal not found (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "Would leave the deployment with no active principal \
           (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -624,7 +625,7 @@ async fn set_admin_status(
 
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone());
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
     let mut decision = authorize(
         &authz,
         &caller,
@@ -742,12 +743,11 @@ async fn complete_login(
     Json(request): Json<PlatformCallbackRequest>,
 ) -> Result<Json<TokenResponse>, WyrdErrorResponse> {
     let fallback_request_id: String;
-    let req_id = match request_id.as_ref() {
-        Some(axum::Extension(id)) => id.as_str(),
-        None => {
-            fallback_request_id = uuid::Uuid::new_v4().to_string();
-            &fallback_request_id
-        }
+    let req_id = if let Some(axum::Extension(id)) = request_id.as_ref() {
+        id.as_str()
+    } else {
+        fallback_request_id = uuid::Uuid::new_v4().to_string();
+        &fallback_request_id
     };
     let token = login_service(&state)?
         .complete(
@@ -773,10 +773,6 @@ fn platform_authz_error(error: &PlatformAuthzError, required: &Permission) -> Wy
                 details: serde_json::json!({ "permission": required.to_string() }),
             })
         }
-        PlatformAuthzError::AuditUnavailable(reason) => WyrdErrorResponse::from(internal_failure(
-            "platform authorization could not be audited",
-            &reason,
-        )),
         PlatformAuthzError::Transaction(error) => {
             WyrdErrorResponse::from(internal_failure("platform authorization failed", &error))
         }

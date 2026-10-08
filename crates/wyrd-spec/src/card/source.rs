@@ -311,11 +311,9 @@ pub enum LogConnection {
 impl LogConnection {
     fn validate(&self) -> Result<(), SourceValidationError> {
         match self {
-            Self::Loki { endpoint, auth } | Self::Splunk { endpoint, auth } => {
-                non_empty("endpoint", endpoint)?;
-                auth.validate()
-            }
-            Self::Elasticsearch { endpoint, auth, .. } => {
+            Self::Loki { endpoint, auth }
+            | Self::Splunk { endpoint, auth }
+            | Self::Elasticsearch { endpoint, auth, .. } => {
                 non_empty("endpoint", endpoint)?;
                 auth.validate()
             }

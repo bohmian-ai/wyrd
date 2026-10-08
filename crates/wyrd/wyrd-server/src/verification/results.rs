@@ -5,7 +5,7 @@
 //! `vala.eval.result_items`, taken from the tables' own declarations so the
 //! payload can never drift from the registered contract. Every batch also
 //! carries the three correlation columns Scribe admits from a native payload:
-//! `card_ref` (the Verifier, resolved against the SYSTEM token's signed scope),
+//! `card_ref` (the Verifier, resolved against the frame principal's Verifier scope),
 //! `run_id` (the Verifier run), and `wyrd_event_time` (the one server-chosen
 //! event time shared by the summary and every detail row).
 
@@ -18,7 +18,14 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::error::ArrowError;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
+use uuid::Uuid;
+use wyrd_spec::DataTenantId;
+use wyrd_spec::request_id::RequestId;
+
+use crate::components::gateway::{CaptureBatch, CaptureTable, VerifierAttribution};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Error as JsonError;
@@ -118,6 +125,47 @@ impl ResultPayload {
     #[must_use]
     pub fn batches(&self) -> &[ResultBatch] {
         &self.batches
+    }
+
+    /// Encodes every batch, in write order, as one Arrow IPC stream bound for
+    /// `tenant` under `attribution`, each under a fresh `UUIDv7` batch id.
+    ///
+    /// The encoded batches are what the capture writer submits; resubmitting
+    /// the same encoded batch reuses its bytes and id, so Scribe's batch-id
+    /// dedup absorbs a write that was durable but unacknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResultPayloadError::Arrow`] when a batch cannot be encoded,
+    /// and [`ResultPayloadError::ColumnMismatch`] when a batch names a table
+    /// outside the three result tables.
+    pub(crate) fn encode(
+        &self,
+        tenant: DataTenantId,
+        attribution: &VerifierAttribution,
+    ) -> Result<Vec<CaptureBatch>, ResultPayloadError> {
+        let request_id = RequestId::now_v7();
+        self.batches
+            .iter()
+            .map(|batch| {
+                let table = CaptureTable::from_fqn(&batch.table)
+                    .filter(|table| table.is_result())
+                    .ok_or_else(|| ResultPayloadError::ColumnMismatch {
+                        column: batch.table.clone(),
+                        problem: "unexpected",
+                    })?;
+                let mut writer = StreamWriter::try_new(Vec::new(), batch.batch.schema().as_ref())?;
+                writer.write(&batch.batch)?;
+                Ok(CaptureBatch {
+                    tenant,
+                    table,
+                    batch_id: Uuid::now_v7(),
+                    request_id: request_id.clone(),
+                    ipc: Bytes::from(writer.into_inner()?),
+                    verifier: Some(attribution.clone()),
+                })
+            })
+            .collect()
     }
 }
 
@@ -348,15 +396,21 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             (
                 "score",
-                Arc::new(Float64Array::from_iter(
-                    features.clone().map(|feature| finite(feature.score)),
-                )),
+                Arc::new(
+                    features
+                        .clone()
+                        .map(|feature| finite(feature.score))
+                        .collect::<Float64Array>(),
+                ),
             ),
             (
                 "threshold",
-                Arc::new(Float64Array::from_iter(
-                    features.clone().map(|feature| finite(feature.threshold)),
-                )),
+                Arc::new(
+                    features
+                        .clone()
+                        .map(|feature| finite(feature.threshold))
+                        .collect::<Float64Array>(),
+                ),
             ),
             (
                 "verdict",
@@ -420,9 +474,12 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             (
                 "passed",
-                Arc::new(BooleanArray::from_iter(
-                    items.iter().map(|item| item.passed),
-                )),
+                Arc::new(
+                    items
+                        .iter()
+                        .map(|item| item.passed)
+                        .collect::<BooleanArray>(),
+                ),
             ),
             (
                 "actual",
@@ -439,7 +496,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("message", text(items.iter().map(|item| item.message))),
             (
                 "stage",
-                Arc::new(Int32Array::from_iter(items.iter().map(|item| item.stage))),
+                Arc::new(items.iter().map(|item| item.stage).collect::<Int32Array>()),
             ),
             (
                 "started_at",
@@ -447,9 +504,12 @@ impl<'a> ResultPayloadBuilder<'a> {
             ),
             (
                 "duration_ms",
-                Arc::new(Int64Array::from_iter(
-                    items.iter().map(|item| item.duration_ms),
-                )),
+                Arc::new(
+                    items
+                        .iter()
+                        .map(|item| item.duration_ms)
+                        .collect::<Int64Array>(),
+                ),
             ),
             (
                 "skip_reason",
@@ -674,12 +734,11 @@ fn text<S: AsRef<str>>(values: impl IntoIterator<Item = Option<S>>) -> ArrayRef 
 /// Build a nullable UTC microsecond timestamp column.
 fn timestamps(values: impl IntoIterator<Item = Option<DateTime<Utc>>>) -> ArrayRef {
     Arc::new(
-        TimestampMicrosecondArray::from_iter(
-            values
-                .into_iter()
-                .map(|value| value.map(|at| at.timestamp_micros())),
-        )
-        .with_timezone("UTC"),
+        values
+            .into_iter()
+            .map(|value| value.map(|at| at.timestamp_micros()))
+            .collect::<TimestampMicrosecondArray>()
+            .with_timezone("UTC"),
     )
 }
 

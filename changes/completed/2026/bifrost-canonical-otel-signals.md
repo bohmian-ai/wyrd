@@ -19,4 +19,3 @@ Current owners and evidence:
 - [Bifrost design](../../../architecture/bifrost-design.md).
 - [Trace schema](../../../crates/vala/vala-bifrost-redux/src/tables/traces/spans.rs), [trace projection](../../../crates/vala/vala-bifrost-redux/src/tables/traces/projection.rs), [log schema](../../../crates/vala/vala-bifrost-redux/src/tables/logs/records.rs), and [metric schema](../../../crates/vala/vala-bifrost-redux/src/tables/metrics/points.rs).
 - [Public OTLP journeys](../../../crates/wyrd/wyrd-testing/tests/bifrost/otlp).
-

@@ -49,6 +49,10 @@ impl RunId {
     ///
     /// SHA-256 over the id bytes; the first eight digest bytes are read
     /// big-endian as a `u64` and reduced modulo `buckets`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a remainder exceeds its `u32` divisor, which arithmetic rules out.
     #[must_use]
     pub fn hash_bucket(&self, buckets: u32) -> u32 {
         use sha2::{Digest, Sha256};
@@ -60,7 +64,7 @@ impl RunId {
         let mut prefix = [0_u8; 8];
         prefix.copy_from_slice(&digest[..8]);
         let value = u64::from_be_bytes(prefix);
-        (value % u64::from(buckets)) as u32
+        u32::try_from(value % u64::from(buckets)).expect("a remainder is below its u32 divisor")
     }
 }
 
@@ -71,50 +75,6 @@ impl Default for RunId {
 }
 
 impl std::fmt::Display for RunId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// Local development session identifier (the code axis before any service
-/// identity exists).
-///
-/// UUIDv7 string at the wire boundary. Client-generated at the start of a local
-/// dev session so observations emitted while authoring code — before a commit
-/// or a registered card exists — can later be reconciled to the resulting
-/// commit and card. See [`crate::vala::correlation::CorrelationContext`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct DevSessionId(String);
-
-impl DevSessionId {
-    /// Generate a fresh UUIDv7 dev-session identifier.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(crate::ids::uuid7())
-    }
-
-    /// Adopt a caller-supplied dev-session identifier.
-    #[must_use]
-    pub fn from_string(value: String) -> Self {
-        Self(value)
-    }
-
-    /// Borrow the identifier as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Default for DevSessionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for DevSessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }

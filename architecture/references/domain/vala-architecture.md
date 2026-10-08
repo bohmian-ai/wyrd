@@ -48,7 +48,7 @@ Wyrd-owned analytical storage and is not a Card kind.
   publication, leases and fences, reconciliation, retention, cleanup, and
   maintenance telemetry.
 - **Postgres** owns catalog pointers, tenant-scoped control state, leases,
-  operation identities, and transactional audit rows. It does not store
+  operation identities, and staged audit rows. It does not store
   analytical payload bytes.
 - **Object storage** owns immutable Parquet and Iceberg metadata objects. A
   path or prefix is never an authorization boundary.
@@ -62,7 +62,7 @@ semantics.
 
 - Physical analytical identity is `(tenant, logical table)`. Shared
   physical tables with caller-supplied tenant predicates are forbidden.
-- Server-owned system columns and `wyrd_batch_id` survive
+- Server-owned system columns survive
   WAL, staging, Parquet, Iceberg promotion, Forge rewrite, and query unchanged.
 - A Card is an optional declared subject. A Run is one client execution. Every
   Observation retains authenticated tenant and publisher `principal_id`; when
@@ -75,9 +75,10 @@ semantics.
   mismatch, contradictory durable evidence, or ambiguous publication fails
   closed without discarding the last valid authority.
 - Audit cardinality follows evaluated permission decisions: one event per
-  received verdict, appended before the result or refusal. Oracle read admission
-  uses the one local-WAL audit exception. Engine-internal transitions record
-  lineage in their own operational tables instead of audit.
+  received verdict, staged on the process audit outbox without delaying the
+  result or refusal. No surface has an audit exception or a local audit WAL.
+  Engine-internal transitions record lineage in their own operational tables
+  instead of audit.
 
 ## Rejected shapes
 

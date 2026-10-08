@@ -29,6 +29,28 @@ impl PyWyrdClient {
     pub(crate) const fn inner(&self) -> &WyrdClient {
         &self.inner
     }
+
+    /// Resolve the client a server-facing surface acts as.
+    ///
+    /// Every public Python surface that calls the server takes one optional
+    /// `client`; this is the single place that turns it into a Rust client.
+    /// A supplied client is reused as is, sharing its transport and token
+    /// cache. Omitted, the ambient chain resolves exactly as Rust
+    /// [`WyrdClient::from_global`] does: the global configuration file, then
+    /// the environment, then the saved user login.
+    ///
+    /// # Arguments
+    /// * `client` - The caller's explicit client, or `None` for the ambient chain.
+    ///
+    /// # Errors
+    /// Returns the configuration, credential, or saved-login error raised while
+    /// resolving the ambient chain; a supplied client never fails.
+    pub(crate) fn resolve(client: Option<&Self>) -> Result<WyrdClient, WyrdError> {
+        match client {
+            Some(client) => Ok(client.inner.clone()),
+            None => WyrdClient::from_global().map_err(WyrdError::from),
+        }
+    }
 }
 
 #[pymethods]
@@ -36,24 +58,30 @@ impl PyWyrdClient {
     /// Build a client from optionally overridden transport values.
     ///
     /// Omitted values resolve through `client_from_options`: the environment,
-    /// then the saved user login for this server (the one for `tenant`, a
-    /// tenant route key, when given, otherwise the newest), then
+    /// then the saved user login for this server (the one for `WYRD_TENANT`
+    /// when set, otherwise the newest), then
     /// `~/.config/wyrd/credentials.toml`.
+    ///
+    /// # Arguments
+    /// * `server_url` - The HTTP server URL, or `None` to resolve it.
+    /// * `credential` - The client's own credential: a Wyrd API key
+    ///   (`wyrd_sk_…`), exchanged for a short-lived access token and renewed,
+    ///   or an access token, presented as-is. `None` resolves the chain.
+    /// * `grpc_url` - The gRPC endpoint, or `None` to derive it.
     ///
     /// # Errors
     /// Raises `WyrdError` carrying `WYRD_CLIENT_401_NO_CREDENTIALS` when no
     /// credential resolves, `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` when this
-    /// server has saved logins but none for `tenant`, or the saved login
+    /// server has saved logins but none for `WYRD_TENANT`, or the saved login
     /// cannot be used, or a transport error when the client cannot be built.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, grpc_url=None, tenant=None))]
+    #[pyo3(signature = (server_url=None, credential=None, grpc_url=None))]
     fn __new__(
         server_url: Option<&str>,
         credential: Option<&str>,
         grpc_url: Option<&str>,
-        tenant: Option<&str>,
     ) -> WyrdPyResult<Self> {
-        client_from_options(server_url, credential, grpc_url, tenant)
+        client_from_options(server_url, credential, grpc_url)
             .map(|inner| Self { inner })
             .map_err(|error| WyrdPyError::from(WyrdError::from(error)))
     }
@@ -65,10 +93,26 @@ impl PyWyrdClient {
     }
 
     /// The effective gRPC endpoint: the explicit `grpc_url` when one was given,
-    /// else the server URL's scheme and host on the public gRPC port `50051`.
+    /// else `WYRD_GRPC_URL`, else the server URL's scheme and host on the
+    /// public gRPC port `50051`.
     #[getter]
     fn grpc_url(&self) -> &str {
         self.inner.grpc_url()
+    }
+
+    /// Return a current bearer for this client's credential.
+    ///
+    /// Reads through the Rust client's shared auth middleware with the GIL
+    /// released, so an expired token is renewed there; nothing is cached on
+    /// the Python side.
+    ///
+    /// # Errors
+    /// Raises the server's stable error when it refuses the credential, or a
+    /// transport error when the token endpoint cannot be reached.
+    fn access_token(&self, py: Python<'_>) -> WyrdPyResult<String> {
+        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.access_token()))
+            .map(|bearer| bearer.expose().to_owned())
+            .map_err(WyrdPyError::from)
     }
 
     /// Return a client that acts for the holder of `subject_token`.

@@ -38,7 +38,7 @@ use wyrd_spec::ids::{IdempotencyKey, WorkflowRunId};
 use crate::config::ServerWorkflowConfig;
 
 /// How long a terminal run stays retrievable.
-const RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const RETENTION: Duration = Duration::from_hours(24);
 
 /// Outcome a preparation publishes to its creator and matching waiters: the
 /// queued snapshot on acceptance, or the structured preparation failure.

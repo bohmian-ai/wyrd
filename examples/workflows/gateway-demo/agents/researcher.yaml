@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: examples
+  name: researcher
+  version: "0.1.0"
+spec:
+  prompt:
+    model: gpt-4o-mini
+    request:
+      provider: open_ai_chat_completion
+      body:
+        model: gpt-4o-mini
+        messages:
+          - role: system
+            content: You are a helpful assistant.
+          - role: user
+            content: "Summarise: {{topic}}"
+    variables: [topic]
+    response_type: text
+  tool_names: []

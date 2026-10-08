@@ -1,9 +1,12 @@
 //! Iceberg snapshot expiry for the Forge maintenance loop.
 
+use super::compact::ForgeConfig;
+use super::live_reconcile::DestructiveMaintenance;
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
+use iceberg::table::Table;
 use iceberg::transaction::{
     ApplyTransactionAction, CleanupTraversalLimits, ExpiredFileSet, Transaction,
     expired_files_between,
@@ -12,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::queries::oracle_reader_authority::ExclusiveTableAuthority;
 use vala_sql::row_types::forge_operations::{
     ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
     ForgeExpirationResetRequest, ForgeExpirationSettlement, ForgeExpirationSettlementRequest,
@@ -24,7 +28,7 @@ use vala_sql::row_types::forge_tasks::{
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, ForgeSnapshotExpirePhase, StoragePath};
 
-use crate::catalog::{BIFROST_CATALOG_NAME, TableRef, TenantTableBinding};
+use crate::catalog::{BIFROST_CATALOG_NAME, TenantTableBinding};
 #[cfg(test)]
 use crate::namespaces::BifrostNamespace;
 
@@ -59,7 +63,7 @@ pub(crate) struct ExpiryReconciliationOutcome {
     /// Prepared selections no longer safe to replay.
     pub(crate) unresolved: usize,
     /// Fail-closed destructive-maintenance disposition.
-    pub(crate) destructive_maintenance: super::live_reconcile::DestructiveMaintenance,
+    pub(crate) destructive_maintenance: DestructiveMaintenance,
     /// Final task evidence an atomic settlement in this pass already stored.
     ///
     /// `Some` means the task row is already `Succeeded` with its exact cleanup
@@ -85,55 +89,48 @@ pub(crate) struct ExpiryTaskAuthority {
     pub(crate) worker: Uuid,
 }
 
-/// Selects only snapshots older than `cutoff_ms` that are not current, ref
-/// heads, or among the retained ancestry of a current/ref head.
+/// The fixed identity of one snapshot expiration from preparation to its
+/// resolution.
+///
+/// Preparation, the Iceberg commit, reset, and settlement all act on the same
+/// table, task, claim set, and audited selection, so they share this one
+/// borrowed value instead of each re-threading its parts.
+#[derive(Debug, Clone, Copy)]
+struct PreparedExpiry<'a> {
+    /// Tenant-qualified table the expiration acts on.
+    key: &'a ForgeTableKey,
+    /// Physical binding of that table.
+    binding: &'a TenantTableBinding,
+    /// Claimed task the expiration runs under.
+    authority: &'a ExpiryTaskAuthority,
+    /// Durable claim-table identity the claims are keyed by.
+    claim_table: &'a ForgeClaimTable,
+    /// The prepared, audited snapshot selection.
+    detail: &'a AuditDetail,
+}
+
+/// Selects every retained snapshot that is neither current nor a ref head.
+///
+/// There is no age or depth retention: a replaced snapshot is eligible as soon
+/// as nothing else roots it. Roots outside Iceberg — open attempts, rewrite
+/// lineage, existing claims — are removed by the expiry policy, and active
+/// Oracle readers refuse the whole operation at preparation.
 #[must_use]
 pub fn select_expirable_snapshots(
     snapshots: &[SnapshotSummary],
     current_snapshot_id: Option<i64>,
     ref_heads: &[i64],
-    cutoff_ms: i64,
-    retain_last: usize,
 ) -> Vec<i64> {
-    let by_id = snapshots
-        .iter()
-        .map(|snapshot| (snapshot.id, *snapshot))
-        .collect::<HashMap<_, _>>();
-    let mut heads = ref_heads.iter().copied().collect::<HashSet<_>>();
-    if let Some(current) = current_snapshot_id {
-        heads.insert(current);
-    }
-    let mut protected = HashSet::new();
-    let retained_count = retain_last.max(1);
-    for head in heads {
-        let mut cursor = Some(head);
-        for _ in 0..retained_count {
-            let Some(id) = cursor else { break };
-            if !protected.insert(id) {
-                break;
-            }
-            cursor = by_id.get(&id).and_then(|snapshot| snapshot.parent_id);
-        }
-    }
     let mut selected = snapshots
         .iter()
-        .filter(|snapshot| snapshot.timestamp_ms < cutoff_ms && !protected.contains(&snapshot.id))
         .map(|snapshot| snapshot.id)
+        .filter(|id| Some(*id) != current_snapshot_id && !ref_heads.contains(id))
         .collect::<Vec<_>>();
     selected.sort_unstable();
     selected
 }
 
 impl Forge {
-    /// Discover the ordered durable table set for one periodic tick.
-    ///
-    /// # Errors
-    ///
-    /// Returns a SQL error when no complete discovery set can be formed.
-    pub(super) async fn discover_tables(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-        self.discover_tables_inner().await
-    }
-
     /// Reconcile and expire snapshots while retaining the shared table fence.
     ///
     /// # Errors
@@ -213,43 +210,7 @@ impl Forge {
     }
 }
 
-/// Discover tenant/table pairs from active durable catalog registrations.
-///
-/// Invalid rows are counted and skipped so one malformed table identity does
-/// not prevent maintenance for the remaining tables.
 impl Forge {
-    async fn discover_tables_inner(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-        let rows = vala_sql::queries::forge_catalog_operator::list_active_tables_for_operator(
-            &self.core.operator_pool,
-        )
-        .await
-        .map_err(ForgeError::Sql)?;
-        let mut failures = 0;
-        let mut tables = Vec::new();
-        for row in rows {
-            let table: Result<ForgeTableKey, ForgeError> = (|| {
-                let tenant = DataTenantId::try_from(row.data_tenant_id).map_err(|error| {
-                    ForgeError::SnapshotExpiry {
-                        detail: error.to_string(),
-                    }
-                })?;
-                let table_ref =
-                    TableRef::parse_fqn(&row.fqn).ok_or_else(|| ForgeError::SnapshotExpiry {
-                        detail: format!("invalid registered Bifrost FQN `{}`", row.fqn),
-                    })?;
-                Ok(ForgeTableKey { tenant, table_ref })
-            })();
-            match table {
-                Ok(table) => tables.push(table),
-                Err(error) => {
-                    failures += 1;
-                    tracing::warn!(error = %error, "Forge table discovery skipped an invalid row");
-                }
-            }
-        }
-        Ok((tables, failures))
-    }
-
     /// Reconcile this task's prepared expiry, then expire eligible snapshots.
     ///
     /// Current and reference heads, plus their retained ancestry, are protected by
@@ -257,9 +218,39 @@ impl Forge {
     /// ends the pass so a successor never submits a second expiry effect from the
     /// same metadata load. New selections reload metadata before commit.
     ///
-    /// Postgres closes before Iceberg: the preparation transaction commits and
-    /// releases the table maintenance-authority row before the second catalog
-    /// read, so no SQL lock is held across catalog or object-store IO.
+    /// The preparation transaction commits before the second catalog read, so
+    /// its uncertain-effect evidence is durable before Iceberg is touched. The
+    /// table's exclusive maintenance authority is the one SQL lock deliberately
+    /// held across that IO: it is taken before preparation and surrendered
+    /// only once the commit's outcome is known and the claims are settled or
+    /// reset, which is what makes the reader check and the destructive commit
+    /// inseparable. The Forge lease TTL bounds that hold. Claims that outlive
+    /// the authority therefore always name an expiration whose acceptance is
+    /// unknown, and Oracle refuses new cuts of the table until reconciliation
+    /// establishes the stable pointer.
+    ///
+    /// # Errors
+    /// Returns [`ForgeError::Shutdown`] when `stop` is cancelled at a stage
+    /// boundary, [`ForgeError::FenceLost`] when the table lease fence is gone,
+    /// an SQL conflict when an Oracle query still holds the table's read
+    /// authority, policy and metadata errors from snapshot selection, the
+    /// catalog, SQL, or object-store error of any reconciliation, preparation,
+    /// commit, or settlement step, and [`ForgeError::Reconciliation`] when a
+    /// submitted commit outlives the lease bound. Drift, a definite
+    /// optimistic-commit rejection, and a lease bound reached before
+    /// submission are not errors: they reset the claims and return a blocked
+    /// outcome.
+    ///
+    /// # Cancellation and partial progress
+    /// Cancellation is observed only at stage boundaries before preparation
+    /// and before the corroborating read. A failure after preparation but
+    /// before the commit is submitted resets the claims under the authority.
+    /// Once the commit is submitted, the operation, task, and claims stay
+    /// `Prepared` on every exit that does not prove its outcome (the lease
+    /// bound, a retryable catalog error, or any later failure), so the next
+    /// pass reconciles that one operation instead of submitting a second
+    /// expiry. Dropping the future while the exclusive authority is held rolls
+    /// its transaction back and releases the table to readers.
     async fn run_snapshot_expiry_for_table_inner(
         &self,
         lease: &mut ForgeLease,
@@ -276,14 +267,12 @@ impl Forge {
         if outcome.recovered > 0 {
             return Ok(outcome);
         }
-        if outcome.destructive_maintenance == super::live_reconcile::DestructiveMaintenance::Blocked
-        {
+        if outcome.destructive_maintenance == DestructiveMaintenance::Blocked {
             return Ok(outcome);
         }
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let table = self.load_table(&binding.table_ident()).await?;
-        let retention_cutoff_ms = expiry_cutoff_ms(now, self.core.config.snapshot_retention)?;
         let roots = self
             .snapshot_protection_roots(key, &table, outcome.destructive_maintenance)
             .await?;
@@ -293,157 +282,261 @@ impl Forge {
             current_snapshot_id: table.metadata().current_snapshot_id(),
             ref_heads: &ref_heads,
             roots: &roots,
-            retention_cutoff_ms,
-            retain_last: self.core.config.retain_last,
             traversal_limit: self.core.config.max_retained_snapshots_per_table,
         }
         .decide()?;
-        let SnapshotExpiryDecision::Expire {
-            snapshot_ids,
-            cutoff_ms,
-        } = decision
-        else {
+        let SnapshotExpiryDecision::Expire { snapshot_ids } = decision else {
             return Ok(outcome);
         };
-        let doomed: Vec<i64> = snapshot_ids.clone();
-        let detail = expiry_detail(&table, key, cutoff_ms, snapshot_ids, ref_heads)?;
+        let detail = expiry_detail(&table, key, snapshot_ids, ref_heads)?;
         let claim_table = self.expiry_claim_table(key, &table).await?;
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
-        self.revalidate_reader_protection(key, &doomed, cutoff_ms)
-            .await?;
-        self.prepare_expiration(lease, key, authority, &claim_table, &detail)
-            .await?;
-        require_running(stop)?;
-        // The one corroborating read. Every pinned field must still be exactly
-        // what preparation recorded; anything else is definite pre-call drift
-        // that releases the claims without making a single Iceberg mutation.
-        let reloaded = self.load_table(&binding.table_ident()).await?;
-        if let Err(drift) = corroborate_expiry(
-            &reloaded,
-            &claim_table,
-            &detail,
-            self.core.config.retain_last,
-        ) {
-            self.reset_expiration(lease, key, authority, &claim_table, &detail, &drift)
-                .await?;
-            outcome.unresolved = outcome.unresolved.saturating_add(1);
-            outcome.destructive_maintenance =
-                super::live_reconcile::DestructiveMaintenance::Blocked;
-            return Ok(outcome);
-        }
-        let expired_files = match self
-            .complete_expiry(lease, key, reloaded, &detail, stop)
-            .await
-        {
-            Ok(files) => files,
-            // A definite optimistic-commit rejection proves the mutation was
-            // never applied, so it releases the claims exactly like drift.
-            // A retryable catalog error is not that proof: the pinned Iceberg
-            // transaction exhausted its own budget without ever learning
-            // whether the commit landed, so it falls through to the uncertain
-            // path below. Every other failure leaves acceptance unproven and
-            // therefore leaves task, operation, and claims Prepared for
-            // reconciliation.
-            Err(ForgeError::Catalog(error)) if !error.retryable() => {
-                let rejection = ForgeError::Catalog(error);
-                self.reset_expiration(lease, key, authority, &claim_table, &detail, &rejection)
-                    .await?;
-                outcome.unresolved = outcome.unresolved.saturating_add(1);
-                outcome.destructive_maintenance =
-                    super::live_reconcile::DestructiveMaintenance::Blocked;
-                return Ok(outcome);
-            }
-            Err(error) => return Err(error),
-        };
-        let evidence = self
-            .settle_expiration(
-                binding,
-                &expiration_authority(authority, lease),
-                &claim_table,
-                &detail,
-                &expired_files,
-                ForgeExpirationSettlement::Committed,
-            )
-            .await?;
-        Self::record_expired_snapshots(&detail);
-        outcome.settled_evidence = Some(evidence);
-        outcome.recovered = outcome.recovered.saturating_add(1);
-        Ok(outcome)
-    }
-}
-
-impl Forge {
-    /// Re-reads reader protection immediately before the destructive commit.
-    ///
-    /// The selection was decided against a read of the reader watermarks taken
-    /// before planning, the prepared audit, and the fence refresh. A query
-    /// admitted in that window publishes its pin durably before it reads, so
-    /// re-reading here is what turns "nobody needed this when we looked" into
-    /// "nobody needs this now". The pass is abandoned rather than narrowed: the
-    /// prepared operation settles on its own reconciliation path, and a
-    /// successor re-decides against the newer reader set.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Sql`] when the watermarks cannot be re-read and
-    /// [`ForgeError::SnapshotExpiry`] when the bounded query overflows or a
-    /// live reader now depends on a snapshot this pass intended to expire.
-    async fn revalidate_reader_protection(
-        &self,
-        key: &ForgeTableKey,
-        doomed: &[i64],
-        cutoff_ms: i64,
-    ) -> Result<(), ForgeError> {
-        let mut conn = self
+        // The exclusive table authority is held from reader exclusion through
+        // the Iceberg commit's known outcome and the claims' resolution, so no
+        // Oracle cut can pin the pre-expiry pointer between the reader check
+        // and the commit, and none ever observes the claims of an expiration
+        // whose outcome is known. The lease TTL bounds the hold.
+        let mut authority_conn = self
             .core
             .vala
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let readers = super::reader_protection::ReaderProtection::new(&mut conn)
-            .watermarks(key.tenant, &key.table_ref)
-            .await?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        // The cutoff is the minimum of configured retention and every watermark
-        // this pass already saw, so a reader sitting exactly on it is the reader
-        // that lowered it and is protected by construction — selection expires
-        // only snapshots strictly older. Refusing at the cutoff would refuse
-        // every pass that a protected old reader made safe. What is unsafe is a
-        // reader the pass never saw: one on a doomed snapshot, or one that would
-        // have pulled the cutoff further back.
-        for reader in &readers {
-            if doomed.contains(&reader.snapshot_id) || reader.timestamp_ms < cutoff_ms {
-                return Err(ForgeError::SnapshotExpiry {
-                    detail: format!(
-                        "a live reader on snapshot {} at {}ms was admitted after this expiry was \
-                         decided against cutoff {cutoff_ms}ms",
-                        reader.snapshot_id, reader.timestamp_ms
-                    ),
+        let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
+            .exclusive(key.tenant, &key.table_ref)
+            .await?
+            .ok_or_else(super::table_authority::active_read_refusal)?;
+        let expiry = PreparedExpiry {
+            key,
+            binding,
+            authority,
+            claim_table: &claim_table,
+            detail: &detail,
+        };
+        let progress = ExpiryProgress::default();
+        let bounded = tokio::time::timeout(
+            self.core.config.lease_ttl,
+            // Boxed so the whole expiry state machine stays off every
+            // caller's future.
+            Box::pin(self.expire_under_authority(lease, expiry, &exclusive, &progress, stop)),
+        )
+        .await;
+        drop(exclusive);
+        let resolution = match bounded {
+            Ok(resolution) => {
+                authority_conn.commit().await.map_err(ForgeError::Sql)?;
+                resolution?
+            }
+            // The commit may already have reached the catalog: the claims stay
+            // Prepared, which keeps new cuts off this table until
+            // reconciliation establishes the stable pointer.
+            Err(_) if progress.submitted.load(Ordering::Acquire) => {
+                authority_conn.commit().await.map_err(ForgeError::Sql)?;
+                return Err(ForgeError::Reconciliation {
+                    detail: "Iceberg snapshot expiry outlived the Forge lease bound with unknown \
+                             acceptance"
+                        .to_owned(),
                 });
             }
+            // Nothing reached the catalog: roll the authority transaction
+            // back and release any prepared claims.
+            Err(_) => {
+                drop(authority_conn);
+                if progress.prepared.load(Ordering::Acquire) {
+                    self.reset_expiration(
+                        lease,
+                        expiry,
+                        None,
+                        &ForgeError::Timeout {
+                            operation: "snapshot expiry under table authority",
+                        },
+                    )
+                    .await?;
+                }
+                ExpiryResolution::Reset
+            }
+        };
+        match resolution {
+            ExpiryResolution::Reset => {
+                outcome.unresolved = outcome.unresolved.saturating_add(1);
+                outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
+            }
+            ExpiryResolution::Settled(evidence) => {
+                Self::record_expired_snapshots(&detail);
+                outcome.settled_evidence = Some(evidence);
+                outcome.recovered = outcome.recovered.saturating_add(1);
+            }
         }
-        Ok(())
+        Ok(outcome)
     }
 
+    /// Prepares, commits, and resolves one expiry under the table's authority.
+    ///
+    /// `exclusive` is held throughout, so the claims are resolved before any
+    /// Oracle cut can observe them: a committed expiry settles, and drift, a
+    /// definite optimistic-commit rejection, or any failure before the commit
+    /// was submitted resets. The one corroborating read must still match
+    /// exactly what preparation recorded; anything else is definite pre-call
+    /// drift. `progress` records how far the operation got, so a caller that
+    /// cuts this future off at the lease bound knows whether the catalog may
+    /// have seen the commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns preparation failures, the failure of a reset or settlement, and
+    /// every submitted-commit failure other than a definite rejection. Any
+    /// other failure before submission is returned after its claims are
+    /// reset; one after submission leaves operation, task, and claims Prepared
+    /// for reconciliation.
+    async fn expire_under_authority(
+        &self,
+        lease: &mut ForgeLease,
+        expiry: PreparedExpiry<'_>,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
+        progress: &ExpiryProgress,
+        stop: &CancellationToken,
+    ) -> Result<ExpiryResolution, ForgeError> {
+        self.prepare_expiration(lease, expiry, exclusive).await?;
+        progress.prepared.store(true, Ordering::Release);
+        let reloaded = match self.reload_running(expiry, stop).await {
+            Ok(reloaded) => reloaded,
+            Err(error) => {
+                return Err(self
+                    .release_unsubmitted(lease, expiry, exclusive, error)
+                    .await);
+            }
+        };
+        if let Err(drift) = corroborate_expiry(&reloaded, expiry.claim_table, expiry.detail) {
+            self.reset_expiration(lease, expiry, Some(exclusive), &drift)
+                .await?;
+            return Ok(ExpiryResolution::Reset);
+        }
+        match self
+            .complete_expiry(
+                lease,
+                expiry,
+                exclusive,
+                reloaded,
+                &progress.submitted,
+                stop,
+            )
+            .await
+        {
+            Ok(expired_files) => Ok(ExpiryResolution::Settled(
+                self.settle_expiration(
+                    lease,
+                    expiry,
+                    Some(exclusive),
+                    &expired_files,
+                    ForgeExpirationSettlement::Committed,
+                )
+                .await?,
+            )),
+            // A definite optimistic-commit rejection proves the mutation was
+            // never applied, so it releases the claims exactly like drift. A
+            // retryable catalog error is not that proof: the pinned Iceberg
+            // transaction exhausted its own budget without learning whether
+            // the commit landed.
+            Err(ForgeError::Catalog(error)) if !error.retryable() => {
+                let rejection = ForgeError::Catalog(error);
+                self.reset_expiration(lease, expiry, Some(exclusive), &rejection)
+                    .await?;
+                Ok(ExpiryResolution::Reset)
+            }
+            Err(error) if !progress.submitted.load(Ordering::Acquire) => Err(self
+                .release_unsubmitted(lease, expiry, exclusive, error)
+                .await),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reloads the prepared table for corroboration unless the pass stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Shutdown`] when `stop` is cancelled and the
+    /// catalog failure of the reload.
+    async fn reload_running(
+        &self,
+        expiry: PreparedExpiry<'_>,
+        stop: &CancellationToken,
+    ) -> Result<Table, ForgeError> {
+        require_running(stop)?;
+        self.load_table(&expiry.binding.table_ident()).await
+    }
+
+    /// Releases the claims of an expiry that failed before its commit was
+    /// submitted, and returns that failure.
+    ///
+    /// Nothing reached the catalog, so the claims would only keep new cuts off
+    /// the table. A reset that itself fails is logged and leaves the claims to
+    /// reconciliation.
+    async fn release_unsubmitted(
+        &self,
+        lease: &ForgeLease,
+        expiry: PreparedExpiry<'_>,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
+        error: ForgeError,
+    ) -> ForgeError {
+        if let Err(reset) = self
+            .reset_expiration(lease, expiry, Some(exclusive), &error)
+            .await
+        {
+            tracing::warn!(
+                error = %reset,
+                cause = %error,
+                "Forge could not release an unsubmitted snapshot expiration; reconciliation owns it"
+            );
+        }
+        error
+    }
+}
+
+/// How far one snapshot expiry got under its table authority.
+///
+/// Read only after the lease bound cuts the operation off, to decide whether
+/// its prepared claims can be released or must wait for reconciliation.
+#[derive(Debug, Default)]
+struct ExpiryProgress {
+    /// The preparation transaction committed the operation and its claims.
+    prepared: AtomicBool,
+    /// The Iceberg commit was handed to the catalog; its acceptance may be
+    /// unknown from here on.
+    submitted: AtomicBool,
+}
+
+/// How one expiry under table authority resolved its prepared claims.
+#[derive(Debug)]
+enum ExpiryResolution {
+    /// The commit was accepted and settled with this evidence.
+    Settled(ForgeTaskEvidence),
+    /// Nothing was expired and the claims were released.
+    Reset,
+}
+
+impl Forge {
     /// Gathers every non-catalog authority that protects a snapshot.
     ///
     /// The three roots are read together, under the fence this pass already
     /// holds, because a decision made from two of them is not a smaller
     /// decision — it is an unsafe one. Watermarks are returned unvalidated;
     /// corroborating them against Iceberg belongs to the policy, which is the
-    /// owner that also knows the ancestry they must be reachable from.
+    /// owner that also knows the ancestry they must be reachable from. On the
+    /// leader, a compaction it selected but no worker has started yet joins
+    /// the attempt watermarks.
     ///
     /// # Errors
     ///
     /// Returns SQL or identity failures from the durable watermark reads, and
     /// [`ForgeError::SnapshotExpiry`] when either bounded query overflowed,
-    /// which means the protected set is not provably complete.
+    /// which means the protected set is not provably complete, or when the
+    /// leader's selected compaction holds no retained snapshot.
     async fn snapshot_protection_roots(
         &self,
         key: &ForgeTableKey,
-        table: &iceberg::table::Table,
-        destructive_maintenance: super::live_reconcile::DestructiveMaintenance,
+        table: &Table,
+        destructive_maintenance: DestructiveMaintenance,
     ) -> Result<SnapshotProtectionRoots, ForgeError> {
         let identity = ForgeTaskTableIdentity::new(
             crate::catalog::BIFROST_CATALOG_NAME,
@@ -462,23 +555,17 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let (attempt_watermarks, attempts_overflowed) =
+        let (mut attempt_watermarks, attempts_overflowed) =
             ForgeTasks::new(self.core.operator_pool.clone())
                 .watermarks(&mut conn, &identity, cap)
                 .await
                 .map_err(ForgeError::Sql)?;
-        // Reader protection is not bounded by the open-operation cap: a
-        // frontier is one member per incomparable lineage, and truncating it
-        // would silently stop protecting one of them. A frontier that cannot be
-        // read or validated fails the pass instead.
-        let reader_watermarks = super::reader_protection::ReaderProtection::new(&mut conn)
-            .watermarks(key.tenant, &key.table_ref)
-            .await?;
+        attempt_watermarks.extend(self.leader_compaction_watermark(key.tenant, identity, table)?);
         // Snapshots another prepared expiration already claimed are removed
         // from this pass in the same transaction the other roots are read in.
         // Preparation re-checks the claim index under the table lock; this read
         // only keeps a pass from planning work that is already owned.
-        let claimed_snapshot_ids = super::reader_protection::ReaderProtection::new(&mut conn)
+        let claimed_snapshot_ids = super::table_authority::TableAuthority::new(&mut conn)
             .claimed_snapshot_ids(key.tenant, &key.table_ref)
             .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
@@ -489,11 +576,53 @@ impl Forge {
         }
         Ok(SnapshotProtectionRoots {
             attempt_watermarks,
-            reader_watermarks,
             lineage_snapshot_id: head_lineage_snapshot_id(table),
             claimed_snapshot_ids,
             destructive_maintenance,
         })
+    }
+
+    /// Returns the snapshot a compaction the leader selected still holds.
+    ///
+    /// A pulled compaction writes its durable watermark only when a worker
+    /// starts it, so until then the leader's in-memory track is the one
+    /// record of the snapshot it was selected against. Without this root the
+    /// leader's own clamp would decide only that expiry is due, and the
+    /// effect would still expire the selected snapshot. The timestamp comes
+    /// from the table the policy decides over, so a held snapshot the table no
+    /// longer retains cannot silently protect nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::SnapshotExpiry`] when the leader holds a
+    /// compaction without an observed snapshot, or one whose snapshot the
+    /// table no longer retains: neither leaves a provable protection.
+    fn leader_compaction_watermark(
+        &self,
+        tenant: DataTenantId,
+        table: ForgeTaskTableIdentity,
+        iceberg_table: &Table,
+    ) -> Result<Option<SnapshotWatermark>, ForgeError> {
+        // ponytail: only the leader's memory holds a pulled-not-started
+        // watermark, so an expiry a non-leader worker runs sees the durable
+        // roots alone; route such effects through the leader if they ever
+        // run outside its maintenance pass.
+        let Some(term) = self.leadership.held() else {
+            return Ok(None);
+        };
+        let key = super::leader::ForgeTableKey { tenant, table };
+        let Some(held) = term.schedule().processing_watermark(&key) else {
+            return Ok(None);
+        };
+        let snapshot = held
+            .and_then(|snapshot_id| iceberg_table.metadata().snapshot_by_id(snapshot_id))
+            .ok_or_else(|| ForgeError::SnapshotExpiry {
+                detail: "a selected compaction holds no retained snapshot".to_owned(),
+            })?;
+        Ok(Some(SnapshotWatermark {
+            snapshot_id: snapshot.snapshot_id(),
+            timestamp_ms: snapshot.timestamp_ms(),
+        }))
     }
 }
 
@@ -503,7 +632,7 @@ impl Forge {
 /// whose properties do not parse as a complete rewrite identity is not lineage
 /// this owner wrote. Both are `None` rather than an error: neither is a reason
 /// to refuse expiry, only a reason not to protect an extra snapshot.
-fn head_lineage_snapshot_id(table: &iceberg::table::Table) -> Option<i64> {
+fn head_lineage_snapshot_id(table: &Table) -> Option<i64> {
     let properties = table
         .metadata()
         .current_snapshot()?
@@ -517,10 +646,11 @@ fn head_lineage_snapshot_id(table: &iceberg::table::Table) -> Option<i64> {
         .map(|rewrite| rewrite.base_snapshot_id)
 }
 
-/// Validates watermark identity/timestamp parity and returns a timestamp cutoff.
+/// Validates that every watermark names a retained snapshot on an approved
+/// head's ancestry, with the timestamp Iceberg records for it.
 ///
-/// Snapshot identifiers are used only for ancestry lookup; ordering is based
-/// exclusively on timestamps so non-monotonic Iceberg IDs remain valid.
+/// Snapshot identifiers are used only for ancestry lookup, so non-monotonic
+/// Iceberg IDs remain valid.
 ///
 /// # Errors
 ///
@@ -534,9 +664,8 @@ pub(super) fn validate_watermarks(
     current_snapshot_id: Option<i64>,
     ref_heads: &[i64],
     watermarks: &[SnapshotWatermark],
-    retention_cutoff_ms: i64,
     traversal_limit: usize,
-) -> Result<i64, ForgeError> {
+) -> Result<(), ForgeError> {
     let by_id = snapshots
         .iter()
         .map(|snapshot| (snapshot.id, *snapshot))
@@ -547,17 +676,15 @@ pub(super) fn validate_watermarks(
     }
     let table_is_empty = snapshots.is_empty() && heads.is_empty();
     if table_is_empty {
-        return watermarks
-            .iter()
-            .try_fold(retention_cutoff_ms, |cutoff, watermark| {
-                if watermark.snapshot_id == 0 && watermark.timestamp_ms == 0 {
-                    Ok(cutoff.min(0))
-                } else {
-                    Err(ForgeError::SnapshotExpiry {
-                        detail: "non-sentinel watermark protects an empty Iceberg table".to_owned(),
-                    })
-                }
-            });
+        return watermarks.iter().try_for_each(|watermark| {
+            if watermark.snapshot_id == 0 && watermark.timestamp_ms == 0 {
+                Ok(())
+            } else {
+                Err(ForgeError::SnapshotExpiry {
+                    detail: "non-sentinel watermark protects an empty Iceberg table".to_owned(),
+                })
+            }
+        });
     }
     if watermarks
         .iter()
@@ -585,10 +712,11 @@ pub(super) fn validate_watermarks(
             // A parent an earlier expiration already removed is where the
             // retained ancestry ends, not a malformed graph: Iceberg leaves the
             // surviving snapshot's `parent_snapshot_id` pointing at the deleted
-            // one. Every snapshot a watermark can still protect is newer than
-            // the cutoff that removed these, so the truncated walk still reaches
-            // all of them, and a watermark below the truncation is caught by the
-            // detached-from-heads refusal below.
+            // one. Every snapshot a watermark protects lies on the chain between
+            // it and a head, which expiration never removed while the watermark
+            // was held, so the truncated walk still reaches all of them, and a
+            // watermark below the truncation is caught by the detached-from-heads
+            // refusal below.
             let Some(snapshot) = by_id.get(&id) else {
                 break;
             };
@@ -601,36 +729,34 @@ pub(super) fn validate_watermarks(
             cursor = snapshot.parent_id;
         }
     }
-    watermarks
-        .iter()
-        .try_fold(retention_cutoff_ms, |cutoff, watermark| {
-            let snapshot =
-                by_id
-                    .get(&watermark.snapshot_id)
-                    .ok_or_else(|| ForgeError::SnapshotExpiry {
-                        detail: format!(
-                            "active Forge watermark snapshot {} is not retained",
-                            watermark.snapshot_id
-                        ),
-                    })?;
-            if !reachable.contains(&watermark.snapshot_id) {
-                return Err(ForgeError::SnapshotExpiry {
+    watermarks.iter().try_for_each(|watermark| {
+        let snapshot =
+            by_id
+                .get(&watermark.snapshot_id)
+                .ok_or_else(|| ForgeError::SnapshotExpiry {
                     detail: format!(
-                        "active Forge watermark snapshot {} is detached from approved heads",
+                        "active Forge watermark snapshot {} is not retained",
                         watermark.snapshot_id
                     ),
-                });
-            }
-            if snapshot.timestamp_ms != watermark.timestamp_ms {
-                return Err(ForgeError::SnapshotExpiry {
-                    detail: format!(
-                        "active Forge watermark {} timestamp does not match Iceberg ancestry",
-                        watermark.snapshot_id
-                    ),
-                });
-            }
-            Ok(cutoff.min(watermark.timestamp_ms))
-        })
+                })?;
+        if !reachable.contains(&watermark.snapshot_id) {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: format!(
+                    "active Forge watermark snapshot {} is detached from approved heads",
+                    watermark.snapshot_id
+                ),
+            });
+        }
+        if snapshot.timestamp_ms != watermark.timestamp_ms {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: format!(
+                    "active Forge watermark {} timestamp does not match Iceberg ancestry",
+                    watermark.snapshot_id
+                ),
+            });
+        }
+        Ok(())
+    })
 }
 
 /// Rejects entry into a new expiry effect after operation authority is cancelled.
@@ -646,28 +772,13 @@ fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
     }
 }
 
-/// Convert a retention duration into the UTC millisecond cutoff used by Iceberg.
-fn expiry_cutoff_ms(now: DateTime<Utc>, retention: Duration) -> Result<i64, ForgeError> {
-    let retention_ms =
-        i64::try_from(retention.as_millis()).map_err(|_| ForgeError::InvalidConfig {
-            detail: "snapshot_retention exceeds an i64 millisecond timestamp".to_owned(),
-        })?;
-    now.timestamp_millis()
-        .checked_sub(retention_ms)
-        .ok_or_else(|| ForgeError::InvalidConfig {
-            detail: "snapshot retention cutoff overflows UTC milliseconds".to_owned(),
-        })
-}
-
 /// Extract snapshot timestamps, parent links, and every metadata reference head.
 ///
 /// # Errors
 ///
 /// Returns snapshot-expiry failure when metadata serialization fails or any
 /// named reference does not carry a resolvable snapshot head.
-fn snapshot_summaries(
-    table: &iceberg::table::Table,
-) -> Result<(Vec<SnapshotSummary>, Vec<i64>), ForgeError> {
+fn snapshot_summaries(table: &Table) -> Result<(Vec<SnapshotSummary>, Vec<i64>), ForgeError> {
     let summaries = table
         .metadata()
         .snapshots()
@@ -704,10 +815,17 @@ fn snapshot_summaries(
 }
 
 /// Build canonical audit detail for a snapshot-expiry selection.
+///
+/// Both id lists are sorted so the derived operation id is stable for the
+/// same selection regardless of discovery order.
+///
+/// # Errors
+/// Returns [`ForgeError::Catalog`] when the table has no metadata location and
+/// [`ForgeError::SnapshotExpiry`] when that location is not a valid storage
+/// path.
 fn expiry_detail(
-    table: &iceberg::table::Table,
+    table: &Table,
     key: &ForgeTableKey,
-    cutoff_ms: i64,
     mut selected_snapshot_ids: Vec<i64>,
     mut retained_ref_heads: Vec<i64>,
 ) -> Result<AuditDetail, ForgeError> {
@@ -722,13 +840,12 @@ fn expiry_detail(
             })
         })?;
     Ok(AuditDetail::ForgeSnapshotExpire {
-        operation_id: expiry_operation_id(key, cutoff_ms, &selected_snapshot_ids),
+        operation_id: expiry_operation_id(key, &base_metadata_location, &selected_snapshot_ids),
         phase: ForgeSnapshotExpirePhase::Prepared,
         group: table_resource_for_key(key),
         base_metadata_location,
         current_snapshot_id: table.metadata().current_snapshot_id(),
         retained_ref_heads,
-        cutoff_ms,
         selected_snapshot_ids,
     })
 }
@@ -743,11 +860,10 @@ fn expiry_detail(
 fn expiry_selection<'detail>(
     detail: &'detail AuditDetail,
     key: &ForgeTableKey,
-) -> Result<(&'detail [i64], i64), ForgeError> {
+) -> Result<&'detail [i64], ForgeError> {
     let AuditDetail::ForgeSnapshotExpire {
         operation_id: _,
         selected_snapshot_ids,
-        cutoff_ms,
         group,
         ..
     } = detail
@@ -766,16 +882,25 @@ fn expiry_selection<'detail>(
             detail: "expiry audit detail is not canonical".to_owned(),
         });
     }
-    Ok((selected_snapshot_ids, *cutoff_ms))
+    Ok(selected_snapshot_ids)
 }
 
 /// Commit an expiry selection after rechecking metadata and the lease fence.
 impl Forge {
     /// Submits the canonical expiry transaction while preserving uncertain acceptance.
     ///
+    /// `exclusive` is the table's live exclusive maintenance authority. The
+    /// borrow keeps every Oracle cut acquisition on this table waiting until
+    /// the caller surrenders it after this commit's outcome is known, so a
+    /// reader either committed before the authority was taken — and no
+    /// authority exists — or observes the post-expiry pointer. `submitted` is
+    /// set immediately before the commit is handed to the catalog, so a caller
+    /// that cuts this future off knows whether acceptance may be unknown.
+    ///
     /// # Errors
     ///
-    /// Returns validation, lease, catalog, traversal, or reconciliation failures.
+    /// Returns validation, authority-coverage, lease, catalog, traversal, or
+    /// reconciliation failures.
     /// Timeout or cancellation after submission returns reconciliation-required
     /// and deliberately leaves the caller's Prepared operation open.
     ///
@@ -786,12 +911,15 @@ impl Forge {
     async fn complete_expiry(
         &self,
         lease: &mut ForgeLease,
-        key: &ForgeTableKey,
-        table: iceberg::table::Table,
-        detail: &AuditDetail,
+        expiry: PreparedExpiry<'_>,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
+        table: Table,
+        submitted: &AtomicBool,
         stop: &CancellationToken,
     ) -> Result<ExpiredFileSet, ForgeError> {
-        let (selected_snapshot_ids, cutoff_ms) = expiry_selection(detail, key)?;
+        let key = expiry.key;
+        super::table_authority::require_covers(exclusive, key.tenant, &key.table_ref)?;
+        let selected_snapshot_ids = expiry_selection(expiry.detail, key)?;
         if !lease.renew(&self.core.operator_pool).await? {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
@@ -805,9 +933,8 @@ impl Forge {
         let tx = Transaction::new(&table);
         let action = tx
             .expire_snapshots()
-            .expire_snapshot_ids(selected_snapshot_ids.iter().copied())
-            .expire_older_than_ms(cutoff_ms)
-            .retain_last(self.core.config.retain_last.max(1));
+            .explicit_ids_only(true)
+            .expire_snapshot_ids(selected_snapshot_ids.iter().copied());
         let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
         lease.require_fence(&self.core.operator_pool).await?;
         if !lease.commit_window_fits(self.core.config.commit_window()) {
@@ -816,7 +943,8 @@ impl Forge {
             });
         }
         require_running(stop)?;
-        let commit = transaction.commit(self.core.catalog.as_ref());
+        submitted.store(true, Ordering::Release);
+        let commit = transaction.commit_once(self.core.catalog.as_ref());
         tokio::pin!(commit);
         let committed = tokio::select! {
             response = tokio::time::timeout(
@@ -861,8 +989,8 @@ impl Forge {
 ///
 /// Returns catalog failures or fails closed when traversal exhausts a bound.
 async fn derive_expired_files(
-    before: &iceberg::table::Table,
-    after: &iceberg::table::Table,
+    before: &Table,
+    after: &Table,
     max_items: usize,
     max_bytes: u64,
     max_candidates: usize,
@@ -913,7 +1041,7 @@ fn validate_expired_files(files: &ExpiredFileSet, max_candidates: usize) -> Resu
 /// # Errors
 ///
 /// Returns invalid configuration when the multiplication overflows.
-fn cleanup_traversal_items(config: &super::compact::ForgeConfig) -> Result<usize, ForgeError> {
+fn cleanup_traversal_items(config: &ForgeConfig) -> Result<usize, ForgeError> {
     config
         .max_gc_candidates_per_batch
         .checked_mul(config.max_retained_snapshots_per_table)
@@ -928,9 +1056,9 @@ fn cleanup_traversal_items(config: &super::compact::ForgeConfig) -> Result<usize
 ///
 /// Returns catalog, traversal-bound, candidate-bound, or configuration failures.
 pub(super) async fn derive_recovered_files(
-    table: &iceberg::table::Table,
+    table: &Table,
     base_metadata_location: &str,
-    config: &super::compact::ForgeConfig,
+    config: &ForgeConfig,
 ) -> Result<ExpiredFileSet, ForgeError> {
     let before = iceberg::spec::TableMetadata::read_from(table.file_io(), base_metadata_location)
         .await
@@ -951,19 +1079,22 @@ pub(super) async fn derive_recovered_files(
 }
 
 /// Check that every selected snapshot is still eligible under current metadata.
-fn selected_ids_are_eligible(
-    table: &iceberg::table::Table,
-    selected: &[i64],
-    cutoff_ms: i64,
-    retain_last: usize,
-) -> Result<bool, ForgeError> {
+///
+/// Recomputes the expirable set from the reloaded table and reports whether
+/// the earlier selection is a subset of it, so a concurrent ref or snapshot
+/// change that protects a selected id aborts the expiry instead of dropping a
+/// now-referenced snapshot.
+///
+/// # Errors
+///
+/// Returns the [`ForgeError`] from summarizing the table's snapshots when its
+/// metadata cannot be read into snapshot summaries and ref heads.
+fn selected_ids_are_eligible(table: &Table, selected: &[i64]) -> Result<bool, ForgeError> {
     let (summaries, ref_heads) = snapshot_summaries(table)?;
     let expected = select_expirable_snapshots(
         &summaries,
         table.metadata().current_snapshot_id(),
         &ref_heads,
-        cutoff_ms,
-        retain_last,
     )
     .into_iter()
     .collect::<HashSet<_>>();
@@ -1026,13 +1157,21 @@ impl Forge {
     /// reconciliation reads that operation by primary key instead of scanning
     /// open operations and matching derived candidates. A selection already
     /// absent from Iceberg is settled `Recovered`. A selection still present is
-    /// retried only after the uncertainty bound has elapsed.
+    /// retried only after the uncertainty bound has elapsed, and only under
+    /// the table's exclusive maintenance authority; while a reader holds the
+    /// table the operation stays Prepared and the pass reports it pending.
     ///
     /// # Errors
     ///
     /// Returns SQL, lease, catalog, traversal, or settlement failures. Anything
     /// that cannot prove acceptance leaves the operation, task, and claims
     /// Prepared and blocks destructive maintenance for this pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the stored detail stops being snapshot-expiry evidence
+    /// between [`expiry_selection`] validating it and the recovered branch
+    /// destructuring it, which the shared borrow makes unreachable.
     async fn reconcile_expiry(
         &self,
         lease: &mut ForgeLease,
@@ -1055,7 +1194,6 @@ impl Forge {
         let detail = state.prepared_detail;
         let AuditDetail::ForgeSnapshotExpire {
             selected_snapshot_ids,
-            cutoff_ms,
             ..
         } = &detail
         else {
@@ -1088,23 +1226,23 @@ impl Forge {
             < self.core.config.uncertainty_bound
         {
             outcome.pending = 1;
-            outcome.destructive_maintenance =
-                super::live_reconcile::DestructiveMaintenance::Blocked;
+            outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
             return Ok(outcome);
-        } else if selected_ids_are_eligible(
-            &table,
-            selected_snapshot_ids,
-            *cutoff_ms,
-            self.core.config.retain_last,
-        )? {
+        } else if selected_ids_are_eligible(&table, selected_snapshot_ids)? {
             ForgeExpirationSettlement::Committed
         } else {
             outcome.unresolved = 1;
-            outcome.destructive_maintenance =
-                super::live_reconcile::DestructiveMaintenance::Blocked;
+            outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
             return Ok(outcome);
         };
-        let expired_files = match settlement {
+        let expiry = PreparedExpiry {
+            key,
+            binding,
+            authority,
+            claim_table: &claim_table,
+            detail: &detail,
+        };
+        let evidence = match settlement {
             ForgeExpirationSettlement::Recovered => {
                 let AuditDetail::ForgeSnapshotExpire {
                     base_metadata_location,
@@ -1113,28 +1251,96 @@ impl Forge {
                 else {
                     unreachable!("detail kind was matched above")
                 };
-                derive_recovered_files(&table, base_metadata_location.as_str(), &self.core.config)
+                let expired_files = derive_recovered_files(
+                    &table,
+                    base_metadata_location.as_str(),
+                    &self.core.config,
+                )
+                .await?;
+                self.settle_expiration(lease, expiry, None, &expired_files, settlement)
                     .await?
             }
             ForgeExpirationSettlement::Committed => {
-                self.complete_expiry(lease, key, table, &detail, stop)
+                let Some(evidence) = self
+                    .retry_committed_expiry(lease, expiry, table, stop)
                     .await?
+                else {
+                    outcome.pending = 1;
+                    outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
+                    return Ok(outcome);
+                };
+                evidence
             }
         };
-        let evidence = self
-            .settle_expiration(
-                binding,
-                &expiration_authority(authority, lease),
-                &claim_table,
-                &detail,
-                &expired_files,
-                settlement,
-            )
-            .await?;
         Self::record_expired_snapshots(&detail);
         outcome.settled_evidence = Some(evidence);
         outcome.recovered = 1;
         Ok(outcome)
+    }
+
+    /// Retries and settles one reconciled expiration under table authority.
+    ///
+    /// A retried commit is destructive exactly like the first one, so it holds
+    /// the same exclusive maintenance authority through its known outcome and
+    /// settles before surrendering it; the lease TTL bounds the hold. A retry
+    /// still running at the bound may have reached the catalog, so its claims
+    /// stay Prepared and keep new cuts off the table for the next pass.
+    ///
+    /// Returns `None`, with nothing destroyed, while any reader holds the
+    /// table; the operation then stays Prepared for a later pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL failures acquiring or committing the authority, every
+    /// failure [`Self::complete_expiry`] or settlement reports, and
+    /// [`ForgeError::Reconciliation`] when the retry outlives the lease bound.
+    async fn retry_committed_expiry(
+        &self,
+        lease: &mut ForgeLease,
+        expiry: PreparedExpiry<'_>,
+        table: Table,
+        stop: &CancellationToken,
+    ) -> Result<Option<ForgeTaskEvidence>, ForgeError> {
+        let key = expiry.key;
+        let mut authority_conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let Some(exclusive) = super::table_authority::TableAuthority::new(&mut authority_conn)
+            .exclusive(key.tenant, &key.table_ref)
+            .await?
+        else {
+            authority_conn.commit().await.map_err(ForgeError::Sql)?;
+            return Ok(None);
+        };
+        let submitted = AtomicBool::new(false);
+        let bounded = tokio::time::timeout(
+            self.core.config.lease_ttl,
+            Box::pin(async {
+                let expired_files = self
+                    .complete_expiry(lease, expiry, &exclusive, table, &submitted, stop)
+                    .await?;
+                self.settle_expiration(
+                    lease,
+                    expiry,
+                    Some(&exclusive),
+                    &expired_files,
+                    ForgeExpirationSettlement::Committed,
+                )
+                .await
+            }),
+        )
+        .await;
+        drop(exclusive);
+        authority_conn.commit().await.map_err(ForgeError::Sql)?;
+        match bounded {
+            Ok(evidence) => evidence.map(Some),
+            Err(_) => Err(ForgeError::Reconciliation {
+                detail: "retried Iceberg snapshot expiry outlived the Forge lease bound".to_owned(),
+            }),
+        }
     }
 
     /// Counts the exact snapshots one settled expiration durably removed.
@@ -1168,7 +1374,7 @@ impl Forge {
     pub(super) async fn expiry_claim_table(
         &self,
         key: &ForgeTableKey,
-        table: &iceberg::table::Table,
+        table: &Table,
     ) -> Result<ForgeClaimTable, ForgeError> {
         let mut conn = self
             .core
@@ -1176,7 +1382,7 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let identity = super::reader_protection::ReaderProtection::new(&mut conn)
+        let identity = super::table_authority::TableAuthority::new(&mut conn)
             .identity(key.tenant, &key.table_ref)
             .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
@@ -1191,26 +1397,35 @@ impl Forge {
 
     /// Opens the atomic preparation transaction that closes before Iceberg.
     ///
+    /// `exclusive` is the caller's live table authority, which it keeps
+    /// holding through the Iceberg commit this preparation precedes.
+    ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the fence, task identity, table
-    /// identity, surviving reader protection, or operation phase refuses the
+    /// identity, authority coverage, or operation phase refuses the
     /// preparation, and [`ForgeError::SnapshotExpiry`] when the detail is not
     /// canonical expiry evidence.
     async fn prepare_expiration(
         &self,
         lease: &ForgeLease,
-        key: &ForgeTableKey,
-        authority: &ExpiryTaskAuthority,
-        table: &ForgeClaimTable,
-        detail: &AuditDetail,
+        expiry: PreparedExpiry<'_>,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
     ) -> Result<(), ForgeError> {
+        let PreparedExpiry {
+            key,
+            authority,
+            claim_table: table,
+            detail,
+            ..
+        } = expiry;
         let resource = expiry_resource(detail)?;
         ForgeOperations::new(resource, ForgeOperationFamily::SnapshotExpire)
             .map_err(ForgeError::Sql)?
             .prepare_snapshot_expiration(
                 &self.core.operator_pool,
                 key.tenant,
+                exclusive,
                 &ForgeExpirationPreparation {
                     authority: &expiration_authority(authority, lease),
                     table,
@@ -1227,6 +1442,10 @@ impl Forge {
     /// Releases an unproven selection so a successor can replan against fresh
     /// reader protection.
     ///
+    /// `exclusive` is the caller's live table authority when it still holds
+    /// it, so the claims are released before any cut can observe them; `None`
+    /// takes the authority row inside the reset transaction.
+    ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the reset preconditions do not match
@@ -1234,18 +1453,24 @@ impl Forge {
     async fn reset_expiration(
         &self,
         lease: &ForgeLease,
-        key: &ForgeTableKey,
-        authority: &ExpiryTaskAuthority,
-        table: &ForgeClaimTable,
-        detail: &AuditDetail,
+        expiry: PreparedExpiry<'_>,
+        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         cause: &ForgeError,
     ) -> Result<(), ForgeError> {
+        let PreparedExpiry {
+            key,
+            authority,
+            claim_table: table,
+            detail,
+            ..
+        } = expiry;
         let resource = expiry_resource(detail)?;
         ForgeOperations::new(resource, ForgeOperationFamily::SnapshotExpire)
             .map_err(ForgeError::Sql)?
             .reset_snapshot_expiration(
                 &self.core.operator_pool,
                 key.tenant,
+                exclusive,
                 &ForgeExpirationResetRequest {
                     authority: &expiration_authority(authority, lease),
                     table,
@@ -1267,10 +1492,13 @@ impl Forge {
     /// Cleanup candidates are derived here and handed to separate cleanup
     /// through task evidence; this owner performs no delete of its own.
     ///
-    /// Tenant and table identity come from `binding`, and the caller projects
-    /// its claimed task and live lease into `authority` before calling, so
-    /// this operation carries exactly the terms the settlement transaction
-    /// verifies and nothing that would have to agree with them.
+    /// Tenant and table identity come from the expiry's binding, and its
+    /// claimed task and the live lease are projected into the settlement
+    /// authority, so this operation carries exactly the terms the settlement
+    /// transaction verifies and nothing that would have to agree with them.
+    /// `exclusive` is the caller's live table authority when it still holds
+    /// it, so the claims are deleted before any cut can observe them; `None`
+    /// takes the authority row inside the settlement transaction.
     ///
     /// # Errors
     ///
@@ -1279,13 +1507,19 @@ impl Forge {
     /// and claims Prepared for exact replay.
     async fn settle_expiration(
         &self,
-        binding: &TenantTableBinding,
-        authority: &ForgeExpirationAuthority,
-        table: &ForgeClaimTable,
-        detail: &AuditDetail,
+        lease: &ForgeLease,
+        expiry: PreparedExpiry<'_>,
+        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         expired_files: &ExpiredFileSet,
         settlement: ForgeExpirationSettlement,
     ) -> Result<ForgeTaskEvidence, ForgeError> {
+        let PreparedExpiry {
+            binding,
+            claim_table: table,
+            detail,
+            ..
+        } = expiry;
+        let authority = &expiration_authority(expiry.authority, lease);
         let committed = self.load_table(&binding.table_ident()).await?;
         let identity = ForgeTaskTableIdentity::new(
             BIFROST_CATALOG_NAME,
@@ -1317,6 +1551,7 @@ impl Forge {
             .settle_snapshot_expiration(
                 &self.core.operator_pool,
                 binding.tenant,
+                exclusive,
                 &ForgeExpirationSettlementRequest {
                     authority,
                     table,
@@ -1381,16 +1616,14 @@ fn expiry_resource(detail: &AuditDetail) -> Result<&str, ForgeError> {
 /// Returns [`ForgeError::SnapshotExpiry`] naming the first field that drifted.
 /// Any error here is definite pre-call drift: no Iceberg mutation has run.
 fn corroborate_expiry(
-    table: &iceberg::table::Table,
+    table: &Table,
     claim_table: &ForgeClaimTable,
     detail: &AuditDetail,
-    retain_last: usize,
 ) -> Result<(), ForgeError> {
     let AuditDetail::ForgeSnapshotExpire {
         base_metadata_location,
         current_snapshot_id,
         retained_ref_heads,
-        cutoff_ms,
         selected_snapshot_ids,
         ..
     } = detail
@@ -1419,7 +1652,7 @@ fn corroborate_expiry(
     if &ref_heads != retained_ref_heads {
         return Err(drift("retained ref heads"));
     }
-    if !selected_ids_are_eligible(table, selected_snapshot_ids, *cutoff_ms, retain_last)? {
+    if !selected_ids_are_eligible(table, selected_snapshot_ids)? {
         return Err(drift("selected snapshots"));
     }
     Ok(())
@@ -1434,7 +1667,6 @@ fn terminal_expiry_detail(detail: &AuditDetail, phase: ForgeSnapshotExpirePhase)
             base_metadata_location,
             current_snapshot_id,
             retained_ref_heads,
-            cutoff_ms,
             selected_snapshot_ids,
             ..
         } => AuditDetail::ForgeSnapshotExpire {
@@ -1444,7 +1676,6 @@ fn terminal_expiry_detail(detail: &AuditDetail, phase: ForgeSnapshotExpirePhase)
             base_metadata_location: base_metadata_location.clone(),
             current_snapshot_id: *current_snapshot_id,
             retained_ref_heads: retained_ref_heads.clone(),
-            cutoff_ms: *cutoff_ms,
             selected_snapshot_ids: selected_snapshot_ids.clone(),
         },
         _ => detail.clone(),
@@ -1500,12 +1731,17 @@ pub(crate) fn table_resource_for_key(key: &ForgeTableKey) -> String {
     )
 }
 
-/// Derive a stable operation ID from the table, cutoff, and sorted snapshot IDs.
-fn expiry_operation_id(key: &ForgeTableKey, cutoff_ms: i64, selected: &[i64]) -> Uuid {
+/// Derive a stable operation ID from the table, the base metadata location the
+/// selection was made against, and the sorted snapshot IDs.
+fn expiry_operation_id(
+    key: &ForgeTableKey,
+    base_metadata_location: &StoragePath,
+    selected: &[i64],
+) -> Uuid {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(table_resource_for_key(key));
-    hasher.update(cutoff_ms.to_be_bytes());
+    hasher.update(base_metadata_location.as_str());
     for id in selected {
         hasher.update(id.to_be_bytes());
     }
@@ -1518,7 +1754,17 @@ fn expiry_operation_id(key: &ForgeTableKey, cutoff_ms: i64, selected: &[i64]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::TableRef;
+    use wyrd_spec::DataTenantId;
 
+    /// Selection skips the current snapshot and every retained reference head.
+    ///
+    /// Only a snapshot no live pointer names is eligible; the current head and a
+    /// branch or tag head must survive expiry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the selection differs from the one unprotected snapshot.
     #[test]
     fn snapshot_selection_never_includes_current_or_retained_head() {
         let snapshots = vec![
@@ -1538,36 +1784,46 @@ mod tests {
                 timestamp_ms: 3,
             },
         ];
-        let selected = select_expirable_snapshots(&snapshots, Some(30), &[], 4, 2);
+        let selected = select_expirable_snapshots(&snapshots, Some(30), &[20]);
         assert_eq!(selected, vec![10]);
     }
 
+    /// Every replaced snapshot is eligible regardless of age or ancestry depth.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any replaced snapshot is withheld from the selection.
     #[test]
-    fn snapshot_selection_uses_timestamp_and_retain_last_not_numeric_id() {
+    fn snapshot_selection_has_no_age_or_depth_retention() {
         let snapshots = vec![
             SnapshotSummary {
                 id: 100,
                 parent_id: None,
-                timestamp_ms: 1,
+                timestamp_ms: i64::MAX - 2,
             },
             SnapshotSummary {
                 id: 2,
                 parent_id: Some(100),
-                timestamp_ms: 2,
+                timestamp_ms: i64::MAX - 1,
             },
             SnapshotSummary {
                 id: 50,
                 parent_id: Some(2),
-                timestamp_ms: 3,
+                timestamp_ms: i64::MAX,
             },
         ];
-        let selected = select_expirable_snapshots(&snapshots, Some(50), &[], 4, 2);
-        assert_eq!(selected, vec![100]);
+        let selected = select_expirable_snapshots(&snapshots, Some(50), &[]);
+        assert_eq!(selected, vec![2, 100]);
     }
 
-    /// Active watermark ordering follows timestamps even when IDs move backward.
+    /// A watermark validates by ancestry even when IDs move backward.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a watermark reachable from the head is rejected because its
+    /// snapshot id is larger than the head's.
     #[test]
-    fn watermark_cutoff_uses_timestamps_not_snapshot_ids() {
+    fn watermark_validation_uses_ancestry_not_snapshot_ids() {
         let snapshots = vec![
             SnapshotSummary {
                 id: 900,
@@ -1584,9 +1840,8 @@ mod tests {
             snapshot_id: 900,
             timestamp_ms: 10,
         }];
-        let cutoff = validate_watermarks(&snapshots, Some(2), &[], &watermarks, 100, 2)
+        validate_watermarks(&snapshots, Some(2), &[], &watermarks, 2)
             .expect("valid non-monotonic watermark");
-        assert_eq!(cutoff, 10);
     }
 
     /// A persisted timestamp mismatch fails closed before expiry selection.
@@ -1605,23 +1860,30 @@ mod tests {
                 snapshot_id: 7,
                 timestamp_ms: 19,
             }],
-            100,
             1,
         )
         .expect_err("mismatched watermark must fail");
         assert!(error.to_string().contains("does not match"));
     }
 
-    /// Stable expiry identities bind an exact ordered selection and cutoff.
+    /// Stable expiry identities bind an exact base and ordered selection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture path is invalid, the same selection derives two
+    /// ids, or a different selection derives the same id.
     #[test]
     fn maintenance_operation_id_is_stable_for_sorted_targets() {
         let key = ForgeTableKey {
             tenant: DataTenantId::new_v7(),
             table_ref: TableRef::new(BifrostNamespace::Traces, "spans"),
         };
-        let left = expiry_operation_id(&key, 10, &[3, 8]);
-        let right = expiry_operation_id(&key, 10, &[3, 8]);
+        let base = StoragePath::new("s3://bucket/t/metadata/00001.metadata.json".to_owned())
+            .expect("test metadata location");
+        let left = expiry_operation_id(&key, &base, &[3, 8]);
+        let right = expiry_operation_id(&key, &base, &[3, 8]);
         assert_eq!(left, right);
+        assert_ne!(left, expiry_operation_id(&key, &base, &[3]));
     }
 
     /// A timestamp-correct sibling cannot authorize expiry from another branch.
@@ -1652,7 +1914,6 @@ mod tests {
                 snapshot_id: 3,
                 timestamp_ms: 30,
             }],
-            100,
             3,
         )
         .expect_err("detached sibling must fail");
@@ -1665,6 +1926,11 @@ mod tests {
     /// every table that has ever expired presents this shape. Truncating the
     /// walk there is what makes the retained ancestry describable at all; a head
     /// that is not retained is a different claim and still fails closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a head with an expired parent is rejected, or an unretained
+    /// head is accepted or refused for another reason.
     #[test]
     fn expired_parent_truncates_ancestry_and_missing_head_fails_closed() {
         let snapshots = vec![SnapshotSummary {
@@ -1672,10 +1938,10 @@ mod tests {
             parent_id: Some(1),
             timestamp_ms: 20,
         }];
-        validate_watermarks(&snapshots, Some(2), &[], &[], 100, 2)
+        validate_watermarks(&snapshots, Some(2), &[], &[], 2)
             .expect("an already-expired parent ends the retained ancestry");
 
-        let error = validate_watermarks(&snapshots, Some(3), &[], &[], 100, 3)
+        let error = validate_watermarks(&snapshots, Some(3), &[], &[], 3)
             .expect_err("an unretained head must fail");
         assert!(error.to_string().contains("missing head snapshot 3"));
     }
@@ -1703,7 +1969,6 @@ mod tests {
                 snapshot_id: 1,
                 timestamp_ms: 10,
             }],
-            100,
             2,
         )
         .expect_err("cycle must fail");
@@ -1726,7 +1991,6 @@ mod tests {
                 snapshot_id: 0,
                 timestamp_ms: 0,
             }],
-            100,
             1,
         )
         .expect_err("sentinel must fail for a non-empty table");
@@ -1734,6 +1998,11 @@ mod tests {
     }
 
     /// Traversal stops at the configured retained-history ceiling.
+    ///
+    /// # Panics
+    ///
+    /// Panics when ancestry deeper than the bound validates or fails for another
+    /// reason.
     #[test]
     fn ancestry_traversal_overflow_fails_closed() {
         let snapshots = vec![
@@ -1748,7 +2017,7 @@ mod tests {
                 timestamp_ms: 20,
             },
         ];
-        let error = validate_watermarks(&snapshots, Some(2), &[], &[], 100, 1)
+        let error = validate_watermarks(&snapshots, Some(2), &[], &[], 1)
             .expect_err("ancestry beyond the bound must fail");
         assert!(error.to_string().contains("traversal bound"));
     }

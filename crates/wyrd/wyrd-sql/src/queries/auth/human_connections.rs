@@ -29,26 +29,26 @@ const LOCK_SLOT_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended(\
      'wyrd.auth_human_connections:' || wyrd.current_tenant()::text, 0))";
 
 /// Reads the tenant's live connections, newest revision first.
-const LIVE_SQL: &str = r#"
+const LIVE_SQL: &str = r"
     SELECT connection_id, data_tenant_id, revision, state, issuer_url, client_id,
            client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
            jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
       FROM wyrd.auth_human_connections
      WHERE removed_at IS NULL
      ORDER BY revision DESC
-"#;
+";
 
 /// Reads the tenant's one live connection in a state.
-const IN_STATE_SQL: &str = r#"
+const IN_STATE_SQL: &str = r"
     SELECT connection_id, data_tenant_id, revision, state, issuer_url, client_id,
            client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
            jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
       FROM wyrd.auth_human_connections
      WHERE state = $1 AND removed_at IS NULL
-"#;
+";
 
 /// Inserts a candidate at one more than the tenant's highest revision ever.
-const INSERT_CANDIDATE_SQL: &str = r#"
+const INSERT_CANDIDATE_SQL: &str = r"
     INSERT INTO wyrd.auth_human_connections (
         connection_id, data_tenant_id, revision, state, issuer_url, client_id,
         client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs)
@@ -58,10 +58,10 @@ const INSERT_CANDIDATE_SQL: &str = r#"
     RETURNING connection_id, data_tenant_id, revision, state, issuer_url, client_id,
            client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
            jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
-"#;
+";
 
 /// Replaces the candidate in place at the next revision, clearing its test.
-const REPLACE_CANDIDATE_SQL: &str = r#"
+const REPLACE_CANDIDATE_SQL: &str = r"
     UPDATE wyrd.auth_human_connections
        SET revision = (SELECT max(revision) + 1 FROM wyrd.auth_human_connections),
            issuer_url = $2, client_id = $3, client_auth = $4, client_secret_enc = $5,
@@ -72,10 +72,10 @@ const REPLACE_CANDIDATE_SQL: &str = r#"
     RETURNING connection_id, data_tenant_id, revision, state, issuer_url, client_id,
            client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
            jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
-"#;
+";
 
 /// Stamps the exact candidate revision tested until a database-clock deadline.
-const STAMP_TESTED_SQL: &str = r#"
+const STAMP_TESTED_SQL: &str = r"
     UPDATE wyrd.auth_human_connections
        SET jwks_uri = $3, tested_revision = revision,
            tested_until = statement_timestamp() + make_interval(secs => $4),
@@ -84,18 +84,18 @@ const STAMP_TESTED_SQL: &str = r#"
     RETURNING connection_id, data_tenant_id, revision, state, issuer_url, client_id,
            client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
            jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
-"#;
+";
 
 /// Retires the Active connection to Inactive.
-const DEACTIVATE_ACTIVE_SQL: &str = r#"
+const DEACTIVATE_ACTIVE_SQL: &str = r"
     UPDATE wyrd.auth_human_connections
        SET state = 'Inactive', updated_at = statement_timestamp()
      WHERE state = 'Active'
     RETURNING connection_id
-"#;
+";
 
 /// Promotes the candidate at a revision whose test stamp is still current.
-const PROMOTE_TESTED_SQL: &str = r#"
+const PROMOTE_TESTED_SQL: &str = r"
     UPDATE wyrd.auth_human_connections
        SET state = 'Active', updated_at = statement_timestamp()
      WHERE state = 'Candidate' AND revision = $1
@@ -104,32 +104,32 @@ const PROMOTE_TESTED_SQL: &str = r#"
     RETURNING connection_id, data_tenant_id, revision, state, issuer_url, client_id,
            client_auth, client_secret_enc, claim_mapping, group_role_map, jwks_ttl_secs,
            jwks_uri, tested_revision, tested_until, removed_at, created_at, updated_at
-"#;
+";
 
 /// Reports whether the candidate at a revision carries an unexpired stamp.
-const TEST_IS_CURRENT_SQL: &str = r#"
+const TEST_IS_CURRENT_SQL: &str = r"
     SELECT EXISTS (
         SELECT 1 FROM wyrd.auth_human_connections
          WHERE state = 'Candidate' AND revision = $1
            AND tested_revision = revision
            AND tested_until > statement_timestamp())
-"#;
+";
 
 /// Reports whether one exact connection revision is the tenant's Active one.
-const IS_ACTIVE_SQL: &str = r#"
+const IS_ACTIVE_SQL: &str = r"
     SELECT EXISTS (
         SELECT 1 FROM wyrd.auth_human_connections
          WHERE connection_id = $1 AND revision = $2
            AND state = 'Active' AND removed_at IS NULL)
-"#;
+";
 
 /// Tombstones one live connection and wipes its secret.
-const REMOVE_SQL: &str = r#"
+const REMOVE_SQL: &str = r"
     UPDATE wyrd.auth_human_connections
        SET state = 'Inactive', client_secret_enc = NULL,
            removed_at = statement_timestamp(), updated_at = statement_timestamp()
      WHERE connection_id = $1 AND removed_at IS NULL
-"#;
+";
 
 /// Column values for a new or replaced candidate connection.
 ///

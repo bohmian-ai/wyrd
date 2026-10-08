@@ -130,8 +130,7 @@ jobs:
             timed gate
           else
             timed check
-            timed check:client-tier
-            timed check:pyo3-scope
+            timed check:deps
             for lane in $CI_LANES; do
               timed "$lane"
             done
@@ -353,7 +352,8 @@ jobs:
           pnpm exec vite --version
 
       - name: Token drift lock
-        run: mise run check:tokens
+        working-directory: crates/wyrd/wyrd-server/wyrd-ui
+        run: node brand/gen-theme.mjs --check
 
   ci-complete:
     name: ci complete

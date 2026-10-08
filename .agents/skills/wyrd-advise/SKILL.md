@@ -103,7 +103,7 @@ grounding guide any necessary repository or upstream follow-up.
 | [Errors](../../../architecture/references/languages/errors.md) | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
 | [Vala architecture](../../../architecture/references/domain/vala-architecture.md) | Broad Vala ownership, Bifrost orientation, or cross-domain choices |
 | [Telemetry observations](../../../architecture/references/domain/telemetry-observations.md) | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
-| [Evaluation](../../../architecture/references/domain/evaluation.md) | Eval Cards, scenarios, judge quality, scoring, or evidence |
+| [Evaluation](../../../architecture/references/domain/evaluation.md) | Eval Verifiers, scenarios, judge quality, scoring, or evidence |
 | [Drift monitoring](../../../architecture/references/domain/drift-monitoring.md) | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
 | [OLAP serving](../../../architecture/references/domain/olap-serving.md) | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
 | [Iceberg](../../../architecture/references/domain/iceberg.md) | Snapshots, catalogs, schemas, partitions, object storage, or compaction |

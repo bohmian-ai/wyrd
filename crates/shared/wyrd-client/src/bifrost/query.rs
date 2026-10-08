@@ -149,7 +149,7 @@ impl From<&BifrostClientError> for WyrdError {
 
 /// Projects one client-tier queue refusal onto its catalog variant.
 ///
-/// Saturation, drain, and payload refusals keep their own `WYRD_CLIENT_*`
+/// Saturation, drain, payload, and configuration refusals keep their own `WYRD_CLIENT_*`
 /// codes so a caller can retry a full queue without parsing error text; a sink
 /// failure is already a catalog error and passes through unchanged.
 fn queue_catalog_error(error: &WyrdQueueError) -> WyrdError {
@@ -161,6 +161,10 @@ fn queue_catalog_error(error: &WyrdQueueError) -> WyrdError {
         }
         WyrdQueueError::FlushTimeout => WyrdError::ClientFlushTimeout { message, details },
         WyrdQueueError::PayloadTooLarge => WyrdError::ClientPayloadTooLarge { message, details },
+        WyrdQueueError::ConfigInvalid { field, reason } => WyrdError::ClientConfigInvalid {
+            message,
+            details: serde_json::json!({ "field": field, "reason": reason }),
+        },
         WyrdQueueError::SchemaParse(detail) => WyrdError::Vala {
             error: BifrostError::SchemaParse {
                 detail: detail.clone(),
@@ -195,7 +199,6 @@ fn terminal_bifrost_error(terminal: &QueryTerminalFrame) -> BifrostError {
             BifrostError::QueryReconciliationInvariant
         }
         Some(QueryTerminalErrorCode::QueryPeerSecurity) => BifrostError::QueryPeerSecurity,
-        Some(QueryTerminalErrorCode::QueryAuditUnavailable) => BifrostError::QueryAuditUnavailable,
         Some(QueryTerminalErrorCode::CatalogUnreachable) => {
             BifrostError::CatalogUnreachable { detail }
         }
@@ -242,10 +245,16 @@ impl QueryClient {
     /// The returned stream owns the HTTP response body. Dropping it stops body
     /// consumption, which propagates cancellation through the transport.
     ///
+    /// # Arguments
+    /// * `request` - The complete query request: SQL, bind values, and deadline.
+    ///
     /// # Errors
     ///
-    /// Returns a contract error before IO when the request is invalid, or a
-    /// transport error when authentication or the HTTP request fails.
+    /// Returns a contract error before IO when the request is invalid —
+    /// `WYRD_VALA_400_QUERY_INVALID_DEADLINE` for an out-of-range deadline and
+    /// `WYRD_VALA_400_QUERY_INVALID_SQL` for empty SQL or a non-finite bind
+    /// value — or a transport error when authentication or the HTTP request
+    /// fails.
     ///
     /// # Cancellation
     ///
@@ -255,16 +264,13 @@ impl QueryClient {
         &self,
         request: &BifrostQueryRequest,
     ) -> Result<QueryResultStream, BifrostClientError> {
-        request.validate().map_err(|error| {
-            BifrostClientError::Transport(WyrdError::Vala {
-                error: BifrostError::QueryInvalidSql {
-                    detail: error.to_string(),
-                },
-            })
-        })?;
+        request
+            .validate()
+            .map_err(|error| BifrostClientError::Transport(error.into()))?;
         let request_id = RequestId::now_v7();
         let response = self
             .client
+            .http
             .request_json_stream_with_id(reqwest::Method::POST, "/v1/query", request, &request_id)
             .await?;
         let deadline_ms = response
@@ -297,6 +303,7 @@ impl QueryClient {
     pub async fn running(&self) -> Result<Vec<RunningQuerySummary>, BifrostClientError> {
         let response: ListRunningQueriesResponse = self
             .client
+            .http
             .request_json::<(), _>(reqwest::Method::GET, "/v1/query/running", None)
             .await?;
         Ok(response.queries)
@@ -307,6 +314,9 @@ impl QueryClient {
     /// Cancelling this future abandons the pending HTTP request without
     /// changing the active query.
     ///
+    /// # Arguments
+    /// * `request_id` - The id of the active query to look up.
+    ///
     /// # Errors
     ///
     /// Returns stable authentication, authorization, not-found, availability, or protocol errors.
@@ -315,6 +325,7 @@ impl QueryClient {
         request_id: &RequestId,
     ) -> Result<RunningQuerySummary, BifrostClientError> {
         self.client
+            .http
             .request_json::<(), _>(
                 reqwest::Method::GET,
                 &format!("/v1/query/{request_id}"),
@@ -329,6 +340,9 @@ impl QueryClient {
     /// Once the server accepts cancellation, cancelling this future does not
     /// reverse the server-side lifecycle transition.
     ///
+    /// # Arguments
+    /// * `request_id` - The id of the active query to cancel.
+    ///
     /// # Errors
     ///
     /// Returns stable authentication, authorization, not-found, availability, or protocol errors.
@@ -337,6 +351,7 @@ impl QueryClient {
         request_id: &RequestId,
     ) -> Result<CancelRunningQueryResponse, BifrostClientError> {
         self.client
+            .http
             .request_json::<(), _>(
                 reqwest::Method::DELETE,
                 &format!("/v1/query/{request_id}"),
@@ -355,6 +370,10 @@ impl QueryClient {
     /// insertable Arrow schema from this rather than from a local table
     /// definition, so no client owns a second copy of the physical contract.
     ///
+    /// # Arguments
+    /// * `namespace` - The table's namespace.
+    /// * `name` - The table's name within `namespace`.
+    ///
     /// # Errors
     ///
     /// Returns stable authentication, authorization, not-found, availability,
@@ -370,6 +389,7 @@ impl QueryClient {
         name: &str,
     ) -> Result<BifrostTableDescription, BifrostClientError> {
         self.client
+            .http
             .request_json::<(), _>(
                 reqwest::Method::GET,
                 &format!("/v1/bifrost/tables/{namespace}/{name}"),
@@ -381,6 +401,10 @@ impl QueryClient {
 
     /// Collects a query while enforcing explicit row and encoded-byte limits.
     ///
+    /// # Arguments
+    /// * `request` - The complete query request: SQL, bind values, and deadline.
+    /// * `limits` - The row and encoded-byte ceilings the collected result must fit.
+    ///
     /// # Errors
     ///
     /// Returns a protocol, Arrow, transport, failed-terminal, incomplete-stream,
@@ -390,6 +414,7 @@ impl QueryClient {
     /// # Cancellation
     ///
     /// Cancelling the future drops the response stream and its HTTP body.
+    #[cfg(feature = "internal")]
     pub async fn collect_bounded(
         &self,
         request: &BifrostQueryRequest,
@@ -646,16 +671,20 @@ enum StreamSettlement {
 }
 
 /// Stable code proving one query is no longer running and needs no settlement.
+#[cfg(feature = "internal")]
 const RUNNING_QUERY_RETIRED_CODE: &str = "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND";
 
 /// Interval between status polls while proving a broken stream was cleaned up.
+#[cfg(feature = "internal")]
 const SETTLEMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Arrow-projecting query stream that preserves terminal metadata.
 pub struct QueryResultStream {
     /// Canonical server-visible request identity available before body polling.
     request_id: RequestId,
-    /// Client reused for the one cancellation and any status proof this stream owes.
+    /// Client reused for the one cancellation and any status proof this stream
+    /// owes; only internal settlement reads it.
+    #[cfg(feature = "internal")]
     client: QueryClient,
     /// Server-pinned absolute deadline bounding every settlement wait.
     deadline_ms: i64,
@@ -681,8 +710,13 @@ impl QueryResultStream {
         client: QueryClient,
         deadline_ms: i64,
     ) -> Self {
+        // Without `internal` nothing settles a stream, so the client it would
+        // settle with is not retained.
+        #[cfg(not(feature = "internal"))]
+        let _ = client;
         Self {
             request_id,
+            #[cfg(feature = "internal")]
             client,
             deadline_ms,
             settlement: StreamSettlement::Healthy,
@@ -743,13 +777,10 @@ impl QueryResultStream {
                             "batch frame contains no record batch".to_owned(),
                         )));
                     };
-                    let rows = match u64::try_from(decoded.num_rows()) {
-                        Ok(rows) => rows,
-                        Err(_) => {
-                            return Err(self.mark_broken(BifrostClientError::Protocol(
-                                "row count does not fit u64".to_owned(),
-                            )));
-                        }
+                    let Ok(rows) = u64::try_from(decoded.num_rows()) else {
+                        return Err(self.mark_broken(BifrostClientError::Protocol(
+                            "row count does not fit u64".to_owned(),
+                        )));
                     };
                     let Some(emitted) = self.emitted_rows.checked_add(rows) else {
                         return Err(self.mark_broken(BifrostClientError::Protocol(
@@ -839,6 +870,9 @@ impl QueryResultStream {
     /// initial schema frame, including when the query produces no batches. A
     /// successful terminal without that schema is rejected as incomplete.
     ///
+    /// # Arguments
+    /// * `limits` - The row and encoded-byte ceilings the collected result must fit.
+    ///
     /// # Errors
     ///
     /// Returns a stream error or [`BifrostClientError::ResultTooLarge`] before
@@ -847,6 +881,7 @@ impl QueryResultStream {
     /// # Cancellation
     ///
     /// Cancelling drops this owned stream and stops response-body consumption.
+    #[cfg(feature = "internal")]
     pub async fn collect_bounded(
         mut self,
         limits: CollectedQueryLimits,
@@ -892,6 +927,7 @@ impl QueryResultStream {
     /// client's obligation to the server, not a second failure to report. A
     /// decode or transport error also means the body can no longer be trusted,
     /// so it downgrades settlement to the status-polling proof before running.
+    #[cfg(feature = "internal")]
     async fn settle_with(&mut self, error: BifrostClientError) -> BifrostClientError {
         let error = self.mark_broken(error);
         self.settle().await;
@@ -912,6 +948,7 @@ impl QueryResultStream {
     /// the deadline passes without proof, that is reported as scrubbed
     /// telemetry rather than raised: the caller's own error is the one that
     /// matters, and the server still owns its cleanup.
+    #[cfg(feature = "internal")]
     pub async fn settle(&mut self) {
         let owed = std::mem::replace(&mut self.settlement, StreamSettlement::Settled);
         match owed {
@@ -940,6 +977,7 @@ impl QueryResultStream {
     /// Returns whether the terminal actually arrived. A drain that hits the
     /// deadline or a late decode failure leaves the caller with no proof, so it
     /// reports `false` and the status poll takes over.
+    #[cfg(feature = "internal")]
     async fn drain_to_terminal(&mut self) -> bool {
         let drained = tokio::time::timeout(self.remaining(), async {
             while let Ok(Some(_)) = self.next_batch().await {}
@@ -959,6 +997,7 @@ impl QueryResultStream {
     /// running, unavailable, a transport failure — means the answer is not in
     /// yet, so the poll simply waits out its fixed interval and asks again
     /// until the deadline retires it.
+    #[cfg(feature = "internal")]
     async fn poll_until_retired(client: QueryClient, request_id: RequestId, deadline_ms: i64) {
         loop {
             let remaining = Self::remaining_until(deadline_ms);
@@ -986,6 +1025,7 @@ impl QueryResultStream {
     ///
     /// The caller's own error is the one that matters and the server still owns
     /// its cleanup, so an unconfirmed settlement is only ever observability.
+    #[cfg(feature = "internal")]
     fn warn_unconfirmed(request_id: &RequestId, deadline_ms: i64) {
         tracing::warn!(
             request_id = %request_id,
@@ -1039,6 +1079,7 @@ impl QueryResultStream {
 
     /// Returns exact length-delimited response bytes received so far.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn encoded_bytes(&self) -> usize {
         self.encoded_bytes
     }
@@ -1106,7 +1147,7 @@ pub struct CollectedQueryResult {
 /// The server tier has its own copy of this state machine in
 /// `vala-bifrost-redux`. Client-tier crates may not depend on the Bifrost
 /// server engine, so the wire contract — not shared code — is what keeps the
-/// two honest, and the journeys in `tests/pg_bifrost_e2e.rs` are what prove it.
+/// two honest, and the journeys in `tests/integration/pg_bifrost_e2e.rs` are what prove it.
 ///
 /// End-of-stream receipt is tracked here rather than delegated to
 /// [`arrow::ipc::reader::StreamDecoder::finish`], which reports success both
@@ -1786,6 +1827,121 @@ mod tests {
         (format!("http://{address}"), seen)
     }
 
+    /// Serves the token exchange and captures the first `POST /v1/query` body.
+    ///
+    /// The query is answered with an empty `503`, so the caller fails fast
+    /// after its request has been fully written; the captured JSON body is the
+    /// proof of exactly what the client put on the wire.
+    fn query_body_server() -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        listener
+            .set_nonblocking(true)
+            .expect("listener converts to tokio");
+        let listener = TcpListener::from_std(listener).expect("listener adopts the runtime");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let sender = Arc::new(std::sync::Mutex::new(Some(sender)));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let sender = Arc::clone(&sender);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 4096];
+                    let (head, body) = loop {
+                        let Ok(read) = socket.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        let text = String::from_utf8_lossy(&request).to_string();
+                        let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break (head.to_owned(), body.to_owned());
+                        }
+                    };
+                    let response = if head.starts_with("POST /auth/token") {
+                        let token = "{\"access_token\":\"test-token\",\"token_type\":\"Bearer\",\"expires_at\":\"2099-01-01T00:00:00Z\"}";
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{token}",
+                            token.len()
+                        )
+                    } else {
+                        if head.starts_with("POST /v1/query ")
+                            && let Some(sender) =
+                                sender.lock().ok().and_then(|mut slot| slot.take())
+                        {
+                            let _ = sender.send(
+                                serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+                            );
+                        }
+                        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_owned()
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    /// `sql(query, params)` sends bind values as ordered typed data.
+    ///
+    /// A parameter holding SQL text must reach the server as one JSON string
+    /// in `params` while `sql` stays byte-for-byte the caller's placeholder
+    /// template, so no client path can splice a value into the statement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the request never reaches the query route, or when the SQL
+    /// text or the ordered params differ from what the caller supplied.
+    #[tokio::test]
+    async fn sql_forwards_bind_values_without_interpolation() {
+        let (base_url, body) = query_body_server();
+        let config = crate::config::ClientConfig {
+            credential: Some(secrecy::SecretString::from("test-key")),
+            http: crate::transport::config::HttpConfig {
+                base_url,
+                timeout_ms: 2_000,
+                ..crate::transport::config::HttpConfig::default()
+            },
+            ..crate::config::ClientConfig::default()
+        };
+        let client = WyrdClient::with_config(config).expect("static config builds a client");
+        let template = "SELECT v FROM t WHERE name = $1 AND n = $2";
+        let injection = "x'); DROP TABLE t; --";
+        let _ = crate::bifrost::Bifrost::query_only(&client)
+            .sql(
+                template,
+                &[
+                    wyrd_spec::vala::api::QueryParam::String(injection.to_owned()),
+                    wyrd_spec::vala::api::QueryParam::Int(7),
+                ],
+            )
+            .await;
+        let body = tokio::time::timeout(std::time::Duration::from_secs(5), body)
+            .await
+            .expect("the query request arrives")
+            .expect("the query body is captured");
+        assert_eq!(
+            body,
+            serde_json::json!({ "sql": template, "params": [injection, 7], "deadline_ms": null })
+        );
+    }
+
     /// A described canonical table builds its insertable Arrow schema directly.
     ///
     /// The three describe classes are exactly what a writer needs: it declares
@@ -2137,10 +2293,6 @@ mod tests {
             (
                 QueryTerminalErrorCode::QueryPeerSecurity,
                 BifrostError::QueryPeerSecurity,
-            ),
-            (
-                QueryTerminalErrorCode::QueryAuditUnavailable,
-                BifrostError::QueryAuditUnavailable,
             ),
             (
                 QueryTerminalErrorCode::CatalogUnreachable,

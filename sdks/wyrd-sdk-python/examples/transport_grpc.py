@@ -7,36 +7,22 @@ Run with:
 from __future__ import annotations
 
 import json
-from typing import Any
-
-
-def secret_env(name: str) -> dict[str, str]:
-    return {"source": "env", "name": name}
-
-
-def without_none(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: without_none(item) for key, item in value.items() if item is not None}
-    return value
 
 
 def main() -> None:
-    grpc = without_none(
-        {
+    transport = {
+        "transport": "grpc",
+        "params": {
             "endpoint": "https://wyrd-ingest.example.com:50051",
             "timeout_ms": 30_000,
-            "auth": secret_env("WYRD_API_KEY"),
             "connect_retries": 3,
-        }
-    )
-    queue = {
-        "transport": {"transport": "grpc", "params": grpc},
-        "flush_max_rows": 10_000,
-        "flush_interval_ms": 5_000,
-        "channel_capacity": 100,
+            "keepalive_interval_ms": 20_000,
+            "keepalive_timeout_ms": 5_000,
+            "max_message_bytes": 4 * 1024 * 1024,
+        },
     }
-    encoded = json.dumps(queue, indent=2, sort_keys=True)
-    assert json.loads(encoded) == queue
+    encoded = json.dumps(transport, indent=2, sort_keys=True)
+    assert json.loads(encoded) == transport
     print(encoded)
 
 

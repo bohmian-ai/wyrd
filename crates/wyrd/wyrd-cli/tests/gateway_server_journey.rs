@@ -113,6 +113,12 @@ fn document(dir: &Path, name: &str, value: &Value) -> String {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the serialized Postgres-backed CLI journey lane"]
 async fn gateway_commands_manage_redacted_tenant_configuration() {
+    // A first attempt at the body gets the source field's shape wrong. The
+    // command refuses it, names the flag and the position, and repeats no part
+    // of the document — the key the administrator just typed included.
+    const MISTYPED: &str = "sk-live-cli-mistyped";
+    const SUBMITTED: &str = "sk-live-cli-submission";
+    const ROTATED: &str = "sk-live-cli-rotation";
     let server = WyrdTestServer::start_bound()
         .await
         .expect("test server starts");
@@ -228,8 +234,6 @@ async fn gateway_commands_manage_redacted_tenant_configuration() {
         })
         .to_string()
     };
-    const SUBMITTED: &str = "sk-live-cli-submission";
-    const ROTATED: &str = "sk-live-cli-rotation";
     let submitted = gateway_stdin(
         &endpoint,
         &token,
@@ -268,10 +272,6 @@ async fn gateway_commands_manage_redacted_tenant_configuration() {
         );
     }
 
-    // A first attempt at the body gets the source field's shape wrong. The
-    // command refuses it, names the flag and the position, and repeats no part
-    // of the document — the key the administrator just typed included.
-    const MISTYPED: &str = "sk-live-cli-mistyped";
     let mistyped = gateway_stdin(
         &endpoint,
         &token,

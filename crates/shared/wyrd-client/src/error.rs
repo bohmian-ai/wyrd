@@ -149,6 +149,10 @@ impl From<WyrdClientError> for WyrdError {
 /// [`WyrdError`] variant. Unknown codes are preserved in
 /// [`WyrdError::UpstreamFailure`]`::details.original_code` so the original
 /// code is never dropped. `pub` so other transport response sinks can reuse it.
+///
+/// # Arguments
+/// * `body` - Decoded problem document; missing `code`, `detail`, or `details` fields default
+///   to empty.
 pub fn from_problem_json(body: &serde_json::Value) -> WyrdError {
     let code = body["code"].as_str().unwrap_or("");
     let message = body["detail"].as_str().unwrap_or("").to_owned();
@@ -166,6 +170,9 @@ pub fn from_problem_json(body: &serde_json::Value) -> WyrdError {
 ///
 /// Falls back to [`WyrdError::Internal`] when the status carries no
 /// `ErrorInfo`.
+///
+/// # Arguments
+/// * `status` - gRPC status whose metadata or details carry the Wyrd error.
 pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
     use wyrd_tonic::tonic_types::StatusExt as _;
 
@@ -267,6 +274,9 @@ fn bifrost_error_from_code(
                 table: table_from_message("compaction target mismatch for table: "),
             }
         }
+        "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH" => BifrostError::CompactionTypeMismatch {
+            table: table_from_message("compaction type mismatch for table: "),
+        },
         "WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET" => {
             let (bytes, table) = message
                 .strip_prefix("invalid compaction target file size ")
@@ -283,6 +293,7 @@ fn bifrost_error_from_code(
                 .unwrap_or(message)
                 .to_owned(),
         },
+        "WYRD_VALA_400_QUERY_INVALID_DEADLINE" => BifrostError::QueryInvalidDeadline,
         "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE" => BifrostError::OracleRoleUnavailable,
         // Ingest backpressure. A caller that cannot see this code cannot tell
         // "the pod is out of WAL space, retry when it drains" from a generic
@@ -294,12 +305,6 @@ fn bifrost_error_from_code(
         "WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE" => {
             BifrostError::RunningQueryControlUnavailable
         }
-        "WYRD_VALA_500_AUDIT_UNAVAILABLE" => BifrostError::AuditUnavailable {
-            detail: message
-                .strip_prefix("audit outbox unavailable: ")
-                .unwrap_or(message)
-                .to_owned(),
-        },
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
         "WYRD_VALA_429_QUERY_QUEUE_FULL" => BifrostError::QueryQueueFull,
         "WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED" => BifrostError::QueryResourcesExhausted,
@@ -317,9 +322,15 @@ fn bifrost_error_from_code(
         }
         "WYRD_VALA_403_QUERY_PEER_SECURITY" => BifrostError::QueryPeerSecurity,
         "WYRD_VALA_403_QUERY_FORBIDDEN" => BifrostError::QueryForbidden,
+        "WYRD_VALA_403_BIFROST_CARD_SCOPE" => BifrostError::CardScopeDenied {
+            card_ref: message
+                .strip_prefix("card_ref outside principal card scope: ")
+                .or_else(|| details.get("card_ref").and_then(serde_json::Value::as_str))
+                .unwrap_or("<unknown>")
+                .to_owned(),
+        },
         "WYRD_VALA_502_QUERY_STREAM_PROTOCOL" => BifrostError::QueryStreamProtocol,
         "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE" => BifrostError::QueryStreamIncomplete,
-        "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE" => BifrostError::QueryAuditUnavailable,
         "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE" => BifrostError::QueryResultTooLarge,
         // The enforced ceiling is configured, not universal. A caller that only
         // learns "too large" cannot resize its batch to fit; it has to guess at
@@ -440,6 +451,11 @@ mod tests {
     }
 
     /// Bifrost-specific codes retain their typed status instead of becoming upstream failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any Bifrost problem code maps to a status or code other than
+    /// the one it carried on the wire.
     #[test]
     fn bifrost_grpc_codes_keep_their_wire_status() {
         let not_found = from_problem_json(&serde_json::json!({
@@ -472,6 +488,21 @@ mod tests {
             "WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH"
         );
 
+        let type_conflict = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH",
+            "detail": "compaction type mismatch for table: vala.datasets.events",
+            "details": {},
+        }));
+        assert_eq!(type_conflict.status(), 409);
+        assert_eq!(
+            type_conflict.code(),
+            "WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH"
+        );
+        assert_eq!(
+            type_conflict.to_string(),
+            "compaction type mismatch for table: vala.datasets.events"
+        );
+
         let schema = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_400_SCHEMA_PARSE",
             "detail": "schema parse failed: too many leaves",
@@ -499,6 +530,29 @@ mod tests {
         }));
         assert_eq!(invalid_sql.status(), 400);
         assert_eq!(invalid_sql.code(), "WYRD_VALA_400_QUERY_INVALID_SQL");
+
+        let invalid_deadline = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_400_QUERY_INVALID_DEADLINE",
+            "detail": "deadline_ms must be an integer between 1 and 4294967295",
+            "details": {},
+        }));
+        assert_eq!(invalid_deadline.status(), 400);
+        assert_eq!(
+            invalid_deadline.code(),
+            "WYRD_VALA_400_QUERY_INVALID_DEADLINE"
+        );
+
+        let card_scope = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+            "detail": "card_ref outside principal card scope: Model/model@1.0.0",
+            "details": {},
+        }));
+        assert_eq!(card_scope.status(), 403);
+        assert_eq!(card_scope.code(), "WYRD_VALA_403_BIFROST_CARD_SCOPE");
+        assert_eq!(
+            card_scope.to_string(),
+            "card_ref outside principal card scope: Model/model@1.0.0"
+        );
 
         let admission = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
@@ -532,7 +586,6 @@ mod tests {
             ("WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND", 404),
             ("WYRD_VALA_409_RUNNING_QUERY_CONFLICT", 409),
             ("WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE", 503),
-            ("WYRD_VALA_500_AUDIT_UNAVAILABLE", 500),
         ] {
             let error = from_problem_json(&serde_json::json!({
                 "code": code,
@@ -667,7 +720,7 @@ mod tests {
             transport: "grpc".to_owned(),
             message: "refused".to_owned(),
         };
-        let _n = WyrdClientError::NoCredentials;
+        let _ = WyrdClientError::NoCredentials;
     }
 
     mod grpc_convergence {

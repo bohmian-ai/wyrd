@@ -1,5 +1,5 @@
-"""Wyrd workspace configuration (wyrd.toml) loader."""
+"""Workspace defaults from ``wyrd.toml``, applied on request with ``apply_defaults``."""
 
-from .._wyrd.config import WyrdConfig
+from .._wyrd.config import ConfigDefaults, WyrdConfig
 
-__all__ = ["WyrdConfig"]
+__all__ = ["ConfigDefaults", "WyrdConfig"]

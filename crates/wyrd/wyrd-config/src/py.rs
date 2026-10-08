@@ -1,6 +1,7 @@
 //! `PyO3` surface for `WyrdConfig`. Opt-in only — the Python SDK never
 //! mutates user-constructed cards implicitly (Q4 in the overview).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
@@ -9,7 +10,7 @@ use pyo3::types::{PyDict, PyType};
 use wyrd_spec::envelope::{CardKind, Metadata};
 use wyrd_spec::error::WyrdError;
 
-use crate::config::WyrdConfig;
+use crate::config::{Defaults, WyrdConfig};
 use crate::error::WyrdConfigError;
 use crate::merge::apply_defaults as core_apply_defaults;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
@@ -28,8 +29,6 @@ impl WyrdConfigPy {
     /// Load `wyrd.toml`.
     #[classmethod]
     #[pyo3(signature = (path=None))]
-    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
-    #[allow(clippy::needless_pass_by_value)]
     fn load(_cls: &Bound<'_, PyType>, path: Option<PathBuf>) -> WyrdPyResult<Self> {
         let cfg = WyrdConfig::load(path.as_deref()).map_err(WyrdPyError::from)?;
         Ok(Self { inner: cfg })
@@ -60,6 +59,12 @@ impl WyrdConfigPy {
         Ok(())
     }
 
+    /// Return the workspace `[defaults]` table as typed values.
+    #[getter]
+    fn defaults(&self) -> ConfigDefaultsPy {
+        ConfigDefaultsPy(self.inner.defaults.clone())
+    }
+
     fn __repr__(&self) -> String {
         let space = self
             .inner
@@ -74,6 +79,43 @@ impl WyrdConfigPy {
             .filter_map(CardKind::native_name)
             .collect();
         format!("WyrdConfig(space='{space}', kinds={kinds:?})")
+    }
+}
+
+/// Python-visible read-only view of the workspace `[defaults]` table.
+///
+/// Kept as a boundary newtype because the deserialized config type must not
+/// carry `PyO3`-generated methods.
+#[pyclass(module = "wyrd.config", name = "ConfigDefaults", frozen)]
+#[derive(Debug)]
+pub struct ConfigDefaultsPy(Defaults);
+
+#[pymethods]
+impl ConfigDefaultsPy {
+    /// Return the default `metadata.space`, or `None` when unset.
+    #[getter]
+    fn space(&self) -> Option<&str> {
+        self.0.space.as_ref().map(wyrd_spec::ids::SpaceName::as_str)
+    }
+
+    /// Return the default labels merged into `metadata.labels`.
+    #[getter]
+    fn labels(&self) -> BTreeMap<String, String> {
+        self.0
+            .labels
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// Return the default annotations merged into `metadata.annotations`.
+    #[getter]
+    fn annotations(&self) -> BTreeMap<String, String> {
+        self.0
+            .annotations
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
     }
 }
 
@@ -144,6 +186,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let config = PyModule::new(py, "config")?;
     wyrd_interfaces::error::register_exceptions(&config)?;
     config.add_class::<WyrdConfigPy>()?;
+    config.add_class::<ConfigDefaultsPy>()?;
     parent.add_submodule(&config)?;
     py.import("sys")?
         .getattr("modules")?

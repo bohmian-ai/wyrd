@@ -362,6 +362,14 @@ impl CommitUncertaintyCatalog {
             .store(true, Ordering::Release);
     }
 
+    /// Lets commits through again once the simulated lost response has been
+    /// reconciled, so later rewrites publish instead of inheriting the fault.
+    pub fn resolve_uncertainty(&self) {
+        self.controls
+            .uncertainty_active
+            .store(false, Ordering::Release);
+    }
+
     /// Pause after the real catalog has accepted one commit.
     pub fn pause_after_commit(&self) {
         self.controls.update_attempts.store(0, Ordering::Release);
@@ -498,6 +506,20 @@ impl CommitUncertaintyCatalog {
         self.controls
             .reject_before_commit
             .store(true, Ordering::Release);
+        self.controls.before_commit_release.notify_waiters();
+    }
+
+    /// Resume the paused commit unchanged, so it delegates to the real catalog.
+    ///
+    /// A journey that parks a commit only to hold the table's state still
+    /// needs that commit to land when it lets go; refusing it instead would
+    /// prove the refusal path, not the held state. Like the other releases,
+    /// this wakes only a caller already parked, so the journey awaits
+    /// [`Self::wait_for_before_commit`] first.
+    pub fn release_paused_before_commit(&self) {
+        self.controls
+            .reject_before_commit
+            .store(false, Ordering::Release);
         self.controls.before_commit_release.notify_waiters();
     }
 }
@@ -923,6 +945,10 @@ impl ForgeObjectStoreControl {
     }
 
     /// Pause after the exact real delete succeeds but before Forge observes its return.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a thread panicked while holding the path lock.
     pub fn pause_after_delete_for_path(&self, path: &str) {
         self.delete_completed.store(false, Ordering::Release);
         *self
@@ -960,6 +986,10 @@ impl ForgeObjectStoreControl {
     }
 
     /// Return the exact paths supplied to real deletes in call order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a thread panicked while holding the delete-path lock.
     #[must_use]
     pub fn delete_paths(&self) -> Vec<String> {
         self.delete_paths
@@ -1084,6 +1114,10 @@ impl ForgeFixture {
     /// The returned owner still executes only through [`Forge::run`] and
     /// `ForgeWorker::run`; the controls observe completion and request a normal
     /// production scheduler wakeup without planning or executing work themselves.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Forge fixture cannot be built.
     #[must_use]
     pub fn context_with_supervision(
         &self,
@@ -1110,6 +1144,10 @@ impl ForgeFixture {
     /// The returned publisher owns the matching production hint inbox. The
     /// observer remains passive; planning and execution still belong to the
     /// production `Forge::run` and `ForgeWorker::run` supervisors.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Forge fixture cannot be built.
     #[must_use]
     pub fn context_with_worker_supervision(
         &self,
@@ -1136,6 +1174,10 @@ impl ForgeFixture {
     ///
     /// This read-only configuration seam lets gated journeys exercise real
     /// filesystem health failures without adding production fault injection.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Forge fixture cannot be built.
     #[must_use]
     pub fn context_with_worker_supervision_and_spill_root(
         &self,
@@ -1174,6 +1216,10 @@ impl ForgeFixture {
     }
 
     /// Build a Forge graph from a constrained process-memory observation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Forge fixture cannot be built.
     #[must_use]
     pub fn context_with_constrained_memory_and_publisher(
         &self,
@@ -1204,6 +1250,10 @@ impl ForgeFixture {
     }
 
     /// Return a read-only snapshot of the shared Bifrost memory parent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the in-memory fixture root cannot be snapshotted.
     #[must_use]
     pub fn memory_snapshot(&self) -> vala_bifrost_redux::resources::ResourceSnapshot {
         self.memory.snapshot().expect("Forge fixture root snapshot")
@@ -1374,7 +1424,7 @@ impl ForgeFixture {
                 object_store,
                 hints: inbox,
                 config,
-                maintenance_interval: std::time::Duration::from_secs(60),
+                maintenance_interval: std::time::Duration::from_mins(1),
                 scheduler_owner: uuid::Uuid::now_v7(),
                 clock: self.forge.clock_for_test(),
                 completion_observer: supervision.completion_observer,
@@ -1504,14 +1554,12 @@ impl ForgeFixture {
 
 /// Return whether a fixture-owned spill directory contains no files.
 fn directory_tree_is_empty(path: &Path) -> bool {
-    std::fs::read_dir(path)
-        .map(|entries| {
-            entries.flatten().all(|entry| {
-                let child = entry.path();
-                child.is_dir() && directory_tree_is_empty(&child)
-            })
+    std::fs::read_dir(path).is_ok_and(|entries| {
+        entries.flatten().all(|entry| {
+            let child = entry.path();
+            child.is_dir() && directory_tree_is_empty(&child)
         })
-        .unwrap_or(false)
+    })
 }
 
 /// Create an Iceberg table, drive a real Scribe append and seal, and age the
@@ -1743,6 +1791,10 @@ async fn age_fixture_files(
 
 /// Create a durable Forge fixture with explicit partition days and an optional
 /// table-specific schema column.
+///
+/// # Panics
+///
+/// Panics if the server was started without Forge.
 pub async fn seed_forge_group_for_tenant_with_schema_and_days(
     server: &WyrdTestServer,
     tenant: DataTenantId,
@@ -1814,7 +1866,6 @@ async fn create_fixture_table(
             user_fields: fields,
             tenant,
             physical_layout: Some(daily_layout_declaration()),
-            audit: None,
         })
         .await
         .expect("production Forge fixture table");

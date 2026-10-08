@@ -1,6 +1,6 @@
 ---
 title: Card kinds
-description: The 15 native card kinds plus External, grouped by domain, with what each declares and its shipping status.
+description: The 15 registrable card kinds plus the non-registrable External discriminator, grouped by domain, with what each declares and its shipping status.
 pillar: wyrd
 group: Concepts
 order: 3
@@ -9,15 +9,20 @@ order: 3
 # Card kinds
 
 A `kind` selects the spec schema a card carries. The envelope is always the same;
-the kind changes the payload, not the ontology. The v1 doctrine defines 15 native
-kinds plus `External` for forward compatibility.
+the kind changes the payload, not the ontology. The v1 doctrine defines 15
+registrable kinds. `External` is a discriminator for foreign schema
+descriptors, not a sixteenth kind you can register.
 
-<Aside title="Three kinds run end-to-end" data-variant="wyrd">
+<Aside title="What runs end-to-end" data-variant="wyrd">
 
 **Data**, **Model**, and **Prompt** are shipped: authored in Python, validated,
-saved, and — for Prompt — resolved by the Skald runtime. Every other kind has an
-authored spec and JSON Schema but no runtime behind it yet. The tables below mark
-each one. See [Cards](/cards/) for per-field reference on the shipped kinds.
+saved, and — for Prompt — resolved by the Skald runtime. The verification kinds
+are also shipped: a **Verifier** with a `drift` or `eval` implementation is
+attached to a subject through a `verified_by` binding, a **Trigger** decides
+when the server runs it, and **Operators** react when a run fails. The other
+kinds have an authored spec and JSON Schema but no runtime behind them yet. The
+tables below mark each one. See [Cards](/cards/) for per-field reference on the
+shipped kinds.
 
 </Aside>
 
@@ -83,7 +88,7 @@ kinds** — declaring one as a registered, versioned card — are spec-only for 
     { header: 'Status' }
   ]}
   rows={[
-    ['Policy', 'CEL rules evaluated at register, deploy, and invoke time.', { text: 'Spec-only', badge: 'warn' }],
+    ['Policy', 'CEL rules evaluated at register time (classify) and deploy time (gate).', { text: 'Spec-only', badge: 'warn' }],
     ['Audit', 'An accountability record of a governed decision.', { text: 'Spec-only', badge: 'warn' }]
   ]}
 />
@@ -97,7 +102,7 @@ kinds** — declaring one as a registered, versioned card — are spec-only for 
     { header: 'Status' }
   ]}
   rows={[
-    ['Verifier', { text: 'One reusable judgment with a <code>drift</code> or <code>eval</code> implementation, bound to a Service, component, or Agent through <code>verified_by</code>.', html: true }, { text: 'Spec-only', badge: 'warn' }],
+    ['Verifier', { text: 'One reusable judgment with a <code>drift</code> or <code>eval</code> implementation, bound to a Service, component, or Agent through <code>verified_by</code>. The server runs continuous Drift and Eval Verifiers.', html: true }, { text: 'Shipped', badge: 'ok' }],
     ['Source', 'A reference to external data Wyrd reads.', { text: 'Spec-only', badge: 'warn' }]
   ]}
 />
@@ -111,17 +116,17 @@ kinds** — declaring one as a registered, versioned card — are spec-only for 
     { header: 'Status' }
   ]}
   rows={[
-    ['Trigger', { text: 'When a bound Verifier runs: <code>schedule</code> (drift) or <code>observations_ready</code> (eval).', html: true }, { text: 'Spec-only', badge: 'warn' }],
-    ['Operator', { text: 'One <code>notify</code> or <code>http</code> reaction to a failed verification.', html: true }, { text: 'Spec-only', badge: 'warn' }]
+    ['Trigger', { text: 'When a bound Verifier runs: <code>schedule</code> (drift) or <code>observations_ready</code> (eval).', html: true }, { text: 'Shipped', badge: 'ok' }],
+    ['Operator', { text: 'One reaction to a failed verification: <code>notify</code> (Slack or PagerDuty) or <code>http</code>. A <code>workflow</code> Operator parses and registers as a Card but cannot yet be attached to <code>on_failure</code>.', html: true }, { text: 'Shipped', badge: 'ok' }]
   ]}
 />
 
 ## External
 
-`External` is the forward-compatibility escape hatch: a typed placeholder for a
-component Wyrd does not natively model as a kind. It exists so a card graph can
-reference something outside the 15 native kinds without inventing a private shape.
-Spec-only.
+`External` is a non-registrable discriminator for foreign schema descriptors:
+it lets a card graph describe something outside the 15 registrable kinds
+without inventing a private shape. It has no spec of its own and cannot be
+registered as a card.
 
 ## Not card kinds
 

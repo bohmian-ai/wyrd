@@ -1,63 +1,79 @@
-"""Boundary tests for the Vala bifrost/observe Python surface."""
+"""Bifrost construction and table configuration, checked before any request."""
 
-from __future__ import annotations
-
+import pyarrow
 import pytest
+from pydantic import BaseModel
+from wyrd import WyrdError
+from wyrd.bifrost import Bifrost, TableConfig
+
+TABLE = "vala.datasets.events"
+TARGET_FILE_SIZE_BYTES = 256 * 1024 * 1024
 
 
-def test_extension_submodules_import():
-    import wyrd._wyrd.bifrost  # noqa: F401
-    import wyrd._wyrd.observe  # noqa: F401
+class Event(BaseModel):
+    id: int
 
 
-def test_bifrost_without_a_resolvable_credential_raises(monkeypatch: pytest.MonkeyPatch):
-    """Constructing with nothing names the failure instead of connecting.
-
-    Every transport argument is optional and resolves through the credential
-    chain, so the only construction failure left is an empty chain — and it must
-    say so through the typed exception rather than a generic error.
-    """
-
-    from wyrd import WyrdError
-    from wyrd.bifrost import Bifrost
-
-    for name in ("WYRD_ACCESS_TOKEN", "WYRD_WORKLOAD_TOKEN", "WYRD_TENANT", "WYRD_API_KEY"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("HOME", "/nonexistent-wyrd-home")
-
+@pytest.mark.usefixtures("no_credentials")
+def test_bifrost_without_a_resolvable_credential_raises() -> None:
     with pytest.raises(WyrdError) as captured:
         Bifrost()
+
     assert captured.value.code == "WYRD_CLIENT_401_NO_CREDENTIALS"
 
 
-def test_producer_key_and_client_scope_are_not_importable():
-    with pytest.raises(ImportError):
-        from wyrd._wyrd.bifrost import ProducerKey  # noqa: F401
-    with pytest.raises(ImportError):
-        from wyrd._wyrd.bifrost import ClientScope  # noqa: F401
+def test_table_config_has_no_compaction_target_by_default() -> None:
+    assert TableConfig(Event, TABLE).compaction_target_file_size_bytes is None
 
 
-def test_table_config_carries_an_optional_compaction_target():
-    """The explicit Forge file target reaches the native config from both doors.
+def test_pydantic_table_config_carries_a_compaction_target() -> None:
+    config = TableConfig(Event, TABLE, compaction_target_file_size_bytes=TARGET_FILE_SIZE_BYTES)
 
-    Omitted, it stays ``None`` so the register request carries no target and the
-    table follows the server's deployment default.
-    """
+    assert config.compaction_target_file_size_bytes == TARGET_FILE_SIZE_BYTES
 
-    import pyarrow
-    from pydantic import BaseModel
-    from wyrd.bifrost import TableConfig
 
-    class Row(BaseModel):
-        id: int
-
-    target = 256 * 1024 * 1024
-    assert TableConfig(Row, "vala.datasets.t").compaction_target_file_size_bytes is None
-    declared = TableConfig(Row, "vala.datasets.t", compaction_target_file_size_bytes=target)
-    assert declared.compaction_target_file_size_bytes == target
-    arrow = TableConfig.from_arrow(
+def test_arrow_table_config_carries_a_compaction_target() -> None:
+    config = TableConfig.from_arrow(
+        TABLE,
         pyarrow.schema([("id", pyarrow.int64())]),
-        "vala.datasets.t",
-        compaction_target_file_size_bytes=target,
+        compaction_target_file_size_bytes=TARGET_FILE_SIZE_BYTES,
     )
-    assert arrow.compaction_target_file_size_bytes == target
+
+    assert config.compaction_target_file_size_bytes == TARGET_FILE_SIZE_BYTES
+
+
+def test_json_schema_table_config_declares_the_same_columns_as_its_model() -> None:
+    schema = {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}
+
+    config = TableConfig.from_json_schema(TABLE, schema)
+
+    assert config.fqn == TABLE
+    assert config.arrow_schema == TableConfig(Event, TABLE).arrow_schema
+
+
+def test_table_config_has_no_compaction_type_by_default() -> None:
+    assert TableConfig(Event, TABLE).compaction_type is None
+
+
+@pytest.mark.parametrize("compaction_type", ["auto", "full", "small-files", "files-with-delete"])
+def test_table_config_carries_a_compaction_type(compaction_type: str) -> None:
+    assert (
+        TableConfig(Event, TABLE, compaction_type=compaction_type).compaction_type
+        == compaction_type
+    )
+
+
+def test_arrow_table_config_carries_a_compaction_type() -> None:
+    config = TableConfig.from_arrow(
+        TABLE, pyarrow.schema([("id", pyarrow.int64())]), compaction_type="files-with-delete"
+    )
+
+    assert config.compaction_type == "files-with-delete"
+
+
+@pytest.mark.parametrize("compaction_type", ["small_files", "files_with_delete"])
+def test_underscore_compaction_type_is_refused(compaction_type: str) -> None:
+    with pytest.raises(WyrdError) as captured:
+        TableConfig(Event, TABLE, compaction_type=compaction_type)
+
+    assert captured.value.code == "WYRD_SPEC_400_VALIDATION"

@@ -33,6 +33,9 @@ pub struct Workflows {
 
 impl Workflows {
     /// Bind the handle to an assembled client.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client every run request is sent through.
     #[must_use]
     pub fn new(client: WyrdClient) -> Self {
         Self { client }
@@ -51,6 +54,9 @@ impl Workflows {
     /// back. The key lives only for this call, so calling `create` again is a
     /// new submission and can start a second run.
     ///
+    /// # Arguments
+    /// * `request` - The Workflow reference, its input, and an optional timeout.
+    ///
     /// # Errors
     /// Returns the server's stable request, permission, resolution,
     /// validation, admission, or idempotency-conflict error, or a transport
@@ -60,17 +66,22 @@ impl Workflows {
         request: &CreateWorkflowRunRequest,
     ) -> Result<WorkflowRun, WyrdError> {
         self.client
+            .http
             .submit_idempotent(Method::POST, WORKFLOW_RUNS, request)
             .await
     }
 
     /// Read the current snapshot of one run.
     ///
+    /// # Arguments
+    /// * `run_id` - The run to read.
+    ///
     /// # Errors
     /// Returns the server's permission or not-found error, or a transport
     /// failure.
     pub async fn get(&self, run_id: &WorkflowRunId) -> Result<WorkflowRun, WyrdError> {
         self.client
+            .http
             .request_json(Method::GET, &run_path(run_id), None::<&()>)
             .await
     }
@@ -85,11 +96,15 @@ impl Workflows {
     /// even though the resulting snapshot is never observed; read the run with
     /// [`Self::get`] to learn its state.
     ///
+    /// # Arguments
+    /// * `run_id` - The run to cancel.
+    ///
     /// # Errors
     /// Returns the server's permission or not-found error, or a transport
     /// failure.
     pub async fn cancel(&self, run_id: &WorkflowRunId) -> Result<WorkflowRun, WyrdError> {
         self.client
+            .http
             .request_json(
                 Method::POST,
                 &format!("{}/cancel", run_path(run_id)),
@@ -102,6 +117,9 @@ impl Workflows {
     ///
     /// Dropping the future stops polling only; it never cancels or resubmits
     /// the server run.
+    ///
+    /// # Arguments
+    /// * `run_id` - The run to poll until it is terminal.
     ///
     /// # Errors
     /// Returns the first error of [`Self::get`].

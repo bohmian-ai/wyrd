@@ -108,13 +108,11 @@ catalog code, so SDK callers keep branching on `code`.
 - Do not ignore `remediation` when it is present.
 - Do not infer error semantics from `detail`; it is instance-specific prose and is not stable across releases.
 
-## Audit failures
+## Audit
 
-Audit denials are decisions, not transport errors. If a write is rejected
-because an audit record could not be committed, the `code` will identify the
-audit step and `remediation` will describe what the agent or operator needs to
-resolve before retrying. This is different from a missing credential or a
-malformed request.
+Audit never refuses a request. A permission denial is reported by its
+authorization code; a failure to record the decision is the server's concern
+and never reaches the caller.
 
 ## Authorization errors
 
@@ -141,7 +139,7 @@ Retries are only safe for idempotent operations. The `code` field is the signal 
 - For `WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID`, send a new non-empty opaque `Idempotency-Key` header.
 - For `WYRD_SPEC_400_DUPLICATE_SUBMISSION`, remove the repeated `(kind, space, name)` submission from the request.
 - For `WYRD_REGISTRY_410_OPERATION_EXPIRED`, start a new registration with a fresh idempotency key.
-- Not retryable: audit failures, authorization errors. These require a corrective action before a retry will succeed.
+- Not retryable: authorization errors. These require a corrective action before a retry will succeed.
 
 If a Problem Details response does not include a `code`, treat the operation as non-retryable until the cause is identified. OAuth endpoint refusals are covered by their `error` value above.
 

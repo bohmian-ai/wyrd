@@ -1,0 +1,12 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: latency-watch
+  version: 1.0.0
+  space: default
+spec:
+  verified_by:
+    - verifier: ./latency-shift.yaml
+      runs_on: ./daily.yaml
+      on_failure:
+        - ./alert-on-call.yaml

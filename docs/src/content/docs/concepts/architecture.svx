@@ -46,8 +46,9 @@ the envelope, `CardRef`, relationships, status, and version:
 - **Registry** stores and validates cards, derives relationships, and manages
   version and space isolation.
 - **Lineage** reads those derived relationships to answer provenance queries.
-- **Policy** evaluates CEL rules at three points: register-time (classify),
-  deploy-time (gate), and runtime (invoke).
+- **Policy** evaluates CEL rules at two points: register-time (classify) and
+  deploy-time (gate). There is no runtime invoke gate; whether a principal may
+  call a route is an RBAC permission check.
 - **Observability / Bifrost** records runs and observations; external data enters
   through `Source` cards rather than a bespoke connector.
 

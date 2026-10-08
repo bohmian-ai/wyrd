@@ -13,7 +13,7 @@ use skald_spec::wire::google_generate::{
     GoogleFileData, GoogleFunctionCall, GoogleFunctionCallingConfig, GoogleFunctionDeclaration,
     GoogleFunctionResponse, GoogleGenerateContentRequest, GoogleGenerateContentResponse,
     GoogleGenerationConfig, GoogleInlineData, GooglePart, GoogleSafetyRating, GoogleSafetySetting,
-    GoogleThinkingConfig, GoogleTool, GoogleToolConfig, GoogleUsageMetadata,
+    GoogleThinkingConfig, GoogleTool, GoogleUsageMetadata,
 };
 use skald_spec::{ProviderRequest, ProviderResponse};
 use wyrd_utils::py::WyrdPyResult;
@@ -38,6 +38,7 @@ fn google_response(arc: &Arc<ProviderResponse>) -> &GoogleGenerateContentRespons
     }
 }
 
+/// Read-only view of a Gemini `GenerateContent` request.
 #[pyclass(module = "wyrd.prompt", name = "GeminiRequest")]
 pub struct PyGeminiRequest {
     pub(crate) inner: Arc<ProviderRequest>,
@@ -49,6 +50,7 @@ impl PyGeminiRequest {
 }
 #[pymethods]
 impl PyGeminiRequest {
+    /// The `contents` turns, in order.
     #[getter]
     fn contents(&self) -> Vec<PyGoogleContent> {
         let n = google_request(&self.inner).contents.len();
@@ -97,10 +99,12 @@ impl PyGoogleContent {
 }
 #[pymethods]
 impl PyGoogleContent {
+    /// The turn `role`, such as `"user"`, `"model"`, or `"function"`.
     #[getter]
     fn role(&self) -> &str {
         &self.c().role
     }
+    /// The turn `parts`.
     #[getter]
     fn parts(&self) -> Vec<PyGooglePart> {
         let n = self.c().parts.len();
@@ -117,6 +121,7 @@ impl PyGoogleContent {
     }
 }
 
+/// One part of a Gemini or Vertex content turn.
 #[pyclass(module = "wyrd.prompt", name = "GooglePart")]
 pub struct PyGooglePart {
     inner: Arc<ProviderRequest>,
@@ -136,6 +141,10 @@ impl PyGooglePart {
 }
 #[pymethods]
 impl PyGooglePart {
+    /// The part variant.
+    ///
+    /// One of `"text"`, `"inline_data"`, `"file_data"`, `"function_call"`, `"function_response"`,
+    /// `"thought"`, `"executable_code"`, or `"code_execution_result"`.
     #[getter]
     fn kind(&self) -> &'static str {
         match self.p() {
@@ -149,6 +158,10 @@ impl PyGooglePart {
             GooglePart::CodeExecutionResult { .. } => "code_execution_result",
         }
     }
+    /// Return the `text` of a `"text"` part.
+    ///
+    /// # Errors
+    /// Returns `WYRD_PROMPT_400_PROVIDER_MISMATCH` when this value is another variant.
     fn as_text(&self) -> WyrdPyResult<String> {
         match self.p() {
             GooglePart::Text { text } => Ok(text.clone()),
@@ -574,15 +587,6 @@ impl PyGoogleFunctionDeclaration {
 pub struct PyGoogleToolConfig {
     inner: Arc<ProviderRequest>,
 }
-impl PyGoogleToolConfig {
-    #[allow(dead_code)]
-    fn c(&self) -> &GoogleToolConfig {
-        google_request(&self.inner)
-            .tool_config
-            .as_ref()
-            .expect("guarded")
-    }
-}
 #[pymethods]
 impl PyGoogleToolConfig {
     #[getter]
@@ -626,6 +630,7 @@ impl PyGoogleFunctionCallingConfig {
 
 // Google response
 
+/// Read-only view of a Gemini `GenerateContent` response.
 #[pyclass(module = "wyrd.prompt", name = "GeminiResponse")]
 pub struct PyGeminiResponse {
     inner: Arc<ProviderResponse>,
@@ -637,6 +642,7 @@ impl PyGeminiResponse {
 }
 #[pymethods]
 impl PyGeminiResponse {
+    /// The `candidates` list.
     #[getter]
     fn candidates(&self) -> Vec<PyGoogleCandidate> {
         let n = google_response(&self.inner).candidates.len();
@@ -647,6 +653,7 @@ impl PyGeminiResponse {
             })
             .collect()
     }
+    /// The `usageMetadata` token counts, or `None` when omitted.
     #[getter]
     fn usage_metadata(&self) -> Option<PyGoogleUsageMetadata> {
         google_response(&self.inner)
@@ -677,6 +684,11 @@ impl PyGoogleCandidate {
 }
 #[pymethods]
 impl PyGoogleCandidate {
+    /// The `finishReason`, lowercased.
+    ///
+    /// One of `"stop"`, `"max_tokens"`, `"safety"`, `"recitation"`, `"language"`, `"other"`,
+    /// `"blocklist"`, `"prohibited_content"`, `"spii"`, `"malformed_function_call"`, or
+    /// `"unspecified"`.
     #[getter]
     fn finish_reason(&self) -> Option<&'static str> {
         use skald_spec::wire::google_generate::GoogleFinishReason;
@@ -694,6 +706,7 @@ impl PyGoogleCandidate {
             GoogleFinishReason::FinishReasonUnspecified => "unspecified",
         })
     }
+    /// The candidate `index`.
     #[getter]
     fn index(&self) -> Option<u32> {
         self.c().index
@@ -718,6 +731,7 @@ impl PyGoogleCandidate {
     }
 }
 
+/// The `usageMetadata` of a Gemini or Vertex response.
 #[pyclass(module = "wyrd.prompt", name = "GoogleUsageMetadata")]
 pub struct PyGoogleUsageMetadata {
     inner: Arc<ProviderResponse>,
@@ -732,14 +746,17 @@ impl PyGoogleUsageMetadata {
 }
 #[pymethods]
 impl PyGoogleUsageMetadata {
+    /// The `promptTokenCount`.
     #[getter]
     fn prompt_token_count(&self) -> u64 {
         self.u().prompt_token_count
     }
+    /// The `candidatesTokenCount` across all candidates.
     #[getter]
     fn candidates_token_count(&self) -> u64 {
         self.u().candidates_token_count
     }
+    /// The `totalTokenCount`.
     #[getter]
     fn total_token_count(&self) -> u64 {
         self.u().total_token_count

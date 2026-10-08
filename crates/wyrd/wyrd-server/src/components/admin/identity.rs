@@ -3,9 +3,9 @@
 //! Thin HTTP adapters over [`HumanConnections`], the one owner of a tenant's
 //! human login trust. The tenant is always the bearer's tenant; no route takes
 //! a tenant identifier. Every route requires `identity_connections:write`, and
-//! its verdict is audited before any provider IO or store read: a denial is
-//! recorded standalone and refused, and the allowed decision is appended in the
-//! same tenant transaction as the state change it authorizes. A refused caller
+//! its verdict is staged on the process audit outbox before any provider IO or
+//! store read: a denial is staged and refused, and the allowed decision is
+//! staged before the state change it authorizes. A refused caller
 //! therefore sees neither connection metadata nor secrets, and no secret ever
 //! appears in a response, error, log, or audit row.
 
@@ -60,9 +60,8 @@ fn connections(state: &AppState) -> Result<&HumanConnections, WyrdErrorResponse>
 /// Evaluate `identity_connections:write` for `operation`, recording a denial.
 ///
 /// # Errors
-/// Returns the RBAC denial (already audited) and `AuditUnavailable` when the
-/// denial cannot be recorded.
-async fn decide(
+/// Returns the RBAC denial (already staged for audit).
+fn decide(
     state: &AppState,
     caller: &Caller,
     operation: &str,
@@ -74,27 +73,23 @@ async fn decide(
         operation,
         RESOURCE,
     )
-    .await
     .map_err(WyrdErrorResponse::from)
 }
 
-/// Commit an allowed decision standalone and return `refusal`.
+/// Stage an allowed decision on the audit outbox and return `refusal`.
 ///
 /// Used when a request is refused after authorization but before any tenant
-/// transaction exists (an invalid body), so the allowance is still durable.
+/// transaction exists (an invalid body), so the allowance is still recorded.
 ///
 /// # Errors
-/// Always returns an error: `refusal`, or `AuditUnavailable` when the decision
-/// cannot be recorded.
-async fn refuse_after_decision<T>(
+/// Always returns `refusal`.
+fn refuse_after_decision<T>(
     state: &AppState,
     caller: &Caller,
-    decision: &AuditEvent,
+    decision: AuditEvent,
     refusal: WyrdError,
 ) -> Result<T, WyrdErrorResponse> {
-    audit::record_audit(state.postgres.vala(), caller.data_tenant_id, decision)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
     Err(WyrdErrorResponse::from(refusal))
 }
 
@@ -103,7 +98,7 @@ async fn refuse_after_decision<T>(
 ///
 /// # Errors
 /// Returns `403` without `identity_connections:write`, and `503` when the store is
-/// unavailable or the decision cannot be audited.
+/// unavailable.
 #[utoipa::path(
     get,
     path = "/identity/oidc/connections",
@@ -117,8 +112,8 @@ async fn refuse_after_decision<T>(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 500, description = "A stored row did not decode (WYRD_SPEC_500_INTERNAL)",
          body = WyrdProblem),
-        (status = 503, description = "The store is unavailable or the decision could not be \
-          audited (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)",
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
          body = WyrdProblem)
     ),
     tag = "Identity"
@@ -128,7 +123,7 @@ async fn list_connections(
     State(state): State<AppState>,
     caller: Caller,
 ) -> Result<Json<HumanConnectionsResponse>, WyrdErrorResponse> {
-    let decision = decide(&state, &caller, "identity.oidc.connections.list").await?;
+    let decision = decide(&state, &caller, "identity.oidc.connections.list")?;
     connections(&state)?
         .list(caller.data_tenant_id, &decision)
         .await
@@ -150,7 +145,7 @@ async fn list_connections(
 /// Returns `400` for invalid input, a missing public origin, or an unsupported
 /// client authentication method, `403` without `identity_connections:write`,
 /// `409` for a stale `expected_revision`, and `503` when the store is
-/// unavailable or the decision cannot be audited.
+/// unavailable.
 #[utoipa::path(
     put,
     path = "/identity/oidc/candidate",
@@ -170,8 +165,8 @@ async fn list_connections(
           (WYRD_AUTH_409_CONNECTION_CONFLICT)", body = WyrdProblem),
         (status = 500, description = "An unexpected server failure (WYRD_SPEC_500_INTERNAL)",
          body = WyrdProblem),
-        (status = 503, description = "The store is unavailable or the decision could not be \
-          audited (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)",
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
          body = WyrdProblem)
     ),
     tag = "Identity"
@@ -182,11 +177,11 @@ async fn put_candidate(
     caller: Caller,
     body: Bytes,
 ) -> Result<Json<HumanConnectionView>, WyrdErrorResponse> {
-    let decision = decide(&state, &caller, "identity.oidc.candidate.put").await?;
+    let decision = decide(&state, &caller, "identity.oidc.candidate.put")?;
     let owner = connections(&state)?;
     let staged = match ConnectionInput::from_slice(&body).and_then(|input| owner.stage(input)) {
         Ok(staged) => staged,
-        Err(refusal) => return refuse_after_decision(&state, &caller, &decision, refusal).await,
+        Err(refusal) => return refuse_after_decision(&state, &caller, decision, refusal),
     };
     owner
         .put_candidate(caller.data_tenant_id, staged, &decision)
@@ -214,7 +209,7 @@ async fn put_candidate(
 /// without `identity_connections:write`, `409` for a stale revision
 /// (`CONNECTION_CONFLICT`) or a failed check (`CONNECTION_NOT_TESTED`), and
 /// `503` when the provider is refused by address screening or unavailable, the
-/// store is unavailable, or the decision cannot be audited.
+/// store is unavailable.
 #[utoipa::path(
     post,
     path = "/identity/oidc/candidate/test",
@@ -236,9 +231,8 @@ async fn put_candidate(
         (status = 500, description = "An unexpected server failure (WYRD_SPEC_500_INTERNAL)",
          body = WyrdProblem),
         (status = 503, description = "The provider is refused by address screening or \
-          unavailable, the store is unavailable, or the decision could not be audited \
-          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, \
-          WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)",
+          unavailable, or the store is unavailable \
+          (WYRD_AUTH_503_DISCOVERY_UNAVAILABLE, WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
          body = WyrdProblem)
     ),
     tag = "Identity"
@@ -249,10 +243,8 @@ async fn test_candidate(
     caller: Caller,
     Json(request): Json<ConnectionTestRequest>,
 ) -> Result<Json<ConnectionTestResponse>, WyrdErrorResponse> {
-    let decision = decide(&state, &caller, "identity.oidc.candidate.test").await?;
-    audit::record_audit(state.postgres.vala(), caller.data_tenant_id, &decision)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
+    let decision = decide(&state, &caller, "identity.oidc.candidate.test")?;
+    state.audit_outbox.stage(caller.data_tenant_id, decision);
     let tester = ConnectionTester {
         principal_id: caller.principal.id,
         principal_kind: caller.principal.kind.tag(),
@@ -276,7 +268,7 @@ async fn test_candidate(
 /// Returns `403` without `identity_connections:write`, `409` for a stale
 /// revision or invalid recovery key (`CONNECTION_CONFLICT`) or a missing or
 /// expired test (`CONNECTION_NOT_TESTED`), and `503` when the store is
-/// unavailable or the decision cannot be audited.
+/// unavailable.
 #[utoipa::path(
     post,
     path = "/identity/oidc/candidate/activate",
@@ -294,8 +286,8 @@ async fn test_candidate(
           (WYRD_AUTH_409_CONNECTION_NOT_TESTED)", body = WyrdProblem),
         (status = 500, description = "An unexpected server failure (WYRD_SPEC_500_INTERNAL)",
          body = WyrdProblem),
-        (status = 503, description = "The store is unavailable or the decision could not be \
-          audited (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)",
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
          body = WyrdProblem)
     ),
     tag = "Identity"
@@ -306,7 +298,7 @@ async fn activate_candidate(
     caller: Caller,
     Json(request): Json<ConnectionActivate>,
 ) -> Result<Json<HumanConnectionView>, WyrdErrorResponse> {
-    let decision = decide(&state, &caller, "identity.oidc.candidate.activate").await?;
+    let decision = decide(&state, &caller, "identity.oidc.candidate.activate")?;
     connections(&state)?
         .activate(caller.data_tenant_id, request, &decision)
         .await
@@ -319,8 +311,7 @@ async fn activate_candidate(
 ///
 /// # Errors
 /// Returns `403` without `identity_connections:write`, `404` when no Active
-/// connection exists, and `503` when the store is unavailable
-/// or the decision cannot be audited.
+/// connection exists, and `503` when the store is unavailable.
 #[utoipa::path(
     post,
     path = "/identity/oidc/active/deactivate",
@@ -335,8 +326,8 @@ async fn activate_candidate(
           (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "An unexpected server failure (WYRD_SPEC_500_INTERNAL)",
          body = WyrdProblem),
-        (status = 503, description = "The store is unavailable or the decision could not be \
-          audited (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)",
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
          body = WyrdProblem)
     ),
     tag = "Identity"
@@ -346,7 +337,7 @@ async fn deactivate_active(
     State(state): State<AppState>,
     caller: Caller,
 ) -> Result<StatusCode, WyrdErrorResponse> {
-    let decision = decide(&state, &caller, "identity.oidc.active.deactivate").await?;
+    let decision = decide(&state, &caller, "identity.oidc.active.deactivate")?;
     connections(&state)?
         .deactivate(caller.data_tenant_id, &decision)
         .await
@@ -360,7 +351,7 @@ async fn deactivate_active(
 /// # Errors
 /// Returns `403` without `identity_connections:write`, `404` when this tenant
 /// has no live connection with `id`, and `503` when the store is
-/// unavailable or the decision cannot be audited.
+/// unavailable.
 #[utoipa::path(
     delete,
     path = "/identity/oidc/connections/{id}",
@@ -376,8 +367,8 @@ async fn deactivate_active(
           (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
         (status = 500, description = "An unexpected server failure (WYRD_SPEC_500_INTERNAL)",
          body = WyrdProblem),
-        (status = 503, description = "The store is unavailable or the decision could not be \
-          audited (WYRD_AUTH_503_VERIFY_UNAVAILABLE, WYRD_AUDIT_503_UNAVAILABLE)",
+        (status = 503, description = "The store is unavailable \
+          (WYRD_AUTH_503_VERIFY_UNAVAILABLE)",
          body = WyrdProblem)
     ),
     tag = "Identity"
@@ -388,7 +379,7 @@ async fn remove_connection(
     caller: Caller,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, WyrdErrorResponse> {
-    let decision = decide(&state, &caller, "identity.oidc.connection.remove").await?;
+    let decision = decide(&state, &caller, "identity.oidc.connection.remove")?;
     connections(&state)?
         .remove(caller.data_tenant_id, id, &decision)
         .await
@@ -501,25 +492,28 @@ mod pg_tests {
         std::fs::create_dir_all(&root).expect("storage root creates");
         let signer = LocalSigner::new(root).expect("local signer creates");
         let origin = Url::parse(PUBLIC_ORIGIN).expect("origin parses");
-        test_app_state(
+        let state = test_app_state(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             test_catalog().await,
-        )
-        .with_auth(ServerAuth {
-            human_connections: Some(HumanConnections::new(
-                fixture.wyrd_postgres().clone(),
-                Some(Arc::new(SealingKeyring::new(SecretKey::from_bytes(
-                    [7_u8; 32],
-                )))),
-                ScreenedHttp::allowing_internal(),
-                Some(&origin),
-            )),
-            ..ServerAuth::default()
-        })
-        .with_authz(ServerAuthz {
-            permission_check: check,
-        })
+        );
+        let audit = Arc::clone(&state.audit_outbox);
+        state
+            .with_auth(ServerAuth {
+                human_connections: Some(HumanConnections::new(
+                    fixture.wyrd_postgres().clone(),
+                    Some(Arc::new(SealingKeyring::new(SecretKey::from_bytes(
+                        [7_u8; 32],
+                    )))),
+                    ScreenedHttp::allowing_internal(),
+                    Some(&origin),
+                    audit,
+                )),
+                ..ServerAuth::default()
+            })
+            .with_authz(ServerAuthz {
+                permission_check: check,
+            })
     }
 
     /// A caller of `tenant`; the injected check, not its grants, decides.
@@ -573,11 +567,22 @@ mod pg_tests {
             .expect("candidate is staged");
     }
 
-    /// Count staged `(outcome)` decisions for `operation`.
+    /// Count staged `(outcome)` decisions for `operation` once everything
+    /// `state` staged on its audit outbox is committed.
     ///
     /// # Panics
-    /// Panics when the staging read fails.
-    async fn decisions(fixture: &PgFixture, operation: &str) -> Vec<(String, i64)> {
+    /// Panics when the outbox does not settle or the staging read fails.
+    async fn decisions(
+        state: &AppState,
+        fixture: &PgFixture,
+        operation: &str,
+    ) -> Vec<(String, i64)> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            state.audit_outbox.settle(deadline).await,
+            0,
+            "audit settles"
+        );
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let rows = sqlx::query_as(
             "SELECT outcome, count(*) FROM vala.audit_staging \
@@ -627,7 +632,7 @@ mod pg_tests {
         stage_candidate(&state, tenant, &provider).await;
 
         let Json(begun) = test_candidate(
-            State(state),
+            State(state.clone()),
             caller(tenant),
             Json(ConnectionTestRequest {
                 expected_revision: 1,
@@ -666,7 +671,7 @@ mod pg_tests {
         );
         assert_eq!(check.evaluations.load(Ordering::SeqCst), 1);
         assert_eq!(
-            decisions(&fixture, "identity.oidc.candidate.test").await,
+            decisions(&state, &fixture, "identity.oidc.candidate.test").await,
             vec![("allowed".to_owned(), 1)]
         );
         assert_eq!(stamp(&fixture).await, (None, false));
@@ -693,7 +698,7 @@ mod pg_tests {
         )
         .await;
         let refused = put_candidate(
-            State(denied),
+            State(denied.clone()),
             caller(tenant),
             Bytes::from_static(b"{not json"),
         )
@@ -701,7 +706,7 @@ mod pg_tests {
         .expect_err("an unauthorized caller is refused");
         assert_eq!(refused.0.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
         assert_eq!(
-            decisions(&fixture, "identity.oidc.candidate.put").await,
+            decisions(&denied, &fixture, "identity.oidc.candidate.put").await,
             vec![("denied".to_owned(), 1)]
         );
 
@@ -735,7 +740,7 @@ mod pg_tests {
         );
 
         let Json(staged) = put_candidate(
-            State(state),
+            State(state.clone()),
             caller(tenant),
             candidate_body("https://idp.example.com", "Public"),
         )
@@ -743,7 +748,7 @@ mod pg_tests {
         .expect("a valid body stages");
         assert_eq!(staged.revision, 1);
         assert_eq!(
-            decisions(&fixture, "identity.oidc.candidate.put").await,
+            decisions(&state, &fixture, "identity.oidc.candidate.put").await,
             vec![("allowed".to_owned(), 3), ("denied".to_owned(), 1)]
         );
     }

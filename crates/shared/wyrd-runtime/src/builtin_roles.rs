@@ -2,39 +2,8 @@
 
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{BifrostPermissionScope, BifrostTableScope, PermissionScope};
 
-use crate::permission::{Action, Permission, Resource};
-
-/// Informational Role name carried only by the gateway capture principal's tokens.
-///
-/// It has no `wyrd.auth_roles` row and grants nothing on its own: the token's
-/// authority is its signed `permissions` claim, built per tenant from
-/// [`gateway_capture_permissions`], so it is not listed in [`BUILTIN_ROLES`]
-/// and never appears in a tenant's role listing.
-pub const GATEWAY_CAPTURE_ROLE: &str = "gateway_capture";
-
-/// Builds the exact `gateway_capture` grants for one tenant's capture destinations.
-///
-/// Each grant is `BifrostRecord` `Write` scoped to one resolved table UID, so
-/// the Role reaches `vala.gateway.calls` and `vala.traces.spans` and nothing
-/// else, including a same-named table recreated under a new UID.
-#[must_use]
-pub fn gateway_capture_permissions(calls_uid: Uuid, spans_uid: Uuid) -> [Permission; 2] {
-    let table_write = |schema: &str, table_uid| Permission {
-        resource: Resource::BifrostRecord,
-        action: Action::Write,
-        scope: PermissionScope::Bifrost(BifrostPermissionScope::Table(BifrostTableScope {
-            catalog: "vala".to_owned(),
-            schema: schema.to_owned(),
-            table_uid,
-        })),
-    };
-    [
-        table_write("gateway", calls_uid),
-        table_write("traces", spans_uid),
-    ]
-}
+use crate::permission::Permission;
 
 /// Fixed namespace for deterministic per-tenant builtin role IDs.
 pub const NS_BUILTIN_ROLE: Uuid = Uuid::from_u128(0x6ad8_2377_3a8f_5f42_9d17_a9f5_5b1c_5c63);
@@ -91,7 +60,35 @@ pub const BUILTIN_ROLES: &[BuiltinRole] = &[
         name: "runtime_admin",
         permissions: &[Permission::service_accounts_write()],
     },
+    BuiltinRole {
+        name: "workload",
+        permissions: &[
+            Permission::bifrost_table_read(),
+            Permission::bifrost_record_write(),
+            Permission::bifrost_query_read(),
+        ],
+    },
+    BuiltinRole {
+        name: DEFAULT_CARD_ROLE,
+        permissions: &[
+            Permission::bifrost_table_read(),
+            Permission::bifrost_record_write(),
+            Permission::eval_run(),
+        ],
+    },
 ];
+
+/// Built-in Role a Card-bound Service or Agent principal receives at its first
+/// projection.
+///
+/// It lets the workload emit and verify its own evidence: Bifrost table read
+/// (the describe every writer performs before admission), record write, and
+/// Verifier runs, nothing else. Tenant-wide Bifrost query reads are withheld;
+/// they come from an explicit grant of the `workload` Role. The principal's
+/// Card scope still bounds which Cards it may emit for and verify, and an
+/// administrator who revokes the Role is not overridden by a later
+/// re-registration.
+pub const DEFAULT_CARD_ROLE: &str = "wyrd_default";
 
 /// Deterministic UUID for a tenant-scoped builtin role row.
 #[must_use]
@@ -106,7 +103,7 @@ pub fn builtin_role_uuid(data_tenant_id: DataTenantId, role_name: &str) -> Uuid 
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{BUILTIN_ROLES, builtin_role_uuid};
+    use super::{BUILTIN_ROLES, DEFAULT_CARD_ROLE, builtin_role_uuid};
     use crate::Permission;
 
     #[test]
@@ -151,6 +148,35 @@ mod tests {
             let expected = matches!(role.name, "admin" | "writer" | "agent");
             assert_eq!(granted, expected, "role {}", role.name);
         }
+    }
+
+    /// Proves the default Card role lets a Service emit and verify its own
+    /// evidence while withholding tenant-wide Bifrost query reads, which stay
+    /// with the explicitly granted `workload` role.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either role is missing or its grants differ from that split.
+    #[test]
+    fn default_card_role_emits_and_verifies_without_tenant_reads() {
+        let held = |name: &str, required: &Permission| {
+            BUILTIN_ROLES
+                .iter()
+                .find(|role| role.name == name)
+                .expect("role is built in")
+                .permissions
+                .iter()
+                .any(|permission| permission.covers(required))
+        };
+        for required in [
+            Permission::bifrost_table_read(),
+            Permission::bifrost_record_write(),
+            Permission::eval_run(),
+        ] {
+            assert!(held(DEFAULT_CARD_ROLE, &required), "{required}");
+        }
+        assert!(!held(DEFAULT_CARD_ROLE, &Permission::bifrost_query_read()));
+        assert!(held("workload", &Permission::bifrost_query_read()));
     }
 
     #[test]

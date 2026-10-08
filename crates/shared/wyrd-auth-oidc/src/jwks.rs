@@ -352,7 +352,7 @@ mod tests {
     fn cache() -> JwksCache {
         JwksCache::new(
             ScreenedHttp::allowing_internal(),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             Duration::from_secs(5),
         )
     }
@@ -374,7 +374,7 @@ mod tests {
 
         let cache = JwksCache::new(
             ScreenedHttp::new(AddressPolicy::BlockInternal),
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             Duration::from_secs(5),
         );
         cache

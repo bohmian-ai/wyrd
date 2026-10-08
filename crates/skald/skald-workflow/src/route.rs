@@ -35,7 +35,7 @@ use crate::error::WorkflowResult;
 
 /// Gateway call budget used when neither the step, the Agent, nor the run sets
 /// a deadline, so a gateway caller always receives a finite timeout.
-pub const DEFAULT_GATEWAY_CALL_TIMEOUT: Duration = Duration::from_secs(600);
+pub const DEFAULT_GATEWAY_CALL_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Network profile for external-gateway egress.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -445,10 +445,8 @@ pub(crate) fn protocol_matches(
             ExternalGatewayProtocol::AnthropicMessages,
             ProviderRequest::AnthropicMessage(_)
         ) | (
-            ExternalGatewayProtocol::GeminiGenerateContent,
-            ProviderRequest::GeminiGenerateContent(_)
-        ) | (
-            ExternalGatewayProtocol::VertexGenerateContent,
+            ExternalGatewayProtocol::GeminiGenerateContent
+                | ExternalGatewayProtocol::VertexGenerateContent,
             ProviderRequest::GeminiGenerateContent(_)
         )
     )

@@ -9,32 +9,32 @@ use sqlx::types::Uuid;
 
 use crate::TenantConn;
 
-const ROLES_BY_NAME_SQL: &str = r#"
+const ROLES_BY_NAME_SQL: &str = r"
 SELECT id, name, permissions
   FROM wyrd.auth_roles
  WHERE name = ANY($1)
-"#;
+";
 
-const ROLE_BY_ID_SQL: &str = r#"
+const ROLE_BY_ID_SQL: &str = r"
 SELECT id, name, permissions
   FROM wyrd.auth_roles
  WHERE data_tenant_id = wyrd.current_tenant()
    AND id = $1
-"#;
+";
 
-const ROLE_BY_NAME_SQL: &str = r#"
+const ROLE_BY_NAME_SQL: &str = r"
 SELECT id, name, permissions
   FROM wyrd.auth_roles
  WHERE data_tenant_id = wyrd.current_tenant()
    AND name = $1
-"#;
+";
 
-const LIST_ROLES_SQL: &str = r#"
+const LIST_ROLES_SQL: &str = r"
 SELECT id, name, permissions
   FROM wyrd.auth_roles
  WHERE data_tenant_id = wyrd.current_tenant()
  ORDER BY name
-"#;
+";
 
 /// Raw role row used by server-tier permission resolution.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,18 +79,18 @@ pub async fn roles_by_name(
         .collect()
 }
 
-const INSERT_ROLE_SQL: &str = r#"
+const INSERT_ROLE_SQL: &str = r"
 INSERT INTO wyrd.auth_roles (id, data_tenant_id, name, permissions, builtin)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (data_tenant_id, name) DO UPDATE
   SET permissions = EXCLUDED.permissions
-"#;
+";
 
-const DELETE_ROLE_SQL: &str = r#"
+const DELETE_ROLE_SQL: &str = r"
 DELETE FROM wyrd.auth_roles
  WHERE data_tenant_id = wyrd.current_tenant()
    AND name = $1
-"#;
+";
 
 /// Insert or update a role's permission payload.
 ///

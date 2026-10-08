@@ -14,6 +14,13 @@ use wyrd_spec::vala::api::{
 use crate::row_types::cluster_nodes::{RegisteredRoleRow, RoleMutation, RoleRegistration};
 use crate::{SqlError, TenantConn, ValaPostgres};
 
+/// Maximum age of a heartbeat included in a live cluster snapshot.
+///
+/// Owned here rather than by the runtime registry because durable decisions
+/// also consume it: Forge treats an Oracle fence whose heartbeat is older than
+/// this as no longer live when it evaluates an abandoned active table read.
+pub const ROLE_LIVENESS_CUTOFF: Duration = Duration::from_secs(15);
+
 /// SQL owner for role-fenced cluster membership.
 pub struct ClusterNodes {
     /// Vala runtime handle from which callers open tenant transactions.
@@ -108,7 +115,7 @@ impl ClusterNodes {
         .await
         .map_err(SqlError::from)?;
         let row = sqlx::query_as::<_, ClusterNodeDbRow>(
-            r#"INSERT INTO vala.cluster_nodes
+            r"INSERT INTO vala.cluster_nodes
                (data_tenant_id, node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at,
                 capability_version, capabilities, ready)
                VALUES ($1,$2,$3,$4,1,$5,statement_timestamp(),1,$6,false)
@@ -118,7 +125,7 @@ impl ClusterNodes {
                  started_at=EXCLUDED.started_at, heartbeat_at=statement_timestamp(),
                  capability_version=1, capabilities=EXCLUDED.capabilities, ready=false
                RETURNING node_id, role, advertise_addr, fencing_token, capability_version,
-                         capabilities, ready, started_at, heartbeat_at"#,
+                         capabilities, ready, started_at, heartbeat_at",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(registration.key.node_id.as_uuid())

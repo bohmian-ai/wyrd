@@ -30,7 +30,9 @@ use crate::components::principals::principals_router;
 use crate::components::storage::storage_router;
 use crate::components::verification::verification_router;
 use crate::http::error::WyrdErrorResponse;
-use crate::http::middleware::authenticate::{require_authenticated, require_bifrost_authenticated};
+use crate::http::middleware::authenticate::{
+    require_authenticated, require_bifrost_authenticated, require_otlp_authenticated,
+};
 use crate::http::openapi::{ProblemMediaAddon, SecurityAddon, WyrdApiDoc};
 use crate::http::otlp::router as otlp_router;
 use crate::query::routes::router as query_router;
@@ -62,21 +64,27 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             require_bifrost_authenticated,
         ));
+    // OTLP alone also admits a stock exporter's `x-wyrd-api-key`.
+    let otlp_group = otlp_router().layer(middleware::from_fn_with_state(
+        state.clone(),
+        require_otlp_authenticated,
+    ));
     let v1_group = OpenApiRouter::new()
         .merge(storage_router(&state))
         .merge(cards_router())
         .merge(crate::components::workflow::workflow_runs_router())
         .merge(principals_router())
+        .merge(crate::components::auth::routes::tenant_auth_router())
         .merge(verification_router())
         .merge(operator_connections_router())
         .merge(admin_router())
         .merge(identity_router())
         .merge(gateway_router())
-        .merge(otlp_router())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_authenticated,
         ))
+        .merge(otlp_group)
         .merge(bifrost_group)
         .fallback(v1_not_found);
 

@@ -1,7 +1,10 @@
 use wyrd_error_derive::WyrdError;
 
 #[derive(WyrdError)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "variants exist to exercise the derive, not to be constructed"
+)]
 enum ExampleError {
     #[wyrd_error(
         code = "WYRD_TEST_400_VALIDATION",
@@ -22,7 +25,10 @@ enum ExampleError {
 }
 
 #[derive(WyrdError)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "variants exist to exercise the derive, not to be constructed"
+)]
 enum InnerError {
     #[wyrd_error(
         code = "WYRD_TEST_503_UPSTREAM",
@@ -34,7 +40,10 @@ enum InnerError {
 }
 
 #[derive(WyrdError, Debug, PartialEq)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "variants exist to exercise the derive, not to be constructed"
+)]
 enum ReconstructableError {
     #[wyrd_error(
         code = "WYRD_TEST_404_NOT_FOUND",

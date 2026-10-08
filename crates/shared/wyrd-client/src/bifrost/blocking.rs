@@ -11,15 +11,17 @@ use crate::WyrdClient;
 use arrow::record_batch::RecordBatch;
 use wyrd_queue::QueueConfig;
 use wyrd_spec::request_id::RequestId;
+#[cfg(feature = "internal")]
+use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, RegisterOutcome,
+    BifrostTableDescription, CancelRunningQueryResponse, QueryParam, RegisterOutcome,
     RunningQuerySummary,
 };
 
 use crate::bifrost::facade::QueryResult;
-use crate::bifrost::query::{
-    BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryResultStream,
-};
+use crate::bifrost::query::{BifrostClientError, QueryResultStream};
+#[cfg(feature = "internal")]
+use crate::bifrost::query::{CollectedQueryLimits, CollectedQueryResult};
 use crate::bifrost::table::{Correlation, TableConfig};
 
 /// The synchronous [`crate::bifrost::Bifrost`].
@@ -48,6 +50,10 @@ impl Bifrost {
 
     /// Build a query-only client over an explicitly supplied transport.
     ///
+    /// # Arguments
+    /// * `client` - The authenticated client whose credential and connection pools
+    ///   both planes share; it is borrowed, not owned.
+    ///
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::connect`].
@@ -58,6 +64,10 @@ impl Bifrost {
     }
 
     /// Build a client already bound to `table` for writes.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client whose transport both planes share.
+    /// * `table` - The table bound as the initial write target.
     ///
     /// # Errors
     ///
@@ -72,6 +82,11 @@ impl Bifrost {
     }
 
     /// Build a client with explicit producer tuning.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client whose transport both planes share.
+    /// * `table` - The initial write target, or `None` to bind one later.
+    /// * `config` - Producer tuning, validated before the ingest channel is dialled.
     ///
     /// # Errors
     ///
@@ -98,11 +113,17 @@ impl Bifrost {
     }
 
     /// Bind `table` as the write target, returning the previous binding.
+    ///
+    /// # Arguments
+    /// * `table` - The table to bind as the new write target.
     pub fn use_table(&self, table: TableConfig) -> Option<TableConfig> {
         self.inner.use_table(table)
     }
 
     /// Bind an already-registered table by name.
+    ///
+    /// # Arguments
+    /// * `fqn` - The registered table's `<namespace>.<name>`.
     ///
     /// # Errors
     ///
@@ -121,6 +142,10 @@ impl Bifrost {
     ///
     /// Already synchronous on the async client, so this forwards rather than
     /// blocking: enqueueing is a bounded channel send, not IO.
+    ///
+    /// # Arguments
+    /// * `row` - One JSON-encoded row whose fields match the active table's schema.
+    /// * `correlation` - The card and run identities stamped onto the row.
     ///
     /// # Errors
     ///
@@ -149,14 +174,26 @@ impl Bifrost {
 
     /// Run one SQL SELECT and collect every batch.
     ///
+    /// # Arguments
+    /// * `query` - The SQL SELECT text.
+    /// * `params` - Positional bind values; `params[i]` binds `$(i + 1)`.
+    ///
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::sql`].
-    pub fn sql(&self, query: &str) -> Result<QueryResult, BifrostClientError> {
-        block_on(self.inner.sql(query))
+    pub fn sql(
+        &self,
+        query: &str,
+        params: &[QueryParam],
+    ) -> Result<QueryResult, BifrostClientError> {
+        block_on(self.inner.sql(query, params))
     }
 
     /// Run one SQL SELECT and deserialize every row into `T`.
+    ///
+    /// # Arguments
+    /// * `query` - The SQL SELECT text.
+    /// * `params` - Positional bind values; `params[i]` binds `$(i + 1)`.
     ///
     /// # Errors
     ///
@@ -164,35 +201,59 @@ impl Bifrost {
     pub fn sql_as<T: serde::de::DeserializeOwned>(
         &self,
         query: &str,
+        params: &[QueryParam],
     ) -> Result<Vec<T>, BifrostClientError> {
-        block_on(self.inner.sql_as(query))
+        block_on(self.inner.sql_as(query, params))
     }
 
     /// Run one SQL SELECT and iterate its batches as they arrive.
     ///
+    /// # Arguments
+    /// * `query` - The SQL SELECT text.
+    /// * `params` - Positional bind values.
+    /// * `deadline` - The server-side query deadline, or `None` for the
+    ///   server default.
+    ///
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::stream`].
-    pub fn stream(&self, query: &str) -> Result<BlockingQueryStream, BifrostClientError> {
+    pub fn stream(
+        &self,
+        query: &str,
+        params: &[QueryParam],
+        deadline: Option<std::time::Duration>,
+    ) -> Result<BlockingQueryStream, BifrostClientError> {
         Ok(BlockingQueryStream {
-            inner: block_on(self.inner.stream(query))?,
+            inner: block_on(self.inner.stream(query, params, deadline))?,
         })
     }
 
     /// Read one registered table's server-owned description.
     ///
+    /// # Arguments
+    /// * `namespace` - The table's namespace.
+    /// * `name` - The table's name within `namespace`.
+    ///
     /// # Errors
     ///
-    /// As [`crate::bifrost::Bifrost::describe`].
-    pub fn describe(&self, fqn: &str) -> Result<BifrostTableDescription, BifrostClientError> {
-        block_on(self.inner.describe(fqn))
+    /// As [`crate::bifrost::Bifrost::describe_table`].
+    pub fn describe_table(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<BifrostTableDescription, BifrostClientError> {
+        block_on(self.inner.describe_table(namespace, name))
     }
 
     /// Start one query from a complete request and iterate its batches.
     ///
+    /// # Arguments
+    /// * `request` - The complete query request: SQL, bind values, and deadline.
+    ///
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::query`].
+    #[cfg(feature = "internal")]
     pub fn query(
         &self,
         request: &BifrostQueryRequest,
@@ -204,9 +265,14 @@ impl Bifrost {
 
     /// Run one query and collect it within explicit limits.
     ///
+    /// # Arguments
+    /// * `request` - The complete query request: SQL, bind values, and deadline.
+    /// * `limits` - The row and encoded-byte ceilings the collected result must fit.
+    ///
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::collect_bounded`].
+    #[cfg(feature = "internal")]
     pub fn collect_bounded(
         &self,
         request: &BifrostQueryRequest,
@@ -226,6 +292,9 @@ impl Bifrost {
 
     /// Get one active query visible to the authenticated tenant.
     ///
+    /// # Arguments
+    /// * `request_id` - The id of the active query to look up.
+    ///
     /// # Errors
     ///
     /// As [`crate::bifrost::Bifrost::status`].
@@ -237,6 +306,9 @@ impl Bifrost {
     }
 
     /// Request server-side cancellation of one active query.
+    ///
+    /// # Arguments
+    /// * `request_id` - The id of the active query to cancel.
     ///
     /// # Errors
     ///
@@ -250,6 +322,7 @@ impl Bifrost {
 
     /// The async client underneath, for a caller that acquires a runtime later.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn into_async(self) -> crate::bifrost::Bifrost {
         self.inner
     }

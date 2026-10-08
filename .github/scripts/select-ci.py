@@ -29,12 +29,12 @@ GLOBAL = re.compile(r"^(Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|deny\.toml|
 # Paths that select no verification of their own.
 UNVERIFIED = re.compile(r"^(changes/|architecture/|[^/]+\.md$)")
 DOCS = re.compile(r"^(docs/|openapi\.yaml|crates/wyrd-spec/schemas/|examples/)")
-# UI also covers the generated token targets so check:tokens fires on a
+# UI also covers the generated token targets so the token drift check fires on a
 # hand-edit to any of them. The UI is bundled beside the server binary, not
 # compiled into it, so it does not select the server's Rust closure.
 UI = re.compile(
     r"^(crates/wyrd/wyrd-server/wyrd-ui/|docs/src/styles/wyrd-tokens\.css"
-    r"|\.claude/skills/wyrd-ui/references/wyrd-theme\.css|\.agents/skills/wyrd-ui/references/wyrd-theme\.css)"
+    r"|\.agents/skills/wyrd-ui/references/wyrd-theme\.css)"
 )
 PYTHON = re.compile(r"^(sdks/wyrd-sdk-python/|examples/python/)")
 TYPESCRIPT = re.compile(r"^sdks/wyrd-sdk-ts/")
@@ -48,7 +48,7 @@ BIFROST_ONLY = re.compile(
     r"^(architecture/bifrost-design\.md"
     r"|architecture/references/domain/(olap-serving|iceberg|datafusion|arrow-analytical-interop|analytical-operations-reliability)\.md"
     r"|crates/vala/vala-bifrost-redux/"
-    r"|crates/shared/wyrd-client/(src/bifrost/|tests/pg_bifrost_e2e\.rs)"
+    r"|crates/shared/wyrd-client/(src/bifrost/|tests/integration/pg_bifrost_e2e\.rs)"
     r"|crates/vala/vala-sql/(src/(queries|row_types)/(forge|oracle|file_list|maintenance|scribe)"
     r"|tests/(oracle_admission|pg_(file_list|forge|maintenance|olap|oracle|stream)))"
     r"|crates/wyrd/wyrd-testing/(src/bifrost/|tests/bifrost/)"
@@ -56,8 +56,8 @@ BIFROST_ONLY = re.compile(
     r"|crates/wyrd/wyrd-server/tests/(pg_eval_v1_protocol|pg_grpc_ingest_smoke|pg_grpc_smoke|pg_merge_http_protected|pg_router_smoke)\.rs"
     r"|crates/wyrd/wyrd-mcp/(src/bifrost/|tests/bifrost/)"
     r"|crates/wyrd-spec/src/vala/(api|assignment_authority|error|ids|managed_columns)\.rs"
-    r"|sdks/wyrd-sdk-python/(python/wyrd/bifrost/|tests/bifrost/|tests/test_bifrost\.py|tests/integration/test_bifrost_(e2e|query)\.py)"
-    r"|sdks/wyrd-sdk-ts/wyrd/(tests/unit/bifrost-query\.test\.ts|tests/integration/oracle-query\.test\.ts))"
+    r"|sdks/wyrd-sdk-python/(python/wyrd/bifrost/|tests/typecheck/bifrost_contracts\.py|tests/integration/(bifrost/|test_query_bifrost\.py))"
+    r"|sdks/wyrd-sdk-ts/wyrd/(tests/unit/bifrost-query\.test\.ts|tests/integration/query-bifrost\.test\.ts))"
 )
 # Trees whose every file must be owned by a workspace package.
 PACKAGE_TREES = re.compile(r"^(crates/|sdks/[^/]+/(src|native|native-testing)/|examples/rust/)")
@@ -73,22 +73,31 @@ IDENTITY_PACKAGES = {
     "wyrd-auth", "wyrd-auth-check", "wyrd-auth-issue", "wyrd-auth-oidc",
     "wyrd-auth-verify", "wyrd-client", "wyrd-server", "wyrd-testing",
 }
-CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "vala-core", "wyrd-sdk-python"}
+CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "wyrd-sdk-python"}
 RUST_CLIENT_PACKAGES = {"wyrd-client", "wyrd-sdk-rust"}
 EXAMPLE_PACKAGES = {"wyrd-rust-examples", "wyrd-cli"}
 # release-plz publishes these crates.
 PUBLISHED_CRATES = {"wyrd-spec"}
-FAMILIES_FILE = "scripts/test-families.sh"
+# Each Rust test family is a directory tree; scripts/run-family-tests.sh
+# uses the same prefixes.
+FAMILY_DIRS = (
+    ("crates/wyrd/", "wyrd"),
+    ("crates/wyrd-spec/", "wyrd"),
+    ("crates/skald/", "skald"),
+    ("crates/vala/", "vala"),
+    ("crates/shared/", "shared"),
+    ("sdks/wyrd-sdk-rust/", "shared"),
+)
 
 
-def read_families(root):
-    """Map each package to its Rust test family from scripts/test-families.sh."""
-    families = {}
-    text = open(os.path.join(root, FAMILIES_FILE), encoding="utf-8").read()
-    for name, body in re.findall(r"FAMILY_([A-Z]+)=\(([^)]*)\)", text):
-        for package in body.split():
-            families[package] = name.lower()
-    return families
+def read_families(workspace):
+    """Map each package to the Rust test family that owns its directory."""
+    return {
+        name: family
+        for directory, name in workspace.dirs
+        for prefix, family in FAMILY_DIRS
+        if directory.startswith(prefix)
+    }
 
 
 def read_metadata(root):
@@ -189,7 +198,7 @@ def select(paths, root):
 
     try:
         workspace = Workspace(read_metadata(root))
-        families = read_families(root)
+        families = read_families(workspace)
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
         sel.full_gate(f"cannot read the workspace graph: {error}")
         return sel, outputs

@@ -228,6 +228,11 @@ impl TryFrom<proto::BifrostQueryRequest> for domain::BifrostQueryRequest {
     fn try_from(value: proto::BifrostQueryRequest) -> Result<Self, Self::Error> {
         let request = Self {
             sql: value.sql,
+            params: value
+                .params
+                .into_iter()
+                .map(domain::QueryParam::try_from)
+                .collect::<Result<_, _>>()?,
             // Above-`i64` wire values stay out of range so validation rejects them.
             deadline_ms: value
                 .deadline_ms
@@ -243,10 +248,51 @@ impl From<domain::BifrostQueryRequest> for proto::BifrostQueryRequest {
     fn from(value: domain::BifrostQueryRequest) -> Self {
         Self {
             sql: value.sql,
+            params: value.params.into_iter().map(Into::into).collect(),
             // Negative contract values stay out of range as zero on the unsigned wire.
             deadline_ms: value
                 .deadline_ms
                 .map(|deadline| u64::try_from(deadline).unwrap_or(0)),
+        }
+    }
+}
+
+impl TryFrom<proto::QueryParam> for domain::QueryParam {
+    type Error = QueryConversionError;
+
+    /// Decodes one positional bind value from its protobuf oneof.
+    ///
+    /// # Errors
+    /// Returns [`QueryConversionError::Missing`] when the oneof is unset.
+    fn try_from(value: proto::QueryParam) -> Result<Self, Self::Error> {
+        use proto::query_param::Value;
+        Ok(
+            match value
+                .value
+                .ok_or(QueryConversionError::Missing("params.value"))?
+            {
+                Value::NullValue(_) => Self::Null,
+                Value::BoolValue(value) => Self::Bool(value),
+                Value::IntValue(value) => Self::Int(value),
+                Value::FloatValue(value) => Self::Float(value),
+                Value::StringValue(value) => Self::String(value),
+            },
+        )
+    }
+}
+
+impl From<domain::QueryParam> for proto::QueryParam {
+    /// Encodes one positional bind value as its protobuf oneof.
+    fn from(value: domain::QueryParam) -> Self {
+        use proto::query_param::Value;
+        Self {
+            value: Some(match value {
+                domain::QueryParam::Null => Value::NullValue(true),
+                domain::QueryParam::Bool(value) => Value::BoolValue(value),
+                domain::QueryParam::Int(value) => Value::IntValue(value),
+                domain::QueryParam::Float(value) => Value::FloatValue(value),
+                domain::QueryParam::String(value) => Value::StringValue(value),
+            }),
         }
     }
 }
@@ -461,7 +507,7 @@ fn terminal(
             proto::QueryTerminalOutcome::Degraded => domain::QueryTerminalOutcome::Degraded,
             proto::QueryTerminalOutcome::Failed => domain::QueryTerminalOutcome::Failed,
             proto::QueryTerminalOutcome::Unspecified => {
-                return Err(QueryConversionError::RequiredEnum("outcome"))
+                return Err(QueryConversionError::RequiredEnum("outcome"));
             }
         },
         row_count: value.row_count,
@@ -483,7 +529,7 @@ fn terminal(
             proto::QueryClass::Interactive => domain::QueryClass::Interactive,
             proto::QueryClass::Analytical => domain::QueryClass::Analytical,
             proto::QueryClass::Unspecified => {
-                return Err(QueryConversionError::RequiredEnum("query_class"))
+                return Err(QueryConversionError::RequiredEnum("query_class"));
             }
         },
     };
@@ -532,7 +578,6 @@ fn proto_terminal_error(value: domain::QueryTerminalError) -> proto::QueryTermin
             D::QueryTenantInvariant => P::QueryTenantInvariant as i32,
             D::QueryReconciliationInvariant => P::QueryReconciliationInvariant as i32,
             D::QueryPeerSecurity => P::QueryPeerSecurity as i32,
-            D::QueryAuditUnavailable => P::QueryAuditUnavailable as i32,
             D::CatalogUnreachable => P::CatalogUnreachable as i32,
             D::StorageUnreachable => P::StorageUnreachable as i32,
             D::QueryExecutionFailed => P::QueryExecutionFailed as i32,
@@ -570,7 +615,7 @@ fn source_completion(
         proto::QuerySource::HotSealed => domain::QuerySource::HotSealed,
         proto::QuerySource::LiveTail => domain::QuerySource::LiveTail,
         proto::QuerySource::Unspecified => {
-            return Err(QueryConversionError::RequiredEnum("source"))
+            return Err(QueryConversionError::RequiredEnum("source"));
         }
     };
     let outcome = match proto::SourceCompletionOutcome::try_from(value.outcome)
@@ -579,7 +624,7 @@ fn source_completion(
         proto::SourceCompletionOutcome::Complete => domain::SourceCompletionOutcome::Complete,
         proto::SourceCompletionOutcome::Unavailable => domain::SourceCompletionOutcome::Unavailable,
         proto::SourceCompletionOutcome::Unspecified => {
-            return Err(QueryConversionError::RequiredEnum("source_outcome"))
+            return Err(QueryConversionError::RequiredEnum("source_outcome"));
         }
     };
     Ok(domain::SourceCompletion { source, outcome })
@@ -602,7 +647,6 @@ fn terminal_error(
         P::QueryTenantInvariant => D::QueryTenantInvariant,
         P::QueryReconciliationInvariant => D::QueryReconciliationInvariant,
         P::QueryPeerSecurity => D::QueryPeerSecurity,
-        P::QueryAuditUnavailable => D::QueryAuditUnavailable,
         P::CatalogUnreachable => D::CatalogUnreachable,
         P::StorageUnreachable => D::StorageUnreachable,
         P::QueryExecutionFailed => D::QueryExecutionFailed,
@@ -723,6 +767,13 @@ mod tests {
     #[test]
     fn public_query_messages_round_trip() {
         let request = domain::BifrostQueryRequest {
+            params: vec![
+                domain::QueryParam::Null,
+                domain::QueryParam::Bool(false),
+                domain::QueryParam::Int(-7),
+                domain::QueryParam::Float(2.5),
+                domain::QueryParam::String("$1".into()),
+            ],
             sql: "SELECT 1".into(),
             deadline_ms: Some(100),
         };

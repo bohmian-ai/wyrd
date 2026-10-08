@@ -401,8 +401,7 @@ mod tests {
                         let body = serde_json::json!({
                             "access_token": format!("access-{nth}"),
                             "token_type": "Bearer",
-                            "expires_at": chrono::Utc::now()
-                                + chrono::Duration::seconds(token_ttl_seconds),
+                            "expires_in": token_ttl_seconds,
                         })
                         .to_string();
                         format!(

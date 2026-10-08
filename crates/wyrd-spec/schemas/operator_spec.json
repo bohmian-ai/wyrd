@@ -117,7 +117,7 @@
           "minimum": 0.0
         },
         "url": {
-          "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query.",
+          "description": "URL template; its origin is literal and `{{field}}` placeholders may appear only in the path and query. A template beginning with `/` is path-only and is sent to the origin stored on the `auth` connection, read at each attempt; it requires `auth`.",
           "type": "string"
         }
       },

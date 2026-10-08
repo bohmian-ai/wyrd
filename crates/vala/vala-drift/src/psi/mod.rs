@@ -159,7 +159,7 @@ pub(crate) fn fit_psi_baseline_until(
         let fitted = if profile.categorical_features.contains(feature) {
             fit_categorical(feature, &column, cancelled)?
         } else {
-            fit_numeric(feature, &column, &profile.binning_strategy, cancelled)?
+            fit_numeric(feature, &column, profile.binning_strategy, cancelled)?
         };
         fitted_features.insert(feature.clone(), fitted);
     }
@@ -446,7 +446,7 @@ fn is_categorical_dtype(data_type: &DataType) -> bool {
 fn fit_numeric(
     feature: &FeatureName,
     column: &ColumnRef<'_>,
-    strategy: &PsiBinningStrategy,
+    strategy: PsiBinningStrategy,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<FittedPsiFeature, DriftFitError> {
     if !column.is_numeric() {
@@ -471,8 +471,8 @@ fn fit_numeric(
 
     ensure_live(cancelled)?;
     let edges = match strategy {
-        PsiBinningStrategy::EqualWidth { n_bins } => compute_edges_equal_width(&values, *n_bins)?,
-        PsiBinningStrategy::Quantile { n_bins } => compute_edges_quantile(&values, *n_bins)?,
+        PsiBinningStrategy::EqualWidth { n_bins } => compute_edges_equal_width(&values, n_bins)?,
+        PsiBinningStrategy::Quantile { n_bins } => compute_edges_quantile(&values, n_bins)?,
     };
 
     let mut counts = vec![0_u64; edges.edges.len() - 1];
@@ -619,7 +619,7 @@ mod psi_fit {
 
     #[test]
     fn equal_width_numeric_fit_computes_bin_proportions() {
-        let values = (0..100).map(|value| Some(value as f64)).collect();
+        let values = (0..100).map(|value| Some(f64::from(value))).collect();
         let batch = numeric_batch("score", values);
         let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 10 });
         let baseline = fit_psi_baseline(&batch, &profile, &[feature("score")]).expect("baseline");
@@ -637,6 +637,10 @@ mod psi_fit {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn all_equal_numeric_fit_uses_single_infinite_bin() {
         let batch = numeric_batch("score", vec![Some(5.0); 12]);
         let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 10 });
@@ -870,8 +874,8 @@ mod psi_score {
 
     #[test]
     fn psi_identical_distributions_no_drift() {
-        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
-        let target_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let baseline_batch = numeric_batch("x", (0..1000).map(f64::from).collect());
+        let target_batch = numeric_batch("x", (0..1000).map(f64::from).collect());
         let profile = psi_profile_default();
         let fname = feature("x");
         let baseline = fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
@@ -887,8 +891,8 @@ mod psi_score {
 
     #[test]
     fn psi_shifted_distribution_drift() {
-        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
-        let target_batch = numeric_batch("x", (1000..2000).map(|value| value as f64).collect());
+        let baseline_batch = numeric_batch("x", (0..1000).map(f64::from).collect());
+        let target_batch = numeric_batch("x", (1000..2000).map(f64::from).collect());
         let profile = psi_profile_default();
         let fname = feature("x");
         let baseline = fit_psi_baseline(&baseline_batch, &profile, &[fname]).expect("baseline");
@@ -905,8 +909,8 @@ mod psi_score {
     /// Panics when a short target produces a feature report.
     #[test]
     fn psi_target_too_small_is_unscored() {
-        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
-        let target_batch = numeric_batch("x", (0..50).map(|value| value as f64).collect());
+        let baseline_batch = numeric_batch("x", (0..1000).map(f64::from).collect());
+        let target_batch = numeric_batch("x", (0..50).map(f64::from).collect());
         let profile = psi_profile_default();
         let baseline =
             fit_psi_baseline(&baseline_batch, &profile, &[feature("x")]).expect("baseline");
@@ -929,7 +933,7 @@ mod psi_score {
             ..psi_profile_default()
         };
         let baseline_batch = two_column_batch(
-            (0..1000).map(|value| Some(value as f64)).collect(),
+            (0..1000).map(|value| Some(f64::from(value))).collect(),
             (0..1000).map(|value| Some(["a", "b"][value % 2])).collect(),
         );
         let baseline = fit_psi_baseline(&baseline_batch, &profile, &[feature("x"), feature("c")])
@@ -964,12 +968,14 @@ mod psi_score {
             ..psi_profile_default()
         };
         let baseline_batch = two_column_batch(
-            (0..1000).map(|value| Some(value as f64)).collect(),
+            (0..1000).map(|value| Some(f64::from(value))).collect(),
             (0..1000).map(|value| Some(["a", "b"][value % 2])).collect(),
         );
         let baseline = fit_psi_baseline(&baseline_batch, &profile, &[feature("x"), feature("c")])
             .expect("baseline");
-        let mut x = (0..200).map(|value| Some(value as f64)).collect::<Vec<_>>();
+        let mut x = (0..200)
+            .map(|value| Some(f64::from(value)))
+            .collect::<Vec<_>>();
         let mut c = (0..200).map(|_| Some("a")).collect::<Vec<_>>();
         let selected = score_psi(&baseline, &two_column_batch(x.clone(), c.clone()), &profile)
             .expect("report");
@@ -995,12 +1001,16 @@ mod psi_score {
             ..psi_profile_default()
         };
         let baseline_batch = two_column_batch(
-            (0..1000).map(|value| Some(value as f64)).collect(),
+            (0..1000).map(|value| Some(f64::from(value))).collect(),
             (0..1000).map(|value| Some(["a", "b"][value % 2])).collect(),
         );
         let baseline = fit_psi_baseline(&baseline_batch, &profile, &[feature("x"), feature("c")])
             .expect("baseline");
-        let calm = || (0..200).map(|value| Some(value as f64)).collect::<Vec<_>>();
+        let calm = || {
+            (0..200)
+                .map(|value| Some(f64::from(value)))
+                .collect::<Vec<_>>()
+        };
         let labels = || (0..200).map(|_| Some("a")).collect::<Vec<_>>();
 
         let complete =
@@ -1064,6 +1074,8 @@ mod psi_score {
     /// Panics when the score or evidence differs from the closed form.
     #[test]
     fn psi_unseen_categories_land_in_the_other_bin() {
+        // Bins pdx, sea, other: baseline [0.5, 0.5, 0], target [0.4, 0.5, 0.1].
+        const EPS: f64 = 1e-10;
         let baseline_batch = cat_batch(
             "city",
             std::iter::repeat_n("sea", 500)
@@ -1090,8 +1102,6 @@ mod psi_score {
         let report = score_psi(&baseline, &target_batch, &profile).expect("report");
 
         let feature_report = report.features.get(&fname).expect("feature report");
-        // Bins pdx, sea, other: baseline [0.5, 0.5, 0], target [0.4, 0.5, 0.1].
-        const EPS: f64 = 1e-10;
         let expected: f64 = [(0.5_f64, 0.4_f64), (0.5, 0.5), (0.0, 0.1)]
             .iter()
             .map(|(p, q)| {
@@ -1118,8 +1128,12 @@ mod psi_score {
     /// # Panics
     /// Panics when a zero bin breaks the score or the threshold ignores `other`.
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn psi_zero_bins_and_other_count_toward_the_threshold() {
-        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let baseline_batch = numeric_batch("x", (0..1000).map(f64::from).collect());
         let target_batch = numeric_batch("x", vec![5.0; 200]);
         let profile = psi_profile_default();
         let fname = feature("x");
@@ -1160,8 +1174,8 @@ mod psi_score {
     /// Panics when the boundary is not strict.
     #[test]
     fn psi_threshold_boundary_is_strict() {
-        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
-        let target_batch = numeric_batch("x", (300..1300).map(|value| value as f64).collect());
+        let baseline_batch = numeric_batch("x", (0..1000).map(f64::from).collect());
+        let target_batch = numeric_batch("x", (300..1300).map(f64::from).collect());
         let fname = feature("x");
         let at = |value: f64| PsiProfile {
             binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 10 },
@@ -1182,8 +1196,8 @@ mod psi_score {
 
     #[test]
     fn psi_fixed_threshold_is_used() {
-        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
-        let target_batch = numeric_batch("x", (500..1500).map(|value| value as f64).collect());
+        let baseline_batch = numeric_batch("x", (0..1000).map(f64::from).collect());
+        let target_batch = numeric_batch("x", (500..1500).map(f64::from).collect());
         let fname = feature("x");
         let profile_low = PsiProfile {
             binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 10 },
@@ -1215,7 +1229,7 @@ mod psi_score {
     /// Panics when either target scores, errors, or carries feature rows.
     #[test]
     fn psi_null_typed_target_is_unscored() {
-        let numeric = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let numeric = numeric_batch("x", (0..1000).map(f64::from).collect());
         let categorical = cat_batch(
             "x",
             std::iter::repeat_n("sea", 500)
@@ -1248,7 +1262,7 @@ mod psi_score {
 
     #[test]
     fn psi_numeric_target_type_mismatch_errors() {
-        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let baseline_batch = numeric_batch("x", (0..1000).map(f64::from).collect());
         let target_batch = cat_batch("x", vec!["1", "2", "3"]);
         let profile = psi_profile_default();
         let fname = feature("x");

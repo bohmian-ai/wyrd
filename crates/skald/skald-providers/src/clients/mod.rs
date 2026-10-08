@@ -18,8 +18,8 @@ pub use vertex::VertexClient;
 
 use std::time::SystemTime;
 
+use reqwest::Method;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER};
-use reqwest::{Method, StatusCode};
 use serde_json::value::RawValue;
 
 use crate::error::{ProviderError, ProviderResult};
@@ -377,11 +377,6 @@ fn retry_after_ms(response: &reqwest::Response) -> Option<u64> {
 
 fn retry_after_header_value(retry_after_ms: Option<u64>) -> Option<String> {
     retry_after_ms.map(|millis| (millis / 1000).to_string())
-}
-
-#[allow(dead_code)]
-fn status_is_success(status: StatusCode) -> bool {
-    status.is_success()
 }
 
 #[cfg(test)]

@@ -1,14 +1,15 @@
 //! Thin napi projection of the Rust-owned `wyrd_client` capabilities:
 //! the shared client, Bifrost, Cards, Verification, Operator connections,
-//! Gateway administration, and offline `WyrdState`.
+//! Gateway administration, offline `WyrdState`, and the in-process `wyrd`
+//! CLI commands.
 
 #![deny(missing_docs)]
 
 pub mod cards;
+pub mod cli;
 pub mod client;
 pub mod gateway;
 pub mod operators;
-pub mod verification;
 pub mod workflow;
 
 use std::result::Result as StdResult;
@@ -31,8 +32,8 @@ use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::BifrostQueryRequest;
-use wyrd_spec::vala::api::PhysicalLayoutWire;
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryContractError, QueryParam};
+use wyrd_spec::vala::api::{CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
 
@@ -47,6 +48,67 @@ pub struct NativeQueryRequest {
     /// non-finite value reaches the structured startup failure instead of a
     /// napi binding error.
     pub deadline_ms: Option<f64>,
+    /// Ordered bind values for the `$1..$n` placeholders in `sql`.
+    pub params: Option<Vec<NativeQueryParam>>,
+}
+
+/// One JavaScript bind value, tagged by its JavaScript runtime type.
+///
+/// The TypeScript facade sets `kind` to `"null"`, `"boolean"`, `"number"`, or
+/// `"string"` and fills the matching field; any other kind is refused by
+/// [`NativeQueryParam::into_param`] so the catalog error comes from Rust.
+#[napi(object)]
+pub struct NativeQueryParam {
+    /// JavaScript runtime type of the value.
+    pub kind: String,
+    /// Value when `kind` is `"boolean"`.
+    pub bool: Option<bool>,
+    /// Value when `kind` is `"number"`.
+    pub number: Option<f64>,
+    /// Value when `kind` is `"string"`.
+    pub string: Option<String>,
+}
+
+impl NativeQueryParam {
+    /// Largest integer a JavaScript number represents exactly (`2^53 - 1`).
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+
+    /// Projects this JavaScript value onto the shared typed bind value.
+    ///
+    /// A number that is an exact safe integer binds as an integer; any other
+    /// number binds as a float, so a non-finite value reaches
+    /// `BifrostQueryRequest::validate` and its one catalog error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the shared invalid-query error when `kind` is unsupported or
+    /// its matching field is absent.
+    fn into_param(self, index: usize) -> StdResult<QueryParam, BifrostClientError> {
+        let unsupported = || {
+            BifrostClientError::Transport(WyrdError::Vala {
+                error: BifrostError::QueryInvalidSql {
+                    detail: format!(
+                        "params[{index}] must be null, a boolean, a number, or a string"
+                    ),
+                },
+            })
+        };
+        match (self.kind.as_str(), self.bool, self.number, self.string) {
+            ("null", ..) => Ok(QueryParam::Null),
+            ("boolean", Some(value), ..) => Ok(QueryParam::Bool(value)),
+            ("number", _, Some(value), _) => Ok(
+                // The decimal round trip is exact for a safe integer.
+                match value.to_string().parse() {
+                    Ok(integer) if value.abs() <= Self::MAX_SAFE_INTEGER => {
+                        QueryParam::Int(integer)
+                    }
+                    _ => QueryParam::Float(value),
+                },
+            ),
+            ("string", _, _, Some(value)) => Ok(QueryParam::String(value)),
+            _ => Err(unsupported()),
+        }
+    }
 }
 
 /// One raw native iterator step consumed by the TypeScript Arrow facade.
@@ -397,82 +459,124 @@ fn decode_batch_ipc(bytes: &[u8]) -> Result<RecordBatch> {
 ///
 /// # Errors
 ///
-/// Returns a napi error when the table is not `namespace.name`, the document is
-/// not one mappable JSON Schema, a declared column is server-owned, the
-/// layout is not one physical-layout declaration, or the compaction target is
-/// not a non-negative integer.
-// justification: napi boundary; a JavaScript string is primitive and cannot be
-// passed by reference, so the generated binding requires an owned String
-#[allow(clippy::needless_pass_by_value)]
+/// Returns a napi error only when the declared config cannot be encoded. A
+/// table that is not `namespace.name`, a document that is not one mappable
+/// JSON Schema, a server-owned column, a layout that is not one
+/// physical-layout declaration, a compaction target that is not a
+/// non-negative integer, or a compaction type that is not one known
+/// hyphenated wire spelling is returned as catalog metadata.
 #[napi]
 pub fn table_config_from_json_schema(
     table: String,
     schema_json: String,
     layout_json: Option<String>,
     compaction_target_file_size_bytes: Option<f64>,
-) -> Result<NativeTableConfig> {
-    let schema: Value = serde_json::from_str(&schema_json)
-        .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
-    let config = TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
-    let config = apply_layout(config, layout_json.as_deref())?;
-    NativeTableConfig::project(&apply_compaction_target(
-        config,
-        compaction_target_file_size_bytes,
-    )?)
+    compaction_type: Option<String>,
+) -> Result<NativeTableConfigResult> {
+    let declared = serde_json::from_str::<Value>(&schema_json)
+        .map_err(|error| validation_error(format!("invalid JSON schema: {error}"), "schema"))
+        .and_then(|schema| TableConfig::from_json_schema(&table, &schema))
+        .and_then(|config| {
+            declare(
+                config,
+                layout_json.as_deref(),
+                compaction_target_file_size_bytes,
+                compaction_type.as_deref(),
+            )
+        });
+    NativeTableConfigResult::declared(declared)
 }
 
-/// Fetches an already-registered table's config by name.
+/// Builds one table config from an explicit Arrow schema.
 ///
-/// Every transport argument is optional and resolves through the same chain the
-/// client constructor uses when omitted.
+/// This is the door for column types JSON Schema cannot express. The schema
+/// crosses as one schema-only Arrow IPC stream, the framing
+/// [`NativeTableConfig::schema_ipc`] uses in the other direction; layout and
+/// compaction apply as in [`table_config_from_json_schema`].
 ///
 /// # Errors
 ///
-/// Returns a napi error only when the described config cannot be encoded;
-/// credential, transport, and server refusals are returned as catalog metadata.
-// justification: napi boundary; a JavaScript string is primitive and cannot be
-// passed by reference, so the generated binding requires an owned String
-#[allow(clippy::needless_pass_by_value)]
+/// Returns a napi error only when the declared config cannot be encoded. Bytes
+/// that are not one Arrow IPC stream and every refusal
+/// [`table_config_from_json_schema`] lists are returned as catalog metadata.
 #[napi]
-pub async fn describe_table_config(
+pub fn table_config_from_arrow_ipc(
     table: String,
-    server_url: Option<String>,
-    credential: Option<String>,
-    grpc_url: Option<String>,
-    tenant: Option<String>,
+    schema_ipc: Buffer,
+    layout_json: Option<String>,
+    compaction_target_file_size_bytes: Option<f64>,
+    compaction_type: Option<String>,
 ) -> Result<NativeTableConfigResult> {
-    let described = match wyrd_client::bifrost::client_from_options(
-        server_url.as_deref(),
-        credential.as_deref(),
-        grpc_url.as_deref(),
-        tenant.as_deref(),
-    ) {
-        Ok(client) => TableConfig::describe(&client, &table).await,
-        Err(error) => Err(error),
-    };
-    match described {
-        Ok(config) => Ok(NativeTableConfigResult {
-            config: Some(NativeTableConfig::project(&config)?),
-            error: None,
-        }),
-        Err(error) => Ok(NativeTableConfigResult {
-            config: None,
-            error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
-        }),
+    let declared =
+        arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(schema_ipc.as_ref()), None)
+            .map_err(|error| validation_error(format!("invalid Arrow schema: {error}"), "schema"))
+            .and_then(|reader| TableConfig::from_arrow(&table, reader.schema()))
+            .and_then(|config| {
+                declare(
+                    config,
+                    layout_json.as_deref(),
+                    compaction_target_file_size_bytes,
+                    compaction_type.as_deref(),
+                )
+            });
+    NativeTableConfigResult::declared(declared)
+}
+
+impl NativeTableConfigResult {
+    /// Projects one declaration outcome, its refusal as catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the declared config cannot be encoded.
+    fn declared(declared: StdResult<TableConfig, BifrostClientError>) -> Result<Self> {
+        match declared {
+            Ok(config) => Ok(Self {
+                config: Some(NativeTableConfig::project(&config)?),
+                error: None,
+            }),
+            Err(error) => Ok(Self {
+                config: None,
+                error: Some(NativeWyrdError::from_wyrd(&WyrdError::from(&error))),
+            }),
+        }
     }
+}
+
+/// Applies a declaration's serialized layout and compaction options to its
+/// base config, whichever schema door built it.
+///
+/// # Errors
+///
+/// Returns the shared validation refusal for unparsable layout text, a
+/// non-integer compaction target, and an unknown compaction type.
+fn declare(
+    config: TableConfig,
+    layout_json: Option<&str>,
+    compaction_target_file_size_bytes: Option<f64>,
+    compaction_type: Option<&str>,
+) -> StdResult<TableConfig, BifrostClientError> {
+    let config = apply_layout(config, layout_json)?;
+    apply_compaction_type(
+        apply_compaction_target(config, compaction_target_file_size_bytes)?,
+        compaction_type,
+    )
 }
 
 /// Applies one optional serialized physical layout to a config.
 ///
 /// # Errors
 ///
-/// Returns a napi error when the text is not one `PhysicalLayoutWire`.
-fn apply_layout(config: TableConfig, layout_json: Option<&str>) -> Result<TableConfig> {
+/// Returns the shared validation refusal when the text is not one
+/// `PhysicalLayoutWire`.
+fn apply_layout(
+    config: TableConfig,
+    layout_json: Option<&str>,
+) -> StdResult<TableConfig, BifrostClientError> {
     match layout_json {
         None => Ok(config),
         Some(layout) => {
             let layout: PhysicalLayoutWire = serde_json::from_str(layout).map_err(|error| {
-                napi::Error::from_reason(format!("invalid physical layout: {error}"))
+                validation_error(format!("invalid physical layout: {error}"), "layout")
             })?;
             Ok(config.with_layout(layout))
         }
@@ -488,19 +592,66 @@ fn apply_layout(config: TableConfig, layout_json: Option<&str>) -> Result<TableC
 ///
 /// # Errors
 ///
-/// Returns a napi error for a non-finite, fractional, or negative number.
-fn apply_compaction_target(config: TableConfig, bytes: Option<f64>) -> Result<TableConfig> {
+/// Returns the shared validation refusal for a non-finite, fractional, or
+/// negative number.
+fn apply_compaction_target(
+    config: TableConfig,
+    bytes: Option<f64>,
+) -> StdResult<TableConfig, BifrostClientError> {
     match bytes {
         None => Ok(config),
         Some(bytes) => {
             let bytes: u64 = bytes.to_string().parse().map_err(|_| {
-                napi::Error::from_reason(format!(
-                    "compaction target must be a non-negative integer byte count, got {bytes}"
-                ))
+                validation_error(
+                    format!(
+                        "compaction target must be a non-negative integer byte count, got {bytes}"
+                    ),
+                    "compactionTargetFileSizeBytes",
+                )
             })?;
             Ok(config.with_compaction_target_file_size_bytes(bytes))
         }
     }
+}
+
+/// Applies one optional explicit Forge compaction type to a config.
+///
+/// The spelling is the hyphenated wire value, parsed by the wire type's own
+/// serde contract so JavaScript accepts exactly what the server accepts.
+///
+/// # Errors
+///
+/// Returns the shared validation refusal when the spelling is not one known
+/// compaction type.
+fn apply_compaction_type(
+    config: TableConfig,
+    raw: Option<&str>,
+) -> StdResult<TableConfig, BifrostClientError> {
+    match raw {
+        None => Ok(config),
+        Some(raw) => {
+            let kind: CompactionTypeWire = serde_json::from_value(Value::String(raw.to_owned()))
+                .map_err(|error| {
+                    validation_error(
+                        format!("invalid compaction type: {error}"),
+                        "compactionType",
+                    )
+                })?;
+            Ok(config.with_compaction_type(kind))
+        }
+    }
+}
+
+/// The queue configuration for an optional JavaScript byte-budget override.
+///
+/// `None` keeps the 256 MiB default. A negative number cannot be a budget, so
+/// it becomes zero, which connecting refuses with
+/// `WYRD_CLIENT_400_CONFIG_INVALID` like any budget too small to seal one
+/// message.
+pub(crate) fn queue_config(client_byte_limit_bytes: Option<i64>) -> QueueConfig {
+    QueueConfig::with_client_byte_limit(
+        client_byte_limit_bytes.map(|limit| usize::try_from(limit).unwrap_or(0)),
+    )
 }
 
 /// The one Bifrost client: query any authorized table, write to the active one.
@@ -515,38 +666,6 @@ pub struct NativeBifrost {
     /// Shared through an [`Arc`] so a blocking drain can move it onto a
     /// blocking worker without stalling the Node event loop.
     client: Arc<Bifrost>,
-}
-
-/// Connects one Bifrost client, optionally already bound to a write target.
-///
-/// A free function rather than a constructor because connecting is asynchronous
-/// and a napi constructor cannot be. Every transport argument is optional and
-/// falls through the existing resolution chain exactly once when omitted.
-///
-/// # Errors
-///
-/// Returns a napi error only when the supplied table config is not one
-/// serialized `TableConfig`; credential and ingest-dial failures are returned
-/// as catalog metadata.
-#[napi]
-pub async fn connect_bifrost(
-    table: Option<NativeTableConfig>,
-    server_url: Option<String>,
-    credential: Option<String>,
-    grpc_url: Option<String>,
-    tenant: Option<String>,
-) -> Result<NativeBifrostConnection> {
-    let table = table.map(|table| table.parse()).transpose()?;
-    let connected = match wyrd_client::bifrost::client_from_options(
-        server_url.as_deref(),
-        credential.as_deref(),
-        grpc_url.as_deref(),
-        tenant.as_deref(),
-    ) {
-        Ok(client) => Bifrost::connect_with_config(&client, table, QueueConfig::default()).await,
-        Err(error) => Err(error),
-    };
-    Ok(NativeBifrostConnection::from_outcome(connected))
 }
 
 #[napi]
@@ -577,8 +696,6 @@ impl NativeBifrost {
     ///
     /// Returns a napi error when the config is not one serialized `TableConfig`
     /// or the previous binding cannot be projected.
-    // justification: napi boundary; a generated object argument arrives owned
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn use_table(&self, table: NativeTableConfig) -> Result<Option<NativeTableConfig>> {
         self.client
@@ -595,9 +712,6 @@ impl NativeBifrost {
     /// Returns a napi error only when the native result cannot be projected;
     /// not-found, authorization, and transport failures are returned in
     /// [`NativeLifecycleResult`].
-    // justification: napi boundary; a JavaScript string is primitive and cannot
-    // be passed by reference, so the generated binding requires an owned String
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub async fn use_table_by_name(&self, table: String) -> Result<NativeLifecycleResult> {
         match self.client.use_table_by_name(&table).await {
@@ -628,11 +742,9 @@ impl NativeBifrost {
     ///
     /// # Errors
     ///
-    /// Returns a napi error for an invalid card reference; no-active-table and
-    /// queue-full refusals are returned in [`NativeLifecycleResult`].
-    // justification: napi boundary; a JavaScript string is primitive and cannot
-    // be passed by reference, so the generated binding requires an owned String
-    #[allow(clippy::needless_pass_by_value)]
+    /// Returns a napi error only when the outcome cannot be encoded; an invalid
+    /// card reference, no-active-table, and queue-full refusals are returned in
+    /// [`NativeLifecycleResult`].
     #[napi]
     pub fn insert(
         &self,
@@ -640,8 +752,9 @@ impl NativeBifrost {
         card_ref: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
-        let correlation = correlation(card_ref.as_deref(), run_id)?;
-        match self.client.insert(row.into_bytes(), correlation) {
+        let inserted = correlation(card_ref.as_deref(), run_id)
+            .and_then(|correlation| self.client.insert(row.into_bytes(), correlation));
+        match inserted {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
         }
@@ -659,8 +772,6 @@ impl NativeBifrost {
     /// Returns a napi error when the bytes are not one single-batch Arrow IPC
     /// stream; server and envelope refusals are returned in
     /// [`NativeLifecycleResult`].
-    // justification: napi boundary; the generated binding requires owned values
-    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub async fn write_batch(
         &self,
@@ -707,6 +818,55 @@ impl NativeBifrost {
         u32::try_from(self.client.producer_count()).unwrap_or(u32::MAX)
     }
 
+    /// Rows dropped by the fire-and-forget observation path, saturating at
+    /// `i64::MAX`.
+    ///
+    /// Always zero for [`NativeBifrost::insert`], which refuses rather than
+    /// drops.
+    #[napi(getter)]
+    pub fn dropped(&self) -> i64 {
+        i64::try_from(self.client.dropped()).unwrap_or(i64::MAX)
+    }
+
+    /// Records one telemetry row fire-and-forget through
+    /// [`wyrd_client::bifrost::observe::record`].
+    ///
+    /// The row names its own `table` and JSON Schema rather than this client's
+    /// bound table, so instrumentation never disturbs the application's
+    /// binding. A producer refusal, such as a full queue, is counted on
+    /// [`NativeBifrost::dropped`] instead of returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be encoded; an
+    /// unparsable or unmappable schema and an invalid card reference are
+    /// returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub fn record(
+        &self,
+        table: String,
+        schema_json: String,
+        row: String,
+        card_ref: Option<String>,
+        run_id: Option<String>,
+    ) -> Result<NativeLifecycleResult> {
+        let recorded = telemetry_schema(&schema_json).and_then(|schema| {
+            let correlation = correlation(card_ref.as_deref(), run_id)?;
+            wyrd_client::bifrost::observe::record(
+                &self.client,
+                &table,
+                &schema,
+                row.into_bytes(),
+                correlation,
+            );
+            Ok(())
+        });
+        match recorded {
+            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
     /// Starts one terminal-safe query through the Rust SDK owner.
     ///
     /// Expected request, Gate, authentication, and transport failures are
@@ -719,7 +879,19 @@ impl NativeBifrost {
     /// startup result itself.
     #[napi]
     pub async fn query(&self, request: NativeQueryRequest) -> Result<NativeQueryStart> {
+        let params = request
+            .params
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(index, param)| param.into_param(index))
+            .collect::<StdResult<Vec<_>, _>>();
+        let params = match params {
+            Ok(params) => params,
+            Err(error) => return Ok(NativeQueryStart::failure(&error)),
+        };
         let request = BifrostQueryRequest {
+            params,
             sql: request.sql,
             deadline_ms: match request.deadline_ms.map(parse_deadline_ms).transpose() {
                 Ok(deadline_ms) => deadline_ms,
@@ -819,7 +991,7 @@ impl NativeBifrost {
         namespace: String,
         name: String,
     ) -> Result<NativeLifecycleResult> {
-        match self.client.describe(&format!("{namespace}.{name}")).await {
+        match self.client.describe_table(&namespace, &name).await {
             Ok(description) => NativeLifecycleResult::success(
                 &serde_json::to_value(description).map_err(napi_error)?,
             ),
@@ -1001,17 +1173,34 @@ impl NativeBifrostQueryStream {
     }
 }
 
+/// Maps one telemetry row's JSON Schema text to its Arrow schema through the
+/// shared `wyrd-queue` mapper.
+///
+/// # Errors
+///
+/// Returns the shared validation refusal for unparsable text and the mapper's
+/// error for a document that does not map to Arrow.
+fn telemetry_schema(schema_json: &str) -> StdResult<SchemaRef, BifrostClientError> {
+    let schema: Value = serde_json::from_str(schema_json)
+        .map_err(|error| validation_error(format!("invalid JSON schema: {error}"), "schema"))?;
+    Ok(Arc::new(wyrd_queue::json_schema_to_arrow(&schema)?))
+}
+
 /// Parses the optional per-row correlation at the Node boundary.
 ///
 /// # Errors
 ///
-/// Returns a napi error when `card_ref` is not one parsable Card reference.
-fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> Result<Correlation> {
+/// Returns the shared validation refusal when `card_ref` is not one parsable
+/// Card reference.
+fn correlation(
+    card_ref: Option<&str>,
+    run_id: Option<String>,
+) -> StdResult<Correlation, BifrostClientError> {
     Ok(Correlation {
         card_ref: card_ref
             .map(str::parse)
             .transpose()
-            .map_err(|error| napi::Error::from_reason(format!("invalid cardRef: {error}")))?,
+            .map_err(|error| validation_error(format!("invalid cardRef: {error}"), "cardRef"))?,
         run_id: run_id.map(RunId::from_string),
     })
 }
@@ -1024,16 +1213,13 @@ fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> Result<Correla
 ///
 /// # Errors
 ///
-/// Returns the shared query-contract validation error for a non-finite,
-/// fractional, or beyond-`i64` number.
+/// Returns the shared deadline refusal, `WYRD_VALA_400_QUERY_INVALID_DEADLINE`, for a
+/// non-finite, fractional, or beyond-`i64` number.
 fn parse_deadline_ms(value: f64) -> StdResult<i64, BifrostClientError> {
-    value.to_string().parse().map_err(|_| {
-        BifrostClientError::Transport(WyrdError::Vala {
-            error: BifrostError::QueryInvalidSql {
-                detail: "deadline_ms must be an integer between 1 and 4294967295".to_owned(),
-            },
-        })
-    })
+    value
+        .to_string()
+        .parse()
+        .map_err(|_| BifrostClientError::Transport(QueryContractError::InvalidDeadline.into()))
 }
 
 /// Parses one canonical request ID at the Node boundary.
@@ -1093,6 +1279,18 @@ fn problem_field(problem: &Value, key: &str, fallback: &str) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or(fallback)
         .to_owned()
+}
+
+/// Builds the catalog validation refusal for one malformed JavaScript argument.
+///
+/// Local argument checks share `WYRD_SPEC_400_VALIDATION`, so a caller reads
+/// the same stable code for a bad argument as the server returns for a bad
+/// request field; `field` names the offending argument in `details`.
+fn validation_error(message: String, field: &str) -> BifrostClientError {
+    BifrostClientError::Transport(WyrdError::Validation {
+        message,
+        details: serde_json::json!({"field": field}),
+    })
 }
 
 /// Projects an SDK error with its stable code intact.

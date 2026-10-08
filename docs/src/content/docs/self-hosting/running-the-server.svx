@@ -46,7 +46,7 @@ wyrd-server init
 # wyrd_global_… (shown once, store it now)
 ```
 
-The credential is shown exactly once and stored only as an Argon2 verifier. It is printed to your terminal rather than emitted through the server's log pipeline, and server start creates no administrative state and prints no credential under any deployment profile.
+The credential is shown exactly once and stored only as a SHA-256 verifier. It is printed to your terminal rather than emitted through the server's log pipeline, and server start creates no administrative state and prints no credential under any deployment profile.
 
 Initialization happens at most once. The root's name is unique in the database, so a second `init` — concurrent or later — refuses rather than minting a second root. All three writes commit together, so a failure leaves the deployment uninitialized and safe to retry.
 
@@ -244,6 +244,67 @@ Two unauthenticated endpoints back liveness and readiness probes:
 ## Metrics
 
 When `metrics.enabled` is true (the default), the server serves Prometheus metrics on a dedicated listener. By default that listener binds loopback (`127.0.0.1`) on the HTTP port plus one, so `/metrics` is not exposed publicly unless you set `WYRD_METRICS_BIND` yourself. It records `wyrd_http_requests_total` and `wyrd_http_request_duration_seconds` per route, method, and status.
+
+### Verification metrics
+
+Each process exports its own verification runtime series. Labels are closed sets: no tenant, Card, Verifier, Run, request, prompt, or error text ever becomes a label. Attach deployment and instance labels in your scrape configuration.
+
+| Label | Values |
+|---|---|
+| `kind` | `drift_psi`, `drift_spc`, `drift_custom`, `eval_assertion`, `eval_llm_judge`, `eval_other`, `unknown` |
+| `mode` | `queued` (a claimed attempt of a durable run), `direct` (a supplied-input request) |
+| `origin` | `schedule`, `manual`, `observation` (queued only) |
+| `phase` | `load`, `input_read`, `prepare`, `engine`, `publication`, `settlement` |
+| `outcome` | queued: `completed`, `retrying`, `exhausted`, `awaiting_trace`, `cancelled`, `timed_out`, `errored`, `released`, `deferred`, `stale_lease`, `settlement_failed`; direct: `completed`, `cancelled`, `timed_out`, `errored` |
+
+An Eval with any LLM judge is `eval_llm_judge`. An Eval made only of record assertions is `eval_assertion`. Any other Eval graph is `eval_other`. `unknown` means the exact Verifier could not be loaded or classified.
+
+**Demand and progress**
+
+- `wyrd_verification_run_attempts_total{kind,mode}` counts every claimed queued attempt, retries included, and every admitted direct execution. Requests refused before they reach the runtime appear only in the HTTP series and audit.
+- `wyrd_verification_run_failures_total{kind,mode,outcome}` counts unsuccessful execution outcomes. A judgment that fails its expectation is `completed`, not a failure.
+- `wyrd_verification_active_runs{kind,mode}` is the number of executions in flight in this process.
+
+**Queue**
+
+- `wyrd_verification_queue_depth{queue,status}` reports non-terminal runs and Operator dispatches. This is shared durable state, so read it from one replica rather than summing replicas.
+- `wyrd_verification_queue_wait_seconds{kind,origin}` is how long a run was claimable before a process claimed it, as measured by PostgreSQL.
+- `wyrd_verification_trigger_to_terminal_seconds{kind,origin,outcome}` runs from run creation to durable terminal settlement. Its `_count` counts terminal settlements, not attempts.
+
+**Runtime latency**
+
+- `wyrd_verification_run_duration_seconds{kind,mode,outcome}` is claim-to-settlement for a queued attempt and runtime-entry-to-result for a direct request. Do not combine the two modes into one percentile.
+- `wyrd_verification_phase_duration_seconds{kind,mode,phase}` records at most one sample per phase per execution. When a phase runs more than once, the sample is the union of its intervals. `engine` includes `input_read`, `prepare`, scoring, and provider waits, so phases overlap and never add up. A phase that did not run emits no sample. Direct requests have no `input_read`, `publication`, or `settlement`.
+- `wyrd_verification_engine_overhead_seconds{kind,mode,outcome}` is engine wall time minus the union of measured evidence, dependency, and provider waits inside the engine. Nested and concurrent waits are subtracted once. The result includes preparation, scoring, and scheduling delay. It is wall time, not CPU, and CPU work that overlaps a wait is hidden by it.
+
+**Health and delivery**
+
+`wyrd_verification_schedule_ticks_total`, `wyrd_verification_capability_up`, and `wyrd_verification_capability_restarts_total` report scheduler and capability health. They are separate from execution counts. Operator delivery has its own series: `wyrd_operator_active_dispatches`, `wyrd_operator_dispatch_attempts_total`, and `wyrd_operator_dispatch_duration_seconds`.
+
+Run duration, queue wait, trigger-to-terminal, phase, and overhead histograms all share these bucket bounds, in seconds: `0.0005, 0.001, 0.0025, 0.005, 0.0075, 0.009, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300`.
+
+Example queries:
+
+```promql
+sum by (kind, mode) (rate(wyrd_verification_run_attempts_total[5m]))
+
+sum by (kind, mode, outcome) (rate(wyrd_verification_run_duration_seconds_count[5m]))
+
+histogram_quantile(0.95,
+  sum by (le, kind, mode) (rate(wyrd_verification_phase_duration_seconds_bucket{phase="prepare"}[5m])))
+
+histogram_quantile(0.95,
+  sum by (le, kind, mode) (rate(wyrd_verification_engine_overhead_seconds_bucket[5m])))
+
+sum by (queue, status) (wyrd_verification_queue_depth)
+
+histogram_quantile(0.99,
+  sum by (le, kind, origin) (rate(wyrd_verification_queue_wait_seconds_bucket[5m])))
+```
+
+Counters count attempt observations. For durable reconciliation, use run status and published results. Always sum histogram buckets across replicas before taking a quantile; never average per-replica percentiles. A series with no samples in the window produces no quantile. `rate` absorbs counter resets when a process restarts.
+
+Each attempt or direct request is one trace. The root span is `verification.attempt` or the direct request, with `verification.load`, `verification.engine` (containing `verification.evidence_read`, `verification.baseline`, `verification.prepare`, `verification.score`, and `verification.judge`), `verification.publish`, and `verification.settle` as children. A queued attempt's root records `task_start_delay_us`: the delay from spawn to first execution. It does not cover later wake-to-poll delays.
 
 ## Related
 

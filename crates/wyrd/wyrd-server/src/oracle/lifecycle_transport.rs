@@ -151,6 +151,15 @@ impl OracleLifecycleTransport {
         outcomes
     }
 
+    /// Borrows the cluster mTLS identity, absent on a process-local node.
+    ///
+    /// Gateway capture on a pod without Scribe dials peer Scribes with the
+    /// same boot-selected identity, so the peer plane has one trust policy.
+    #[must_use]
+    pub(crate) const fn peer_tls(&self) -> Option<&BifrostPeerTls> {
+        self.tls.as_ref()
+    }
+
     /// Captures each current ready remote Oracle at most once.
     fn ready_remote_nodes(&self) -> Vec<(NodeId, String)> {
         self.cluster

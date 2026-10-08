@@ -1,7 +1,7 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-from collections.abc import AsyncIterator, Iterator
-from typing import Any, Protocol, TypedDict, TypeVar, overload
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from typing import Any, Literal, Protocol, TypedDict, TypeVar, overload
 
 import pyarrow
 
@@ -22,6 +22,9 @@ class DataTypeSpecVariants(TypedDict, total=False):
     Decimal128: dict[str, int]
     List: FieldSpec
     Struct: list[FieldSpec]
+
+QueryParam = None | bool | int | float | str
+"""One positional SQL bind value: ``params[i]`` binds placeholder ``$(i + 1)``."""
 
 DataTypeSpec = str | DataTypeSpecVariants
 """One column's logical type: a scalar variant name or a parameterized form."""
@@ -54,27 +57,43 @@ class TableEntry(TypedDict):
     updated_at: str
 
 class SortKey(TypedDict):
-    """One resolved sort key of a table's physical layout."""
+    """One sort key: ``direction`` is ``"asc"`` or ``"desc"``, ``null_order``
+    is ``"first"`` or ``"last"``."""
 
     column: str
     direction: str
     null_order: str
 
 class PhysicalLayout(TypedDict):
-    """A table's server-resolved partitioning, sort order, and Bloom columns."""
+    """A table's server-resolved partitioning, sort order, and Bloom columns.
+
+    ``partition_granularity`` is ``"hour"`` or ``"day"`` on
+    ``wyrd_event_time``; ``bloom_columns`` begins with the managed columns.
+    """
 
     partition_granularity: str
     sort_keys: list[SortKey]
     bloom_columns: list[str]
 
 class _TableDescriptionOptional(TypedDict, total=False):
-    """Description fields the server omits when they do not apply."""
+    """Description fields the server omits when they do not apply.
+
+    ``canonical_physical_fingerprint`` is present only for built-in signal
+    tables. The compaction keys are present only when the table stores its
+    own value; absent means the server default.
+    """
 
     canonical_physical_fingerprint: str
     compaction_target_file_size_bytes: int
+    compaction_type: str
 
 class TableDescription(_TableDescriptionOptional):
-    """Server projection of one registered table's stored physical schema."""
+    """Server projection of one registered table's stored physical schema.
+
+    ``user_fields`` are the declared columns, ``correlation_fields`` the
+    write-time ``card_ref``/``run_id`` inputs, and ``managed_candidates`` the
+    managed columns a writer may supply itself.
+    """
 
     entry: TableEntry
     user_fields: list[FieldSpec]
@@ -105,21 +124,56 @@ class CancelRunningQueryResult(TypedDict):
     request_id: str
     cancellation_started: bool
 
+class QueryTerminal:
+    """The validated terminal frame one query stream closed with.
+
+    Closed wire enums read back as their snake_case wire names.
+    """
+
+    @property
+    def outcome(self) -> Literal["success", "degraded", "failed"]:
+        """Stream outcome."""
+        ...
+    @property
+    def query_class(self) -> Literal["interactive", "analytical"]:
+        """Path Oracle ran the query on."""
+        ...
+    @property
+    def row_count(self) -> int:
+        """Rows already emitted in batch frames."""
+        ...
+    @property
+    def warnings(self) -> list[Literal["live_tail_unavailable", "stale_cut_replanned"]]:
+        """Closed warnings the server attached."""
+        ...
+    @property
+    def source_completion(self) -> dict[str, str]:
+        """Completion outcome per source tier present in the cut."""
+        ...
+    @property
+    def error_code(self) -> str | None:
+        """Stable failure code for a failed terminal, otherwise ``None``."""
+        ...
+    @property
+    def error_detail(self) -> str | None:
+        """Scrubbed failure diagnostic for a failed terminal, when sent."""
+        ...
+
 class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
-    """Asynchronously yields Arrow batches from one Oracle query."""
+    """Asynchronously yields Arrow batches from one terminal-safe Oracle query."""
 
     def __aiter__(self) -> BifrostQueryStream: ...
     async def __anext__(self) -> pyarrow.RecordBatch: ...
     @property
     def request_id(self) -> str:
-        """Return the server lifecycle request ID before completion."""
+        """Return the server lifecycle request ID before stream completion."""
         ...
     @property
-    def terminal(self) -> dict[str, Any] | None:
+    def terminal(self) -> QueryTerminal | None:
         """Return terminal metadata after validated completion."""
         ...
     async def aclose(self) -> None:
-        """Cancel response-body consumption."""
+        """Abandon this local response stream without requesting server cancellation."""
         ...
 
 class ResolvedTable(TypedDict):
@@ -135,11 +189,11 @@ class Correlation(TypedDict, total=False):
     run_id: str
 
 class TableConfig:
-    """One Bifrost table: its name, declared columns, and physical layout.
+    """One Bifrost table: its name, declared user columns, and requested layout.
 
-    The schema comes from a Pydantic model class through ``model_json_schema()``
-    and is mapped by the same Rust owner every language uses. ``resolved`` stays
-    ``None`` until ``Bifrost.register()`` or ``TableConfig.describe()``.
+    A config is inert until ``Bifrost.register()`` or ``TableConfig.describe()``
+    resolves it; until then ``resolved`` is ``None``. The server, not the
+    client, mints the table identity and schema fingerprint.
     """
 
     def __init__(
@@ -150,27 +204,158 @@ class TableConfig:
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
         compaction_target_file_size_bytes: int | None = None,
-    ) -> None: ...
+        compaction_type: str | None = None,
+    ) -> None:
+        """Declare a table from a Pydantic model class.
+
+        The three layout arguments travel as one layout request. Omitting all
+        of them lets the server choose its default layout: hourly partitions,
+        ``wyrd_event_time`` descending with nulls last, and only the managed
+        Bloom columns. Layout column names are checked against the table's
+        full physical schema, managed columns included, at register time.
+
+        Args:
+            model: a Pydantic model class, not an instance. Its
+                ``model_json_schema()`` becomes the declared user columns.
+                ``card_ref``, ``run_id``, and ``wyrd_*`` names are reserved.
+            table: the ``"<namespace>.<name>"`` name SQL uses.
+            partition_granularity: ``"hour"`` or ``"day"`` partitions on
+                ``wyrd_event_time``. Omitted while another layout argument is
+                set, ``"hour"`` is sent.
+            sort_keys: up to four ``SortKey`` mappings in priority order;
+                ``direction`` is ``"asc"`` or ``"desc"`` and ``null_order``
+                is ``"first"`` or ``"last"``. Omitted or empty, the table
+                sorts by ``wyrd_event_time`` descending with nulls last.
+            bloom_columns: extra columns to Bloom-filter. The managed
+                ``run_id``, ``card_uid``, and ``principal_id`` columns the
+                table has always come first, and naming one is harmless.
+                Omitted or empty, only those managed columns are filtered.
+            compaction_target_file_size_bytes: the file size Forge compacts
+                this table toward, at least 134217728 (128 MiB). Omitted, the
+                table follows the deployment default (1 GiB unless the
+                operator changed it).
+            compaction_type: ``"auto"``, ``"full"``, ``"small-files"``, or
+                ``"files-with-delete"``. Omitted, Forge compacts
+                ``small-files``. A copy-on-write table always compacts
+                ``full``.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` when ``table`` is not
+                ``namespace.name`` or the model schema has no column mapping;
+                ``WYRD_VALA_400_BIFROST_RESERVED_COLUMN`` for a reserved
+                column; ``WYRD_SPEC_400_VALIDATION`` for an unknown
+                granularity, sort-key, or compaction-type spelling. Column,
+                file-size, and stored-setting conflicts raise from
+                ``Bifrost.register()``.
+
+        """
+        ...
     @staticmethod
-    def from_arrow(
-        schema: pyarrow.Schema,
+    def from_json_schema(
         table: str,
+        schema: Mapping[str, Any],
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
         compaction_target_file_size_bytes: int | None = None,
+        compaction_type: str | None = None,
     ) -> TableConfig:
-        """Build from an explicit Arrow schema, for types JSON Schema cannot express."""
+        """Declare a table from a JSON Schema object, as Rust and TypeScript do.
+
+        Use this when the columns come from a schema document rather than a
+        Pydantic model; ``TableConfig()`` calls it with
+        ``model.model_json_schema()``. Each ``properties`` entry becomes one
+        user column, and ``required`` marks it non-nullable.
+
+        Args:
+            table: the ``"<namespace>.<name>"`` name SQL uses.
+            schema: a JSON Schema object with a ``properties`` mapping.
+                ``card_ref``, ``run_id``, and ``wyrd_*`` names are reserved.
+            partition_granularity: ``"hour"`` or ``"day"``, as for
+                ``TableConfig()``.
+            sort_keys: up to four ``SortKey`` mappings, as for
+                ``TableConfig()``.
+            bloom_columns: extra columns to Bloom-filter, as for
+                ``TableConfig()``.
+            compaction_target_file_size_bytes: the Forge compaction file
+                target, at least 134217728 bytes. Omitted, the deployment
+                default.
+            compaction_type: ``"auto"``, ``"full"``, ``"small-files"``, or
+                ``"files-with-delete"``. Omitted, ``small-files``.
+
+        Returns:
+            An unresolved config.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` when ``table`` is not
+                ``namespace.name`` or ``schema`` has no column mapping;
+                ``WYRD_VALA_400_BIFROST_RESERVED_COLUMN`` for a reserved
+                column; otherwise as for ``TableConfig()``.
+        """
+        ...
+    @staticmethod
+    def from_arrow(
+        table: str,
+        schema: pyarrow.Schema,
+        partition_granularity: str | None = None,
+        sort_keys: list[SortKey] | None = None,
+        bloom_columns: list[str] | None = None,
+        compaction_target_file_size_bytes: int | None = None,
+        compaction_type: str | None = None,
+    ) -> TableConfig:
+        """Declare a table from an explicit ``pyarrow.Schema``.
+
+        Use this for column types JSON Schema cannot express, such as
+        ``int32``, a non-UTC timestamp, or ``decimal128``. ``schema`` holds
+        user columns only; every other error is as for ``TableConfig()``.
+
+        Args:
+            table: the ``"<namespace>.<name>"`` name SQL uses.
+            schema: the declared user columns.
+            partition_granularity: ``"hour"`` or ``"day"``, as for
+                ``TableConfig()``.
+            sort_keys: up to four ``SortKey`` mappings, as for
+                ``TableConfig()``.
+            bloom_columns: extra columns to Bloom-filter, as for
+                ``TableConfig()``.
+            compaction_target_file_size_bytes: the Forge compaction file
+                target, at least 134217728 bytes. Omitted, the deployment
+                default.
+            compaction_type: ``"auto"``, ``"full"``, ``"small-files"``, or
+                ``"files-with-delete"``. Omitted, ``small-files``.
+
+        Returns:
+            An unresolved config.
+
+        Raises:
+            WyrdError: As for ``TableConfig()``.
+        """
         ...
     @staticmethod
     def describe(
         table: str,
-        server_url: str | None = None,
-        credential: str | None = None,
-        grpc_url: str | None = None,
-        tenant: str | None = None,
+        client: WyrdClient | None = None,
     ) -> TableConfig:
-        """Fetch an already-registered table's config by name."""
+        """Fetch an already-registered table's config by name.
+
+        The result is already resolved and carries the server's stored schema,
+        layout, and compaction settings.
+
+        Args:
+            table: the ``"<namespace>.<name>"`` table to describe.
+            client: the ``WyrdClient`` to act as. Omitted, the ambient client
+                resolves as for ``Bifrost()``.
+
+        Returns:
+            The resolved config.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND`` for an
+                unknown table, ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no
+                credential resolves, or the server's authorization or
+                transport error.
+
+        """
         ...
     @property
     def fqn(self) -> str:
@@ -178,11 +363,21 @@ class TableConfig:
         ...
     @property
     def arrow_schema(self) -> pyarrow.Schema:
-        """The declared user columns only."""
+        """The declared user columns only.
+
+        Correlation and managed columns are appended by the write path and the
+        server, so they are absent here by construction.
+        """
         ...
     @property
     def compaction_target_file_size_bytes(self) -> int | None:
-        """The explicit Forge compaction file target, or ``None`` for the deployment default."""
+        """The explicit Forge compaction file target, or ``None`` for the
+        server's deployment default."""
+        ...
+    @property
+    def compaction_type(self) -> str | None:
+        """The explicit Forge compaction type, or ``None`` for the
+        ``small-files`` default."""
         ...
     @property
     def resolved(self) -> ResolvedTable | None:
@@ -192,15 +387,54 @@ class TableConfig:
 class QueryResult:
     """Arrow batches from one query, converted on demand."""
 
-    def to_arrow(self) -> pyarrow.Table: ...
-    def to_polars(self) -> Any: ...
-    def to_pandas(self) -> Any: ...
-    def to_bytes(self) -> bytes: ...
+    def to_arrow(self) -> pyarrow.Table:
+        """Read the result as one ``pyarrow.Table``.
+
+        Returns:
+            Every batch concatenated under the result schema.
+        """
+        ...
     @property
-    def terminal(self) -> dict[str, Any]:
+    def batches(self) -> list[pyarrow.RecordBatch]:
+        """The result's Arrow record batches, in server order.
+
+        Returns:
+            One ``pyarrow.RecordBatch`` per batch the server streamed; empty
+            when no row matched.
+        """
+        ...
+    @property
+    def schema(self) -> pyarrow.Schema:
+        """The result's Arrow schema.
+
+        Returns:
+            The projected columns, present even when no row matched.
+        """
+        ...
+    @property
+    def num_rows(self) -> int:
+        """Total rows across every batch; the same count as ``len(result)``.
+
+        Returns:
+            The row count.
+        """
+        ...
+    def to_polars(self) -> Any:
+        """Read the result as a Polars DataFrame, zero-copy from Arrow."""
+        ...
+    def to_pandas(self) -> Any:
+        """Read the result as a pandas DataFrame."""
+        ...
+    def to_bytes(self) -> bytes:
+        """The raw Arrow IPC stream, for a caller with its own reader."""
+        ...
+    @property
+    def terminal(self) -> QueryTerminal:
         """The validated terminal frame the server closed the stream with."""
         ...
-    def __len__(self) -> int: ...
+    def __len__(self) -> int:
+        """Total rows across every batch."""
+        ...
 
 _Row = TypeVar("_Row", bound="RowModel")
 
@@ -208,7 +442,16 @@ class RowModel(Protocol):
     """Anything that validates one row mapping and returns itself typed."""
 
     @classmethod
-    def model_validate(cls: type[_Row], obj: Any, /) -> _Row: ...
+    def model_validate(cls: type[_Row], obj: Any, /) -> _Row:
+        """Validate one row mapping into an instance of this model.
+
+        Args:
+            obj: one row as a column-name mapping.
+
+        Returns:
+            The validated row.
+        """
+        ...
 
 class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
     """Synchronously yields Arrow batches from one terminal-safe query."""
@@ -220,7 +463,7 @@ class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
         """The server lifecycle request ID, available before completion."""
         ...
     @property
-    def terminal(self) -> dict[str, Any] | None:
+    def terminal(self) -> QueryTerminal | None:
         """Terminal metadata, present only after validated completion."""
         ...
     def close(self) -> None:
@@ -228,33 +471,71 @@ class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
         ...
 
 class _BifrostBase:
-    """Construction and the two non-IO operations both facades share."""
+    """Everything the sync and async clients share."""
 
     def __init__(
         self,
         table: TableConfig | None = None,
-        server_url: str | None = None,
-        credential: str | None = None,
-        grpc_url: str | None = None,
         client: WyrdClient | None = None,
-        tenant: str | None = None,
+        client_byte_limit_bytes: int | None = None,
     ) -> None:
-        """Connect one client; every argument resolves from the chain if omitted.
+        """Connect one client, optionally already bound to a write target.
 
-        ``client`` reuses an existing, possibly delegated, ``WyrdClient`` and
-        cannot be combined with ``server_url``, ``credential``, ``grpc_url``,
-        or ``tenant``.
+        Args:
+            table: the active write target. Omitted, the client is query-only
+                until ``use_table``.
+            client: the ``WyrdClient`` to act as, such as one returned by
+                ``on_behalf_of``, sharing its authentication and transport.
+                Omitted, the ambient client resolves from ``[client]`` in the
+                Wyrd ``config.toml``, then the environment, then the saved
+                ``wyrd auth login``.
+            client_byte_limit_bytes: the handle-wide ingestion byte budget
+                shared by every table this client writes. 256 MiB if omitted.
+
+        Raises:
+            WyrdError: ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no ambient
+                credential resolves;
+                ``WYRD_CLIENT_400_CONFIG_INVALID`` when the byte budget is too
+                small to seal one message.
+
         """
         ...
     def use_table(self, table: TableConfig) -> TableConfig | None:
-        """Bind ``table`` as the write target, returning the previous binding."""
+        """Bind ``table`` as the write target, returning the previous binding.
+
+        The previous table's producer stays pooled, so its buffered rows still
+        flush; a swap loses nothing.
+
+        Args:
+            table: the new write target.
+
+        Returns:
+            The previous binding, or ``None``.
+        """
         ...
     @property
     def table(self) -> TableConfig | None:
         """The active write binding, if any."""
         ...
     def insert(self, row: Any, correlation: Correlation | None = None) -> None:
-        """Enqueue one row into the active table; durable after ``flush()``."""
+        """Enqueue one row into the active table.
+
+        Non-blocking; the row is durable after ``flush()``. A saturated queue
+        refuses here rather than dropping silently.
+
+        Args:
+            row: a Pydantic model instance, a mapping, or a JSON object string
+                holding the table's declared columns.
+            correlation: optional ``card_ref`` and ``run_id`` for this row.
+                Omitted keys are stored as null.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unparsable
+                ``card_ref``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
+                is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
+                queue is full.
+
+        """
         ...
     @property
     def dropped(self) -> int:
@@ -266,50 +547,331 @@ class _BifrostBase:
         ...
 
 class Bifrost(_BifrostBase):
-    """Query any authorized table; write to the active one. Synchronous."""
+    """Query any authorized table; write to the active one.
 
-    def register(self) -> str: ...
-    def use_table_by_name(self, table: str) -> None: ...
-    def write_batch(self, table: str, batch: pyarrow.RecordBatch) -> None: ...
-    def flush(self) -> None: ...
-    def shutdown(self) -> None: ...
+    Synchronous. Use ``AsyncBifrost`` for the ``await`` surface — the same
+    methods on the same native client, differing only in who drives them.
+    """
+
+    def register(self) -> str:
+        """Create the active table; returns ``"created"`` or ``"already_exists"``.
+
+        Registering again with the same schema and settings is idempotent.
+
+        Returns:
+            ``"created"`` or ``"already_exists"``.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table is
+                bound; ``WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT`` or
+                ``WYRD_VALA_400_BIFROST_INVALID_COMPACTION_TARGET`` for a bad
+                layout or file target; ``WYRD_VALA_409_BIFROST_*_MISMATCH``
+                when the table exists with different columns, layout, or
+                compaction settings.
+
+        """
+        ...
+    def use_table_by_name(self, table: str) -> None:
+        """Bind the registered ``"<namespace>.<name>"`` table, describing it first.
+
+        Args:
+            table: the registered ``"<namespace>.<name>"`` table.
+
+        Raises:
+            WyrdError: as for ``TableConfig.describe()``.
+
+        """
+        ...
+    def write_batch(self, table: str, batch: pyarrow.RecordBatch) -> None:
+        """Write one already-built Arrow batch to ``table`` and await durability.
+
+        The precision write door, beside ``insert``: it names its destination
+        instead of using the active binding, carries correlation as ordinary
+        columns, and is durable when it returns, so no ``flush`` follows it.
+        Build the batch against ``TableConfig.describe(...).arrow_schema``; a
+        canonical table compares an incoming block against its declared fields
+        exactly, metadata included.
+
+        Args:
+            table: the destination ``"<namespace>.<name>"`` table.
+            batch: the rows, built against the table's Arrow schema.
+
+        Raises:
+            WyrdError: the batch exceeded the byte envelope, or the server
+                refused it; the stable ``code`` says which.
+
+        """
+        ...
+    def flush(self) -> None:
+        """Flush every pooled producer and await each durable acknowledgement.
+
+        Raises:
+            WyrdError: the first producer or server failure, after every
+                producer has been attempted.
+
+        """
+        ...
+    def shutdown(self) -> None:
+        """Drain every producer and stop its background task.
+
+        Raises:
+            WyrdError: as for ``flush()``.
+
+        """
+        ...
     @overload
-    def sql(self, query: str) -> QueryResult: ...
+    def sql(self, query: str, params: Sequence[QueryParam] | None = None) -> QueryResult: ...
     @overload
-    def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
+    def sql(
+        self, query: str, params: Sequence[QueryParam] | None = None, *, model: type[_Row]
+    ) -> list[_Row]:
+        """Run one SQL SELECT over any authorized table and collect every batch.
+
+        ``params`` bind the ``$1..$n`` placeholders in order as typed values;
+        they are never interpolated into ``query``. Passing ``model``
+        validates every row through it locally and returns model instances
+        instead of the Arrow-backed ``QueryResult``.
+
+        Args:
+            query: one SELECT statement.
+            params: typed values for the ``$1..$n`` placeholders.
+            model: a row model that validates each row.
+
+        Returns:
+            A ``QueryResult``, or a list of ``model`` instances.
+
+        Raises:
+            WyrdError: invalid or refused SQL, an authorization or transport
+                failure, or ``WYRD_VALA_502_QUERY_STREAM_INCOMPLETE`` when
+                the response ends without its terminal frame.
+            pydantic.ValidationError: a row did not fit ``model``.
+        """
+        ...
     def stream(
         self,
         query: str,
-        *,
+        params: Sequence[QueryParam] | None = None,
         deadline_ms: int | None = None,
-    ) -> BifrostBatchIterator: ...
-    def running(self) -> list[RunningQuery]: ...
-    def status(self, request_id: str) -> RunningQuery: ...
-    def cancel(self, request_id: str) -> CancelRunningQueryResult: ...
-    def describe_table(self, namespace: str, name: str) -> TableDescription: ...
+    ) -> BifrostBatchIterator:
+        """Run one SQL SELECT and iterate its batches as they arrive.
+
+        Args:
+            query: one SELECT statement.
+            params: typed values for the ``$1..$n`` placeholders.
+            deadline_ms: the query deadline, from 1 to 4294967295
+                milliseconds. Omitted, the server's default deadline applies.
+
+        Returns:
+            An iterator over the result batches.
+
+        Raises:
+            WyrdError: an invalid request or a transport failure when the
+                query starts; later failures raise during iteration.
+
+        """
+        ...
+    def running(self) -> list[RunningQuery]:
+        """List the authenticated tenant's active queries.
+
+        Returns:
+            The tenant's active queries.
+
+        Raises:
+            WyrdError: The server's refusal or a transport failure.
+        """
+        ...
+    def status(self, request_id: str) -> RunningQuery:
+        """Return one active query by the ``request_id`` its stream reported.
+
+        Args:
+            request_id: the ``request_id`` a stream reported.
+
+        Returns:
+            The active query.
+
+        Raises:
+            WyrdError: a malformed ID, or the server's refusal or a
+                transport failure.
+
+        """
+        ...
+    def cancel(self, request_id: str) -> CancelRunningQueryResult:
+        """Request server-side cancellation without closing a local stream.
+
+        Repeating the request is harmless.
+
+        Args:
+            request_id: the ``request_id`` a stream reported.
+
+        Returns:
+            The cancellation result.
+
+        Raises:
+            WyrdError: As for ``status()``.
+        """
+        ...
+    def describe_table(self, namespace: str, name: str) -> TableDescription:
+        """Describe the registered ``namespace.name`` table's stored schema and layout.
+
+        Args:
+            namespace: the table namespace.
+            name: the table name.
+
+        Returns:
+            The stored schema and layout.
+
+        Raises:
+            WyrdError: ``WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND`` or an
+                authorization or transport failure.
+
+        """
+        ...
 
 class AsyncBifrost(_BifrostBase):
-    """The ``await`` surface over the same native client."""
+    """The ``await`` surface over the same native client.
 
-    async def register(self) -> str: ...
-    async def use_table_by_name(self, table: str) -> None: ...
-    async def write_batch(self, table: str, batch: pyarrow.RecordBatch) -> None: ...
-    async def flush(self) -> None: ...
-    async def shutdown(self) -> None: ...
+    Every blocking native call runs in a worker thread, so the event loop is
+    never blocked. ``insert`` and ``use_table`` stay synchronous because they
+    perform no IO. Each method behaves as its ``Bifrost`` counterpart.
+    """
+
+    async def register(self) -> str:
+        """Create the active table; returns ``"created"`` or ``"already_exists"``.
+
+        Returns:
+            ``"created"`` or ``"already_exists"``.
+
+        Raises:
+            WyrdError: As for ``Bifrost.register()``.
+        """
+        ...
+    async def use_table_by_name(self, table: str) -> None:
+        """Bind the registered ``"<namespace>.<name>"`` table, describing it first.
+
+        Args:
+            table: the registered ``"<namespace>.<name>"`` table.
+
+        Raises:
+            WyrdError: As for ``TableConfig.describe()``.
+        """
+        ...
+    async def write_batch(self, table: str, batch: pyarrow.RecordBatch) -> None:
+        """Write one already-built Arrow batch to ``table`` and await durability.
+
+        Args:
+            table: the destination ``"<namespace>.<name>"`` table.
+            batch: the rows, built against the table's Arrow schema.
+
+        Raises:
+            WyrdError: As for ``Bifrost.write_batch()``.
+        """
+        ...
+    async def flush(self) -> None:
+        """Flush every pooled producer and await each durable acknowledgement.
+
+        Raises:
+            WyrdError: As for ``Bifrost.flush()``.
+        """
+        ...
+    async def shutdown(self) -> None:
+        """Drain every producer and stop its background task.
+
+        Raises:
+            WyrdError: As for ``Bifrost.flush()``.
+        """
+        ...
     @overload
-    async def sql(self, query: str) -> QueryResult: ...
+    async def sql(self, query: str, params: Sequence[QueryParam] | None = None) -> QueryResult: ...
     @overload
-    async def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
+    async def sql(
+        self, query: str, params: Sequence[QueryParam] | None = None, *, model: type[_Row]
+    ) -> list[_Row]:
+        """Run one SQL SELECT over any authorized table and collect every batch.
+
+        Args:
+            query: one SELECT statement.
+            params: typed values for the ``$1..$n`` placeholders.
+            model: a row model that validates each row.
+
+        Returns:
+            A ``QueryResult``, or a list of ``model`` instances.
+
+        Raises:
+            WyrdError: As for ``Bifrost.sql()``.
+            pydantic.ValidationError: a row did not fit ``model``.
+        """
+        ...
     async def stream(
         self,
         query: str,
-        *,
+        params: Sequence[QueryParam] | None = None,
         deadline_ms: int | None = None,
-    ) -> BifrostQueryStream: ...
-    async def running(self) -> list[RunningQuery]: ...
-    async def status(self, request_id: str) -> RunningQuery: ...
-    async def cancel(self, request_id: str) -> CancelRunningQueryResult: ...
-    async def describe_table(self, namespace: str, name: str) -> TableDescription: ...
+    ) -> BifrostQueryStream:
+        """Start one query and iterate its batches with ``async for``.
+
+        Args:
+            query: one SELECT statement.
+            params: typed values for the ``$1..$n`` placeholders.
+            deadline_ms: the query deadline, from 1 to 4294967295
+                milliseconds. Omitted, the server's default deadline applies.
+
+        Returns:
+            An async iterator over the result batches.
+
+        Raises:
+            WyrdError: As for ``Bifrost.stream()``.
+        """
+        ...
+    async def running(self) -> list[RunningQuery]:
+        """List the authenticated tenant's active queries.
+
+        Returns:
+            The tenant's active queries.
+
+        Raises:
+            WyrdError: The server's refusal or a transport failure.
+        """
+        ...
+    async def status(self, request_id: str) -> RunningQuery:
+        """Return one active query by its ``request_id``.
+
+        Args:
+            request_id: the ``request_id`` a stream reported.
+
+        Returns:
+            The active query.
+
+        Raises:
+            WyrdError: As for ``Bifrost.status()``.
+        """
+        ...
+    async def cancel(self, request_id: str) -> CancelRunningQueryResult:
+        """Request server-side cancellation without closing a local stream.
+
+        Args:
+            request_id: the ``request_id`` a stream reported.
+
+        Returns:
+            The cancellation result.
+
+        Raises:
+            WyrdError: As for ``Bifrost.status()``.
+        """
+        ...
+    async def describe_table(self, namespace: str, name: str) -> TableDescription:
+        """Describe the registered ``namespace.name`` table's stored schema and layout.
+
+        Args:
+            namespace: the table namespace.
+            name: the table name.
+
+        Returns:
+            The stored schema and layout.
+
+        Raises:
+            WyrdError: As for ``Bifrost.describe_table()``.
+        """
+        ...
 
 __all__ = [
     "AsyncBifrost",
@@ -322,7 +884,9 @@ __all__ = [
     "DataTypeSpecVariants",
     "FieldSpec",
     "PhysicalLayout",
+    "QueryParam",
     "QueryResult",
+    "QueryTerminal",
     "ResolvedTable",
     "RowModel",
     "RunningQuery",

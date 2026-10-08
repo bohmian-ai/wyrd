@@ -21,6 +21,10 @@ impl VersionBlock {
     /// `u64`s that format to a valid semver triple. Used to seed a
     /// `VersionBlock` from a `VersionBounds::lower()` value on the register
     /// path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the formatted triple fails to parse, which three integers cannot cause.
     #[must_use]
     pub fn from_triple(triple: SemverTriple) -> Self {
         Self::parse(format!(
@@ -121,6 +125,10 @@ impl VersionBlock {
     }
 
     /// Sort versions by semantic version precedence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a `VersionBlock` holds an invalid semver triple, which construction rules out.
     pub fn sort_versions(versions: &mut [Self]) {
         versions.sort_by(|left, right| {
             left.semver()

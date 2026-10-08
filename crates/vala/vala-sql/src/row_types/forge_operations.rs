@@ -494,11 +494,8 @@ impl ForgeExpirationSettlement {
 /// Outcome of applying the internal `Prepared -> Reset` expiration transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeExpirationResetOutcome {
-    /// The reset applied: claims were deleted and planning demand advanced.
-    Applied {
-        /// Planning-demand generation the same transaction advanced to.
-        demand_generation: i64,
-    },
+    /// The reset applied: claims were deleted and the task was cancelled.
+    Applied,
     /// A matching reset was already durable; nothing was written again.
     AlreadyApplied,
 }

@@ -14,9 +14,9 @@ All tables are pre-declared `DomainTable` instances registered at boot. The phys
 
 ### Shared signal tables
 
-**Namespace:** `vala.traces`, `vala.metrics`, `vala.logs`, `vala.eval`, `vala.drift`, `vala.dev`
+**Namespace:** `vala.traces`, `vala.metrics`, `vala.logs`, `vala.drift`, `vala.eval`, `vala.verification`
 
-**Partitioning:** `Day(event_time) + Bucket(tenant, 64)`
+**Partitioning:** one time transform on `wyrd_event_time`. The OpenTelemetry tables (`vala.traces.spans`, `vala.metrics.points`, `vala.logs.records`) partition by UTC hour. The five verification tables (`vala.drift.observations`, `vala.eval.observations`, `vala.verification.results`, `vala.drift.result_features`, `vala.eval.result_items`) partition by UTC day, so a Verification Result and its detail rows, which share one event time, never split across partitions. Bifrost has no bucket, identity, or tenant partition transform.
 
 **Tenant isolation:** tenant-qualified physical table + per-file footer tenant proof
 
@@ -26,7 +26,7 @@ Each tenant writes to its own tenant-qualified physical table. Every Parquet fil
 
 **Namespace:** `vala.datasets.<tenant_uuid>.<name>`
 
-**Partitioning:** `Day(event_time) + Bucket(tenant, 64)` (collapses to 1 slot for single-tenant tables)
+**Partitioning:** the hour or day transform on `wyrd_event_time` declared at registration; hourly when the registration declares no layout
 
 **Tenant isolation:** Physical namespace + per-file footer tenant proof
 
@@ -36,12 +36,14 @@ User-defined datasets for high-volume custom observability writes. Each tenant g
 
 | Column | Physical type | Description |
 |---|---|---|
-| `wyrd_event_time` | `Timestamp(µs, UTC)` | Canonical event time for partitioning and windowing |
-| `wyrd_ingested_at` | `Timestamp(µs, UTC)` | Server-side flush wall clock |
-| `wyrd_batch_id` | `FixedSizeBinary(16)` | Batch deduplication key |
 | `run_id` | `Utf8` (nullable) | Correlation: job/experiment run |
 | `card_uid` | `Utf8` (nullable) | Correlation: owning Card |
-| `principal_id` | `Utf8` (nullable) | Correlation: emitting principal |
+| `principal_id` | `Utf8` | Correlation: emitting principal |
+| `wyrd_request_id` | `Utf8` | Admitting request identity |
+| `wyrd_event_time` | `Timestamp(µs, UTC)` | When the observed thing happened: the caller's value, or `wyrd_ingested_at` when absent; partitions and windows the table |
+| `wyrd_ingested_at` | `Timestamp(µs, UTC)` | When Wyrd accepted the batch: one PostgreSQL timestamp per batch, read at admission; never caller-supplied |
+
+Tables registered with `CorrelationPolicy::None` (for example `vala.system.audit_log`) carry only `wyrd_event_time` and `wyrd_ingested_at`; `CorrelationPolicy::CodeAxis` tables declare their own `run_id`.
 
 ## vala.traces.spans
 
@@ -137,31 +139,107 @@ Source type: `DriftRecordObservation`.
 | `series` | `Utf8` |
 | `num_value` | `Float64` nullable |
 | `str_value` | `Utf8` nullable |
+| `session_id` | `Utf8` nullable |
 | `created_at` | `Timestamp(µs, UTC)` |
 | + system columns | |
 
-## vala.dev.agent_traces
+One row per observed feature; rows from one observation share `record_id`. The
+observed subject is the managed `card_uid`, so the table carries no Verifier or
+binding identity.
 
-Source type: `AgentTraceRecord`.
+## vala.eval.observations
+
+One row per committed Eval input record. A committed row activates every
+matching `observations_ready` binding. The observed subject is the managed
+`card_uid`.
 
 | Column | Physical type |
 |---|---|
-| `dev_session_id` | `Utf8` |
-| `repo` | `Utf8` |
-| `commit_sha` | `Utf8` nullable |
-| `branch` | `Utf8` nullable |
-| `run_id` | `Utf8` |
+| `record_id` | `Utf8` |
+| `session_id` | `Utf8` nullable |
+| `context` | `Utf8` (canonical JSON), **payload-gated** |
+| `trace_id` | `FixedSizeBinary(16)` nullable |
+| `span_id` | `FixedSizeBinary(8)` nullable |
+| `created_at` | `Timestamp(µs, UTC)` |
+| `media` | `Utf8` (canonical JSON) nullable, **payload-gated** |
+| + system columns | |
+
+## vala.verification.results
+
+Exactly one row per completed Drift or Eval Verifier run. Errored, timed-out,
+and running executions have no row. The managed `run_id` is the Verifier run
+and the managed `card_uid` is the Verifier Card.
+
+| Column | Physical type |
+|---|---|
+| `result_id` | `Utf8` |
+| `implementation` | `Utf8` |
+| `execution_status` | `Utf8` |
+| `verdict` | `Utf8` |
+| `verifier_version` | `Utf8` |
+| `owner_card_uid` | `Utf8` nullable |
+| `subject_card_uid` | `Utf8` |
+| `binding_id` | `Utf8` nullable |
+| `trigger_identity` | `Utf8` nullable |
+| `source_record_id` | `Utf8` nullable |
+| `window_start` | `Timestamp(µs, UTC)` nullable |
+| `window_end` | `Timestamp(µs, UTC)` nullable |
 | `started_at` | `Timestamp(µs, UTC)` |
 | `ended_at` | `Timestamp(µs, UTC)` |
-| `messages` | `Utf8`, **payload-gated** |
-| `tool_io` | `Utf8` nullable, **payload-gated** |
+| `details` | `Utf8` nullable, **payload-gated** |
+| + system columns | |
+
+## vala.drift.result_features
+
+One row per scored feature of one Drift result.
+
+| Column | Physical type |
+|---|---|
+| `result_id` | `Utf8` |
+| `owner_card_uid` | `Utf8` nullable |
+| `subject_card_uid` | `Utf8` |
+| `binding_id` | `Utf8` nullable |
+| `window_start` | `Timestamp(µs, UTC)` |
+| `window_end` | `Timestamp(µs, UTC)` |
+| `method` | `Utf8` |
+| `feature` | `Utf8` |
+| `score` | `Float64` nullable |
+| `threshold` | `Float64` nullable |
+| `verdict` | `Utf8` |
+| + system columns | |
+
+## vala.eval.result_items
+
+One row per executed or skipped task outcome of one Eval result. Columns that
+only an executed task fills are nullable; `skip_reason` and `upstream_task_id`
+are set only for a skip.
+
+| Column | Physical type |
+|---|---|
+| `result_id` | `Utf8` |
+| `owner_card_uid` | `Utf8` nullable |
+| `subject_card_uid` | `Utf8` |
+| `binding_id` | `Utf8` nullable |
+| `source_record_id` | `Utf8` |
+| `task_id` | `Utf8` |
+| `outcome_kind` | `Utf8` |
+| `passed` | `Bool` nullable |
+| `actual` | `Utf8` nullable, **payload-gated** |
+| `expected` | `Utf8` nullable, **payload-gated** |
+| `operator` | `Utf8` nullable |
+| `message` | `Utf8` nullable, **payload-gated** |
+| `stage` | `Int32` nullable |
+| `started_at` | `Timestamp(µs, UTC)` nullable |
+| `duration_ms` | `Int64` nullable |
+| `skip_reason` | `Utf8` nullable |
+| `upstream_task_id` | `Utf8` nullable |
 | + system columns | |
 
 ## Type mapping
 
 | Arrow physical type | API wire type | Notes |
 |---|---|---|
-| `FixedSizeBinary(16)` | `String` (lowercase hex) | trace_id, batch_id |
+| `FixedSizeBinary(16)` | `String` (lowercase hex) | trace_id |
 | `FixedSizeBinary(8)` | `String` (lowercase hex) | span_id |
 | `Timestamp(µs, UTC)` | `DateTime<Utc>` (RFC3339) | All timestamps |
 | `Utf8` | `String` or `serde_json::Value` | Attributes are JSON-parsed |

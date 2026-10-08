@@ -7,6 +7,7 @@ use serde::Deserialize;
 use wyrd_spec::card::workflow::ExternalGatewayBindingConfig;
 use wyrd_spec::ids::CredentialBindingName;
 
+use crate::environment::Environment;
 use crate::error::WyrdClientError;
 
 /// Global configuration loaded from the user's Wyrd config directory.
@@ -71,14 +72,34 @@ impl GlobalConfig {
     ///
     /// A missing directory or file is equivalent to an empty configuration.
     /// Invalid TOML or an unknown field is returned to the caller.
+    ///
+    /// # Errors
+    /// Returns the errors of [`GlobalConfig::load_from`].
     pub fn load() -> Result<Self, WyrdClientError> {
-        let Some(directory) = wyrd_utils::config_dir::wyrd_config_dir() else {
+        Self::load_in(&Environment::Process)
+    }
+
+    /// Load `config.toml` from the Wyrd config directory `environment`
+    /// resolves.
+    ///
+    /// A missing directory or file is equivalent to an empty configuration.
+    ///
+    /// # Arguments
+    /// * `environment` - Variables that resolve the Wyrd config directory.
+    ///
+    /// # Errors
+    /// Returns the errors of [`GlobalConfig::load_from`].
+    pub fn load_in(environment: &Environment) -> Result<Self, WyrdClientError> {
+        let Some(directory) = environment.config_dir() else {
             return Ok(Self::default());
         };
         Self::load_from(&directory.join("config.toml"))
     }
 
     /// Load a global config from an explicit path.
+    ///
+    /// # Arguments
+    /// * `path` - Path of the TOML config file to read.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::Config`] when the file cannot be read or

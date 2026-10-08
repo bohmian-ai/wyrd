@@ -636,6 +636,10 @@ mod spc_score {
     /// # Panics
     /// Panics when a calm target signals.
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn in_control_target_passes_with_evidence() {
         let report = score(&[9.5, 10.5, 10.0, 10.0]);
         let x = &report.features[&feature("x")];
@@ -656,6 +660,10 @@ mod spc_score {
     /// # Panics
     /// Panics when either chart misses its signal.
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn each_chart_signals_independently() {
         // Mean 12 (X-bar signal, sd 0); then mean 10 with sd 2.83 (S signal).
         let report = score(&[12.0, 12.0, 8.0, 12.0]);

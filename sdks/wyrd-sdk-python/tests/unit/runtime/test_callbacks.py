@@ -1,41 +1,37 @@
-from wyrd import Agent, FinishReason, Prompt, WyrdError
+"""Agent callbacks see a typed context and can replace or abort a model call."""
+
+from wyrd import Agent, FinishReason, Prompt, ProviderResponse, WyrdError
+from wyrd.agent import CallbackContext, Role
 
 
-def test_before_model_callback_fires_with_ambient_mock() -> None:
-    calls: list[dict] = []
+def test_callback_context_is_typed() -> None:
+    seen: list[CallbackContext] = []
 
     def before_model(ctx, request):
-        calls.append({"ctx": ctx, "request": request})
+        seen.append(ctx)
         return None
 
-    prompt = Prompt(["hello"], "mock-model", provider="mock")
-    agent = Agent(prompt=prompt, before_model_callback=before_model)
+    agent = Agent(
+        prompt=Prompt(["hello"], "mock-model", provider="mock"),
+        before_model_callback=before_model,
+    )
+    agent.run("hello")
 
-    run = agent.run("hello")
-
-    assert "hello" in run.output
-    assert calls
-    assert calls[0]["ctx"]["agent_id"] == agent.id
+    ctx = seen[0]
+    assert isinstance(ctx, CallbackContext)
+    assert ctx.agent_id == agent.id
+    assert ctx.session_id is None
+    assert ctx.iteration == 0
+    assert len(ctx.conversation) == len(ctx.conversation.turns) >= 1
+    user_turns = [turn for turn in ctx.conversation.turns if turn.role == Role.User]
+    assert user_turns
+    assert user_turns[-1].content == "hello"
+    assert user_turns[-1].to_dict()["type"] == "user"
 
 
 def test_after_model_replace_with_changes_output() -> None:
     def after_model(ctx, response):
-        return {
-            "id": "replacement",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "mock-model",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": "synthetic",
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-        }
+        return ProviderResponse.text("synthetic")
 
     agent = Agent(
         prompt=Prompt(["hello"], "mock-model", provider="mock"),

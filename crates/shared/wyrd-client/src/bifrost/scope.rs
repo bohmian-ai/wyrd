@@ -1,10 +1,12 @@
 //! Producer-pool identity: [`SinkKind`], [`ClientScope`], and the credential
 //! fingerprint the token-opaque client tier can compute.
 
+#[cfg(feature = "internal")]
 use crate::config::ClientConfig;
 use crate::transport::ResolvedCredential;
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
+#[cfg(feature = "internal")]
 use wyrd_spec::error::WyrdError;
 
 /// The observation-kind discriminant that keys the producer pool.
@@ -41,9 +43,14 @@ impl ClientScope {
     /// `resolve_credential()` and its exposed secret bytes are hashed; the JWT
     /// is never parsed.
     ///
+    /// # Arguments
+    /// * `config` - The client configuration whose base URL and resolved
+    ///   credential key the scope.
+    ///
     /// # Errors
     /// Returns [`WyrdError`] mapped from [`WyrdClientError`](crate::error::WyrdClientError) when the credential
     /// chain yields nothing (`WYRD_CLIENT_401_NO_CREDENTIALS`).
+    #[cfg(feature = "internal")]
     pub fn from_config(config: &ClientConfig) -> Result<Self, WyrdError> {
         let credential = config.resolve_credential().map_err(WyrdError::from)?;
         Ok(Self {
@@ -60,9 +67,13 @@ impl ClientScope {
     /// different credential than the one its requests carry.
     ///
     /// [`AuthMiddleware`]: crate::auth::AuthMiddleware
+    ///
+    /// # Arguments
+    /// * `client` - The assembled client whose bound base URL and credential key
+    ///   the scope.
     #[must_use]
-    pub fn from_client(client: &crate::WyrdClient) -> Self {
-        let auth = client.auth();
+    pub(crate) fn from_client(client: &crate::WyrdClient) -> Self {
+        let auth = &client.auth;
         Self {
             server_url: auth.base_url().trim_end_matches('/').to_owned(),
             credential_fingerprint: fingerprint_credential(auth.credential()),
@@ -71,12 +82,14 @@ impl ClientScope {
 
     /// The server base URL this scope is bound to.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn server_url(&self) -> &str {
         &self.server_url
     }
 
     /// The SHA-256 hex fingerprint of the resolved credential's secret material.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn credential_fingerprint(&self) -> &str {
         &self.credential_fingerprint
     }

@@ -41,6 +41,10 @@ pub struct PublicWyrdGatewayCaller {
 
 impl PublicWyrdGatewayCaller {
     /// Bind the caller to an assembled client.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client every gateway call is sent through,
+    ///   as its principal.
     #[must_use]
     pub fn new(client: WyrdClient) -> Self {
         Self { client }
@@ -95,7 +99,7 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
             .collect();
         let send = self
             .client
-            .http()
+            .http
             .post_native(&native.path, native.body, &headers);
         let (status, body) = tokio::select! {
             biased;

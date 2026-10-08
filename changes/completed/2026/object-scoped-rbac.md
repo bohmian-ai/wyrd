@@ -19,4 +19,3 @@ Current owners and evidence:
 - [Security posture](../../../architecture/wyrd-security-posture.md) and [Bifrost design](../../../architecture/bifrost-design.md).
 - [Scope contracts](../../../crates/wyrd-spec/src/auth/permission_scope.rs), [runtime permissions](../../../crates/shared/wyrd-runtime/src/permission.rs), and [Oracle enforcement](../../../crates/vala/vala-bifrost-redux/src/oracle/mod.rs).
 - [Scoped-role server journey](../../../crates/wyrd/wyrd-testing/tests/bifrost/server/query.rs).
-

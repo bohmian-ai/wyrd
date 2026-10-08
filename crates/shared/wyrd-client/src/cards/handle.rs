@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::WyrdClient;
+#[cfg(feature = "internal")]
 use futures_util::StreamExt;
+#[cfg(feature = "internal")]
 use reqwest::Method;
-use secrecy::SecretString;
 use tempfile::TempDir;
 use wyrd_loader::RegistrationInput;
 use wyrd_semver::VersionBlock;
@@ -14,17 +15,22 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{GetCardResponse, ListCardsRequest, ListCardsResponse};
+#[cfg(feature = "internal")]
+use wyrd_spec::registry::GetCardResponse;
+use wyrd_spec::registry::{ListCardsRequest, ListCardsResponse};
+#[cfg(feature = "internal")]
 use wyrd_spec::storage::{DownloadInitRequest, DownloadInitResponse};
 
-use crate::cards::RegistrationReceipt;
-use crate::cards::config;
+#[cfg(feature = "internal")]
 use crate::cards::download;
+#[cfg(feature = "internal")]
 use crate::cards::download_progress::DownloadProgressDisplay;
 use crate::cards::engine::{RegistryContext, RegistryEngine};
+#[cfg(feature = "internal")]
 use crate::cards::error::RegistryEngineError;
 use crate::cards::progress::RegistrationProgressSink;
 use crate::cards::reads;
+use crate::cards::{CardGraphHydrator, HydrationMode, HydrationSummary, RegistrationReceipt};
 
 /// A read-time Card lookup request.
 ///
@@ -62,6 +68,11 @@ pub enum CardSelector {
 
 impl CardSelector {
     /// Build a named selector whose read default is latest Active.
+    ///
+    /// # Arguments
+    /// * `kind` - The Card kind.
+    /// * `space` - The Card space.
+    /// * `name` - The Card name.
     #[must_use]
     pub fn named(kind: CardKind, space: SpaceName, name: CardName) -> Self {
         Self::Named {
@@ -73,12 +84,19 @@ impl CardSelector {
     }
 
     /// Build an exact selector from a resolved Card reference.
+    ///
+    /// # Arguments
+    /// * `card_ref` - The exact reference to select, including its optional UID.
     #[must_use]
     pub fn exact(card_ref: CardRef) -> Self {
         Self::Exact(card_ref)
     }
 
     /// Build an exact UID selector.
+    ///
+    /// # Arguments
+    /// * `kind` - The Card kind owning the UID.
+    /// * `uid` - The exact Card UID.
     #[must_use]
     pub fn uid(kind: CardKind, uid: CardUid) -> Self {
         Self::Uid {
@@ -91,16 +109,19 @@ impl CardSelector {
     }
 
     /// Add an exact version assertion to a selector.
+    ///
+    /// # Arguments
+    /// * `version` - The exact version the selected Card must have.
     #[must_use]
     pub fn with_version(mut self, version: VersionBlock) -> Self {
         match &mut self {
-            Self::Named {
-                version: selected, ..
-            } => *selected = Some(version),
             Self::Exact(CardRef {
                 version: selected, ..
             }) => *selected = version,
-            Self::Uid {
+            Self::Named {
+                version: selected, ..
+            }
+            | Self::Uid {
                 version: selected, ..
             } => *selected = Some(version),
         }
@@ -108,6 +129,10 @@ impl CardSelector {
     }
 
     /// Add optional identity assertions to a UID selector.
+    ///
+    /// # Arguments
+    /// * `space` - The space the UID's Card must have, or `None`.
+    /// * `name` - The name the UID's Card must have, or `None`.
     #[must_use]
     pub fn with_identity_assertions(
         mut self,
@@ -148,32 +173,28 @@ pub struct Cards {
 }
 
 impl Cards {
-    /// Construct a registry handle from global client configuration with
-    /// optional explicit server URL, credential, and tenant selector
-    /// overrides.
+    /// Construct a registry handle over the ambient client.
     ///
-    /// `tenant` (a tenant route key) replaces the configured
-    /// `WYRD_TENANT` selector of the saved user login. No network or token
-    /// exchange occurs during construction.
+    /// The client resolves the global configuration file, then the
+    /// environment, then the saved user login selected by `WYRD_TENANT`, as
+    /// [`WyrdClient::from_global`] does. No network or token exchange occurs
+    /// during construction.
     ///
     /// # Errors
-    /// Returns a Wyrd error when the local configuration, credential override,
-    /// or saved-login selection cannot be loaded.
-    pub fn new(
-        server_url: Option<&str>,
-        credential: Option<SecretString>,
-        tenant: Option<&str>,
-    ) -> Result<Self, WyrdError> {
-        let client = config::load(server_url, credential, tenant).map_err(WyrdError::from)?;
-        Ok(Self {
-            engine: RegistryEngine::new(client),
-        })
+    /// Returns a Wyrd error when the global configuration cannot be read, no
+    /// credential resolves, or the saved-login selection fails.
+    pub fn from_env() -> Result<Self, WyrdError> {
+        let client = WyrdClient::from_global().map_err(WyrdError::from)?;
+        Ok(Self::with_client(client))
     }
 
-    /// Construct a handle around an already assembled client.
+    /// Construct a handle that calls the server as `client`'s principal.
     ///
-    /// This advanced seam is intended for tests and embedding. It bypasses
-    /// profile resolution while retaining the same shared transport stack.
+    /// Every registry read, write, and artifact transfer this handle and its
+    /// clones issue shares `client`'s transport and token cache.
+    ///
+    /// # Arguments
+    /// * `client` - The authenticated client every call is sent through.
     #[must_use]
     pub fn with_client(client: WyrdClient) -> Self {
         Self {
@@ -187,23 +208,32 @@ impl Cards {
     /// registry selection, server download-plan creation, bounded transfer, and
     /// integrity verification; no Card receives a registry or storage handle.
     ///
+    /// # Arguments
+    /// * `card_uid` - The exact Card whose artifact inventory is downloaded.
+    /// * `destination` - The directory the verified artifacts are published
+    ///   to; an existing directory is replaced only after every transfer
+    ///   verifies.
+    ///
     /// # Errors
     /// Returns a Wyrd error when inventory lookup, destination preparation,
     /// transfer, or integrity verification fails.
+    #[cfg(feature = "internal")]
     pub async fn download_artifacts_to(
         &self,
         card_uid: &CardUid,
-        destination: &Path,
+        destination: impl AsRef<Path>,
     ) -> Result<(), WyrdError> {
-        ArtifactMaterializer::new(self, card_uid, destination)
+        ArtifactMaterializer::new(self, card_uid, destination.as_ref())
             .materialize()
             .await
     }
+
     /// Clone the authenticated context for another focused registry capability.
     ///
     /// The returned context shares this handle's transport, authentication
     /// cache, and storage client without exposing their implementation types.
     #[must_use]
+    #[cfg(feature = "internal")]
     pub fn registry_context(&self) -> RegistryContext {
         RegistryContext::new(Arc::clone(&self.engine))
     }
@@ -213,25 +243,22 @@ impl Cards {
     /// The loader resolves the document and its local source context before this method
     /// delegates the durable write to [`Self::register`].
     ///
+    /// # Arguments
+    /// * `path` - A Card file, or a bundle directory whose Card files and
+    ///   their local sources are registered together.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the document cannot be loaded or converted into a registration
-    /// request, or when the registry rejects the registration.
-    pub async fn register_from_path(&self, path: &Path) -> Result<RegistrationReceipt, WyrdError> {
-        let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
-            message: format!("card tree failed to load: {error}"),
-            // The loader counts its diagnostics in `Display` but carries the
-            // per-file code, span, message, and remediation on the value. An
-            // author who only sees the count cannot fix the tree, so the
-            // structured diagnostics travel in the error details.
-            details: serde_json::json!({ "path": path, "diagnostics": error.diagnostics }),
-        })?;
-        let input = wyrd_loader::build_registration_input(tree).map_err(|error| {
-            WyrdError::RegistryInvalidCardSpec {
-                message: format!("card tree failed validation: {error}"),
-                details: serde_json::json!({ "path": path, "error": error.to_string() }),
-            }
-        })?;
+    /// Returns `WYRD_LOADER_400_INVALID_ENVELOPE`, carrying the loader's per-file
+    /// diagnostics, when the document cannot be loaded or converted into a
+    /// registration request (the same code `wyrd apply` reports for that tree),
+    /// or the registry's error when it rejects the registration.
+    pub async fn register_from_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<RegistrationReceipt, WyrdError> {
+        let tree = wyrd_loader::load(path.as_ref())?;
+        let input = wyrd_loader::build_registration_input(tree)?;
         self.register(&input).await
     }
 
@@ -241,6 +268,9 @@ impl Cards {
     /// Native language card holders lower into this input at their language
     /// adapter boundary. Local source paths are consumed only by the private
     /// saga and never enter the request body.
+    ///
+    /// # Arguments
+    /// * `input` - The loader-produced registration input, including local artifact sources.
     ///
     /// # Errors
     /// Returns a Wyrd error when validation, registration, artifact upload, or
@@ -262,6 +292,10 @@ impl Cards {
     /// own synchronization; the callback itself must be safe to call from
     /// multiple asynchronous tasks.
     ///
+    /// # Arguments
+    /// * `input` - The loader-produced registration input, including local artifact sources.
+    /// * `progress` - The callback that receives each typed progress event.
+    ///
     /// # Errors
     /// Returns a Wyrd error when validation, registration, artifact upload, or
     /// server-owned completion fails.
@@ -277,6 +311,9 @@ impl Cards {
 
     /// Fetch one Card envelope using exact or latest selector semantics.
     ///
+    /// # Arguments
+    /// * `selector` - The Card to read; a named selector without a version reads the latest Active version.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the selector is invalid, the Card is absent,
     /// or the server request fails.
@@ -288,9 +325,13 @@ impl Cards {
 
     /// Fetch one Card response with its server-derived timestamps.
     ///
+    /// # Arguments
+    /// * `selector` - The Card to read; a named selector without a version reads the latest Active version.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the selector is invalid, the Card is absent,
     /// or the server request fails.
+    #[cfg(feature = "internal")]
     pub async fn get_response(&self, selector: CardSelector) -> Result<GetCardResponse, WyrdError> {
         reads::get_response(&self.engine.client, &selector)
             .await
@@ -298,6 +339,9 @@ impl Cards {
     }
 
     /// List metadata-only Card summaries through the typed server query.
+    ///
+    /// # Arguments
+    /// * `request` - The kind, space, name, version-range, status, and paging filters.
     ///
     /// # Errors
     /// Returns a Wyrd error when the request is invalid or the server query
@@ -311,9 +355,13 @@ impl Cards {
     /// Plan one authorized artifact download through the typed storage
     /// contract.
     ///
+    /// # Arguments
+    /// * `request` - The Card UID, artifact path, and optional URL lifetime.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the Card or artifact is absent, unauthorized,
     /// or the server cannot mint a download plan.
+    #[cfg(feature = "internal")]
     pub async fn download_init(
         &self,
         request: DownloadInitRequest,
@@ -326,6 +374,9 @@ impl Cards {
 
     /// Soft-delete one Card. Named selectors must include an exact version.
     ///
+    /// # Arguments
+    /// * `selector` - The exact Card to delete.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the selector is not exact, the Card is absent,
     /// or the server mutation fails.
@@ -336,6 +387,11 @@ impl Cards {
     }
 
     /// Resolve the latest Active version to an exact `CardRef`.
+    ///
+    /// # Arguments
+    /// * `kind` - The Card kind.
+    /// * `space` - The Card space.
+    /// * `name` - The Card name.
     ///
     /// # Errors
     /// Returns a Wyrd error when no Active version matches or the server query
@@ -351,15 +407,50 @@ impl Cards {
             .map_err(Into::into)
     }
 
+    /// Download a registered Card's reachable graph as a local bundle.
+    ///
+    /// Resolves `selector`, reads every Card its relationships reach, and
+    /// publishes them under `destination` in the hydrated-bundle layout
+    /// [`crate::state::WyrdState::from_path`] loads. Publication is atomic:
+    /// the bundle is staged beside `destination` and renamed into place, so a
+    /// failed hydration leaves any prior bundle intact.
+    ///
+    /// # Arguments
+    /// * `selector` - The root Card; a named selector without a version reads
+    ///   the latest Active version.
+    /// * `destination` - The bundle directory to publish.
+    /// * `mode` - [`HydrationMode::Complete`] also downloads and verifies every
+    ///   artifact; [`HydrationMode::MetadataOnly`] writes Card metadata only.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the graph cannot be resolved, the destination
+    /// is invalid, an artifact cannot be downloaded or verified, or the staged
+    /// bundle cannot be published.
+    pub async fn hydrate(
+        &self,
+        selector: CardSelector,
+        destination: impl AsRef<Path>,
+        mode: HydrationMode,
+    ) -> Result<HydrationSummary, WyrdError> {
+        CardGraphHydrator::new(RegistryContext::new(Arc::clone(&self.engine)))
+            .hydrate(&selector, destination.as_ref(), mode)
+            .await
+    }
+
     /// Resolve one Card and materialize its server-owned artifacts.
     ///
     /// The returned envelope remains server-derived. A later language adapter
     /// can lower it into a native holder without introducing another network
     /// or storage implementation.
     ///
+    /// # Arguments
+    /// * `selector` - The Card to read.
+    /// * `destination` - Where its artifacts are published, or `None` for a managed temporary directory the returned value owns.
+    ///
     /// # Errors
     /// Returns a Wyrd error when the Card, artifact inventory, destination, or
     /// artifact transfer cannot be loaded.
+    #[cfg(feature = "internal")]
     pub async fn load(
         &self,
         selector: CardSelector,
@@ -408,6 +499,7 @@ impl Cards {
 /// random sibling staging directory and renames that complete directory into
 /// place after every transfer verifies, so failed transfers cannot alter a
 /// prior destination.
+#[cfg(feature = "internal")]
 struct ArtifactMaterializer<'a> {
     /// Authenticated registry transport and storage client.
     engine: &'a Arc<RegistryEngine>,
@@ -418,6 +510,7 @@ struct ArtifactMaterializer<'a> {
 }
 
 /// Runs the staged download and atomic publication workflow.
+#[cfg(feature = "internal")]
 impl<'a> ArtifactMaterializer<'a> {
     /// Create a materializer for one Card inventory and destination.
     #[must_use]
@@ -539,13 +632,32 @@ mod tests {
     use base64::Engine;
     use secrecy::SecretString;
     use sha2::{Digest, Sha256};
-    use wiremock::matchers::{body_json, method, path};
+    use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::{CardSelector, Cards};
+    use crate::cards::HydrationMode;
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::card::verifier::DriftBaselineState;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+    use wyrd_spec::reference::CardRef;
+
+    /// A client pointed at `server` with a static credential.
+    ///
+    /// # Panics
+    /// Panics if the static configuration cannot build a client.
+    fn test_client(server: &MockServer) -> crate::WyrdClient {
+        crate::WyrdClient::with_config(crate::config::ClientConfig {
+            credential: Some(SecretString::from("test-api-key")),
+            http: crate::transport::HttpConfig {
+                base_url: server.uri(),
+                ..crate::transport::HttpConfig::default()
+            },
+            ..crate::config::ClientConfig::default()
+        })
+        .expect("static config builds a client")
+    }
 
     /// Preserve an existing publication and remove private staging when a later
     /// artifact fails integrity verification.
@@ -565,7 +677,7 @@ mod tests {
                 "access_token": "test-access-token",
                 "refresh_token": "unused-refresh-token",
                 "token_type": "Bearer",
-                "expires_at": chrono::Utc::now() + chrono::Duration::hours(1)
+                "expires_in": 3600
             })))
             .mount(&server)
             .await;
@@ -639,12 +751,7 @@ mod tests {
         std::fs::create_dir(&destination).expect("existing destination is created");
         std::fs::write(destination.join("existing.txt"), b"keep")
             .expect("existing publication is written");
-        let cards = Cards::new(
-            Some(&server.uri()),
-            Some(SecretString::from("test-api-key")),
-            None,
-        )
-        .expect("test cards handle is configured");
+        let cards = Cards::with_client(test_client(&server));
 
         let error = cards
             .download_artifacts_to(&card_uid, &destination)
@@ -670,6 +777,258 @@ mod tests {
                     .starts_with(".wyrd-artifacts-")
             });
         assert!(!staging_remains);
+    }
+
+    /// One registered envelope for each Card kind `cards.get` types, paired
+    /// with its kind so the stub server can answer the matching exact read.
+    ///
+    /// The Verifier carries a building Drift baseline so the status projection
+    /// is exercised alongside the spec projection.
+    fn supported_kind_envelopes() -> Vec<(CardKind, serde_json::Value)> {
+        let baseline_ref = serde_json::json!({
+            "kind": "Data",
+            "name": "churn-training",
+            "space": "retention",
+            "version": "1.0.0",
+            "uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"
+        });
+        let specs = [
+            (
+                CardKind::Data,
+                serde_json::json!({
+                    "interface": {"kind": "Parquet", "meta": {"compression": "Snappy"}},
+                    "schema": {"columns": [{"name": "feature", "dtype": "float64"}]},
+                    "stats": {"row_count": 1, "col_count": 1, "byte_count": 8, "sha256": "00"}
+                }),
+            ),
+            (
+                CardKind::Model,
+                serde_json::json!({
+                    "interface": {"kind": "Sklearn", "meta": {"framework_version": "1.4.0"}},
+                    "task_type": "BinaryClassification",
+                    "signature": {
+                        "inputs": [{"name": "feature", "dtype": "float64"}],
+                        "outputs": [{"name": "prediction", "dtype": "float64"}]
+                    }
+                }),
+            ),
+            (
+                CardKind::Prompt,
+                serde_json::json!({
+                    "model": "gpt-4o",
+                    "request": {
+                        "provider": "open_ai_chat_completion",
+                        "body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+                    }
+                }),
+            ),
+            (
+                CardKind::Agent,
+                serde_json::json!({
+                    "prompt": {"kind": "Prompt", "name": "triage", "space": "retention", "version": "1.0.0"}
+                }),
+            ),
+            (
+                CardKind::Verifier,
+                serde_json::json!({
+                    "implementation": {
+                        "kind": "drift",
+                        "spec": {
+                            "method": "Psi",
+                            "signal": {
+                                "kind": "Distribution",
+                                "baseline_ref": baseline_ref.clone(),
+                                "features": ["feature"]
+                            },
+                            "condition": {"kind": "Statistical"},
+                            "profile": {
+                                "kind": "Psi",
+                                "binning_strategy": {"kind": "Quantile", "n_bins": 10},
+                                "threshold": {"kind": "Fixed", "value": 0.25}
+                            }
+                        }
+                    }
+                }),
+            ),
+            (
+                CardKind::Service,
+                serde_json::json!({"description": "churn remediation"}),
+            ),
+            (
+                CardKind::Trigger,
+                serde_json::json!({"kind": "schedule", "cron": "*/5 * * * *", "tz": "UTC"}),
+            ),
+            (
+                CardKind::Operator,
+                serde_json::json!({
+                    "kind": "notify",
+                    "channel": {
+                        "kind": "slack",
+                        "connection": "ops-slack",
+                        "channel_id": "C0123456789",
+                        "text": "drift"
+                    }
+                }),
+            ),
+        ];
+        specs
+            .into_iter()
+            .map(|(kind, spec)| {
+                let status = if kind == CardKind::Verifier {
+                    serde_json::json!({
+                        "phase": "active",
+                        "verification": {"baseline": {"state": "building", "data": baseline_ref.clone()}}
+                    })
+                } else {
+                    serde_json::json!({"phase": "active"})
+                };
+                let card = serde_json::json!({
+                    "apiVersion": "wyrd/v1",
+                    "kind": kind.wire_name(),
+                    "metadata": {"space": "retention", "name": "subject", "version": "1.0.0"},
+                    "spec": spec,
+                    "status": status
+                });
+                (kind, card)
+            })
+            .collect()
+    }
+
+    /// Every kind `cards.get` supports deserializes into its own typed `Spec`
+    /// variant, and a Drift Verifier's baseline state arrives typed on
+    /// `status.verification`.
+    #[tokio::test]
+    async fn supported_kinds_project_typed_specs_and_status() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-access-token",
+                "refresh_token": "unused-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        let envelopes = supported_kind_envelopes();
+        for (kind, card) in &envelopes {
+            Mock::given(method("GET"))
+                .and(path("/v1/cards/by-ref"))
+                .and(query_param("kind", kind.wire_name()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "card": card,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                })))
+                .mount(&server)
+                .await;
+        }
+        let cards = Cards::with_client(test_client(&server));
+
+        for (kind, _) in envelopes {
+            let card_ref: CardRef = format!("retention/{}/subject@1.0.0", kind.wire_name())
+                .parse()
+                .expect("test card ref is valid");
+            let card = cards
+                .get(CardSelector::exact(card_ref))
+                .await
+                .unwrap_or_else(|error| panic!("{kind:?} card is readable: {error}"));
+            let typed = matches!(
+                (&kind, &card.spec),
+                (CardKind::Data, Spec::Data(_))
+                    | (CardKind::Model, Spec::Model(_))
+                    | (CardKind::Prompt, Spec::Prompt(_))
+                    | (CardKind::Agent, Spec::Agent(_))
+                    | (CardKind::Verifier, Spec::Verifier(_))
+                    | (CardKind::Service, Spec::Service(_))
+                    | (CardKind::Trigger, Spec::Trigger(_))
+                    | (CardKind::Operator, Spec::Operator(_))
+            );
+            assert!(typed, "{kind:?} projects its own typed spec");
+            let baseline = card
+                .status
+                .as_ref()
+                .and_then(|status| status.verification.as_ref())
+                .and_then(|verification| verification.baseline.as_ref());
+            if kind == CardKind::Verifier {
+                let baseline = baseline.expect("drift verifier carries a typed baseline");
+                assert_eq!(baseline.state, DriftBaselineState::Building);
+            } else {
+                assert!(baseline.is_none(), "{kind:?} carries no baseline");
+            }
+        }
+    }
+
+    /// `Cards::hydrate` publishes a registered Service's graph as a bundle
+    /// that `WyrdState::from_path` loads with the root the server returned.
+    ///
+    /// # Panics
+    /// Panics when hydration fails, the bundle does not load, or the loaded
+    /// root differs from the registered Card.
+    #[tokio::test]
+    async fn hydrate_publishes_a_bundle_the_state_loads() {
+        let server = MockServer::start().await;
+        let uid = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00";
+        Mock::given(method("POST"))
+            .and(path("/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-access-token",
+                "refresh_token": "unused-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/cards/by-ref"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "card": {
+                    "apiVersion": "wyrd/v1",
+                    "kind": "Service",
+                    "metadata": {
+                        "space": "retention",
+                        "name": "subject",
+                        "version": "1.0.0",
+                        "uid": uid
+                    },
+                    "spec": {"description": "churn remediation"},
+                    "status": {"phase": "active"}
+                },
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/cards/{uid}/artifacts")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"artifacts": []})),
+            )
+            .mount(&server)
+            .await;
+        let cards = Cards::with_client(test_client(&server));
+        let parent = tempfile::tempdir().expect("test parent is created");
+        let destination = parent.path().join("bundle");
+        let card_ref: CardRef = "retention/Service/subject@1.0.0"
+            .parse()
+            .expect("test card ref is valid");
+
+        let summary = cards
+            .hydrate(
+                CardSelector::exact(card_ref),
+                &destination,
+                HydrationMode::Complete,
+            )
+            .await
+            .expect("the registered graph hydrates");
+        let state =
+            crate::state::WyrdState::from_path(&destination).expect("the published bundle loads");
+
+        assert_eq!(summary.card_count, 1);
+        assert_eq!(
+            state.root_ref().uid.as_ref().map(ToString::to_string),
+            Some(uid.to_owned())
+        );
     }
 
     /// Keep latest and exact selector construction semantically distinct.

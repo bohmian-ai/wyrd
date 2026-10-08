@@ -52,7 +52,7 @@ pub enum ProviderRequest {
 }
 
 /// Which provider a request targets.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderName {
@@ -66,6 +66,32 @@ pub enum ProviderName {
     Vertex,
     /// Provider not modeled by skald-spec.
     Custom(String),
+}
+
+/// Writes the JSON form the derived `Deserialize` reads in every format.
+///
+/// Built-in providers are unit variants written as their snake-case name.
+/// `Custom` is written as the one-entry map `{"custom": name}` rather than a
+/// newtype variant: JSON output is unchanged, while YAML gets a plain map
+/// instead of a `!custom name` tag that a YAML document cannot carry through
+/// the buffered, untagged deserialization of an inline Prompt in an Agent
+/// Card. Both forms still deserialize.
+impl Serialize for ProviderName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        match self {
+            Self::OpenAi => serializer.serialize_unit_variant("ProviderName", 0, "open_ai"),
+            Self::Anthropic => serializer.serialize_unit_variant("ProviderName", 1, "anthropic"),
+            Self::Google => serializer.serialize_unit_variant("ProviderName", 2, "google"),
+            Self::Vertex => serializer.serialize_unit_variant("ProviderName", 3, "vertex"),
+            Self::Custom(name) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("custom", name)?;
+                map.end()
+            }
+        }
+    }
 }
 
 /// Provider-tool descriptor projected into native request tool fields.
@@ -98,6 +124,7 @@ impl ProviderRequest {
     }
 
     /// Return a copy of the native request with provider-specific tool fields populated.
+    #[must_use]
     pub fn with_tools(mut self, tools: Vec<ToolDescriptor>) -> Self {
         if tools.is_empty() {
             return self;
@@ -244,6 +271,32 @@ mod round_trip {
         ));
         round_trip(&common::vertex_predict_request());
         round_trip(&common::vertex_predict_response());
+    }
+
+    /// Every provider keeps its JSON form, and its YAML form reads back
+    /// through a buffered `serde_json::Value`, the path an inline Prompt in
+    /// an Agent Card takes.
+    #[test]
+    fn provider_name_yaml_reads_back_through_buffered_json() {
+        assert_eq!(
+            serde_json::to_value(ProviderName::Custom("mock".to_owned())).unwrap(),
+            json!({"custom": "mock"})
+        );
+        for provider in [
+            ProviderName::OpenAi,
+            ProviderName::Anthropic,
+            ProviderName::Google,
+            ProviderName::Vertex,
+            ProviderName::Custom("mock".to_owned()),
+        ] {
+            let yaml = serde_yaml::to_string(&provider).unwrap();
+            let buffered: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(buffered, serde_json::to_value(&provider).unwrap());
+            assert_eq!(
+                serde_json::from_value::<ProviderName>(buffered).unwrap(),
+                provider
+            );
+        }
     }
 
     #[test]

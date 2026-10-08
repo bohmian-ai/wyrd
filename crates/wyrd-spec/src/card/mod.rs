@@ -1372,7 +1372,7 @@ mod model_schema_drift_tests {
     use schemars::schema_for;
 
     fn snapshot_path(file_name: &str) -> String {
-        format!("{}/tests/schemas/{file_name}", env!("CARGO_MANIFEST_DIR"))
+        format!("{}/schemas/{file_name}", env!("CARGO_MANIFEST_DIR"))
     }
 
     fn assert_schema_matches_snapshot<T: schemars::JsonSchema>(file_name: &str) {
@@ -3283,7 +3283,7 @@ mod source_card_tests {
                     sslmode: None,
                     auth: SourceAuth::Basic {
                         username: "wyrd_reader".to_owned(),
-                        password_env: "".to_owned(),
+                        password_env: String::new(),
                     },
                 },
             },
@@ -3448,7 +3448,7 @@ mod source_card_tests {
                     schema: None,
                     role: None,
                     auth: SourceAuth::SecretStore {
-                        provider: "".to_owned(),
+                        provider: String::new(),
                         name: "secret/snowflake".to_owned(),
                     },
                 },
@@ -3521,7 +3521,7 @@ mod source_card_tests {
             description: None,
             source: SourceKind::SqlWarehouse {
                 connection: SqlConnection::Postgres {
-                    host: "".to_owned(),
+                    host: String::new(),
                     port: None,
                     database: "telemetry".to_owned(),
                     sslmode: None,
@@ -3622,7 +3622,7 @@ mod source_card_tests {
             description: None,
             source: SourceKind::Logs {
                 connection: LogConnection::Loki {
-                    endpoint: "".to_owned(),
+                    endpoint: String::new(),
                     auth: SourceAuth::None,
                 },
             },

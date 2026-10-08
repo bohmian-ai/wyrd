@@ -154,6 +154,10 @@ mod custom_score {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn custom_within_threshold_is_no_drift() {
         let batch = numeric_batch("latency_ms", vec![100.0, 102.0, 98.0, 101.0]);
         let profile = custom("latency_ms", 100.0, 5.0);
@@ -172,6 +176,10 @@ mod custom_score {
     }
 
     #[test]
+    #[expect(
+        clippy::float_cmp,
+        reason = "the expected value is produced by exact arithmetic on fixed inputs"
+    )]
     fn custom_outside_threshold_is_drift() {
         let batch = numeric_batch("latency_ms", vec![200.0, 210.0, 220.0]);
         let profile = custom("latency_ms", 100.0, 50.0);

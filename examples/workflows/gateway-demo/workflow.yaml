@@ -1,0 +1,39 @@
+apiVersion: wyrd/v1
+kind: Workflow
+metadata:
+  space: examples
+  name: gateway-demo
+  version: "0.1.0"
+spec:
+  description: Summarise a topic through an external gateway, then summarise again with the native provider.
+  inputs:
+    input:
+      type: str
+      value: ""
+
+  steps:
+    - id: researcher
+      action:
+        type: agent
+        target: ./agents/researcher.yaml
+      # Only this step goes through the gateway. The base URL and the binding
+      # name are not secret; the binding in the client config.toml supplies
+      # the origin it authorizes and the secret headers.
+      llm_route:
+        kind: ext_gateway
+        protocol: openai_chat
+        base_url: https://gateway.example.com/v1
+        credential_binding: example-gateway
+      inputs:
+        topic: input.input
+
+    - id: writer
+      action:
+        type: agent
+        target: ./agents/writer.yaml
+      depends_on: [researcher]
+      inputs:
+        topic: steps.researcher.output.text
+
+  outputs:
+    summary: steps.writer.output.text

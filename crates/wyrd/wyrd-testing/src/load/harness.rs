@@ -327,7 +327,7 @@ async fn run_workload(
             } => {
                 query_count += count;
                 queryable_rows.extend(rows);
-                for sample in histogram.into_iter() {
+                for sample in histogram {
                     latency
                         .record(Duration::from_micros(sample))
                         .map_err(|error| LoadError::Histogram(error.to_string()))?;

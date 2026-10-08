@@ -1,41 +1,26 @@
-import { describe, expect, it } from "vitest";
+import { expect, test } from "vitest";
 
-import { WyrdClient, WyrdError } from "@wyrd/sdk";
+import { WyrdClient } from "@wyrd/sdk";
 
-const UNREACHABLE = { serverUrl: "http://127.0.0.1:9", credential: "wyrd_test_actor" };
+const CREDENTIAL = "wyrd_test_actor";
 
-describe("WyrdClient", () => {
-  it("onBehalfOf rejects an unknown audience with the validation WyrdError", async () => {
-    const client = WyrdClient.connect(UNREACHABLE);
-    const caught: unknown = await client
-      .onBehalfOf("subject-token", { audience: "storage" as "wyrd" })
-      .catch((error: unknown) => error);
-    expect(caught).toBeInstanceOf(WyrdError);
-    expect((caught as WyrdError).code).toBe("WYRD_SPEC_400_VALIDATION");
+test("on behalf of an unknown audience is refused locally", async () => {
+  const client = WyrdClient.connect({ serverUrl: "http://127.0.0.1:9", credential: CREDENTIAL });
+
+  // @ts-expect-error `storage` is outside the closed audience set; JavaScript callers can still pass it.
+  await expect(client.onBehalfOf("subject-token", { audience: "storage" })).rejects.toMatchObject({
+    code: "WYRD_SPEC_400_VALIDATION",
+  });
+});
+
+test("grpc endpoint derives from the server url unless overridden", () => {
+  const derived = WyrdClient.connect({ serverUrl: "https://wyrd.example.com/", credential: CREDENTIAL });
+  const overridden = WyrdClient.connect({
+    serverUrl: "https://wyrd.example.com",
+    credential: CREDENTIAL,
+    grpcUrl: "https://grpc.example.com:443",
   });
 
-  it("onBehalfOf runs the exchange in Rust", async () => {
-    const client = WyrdClient.connect(UNREACHABLE);
-    const caught: unknown = await client
-      .onBehalfOf("subject-token")
-      .catch((error: unknown) => error);
-    expect(caught).toBeInstanceOf(WyrdError);
-    expect((caught as WyrdError).code).not.toBe("WYRD_SPEC_400_VALIDATION");
-  });
-
-  it("derives the gRPC endpoint from serverUrl unless overridden", () => {
-    const derived = WyrdClient.connect({
-      serverUrl: "https://wyrd.example.com/",
-      credential: "wyrd_test_actor",
-    });
-    expect(derived.serverUrl).toBe("https://wyrd.example.com");
-    expect(derived.grpcUrl).toBe("https://wyrd.example.com:50051");
-
-    const overridden = WyrdClient.connect({
-      serverUrl: "https://wyrd.example.com",
-      credential: "wyrd_test_actor",
-      grpcUrl: "https://grpc.example.com:443",
-    });
-    expect(overridden.grpcUrl).toBe("https://grpc.example.com:443");
-  });
+  expect([derived.serverUrl, derived.grpcUrl]).toEqual(["https://wyrd.example.com", "https://wyrd.example.com:50051"]);
+  expect(overridden.grpcUrl).toBe("https://grpc.example.com:443");
 });

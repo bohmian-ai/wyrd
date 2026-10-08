@@ -1,0 +1,30 @@
+apiVersion: wyrd/v1
+kind: Model
+metadata:
+  space: default
+  name: model
+  version: 1.0.0
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02
+  labels: {}
+  annotations: {}
+  artifact_hash: 6df95bdf5f1a6ec1b59fe52d2974e222ec5e7094d877a3a16858aa89d66aaca5
+spec:
+  interface:
+    kind: Sklearn
+    meta:
+      framework_version: 1.4.0
+      model_subtype: LogisticRegression
+  task_type: Other
+  signature:
+    inputs:
+    - name: input
+      dtype: float64
+    outputs:
+    - name: output
+      dtype: float64
+  card_refs: []
+relationships:
+  outbound: []
+  outbound_refs: []
+  inbound: []
+  inbound_refs: []

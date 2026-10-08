@@ -55,6 +55,10 @@ impl From<PyDataStats> for DataStats {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyDataStats {
+    /// Record artifact statistics, typically from a custom interface `save`.
+    ///
+    /// Values are stored as given; `sha256` is the lowercase hex digest of
+    /// the `byte_count` artifact bytes, and omitted counts mean unknown.
     #[new]
     #[pyo3(signature = (byte_count, sha256, row_count=None, col_count=None))]
     fn __new__(
@@ -71,26 +75,34 @@ impl PyDataStats {
         })
     }
 
+    /// Row count, or `None` when unknown.
     #[getter]
     fn row_count(&self) -> Option<u64> {
         self.inner.row_count
     }
 
+    /// Column count, or `None` when unknown.
     #[getter]
     fn col_count(&self) -> Option<u32> {
         self.inner.col_count
     }
 
+    /// Number of artifact bytes written.
     #[getter]
     fn byte_count(&self) -> u64 {
         self.inner.byte_count
     }
 
+    /// Hex SHA-256 digest of the artifact bytes.
     #[getter]
     fn sha256(&self) -> String {
         self.inner.sha256.clone()
     }
 
+    /// Return these statistics as a JSON-compatible spec dictionary.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
     fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }

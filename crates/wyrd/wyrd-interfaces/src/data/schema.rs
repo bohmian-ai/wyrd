@@ -61,6 +61,17 @@ impl From<PyFieldSpec> for FieldSpec {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyFieldSpec {
+    /// Declare a field; only `name` is validated here.
+    ///
+    /// `dtype` is stored as given; `ModelSignature` validation rejects
+    /// non-canonical Arrow dtype names. `shape` accepts serialized `Dim`
+    /// values or plain integers (each a fixed dimension); omitted means no
+    /// shape. Omitted `extra` is empty.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_VALIDATION` when `name` is not a valid column
+    /// name (1 to 64 characters, a lowercase letter then lowercase letters,
+    /// digits, `_`, or `-`), or a Wyrd error when `shape` cannot be parsed.
     #[new]
     #[pyo3(signature = (name, dtype, shape=None, nullable=false, extra=None))]
     fn __new__(
@@ -89,45 +100,127 @@ impl PyFieldSpec {
         }))
     }
 
+    /// Field name.
     #[getter]
     fn name(&self) -> String {
         self.inner.name.as_str().to_string()
     }
 
+    /// Declared Arrow logical dtype name.
     #[getter]
     fn dtype(&self) -> String {
         self.inner.dtype.clone()
     }
 
+    /// Return the field shape as typed dimensions.
     #[getter]
-    fn shape(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Ok(json_to_pyobject(
-            py,
-            &serde_json::to_value(&self.inner.shape)?,
-        )?)
+    fn shape(&self) -> Vec<PyDim> {
+        py_dims(&self.inner.shape)
     }
 
+    /// Return the field shape as typed dimensions; alias of `shape`.
     #[getter]
-    fn dims(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
-        Ok(json_to_pyobject(
-            py,
-            &serde_json::to_value(&self.inner.shape)?,
-        )?)
+    fn dims(&self) -> Vec<PyDim> {
+        py_dims(&self.inner.shape)
     }
 
+    /// Whether the field may hold nulls.
     #[getter]
     fn nullable(&self) -> bool {
         self.inner.nullable
     }
 
+    /// String metadata stored with the field.
     #[getter]
     fn extra(&self) -> BTreeMap<String, String> {
         self.inner.extra.clone()
     }
 
+    /// Return this field as a JSON-compatible spec dictionary.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
     fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
+}
+
+/// Python-facing projection of one Wyrd shape [`Dim`].
+///
+/// Shapes read back as typed dimensions (`Dim.fixed(3)`,
+/// `Dim.dynamic("batch")`) instead of serialized `{"kind", "value"}` maps, and
+/// `FieldSpec(shape=[...])` accepts them directly. Shape invariants such as
+/// positive fixed lengths stay with the owning spec validator.
+#[cfg_attr(
+    feature = "python",
+    pyclass(module = "wyrd.data", name = "Dim", frozen, eq, skip_from_py_object)
+)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct PyDim {
+    inner: wyrd_spec::card::field::Dim,
+}
+
+#[cfg(feature = "python")]
+#[pymethods]
+impl PyDim {
+    /// Declare a fixed, known dimension length.
+    #[staticmethod]
+    fn fixed(length: i64) -> Self {
+        Self {
+            inner: Dim::Fixed(length),
+        }
+    }
+
+    /// Declare a dynamic dimension, optionally named such as `"batch"`.
+    #[staticmethod]
+    #[pyo3(signature = (name=None))]
+    fn dynamic(name: Option<String>) -> Self {
+        Self {
+            inner: Dim::Dynamic(name),
+        }
+    }
+
+    /// Return `"Fixed"` or `"Dynamic"`.
+    #[getter]
+    const fn kind(&self) -> &'static str {
+        match self.inner {
+            Dim::Fixed(_) => "Fixed",
+            Dim::Dynamic(_) => "Dynamic",
+        }
+    }
+
+    /// Return the fixed length, or `None` for a dynamic dimension.
+    #[getter]
+    const fn length(&self) -> Option<i64> {
+        match self.inner {
+            Dim::Fixed(length) => Some(length),
+            Dim::Dynamic(_) => None,
+        }
+    }
+
+    /// Return the dynamic dimension name, or `None` when fixed or unnamed.
+    #[getter]
+    fn name(&self) -> Option<&str> {
+        match &self.inner {
+            Dim::Fixed(_) => None,
+            Dim::Dynamic(name) => name.as_deref(),
+        }
+    }
+
+    /// Return a constructor-shaped representation.
+    fn __repr__(&self) -> String {
+        match &self.inner {
+            Dim::Fixed(length) => format!("Dim.fixed({length})"),
+            Dim::Dynamic(Some(name)) => format!("Dim.dynamic({name:?})"),
+            Dim::Dynamic(None) => "Dim.dynamic()".to_owned(),
+        }
+    }
+}
+
+/// Project a native shape into typed Python dimensions.
+#[cfg(feature = "python")]
+fn py_dims(shape: &[Dim]) -> Vec<PyDim> {
+    shape.iter().cloned().map(|inner| PyDim { inner }).collect()
 }
 
 /// Python-facing wrapper for a Wyrd `DataSchema`.
@@ -175,12 +268,18 @@ impl From<PyDataSchema> for DataSchema {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyDataSchema {
+    /// Create a schema from ordered `FieldSpec` objects or serialized field
+    /// dictionaries; omitted means an empty schema.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when a serialized field cannot be parsed.
     #[new]
     #[pyo3(signature = (columns=None))]
     fn __new__(columns: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Self> {
         Ok(Self::from_inner(DataSchema::new(parse_columns(columns)?)))
     }
 
+    /// Fields in schema order.
     #[getter]
     fn columns(&self) -> Vec<PyFieldSpec> {
         self.inner
@@ -191,25 +290,38 @@ impl PyDataSchema {
             .collect()
     }
 
+    /// Alias of `columns`.
     #[getter]
     fn fields(&self) -> Vec<PyFieldSpec> {
         self.columns()
     }
 
+    /// Return `true` when the schema has no fields.
     fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
+    /// Return whether a field named `name` exists.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_VALIDATION` when `name` is not a valid column
+    /// name.
     fn contains_column(&self, name: &str) -> WyrdPyResult<bool> {
         let name = column_name(name)?;
         Ok(self.inner.contains_column(&name))
     }
 
+    /// Return the field named `name`, or `None` when it is absent.
+    ///
+    /// # Errors
+    /// Returns `WYRD_DATA_400_VALIDATION` when `name` is not a valid column
+    /// name.
     fn column(&self, name: &str) -> WyrdPyResult<Option<PyFieldSpec>> {
         let name = column_name(name)?;
         Ok(self.inner.column(&name).cloned().map(PyFieldSpec::from))
     }
 
+    /// Return field names in schema order.
     fn column_names(&self) -> Vec<String> {
         self.inner
             .column_names()
@@ -217,6 +329,10 @@ impl PyDataSchema {
             .collect()
     }
 
+    /// Return this schema as a JSON-compatible spec dictionary.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when JSON conversion fails.
     fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
@@ -225,6 +341,7 @@ impl PyDataSchema {
 /// Register data schema wrapper classes on a Python module.
 #[cfg(feature = "python")]
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyDim>()?;
     module.add_class::<PyFieldSpec>()?;
     module.add_class::<PyDataSchema>()?;
     Ok(())
@@ -269,6 +386,13 @@ fn parse_dims(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Vec<Dim>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(Vec::new());
     };
+    let items = value.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+    if !items.is_empty() && items.iter().all(PyAnyMethods::is_instance_of::<PyDim>) {
+        return items
+            .iter()
+            .map(|item| Ok(item.cast::<PyDim>()?.get().inner.clone()))
+            .collect();
+    }
     dims_from_json(pyobject_to_json(value)?)
 }
 

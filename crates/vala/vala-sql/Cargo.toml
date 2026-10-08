@@ -9,6 +9,11 @@ authors = { workspace = true }
 publish = false
 description = "Server-tier SQL migrations for Vala observability storage."
 
+[features]
+# Exposes the canonical staging append for tests that seed audit rows directly.
+# Production code stages through `audit_outbox::AuditOutbox` only.
+test-support = []
+
 [lib]
 path = "src/lib.rs"
 
@@ -19,12 +24,15 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 metrics = { workspace = true }
 sqlx = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
+wyrd-runtime = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }
 
 [dev-dependencies]
+vala-sql = { path = ".", features = ["test-support"] }
 workspace-hack.workspace = true
 secrecy = { workspace = true }
 serde_json = { workspace = true }
@@ -33,23 +41,5 @@ wyrd-semver = { workspace = true }
 wyrd-sql = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 
-[[test]]
-name = "pg_audit_staging"
-
-[[test]]
-name = "pg_forge_operations"
-
-[[test]]
-name = "pg_forge_tasks"
-
-[[test]]
-name = "pg_forge_file_list"
-
-[[test]]
-name = "pg_migration"
-
-[[test]]
-name = "pg_oracle_membership"
-
-[[test]]
-name = "pg_schema_usage"
+[lints]
+workspace = true

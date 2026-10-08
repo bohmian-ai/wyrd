@@ -1,4 +1,7 @@
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each test target that includes this shared module uses a different subset"
+)]
 
 use std::collections::BTreeMap;
 use std::path::Path;

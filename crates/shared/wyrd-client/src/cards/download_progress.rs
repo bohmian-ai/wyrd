@@ -83,7 +83,7 @@ impl DownloadProgressDisplay {
     fn bars_lock(&self) -> MutexGuard<'_, BTreeMap<RelativeArtifactPath, ProgressBar>> {
         self.bars
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Construct a display with a selected draw target for production and tests.

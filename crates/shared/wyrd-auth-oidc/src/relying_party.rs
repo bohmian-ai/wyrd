@@ -1425,8 +1425,7 @@ mod tests {
 
             for outcome in outcomes {
                 match (verifies, outcome) {
-                    (true, Ok(_)) => {}
-                    (false, Err(RelyingPartyError::UnknownKey)) => {}
+                    (true, Ok(_)) | (false, Err(RelyingPartyError::UnknownKey)) => {}
                     (_, outcome) => panic!("{token_kid}: unexpected {outcome:?}"),
                 }
             }

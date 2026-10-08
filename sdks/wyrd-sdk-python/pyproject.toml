@@ -22,7 +22,6 @@ otel = ["opentelemetry-api>=1.27"]
 
 [dependency-groups]
 dev = [
-    "blake3>=1.0.0",
     "catboost>=1.2.0",
     "datasets>=2.20.0",
     "lightgbm>=4.5.0",
@@ -30,6 +29,7 @@ dev = [
     "numpy>=1.26",
     "opentelemetry-api>=1.27",
     "opentelemetry-exporter-otlp-proto-grpc>=1.27",
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
     "opentelemetry-sdk>=1.27",
     "pandas>=2.2,<3",
     "polars>=1.10.0",
@@ -63,7 +63,6 @@ testpaths = ["tests"]
 pythonpath = ["python"]
 markers = [
     "tensorflow: marks TensorFlow tests that run in the dedicated TensorFlow task",
-    "wyrd_covers(contract): declares that a Python test covers a tagged Wyrd Rust contract",
     "integration: marks tests that require a live WyrdTestServer and run in the gated integration lane",
     "identity: marks integration journeys that need the identity lane's Keycloak; only test:identity:journey runs them",
     "smoke: marks opt-in live provider smoke tests that need operator credentials and real upstreams",
@@ -74,8 +73,25 @@ line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = ["E", "F", "I", "UP", "B", "D417"]
 ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Every documented stub parameter gets an ``Args:`` entry; the stubs are the
+# public help text. Other modules keep their existing docstring style.
+"!python/wyrd/stubs/**" = ["D417"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ty.src]
+# Public modules are typed by their ``__init__.pyi``; the ``stubs/`` sources are
+# assembled into those files, so neither is checked twice.
+include = ["python/wyrd", "scripts", "tests"]
+exclude = ["python/wyrd/stubs", "python/wyrd/**/__init__.py"]
+
+[tool.ty.rules]
+unused-ignore-comment = "error"
 
 [tool.uv]
 package = false

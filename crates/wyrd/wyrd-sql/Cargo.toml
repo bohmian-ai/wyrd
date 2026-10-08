@@ -7,6 +7,10 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 
+[features]
+# Exposes `WyrdPostgres::from_pools`, the lazy-pool seam for DB-free tests.
+test-support = []
+
 [dependencies]
 blake3 = { workspace = true }
 chrono = { workspace = true }
@@ -38,11 +42,5 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 url = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 
-[[test]]
-name = "pg_migration"
-
-[[test]]
-name = "pg_query_compile"
-
-[[test]]
-name = "pg_cards_register"
+[lints]
+workspace = true

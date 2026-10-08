@@ -1,27 +1,29 @@
 //! HTTP projection of the Verification control plane.
 //!
-//! Exactly three operations: binding status, manual run request, and run
-//! status. Each handler parses its path, header, and body, then delegates to
-//! [`VerificationControl`], which owns authorization, audit, tenancy, and
-//! error mapping. Verdicts and Drift/Eval details are read from Bifrost by
-//! `result_id`, so there is no result endpoint here.
+//! Exactly four operations: binding status, manual run request, run status,
+//! and direct execution. Each handler parses its path, header, and body, then
+//! delegates to [`VerificationControl`], which owns authorization, audit,
+//! tenancy, and error mapping. Queued verdicts and Drift/Eval details are read
+//! from Bifrost by `result_id`, so there is no result endpoint here; a direct
+//! execution returns its judgment inline and persists none.
 
-use axum::Json;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::{Extension, Json};
 use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{BindingId, VerificationRunId};
 use wyrd_spec::verification::{
-    StartVerificationRunRequest, StartVerificationRunResponse, VerificationBindingStatus,
-    VerificationRunStatus,
+    ExecuteVerificationRequest, Judgment, MAX_EXECUTE_BODY_BYTES, StartVerificationRunRequest,
+    StartVerificationRunResponse, VerificationBindingStatus, VerificationRunStatus,
 };
 
 use super::service::{VerificationControl, decode_start_request};
 use crate::components::auth::Caller;
 use crate::components::storage::routes::extract_idempotency_key;
 use crate::http::error::{WyrdErrorResponse, path_rejection};
+use crate::http::middleware::edge_timeout::EdgeTimer;
 use crate::state::AppState;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -32,6 +34,7 @@ pub fn verification_router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_binding))
         .routes(routes!(start_run))
         .routes(routes!(get_run))
+        .routes(routes!(execute))
 }
 
 /// Read one verification binding's identities, activity, readiness, and cursor.
@@ -55,8 +58,6 @@ pub fn verification_router() -> OpenApiRouter<AppState> {
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such binding in the caller's tenant \
           (WYRD_VERIFICATION_404_BINDING_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -106,8 +107,6 @@ async fn get_binding(
           Idempotency-Key was used for a different request \
           (WYRD_VERIFICATION_409_VERIFIER_NOT_READY, WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT)",
          body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -160,8 +159,6 @@ async fn start_run(
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such run in the caller's tenant \
           (WYRD_VERIFICATION_404_RUN_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The registry is unavailable, or no verifier is \
           configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
           WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem)
@@ -178,6 +175,82 @@ async fn get_run(
     Ok(Json(
         VerificationControl::new(&state)
             .get_run(&caller, run_id)
+            .await?,
+    ))
+}
+
+/// Execute one exact Verifier over supplied input and return its judgment.
+///
+/// The body is read up to [`MAX_EXECUTE_BODY_BYTES`]; a larger body is
+/// refused before decoding. Not idempotent: a retry executes again. Body
+/// collection, authentication, and resolution are bounded by the server
+/// request timeout; the engine by the 60-second execution deadline.
+///
+/// # Errors
+/// Returns a stable Wyrd error when the body is too large or malformed, the
+/// caller lacks `evals:run` or subject scope, the target is unknown, the
+/// baseline is not ready or legacy, the input does not fit the Verifier, a
+/// judge fails, or the deadline elapses.
+#[utoipa::path(
+    post,
+    path = "/verification/execute",
+    request_body = ExecuteVerificationRequest,
+    responses(
+        (status = 200, description = "The judgment; a failed verdict is a success",
+         body = Judgment),
+        (status = 400, description = "The body or input is malformed \
+          (WYRD_VERIFICATION_400_INPUT_INVALID)", body = WyrdProblem),
+        (status = 401, description = "The request carried no usable access token \
+          (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
+          WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks evals:run or Card scope over the \
+          subject (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 404, description = "No active Verifier and subject with these UIDs in the \
+          caller's tenant (WYRD_VERIFICATION_404_TARGET_NOT_FOUND)", body = WyrdProblem),
+        (status = 409, description = "The fitted baseline is not ready or legacy \
+          (WYRD_VERIFICATION_409_BASELINE_NOT_READY, WYRD_VERIFICATION_409_BASELINE_LEGACY)",
+         body = WyrdProblem),
+        (status = 413, description = "The body or input exceeds a bound \
+          (WYRD_VERIFICATION_413_INPUT_TOO_LARGE)", body = WyrdProblem),
+        (status = 422, description = "The input does not fit the Verifier, or the Verifier \
+          needs a trace or agent run (WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE, \
+          WYRD_VERIFICATION_422_INPUT_UNSUPPORTED)", body = WyrdProblem),
+        (status = 502, description = "A judge provider failed after the task's retries \
+          (WYRD_VERIFICATION_502_DEPENDENCY_FAILED)", body = WyrdProblem),
+        (status = 503, description = "The registry is unavailable, or no verifier is \
+          configured for the access token (WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE, \
+          WYRD_AUTH_503_VERIFY_UNAVAILABLE)", body = WyrdProblem),
+        (status = 504, description = "The execution exceeded its 60-second deadline \
+          (WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT)", body = WyrdProblem)
+    ),
+    tag = "Verification"
+)]
+#[tracing::instrument(skip(state, caller, body), fields(operation = "verification.execute"))]
+async fn execute(
+    State(state): State<AppState>,
+    edge_timer: Option<Extension<EdgeTimer>>,
+    caller: Caller,
+    body: Body,
+) -> Result<Json<Judgment>, WyrdErrorResponse> {
+    let body = axum::body::to_bytes(body, MAX_EXECUTE_BODY_BYTES)
+        .await
+        .map_err(|_| WyrdError::VerificationInputTooLarge {
+            message: format!("the request body may be at most {MAX_EXECUTE_BODY_BYTES} bytes"),
+            details: serde_json::json!({ "max_bytes": MAX_EXECUTE_BODY_BYTES }),
+        })?;
+    let body =
+        serde_json::from_slice(&body).map_err(|error| WyrdError::VerificationInputInvalid {
+            message: format!("request body is not JSON: {error}"),
+            details: serde_json::json!({}),
+        })?;
+    let request = ExecuteVerificationRequest::decode(body)?;
+    Ok(Json(
+        VerificationControl::new(&state)
+            .execute(
+                &caller,
+                &request,
+                edge_timer.map(|Extension(timer)| timer).as_ref(),
+            )
             .await?,
     ))
 }

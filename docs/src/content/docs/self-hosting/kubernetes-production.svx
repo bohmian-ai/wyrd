@@ -1,6 +1,6 @@
 ---
 title: Production server on Kubernetes
-description: Run Wyrd in production on Kubernetes with the hardened profile, backed-up owner-only migrations, a shared object store, a fixed anchor plus an autoscaled Oracle read tier joined over dedicated-CA peer mTLS, and credential capture and rotation.
+description: Run Wyrd in production on Kubernetes with the hardened profile, backed-up owner-only migrations, a shared object store, a scaled-out tier of `all` replicas plus an optional autoscaled Oracle read tier joined over dedicated-CA peer mTLS, and credential capture and rotation.
 pillar: wyrd
 group: Self-hosting
 order: 11
@@ -9,7 +9,8 @@ order: 11
 # Production server on Kubernetes
 
 This journey builds on [Development server on Kubernetes](/self-hosting/kubernetes-development/).
-It runs the hardened profile, one fixed `all` anchor, and an Oracle-only read
+It runs the hardened profile and a core tier of `all` replicas. Scale out by
+adding `all` replicas first; when reads outgrow them, add an Oracle-only read
 tier that a HorizontalPodAutoscaler grows on the reads its Oracles execute. The replicas find each other through
 Postgres membership and talk over a private, mutually authenticated peer port.
 The repository's local proof of this shape is `deploy/kubernetes/kind/`,
@@ -83,8 +84,8 @@ unchanged.
 | `WYRD_STORAGE_URL` | Required | `s3://<bucket>`, `gs://<bucket>`, or `az://<container>` | One shared bucket. `file://` is process-local and cannot serve peers. |
 | `AWS_REGION` or provider equivalent | Provider-dependent | your region | See [Storage](/self-hosting/storage/). Credentials come from the provider chain, bound to the pods' ServiceAccount (IRSA, GKE Workload Identity, Azure Workload Identity), not from static keys. |
 | `WYRD_SIGNING_KEY_FILE` | Required | `/run/wyrd/signing.pem` | Stable Ed25519 key, Secret `wyrd-signing`, shared by every replica. |
-| `WYRD_BIFROST_DATA_DIR` | Set by the image | `/var/lib/wyrd/bifrost` | On the anchor, its own persistent volume: Scribe WAL, staging, and stable node identity. On an Oracle pod, ephemeral query scratch. |
-| `WYRD_TARGET` | Required | `all` (anchor), `oracle` (read tier) | Which roles the pod runs. |
+| `WYRD_BIFROST_DATA_DIR` | Set by the image | `/var/lib/wyrd/bifrost` | On each `all` replica, its own persistent volume: Scribe WAL, staging, and stable node identity. On an Oracle pod, ephemeral query scratch. |
+| `WYRD_TARGET` | Required | `all` (core tier), `oracle` (read tier) | Which roles the pod runs. |
 | `POD_IP` | Required | `status.podIP` | Downward API. |
 | `WYRD_PEER_ADDRESS` | Required | `$(POD_IP):50052` | The address other replicas dial. No replica has an authored address. |
 | `WYRD_PEER_TLS_DIR` | Required | `/etc/wyrd/peer` | Secret `wyrd-peer-tls`: `ca.crt`, `tls.crt`, `tls.key`. |
@@ -169,7 +170,7 @@ kubectl -n wyrd create secret generic wyrd-peer-tls \
 
 Use a CA made only for this purpose: every certificate it signs is a peer.
 To rotate the leaf, sign a new one from the same CA, replace the Secret, and
-roll the anchor and the Oracle Deployment. If the leaf key is exposed, do the same immediately; if
+roll the core StatefulSet and the Oracle Deployment. If the leaf key is exposed, do the same immediately; if
 the CA key is exposed, create a new CA and leaf and roll every pod.
 
 ## 2. Back up, then migrate
@@ -182,7 +183,7 @@ Every migration, first install or upgrade, follows the same order:
    that receives the owner URL. It is the
    [development one](/self-hosting/kubernetes-development/)
    plus the database CA.
-3. On success, roll the anchor StatefulSet and the Oracle Deployment to the
+3. On success, roll the core StatefulSet and the Oracle Deployment to the
    same digest.
 
 ```yaml
@@ -225,17 +226,24 @@ certificate error, a lock held by another migrator, a failed statement), and rer
 completed `migrate` is idempotent. If the database cannot be repaired, restore
 the verified backup, then rerun the Job.
 
-## 3. Serve: a fixed anchor and an autoscaled Oracle tier
+## 3. Serve: scale `all` replicas, then add an Oracle tier
 
-`wyrd-core` is one `all` replica. It owns the only Scribe, Forge coordination,
-and an Oracle, and it serves the whole public API, including Bifrost ingest. A
-second `all` replica would be an unready standby coordinator, so the scalable
-tier is `wyrd-oracle`: pods with `WYRD_TARGET=oracle` that serve public reads
-and execute each read on their own Oracle. They fetch live, not yet published
-rows from the anchor's Scribe over the peer port and published data from the
-shared bucket. They own no Scribe WAL or node identity, so they are a
-Deployment on ephemeral scratch. With no Scribe they refuse Bifrost ingest:
-send ingest to the anchor.
+`wyrd-core` is a StatefulSet of `all` replicas. Each one runs a Scribe, a Forge
+worker, a Forge coordinator, and an Oracle, and serves the whole public API,
+including Bifrost ingest. Scale out by adding `all` replicas first: every
+replica takes ingest and reads, and each Oracle fuses the live rows of every
+replica's Scribe over the peer port. Forge planning is a singleton held by a
+lease, so one coordinator plans while the others stand by, ready, and take over
+when its lease lapses; every replica's worker executes the planned compaction.
+
+Move to role-specific pods when one workload outgrows the shared shape. The
+usual first step is `wyrd-oracle`: pods with `WYRD_TARGET=oracle` that serve
+public reads and execute each read on their own Oracle. They fetch live, not
+yet published rows from the core replicas' Scribes over the peer port and
+published data from the shared bucket. They own no Scribe WAL or node identity,
+so they are a Deployment on ephemeral scratch, autoscaled on their read rate.
+With no Scribe they refuse Bifrost ingest: send ingest to the core tier. Skip
+steps 4 and 6 below until you add this tier.
 
 Apply the manifests in this order, each into namespace `wyrd`:
 
@@ -243,7 +251,7 @@ Apply the manifests in this order, each into namespace `wyrd`:
    [Restrict who reaches the pods](#restrict-who-reaches-the-pods), before any
    serving pod exists.
 2. `wyrd-sa.yaml`: the ServiceAccount below.
-3. `wyrd-core.yaml`: the anchor Service and StatefulSet, then wait for it.
+3. `wyrd-core.yaml`: the core Service and StatefulSet, then wait for it.
 4. `wyrd-oracle.yaml`: the Oracle Service and Deployment, then wait for it.
 5. `wyrd-edge.yaml`: the edge gateway and routes in [Public routing](#public-routing).
 6. The scrape job and adapter rule, then `wyrd-oracle-hpa.yaml`, in [Autoscaling](#4-autoscaling).
@@ -280,7 +288,7 @@ kind: StatefulSet
 metadata: {name: wyrd-core, namespace: wyrd}
 spec:
   serviceName: wyrd
-  replicas: 1
+  replicas: 2                         # add `all` replicas to scale out
   selector: {matchLabels: {app: wyrd-core}}
   template:
     metadata:
@@ -343,8 +351,9 @@ spec:
       spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 50Gi}}}
 ```
 
-The anchor's volume holds its Scribe WAL and node identity. Never replace it
-with `emptyDir`: a lost Scribe volume is node loss, not an empty restart.
+Each core replica's volume holds its Scribe WAL and node identity. Never
+replace it with `emptyDir`: a lost Scribe volume is node loss, not an empty
+restart.
 
 ```yaml
 # wyrd-oracle.yaml
@@ -375,7 +384,7 @@ spec:
       terminationGracePeriodSeconds: 45
       containers:
         - name: wyrd
-          image: registry.example.com/wyrd@sha256:…   # the anchor's digest
+          image: registry.example.com/wyrd@sha256:…   # the core tier's digest
           env:
             - {name: APP_ENV, value: production}
             - {name: WYRD_TARGET, value: oracle}
@@ -423,7 +432,7 @@ spec:
 ```
 
 The Oracle pods use the same serving logins, database CA, signing key, bucket
-identity, and peer bundle as the anchor. Write `wyrd-netpol.yaml` and
+identity, and peer bundle as the core tier. Write `wyrd-netpol.yaml` and
 `wyrd-mesh.yaml` from [Restrict who reaches the pods](#restrict-who-reaches-the-pods)
 and `wyrd-edge.yaml` from [Public routing](#public-routing) first. Apply the
 policies before any serving pod exists, so no pod ever listens unprotected,
@@ -504,7 +513,7 @@ The edge gateway terminates public TLS with Secret `wyrd-public-tls` and is
 the only public entry. Clients derive the gRPC address from the server URL
 (same host, port `50051`), so each hostname listens on `443` for HTTP (API and
 UI) and `50051` for gRPC. `wyrd.example.com` routes to Service `wyrd` (the
-anchor); `wyrd-query.example.com` routes to Service `wyrd-oracle`. Clients
+core tier); `wyrd-query.example.com` routes to Service `wyrd-oracle`. Clients
 that only query set `WYRD_SERVER_URL=https://wyrd-query.example.com`;
 everything else, including every Bifrost writer, uses `wyrd.example.com`.
 Nothing routes to `50052`.
@@ -663,8 +672,8 @@ Postgres connections fit the database.
 
 After a scale-up, prove the join: the new Oracle pod is Ready, it is listed in
 ready membership as `oracle` at its own pod IP, and a strict fused read sent
-through it returns rows the anchor's Scribe just acknowledged while the
-anchor's own Oracle executes nothing. The kind journey checks exactly this.
+through it returns rows a core replica's Scribe just acknowledged while the
+core replicas' own Oracles execute nothing. The kind journey checks exactly this.
 
 ## Sizing
 
@@ -676,7 +685,7 @@ default it is the pod's memory limit less a 1 GiB minimum kept for other
 give Bifrost memory refuses to boot. No role reserves a fixed share, so an idle
 role costs nothing.
 
-The local kind anchor runs at 4 GiB, a 3 GiB cap: enough for the journey, not
+The local kind core replica runs at 4 GiB, a 3 GiB cap: enough for the journey, not
 for production queries or compaction. Set requests equal to limits from load
 tests, and give the Oracle tier its own measured size and scratch. A query that
 exhausts its memory fails alone with `WYRD_VALA_503_QUERY_RESOURCES_EXHAUSTED`,
@@ -737,8 +746,8 @@ export WYRD_API_KEY=wyrd_sk_…
 wyrd apply hello && wyrd list --kind Prompt
 ```
 
-Then restart the anchor and the Oracle tier, wait for both, and list again:
-the Card, API keys, issued tokens, and the anchor's volume survive.
+Then restart a core replica and the Oracle tier, wait for both, and list again:
+the Card, API keys, issued tokens, and the core replica's volume survive.
 
 ```bash
 kubectl -n wyrd delete pod wyrd-core-0
@@ -758,9 +767,9 @@ wyrd list --kind Prompt
 | A new Oracle never turns Ready | Its peer port cannot bind or serve, or it cannot reach Postgres. | Check the pod log, the peer Secret, and the NetworkPolicy. It stays out of routing until fixed. |
 | The HPA shows `<unknown>` or `FailedGetPodsMetric` | Prometheus does not scrape the pods with `namespace` and `pod` labels, or the adapter rule is missing. | Fix the scrape job and rule, then rerun the custom-metrics check above. |
 | Bifrost ingest to the query hostname fails | Oracle pods have no Scribe to acknowledge rows. | Send ingest to `wyrd.example.com`. |
-| Peer calls fail with TLS errors | A pod mounts a leaf from a different CA, or the leaf expired. | Reissue from the cluster CA, replace `wyrd-peer-tls`, roll the anchor and the Oracle Deployment. |
+| Peer calls fail with TLS errors | A pod mounts a leaf from a different CA, or the leaf expired. | Reissue from the cluster CA, replace `wyrd-peer-tls`, roll the core StatefulSet and the Oracle Deployment. |
 | Storage errors | The ServiceAccount lacks the bucket identity. | Fix the workload identity binding; do not add static keys. |
-| The anchor's volume is lost | Scribe node loss, not an empty restart. | Follow the Scribe node or volume loss runbook before readmitting it. |
+| A core replica's volume is lost | Scribe node loss, not an empty restart. | Follow the Scribe node or volume loss runbook before readmitting it. |
 
 ## Related
 

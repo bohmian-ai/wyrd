@@ -789,6 +789,9 @@ pub(super) fn maximal_resource_metrics(time: i64) -> Vec<ResourceMetrics> {
 pub(super) struct OtlpJourney {
     /// The running server under test.
     server: WyrdTestServer,
+    /// The fixture's own admin API key, which a stock exporter can present
+    /// directly in `x-wyrd-api-key`.
+    api_key: secrecy::SecretString,
     /// A bearer minted from the fixture's own admin API key.
     token: String,
     /// The public SDK client the readback runs through.
@@ -803,7 +806,21 @@ impl OtlpJourney {
     /// Panics when the server does not start, does not bind, or cannot
     /// bootstrap the journey's own service principal.
     pub(super) async fn start() -> Self {
-        let server = WyrdTestServer::start_bound()
+        Self::start_on(WyrdTestServer::builder()).await
+    }
+
+    /// Starts one bound server from `builder` and mints the journey's credentials.
+    ///
+    /// The configurable form exists for journeys whose claim depends on server
+    /// configuration, such as a short access-token lifetime.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the server does not start, does not bind, or cannot
+    /// bootstrap the journey's own service principal.
+    pub(super) async fn start_on(builder: wyrd_testing::WyrdTestServerBuilder) -> Self {
+        let server = builder
+            .start_bound()
             .await
             .expect("the OTLP journey harness starts");
         let bootstrap = server
@@ -831,15 +848,21 @@ impl OtlpJourney {
                     .to_owned(),
                 ..wyrd_client::transport::HttpConfig::default()
             },
-            credential: Some(api_key),
+            credential: Some(api_key.clone()),
             ..wyrd_client::config::ClientConfig::default()
         })
         .expect("the journey builds its public SDK client");
         Self {
             server,
+            api_key,
             token,
             client,
         }
+    }
+
+    /// The admin API key an OTLP exporter may send in `x-wyrd-api-key`.
+    pub(super) fn api_key(&self) -> &secrecy::SecretString {
+        &self.api_key
     }
 
     /// The bearer an OTLP exporter sends in `x-wyrd-access-token`.
@@ -1009,6 +1032,7 @@ impl OtlpJourney {
     ) -> Vec<RecordBatch> {
         let mut stream = wyrd_client::Bifrost::query_only(client)
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
+                params: Vec::new(),
                 sql: sql.to_owned(),
                 deadline_ms: Some(120_000),
             })
@@ -1048,6 +1072,7 @@ impl OtlpJourney {
     pub(super) async fn try_query(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
         let mut stream = match wyrd_client::Bifrost::query_only(&self.client)
             .query(&wyrd_spec::vala::api::BifrostQueryRequest {
+                params: Vec::new(),
                 sql: sql.to_owned(),
                 deadline_ms: Some(120_000),
             })

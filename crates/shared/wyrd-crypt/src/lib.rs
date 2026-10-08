@@ -340,7 +340,7 @@ impl std::fmt::Debug for SealingKeyring {
         f.debug_struct("SealingKeyring")
             .field("write_key_id", &self.write.0)
             .field("retained_key_ids", &self.retained_key_ids())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

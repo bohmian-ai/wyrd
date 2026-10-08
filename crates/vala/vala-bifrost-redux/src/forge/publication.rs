@@ -783,8 +783,6 @@ pub(super) struct RewriteFenceAuthority {
 pub(super) struct RewriteAttemptAuthority {
     /// Cooperative cancellation was requested.
     pub(super) cancelled: bool,
-    /// The attempt's immutable deadline has elapsed.
-    pub(super) deadline_passed: bool,
 }
 
 /// Authority the table still being the planned table grants.
@@ -847,8 +845,6 @@ pub(super) enum RewriteRefusal {
     CommitWindow,
     /// Cancellation was requested before the commit.
     Cancelled,
-    /// The attempt's immutable deadline elapsed.
-    Deadline,
     /// The recorded planning snapshot is no longer retained.
     BaseNotRetained,
     /// The table's current schema identity changed.
@@ -875,7 +871,7 @@ impl RewriteCommitAuthority {
     /// reported refusal names the outermost thing that went wrong rather than
     /// a downstream symptom of it. Every dimension is checked; there is no
     /// early `Proceed`.
-    pub(super) const fn decide(&self) -> RewriteCommitDecision {
+    pub(super) const fn decide(self) -> RewriteCommitDecision {
         if !self.fence.lease_held {
             return RewriteCommitDecision::Refuse(RewriteRefusal::LeaseLost);
         }
@@ -887,9 +883,6 @@ impl RewriteCommitAuthority {
         }
         if self.attempt.cancelled {
             return RewriteCommitDecision::Refuse(RewriteRefusal::Cancelled);
-        }
-        if self.attempt.deadline_passed {
-            return RewriteCommitDecision::Refuse(RewriteRefusal::Deadline);
         }
         if !self.table.base_is_retained {
             return RewriteCommitDecision::Refuse(RewriteRefusal::BaseNotRetained);
@@ -951,22 +944,20 @@ const REWRITE_CONFLICT_MAX_BACKOFF: std::time::Duration = std::time::Duration::f
 /// spent, so it holds no clock, no timer, and no configuration: 1s, 2s, 4s, and
 /// then nothing. There is no jitter, because the contention this backs off from
 /// is one worker's own plans against one table head — a spread that jitter
-/// would only blur — and the absolute publication deadline, not the schedule,
-/// is what bounds the total wait.
+/// would only blur. The retry count is what bounds the total wait; each call is
+/// bounded on its own by the catalog request timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RewriteConflictSchedule;
 
 /// Why a scheduled retry did not happen.
 ///
-/// All three are definite non-acceptance — the plan is provably uncommitted —
-/// but they differ in what the caller records, so they stay distinct rather
-/// than collapsing into one boolean.
+/// Both are definite non-acceptance — the plan is provably uncommitted — but
+/// they differ in what the caller records, so they stay distinct rather than
+/// collapsing into one boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RewriteRetryStop {
     /// The schedule owes no further retry.
     Exhausted,
-    /// The absolute publication deadline cannot cover the delay plus a call.
-    DeadlineTruncated,
     /// The attempt was cancelled while waiting.
     Cancelled,
 }
@@ -987,17 +978,13 @@ impl RewriteConflictSchedule {
 
     /// Waits the delay owed after `retries_spent`, or explains why it will not.
     ///
-    /// The deadline is checked *before* the sleep, against the delay the sleep
-    /// would consume, because a wait that consumes the last of the budget
-    /// leaves the resubmission no time to be answered in — and an unanswered
-    /// resubmission is exactly the ambiguity this whole path exists to avoid.
     /// Cancellation is observed during the wait rather than only around it, so
     /// a shutdown does not have to outlast the longest backoff.
     ///
     /// # Errors
     ///
-    /// Returns [`RewriteRetryStop`] when the schedule is exhausted, the
-    /// deadline cannot cover the delay, or the attempt was cancelled.
+    /// Returns [`RewriteRetryStop`] when the schedule is exhausted or the
+    /// attempt was cancelled.
     ///
     /// # Cancellation
     ///
@@ -1005,17 +992,9 @@ impl RewriteConflictSchedule {
     /// without resubmitting, leaving the plan definitely uncommitted.
     pub(super) async fn wait(
         retries_spent: u32,
-        deadline: RewritePublicationDeadline,
-        now: chrono::DateTime<chrono::Utc>,
         stop: &tokio_util::sync::CancellationToken,
     ) -> Result<(), RewriteRetryStop> {
         let delay = Self::delay_after(retries_spent).ok_or(RewriteRetryStop::Exhausted)?;
-        if deadline
-            .remaining(now)
-            .is_none_or(|remaining| remaining <= delay)
-        {
-            return Err(RewriteRetryStop::DeadlineTruncated);
-        }
         tokio::select! {
             () = tokio::time::sleep(delay) => Ok(()),
             () = stop.cancelled() => Err(RewriteRetryStop::Cancelled),
@@ -1026,22 +1005,19 @@ impl RewriteConflictSchedule {
 impl RewriteAcceptance {
     /// Chooses the one legal follow-up for this acceptance.
     ///
-    /// Ambiguity always reconciles: no amount of remaining budget or unchanged
-    /// authority makes resubmitting an unknown commit safe. A definite conflict
-    /// buys a revalidated retry while the schedule still owes one, the original
-    /// deadline still holds, and every assumption the first attempt was built
-    /// on is still true.
+    /// Ambiguity always reconciles: no amount of unchanged authority makes
+    /// resubmitting an unknown commit safe. A definite conflict buys a
+    /// revalidated retry while the schedule still owes one and every assumption
+    /// the first attempt was built on is still true.
     pub(super) fn next_action(
         self,
         retries_spent: u32,
-        deadline_passed: bool,
         authority: RewriteCommitDecision,
     ) -> RewriteConflictAction {
         match self {
             Self::Ambiguous => RewriteConflictAction::ReconcileWithoutRecommit,
             Self::DefiniteConflict => {
                 if RewriteConflictSchedule::delay_after(retries_spent).is_none()
-                    || deadline_passed
                     || !matches!(authority, RewriteCommitDecision::Proceed)
                 {
                     RewriteConflictAction::ResetDefinitelyUncommitted
@@ -1050,64 +1026,6 @@ impl RewriteAcceptance {
                 }
             }
         }
-    }
-}
-
-/// The one absolute instant every catalog call of one publication shares.
-///
-/// A publication is allowed its initial submission plus the scheduled
-/// definite-conflict retries, and every one of those calls is the same
-/// operation. Giving each call its own timeout would let a first call that
-/// burned the whole budget hand the next one a second full budget, so the
-/// budget is captured once as an *instant* rather than a duration and every
-/// later call derives its wait from what is left of it. Nothing may renew it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RewritePublicationDeadline {
-    /// Absolute UTC instant no catalog call may start at or complete after.
-    at: chrono::DateTime<chrono::Utc>,
-}
-
-impl RewritePublicationDeadline {
-    /// Captures the one deadline as `now` plus the configured commit budget.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::InvalidConfig`] when the configured budget is not
-    /// representable as a `chrono` duration or the sum overflows the calendar.
-    pub(super) fn new(
-        now: chrono::DateTime<chrono::Utc>,
-        budget: std::time::Duration,
-    ) -> Result<Self, ForgeError> {
-        let budget = chrono::Duration::from_std(budget).map_err(|_| ForgeError::InvalidConfig {
-            detail: "Forge Iceberg retry timeout is not representable".to_owned(),
-        })?;
-        let at = now
-            .checked_add_signed(budget)
-            .ok_or_else(|| ForgeError::InvalidConfig {
-                detail: "Forge Iceberg retry timeout overflows the publication deadline".to_owned(),
-            })?;
-        Ok(Self { at })
-    }
-
-    /// Returns whether `now` has reached or passed the deadline.
-    pub(super) fn passed(self, now: chrono::DateTime<chrono::Utc>) -> bool {
-        now >= self.at
-    }
-
-    /// Returns the strictly positive budget left at `now`.
-    ///
-    /// `None` means no catalog call may start: either the deadline has elapsed
-    /// or what remains cannot be represented as a wait, and both are refusals
-    /// rather than an unbounded call.
-    pub(super) fn remaining(
-        self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> Option<std::time::Duration> {
-        self.at
-            .signed_duration_since(now)
-            .to_std()
-            .ok()
-            .filter(|remaining: &std::time::Duration| !remaining.is_zero())
     }
 }
 
@@ -1123,7 +1041,7 @@ pub(super) enum RewriteSubmission {
     Committed(Box<Table>),
     /// No `update_table` call was started, so nothing landed.
     NotSubmitted(ForgeError),
-    /// The catalog answered with a definite, non-retryable refusal.
+    /// The catalog answered with a definite refusal: a failed requirement or a non-retryable error.
     DefiniteConflict(ForgeError),
     /// A call was submitted and its acceptance is unknown.
     AcceptanceUnknown(ForgeError),
@@ -1222,8 +1140,6 @@ pub(super) struct ForgeRewriteCommit<'commit> {
     pub(super) table: &'commit Table,
     /// Fully derived replacement this commit executes without further decisions.
     pub(super) request: &'commit RewriteCommitRequest,
-    /// The one absolute budget this call shares with the whole publication.
-    pub(super) deadline: RewritePublicationDeadline,
 }
 
 impl Forge {
@@ -1307,22 +1223,21 @@ impl Forge {
     /// operation stays open for evidence-based recovery.
     ///
     /// Every pre-submission refusal — a lost fence, a cancelled attempt, a
-    /// deadline that already elapsed, a replacement the transaction layer will
-    /// not even encode — is reported as [`RewriteSubmission::NotSubmitted`]
+    /// replacement the transaction layer will not even encode — is reported as [`RewriteSubmission::NotSubmitted`]
     /// instead. That is knowledge, not an outcome: no catalog call started, so
     /// the caller may close the operation as definitely uncommitted rather than
     /// stranding it for a successor to reconcile a commit that never happened.
     ///
-    /// The wait itself is derived from the publication's one absolute deadline
-    /// immediately before the call, so the initial commit and its single
-    /// permitted retry share one budget and neither can outlive it.
+    /// The call is one catalog update (`commit_once`): the transaction layer's
+    /// own retry would re-apply a commit whose response was lost and report
+    /// the landed effect as a definite duplicate-file refusal. Its wait is the
+    /// configured catalog request timeout, the same per-call bound every other
+    /// Forge catalog request uses.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Lease`] or [`ForgeError::Sql`] when the lease
-    /// cannot be renewed or fenced against the operator pool, and
-    /// [`ForgeError::InvalidConfig`] when the clock cannot report the current
-    /// instant. Every publication outcome is reported through the returned
+    /// cannot be renewed or fenced against the operator pool. Every publication outcome is reported through the returned
     /// [`RewriteSubmission`] rather than as an error.
     ///
     /// # Cancellation
@@ -1335,11 +1250,7 @@ impl Forge {
         commit: ForgeRewriteCommit<'_>,
         stop: &CancellationToken,
     ) -> Result<RewriteSubmission, ForgeError> {
-        let ForgeRewriteCommit {
-            table,
-            request,
-            deadline,
-        } = commit;
+        let ForgeRewriteCommit { table, request } = commit;
         let span = catalog_commit_span(
             "iceberg_rewrite",
             Some((request.identity.task_id, request.identity.attempt_id)),
@@ -1364,25 +1275,23 @@ impl Forge {
         if stop.is_cancelled() {
             return Ok(RewriteSubmission::NotSubmitted(ForgeError::Shutdown));
         }
-        // The wait is what is left of the publication's one deadline, taken
-        // from the same clock authority that created it and read here rather
-        // than at construction, so a slow first call shortens the retry instead
-        // of the configured budget silently restarting.
-        let Some(remaining) = deadline.remaining(self.core.clock.now()?) else {
-            return Ok(RewriteSubmission::NotSubmitted(ForgeError::Timeout {
-                operation: "rewrite publication",
-            }));
-        };
+        let timeout = self.core.config.catalog_request_timeout;
         let catalog = self.core.catalog.as_ref();
         let outcome = async move {
-            let commit = transaction.commit(catalog);
+            let commit = transaction.commit_once(catalog);
             tokio::pin!(commit);
             tokio::select! {
-                response = tokio::time::timeout(remaining, &mut commit) => match response {
+                response = tokio::time::timeout(timeout, &mut commit) => match response {
                     Ok(Ok(committed)) => Ok(committed),
-                    // A retryable catalog answer invites another call rather
-                    // than closing this one, so it is not proof of rejection:
-                    // it reconciles rather than resets.
+                    // A failed requirement or compare-and-swap is the catalog
+                    // refusing this exact update, so it is definite even though
+                    // it invites a retry; Forge revalidates and retries it.
+                    Ok(Err(error)) if error.kind() == iceberg::ErrorKind::CatalogCommitConflicts => {
+                        Err(RewriteSubmission::DefiniteConflict(ForgeError::Catalog(error)))
+                    }
+                    // Any other retryable catalog answer invites another call
+                    // rather than closing this one, so it is not proof of
+                    // rejection: it reconciles rather than resets.
                     Ok(Err(error)) if error.retryable() => {
                         Err(RewriteSubmission::AcceptanceUnknown(ForgeError::Catalog(error)))
                     }
@@ -1390,7 +1299,7 @@ impl Forge {
                         Err(RewriteSubmission::DefiniteConflict(ForgeError::Catalog(error)))
                     }
                     Err(_) => Err(RewriteSubmission::AcceptanceUnknown(ForgeError::Reconciliation {
-                        detail: "Forge rewrite commit ran out of publication budget with unknown acceptance".to_owned(),
+                        detail: "Forge rewrite commit timed out with unknown acceptance".to_owned(),
                     })),
                 },
                 () = stop.cancelled() => Err(RewriteSubmission::AcceptanceUnknown(ForgeError::Reconciliation {
@@ -2069,12 +1978,11 @@ mod tests {
             1 => authority.fence.fence_held = held,
             2 => authority.fence.commit_window_fits = held,
             3 => authority.attempt.cancelled = !held,
-            4 => authority.attempt.deadline_passed = !held,
-            5 => authority.table.base_is_retained = held,
-            6 => authority.table.schema_unchanged = held,
-            7 => authority.files.inputs_all_live = held,
-            8 => authority.files.delete_scope_safe = held,
-            _ => unreachable!("the authority matrix has exactly nine dimensions"),
+            4 => authority.table.base_is_retained = held,
+            5 => authority.table.schema_unchanged = held,
+            6 => authority.files.inputs_all_live = held,
+            7 => authority.files.delete_scope_safe = held,
+            _ => unreachable!("the authority matrix has exactly eight dimensions"),
         }
     }
 
@@ -2089,10 +1997,7 @@ mod tests {
                 fence_held: true,
                 commit_window_fits: true,
             },
-            attempt: RewriteAttemptAuthority {
-                cancelled: false,
-                deadline_passed: false,
-            },
+            attempt: RewriteAttemptAuthority { cancelled: false },
             table: RewriteTableAuthority {
                 base_is_retained: true,
                 schema_unchanged: true,
@@ -2104,12 +2009,12 @@ mod tests {
         }
     }
 
-    /// The nine single-dimension breaks in exact refusal order.
+    /// The eight single-dimension breaks in exact refusal order.
     ///
     /// Each case breaks exactly one dimension of an otherwise complete
     /// authority, so the expected refusal is also a proof of the order: an
     /// earlier check would have reported a different one.
-    fn single_dimension_refusals() -> [RefusalCase; 9] {
+    fn single_dimension_refusals() -> [RefusalCase; 8] {
         [
             (
                 |authority| authority.fence.lease_held = false,
@@ -2126,10 +2031,6 @@ mod tests {
             (
                 |authority| authority.attempt.cancelled = true,
                 RewriteRefusal::Cancelled,
-            ),
-            (
-                |authority| authority.attempt.deadline_passed = true,
-                RewriteRefusal::Deadline,
             ),
             (
                 |authority| authority.table.base_is_retained = false,
@@ -2168,37 +2069,25 @@ mod tests {
         // Uncertain acceptance never recommits, whatever else is true.
         for retries_spent in 0..=super::REWRITE_CONFLICT_RETRIES {
             assert_eq!(
-                RewriteAcceptance::Ambiguous.next_action(retries_spent, false, authorized.decide()),
+                RewriteAcceptance::Ambiguous.next_action(retries_spent, authorized.decide()),
                 RewriteConflictAction::ReconcileWithoutRecommit
             );
         }
         // A definite conflict buys each scheduled retry and no more.
         for retries_spent in 0..super::REWRITE_CONFLICT_RETRIES {
             assert_eq!(
-                RewriteAcceptance::DefiniteConflict.next_action(
-                    retries_spent,
-                    false,
-                    authorized.decide()
-                ),
+                RewriteAcceptance::DefiniteConflict.next_action(retries_spent, authorized.decide()),
                 RewriteConflictAction::RevalidateAndRecommit
             );
         }
         assert_eq!(
-            RewriteAcceptance::DefiniteConflict.next_action(
-                super::REWRITE_CONFLICT_RETRIES,
-                false,
-                authorized.decide()
-            ),
-            RewriteConflictAction::ResetDefinitelyUncommitted
-        );
-        assert_eq!(
-            RewriteAcceptance::DefiniteConflict.next_action(0, true, authorized.decide()),
+            RewriteAcceptance::DefiniteConflict
+                .next_action(super::REWRITE_CONFLICT_RETRIES, authorized.decide()),
             RewriteConflictAction::ResetDefinitelyUncommitted
         );
         assert_eq!(
             RewriteAcceptance::DefiniteConflict.next_action(
                 0,
-                false,
                 RewriteCommitDecision::Refuse(RewriteRefusal::InputsChanged)
             ),
             RewriteConflictAction::ResetDefinitelyUncommitted,
@@ -2210,14 +2099,14 @@ mod tests {
     ///
     /// Every branch of the definite-conflict path is here because each one is a
     /// way to publish twice or to strand an operation: a delay that drifts, a
-    /// wait the deadline cannot cover, a cancellation that resubmits anyway, or
-    /// an ambiguous answer treated as a refusal. Time is paused, so the elapsed
+    /// cancellation that resubmits anyway, or an ambiguous answer treated as a
+    /// refusal. Time is paused, so the elapsed
     /// figures are the schedule's own and not a timing artefact.
     ///
     /// # Panics
     ///
-    /// Panics when a delay, the exhaustion point, the deadline truncation, the
-    /// cancellation behaviour, or the ambiguous action changes.
+    /// Panics when a delay, the exhaustion point, the cancellation behaviour,
+    /// or the ambiguous action changes.
     #[tokio::test(start_paused = true)]
     async fn definite_conflict_retry_schedule_and_unknown_acceptance_are_exact() {
         use std::time::Duration;
@@ -2248,14 +2137,11 @@ mod tests {
         );
 
         let stop = CancellationToken::new();
-        let now = chrono::Utc::now();
-        let generous = RewritePublicationDeadline::new(now, Duration::from_secs(599))
-            .expect("a representable deadline");
 
         // Each wait consumes exactly its scheduled delay.
         for retries_spent in 0..super::REWRITE_CONFLICT_RETRIES {
             let before = tokio::time::Instant::now();
-            RewriteConflictSchedule::wait(retries_spent, generous, now, &stop)
+            RewriteConflictSchedule::wait(retries_spent, &stop)
                 .await
                 .expect("a scheduled retry waits");
             assert_eq!(
@@ -2265,30 +2151,8 @@ mod tests {
             );
         }
         assert_eq!(
-            RewriteConflictSchedule::wait(super::REWRITE_CONFLICT_RETRIES, generous, now, &stop)
-                .await,
+            RewriteConflictSchedule::wait(super::REWRITE_CONFLICT_RETRIES, &stop).await,
             Err(RewriteRetryStop::Exhausted)
-        );
-
-        // A deadline that cannot cover the delay plus an answer truncates
-        // before sleeping rather than shortening the wait.
-        let tight = RewritePublicationDeadline::new(now, Duration::from_secs(1))
-            .expect("a representable deadline");
-        let before = tokio::time::Instant::now();
-        assert_eq!(
-            RewriteConflictSchedule::wait(0, tight, now, &stop).await,
-            Err(RewriteRetryStop::DeadlineTruncated)
-        );
-        assert_eq!(
-            before.elapsed(),
-            Duration::ZERO,
-            "truncation does not sleep"
-        );
-        assert_eq!(
-            RewriteConflictSchedule::wait(0, tight, now + chrono::Duration::seconds(5), &stop)
-                .await,
-            Err(RewriteRetryStop::DeadlineTruncated),
-            "an elapsed deadline is also a truncation, never an unbounded wait"
         );
 
         // Cancellation interrupts the backoff instead of outlasting it.
@@ -2296,7 +2160,7 @@ mod tests {
         let before = tokio::time::Instant::now();
         let waiting = tokio::spawn({
             let cancelled = cancelled.clone();
-            async move { RewriteConflictSchedule::wait(2, generous, now, &cancelled).await }
+            async move { RewriteConflictSchedule::wait(2, &cancelled).await }
         });
         tokio::time::advance(Duration::from_secs(1)).await;
         cancelled.cancel();
@@ -2313,7 +2177,7 @@ mod tests {
         let authorized = authorized_rewrite_commit_authority();
         for retries_spent in 0..=super::REWRITE_CONFLICT_RETRIES {
             assert_eq!(
-                RewriteAcceptance::Ambiguous.next_action(retries_spent, false, authorized.decide()),
+                RewriteAcceptance::Ambiguous.next_action(retries_spent, authorized.decide()),
                 RewriteConflictAction::ReconcileWithoutRecommit,
                 "an unknown acceptance leaves the operation Prepared for reconciliation"
             );
@@ -2323,7 +2187,7 @@ mod tests {
     /// The closed matrix always reports its outermost broken dimension.
     ///
     /// The single-break cases prove the mapping; this proves the matrix is
-    /// closed. Every one of the 512 combinations must proceed only when
+    /// closed. Every one of the 256 combinations must proceed only when
     /// nothing is broken, and must report the outermost broken dimension, so a
     /// later reordering or an added early `Proceed` cannot hide a refusal
     /// behind a dimension that happens to be checked first.
@@ -2357,57 +2221,5 @@ mod tests {
                 "authority combination {combination:#b} decided out of order"
             );
         }
-    }
-
-    /// One shared deadline never renews, and never permits a call past itself.
-    ///
-    /// The boundary is exclusive on both sides for a reason. A call that starts
-    /// exactly at the deadline has no budget to wait with, so it must not start
-    /// at all; and the remaining budget is always measured from the deadline
-    /// rather than from the configured timeout, so a first call that consumed
-    /// most of it leaves the retry only what is left.
-    #[test]
-    fn rewrite_publication_deadline_never_renews_its_budget() {
-        let start = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("a valid instant");
-        let budget = std::time::Duration::from_secs(30);
-        let deadline =
-            RewritePublicationDeadline::new(start, budget).expect("a representable deadline");
-
-        assert!(!deadline.passed(start), "a fresh deadline has not elapsed");
-        assert_eq!(deadline.remaining(start), Some(budget));
-
-        // A slow first call shortens the retry rather than restarting the clock.
-        let late = start + chrono::Duration::seconds(29);
-        assert!(!deadline.passed(late));
-        assert_eq!(
-            deadline.remaining(late),
-            Some(std::time::Duration::from_secs(1)),
-            "the retry inherits what the first call left, never a fresh budget"
-        );
-
-        // Exactly at the deadline there is nothing to wait with.
-        let at = start + chrono::Duration::seconds(30);
-        assert!(deadline.passed(at));
-        assert_eq!(
-            deadline.remaining(at),
-            None,
-            "a call may not start with zero remaining budget"
-        );
-
-        let after = start + chrono::Duration::seconds(31);
-        assert!(deadline.passed(after));
-        assert_eq!(deadline.remaining(after), None);
-
-        // The deadline is an instant, so re-deriving it from the same instant
-        // and budget is the only way to get the same value; nothing about the
-        // type can extend one that already exists.
-        assert_eq!(
-            deadline,
-            RewritePublicationDeadline::new(start, budget).expect("a representable deadline"),
-        );
-        assert!(
-            RewritePublicationDeadline::new(start, std::time::Duration::MAX).is_err(),
-            "an unrepresentable budget refuses instead of producing an unbounded call"
-        );
     }
 }

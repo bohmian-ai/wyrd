@@ -89,9 +89,9 @@ input, and preserves the lease and fence. A changed branch head alone is not a
 refusal. Concurrent sibling plans may therefore race optimistically and incur
 expected catalog conflicts. After a definite conflict, reacquire metadata and
 repeat the same validation before the same plan operation may retry after fixed
-1s/2s/4s delays, for at most three retries within its original deadline. Reuse
-the same operation ID, output generation, and objects. Exhausted retries,
-deadline, or a changed required condition ends that plan as definitely
+1s/2s/4s delays, for at most three retries. Reuse
+the same operation ID, output generation, and objects. Exhausted retries or a
+changed required condition ends that plan as definitely
 uncommitted; successful siblings remain committed and remaining debt is
 replanned from the current head. Never hide revalidation inside a generic
 retry. Promotion retains its separate one-retry protocol.
@@ -112,15 +112,17 @@ Data-file compaction, manifest rewrite, snapshot expiration, expired-file
 cleanup, and never-published orphan cleanup are separate protocols with
 separate selection, commit, retention, and audit evidence.
 
-- Expiration respects all retained refs, reader/task watermarks, minimum age,
-  and minimum snapshot count.
+- Expiration respects all retained refs, active Oracle reads, task
+  watermarks, and unsettled promotions; it applies no age or retain-last
+  window.
 - Cleanup derives candidates from catalog reachability before expiration and
   confirms they are unreachable from every retained head afterward.
 - Expired-file cleanup persists per-object progress and treats already-missing
   objects idempotently only after safety validation.
 - Orphan cleanup protects every live snapshot, staged or prepared operation,
   publication attempt, committed Scribe `file_list` object without exact
-  promotion evidence, pinned Oracle cut, and configured age window.
+  promotion evidence, and active Oracle read; only never-published attempt
+  output additionally waits out the configured orphan age window.
   An open Scribe fragment retains local Arrow batches and staged resources
   until its stream completes or drops; it names no Forge-collectable object
   and contributes no independent Forge GC root.

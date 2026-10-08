@@ -211,7 +211,7 @@ impl fmt::Debug for Agent {
             .field("prompt_model", &self.prompt.native().model)
             .field("run_config", &self.run_config)
             .field("tool_names", &self.tool_names)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -510,7 +510,7 @@ impl Agent {
         if self.meta.name.is_none() || self.meta.version.is_none() {
             return Ok(None);
         }
-        let Some(card) = self.identity_card()? else {
+        let Some(card) = self.identity_card() else {
             return Ok(None);
         };
         card.card_ref().map(Some)
@@ -577,7 +577,7 @@ impl Agent {
     /// # Errors
     /// Returns missing identity or invalid identity errors.
     pub fn to_card(&self) -> Result<AgentCard, WyrdError> {
-        let mut card = self.identity_card()?.ok_or(AgentCardError::MissingName)?;
+        let mut card = self.identity_card().ok_or(AgentCardError::MissingName)?;
         if self.meta.version.is_none() {
             return Err(AgentCardError::MissingVersion.into());
         }
@@ -711,12 +711,10 @@ impl Agent {
         }
     }
 
-    fn identity_card(&self) -> Result<Option<AgentCard>, WyrdError> {
-        let Some(name) = self.meta.name.clone() else {
-            return Ok(None);
-        };
+    fn identity_card(&self) -> Option<AgentCard> {
+        let name = self.meta.name.clone()?;
         let Some(version) = self.meta.version.clone() else {
-            return Ok(Some(AgentCard {
+            return Some(AgentCard {
                 space: self
                     .meta
                     .space
@@ -730,9 +728,9 @@ impl Agent {
                 spec: self.to_spec(),
                 cascade_children: self.cascade_children(),
                 created_at: chrono::Utc::now(),
-            }));
+            });
         };
-        Ok(Some(AgentCard {
+        Some(AgentCard {
             space: self
                 .meta
                 .space
@@ -746,7 +744,7 @@ impl Agent {
             spec: self.to_spec(),
             cascade_children: self.cascade_children(),
             created_at: chrono::Utc::now(),
-        }))
+        })
     }
 }
 

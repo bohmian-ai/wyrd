@@ -19,8 +19,8 @@ const SECOND: usize = 1;
 
 /// `oracle` pod launched into the running topology.
 ///
-/// A second `all` replica would be a standby Forge coordinator, which is
-/// unready by design, so the joiner selects exactly the role that scales out.
+/// The joiner selects only the Oracle role, so the journey proves a read-tier
+/// pod with no Scribe of its own executes against the running topology.
 const JOINED: usize = 2;
 
 /// Rows the first pod writes and publishes.
@@ -46,7 +46,7 @@ const GROUPS: i64 = 8;
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn peer_join_and_remote_query() {
-    prove_peer_join_and_remote_query()
+    Box::pin(prove_peer_join_and_remote_query())
         .await
         .expect("peer join journey");
 }
@@ -202,6 +202,7 @@ async fn fused_row_count(
     let client = public_client(node, api_key)?;
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
+            params: Vec::new(),
             sql: sql.to_owned(),
             deadline_ms: None,
         })

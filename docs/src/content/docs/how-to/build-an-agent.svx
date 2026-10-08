@@ -32,7 +32,7 @@ Tools are runtime-local callables. Python uses the `@tool` decorator. Rust uses 
 <LangTabs>
 <LangTab lang="python">
 
-<CodeFromFile file="examples/python/workflow_anthropic.py" lang="python" range="5-10" title="workflow_anthropic.py" />
+<CodeFromFile file="examples/python/workflow_anthropic.py" lang="python" range="18-20" title="workflow_anthropic.py" />
 
 </LangTab>
 <LangTab lang="rust">

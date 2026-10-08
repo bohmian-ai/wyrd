@@ -10,9 +10,7 @@ use vala_bifrost_redux::scribe::admission::GLOBAL_INFLIGHT_ITEMS;
 use vala_bifrost_redux::scribe::geometry::DEFAULT_SHARD_COUNT;
 use wyrd_spec::DataTenantId;
 
-use super::support::{
-    append_values, register_table, sorted_values, start_scribe_server, tenant_client, unique_table,
-};
+use super::support::{append_values, register_table, sorted_values, tenant_client, unique_table};
 
 /// Tenants that are concurrently resident on the topology pod.
 const TENANTS: usize = 4;
@@ -47,7 +45,13 @@ const BATCHES_PER_TABLE: usize = 2;
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_shards_obey_global_and_tenant_budgets() {
-    let server = start_scribe_server().await;
+    // The accounting snapshot is read live, so the tenant's audit table must
+    // not write between its per-shard and per-bucket totals.
+    let server = wyrd_testing::WyrdTestServer::builder()
+        .without_audit_publication_for_test()
+        .start_bound()
+        .await
+        .expect("the Scribe production harness starts");
 
     let mut tenants: Vec<DataTenantId> = vec![server.data_tenant_id()];
     for ordinal in 1..TENANTS {
@@ -76,8 +80,9 @@ async fn scribe_shards_obey_global_and_tenant_budgets() {
         for (table_ordinal, (_, table)) in tables.iter().enumerate() {
             let owner = index * TABLES_PER_TENANT + table_ordinal;
             for batch in 0..BATCHES_PER_TABLE {
-                let first = ((owner * BATCHES_PER_TABLE + batch) * ROWS_PER_BATCH) as i64;
-                let rows: Vec<i64> = (first..first + ROWS_PER_BATCH as i64).collect();
+                let first = i64::try_from((owner * BATCHES_PER_TABLE + batch) * ROWS_PER_BATCH)
+                    .expect("test row ordinals fit i64");
+                let rows: Vec<i64> = (first..).take(ROWS_PER_BATCH).collect();
                 append_values(client, table, uuid::Uuid::now_v7(), &rows)
                     .await
                     .unwrap_or_else(|error| {

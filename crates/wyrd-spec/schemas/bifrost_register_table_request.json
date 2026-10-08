@@ -18,6 +18,17 @@
       "format": "uint64",
       "minimum": 0.0
     },
+    "compaction_type": {
+      "description": "Optional physical compaction strategy Forge applies to this table.\n\nOmitted, the table stores no explicit type and Forge compacts it `small-files`. Supplied, it is stored as the table's `wyrd.forge.compaction.type` Iceberg property. A re-register may omit it or repeat the stored value; a different value is `WYRD_VALA_409_BIFROST_COMPACTION_TYPE_MISMATCH`.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CompactionTypeWire"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "fields": {
       "description": "User fields only; `wyrd_*`/`card_ref`/`run_id` reserved names are rejected.",
       "type": "array",
@@ -46,6 +57,39 @@
     }
   },
   "definitions": {
+    "CompactionTypeWire": {
+      "description": "Physical compaction strategy a table asks Forge to apply.\n\nThe public wire spelling is hyphenated (`auto`, `full`, `small-files`, `files-with-delete`), matching the table's stored `wyrd.forge.compaction.type` Iceberg property; underscore spellings are rejected. A table that names no type compacts `small-files`, and a copy-on-write table always compacts `full` whatever it names.",
+      "oneOf": [
+        {
+          "description": "Choose a delete-heavy or small-file plan from table-wide thresholds.",
+          "type": "string",
+          "enum": [
+            "auto"
+          ]
+        },
+        {
+          "description": "Rewrite every live data file.",
+          "type": "string",
+          "enum": [
+            "full"
+          ]
+        },
+        {
+          "description": "Rewrite only data files below the small-file threshold; the default when none is declared.",
+          "type": "string",
+          "enum": [
+            "small-files"
+          ]
+        },
+        {
+          "description": "Rewrite only data files with associated delete files.",
+          "type": "string",
+          "enum": [
+            "files-with-delete"
+          ]
+        }
+      ]
+    },
     "DataTypeSpec": {
       "description": "Arrow-free logical column type. The exhaustive set Bifrost accepts on the register path; the `DataTypeSpec ↔ arrow::DataType` conversion lives in the server/engine, never in `wyrd-spec`.",
       "oneOf": [

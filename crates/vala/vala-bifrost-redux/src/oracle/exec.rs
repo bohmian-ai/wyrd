@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arrow::array::Array;
 use arrow::compute::cast;
 #[cfg(test)]
-use arrow::datatypes::{DataType, Field};
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::Field;
+use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -48,6 +48,7 @@ use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
 };
+use datafusion::scalar::ScalarValue;
 use datafusion_distributed::NetworkBoundaryExt as _;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
@@ -60,15 +61,18 @@ use iceberg_datafusion::IcebergStaticTableProvider;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
+use parquet::bloom_filter::Sbbf;
 use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use parquet::schema::types::ColumnDescriptor;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::BifrostError;
 
 use crate::scribe::hot_source::StagedSourceLease;
 use crate::storage::error_chain_contains_not_found;
 use wyrd_spec::vala::api::{QueryClass, WorkerScanStats};
-use wyrd_spec::vala::assignment_authority::ScanPredicate;
+use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::live::LiveScribeExec;
@@ -113,6 +117,11 @@ pub(super) struct OracleScanMetricsHandle {
     row_groups_selected: AtomicU64,
     /// Row groups excluded by closed-predicate statistics pruning.
     row_groups_pruned: AtomicU64,
+    /// Row groups that survived statistics pruning and a Bloom filter then
+    /// proved empty. Also counted in `row_groups_pruned`.
+    row_groups_pruned_bloom: AtomicU64,
+    /// Rows inside retained row groups that page-index selection skipped.
+    rows_pruned_page_index: AtomicU64,
 }
 
 impl OracleScanMetricsHandle {
@@ -160,6 +169,27 @@ impl OracleScanMetricsHandle {
             .fetch_add(selection.pruned, Ordering::Relaxed);
     }
 
+    /// Moves `count` row groups that statistics retained to the pruned side,
+    /// attributing them to a Bloom filter.
+    ///
+    /// Called once per opened hot file after its Bloom probes complete, so the
+    /// selected/pruned pair still accounts for every inspected row group.
+    pub(super) fn record_bloom_pruned(&self, count: u64) {
+        if count == 0 {
+            return;
+        }
+        self.row_groups_selected.fetch_sub(count, Ordering::Relaxed);
+        self.row_groups_pruned.fetch_add(count, Ordering::Relaxed);
+        self.row_groups_pruned_bloom
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Records rows a page-index row selection skipped in retained groups.
+    pub(super) fn record_page_pruned_rows(&self, rows: usize) {
+        self.rows_pruned_page_index
+            .fetch_add(u64::try_from(rows).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
     /// Returns terminal dependency counters without substituting metadata sizes.
     fn terminal_values(&self) -> (Option<u64>, u64, u64) {
         let mut total = 0_u64;
@@ -187,12 +217,70 @@ impl OracleScanMetricsHandle {
         (available.then_some(total), files, partitions)
     }
 
-    /// Returns the terminal `(selected, pruned)` row-group counters.
-    fn terminal_row_groups(&self) -> (u64, u64) {
-        (
-            self.row_groups_selected.load(Ordering::Acquire),
-            self.row_groups_pruned.load(Ordering::Acquire),
-        )
+    /// Returns the terminal per-mechanism pruning counters of both readers.
+    ///
+    /// Hot counters are this handle's own. Each Iceberg partition reader
+    /// reports the row groups it considered and attributes every excluded one
+    /// to exactly one of statistics or Bloom, so its retained groups are the
+    /// considered groups minus both.
+    fn terminal_pruning(&self) -> PruningEvidence {
+        let mut evidence = PruningEvidence {
+            row_groups_scanned: self.row_groups_selected.load(Ordering::Acquire),
+            row_groups_pruned: self.row_groups_pruned.load(Ordering::Acquire),
+            row_groups_pruned_bloom: self.row_groups_pruned_bloom.load(Ordering::Acquire),
+            rows_pruned_page_index: self.rows_pruned_page_index.load(Ordering::Acquire),
+        };
+        if let Ok(readers) = self.iceberg.lock() {
+            for reader in readers.iter() {
+                let statistics = reader.row_groups_pruned_by_statistics();
+                let bloom = reader.row_groups_pruned_by_bloom_filter();
+                evidence.add(PruningEvidence {
+                    row_groups_scanned: reader
+                        .row_groups_considered()
+                        .saturating_sub(statistics.saturating_add(bloom)),
+                    row_groups_pruned: statistics.saturating_add(bloom),
+                    row_groups_pruned_bloom: bloom,
+                    rows_pruned_page_index: reader.rows_pruned_by_page_index(),
+                });
+            }
+        }
+        evidence
+    }
+}
+
+/// Per-mechanism row-group and page pruning evidence of one or more scans.
+///
+/// `row_groups_pruned` counts every excluded row group whatever excluded it;
+/// `row_groups_pruned_bloom` is the subset a Bloom filter excluded after
+/// statistics kept it, so statistics-only exclusion is the difference.
+/// `rows_pruned_page_index` counts rows skipped inside retained row groups.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PruningEvidence {
+    /// Row groups read after every row-group pruning mechanism.
+    pub(crate) row_groups_scanned: u64,
+    /// Row groups excluded by statistics or Bloom filters.
+    pub(crate) row_groups_pruned: u64,
+    /// Row groups a Bloom filter excluded after statistics retained them.
+    pub(crate) row_groups_pruned_bloom: u64,
+    /// Rows in retained row groups that page-index selection skipped.
+    pub(crate) rows_pruned_page_index: u64,
+}
+
+impl PruningEvidence {
+    /// Adds `other` into this total, saturating every counter.
+    pub(crate) fn add(&mut self, other: Self) {
+        self.row_groups_scanned = self
+            .row_groups_scanned
+            .saturating_add(other.row_groups_scanned);
+        self.row_groups_pruned = self
+            .row_groups_pruned
+            .saturating_add(other.row_groups_pruned);
+        self.row_groups_pruned_bloom = self
+            .row_groups_pruned_bloom
+            .saturating_add(other.row_groups_pruned_bloom);
+        self.rows_pruned_page_index = self
+            .rows_pruned_page_index
+            .saturating_add(other.rows_pruned_page_index);
     }
 }
 
@@ -281,6 +369,10 @@ pub(crate) struct RemoteScanMetrics {
     row_groups_scanned: AtomicU64,
     /// Summed pruned row groups across every completed participant.
     row_groups_pruned: AtomicU64,
+    /// Summed Bloom-excluded row groups across every completed participant.
+    row_groups_pruned_bloom: AtomicU64,
+    /// Summed page-index-skipped rows across every completed participant.
+    rows_pruned_page_index: AtomicU64,
 }
 
 impl RemoteScanMetrics {
@@ -302,6 +394,10 @@ impl RemoteScanMetrics {
             .fetch_add(stats.row_groups_scanned, Ordering::Relaxed);
         self.row_groups_pruned
             .fetch_add(stats.row_groups_pruned, Ordering::Relaxed);
+        self.row_groups_pruned_bloom
+            .fetch_add(stats.row_groups_pruned_bloom, Ordering::Relaxed);
+        self.rows_pruned_page_index
+            .fetch_add(stats.rows_pruned_page_index, Ordering::Relaxed);
     }
 
     /// Returns the aggregated totals, preserving absent-versus-zero bytes.
@@ -317,16 +413,18 @@ impl RemoteScanMetrics {
         )
     }
 
-    /// Returns the aggregated retained and pruned row-group totals.
+    /// Returns the aggregated per-mechanism pruning totals.
     ///
-    /// Reported separately from [`Self::terminal_values`] because row-group
+    /// Reported separately from [`Self::terminal_values`] because pruning
     /// evidence exists only for participants running a Parquet leaf; a cut
     /// with no such participant contributes a true zero, not an absence.
-    fn terminal_row_groups(&self) -> (u64, u64) {
-        (
-            self.row_groups_scanned.load(Ordering::Acquire),
-            self.row_groups_pruned.load(Ordering::Acquire),
-        )
+    fn terminal_pruning(&self) -> PruningEvidence {
+        PruningEvidence {
+            row_groups_scanned: self.row_groups_scanned.load(Ordering::Acquire),
+            row_groups_pruned: self.row_groups_pruned.load(Ordering::Acquire),
+            row_groups_pruned_bloom: self.row_groups_pruned_bloom.load(Ordering::Acquire),
+            rows_pruned_page_index: self.rows_pruned_page_index.load(Ordering::Acquire),
+        }
     }
 }
 
@@ -343,10 +441,8 @@ pub(crate) struct OracleQueryScanStats {
     pub(crate) files_scanned: u64,
     /// Number of file partitions represented by executed scan nodes.
     pub(crate) partitions_scanned: u64,
-    /// Row groups retained after closed-predicate statistics pruning.
-    pub(crate) row_groups_scanned: u64,
-    /// Row groups excluded by closed-predicate statistics pruning.
-    pub(crate) row_groups_pruned: u64,
+    /// Per-mechanism row-group and page pruning across every executed leaf.
+    pub(crate) pruning: PruningEvidence,
     /// Shared file-source metric sets retained until terminal stream drain.
     physical_metrics: Vec<ExecutionPlanMetricsSet>,
     /// Shared dependency counters retained until terminal stream drain.
@@ -388,11 +484,9 @@ impl OracleQueryScanStats {
         }
         for handle in &self.remote_handles {
             let (bytes, files, partitions) = handle.terminal_values();
-            let (selected_groups, pruned_groups) = handle.terminal_row_groups();
             self.files_scanned = self.files_scanned.saturating_add(files);
             self.partitions_scanned = self.partitions_scanned.saturating_add(partitions);
-            self.row_groups_scanned = self.row_groups_scanned.saturating_add(selected_groups);
-            self.row_groups_pruned = self.row_groups_pruned.saturating_add(pruned_groups);
+            self.pruning.add(handle.terminal_pruning());
             if let Some(bytes) = bytes {
                 available = true;
                 total = total.saturating_add(bytes);
@@ -400,11 +494,9 @@ impl OracleQueryScanStats {
         }
         for handle in &self.scan_handles {
             let (bytes, files, partitions) = handle.terminal_values();
-            let (selected_groups, pruned_groups) = handle.terminal_row_groups();
             self.files_scanned = self.files_scanned.saturating_add(files);
             self.partitions_scanned = self.partitions_scanned.saturating_add(partitions);
-            self.row_groups_scanned = self.row_groups_scanned.saturating_add(selected_groups);
-            self.row_groups_pruned = self.row_groups_pruned.saturating_add(pruned_groups);
+            self.pruning.add(handle.terminal_pruning());
             if let Some(bytes) = bytes {
                 available = true;
                 total = total.saturating_add(bytes);
@@ -489,8 +581,12 @@ pub(crate) const WYRD_FILES_SCANNED_METRIC: &str = "wyrd_files_scanned";
 pub(crate) const WYRD_PARTITIONS_SCANNED_METRIC: &str = "wyrd_partitions_scanned";
 /// Row groups a follower leaf retained after statistics pruning.
 pub(crate) const WYRD_ROW_GROUPS_SCANNED_METRIC: &str = "wyrd_row_groups_scanned";
-/// Row groups a follower leaf skipped by statistics pruning.
+/// Row groups a follower leaf skipped by statistics or Bloom pruning.
 pub(crate) const WYRD_ROW_GROUPS_PRUNED_METRIC: &str = "wyrd_row_groups_pruned";
+/// Row groups a follower leaf's Bloom filters skipped after statistics kept them.
+pub(crate) const WYRD_ROW_GROUPS_PRUNED_BLOOM_METRIC: &str = "wyrd_row_groups_pruned_bloom";
+/// Rows a follower leaf's page-index selection skipped in retained row groups.
+pub(crate) const WYRD_ROWS_PRUNED_PAGE_INDEX_METRIC: &str = "wyrd_rows_pruned_page_index";
 
 /// Publishes one resolved follower leaf's terminal scan evidence as metrics.
 ///
@@ -518,8 +614,22 @@ pub(crate) fn analytical_leaf_scan_metrics(plan: &dyn ExecutionPlan) -> MetricsS
     }
     publish(WYRD_FILES_SCANNED_METRIC, stats.files_scanned);
     publish(WYRD_PARTITIONS_SCANNED_METRIC, stats.partitions_scanned);
-    publish(WYRD_ROW_GROUPS_SCANNED_METRIC, stats.row_groups_scanned);
-    publish(WYRD_ROW_GROUPS_PRUNED_METRIC, stats.row_groups_pruned);
+    publish(
+        WYRD_ROW_GROUPS_SCANNED_METRIC,
+        stats.pruning.row_groups_scanned,
+    );
+    publish(
+        WYRD_ROW_GROUPS_PRUNED_METRIC,
+        stats.pruning.row_groups_pruned,
+    );
+    publish(
+        WYRD_ROW_GROUPS_PRUNED_BLOOM_METRIC,
+        stats.pruning.row_groups_pruned_bloom,
+    );
+    publish(
+        WYRD_ROWS_PRUNED_PAGE_INDEX_METRIC,
+        stats.pruning.rows_pruned_page_index,
+    );
     published
 }
 
@@ -609,6 +719,12 @@ fn fold_distributed_scan_metrics(node: &Arc<dyn ExecutionPlan>, totals: &mut Wor
                 .row_groups_pruned
                 .saturating_add(sum_named_count(&metrics, name).unwrap_or(0));
         }
+        totals.row_groups_pruned_bloom = totals.row_groups_pruned_bloom.saturating_add(
+            sum_named_count(&metrics, WYRD_ROW_GROUPS_PRUNED_BLOOM_METRIC).unwrap_or(0),
+        );
+        totals.rows_pruned_page_index = totals.rows_pruned_page_index.saturating_add(
+            sum_named_count(&metrics, WYRD_ROWS_PRUNED_PAGE_INDEX_METRIC).unwrap_or(0),
+        );
     }
     if let Some(boundary) = node.as_network_boundary()
         && let datafusion_distributed::Stage::Local(stage) = boundary.input_stage()
@@ -1425,7 +1541,9 @@ impl OracleIcebergScanExec {
         let tasks = futures_util::stream::iter(tasks);
         // Row selection turns each task predicate into a page-index selection,
         // so a point lookup decodes the matching pages instead of every page
-        // of each surviving row group. The reader defaults it off.
+        // of each surviving row group. The reader defaults it off. The pinned
+        // evaluator decodes every physical type it can bound exactly and keeps
+        // pages for any other, so it is enabled for every predicate.
         let reader = self
             .reader
             .get_or_init(|| async {
@@ -2004,16 +2122,39 @@ impl OracleTableProvider {
 fn classify_filter_for_schema(physical_schema: &Schema, filter: &Expr) -> FilterClassification {
     match classify_filter(filter) {
         FilterClassification::Supported(leaves) => {
-            if leaves
-                .iter()
-                .all(|leaf| physical_schema.column_with_name(leaf.column()).is_some())
-            {
+            if leaves.iter().all(|leaf| {
+                physical_schema
+                    .column_with_name(leaf.column())
+                    .is_some_and(|(_, field)| literal_fits_column(leaf, field.data_type()))
+            }) {
                 FilterClassification::Supported(leaves)
             } else {
                 FilterClassification::Unsupported
             }
         }
         FilterClassification::Unsupported => FilterClassification::Unsupported,
+    }
+}
+
+/// Reports whether `leaf`'s literal can be materialized against a column of
+/// `data_type` without a cast.
+///
+/// Only a binary literal is constrained here: it must compare against a
+/// binary-family column, and a fixed-size column additionally requires the
+/// literal's exact width, because a `FixedSizeBinary` scalar of any other width
+/// is not a value of that column. Every other literal keeps the classifier's
+/// existing contract, where the residual filter decides typed comparisons.
+fn literal_fits_column(leaf: &ScanPredicate, data_type: &DataType) -> bool {
+    match (leaf.literal(), data_type) {
+        (Some(ScanLiteral::Bytes(value)), DataType::FixedSizeBinary(width)) => {
+            usize::try_from(*width).is_ok_and(|width| width == value.len())
+        }
+        (
+            Some(ScanLiteral::Bytes(_)),
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView,
+        ) => true,
+        (Some(ScanLiteral::Bytes(_)), _) => false,
+        _ => true,
     }
 }
 
@@ -2803,6 +2944,47 @@ impl ExecutionPlan for HotParquetExec {
     }
 }
 
+/// Opens governed readers for the hot objects of one partition stream.
+///
+/// Owns the dependencies every reader of the stream shares, so each piece
+/// builds its reader from a location and size alone. Cloned into each
+/// piece's reader closure, which the metadata owner may call again on retry.
+#[derive(Clone)]
+struct HotReaderFactory {
+    /// File reader inherited from the pinned Iceberg table.
+    file_io: FileIO,
+    /// Closed governance mode every reader's range reservations use.
+    governance: HotParquetGovernance,
+    /// Shared physical scan counters retained to terminal query emission.
+    metrics: Arc<OracleScanMetricsHandle>,
+    /// Deterministic range reader injected only by focused tests.
+    #[cfg(test)]
+    reader_override: Option<HotReadOverride>,
+}
+
+impl HotReaderFactory {
+    /// Creates an unopened reader for the object at `location` of `size`
+    /// bytes; the object is opened on the reader's first range request.
+    fn reader(&self, location: &str, size: u64) -> IcebergParquetReader {
+        let reader = IcebergParquetReader::new(
+            HotObjectSource::Pending {
+                file_io: self.file_io.clone(),
+                location: location.to_owned(),
+            },
+            size,
+            self.governance.clone(),
+            Arc::clone(&self.metrics),
+        );
+        #[cfg(test)]
+        let reader = if let Some(override_reader) = self.reader_override.as_ref() {
+            reader.with_test_reader(location.to_owned(), Arc::clone(override_reader))
+        } else {
+            reader
+        };
+        reader
+    }
+}
+
 /// Builds one partition's hot-file stream after partition validation.
 ///
 /// The partition's byte ranges are read sequentially. The piece holding a
@@ -2821,14 +3003,18 @@ fn hot_stream(
     governance: HotParquetGovernance,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static {
     let pieces = exec.partition_pieces(partition);
-    let file_io = exec.file_io.clone();
+    let readers = HotReaderFactory {
+        file_io: exec.file_io.clone(),
+        governance,
+        metrics: Arc::clone(&exec.metrics),
+        #[cfg(test)]
+        reader_override: exec.reader_override.clone(),
+    };
     let storage = Arc::clone(&exec.storage);
     let schema = Arc::clone(&exec.schema);
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
     let staged_lease = exec.staged_lease.clone();
-    #[cfg(test)]
-    let reader_override = exec.reader_override.clone();
     // Cancelling the query drops this stream, which drops the guard and
     // cancels any metadata decode this stream still has outstanding. Owner
     // shutdown cancels the same work through the owner's own token.
@@ -2842,30 +3028,9 @@ fn hot_stream(
                 DataFusionError::Execution("hot object size exceeds u64".to_owned())
             })?;
             let build_reader = {
-                let file_io = file_io.clone();
+                let readers = readers.clone();
                 let location = file.location.clone();
-                let governance = governance.clone();
-                let metrics = Arc::clone(&metrics);
-                #[cfg(test)]
-                let reader_override = reader_override.clone();
-                move || {
-                    let reader = IcebergParquetReader::new(
-                        HotObjectSource::Pending {
-                            file_io: file_io.clone(),
-                            location: location.clone(),
-                        },
-                        size,
-                        governance.clone(),
-                        Arc::clone(&metrics),
-                    );
-                    #[cfg(test)]
-                    let reader = if let Some(override_reader) = reader_override.as_ref() {
-                        reader.with_test_reader(location.clone(), Arc::clone(override_reader))
-                    } else {
-                        reader
-                    };
-                    reader
-                }
+                move || readers.reader(&location, size)
             };
             // Recorded before the footer is read so a file observation exists
             // for every attempt on this file, including one whose reader fails
@@ -2901,8 +3066,18 @@ fn hot_stream(
             else {
                 continue;
             };
-            let builder =
+            let mut builder =
                 ParquetRecordBatchStreamBuilder::new_with_metadata(build_reader(), metadata);
+            // Bloom filters are probed only for the groups statistics kept, so
+            // each excluded group is attributed to exactly one mechanism.
+            let bloom = HotBloomProbes::new(builder.metadata(), &predicates)
+                .retain(&mut builder, retained_groups)
+                .await;
+            metrics.record_bloom_pruned(bloom.pruned);
+            if bloom.excludes_file() {
+                continue;
+            }
+            let retained_groups = bloom.retained;
             // Selective decode: only the closure's leaves leave storage. The
             // post-decode `project_batch` below then normalizes exact order and
             // types; it is a normalizer, not the thing that avoids the IO.
@@ -2910,7 +3085,10 @@ fn hot_stream(
             let pages =
                 select_pages_for_predicates(builder.metadata(), &retained_groups, &predicates);
             let builder = match pages {
-                Some(pages) => builder.with_row_selection(pages),
+                Some(pages) => {
+                    metrics.record_page_pruned_rows(pages.skipped_row_count());
+                    builder.with_row_selection(pages)
+                }
                 None => builder,
             };
             let mut batches = builder
@@ -2924,7 +3102,7 @@ fn hot_stream(
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 let batch = project_batch(&batch, Arc::clone(&schema))?;
                 let decoded_reservation =
-                    governance.reserve_decoded(batch.get_array_memory_size())?;
+                    readers.governance.reserve_decoded(batch.get_array_memory_size())?;
                 yield batch;
                 drop(decoded_reservation);
             }
@@ -2967,6 +3145,148 @@ fn hot_piece_metadata(
         ArrowReaderMetadata::try_new(Arc::clone(metadata), ArrowReaderOptions::new())
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
     Ok(Some((reader_metadata, selection.retained)))
+}
+
+/// The equality probes one hot file's Bloom filters can answer.
+///
+/// Built from a file's cached footer and the scan's closed predicates, it keeps
+/// one probe per `column = literal` leaf whose column carries a Bloom filter in
+/// a physical encoding this reader hashes exactly. Probing reads each filter
+/// through the scan's governed reader, so Bloom bytes are charged like every
+/// other range read. Missing filters, unreadable filters, unsupported physical
+/// types, and any leaf other than equality keep the row group: a Bloom filter
+/// can only prove absence, and a false positive merely retains a group.
+struct HotBloomProbes {
+    /// `(Parquet leaf column index, hashed probe value)` per supported leaf.
+    probes: Vec<(usize, BloomProbe)>,
+}
+
+/// One literal encoded exactly as Parquet hashes its column's physical values.
+enum BloomProbe {
+    /// Raw bytes of a `BYTE_ARRAY` or `FIXED_LEN_BYTE_ARRAY` value.
+    Bytes(Vec<u8>),
+    /// A plain signed `INT64` value.
+    Int64(i64),
+}
+
+impl BloomProbe {
+    /// Encodes `literal` for the physical column `descriptor`, or `None` when
+    /// this reader cannot hash it identically to the writer.
+    ///
+    /// Byte arrays hash their raw bytes, so a UTF-8 or binary literal maps
+    /// directly; a fixed-length column additionally requires the literal's
+    /// exact width. `INT64` is accepted only for unannotated or signed-integer
+    /// columns, because a timestamp or unsigned annotation changes what the
+    /// stored value means. Every other physical type — boolean, floating
+    /// point, `INT32`, `INT96` — keeps the group.
+    fn for_column(descriptor: &ColumnDescriptor, literal: &ScanLiteral) -> Option<Self> {
+        match (descriptor.physical_type(), literal) {
+            (PhysicalType::BYTE_ARRAY, ScanLiteral::Utf8(value)) => {
+                Some(Self::Bytes(value.as_bytes().to_vec()))
+            }
+            (PhysicalType::BYTE_ARRAY, ScanLiteral::Bytes(value)) => {
+                Some(Self::Bytes(value.clone()))
+            }
+            (PhysicalType::FIXED_LEN_BYTE_ARRAY, ScanLiteral::Bytes(value))
+                if usize::try_from(descriptor.type_length())
+                    .is_ok_and(|width| width == value.len()) =>
+            {
+                Some(Self::Bytes(value.clone()))
+            }
+            (PhysicalType::INT64, ScanLiteral::I64(value)) => {
+                let plain_signed = match descriptor.logical_type_ref() {
+                    Some(LogicalType::Integer(int)) => int.is_signed,
+                    Some(_) => false,
+                    None => descriptor.converted_type() == ConvertedType::NONE,
+                };
+                plain_signed.then_some(Self::Int64(*value))
+            }
+            _ => None,
+        }
+    }
+
+    /// Reports whether `filter` may contain this value.
+    fn may_contain(&self, filter: &Sbbf) -> bool {
+        match self {
+            Self::Bytes(value) => filter.check(value.as_slice()),
+            Self::Int64(value) => filter.check(value),
+        }
+    }
+}
+
+impl HotBloomProbes {
+    /// Collects the Bloom probes `predicates` allow against `metadata`'s file.
+    ///
+    /// Only equality leaves become probes; a column the file does not carry or
+    /// a literal [`BloomProbe::for_column`] cannot encode is skipped.
+    fn new(metadata: &ParquetMetaData, predicates: &[ScanPredicate]) -> Self {
+        let schema = metadata.file_metadata().schema_descr();
+        let probes = predicates
+            .iter()
+            .filter_map(|predicate| match predicate {
+                ScanPredicate::Eq(column, literal) => {
+                    let index = parquet_column_index(metadata, column)?;
+                    Some((
+                        index,
+                        BloomProbe::for_column(&schema.column(index), literal)?,
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        Self { probes }
+    }
+
+    /// Splits `candidates` into the groups no Bloom filter proves empty, in
+    /// order, and the count of groups a filter excluded.
+    ///
+    /// A group is excluded when any probe's column chunk carries a filter that
+    /// reports the probe value absent. A group without a filter for that
+    /// column, or whose filter cannot be read, is kept and the read failure is
+    /// traced, never surfaced: the filter is an optional pruning aid.
+    ///
+    /// Cancellation drops the outstanding filter read; nothing is recorded
+    /// until the caller receives the completed selection.
+    async fn retain<T>(
+        &self,
+        builder: &mut ParquetRecordBatchStreamBuilder<T>,
+        candidates: Vec<usize>,
+    ) -> RowGroupSelection
+    where
+        T: AsyncFileReader + Send + 'static,
+    {
+        let mut retained = Vec::with_capacity(candidates.len());
+        let mut pruned = 0_u64;
+        for row_group in candidates {
+            let mut absent = false;
+            for (column, probe) in &self.probes {
+                match builder
+                    .get_row_group_column_bloom_filter(row_group, *column)
+                    .await
+                {
+                    Ok(Some(filter)) if !probe.may_contain(&filter) => {
+                        absent = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!(
+                            row_group,
+                            column,
+                            error = %error,
+                            "hot Bloom filter unreadable; keeping the row group"
+                        );
+                    }
+                }
+            }
+            if absent {
+                pruned += 1;
+            } else {
+                retained.push(row_group);
+            }
+        }
+        RowGroupSelection { retained, pruned }
+    }
 }
 
 /// Derives the Parquet projection mask that decodes exactly `schema`'s columns.
@@ -3158,8 +3478,13 @@ fn reverse_comparison_op(op: ClosedComparisonOp) -> ClosedComparisonOp {
 /// vocabulary.
 ///
 /// Returns `None` for any `ScalarValue` variant outside `Boolean`/`Int64`/
-/// `UInt64`/`Float64`/`Utf8`/`TimestampMicrosecond`, a null literal, or a
-/// non-finite `f64`.
+/// `UInt64`/`Float64`/`Utf8`/`TimestampMicrosecond` and the binary family, a
+/// null literal, or a non-finite `f64`. Every binary spelling — `Binary`,
+/// `LargeBinary`, `BinaryView`, and `FixedSizeBinary` — classifies as the same
+/// lossless `Bytes` literal: `DataFusion` unwraps the cast it adds around a
+/// fixed-size column compared with an `X'..'` literal of matching width into a
+/// `FixedSizeBinary` literal, so a trace-id lookup reaches this point as a bare
+/// column comparison.
 fn classify_literal(expr: &Expr) -> Option<wyrd_spec::vala::assignment_authority::ScanLiteral> {
     use datafusion::scalar::ScalarValue;
     use wyrd_spec::vala::assignment_authority::ScanLiteral;
@@ -3178,6 +3503,10 @@ fn classify_literal(expr: &Expr) -> Option<wyrd_spec::vala::assignment_authority
         ScalarValue::TimestampMicrosecond(Some(inner), _) => {
             Some(ScanLiteral::TimestampMicros(*inner))
         }
+        ScalarValue::Binary(Some(inner))
+        | ScalarValue::LargeBinary(Some(inner))
+        | ScalarValue::BinaryView(Some(inner))
+        | ScalarValue::FixedSizeBinary(_, Some(inner)) => Some(ScanLiteral::Bytes(inner.clone())),
         _ => None,
     }
 }
@@ -3455,6 +3784,30 @@ fn scan_literal_scalar(
         ScanLiteral::TimestampMicros(inner) => {
             ScalarValue::TimestampMicrosecond(Some(*inner), timestamp_timezone_of(schema, column))
         }
+        ScanLiteral::Bytes(inner) => binary_scalar_for(schema, column, inner),
+    }
+}
+
+/// Materializes one binary literal in the compared column's own binary type.
+///
+/// A fixed-size column of the literal's exact width yields a `FixedSizeBinary`
+/// scalar, and the variable-width binary types yield their own spelling, so the
+/// physical comparison never needs a cast. Any other column — absent, or a
+/// width the classifier would have refused — falls back to plain `Binary`,
+/// leaving the residual filter authoritative.
+fn binary_scalar_for(schema: &SchemaRef, column: &str, value: &[u8]) -> ScalarValue {
+    match schema
+        .field_with_name(column)
+        .map(arrow::datatypes::Field::data_type)
+    {
+        Ok(DataType::FixedSizeBinary(width))
+            if usize::try_from(*width).is_ok_and(|width| width == value.len()) =>
+        {
+            ScalarValue::FixedSizeBinary(*width, Some(value.to_vec()))
+        }
+        Ok(DataType::LargeBinary) => ScalarValue::LargeBinary(Some(value.to_vec())),
+        Ok(DataType::BinaryView) => ScalarValue::BinaryView(Some(value.to_vec())),
+        _ => ScalarValue::Binary(Some(value.to_vec())),
     }
 }
 
@@ -3557,6 +3910,9 @@ enum StatBound {
     I64(i64),
     /// UTF-8 bound compared by byte order.
     Utf8(String),
+    /// Binary bound compared by unsigned lexicographic byte order, which is
+    /// Parquet's order for unannotated and fixed-length byte arrays.
+    Bytes(Vec<u8>),
 }
 
 /// Converts one closed predicate literal into its comparable statistic bound.
@@ -3572,6 +3928,7 @@ fn literal_bound(
             Some(StatBound::I64(*value))
         }
         ScanLiteral::Utf8(value) => Some(StatBound::Utf8(value.clone())),
+        ScanLiteral::Bytes(value) => Some(StatBound::Bytes(value.clone())),
         ScanLiteral::U64(_) | ScanLiteral::F64Bits(_) => None,
     }
 }
@@ -3596,6 +3953,14 @@ fn statistics_bound(
         (Statistics::ByteArray(value), StatBound::Utf8(_)) => Some((
             StatBound::Utf8(String::from_utf8_lossy(value.min_opt()?.data()).into_owned()),
             StatBound::Utf8(String::from_utf8_lossy(value.max_opt()?.data()).into_owned()),
+        )),
+        (Statistics::ByteArray(value), StatBound::Bytes(_)) => Some((
+            StatBound::Bytes(value.min_opt()?.data().to_vec()),
+            StatBound::Bytes(value.max_opt()?.data().to_vec()),
+        )),
+        (Statistics::FixedLenByteArray(value), StatBound::Bytes(_)) => Some((
+            StatBound::Bytes(value.min_opt()?.data().to_vec()),
+            StatBound::Bytes(value.max_opt()?.data().to_vec()),
         )),
         _ => None,
     }
@@ -3703,6 +4068,14 @@ fn page_bound(
         (ColumnIndexMetaData::BYTE_ARRAY(pages), StatBound::Utf8(_)) => Some((
             StatBound::Utf8(String::from_utf8_lossy(pages.min_value(page)?).into_owned()),
             StatBound::Utf8(String::from_utf8_lossy(pages.max_value(page)?).into_owned()),
+        )),
+        (
+            ColumnIndexMetaData::BYTE_ARRAY(pages)
+            | ColumnIndexMetaData::FIXED_LEN_BYTE_ARRAY(pages),
+            StatBound::Bytes(_),
+        ) => Some((
+            StatBound::Bytes(pages.min_value(page)?.to_vec()),
+            StatBound::Bytes(pages.max_value(page)?.to_vec()),
         )),
         _ => None,
     }
@@ -3907,6 +4280,7 @@ fn plan_properties_with_partitions(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::Cursor;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -3916,11 +4290,12 @@ mod tests {
         FollowerSourceKey, OracleExecutionBindingInputs, OracleExecutionBindings,
     };
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
-    use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int32Array, Int64Array, StringArray};
     use async_trait::async_trait;
+    use bytes::Bytes;
     use datafusion::common::tree_node::TreeNode;
     use datafusion::datasource::memory::MemorySourceConfig;
-    use datafusion::logical_expr::{col, lit};
+    use datafusion::logical_expr::{LogicalPlan, col, lit};
     use datafusion::physical_plan::union::UnionExec;
     use parquet::file::properties::WriterProperties;
     use wyrd_runtime::Principal;
@@ -4422,17 +4797,27 @@ mod tests {
         );
     }
 
-    /// Closed-predicate pruning measured on a real two-row-group file written
+    /// Row-group min/max pruning measured on a real two-row-group file written
     /// by the production recipe: the file's low-cardinality `service_name`
-    /// column is dictionary-encoded and Bloom-filtered, an equality leaf
-    /// retains exactly one of the two groups, the retained group's compressed
-    /// bytes are strictly fewer than the whole file's, and the decoded rows are
-    /// exactly the matching rows. A high-cardinality column in the same recipe
-    /// stays lossless after parquet-rs falls back off its dictionary.
+    /// column is dictionary-encoded and carries a Bloom filter, but the two
+    /// groups hold disjoint values, so the equality leaf retains exactly one
+    /// group on min/max statistics alone. No Bloom filter is read here; Bloom
+    /// consumption is proved by
+    /// `hot_bloom_probes_exclude_an_absent_id_inside_statistics_bounds`. The
+    /// retained group's compressed bytes are strictly fewer than the whole
+    /// file's, and the decoded rows are exactly the matching rows. A
+    /// high-cardinality column in the same recipe stays lossless after
+    /// parquet-rs falls back off its dictionary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture footer does not decode, when the file is not two
+    /// dictionary-encoded, Bloom-filtered groups, when the equality leaf does not
+    /// retain exactly the first group, when the retained bytes are not strictly
+    /// fewer than the file's, or when the decoded or high-cardinality rows differ
+    /// from what was written.
     #[test]
-    fn dictionary_bloom_row_group_pruning_contract() {
-        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
-
+    fn dictionary_recipe_row_group_min_max_pruning_contract() {
         const BLOCK_ROWS: i64 = 2_048;
 
         let schema: SchemaRef = Arc::new(Schema::new(vec![
@@ -4483,6 +4868,289 @@ mod tests {
         assert_eq!(decoded_values, (0..BLOCK_ROWS).collect::<Vec<_>>());
 
         assert_high_cardinality_round_trips(&schema, BLOCK_ROWS);
+    }
+
+    /// Writes one production-recipe file of two row groups whose 16-byte
+    /// `trace_id` values interleave, so each group's min/max spans the other
+    /// group's ids, with a Bloom filter on `trace_id` only.
+    ///
+    /// Returns the encoded file and every written id, group by group.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture batch cannot be built or encoded.
+    fn write_trace_id_fixture() -> (Bytes, Vec<Vec<[u8; 16]>>) {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+            Field::new("score", DataType::Float64, false),
+        ]));
+        // Group `g` holds the ids whose big-endian tail is `4k + 2g`: both
+        // groups span nearly the same range and every odd tail is unwritten,
+        // so statistics alone retain both groups for any id between them.
+        let groups = (0..2_u16)
+            .map(|group| {
+                (0..100_u16)
+                    .map(|k| trace_id_with_tail(4 * k + 2 * group))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let blocks = groups
+            .iter()
+            .map(|ids| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(
+                            FixedSizeBinaryArray::try_from_iter(ids.iter())
+                                .expect("16-byte trace ids"),
+                        ) as ArrayRef,
+                        Arc::new(arrow::array::Float64Array::from_iter_values(
+                            ids.iter().map(|id| f64::from(id[15])),
+                        )) as ArrayRef,
+                    ],
+                )
+                .expect("trace id block")
+            })
+            .collect::<Vec<_>>();
+        let rows = blocks.iter().map(RecordBatch::num_rows).sum();
+        let properties = fixture_writer_properties(rows, &["trace_id".to_owned()]);
+        let mut sink = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut sink, Arc::clone(&schema), Some(properties))
+                .expect("trace id fixture writer");
+        for block in &blocks {
+            writer.write(block).expect("trace id fixture write");
+            writer.flush().expect("trace id row-group flush");
+        }
+        writer.close().expect("trace id fixture close");
+        (bytes::Bytes::from(sink), groups)
+    }
+
+    /// Builds one 16-byte trace id with a constant prefix and `tail` as its
+    /// big-endian final two bytes.
+    fn trace_id_with_tail(tail: u16) -> [u8; 16] {
+        let mut id = [0x5a_u8; 16];
+        id[14..].copy_from_slice(&tail.to_be_bytes());
+        id
+    }
+
+    /// Opens an async stream builder over an in-memory Parquet file.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the footer cannot be decoded.
+    async fn in_memory_stream_builder(
+        published: &Bytes,
+    ) -> ParquetRecordBatchStreamBuilder<Cursor<Vec<u8>>> {
+        ParquetRecordBatchStreamBuilder::new(Cursor::new(published.to_vec()))
+            .await
+            .expect("in-memory stream builder")
+    }
+
+    /// The hot reader consumes a `FIXED_LEN_BYTE_ARRAY` Bloom filter: an
+    /// absent id that lies inside both groups' min/max — so statistics keep
+    /// both — is excluded from a group whose filter proves it absent, while a
+    /// present id keeps its own group. The absent probe is chosen to be
+    /// Bloom-negative in the written filter, so the assertion cannot flake on a
+    /// false positive. Unsupported physical types and filterless columns build
+    /// no probe and keep every group.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a group's Bloom filter cannot be read, when no Bloom-negative id
+    /// lies inside both groups' bounds, when statistics alone exclude a group, when
+    /// the Bloom probes keep a group for the absent id or drop the group holding a
+    /// present id, or when an unsupported or filterless probe drops any group.
+    #[tokio::test]
+    async fn hot_bloom_probes_exclude_an_absent_id_inside_statistics_bounds() {
+        let (published, groups) = write_trace_id_fixture();
+        let mut builder = in_memory_stream_builder(&published).await;
+        let metadata = Arc::clone(builder.metadata());
+        assert_eq!(metadata.num_row_groups(), 2, "fixture must have two groups");
+        let mut filters = Vec::new();
+        for group in 0..2 {
+            filters.push(
+                builder
+                    .get_row_group_column_bloom_filter(group, 0)
+                    .await
+                    .expect("readable filter")
+                    .expect("trace_id carries a Bloom filter"),
+            );
+        }
+        // An unwritten odd-tailed id inside every group's bounds that both
+        // written filters report absent.
+        let absent = (1..400_u16)
+            .step_by(2)
+            .map(trace_id_with_tail)
+            .find(|id| {
+                groups.iter().all(|ids| {
+                    ids.iter().min().is_some_and(|min| min < id)
+                        && ids.iter().max().is_some_and(|max| id < max)
+                }) && filters.iter().all(|filter| !filter.check(&id[..]))
+            })
+            .expect("a Bloom-negative id inside both groups' bounds");
+
+        let lookup = |id: &[u8; 16]| {
+            vec![ScanPredicate::Eq(
+                "trace_id".to_owned(),
+                ScanLiteral::Bytes(id.to_vec()),
+            )]
+        };
+        let absent_predicates = lookup(&absent);
+        let statistics =
+            select_row_groups_for_predicates(&metadata, vec![0, 1], &absent_predicates);
+        assert_eq!(
+            statistics.retained,
+            vec![0, 1],
+            "min/max alone must keep both groups, so only a Bloom filter can exclude them"
+        );
+        let bloom = HotBloomProbes::new(&metadata, &absent_predicates)
+            .retain(&mut builder, statistics.retained)
+            .await;
+        assert_eq!(bloom.retained, Vec::<usize>::new());
+        assert_eq!(bloom.pruned, 2);
+
+        let present = groups[1][37];
+        let bloom = HotBloomProbes::new(&metadata, &lookup(&present))
+            .retain(&mut builder, vec![0, 1])
+            .await;
+        assert!(
+            bloom.retained.contains(&1),
+            "the group holding a present id is never excluded"
+        );
+
+        // A float column builds no probe; a column absent from the file
+        // builds none either, so every candidate survives.
+        for predicates in [
+            vec![ScanPredicate::Eq(
+                "score".to_owned(),
+                ScanLiteral::F64Bits(3.0_f64.to_bits()),
+            )],
+            vec![ScanPredicate::Eq(
+                "missing".to_owned(),
+                ScanLiteral::Bytes(absent.to_vec()),
+            )],
+            vec![ScanPredicate::Eq(
+                "trace_id".to_owned(),
+                ScanLiteral::Bytes(vec![0x5a; 8]),
+            )],
+        ] {
+            let kept = HotBloomProbes::new(&metadata, &predicates)
+                .retain(&mut builder, vec![0, 1])
+                .await;
+            assert_eq!(kept.retained, vec![0, 1], "{predicates:?}");
+            assert_eq!(kept.pruned, 0);
+        }
+    }
+
+    /// Binary statistics and page bounds prune by unsigned byte order: a
+    /// `Bytes` leaf outside a group's `FIXED_LEN_BYTE_ARRAY` min/max excludes
+    /// it, and invalid UTF-8 bytes compare as bytes rather than failing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture footer does not decode or when a `Bytes` leaf
+    /// outside both groups' binary bounds retains either group.
+    #[test]
+    fn binary_min_max_prunes_fixed_len_row_groups() {
+        let (published, _) = write_trace_id_fixture();
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&published)
+            .expect("valid Parquet footer");
+        let above = vec![ScanPredicate::Eq(
+            "trace_id".to_owned(),
+            ScanLiteral::Bytes(vec![0xff; 16]),
+        )];
+        let selection = select_row_groups_for_predicates(&metadata, vec![0, 1], &above);
+        assert_eq!(selection.retained, Vec::<usize>::new());
+        assert_eq!(selection.pruned, 2);
+        // Strictly below the smallest written id, so neither group can match.
+        let below = vec![ScanPredicate::Lt(
+            "trace_id".to_owned(),
+            ScanLiteral::Bytes(trace_id_with_tail(0).to_vec()),
+        )];
+        assert!(select_row_groups_for_predicates(&metadata, vec![0, 1], &below).excludes_file());
+    }
+
+    /// A SQL `X'..'` literal compared with a fixed-size binary column
+    /// classifies as one lossless `Bytes` equality after `DataFusion` unwraps
+    /// its coercion cast, materializes back as the column's own type, and a
+    /// literal of the wrong width stays unsupported.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture table cannot be registered or planned, when the
+    /// optimized plan has no filter, when the binary equality does not classify as
+    /// one `Bytes` leaf, when it does not materialize as a 16-byte
+    /// `FixedSizeBinary` scalar, or when a literal of the wrong width is classified
+    /// as supported.
+    #[tokio::test]
+    async fn binary_sql_literal_classifies_as_lossless_bytes() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "trace_id",
+            DataType::FixedSizeBinary(16),
+            false,
+        )]));
+        let context = datafusion::prelude::SessionContext::new();
+        context
+            .register_table(
+                "spans",
+                Arc::new(
+                    datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                        .expect("empty table"),
+                ),
+            )
+            .expect("register table");
+        let filter_of = |plan: &LogicalPlan| -> Option<Expr> {
+            let mut found = None;
+            plan.apply(|node| {
+                if let LogicalPlan::Filter(filter) = node {
+                    found = Some(filter.predicate.clone());
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("plan walk");
+            found
+        };
+        let id = "ff00".repeat(8);
+        let plan = context
+            .sql(&format!(
+                "SELECT trace_id FROM spans WHERE trace_id = X'{id}'"
+            ))
+            .await
+            .expect("plan")
+            .into_optimized_plan()
+            .expect("optimized plan");
+        let predicate = filter_of(&plan).expect("filter retained above the memory table");
+        let expected = [0xff_u8, 0x00].repeat(8);
+        match classify_filter_for_schema(&schema, &predicate) {
+            FilterClassification::Supported(leaves) => assert_eq!(
+                leaves,
+                vec![ScanPredicate::Eq(
+                    "trace_id".to_owned(),
+                    ScanLiteral::Bytes(expected.clone())
+                )]
+            ),
+            FilterClassification::Unsupported => panic!("binary equality must push down"),
+        }
+        assert_eq!(
+            scan_literal_scalar(&schema, "trace_id", &ScanLiteral::Bytes(expected)),
+            datafusion::scalar::ScalarValue::FixedSizeBinary(16, Some([0xff, 0x00].repeat(8)))
+        );
+
+        let short = context
+            .sql("SELECT trace_id FROM spans WHERE trace_id = X'ff00'")
+            .await
+            .expect("plan")
+            .into_optimized_plan()
+            .expect("optimized plan");
+        if let Some(predicate) = filter_of(&short) {
+            assert!(matches!(
+                classify_filter_for_schema(&schema, &predicate),
+                FilterClassification::Unsupported
+            ));
+        }
     }
 
     /// Owns temporary files and metadata for the position-delete adapter proof.
@@ -6148,7 +6816,6 @@ mod tests {
     ) -> wyrd_spec::vala::api::FollowerScanAssignment {
         wyrd_spec::vala::api::FollowerScanAssignment {
             scan_id: key.scan_id.clone(),
-            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
             binding: wyrd_spec::vala::api::TenantTableBinding {
                 tenant_id: key.tenant,
                 namespace: "traces".to_owned(),
@@ -7230,7 +7897,6 @@ mod tests {
                 namespace: "traces".to_owned(),
                 table: "spans".to_owned(),
             },
-            table_uid: uuid::Uuid::nil(),
             routes: vec![crate::oracle::live::LiveScribeRoute {
                 node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
                 writer_epoch: 1,

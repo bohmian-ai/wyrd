@@ -408,6 +408,10 @@ pub fn registration_only_sibling_refs(spec: &Spec) -> Vec<CardRef> {
 /// are matched against the complete serialized `CardRef` identity shape. Any
 /// existing `uid` is ignored because the server must replace authored values
 /// with the UID it resolved.
+///
+/// # Panics
+///
+/// Panics if `CardRef` serialization fails, which it cannot.
 pub fn bind_scoped_card_ref_uids(
     kind: &CardKind,
     spec: Spec,

@@ -111,13 +111,9 @@ pub fn wyrd_error_response_from_parts(
         &error,
         WyrdError::AuthVerifyUnavailable { .. }
             | WyrdError::Vala {
-                error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected,
-            }
-            | WyrdError::Vala {
-                error: wyrd_spec::vala::error::BifrostError::QueryQueueFull,
-            }
-            | WyrdError::Vala {
-                error: wyrd_spec::vala::error::BifrostError::IngestBusy { .. },
+                error: wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected
+                    | wyrd_spec::vala::error::BifrostError::QueryQueueFull
+                    | wyrd_spec::vala::error::BifrostError::IngestBusy { .. }
             }
     );
     let mut body = error.as_problem_json();
@@ -452,11 +448,7 @@ mod error_mapper_tests {
         }
 
         for error in [
-            WyrdError::AuditUnavailable {
-                message: "audit unavailable".to_owned(),
-                details: serde_json::json!({}),
-            },
-            wyrd_spec::vala::error::BifrostError::QueryMemoryRequestTooLarge.into(),
+            WyrdError::from(wyrd_spec::vala::error::BifrostError::QueryMemoryRequestTooLarge),
             wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into(),
             wyrd_spec::vala::error::BifrostError::QueryResourcesExhausted.into(),
             wyrd_spec::vala::error::BifrostError::PayloadTooLarge { bytes: 1, limit: 1 }.into(),
@@ -636,7 +628,6 @@ mod error_mapper_tests {
             DelegationDepthExceededVerify,
             PrincipalNotFound,
             AuthVerifyUnavailable,
-            AuditUnavailable,
             MissingRequiredField,
             PermissionUnauthenticated,
             PermissionDeniedRbac,
@@ -731,7 +722,7 @@ mod error_mapper_tests {
     impl std::error::Error for FakeDatabaseError {}
 
     impl sqlx::error::DatabaseError for FakeDatabaseError {
-        fn message(&self) -> &str {
+        fn message(&self) -> &'static str {
             "fake database error"
         }
 

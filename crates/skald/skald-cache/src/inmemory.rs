@@ -54,7 +54,7 @@ impl InMemoryCache {
 
     /// Returns the approximate number of live entries in the cache.
     pub fn len(&self) -> usize {
-        self.inner.entry_count() as usize
+        usize::try_from(self.inner.entry_count()).unwrap_or(usize::MAX)
     }
 
     /// Returns whether the cache has no entries.
@@ -104,7 +104,7 @@ mod cache_inmemory {
 
     #[test]
     fn put_then_get_returns_value() {
-        let cache = InMemoryCache::new(2, Duration::from_secs(60));
+        let cache = InMemoryCache::new(2, Duration::from_mins(1));
         let key = key("gpt-4o-mini", "a");
         let value = value("cached-a");
 
@@ -115,14 +115,14 @@ mod cache_inmemory {
 
     #[test]
     fn get_missing_returns_none() {
-        let cache = InMemoryCache::new(2, Duration::from_secs(60));
+        let cache = InMemoryCache::new(2, Duration::from_mins(1));
 
         assert_eq!(cache.get(&key("gpt-4o-mini", "missing")), None);
     }
 
     #[test]
     fn ttl_eviction_after_expiry() {
-        let cache = InMemoryCache::new(2, Duration::from_secs(60));
+        let cache = InMemoryCache::new(2, Duration::from_mins(1));
         let key = key("gpt-4o-mini", "ttl");
 
         cache.put(key.clone(), value("cached-ttl"), Duration::from_millis(5));
@@ -137,7 +137,7 @@ mod cache_inmemory {
         // Use a capacity large enough for TinyLFU admission to stabilize, then
         // over-insert to trigger eviction. We verify the cache respects its bound
         // by checking that the hottest entry (accessed many times) survives.
-        let cache = InMemoryCache::new(4, Duration::from_secs(60));
+        let cache = InMemoryCache::new(4, Duration::from_mins(1));
         let hot = key("gpt-4o-mini", "hot");
         cache.put_default(hot.clone(), value("hot"));
 
@@ -160,7 +160,7 @@ mod cache_inmemory {
 
     #[test]
     fn invalidate_removes_key_and_reports_miss() {
-        let cache = InMemoryCache::new(4, Duration::from_secs(60));
+        let cache = InMemoryCache::new(4, Duration::from_mins(1));
         let key = key("gpt-4o-mini", "inv");
 
         cache.put_default(key.clone(), value("cached-inv"));

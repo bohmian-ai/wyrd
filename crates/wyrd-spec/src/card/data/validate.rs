@@ -234,9 +234,7 @@ pub fn check_hf_revision(spec: &DataSpec) -> Result<(), DataCardError> {
     {
         Ok(())
     } else {
-        Err(DataCardError::HuggingfaceRevisionInvalid(
-            revision.to_string(),
-        ))
+        Err(DataCardError::HuggingfaceRevisionInvalid(revision.clone()))
     }
 }
 

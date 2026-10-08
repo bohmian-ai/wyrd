@@ -78,8 +78,7 @@ impl AttributeValue {
             Self::Bool(value) => serde_json::Value::Bool(*value),
             Self::Int(value) => serde_json::Value::Number((*value).into()),
             Self::Double(value) => serde_json::Number::from_f64(*value)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
+                .map_or(serde_json::Value::Null, serde_json::Value::Number),
             Self::Bytes(value) => serde_json::Value::String(base64_encode(value)),
             Self::Array(values) => {
                 serde_json::Value::Array(values.iter().map(Self::to_json).collect())

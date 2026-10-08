@@ -6,17 +6,23 @@ use wyrd_spec::vala::api::{
     BifrostTableEntry, DataTypeSpec, FieldSpec, INPUT_CLASS_GATE_CORRELATION, INPUT_CLASS_KEY,
     PhysicalLayoutWire, TableStatus, TimeUnit,
 };
-use wyrd_spec::vala::{
-    CARD_REF, RUN_ID, WYRD_EVENT_TIME, is_reserved_correlation_column, is_reserved_managed_column,
-};
+use wyrd_spec::vala::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
 
 use crate::catalog::BifrostCatalogError;
+use crate::tables::managed_columns::is_managed_column;
 
 /// Reject user fields that collide with server-owned physical columns.
+///
+/// Registration calls this before any schema is resolved, so a caller can
+/// never declare a column the server stamps or derives itself.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::ReservedColumn`] naming the first user field
+/// whose name is a managed column.
 pub fn reject_reserved_field_names(user_fields: &[Field]) -> Result<(), BifrostCatalogError> {
     for field in user_fields {
         let name = field.name();
-        if is_reserved_managed_column(name) || is_reserved_correlation_column(name) {
+        if is_managed_column(name) {
             return Err(BifrostCatalogError::ReservedColumn(name.clone()));
         }
     }
@@ -85,8 +91,8 @@ pub struct DescribedFields {
 /// input class and carries no field id. It is nullable because Card correlation
 /// is optional: a row without one is accepted and stored with an authenticated
 /// `principal_id` and a null `card_uid`. Every other declaration is taken from
-/// the stored schema, so its type, nullability, and stable field id are the
-/// table's actual ones rather than a restatement.
+/// the stored schema, so its type, nullability, and registered field id are
+/// the table's actual ones rather than a restatement.
 ///
 /// # Errors
 ///
@@ -115,7 +121,7 @@ pub fn described_fields_from_stored_schema(
             run_id = Some(field_to_spec(field)?);
         } else if name == WYRD_EVENT_TIME {
             described.managed_candidates.push(field_to_spec(field)?);
-        } else if !is_reserved_managed_column(name) && !is_reserved_correlation_column(name) {
+        } else if !is_managed_column(name) {
             described.user_fields.push(field_to_spec(field)?);
         }
     }
@@ -237,33 +243,30 @@ fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use wyrd_spec::vala::{PRINCIPAL_ID, RESERVED_CORRELATION_COLUMNS, RESERVED_MANAGED_COLUMNS};
+    use crate::tables::managed_columns::MANAGED_COLUMNS;
 
     use super::*;
 
-    /// Every canonical reserved name, managed and correlation alike, is refused.
+    /// Every managed column name is refused as a user field.
     ///
-    /// The sets are iterated from the spec constants rather than spelled out
-    /// here. A hand-written list silently stops covering a name the moment one
-    /// is added to the contract, which is how `principal_id` went unproven
-    /// while it was already reserved.
+    /// The names are iterated from the managed-column declaration rather than
+    /// spelled out here. A hand-written list silently stops covering a name the
+    /// moment one is added to the declaration.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a managed name is accepted or refused with any error other
+    /// than [`BifrostCatalogError::ReservedColumn`] for that name.
     #[test]
-    fn every_canonical_reserved_field_name_is_rejected() {
-        let canonical = RESERVED_MANAGED_COLUMNS
-            .iter()
-            .chain(RESERVED_CORRELATION_COLUMNS.iter());
-        for name in canonical {
-            let error = reject_reserved_field_names(&[Field::new(*name, DataType::Int64, true)])
+    fn every_managed_field_name_is_rejected() {
+        for name in MANAGED_COLUMNS.iter().map(|column| column.field.name) {
+            let error = reject_reserved_field_names(&[Field::new(name, DataType::Int64, true)])
                 .expect_err("every reserved field must fail");
             assert!(
                 matches!(error, BifrostCatalogError::ReservedColumn(ref column) if column == name),
                 "reserved column {name} was refused as {error:?}"
             );
         }
-        assert!(
-            RESERVED_CORRELATION_COLUMNS.contains(&PRINCIPAL_ID),
-            "the server-stamped principal column must stay reserved"
-        );
     }
 
     /// Projection splits every stored column into its describe class.
@@ -278,21 +281,10 @@ mod tests {
     /// Panics when a class gains or loses a column.
     #[test]
     fn stored_schema_projection_classifies_every_correlation_column() {
-        let mut fields: Vec<Field> = RESERVED_MANAGED_COLUMNS
-            .iter()
-            .chain(RESERVED_CORRELATION_COLUMNS.iter())
-            .map(|name| {
-                if *name == WYRD_EVENT_TIME {
-                    Field::new(
-                        *name,
-                        DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())),
-                        false,
-                    )
-                } else {
-                    Field::new(*name, DataType::Utf8, true)
-                }
-            })
-            .collect();
+        let mut fields: Vec<Field> = crate::tables::managed_columns::ensure_managed_columns(
+            Vec::new(),
+            crate::tables::CorrelationPolicy::Observation,
+        );
         fields.push(Field::new("value", DataType::Int64, true));
         let schema = Schema::new(fields);
 

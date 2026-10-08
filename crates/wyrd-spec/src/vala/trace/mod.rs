@@ -33,7 +33,7 @@ use chrono::{DateTime, Utc};
 /// Sub-millisecond durations return `0`; OLAP predicates on `duration_ms > 0`
 /// will not match sub-millisecond spans.
 pub(crate) fn duration_ms_from_timestamps(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
-    (end - start).num_milliseconds().max(0) as u64
+    u64::try_from((end - start).num_milliseconds()).unwrap_or(0)
 }
 
 pub mod attribute_value;
@@ -405,7 +405,7 @@ mod attributes_tests {
 
     #[test]
     fn wyrd_keys_count_locked() {
-        assert_eq!(WYRD_KEYS.len(), 9);
+        assert_eq!(WYRD_KEYS.len(), 8);
     }
 
     #[test]
@@ -622,7 +622,7 @@ mod attribute_value_tests {
             AttributeValue::Double(0.0),
             AttributeValue::Bytes(vec![]),
             AttributeValue::Array(vec![]),
-            AttributeValue::KvList(Default::default()),
+            AttributeValue::KvList(BTreeMap::default()),
         ];
         let mut seen = Vec::new();
         for value in &values {
@@ -2330,7 +2330,6 @@ mod key_array_sync_tests {
             TRACING_OUTPUT,
             TRACING_LABEL,
             EVAL_RECORD_UID,
-            EVAL_PROFILE_UID,
             SERVICE_CARD_UID,
             DATA_TENANT_ID,
         ];

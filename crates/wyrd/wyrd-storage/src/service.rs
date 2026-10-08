@@ -477,7 +477,13 @@ pub async fn upload_local_blob(
             actual: actual_sha256,
         }));
     }
-    #[cfg_attr(not(feature = "cloud"), allow(irrefutable_let_patterns))]
+    #[cfg_attr(
+        not(feature = "cloud"),
+        expect(
+            irrefutable_let_patterns,
+            reason = "without `cloud` the local signer is the only backend"
+        )
+    )]
     let crate::BackendSigner::Local(local) = storage.signer() else {
         return Err(internal_error(
             "local blob route mounted for non-local backend",
@@ -536,7 +542,13 @@ pub async fn download_local_blob(
     path: String,
 ) -> Result<(tokio::fs::File, u64), WyrdError> {
     let validated = tenant_path::validate(&path, data_tenant_id).map_err(map_tenant_path)?;
-    #[cfg_attr(not(feature = "cloud"), allow(irrefutable_let_patterns))]
+    #[cfg_attr(
+        not(feature = "cloud"),
+        expect(
+            irrefutable_let_patterns,
+            reason = "without `cloud` the local signer is the only backend"
+        )
+    )]
     let crate::BackendSigner::Local(local) = storage.signer() else {
         return Err(internal_error(
             "local download route mounted for non-local backend",
@@ -1317,8 +1329,7 @@ pub fn map_sql_error(error: &wyrd_sql::SqlError) -> WyrdError {
         wyrd_sql::SqlError::UniqueViolation { .. }
         | wyrd_sql::SqlError::FkViolation { .. }
         | wyrd_sql::SqlError::CheckViolation { .. }
-        | wyrd_sql::SqlError::Conflict { .. }
-        | wyrd_sql::SqlError::ForgeDemandGenerationChanged => conflict_error(&message, details),
+        | wyrd_sql::SqlError::Conflict { .. } => conflict_error(&message, details),
         wyrd_sql::SqlError::RlsDenied { .. } => {
             WyrdError::PermissionDeniedRbac { message, details }
         }

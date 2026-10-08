@@ -782,10 +782,11 @@ fn inspect_sealed_artifact(
 /// The projection is the managed Iceberg writer's own footer-to-`DataFile`
 /// conversion, so the per-column sizes, counts, and bounds Scribe persists are
 /// exactly the ones a catalog promoter would compute from the same object.
-/// Field ids come from the same conversion the Bifrost catalog used when it
-/// created the physical table — the canonical table's own declared ids, or the
-/// automatic assignment for a dynamic table — which is what makes the ids in
-/// this projection the table's ids rather than a private numbering.
+/// Field ids are the ones Scribe stamped from the registered Iceberg table at
+/// ingress, which the conversion adopts unchanged, so the ids in this
+/// projection are the table's own rather than a private numbering. A schema
+/// without ids — only the catalog-less engine seam writes one — falls back to
+/// Iceberg's automatic assignment.
 ///
 /// # Errors
 ///

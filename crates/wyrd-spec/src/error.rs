@@ -1022,20 +1022,6 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// Credential issuance audit insert failed.
-    #[error("[WYRD_AUDIT_503_UNAVAILABLE] {message}")]
-    #[wyrd_error(
-        code = "WYRD_AUDIT_503_UNAVAILABLE",
-        status = 503,
-        title = "Credential audit unavailable",
-        remediation = "Credential plaintext cannot be returned without a durable audit row. Inspect existing keys, revoke duplicates, and re-issue after audit is restored."
-    )]
-    AuditUnavailable {
-        /// Human-readable error message.
-        message: String,
-        /// Structured detail payload.
-        details: serde_json::Value,
-    },
     /// Required request field is missing.
     #[error("[WYRD_VALIDATION_400_MISSING_REQUIRED_FIELD] {message}")]
     #[wyrd_error(
@@ -1229,6 +1215,23 @@ pub enum WyrdError {
         remediation = "Use an alias returned by the loaded WyrdState bundle."
     )]
     SdkUnknownAlias {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// `observe.verify` named a Verifier that is not bound in `verified_by`
+    /// to the Run view's subject in the hydrated graph.
+    ///
+    /// Refused locally before any network call.
+    #[error("[WYRD_SDK_404_UNKNOWN_VERIFIER] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_404_UNKNOWN_VERIFIER",
+        status = 404,
+        title = "Verifier is not bound to this subject",
+        remediation = "Name a Verifier bound in `verified_by` to the view's subject Card, or open the view on the Card that binds it."
+    )]
+    SdkUnknownVerifier {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1791,6 +1794,132 @@ pub enum WyrdError {
         remediation = "Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry."
     )]
     VerificationNotReady {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A direct execution request or its supplied input is malformed.
+    #[error("[WYRD_VERIFICATION_400_INPUT_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_400_INPUT_INVALID",
+        status = 400,
+        title = "Invalid verification input",
+        remediation = "Send { verifier_uid, subject_card_uid, input } with input.kind eval_record (a context object) or drift_samples (columns of number, string, or null values)."
+    )]
+    VerificationInputInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A direct execution request exceeds a documented input bound.
+    #[error("[WYRD_VERIFICATION_413_INPUT_TOO_LARGE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_413_INPUT_TOO_LARGE",
+        status = 413,
+        title = "Verification input too large",
+        remediation = "Keep the body within 1 MiB, drift_samples within 64 columns of 100,000 values, and eval_record.context within 256 KiB; split larger input across requests."
+    )]
+    VerificationInputTooLarge {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The direct execution's Verifier or subject is unknown, inactive, or in another tenant.
+    #[error("[WYRD_VERIFICATION_404_TARGET_NOT_FOUND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+        status = 404,
+        title = "Verification target not found",
+        remediation = "Use an active Verifier Card UID and an active subject Card UID registered in the caller's tenant."
+    )]
+    VerificationTargetNotFound {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A PSI or SPC Verifier has no ready fitted baseline to score supplied samples against.
+    #[error("[WYRD_VERIFICATION_409_BASELINE_NOT_READY] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_BASELINE_NOT_READY",
+        status = 409,
+        title = "Verification baseline not ready",
+        remediation = "Poll the Verifier Card's card.status.verification.baseline until it is ready, then retry."
+    )]
+    VerificationBaselineNotReady {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A PSI or SPC Verifier's baseline was fitted under an earlier fitted-profile format.
+    #[error("[WYRD_VERIFICATION_409_BASELINE_LEGACY] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_409_BASELINE_LEGACY",
+        status = 409,
+        title = "Verification baseline legacy",
+        remediation = "Register a new Verifier version so its baseline is refitted under the current format."
+    )]
+    VerificationBaselineLegacy {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// Supplied input lacks a feature the Verifier needs or carries the wrong value type.
+    #[error("[WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
+        status = 422,
+        title = "Verification input incompatible",
+        remediation = "Supply every feature the Verifier scores, with the value type its baseline or profile expects."
+    )]
+    VerificationInputIncompatible {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// The Verifier needs input direct execution cannot supply, such as a trace or agent run.
+    #[error("[WYRD_VERIFICATION_422_INPUT_UNSUPPORTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
+        status = 422,
+        title = "Verification input unsupported",
+        remediation = "Direct execution runs Drift and assertion or LLM-judge Evals only; run trace or agent assertion Evals through observations."
+    )]
+    VerificationInputUnsupported {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A judge provider failed after the task's own retry budget.
+    #[error("[WYRD_VERIFICATION_502_DEPENDENCY_FAILED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_502_DEPENDENCY_FAILED",
+        status = 502,
+        title = "Verification dependency failed",
+        remediation = "The judge provider failed after the task's own retries; retry the request deliberately once the provider recovers."
+    )]
+    VerificationDependencyFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: Value,
+    },
+    /// A direct execution exceeded its 60-second deadline.
+    #[error("[WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT",
+        status = 504,
+        title = "Verification execution timed out",
+        remediation = "Reduce the supplied input or the Verifier's judge work so one execution completes within 60 seconds."
+    )]
+    VerificationExecutionTimedOut {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -3766,13 +3895,16 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
-    /// The bounded client ingestion queue could not accept the row after bounded backoff.
+    /// The bounded client ingestion queue could not accept a record now.
+    ///
+    /// Admission is immediate and all-or-none, so a refused record admitted
+    /// no row and may be resubmitted whole.
     #[error("[WYRD_CLIENT_429_QUEUE_FULL] {message}")]
     #[wyrd_error(
         code = "WYRD_CLIENT_429_QUEUE_FULL",
         status = 429,
         title = "Client ingestion queue is saturated",
-        remediation = "Slow the producer, raise the queue capacity, or flush more often; every refusal bumps the drop counter."
+        remediation = "No row of the refused record was admitted: flush or back off, then resubmit the same record. Sustained refusals mean the producer outpaces delivery; every refusal bumps the drop counter."
     )]
     ClientQueueFull {
         /// Human-readable error message.
@@ -3812,6 +3944,10 @@ pub enum WyrdError {
 
 impl WyrdError {
     /// Return the typed RFC 9457 problem value for this error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the problem document does not round-trip, which the derive guarantees.
     #[must_use]
     pub fn problem(&self) -> WyrdProblem {
         serde_json::from_value(self.as_problem_json())
@@ -3892,7 +4028,6 @@ impl WyrdError {
             | Self::GatewayDeadlineExceeded { message, details }
             | Self::AuthVerifyUnavailable { message, details }
             | Self::DiscoveryUnavailable { message, details }
-            | Self::AuditUnavailable { message, details }
             | Self::MissingRequiredField { message, details }
             | Self::PermissionUnauthenticated { message, details }
             | Self::PermissionDeniedRbac { message, details }
@@ -3978,6 +4113,7 @@ impl WyrdError {
             | Self::SdkRuntimeHydrationFailed { message, details }
             | Self::SdkInvalidStateBundle { message, details }
             | Self::SdkUnknownAlias { message, details }
+            | Self::SdkUnknownVerifier { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
             | Self::SdkBifrostNotStarted { message, details }
             | Self::SdkBifrostClosed { message, details }
@@ -4017,6 +4153,15 @@ impl WyrdError {
             | Self::VerificationInvalidTarget { message, details }
             | Self::VerificationInvalidWindow { message, details }
             | Self::VerificationNotReady { message, details }
+            | Self::VerificationInputInvalid { message, details }
+            | Self::VerificationInputTooLarge { message, details }
+            | Self::VerificationTargetNotFound { message, details }
+            | Self::VerificationBaselineNotReady { message, details }
+            | Self::VerificationBaselineLegacy { message, details }
+            | Self::VerificationInputIncompatible { message, details }
+            | Self::VerificationInputUnsupported { message, details }
+            | Self::VerificationDependencyFailed { message, details }
+            | Self::VerificationExecutionTimedOut { message, details }
             | Self::SpecUnsupportedOperatorAction { message, details }
             | Self::SpecInvalidOperator { message, details }
             | Self::SpecOperatorConnectionUnavailable { message, details }
@@ -4794,10 +4939,6 @@ mod tests {
             },
             WyrdError::DiscoveryUnavailable {
                 message: "oidc discovery unavailable".to_owned(),
-                details: serde_json::json!({}),
-            },
-            WyrdError::AuditUnavailable {
-                message: "credential audit unavailable".to_owned(),
                 details: serde_json::json!({}),
             },
             WyrdError::PermissionUnauthenticated {

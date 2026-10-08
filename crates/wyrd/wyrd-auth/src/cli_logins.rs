@@ -37,16 +37,13 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::row_types::auth::HumanSessionBinding;
 
-use crate::audit::{
-    append_auth_audit, auth_event, auth_failure_code, principal_event, principal_kind_tag,
-    record_auth_audit_best_effort,
-};
+use crate::audit::{auth_event, auth_failure_code, principal_event, principal_kind_tag};
 use crate::connections::HumanConnections;
 use crate::error::store_error;
-use crate::exchange_api_key::token_hash;
 use crate::issuance::TenantTokenIssuer;
 use crate::login::login_unavailable;
 use crate::refresh::tenant_from_refresh_jwt;
+use wyrd_auth_issue::hash_secret;
 
 /// Operation for a device-code token request that issued, or was refused, a
 /// login's credential.
@@ -270,9 +267,8 @@ impl CliLogins {
     /// `authorization_pending`; the issuance errors, including a connection
     /// that is no longer Active or a suspended User, which leave the approval
     /// in place until it expires; [`WyrdError::AuthVerifyUnavailable`] when
-    /// the store fails; and [`WyrdError::AuditUnavailable`] when an audit
-    /// append fails. Every refusal that ends a known device code is audited
-    /// best-effort.
+    /// the store fails. Every refusal that ends a known device code is staged
+    /// on the audit outbox.
     pub async fn redeem(
         &self,
         device_code: &SecretBearer,
@@ -298,7 +294,7 @@ impl CliLogins {
                     error_code: auth_failure_code(error),
                 },
             );
-            record_auth_audit_best_effort(self.connections.postgres(), tenant, &event).await;
+            self.issuer.audit().stage(tenant, event);
         }
         result
     }
@@ -379,8 +375,8 @@ impl CliLogins {
             None,
             AuditOutcome::Allowed,
         );
-        append_auth_audit(&mut conn, &event).await?;
         conn.commit().await.map_err(store_error)?;
+        self.issuer.audit().stage(tenant, event);
         Ok(session.into_response())
     }
 
@@ -393,18 +389,16 @@ impl CliLogins {
     /// row and every row rotated from it are revoked, so the presented token
     /// and any successor stop renewing, while the User's other logins stay
     /// valid. One allowed `auth.token.revoke` audit event naming the row's
-    /// principal, and no token, is appended on that same transaction under
-    /// `request_id`, so the revocation commits exactly when its audit row
-    /// does. A malformed or unknown token revokes and records nothing (RFC
+    /// principal, and no token, is staged on the audit outbox under
+    /// `request_id` once the revocation commits. A malformed or unknown token revokes and records nothing (RFC
     /// 7009 §2.2); an already revoked one revokes nothing but is still
     /// recorded.
     ///
     /// # Errors
     /// Returns [`WyrdError::Validation`] with reason `token_client_mismatch`
     /// for a token issued to another client,
-    /// [`WyrdError::AuthVerifyUnavailable`] when the store fails, and
-    /// [`WyrdError::AuditUnavailable`] when the audit append fails; nothing is
-    /// committed then.
+    /// and [`WyrdError::AuthVerifyUnavailable`] when the store fails; nothing
+    /// is committed then.
     pub async fn revoke(
         &self,
         refresh_token: &SecretBearer,
@@ -420,7 +414,7 @@ impl CliLogins {
             .tenant_conn(tenant)
             .await
             .map_err(store_error)?;
-        let Some(row) = refresh_by_hash(&mut conn, &token_hash(refresh_token.expose()))
+        let Some(row) = refresh_by_hash(&mut conn, &hash_secret(refresh_token.expose()))
             .await
             .map_err(store_error)?
         else {
@@ -449,8 +443,9 @@ impl CliLogins {
             None,
             AuditOutcome::Allowed,
         );
-        append_auth_audit(&mut conn, &event).await?;
-        conn.commit().await.map_err(store_error)
+        conn.commit().await.map_err(store_error)?;
+        self.issuer.audit().stage(tenant, event);
+        Ok(())
     }
 
     /// The tenant `route_key` names, if it is an active tenant.
@@ -571,17 +566,24 @@ mod pg_tests {
     use wyrd_sql::row_types::auth::HumanSessionBinding;
 
     use super::{CliLogins, TOKEN_REVOCATION_OPERATION};
+    use crate::audit::test_outbox::{assert_retrying, drain, outbox};
     use crate::callback::{AuthorizationCodeExchange, LoginCompletion};
     use crate::connections::HumanConnections;
-    use crate::exchange_api_key::token_hash;
     use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
+    use vala_sql::audit_outbox::AuditOutbox;
+    use wyrd_auth_issue::hash_secret;
 
     /// A CLI login owner over `fixture` whose tenant's Active connection
-    /// points at `provider`, a mock discovery document.
+    /// points at `provider`, a mock discovery document, staging its audit on
+    /// `audit`.
     ///
     /// # Panics
     /// Panics when the fixture cannot be seeded.
-    async fn owner(fixture: &PgFixture, provider: &MockServer) -> CliLogins {
+    async fn owner(
+        fixture: &PgFixture,
+        provider: &MockServer,
+        audit: &Arc<AuditOutbox>,
+    ) -> CliLogins {
         let issuer = provider.uri();
         Mock::given(method("GET"))
             .and(path("/.well-known/openid-configuration"))
@@ -613,7 +615,7 @@ mod pg_tests {
         )
         .bind(&issuer)
         .bind(binding.connection_id)
-        .execute(&fixture.superuser_pool().await.expect("superuser pool"))
+        .execute(&fixture.superuser_pool().expect("superuser pool"))
         .await
         .expect("connection points at the mock provider");
         let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
@@ -625,8 +627,13 @@ mod pg_tests {
                 )))),
                 ScreenedHttp::allowing_internal(),
                 Some(&origin),
+                Arc::clone(audit),
             ),
-            TenantTokenIssuer::new(Arc::new(issuing_key()), TokenExchangeSettings::default()),
+            TenantTokenIssuer::new(
+                Arc::new(issuing_key()),
+                TokenExchangeSettings::default(),
+                Arc::clone(audit),
+            ),
         )
     }
 
@@ -702,7 +709,8 @@ mod pg_tests {
     async fn device_codes_poll_approve_deny_and_expire() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let provider = MockServer::start().await;
-        let logins = owner(&fixture, &provider).await;
+        let audit = outbox(&fixture);
+        let logins = owner(&fixture, &provider, &audit).await;
         let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
 
         let device = logins.authorize(&slug).await.expect("authorizes");
@@ -770,7 +778,7 @@ mod pg_tests {
                 SET created_at = statement_timestamp() - interval '11 minutes',
                     expires_at = statement_timestamp() - interval '1 minute'",
         )
-        .execute(&fixture.superuser_pool().await.expect("superuser pool"))
+        .execute(&fixture.superuser_pool().expect("superuser pool"))
         .await
         .expect("expires the code");
         assert_eq!(
@@ -786,6 +794,7 @@ mod pg_tests {
             .await
             .expect_err("a removed code cannot be denied");
         assert_eq!(reason(&error), Some("user_code_unavailable"));
+        drain(&audit).await;
     }
 
     /// The device code of an approved device authorization is redeemed for
@@ -801,7 +810,8 @@ mod pg_tests {
     async fn an_approved_device_code_issues_exactly_once() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let provider = MockServer::start().await;
-        let logins = owner(&fixture, &provider).await;
+        let audit = outbox(&fixture);
+        let logins = owner(&fixture, &provider, &audit).await;
         let slug = TenantSlug::new(fixture.tenant_slug()).expect("slug");
         let tenant = fixture.data_tenant_id();
         let approved = logins.authorize(&slug).await.expect("authorizes");
@@ -886,6 +896,7 @@ mod pg_tests {
             "access_denied"
         );
         assert_eq!(refresh_rows().await, 1, "the session was issued once");
+        drain(&audit).await;
     }
 
     /// How another actor ends a device grant while its approval is in flight.
@@ -963,7 +974,7 @@ mod pg_tests {
                           WHERE device_id = $1",
                     )
                     .bind(device_id)
-                    .execute(&fixture.superuser_pool().await.expect("superuser pool"))
+                    .execute(&fixture.superuser_pool().expect("superuser pool"))
                     .await
                     .expect("expires the code");
                     assert_eq!(
@@ -1033,11 +1044,19 @@ mod pg_tests {
     }
 
     /// Assert the raced sign-in left no User, session, refresh row,
-    /// authorization code, device approval, or login audit behind.
+    /// authorization code, device approval, or login audit behind, once
+    /// everything staged on `audit` so far is committed.
     ///
     /// # Panics
-    /// Panics when anything persisted.
-    async fn assert_no_device_authority(fixture: &PgFixture) {
+    /// Panics when the outbox does not settle or anything persisted.
+    async fn assert_no_device_authority(fixture: &PgFixture, audit: &AuditOutbox) {
+        assert_eq!(
+            audit
+                .settle(std::time::Instant::now() + std::time::Duration::from_secs(30))
+                .await,
+            0,
+            "every staged decision is committed"
+        );
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT (SELECT count(*) FROM wyrd.auth_users),
@@ -1064,14 +1083,15 @@ mod pg_tests {
     async fn a_denial_during_approval_wins() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let provider = MockServer::start().await;
-        let logins = owner(&fixture, &provider).await;
+        let audit = outbox(&fixture);
+        let logins = owner(&fixture, &provider, &audit).await;
         let (device, completion) = approval_racing(&fixture, &logins, Termination::Deny).await;
 
         assert!(
             matches!(completion, Err(WyrdError::InvalidState { .. })),
             "{completion:?}"
         );
-        assert_no_device_authority(&fixture).await;
+        assert_no_device_authority(&fixture, &audit).await;
         assert_eq!(
             device_error(logins.redeem(&device.device_code, "req-denied").await),
             "access_denied"
@@ -1080,7 +1100,8 @@ mod pg_tests {
             device_error(logins.redeem(&device.device_code, "req-again").await),
             "invalid_grant"
         );
-        assert_no_device_authority(&fixture).await;
+        assert_no_device_authority(&fixture, &audit).await;
+        drain(&audit).await;
     }
 
     /// An expiry whose poll deletes the device authorization while an
@@ -1094,7 +1115,8 @@ mod pg_tests {
     async fn an_expiry_deleted_during_approval_wins() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let provider = MockServer::start().await;
-        let logins = owner(&fixture, &provider).await;
+        let audit = outbox(&fixture);
+        let logins = owner(&fixture, &provider, &audit).await;
         let (device, completion) =
             approval_racing(&fixture, &logins, Termination::ExpireAndPoll).await;
 
@@ -1102,12 +1124,13 @@ mod pg_tests {
             matches!(completion, Err(WyrdError::InvalidState { .. })),
             "{completion:?}"
         );
-        assert_no_device_authority(&fixture).await;
+        assert_no_device_authority(&fixture, &audit).await;
         assert_eq!(
             device_error(logins.redeem(&device.device_code, "req-after").await),
             "invalid_grant"
         );
-        assert_no_device_authority(&fixture).await;
+        assert_no_device_authority(&fixture, &audit).await;
+        drain(&audit).await;
     }
 
     /// Seed one User with two CLI logins: a stale refresh token and its live
@@ -1151,7 +1174,7 @@ mod pg_tests {
                 &mut conn,
                 id,
                 user,
-                &token_hash(&jwt),
+                &hash_secret(&jwt),
                 Utc::now() + Duration::days(1),
                 rotated_from.map(|index: usize| ids[index]),
                 HumanSessionBinding {
@@ -1170,8 +1193,8 @@ mod pg_tests {
 
     /// Logout from a stale refresh token revokes its live successor, while the
     /// same User's other login keeps renewing, and records exactly one
-    /// logout audit event; an audit store that refuses the append rolls the
-    /// revocation back.
+    /// logout audit event; an audit store that refuses the append never
+    /// refuses the logout, and the retried decision commits once it recovers.
     ///
     /// # Panics
     /// Panics when the wrong rows are revoked or the audit differs.
@@ -1179,11 +1202,12 @@ mod pg_tests {
     async fn logout_revokes_only_its_own_chain() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let provider = MockServer::start().await;
-        let logins = owner(&fixture, &provider).await;
+        let audit = outbox(&fixture);
+        let logins = owner(&fixture, &provider, &audit).await;
         let tenant = fixture.data_tenant_id();
         let (user, tokens) = seed_two_cli_logins(&fixture).await;
 
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         let logouts = || async {
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM vala.audit_staging
@@ -1200,30 +1224,6 @@ mod pg_tests {
             .execute(&admin)
             .await
             .expect("append privilege revoked");
-        let refused = logins
-            .revoke(
-                &SecretBearer::new(tokens[0].clone()),
-                OAuthClientId::WyrdCli,
-                "req-refused",
-            )
-            .await;
-        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
-            .execute(&admin)
-            .await
-            .expect("append privilege restored");
-        assert!(
-            matches!(refused, Err(WyrdError::AuditUnavailable { .. })),
-            "{refused:?}"
-        );
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let unrevoked = refresh_by_hash(&mut conn, &token_hash(&tokens[0]))
-            .await
-            .expect("lookup")
-            .expect("row exists");
-        assert_eq!(unrevoked.revoked_reason, None, "the revocation rolled back");
-        drop(conn);
-        assert_eq!(logouts().await, 0);
-
         logins
             .revoke(
                 &SecretBearer::new(tokens[0].clone()),
@@ -1231,7 +1231,14 @@ mod pg_tests {
                 "req-logout",
             )
             .await
-            .expect("logout revokes");
+            .expect("an audit failure never refuses a logout");
+        assert_retrying(&audit, 1).await;
+        assert_eq!(logouts().await, 0);
+        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
+            .execute(&admin)
+            .await
+            .expect("append privilege restored");
+
         logins
             .revoke(
                 &SecretBearer::new("not-a-jwt".to_owned()),
@@ -1240,12 +1247,13 @@ mod pg_tests {
             )
             .await
             .expect("an unusable token is a no-op");
+        drain(&audit).await;
         assert_eq!(logouts().await, 1, "exactly one logout is recorded");
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let mut revoked = Vec::new();
         for jwt in &tokens {
-            let row = refresh_by_hash(&mut conn, &token_hash(jwt))
+            let row = refresh_by_hash(&mut conn, &hash_secret(jwt))
                 .await
                 .expect("lookup")
                 .expect("row exists");

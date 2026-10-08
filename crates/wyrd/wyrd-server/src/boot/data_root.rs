@@ -99,7 +99,7 @@ impl BifrostDataRoot {
             source,
         })?;
         let roots = BifrostVolumeRoots {
-            wal: root.to_path_buf(),
+            wal: root.clone(),
             scribe_stage: root.join("scribe-stage"),
             scribe_output_scratch: root.join("scribe-output-scratch"),
         };
@@ -130,9 +130,7 @@ impl BifrostDataRoot {
         match lock.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                return Err(BifrostDataRootError::InUse {
-                    path: root.to_path_buf(),
-                });
+                return Err(BifrostDataRootError::InUse { path: root.clone() });
             }
             Err(TryLockError::Error(source)) => {
                 return Err(BifrostDataRootError::Unusable {

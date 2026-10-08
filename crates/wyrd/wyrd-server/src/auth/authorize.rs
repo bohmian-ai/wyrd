@@ -320,31 +320,28 @@ mod pg_tests {
         )
         .bind(&issuer)
         .bind(binding.connection_id)
-        .execute(
-            &fixture
-                .superuser_pool()
-                .await
-                .expect("superuser pool opens"),
-        )
+        .execute(&fixture.superuser_pool().expect("superuser pool opens"))
         .await
         .expect("connection points at the mock provider");
         let origin = Url::parse("https://wyrd.example.com").expect("origin parses");
         let tempdir = tempfile::tempdir().expect("authorize storage tempdir");
         let signer = LocalSigner::new(tempdir.keep()).expect("local signer creates");
-        crate::test_support::test_app_state(
+        let state = crate::test_support::test_app_state(
             Arc::new(crate::postgres::ServerPostgres::from_parts(
                 fixture.wyrd_postgres().clone(),
                 fixture.vala_postgres().clone(),
             )),
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             crate::test_support::test_catalog().await,
-        )
-        .with_auth(ServerAuth {
+        );
+        let audit = Arc::clone(&state.audit_outbox);
+        state.with_auth(ServerAuth {
             human_connections: Some(HumanConnections::new(
                 fixture.wyrd_postgres().clone(),
                 None,
                 ScreenedHttp::allowing_internal(),
                 Some(&origin),
+                audit,
             )),
             ..ServerAuth::default()
         })

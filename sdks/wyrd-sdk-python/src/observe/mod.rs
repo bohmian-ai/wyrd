@@ -10,10 +10,12 @@ use std::fmt::Display;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyMapping, PyModule, PyString, PyType};
+use wyrd_cards::card_ref::CardRefPy;
 use wyrd_client::observe::eval::parse_session_id;
 use wyrd_client::observe::{EvalObservationOptions, Observe, Run};
 use wyrd_spec::error::WyrdError;
-use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
+use wyrd_spec::verification::Judgment;
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
 /// One boundary validation failure naming the offending argument.
 fn invalid_argument(field: &str, reason: impl Display) -> WyrdPyError {
@@ -175,10 +177,11 @@ impl PyRun {
         self.inner.run_id().as_str().to_owned()
     }
 
-    /// The exact Card reference this view observes.
+    /// The alias this view was opened with; `state.card_ref(alias)` is its
+    /// exact Card reference.
     #[getter]
-    fn card_ref(&self) -> String {
-        self.inner.card_ref().to_string()
+    fn alias(&self) -> &str {
+        self.inner.alias()
     }
 
     /// An immutable sibling view scoped to a registered alias.
@@ -190,6 +193,56 @@ impl PyRun {
         Ok(Self::new(
             self.inner.for_card(alias).map_err(WyrdPyError::from)?,
         ))
+    }
+
+    /// Enter this view's ambient OpenTelemetry span correlation.
+    ///
+    /// Delegates to `wyrd.otel`, which pushes this view's exact `CardRef` and
+    /// `run_id` onto the scope stack held in Python's execution-local
+    /// OpenTelemetry context value, stamps an already-active recording span
+    /// that does not yet carry `wyrd.card_ref`, and ensures the global provider
+    /// has the Wyrd span processor. No scope state is stored on this immutable
+    /// view, so one run may be entered by nested or concurrent scopes.
+    /// Telemetry is optional: any failure, including a missing `opentelemetry`
+    /// package, is swallowed and the run is returned. Entering never flushes,
+    /// starts a span, or calls the server.
+    fn __enter__(slf: Bound<'_, Self>) -> Bound<'_, Self> {
+        let run = slf.get();
+        let _ = slf.py().import("wyrd.otel").and_then(|otel| {
+            otel.call_method1(
+                "_enter_run",
+                (run.inner.subject().to_string(), run.inner.run_id().as_str()),
+            )
+        });
+        slf
+    }
+
+    /// Restore the correlation that was ambient before the matching entry.
+    ///
+    /// Passes this view's `CardRef` and `run_id` to `wyrd.otel`, which pops the
+    /// current execution context's innermost scope only when it equals that
+    /// pair; a mismatched or failing exit changes nothing. Failures are
+    /// swallowed, and the method always returns `False` so an exception raised
+    /// inside the block propagates unchanged. Exiting is not a flush, shutdown,
+    /// or durability acknowledgement.
+    #[pyo3(signature = (exc_type=None, exc_value=None, traceback=None))]
+    fn __exit__(
+        slf: &Bound<'_, Self>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        exc_value: Option<&Bound<'_, PyAny>>,
+        traceback: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        // The exception triple is accepted only to mirror the protocol; it
+        // never changes cleanup or suppresses the exception.
+        let _ = (exc_type, exc_value, traceback);
+        let run = slf.get();
+        let _ = slf.py().import("wyrd.otel").and_then(|otel| {
+            otel.call_method1(
+                "_exit_run",
+                (run.inner.subject().to_string(), run.inner.run_id().as_str()),
+            )
+        });
+        false
     }
 
     /// The emit surface for this view.
@@ -292,12 +345,151 @@ impl PyObserveHandle {
         py.detach(|| wyrd_runtime::runtime().block_on(self.observe().record_json(table, &json)))
             .map_err(WyrdPyError::from)
     }
+
+    /// Judge this view's subject with a bound Verifier and return its judgment.
+    ///
+    /// An Eval Verifier takes one context mapping, dataclass instance, or
+    /// Pydantic model plus optional media; a Drift Verifier takes a list of flat
+    /// feature rows. Blocks with the GIL released for the one server call; a
+    /// `failed` verdict returns normally. Nothing is observed, recorded,
+    /// enqueued, or dispatched, and Bifrost need not be started.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SDK_404_UNKNOWN_VERIFIER` for a Verifier not bound to this
+    /// view's subject and `WYRD_SDK_400_INVALID_OBSERVATION` for input of the
+    /// wrong shape, both before any network IO, and otherwise the server's
+    /// verification refusal.
+    #[pyo3(signature = (verifier, input, *, media=None))]
+    fn verify(
+        &self,
+        py: Python<'_>,
+        verifier: &str,
+        input: &Bound<'_, PyAny>,
+        media: Option<&Bound<'_, PyAny>>,
+    ) -> WyrdPyResult<PyJudgment> {
+        let json = if input.cast::<PyList>().is_ok() {
+            json_array_text(py, "input", input)?
+        } else {
+            json_text(py, "input", input)?
+        };
+        let media = media
+            .map(|media| json_array_text(py, "media", media))
+            .transpose()?
+            .map(|text| serde_json::from_str(&text))
+            .transpose()
+            .map_err(|error| invalid_argument("media", error))?
+            .unwrap_or_default();
+        let observe = self.observe();
+        py.detach(|| wyrd_runtime::runtime().block_on(observe.verify_json(verifier, &json, media)))
+            .map(|inner| PyJudgment { inner })
+            .map_err(WyrdPyError::from)
+    }
 }
 
 impl PyObserveHandle {
     /// The native emit surface over this handle's view.
     fn observe(&self) -> Observe<'_> {
         self.run.observe()
+    }
+}
+
+/// Python view of one direct verification judgment.
+///
+/// Read-only projection of the wire `Judgment`; `passed` is derived from the
+/// verdict, not carried on the wire.
+#[pyclass(module = "wyrd._wyrd.observe", name = "Judgment", frozen)]
+pub struct PyJudgment {
+    /// The judgment the server returned.
+    inner: Judgment,
+}
+
+#[pymethods]
+impl PyJudgment {
+    /// Whether the expectations held: true only for a `passed` verdict.
+    #[getter]
+    fn passed(&self) -> bool {
+        self.inner.passed()
+    }
+
+    /// Transient identity of this execution, shared with its audit and trace.
+    #[getter]
+    fn execution_id(&self) -> String {
+        self.inner.execution_id.to_string()
+    }
+
+    /// The exact Verifier executed.
+    #[getter]
+    fn verifier(&self) -> CardRefPy {
+        CardRefPy(self.inner.verifier.clone())
+    }
+
+    /// The exact subject judged.
+    #[getter]
+    fn subject(&self) -> CardRefPy {
+        CardRefPy(self.inner.subject.clone())
+    }
+
+    /// The Verifier classification, `drift` or `eval`.
+    ///
+    /// # Errors
+    /// Raises an internal error only if the wire enum stops serializing as a
+    /// string.
+    #[getter]
+    fn kind(&self) -> WyrdPyResult<String> {
+        wire_string(&self.inner.kind)
+    }
+
+    /// The common verdict: `passed`, `failed`, or `inconclusive`.
+    ///
+    /// # Errors
+    /// As [`PyJudgment::kind`].
+    #[getter]
+    fn verdict(&self) -> WyrdPyResult<String> {
+        wire_string(&self.inner.verdict)
+    }
+
+    /// Bounded human-readable summary of the verdict.
+    #[getter]
+    fn summary(&self) -> &str {
+        &self.inner.summary
+    }
+
+    /// Count-only rollup of the judgment as its wire mapping.
+    ///
+    /// # Errors
+    /// Raises an internal error when the rollup cannot be converted.
+    #[getter]
+    fn counts(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        Ok(json_to_pyobject(
+            py,
+            &serde_json::to_value(self.inner.counts)?,
+        )?)
+    }
+
+    /// The engine report as its wire mapping: `{"drift": ...}` or `{"eval": ...}`.
+    ///
+    /// # Errors
+    /// Raises an internal error when the report cannot be converted.
+    #[getter]
+    fn detail(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
+        Ok(json_to_pyobject(
+            py,
+            &serde_json::to_value(&self.inner.detail)?,
+        )?)
+    }
+}
+
+/// The wire spelling of a unit enum value.
+///
+/// # Errors
+/// Raises an internal error when `value` does not serialize as a string.
+fn wire_string<T: serde::Serialize>(value: &T) -> WyrdPyResult<String> {
+    match serde_json::to_value(value)? {
+        serde_json::Value::String(text) => Ok(text),
+        other => Err(invalid_argument(
+            "judgment",
+            format!("unexpected wire value {other}"),
+        )),
     }
 }
 
@@ -309,5 +501,6 @@ impl PyObserveHandle {
 pub fn register_run(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyRun>()?;
     module.add_class::<PyObserveHandle>()?;
+    module.add_class::<PyJudgment>()?;
     Ok(())
 }

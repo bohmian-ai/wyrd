@@ -5,9 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use skald_providers::{ProviderError, ProviderStream};
-use skald_spec::wire::openai_chat::{
-    OpenAiChatChoice, OpenAiChatMessage, OpenAiChatResponse, OpenAiMessageContent, OpenAiUsage,
-};
+use skald_spec::wire::openai_chat::OpenAiMessageContent;
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse};
 
 use crate::provider::Provider;
@@ -139,7 +137,7 @@ impl Provider for MockProvider {
         let exchange = self.response_queue().pop_front();
         let Some(exchange) = exchange else {
             return if self.echo {
-                Ok(openai_text_response(&last_user_text(&request)))
+                Ok(ProviderResponse::text(last_user_text(&request)))
             } else {
                 Err(ProviderError::bad_request(
                     "mock",
@@ -202,32 +200,4 @@ fn openai_content_text(content: &OpenAiMessageContent) -> String {
             })
             .collect(),
     }
-}
-
-fn openai_text_response(text: &str) -> ProviderResponse {
-    ProviderResponse::OpenAiChatCompletion(OpenAiChatResponse {
-        id: "mock_response".to_owned(),
-        object: "chat.completion".to_owned(),
-        created: 0,
-        model: "mock-model".to_owned(),
-        choices: vec![OpenAiChatChoice {
-            index: 0,
-            message: OpenAiChatMessage {
-                role: "assistant".to_owned(),
-                content: Some(OpenAiMessageContent::Text(text.to_owned())),
-                ..Default::default()
-            },
-            finish_reason: Some("stop".to_owned()),
-            logprobs: None,
-        }],
-        usage: Some(OpenAiUsage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-        }),
-        system_fingerprint: None,
-        service_tier: None,
-    })
 }

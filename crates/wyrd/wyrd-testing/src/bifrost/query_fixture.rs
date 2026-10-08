@@ -34,6 +34,10 @@ pub struct SeededBifrostQuery {
 ///
 /// Returns a [`WyrdTestServerError`] when bootstrap, table registration, Arrow
 /// encoding, ingest, flush, endpoint discovery, or token exchange fails.
+///
+/// # Panics
+///
+/// Panics if the server was started without the Bifrost catalog.
 pub async fn seed_query_fixture(
     server: &WyrdTestServer,
     name: &str,
@@ -67,7 +71,6 @@ pub async fn seed_query_fixture(
                 .collect(),
             tenant: server.data_tenant_id(),
             physical_layout: None,
-            audit: None,
         })
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -179,7 +182,6 @@ impl WyrdTestServer {
                     .collect(),
                 tenant: self.data_tenant_id(),
                 physical_layout: None,
-                audit: None,
             })
             .await
             .map_err(harness_error)?;

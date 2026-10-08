@@ -31,8 +31,8 @@ use datafusion::physical_plan::{
 use futures_util::StreamExt as _;
 use sha2::{Digest as _, Sha256};
 use wyrd_spec::vala::api::{
-    ClusterRole, FollowerReaderCut, FollowerScanAssignment, NodeId, PersistedFileAssignment,
-    ScribeProviderCut, TenantTableBinding, TimePartitionWire, WorkerAttemptFrame,
+    ClusterRole, FollowerScanAssignment, NodeId, PersistedFileAssignment, ScribeProviderCut,
+    TenantTableBinding, TimePartitionWire, WorkerAttemptFrame,
 };
 use wyrd_spec::vala::assignment_authority::ScanPredicate;
 
@@ -96,8 +96,6 @@ impl LiveScribeRoute {
 pub(crate) struct LiveTableRoutes {
     /// Authenticated wire binding every fragment for this table is signed for.
     pub(crate) binding: TenantTableBinding,
-    /// Stable table identity carried by each fragment's no-snapshot reader cut.
-    pub(crate) table_uid: uuid::Uuid,
     /// Reported routes, in discovery order.
     pub(crate) routes: Vec<LiveScribeRoute>,
 }
@@ -264,7 +262,6 @@ impl LiveScribeExec {
         let assignment = FollowerScanAssignment {
             scan_id,
             binding: binding.clone(),
-            reader_cut: FollowerReaderCut::no_snapshot(self.routes.table_uid, route.writer_epoch),
             persisted: PersistedFileAssignment { files: Vec::new() },
             scribe_provider_cut: Some(ScribeProviderCut {
                 writer_epoch: route.writer_epoch,
@@ -1047,7 +1044,6 @@ mod tests {
                         namespace: "bifrost".to_owned(),
                         table: "events".to_owned(),
                     },
-                    table_uid: uuid::Uuid::nil(),
                     routes: Vec::new(),
                 },
                 "f".repeat(64),
@@ -1136,7 +1132,6 @@ mod tests {
                 namespace: "bifrost".to_owned(),
                 table: "events".to_owned(),
             },
-            table_uid: uuid::Uuid::nil(),
             routes: vec![early, late.clone()],
         };
         let floor = ScanPredicate::GtEq(

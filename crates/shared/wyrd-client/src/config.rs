@@ -10,6 +10,7 @@
 use secrecy::SecretString;
 
 use crate::auth::TokenExchange;
+use crate::environment::Environment;
 use crate::error::WyrdClientError;
 use crate::global_config::{GlobalConfig, TokenCacheKind};
 use crate::saved_login::{SavedLogins, canonical_origin};
@@ -58,6 +59,10 @@ pub struct ClientConfig {
     pub tenant: Option<String>,
     /// Token cache mode.
     pub token_cache: TokenCacheMode,
+    /// Where [`ClientConfig::resolve_credential`] reads the environment
+    /// credential tiers and the configuration directory holding saved logins
+    /// and `credentials.toml`. Defaults to the process environment.
+    pub environment: Environment,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -71,6 +76,7 @@ impl std::fmt::Debug for ClientConfig {
             )
             .field("tenant", &self.tenant)
             .field("token_cache", &self.token_cache)
+            .field("environment", &self.environment)
             .finish()
     }
 }
@@ -101,6 +107,10 @@ impl ClientConfig {
     }
 
     /// Overlay global config values with environment values and defaults.
+    ///
+    /// # Arguments
+    /// * `global` - Loaded global config whose values take precedence over environment
+    ///   variables.
     #[must_use]
     pub fn from_global_with_env(global: &GlobalConfig) -> Self {
         Self::from_global_with_overrides(global, None, None)
@@ -112,8 +122,38 @@ impl ClientConfig {
     /// environment variable. The HTTP base URL then falls back to its default;
     /// the gRPC endpoint falls back to [`grpc_endpoint_for`] of the *effective*
     /// HTTP base URL, so re-pointing only `server_url` re-points gRPC with it.
+    ///
+    /// # Arguments
+    /// * `global` - Loaded global config consulted after the explicit endpoints.
+    /// * `server_url` - Explicit HTTP base URL; `None` falls back to global config,
+    ///   `WYRD_SERVER_URL`, then the default.
+    /// * `grpc_url` - Explicit gRPC endpoint; `None` falls back to global config,
+    ///   `WYRD_GRPC_URL`, then one derived from the HTTP base URL.
     #[must_use]
     pub fn from_global_with_overrides(
+        global: &GlobalConfig,
+        server_url: Option<&str>,
+        grpc_url: Option<&str>,
+    ) -> Self {
+        Self::from_environment(Environment::Process, global, server_url, grpc_url)
+    }
+
+    /// Overlay explicit endpoints over global config, `environment`, and
+    /// defaults, and keep `environment` for credential resolution.
+    ///
+    /// Resolution follows [`ClientConfig::from_global_with_overrides`] with
+    /// every ambient value read from `environment` instead of the process.
+    ///
+    /// # Arguments
+    /// * `environment` - Source of every ambient variable, retained for credential resolution.
+    /// * `global` - Loaded global config consulted after the explicit endpoints.
+    /// * `server_url` - Explicit HTTP base URL; `None` falls back to global config,
+    ///   `WYRD_SERVER_URL`, then the default.
+    /// * `grpc_url` - Explicit gRPC endpoint; `None` falls back to global config,
+    ///   `WYRD_GRPC_URL`, then one derived from the HTTP base URL.
+    #[must_use]
+    pub fn from_environment(
+        environment: Environment,
         global: &GlobalConfig,
         server_url: Option<&str>,
         grpc_url: Option<&str>,
@@ -121,22 +161,22 @@ impl ClientConfig {
         let http_base_url = server_url
             .map(|url| url.trim_end_matches('/').to_owned())
             .or_else(|| global.client.http_url.clone())
-            .or_else(|| std::env::var("WYRD_SERVER_URL").ok())
+            .or_else(|| environment.var("WYRD_SERVER_URL"))
             .unwrap_or_else(|| HTTP_DEFAULT_BASE_URL.to_string());
         let grpc_endpoint = grpc_url
             .map(str::to_owned)
             .or_else(|| global.client.grpc_url.clone())
-            .or_else(|| std::env::var("WYRD_GRPC_URL").ok())
+            .or_else(|| environment.var("WYRD_GRPC_URL"))
             .unwrap_or_else(|| grpc_endpoint_for(&http_base_url));
         let tenant = global
             .client
             .tenant
             .clone()
-            .or_else(|| std::env::var("WYRD_TENANT").ok());
+            .or_else(|| environment.var("WYRD_TENANT"));
         let configured_cache = global.client.token_cache.as_ref();
         let token_cache = configured_cache
             .and_then(|cache| cache.kind)
-            .or_else(|| match std::env::var("WYRD_TOKEN_CACHE").ok().as_deref() {
+            .or_else(|| match environment.var("WYRD_TOKEN_CACHE").as_deref() {
                 Some("disk") => Some(TokenCacheKind::Disk),
                 Some("in_memory") => Some(TokenCacheKind::InMemory),
                 _ => None,
@@ -158,6 +198,7 @@ impl ClientConfig {
             credential: None,
             tenant,
             token_cache,
+            environment,
         }
     }
 
@@ -190,20 +231,23 @@ impl ClientConfig {
         if let Some(credential) = &self.credential {
             chain.push(CredentialSource::explicit(credential.clone()));
         }
-        chain.extend(CredentialChain::env_only(self.tenant.as_deref()));
+        chain.extend(CredentialChain::env_only(
+            &self.environment,
+            self.tenant.as_deref(),
+        ));
         if !chain.is_empty() {
             return self.refuse_selector(chain.resolve()?);
         }
-        if let Some(store) = SavedLogins::locate() {
+        if let Some(store) = self.environment.config_dir().map(SavedLogins::at) {
             let origin = canonical_origin(&self.http.base_url)?;
             if let Some(login) = store.select(&origin, self.tenant.as_deref())? {
                 let exchange = TokenExchange::new(&self.http.base_url, self.http.timeout_ms)?;
                 return Ok(ResolvedCredential::Renewable(
-                    store.source(&login, exchange),
+                    store.renewing_source(&login, exchange),
                 ));
             }
         }
-        self.refuse_selector(CredentialChain::credentials_file().resolve()?)
+        self.refuse_selector(CredentialChain::credentials_file(&self.environment).resolve()?)
     }
 
     /// Pass `credential` through unless it is a bearer or API key resolved
@@ -253,6 +297,7 @@ mod tests {
     use wyrd_spec::auth::SecretBearer;
     use wyrd_spec::ids::TenantSlug;
 
+    use crate::environment::Environment;
     use crate::global_config::{ClientSection, GlobalConfig, LocalWorkflowConfig};
     use crate::saved_login::{SavedLogin, SavedLogins};
 
@@ -262,16 +307,15 @@ mod tests {
         credential::ResolvedCredential,
     };
 
+    /// A config built from defaults and exactly `environment`.
+    fn config_in(environment: Environment) -> ClientConfig {
+        ClientConfig::from_environment(environment, &GlobalConfig::default(), None, None)
+    }
+
+    /// With no variables set, every endpoint and mode takes its default.
     #[test]
     fn from_env_uses_defaults_when_no_env_vars() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_GRPC_URL");
-            std::env::remove_var("WYRD_SERVER_URL");
-        }
-
-        let cfg = ClientConfig::from_env();
+        let cfg = config_in(Environment::from([]));
 
         assert_eq!(cfg.grpc.endpoint, GRPC_DEFAULT_ENDPOINT);
         assert_eq!(cfg.http.base_url, HTTP_DEFAULT_BASE_URL);
@@ -279,16 +323,14 @@ mod tests {
         assert!(cfg.credential.is_none());
     }
 
+    /// Global config file values outrank environment values.
     #[test]
     fn file_values_beat_environment_values() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
-        unsafe {
-            std::env::set_var("WYRD_GRPC_URL", "environment-grpc");
-            std::env::set_var("WYRD_SERVER_URL", "environment-http");
-            std::env::set_var("WYRD_TENANT", "environment-tenant");
-        }
-
+        let environment = Environment::from([
+            ("WYRD_GRPC_URL", "environment-grpc"),
+            ("WYRD_SERVER_URL", "environment-http"),
+            ("WYRD_TENANT", "environment-tenant"),
+        ]);
         let config = GlobalConfig {
             client: ClientSection {
                 grpc_url: Some("file-grpc".to_owned()),
@@ -298,55 +340,34 @@ mod tests {
             },
             workflow: LocalWorkflowConfig::default(),
         };
-        let resolved = ClientConfig::from_global_with_env(&config);
 
-        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
-        unsafe {
-            std::env::remove_var("WYRD_GRPC_URL");
-            std::env::remove_var("WYRD_SERVER_URL");
-            std::env::remove_var("WYRD_TENANT");
-        }
+        let resolved = ClientConfig::from_environment(environment, &config, None, None);
 
         assert_eq!(resolved.grpc.endpoint, "file-grpc");
         assert_eq!(resolved.http.base_url, "file-http");
         assert_eq!(resolved.tenant.as_deref(), Some("file-tenant"));
     }
 
+    /// Values the global config omits fall back to the environment.
     #[test]
     fn missing_file_values_fall_back_to_environment() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
-        unsafe {
-            std::env::set_var("WYRD_GRPC_URL", "environment-grpc");
-            std::env::remove_var("WYRD_SERVER_URL");
-            std::env::set_var("WYRD_TENANT", "environment-tenant");
-        }
-
-        let resolved = ClientConfig::from_global_with_env(&GlobalConfig::default());
-
-        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
-        unsafe {
-            std::env::remove_var("WYRD_GRPC_URL");
-            std::env::remove_var("WYRD_TENANT");
-        }
+        let resolved = config_in(Environment::from([
+            ("WYRD_GRPC_URL", "environment-grpc"),
+            ("WYRD_TENANT", "environment-tenant"),
+        ]));
 
         assert_eq!(resolved.grpc.endpoint, "environment-grpc");
         assert_eq!(resolved.http.base_url, HTTP_DEFAULT_BASE_URL);
         assert_eq!(resolved.tenant.as_deref(), Some("environment-tenant"));
     }
 
+    /// `WYRD_GRPC_URL` replaces the default gRPC endpoint.
     #[test]
     fn wyrd_grpc_url_overrides_default_endpoint() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_GRPC_URL", "https://grpc.example.com:443");
-        }
-        let cfg = ClientConfig::from_env();
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_GRPC_URL");
-        }
+        let cfg = config_in(Environment::from([(
+            "WYRD_GRPC_URL",
+            "https://grpc.example.com:443",
+        )]));
 
         assert_eq!(cfg.grpc.endpoint, "https://grpc.example.com:443");
     }
@@ -355,20 +376,16 @@ mod tests {
     /// at the public port; an explicit gRPC URL still wins.
     #[test]
     fn grpc_endpoint_derives_from_server_url_unless_overridden() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_GRPC_URL");
-            std::env::remove_var("WYRD_SERVER_URL");
-        }
         let global = GlobalConfig::default();
 
-        let derived = ClientConfig::from_global_with_overrides(
+        let derived = ClientConfig::from_environment(
+            Environment::from([]),
             &global,
             Some("https://wyrd.example.com/"),
             None,
         );
-        let overridden = ClientConfig::from_global_with_overrides(
+        let overridden = ClientConfig::from_environment(
+            Environment::from([]),
             &global,
             Some("https://wyrd.example.com"),
             Some("https://grpc.example.com:443"),
@@ -378,68 +395,43 @@ mod tests {
         assert_eq!(derived.grpc.endpoint, "https://wyrd.example.com:50051");
         assert_eq!(overridden.grpc.endpoint, "https://grpc.example.com:443");
         assert_eq!(
-            ClientConfig::from_env().grpc.endpoint,
+            config_in(Environment::from([])).grpc.endpoint,
             GRPC_DEFAULT_ENDPOINT
         );
     }
 
+    /// `WYRD_SERVER_URL` replaces the default HTTP base URL.
     #[test]
     fn wyrd_server_url_overrides_default_base_url() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_SERVER_URL", "https://api.example.com");
-        }
-        let cfg = ClientConfig::from_env();
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_SERVER_URL");
-        }
+        let cfg = config_in(Environment::from([(
+            "WYRD_SERVER_URL",
+            "https://api.example.com",
+        )]));
 
         assert_eq!(cfg.http.base_url, "https://api.example.com");
     }
 
+    /// No environment tier, saved login, or `credentials.toml` resolves to
+    /// `NoCredentials`.
     #[test]
     fn no_credentials_when_chain_empty() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-            std::env::remove_var("WYRD_TENANT");
-            std::env::remove_var("WYRD_API_KEY");
-            // Redirect HOME so no credentials.toml is found.
-            std::env::set_var("HOME", std::env::temp_dir());
-        }
+        let home = crate::credentials_file::private_tempdir();
+        let cfg = config_in(Environment::from([(
+            "WYRD_CONFIG_HOME",
+            home.path().to_str().expect("utf-8 path"),
+        )]));
 
-        let cfg = ClientConfig::from_env();
         let result = cfg.resolve_credential();
-
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("HOME");
-        }
 
         assert!(result.is_err(), "empty chain must return NoCredentials");
     }
 
+    /// `WYRD_API_KEY` resolves when no explicit credential is set.
     #[test]
     fn env_api_key_resolves_when_no_explicit() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_API_KEY", "env_api_key_value");
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-        }
+        let cfg = config_in(Environment::from([("WYRD_API_KEY", "env_api_key_value")]));
 
-        let cfg = ClientConfig::from_env();
         let cred = cfg.resolve_credential().expect("resolves from env");
-
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_API_KEY");
-        }
 
         match cred {
             ResolvedCredential::ApiKey(k) => {
@@ -449,25 +441,13 @@ mod tests {
         }
     }
 
+    /// An explicit credential outranks `WYRD_API_KEY`.
     #[test]
     fn explicit_credential_beats_env_wyrd_api_key() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_API_KEY", "env_key_should_lose");
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-        }
-
-        let mut cfg = ClientConfig::from_env();
+        let mut cfg = config_in(Environment::from([("WYRD_API_KEY", "env_key_should_lose")]));
         cfg.credential = Some(API_KEY_FIXTURE.to_owned().into());
 
         let cred = cfg.resolve_credential().expect("explicit key resolves");
-
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_API_KEY");
-        }
 
         match cred {
             ResolvedCredential::ApiKey(k) => {
@@ -481,26 +461,18 @@ mod tests {
         }
     }
 
+    /// `WYRD_WORKLOAD_TOKEN` with its tenant outranks `WYRD_API_KEY`.
     #[test]
     fn workload_token_beats_env_api_key() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-jwt");
-            std::env::set_var("WYRD_TENANT", "acme");
-            std::env::set_var("WYRD_API_KEY", "api-key-should-lose");
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-        }
+        let mut cfg = config_in(Environment::from([
+            ("WYRD_WORKLOAD_TOKEN", "workload-jwt"),
+            ("WYRD_TENANT", "acme"),
+            ("WYRD_API_KEY", "api-key-should-lose"),
+        ]));
+        // Workload routing reads the ambient tenant; no selector is set.
+        cfg.tenant = None;
 
-        let cfg = ClientConfig::from_env();
         let cred = cfg.resolve_credential().expect("resolves from env");
-
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-            std::env::remove_var("WYRD_TENANT");
-            std::env::remove_var("WYRD_API_KEY");
-        }
 
         match cred {
             ResolvedCredential::WorkloadJwt { tenant, .. } => {
@@ -513,28 +485,18 @@ mod tests {
         }
     }
 
+    /// `WYRD_ACCESS_TOKEN` outranks `WYRD_WORKLOAD_TOKEN`.
     #[test]
     fn explicit_access_token_beats_workload_token() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_ACCESS_TOKEN", "real-access-token");
-            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-should-lose");
-            std::env::set_var("WYRD_TENANT", "acme");
-            std::env::remove_var("WYRD_API_KEY");
-        }
-
-        let mut cfg = ClientConfig::from_env();
+        let mut cfg = config_in(Environment::from([
+            ("WYRD_ACCESS_TOKEN", "real-access-token"),
+            ("WYRD_WORKLOAD_TOKEN", "workload-should-lose"),
+            ("WYRD_TENANT", "acme"),
+        ]));
         // Workload routing reads the ambient tenant; no selector is set.
         cfg.tenant = None;
-        let cred = cfg.resolve_credential().expect("resolves from env");
 
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-            std::env::remove_var("WYRD_TENANT");
-        }
+        let cred = cfg.resolve_credential().expect("resolves from env");
 
         match cred {
             ResolvedCredential::BearerToken(token) => {
@@ -548,28 +510,18 @@ mod tests {
         }
     }
 
+    /// An explicit credential outranks `WYRD_WORKLOAD_TOKEN`.
     #[test]
     fn explicit_credential_beats_workload_token() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-should-lose");
-            std::env::set_var("WYRD_TENANT", "acme");
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-            std::env::remove_var("WYRD_API_KEY");
-        }
-
-        let mut cfg = ClientConfig::from_env();
+        let mut cfg = config_in(Environment::from([
+            ("WYRD_WORKLOAD_TOKEN", "workload-should-lose"),
+            ("WYRD_TENANT", "acme"),
+        ]));
         // Workload routing reads the ambient tenant; no selector is set.
         cfg.tenant = None;
         cfg.credential = Some(API_KEY_FIXTURE.to_owned().into());
-        let cred = cfg.resolve_credential().expect("explicit key resolves");
 
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-            std::env::remove_var("WYRD_TENANT");
-        }
+        let cred = cfg.resolve_credential().expect("explicit key resolves");
 
         match cred {
             ResolvedCredential::ApiKey(key) => {
@@ -583,25 +535,16 @@ mod tests {
         }
     }
 
+    /// A workload token with no tenant is no source, so the chain falls
+    /// through to `WYRD_API_KEY`.
     #[test]
     fn workload_token_without_tenant_yields_no_source() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-jwt");
-            std::env::remove_var("WYRD_TENANT");
-            std::env::set_var("WYRD_API_KEY", "api-key-fallback");
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-        }
+        let cfg = config_in(Environment::from([
+            ("WYRD_WORKLOAD_TOKEN", "workload-jwt"),
+            ("WYRD_API_KEY", "api-key-fallback"),
+        ]));
 
-        let cfg = ClientConfig::from_env();
         let cred = cfg.resolve_credential().expect("falls through to api key");
-
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-            std::env::remove_var("WYRD_API_KEY");
-        }
 
         match cred {
             ResolvedCredential::ApiKey(key) => {
@@ -638,21 +581,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn saved_login_ranks_between_env_and_credentials_file() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let home = crate::credentials_file::private_tempdir();
+        let config_home = home.path().to_str().expect("utf-8 path");
         std::fs::write(
             home.path().join("credentials.toml"),
             format!("[default]\napi_key = \"{API_KEY_FIXTURE}\"\n"),
         )
         .expect("writes floor");
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_CONFIG_HOME", home.path());
-            std::env::remove_var("WYRD_ACCESS_TOKEN");
-            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
-            std::env::remove_var("WYRD_API_KEY");
-        }
-        let mut cfg = ClientConfig::from_env();
+        let mut cfg = config_in(Environment::from([("WYRD_CONFIG_HOME", config_home)]));
         cfg.http.base_url = "https://wyrd.example.com/".to_owned();
         cfg.tenant = None;
         let chmod = |mode: u32| {
@@ -667,7 +603,7 @@ mod tests {
         chmod(0o600);
         let floor = cfg.resolve_credential().expect("floor resolves");
 
-        let store = SavedLogins::locate().expect("config home");
+        let store = SavedLogins::at(home.path().to_path_buf());
         let tenant_key = TenantSlug::from_str("acme").expect("slug");
         store
             .save(SavedLogin {
@@ -682,16 +618,11 @@ mod tests {
         cfg.tenant = Some("globex".to_owned());
         let mismatch = cfg.resolve_credential().map(|_| ());
         cfg.tenant = None;
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::set_var("WYRD_API_KEY", "env_api_key_value");
-        }
+        cfg.environment = Environment::from([
+            ("WYRD_CONFIG_HOME", config_home),
+            ("WYRD_API_KEY", "env_api_key_value"),
+        ]);
         let env = cfg.resolve_credential().expect("env resolves");
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            std::env::remove_var("WYRD_API_KEY");
-            std::env::remove_var("WYRD_CONFIG_HOME");
-        }
 
         let error = exposed.expect_err("a credential file others can read fails closed");
         assert!(error.to_string().contains("unsafe_store"), "{error}");
@@ -725,8 +656,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tenant_selector_is_refused_beside_a_self_naming_credential() {
-        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         let home = crate::credentials_file::private_tempdir();
+        let config_home = home.path().to_str().expect("utf-8 path");
         let floor = home.path().join("credentials.toml");
         std::fs::write(
             &floor,
@@ -738,12 +669,6 @@ mod tests {
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         )
         .expect("chmod");
-        let names = [
-            "WYRD_ACCESS_TOKEN",
-            "WYRD_WORKLOAD_TOKEN",
-            "WYRD_TENANT",
-            "WYRD_API_KEY",
-        ];
         let tiers = [
             ("explicit bearer", Some("explicit-access-token"), None),
             ("explicit API key", Some(API_KEY_FIXTURE), None),
@@ -761,41 +686,26 @@ mod tests {
         ];
         let mut outcomes = Vec::new();
         for (tier, credential, env) in tiers {
-            // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-            unsafe {
-                std::env::set_var("WYRD_CONFIG_HOME", home.path());
-                for name in names {
-                    std::env::remove_var(name);
+            let environment = match env {
+                Some((name, value)) => {
+                    Environment::from([("WYRD_CONFIG_HOME", config_home), (name, value)])
                 }
-                if let Some((name, value)) = env {
-                    std::env::set_var(name, value);
-                }
-            }
-            let mut cfg = ClientConfig::from_env();
+                None => Environment::from([("WYRD_CONFIG_HOME", config_home)]),
+            };
+            let mut cfg = config_in(environment);
             cfg.http.base_url = "https://wyrd.example.com".to_owned();
             cfg.credential = credential.map(|value| value.to_owned().into());
             let unselected = cfg.resolve_credential().map(|_| ());
             cfg.tenant = Some("acme".to_owned());
             outcomes.push((tier, unselected, cfg.resolve_credential().map(|_| ())));
         }
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            for name in names {
-                std::env::remove_var(name);
-            }
-            std::env::set_var("WYRD_WORKLOAD_TOKEN", "workload-assertion");
-            std::env::set_var("WYRD_TENANT", "globex");
-        }
-        let mut cfg = ClientConfig::from_env();
+        let mut cfg = config_in(Environment::from([
+            ("WYRD_CONFIG_HOME", config_home),
+            ("WYRD_WORKLOAD_TOKEN", "workload-assertion"),
+            ("WYRD_TENANT", "globex"),
+        ]));
         cfg.tenant = Some("acme".to_owned());
         let routed = cfg.resolve_credential();
-        // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
-        unsafe {
-            for name in names {
-                std::env::remove_var(name);
-            }
-            std::env::remove_var("WYRD_CONFIG_HOME");
-        }
 
         for (tier, unselected, selected) in outcomes {
             unselected.unwrap_or_else(|error| panic!("{tier} resolves alone: {error}"));

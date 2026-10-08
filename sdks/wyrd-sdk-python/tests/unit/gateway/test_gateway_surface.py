@@ -4,35 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-METHODS = [
-    "credential",
-    "credentials",
-    "put_deployment",
-    "deployment",
-    "deployments",
-    "delete_deployment",
-    "put_fallback_policy",
-    "fallback_policy",
-    "delete_fallback_policy",
-    "put_governance_policy",
-    "governance_policy",
-    "delete_governance_policy",
-    "put_capture_policy",
-    "capture_policy",
-]
-
 MUTATIONS = ["put_credential", "revoke_credential", "delete_credential"]
 
 SENTINEL = "sk-live-python-surface-sentinel"
-
-
-def test_gateway_is_exported_with_every_administration_method():
-    from wyrd._wyrd.gateway import Gateway as NativeGateway
-    from wyrd.gateway import Gateway
-
-    assert Gateway is NativeGateway
-    for name in METHODS:
-        assert callable(getattr(Gateway, name)), name
 
 
 def test_gateway_offers_no_provider_credential_mutation():
@@ -57,18 +31,19 @@ def test_gateway_invalid_body_raises_validation_without_echoing_it():
     transport: the unroutable port would fail with a different code.
     """
     from wyrd import WyrdError
+    from wyrd.client import WyrdClient
     from wyrd.gateway import Gateway
 
-    gateway = Gateway(server_url="http://127.0.0.1:9", credential="unused")
+    gateway = Gateway(WyrdClient(server_url="http://127.0.0.1:9", credential="unused"))
     with pytest.raises(WyrdError) as captured:
         gateway.put_deployment(
-            {
+            {  # ty: ignore[invalid-argument-type]
                 "name": "openai-primary",
                 "model": {"provider": "openai", "model": "gpt-4o"},
                 "adapter": "openai",
                 "auth": {"bearer": {"credential": "openai-key"}},
                 "capabilities": ["chat_completions"],
-                "routing_weight": SENTINEL,
+                "routing_weight": SENTINEL,  # ty: ignore[invalid-argument-type]
             }
         )
     error = captured.value

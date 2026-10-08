@@ -57,7 +57,10 @@ fn decode_failure(error: &JsonError) -> String {
 /// Returns `WYRD_SPEC_400_VALIDATION` naming `field` when the value is not
 /// JSON-compatible or does not match the contract's serde shape. Neither the
 /// message nor the details repeat any part of the rejected value.
-fn decode<T: DeserializeOwned>(field: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<T> {
+pub(crate) fn decode<T: DeserializeOwned>(
+    field: &str,
+    value: &Bound<'_, PyAny>,
+) -> WyrdPyResult<T> {
     let json = pyobject_to_json(value)
         .map_err(|_| invalid_argument(field, "expected a JSON-compatible Python value"))?;
     serde_json::from_value(json).map_err(|error| invalid_argument(field, &decode_failure(&error)))
@@ -65,8 +68,8 @@ fn decode<T: DeserializeOwned>(field: &str, value: &Bound<'_, PyAny>) -> WyrdPyR
 
 /// Python-facing tenant gateway administration client.
 ///
-/// Wraps one [`wyrd_client::Gateway`] bound to a client resolved from explicit
-/// options or the standard Wyrd environment/credential chain. Provider
+/// Wraps one [`wyrd_client::Gateway`] bound to an explicit `WyrdClient` or the
+/// ambient chain. Provider
 /// credential mutation is absent by construction: submitting, rotating,
 /// revoking, or deleting a credential lives on
 /// `wyrd_client::gateway_credential`, which this binding never constructs, so
@@ -87,7 +90,7 @@ impl PyGateway {
     ///
     /// Returns the server's stable `WyrdError` from `call`, or an internal
     /// error when the typed response cannot be projected to Python.
-    fn run<T, F>(py: Python<'_>, call: F) -> WyrdPyResult<Py<PyAny>>
+    pub(crate) fn run<T, F>(py: Python<'_>, call: F) -> WyrdPyResult<Py<PyAny>>
     where
         T: Serialize + Send,
         F: Future<Output = Result<T, WyrdError>> + Send,
@@ -102,7 +105,7 @@ impl PyGateway {
     /// # Errors
     ///
     /// Returns `WYRD_SPEC_400_VALIDATION` when `name` is not a valid token.
-    fn credential_name(name: &str) -> WyrdPyResult<ProviderCredentialName> {
+    pub(crate) fn credential_name(name: &str) -> WyrdPyResult<ProviderCredentialName> {
         ProviderCredentialName::new(name)
             .map_err(|_| invalid_argument("name", "expected a provider credential name"))
     }
@@ -120,25 +123,25 @@ impl PyGateway {
 
 #[pymethods]
 impl PyGateway {
-    /// Connects to a Wyrd server; omitted options resolve from the environment,
-    /// and `tenant` (a tenant route key) selects the saved user login.
+    /// Builds a gateway administration handle acting as `client`.
+    ///
+    /// Omitted, the client resolves from the ambient chain. No network call
+    /// happens here.
+    ///
+    /// # Arguments
+    /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
+    ///   ambient chain.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` with `WYRD_CLIENT_401_NO_CREDENTIALS` when no
     /// credential resolves, or a transport error when the client cannot build.
     #[new]
-    #[pyo3(signature = (server_url=None, credential=None, tenant=None))]
-    fn __new__(
-        server_url: Option<&str>,
-        credential: Option<&str>,
-        tenant: Option<&str>,
-    ) -> WyrdPyResult<Self> {
-        let client =
-            wyrd_client::bifrost::client_from_options(server_url, credential, None, tenant)
-                .map_err(WyrdError::from)?;
+    #[pyo3(signature = (client=None))]
+    fn __new__(client: Option<PyRef<'_, crate::client::PyWyrdClient>>) -> WyrdPyResult<Self> {
+        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
         Ok(Self {
-            inner: wyrd_client::Gateway::new(client),
+            inner: wyrd_client::Gateway::with_client(client),
         })
     }
 
@@ -201,8 +204,8 @@ impl PyGateway {
     ///
     /// # Errors
     ///
-    /// Raises `WyrdError` for an invalid name or the server's permission,
-    /// conflict, or availability error.
+    /// Raises `WyrdError` for an invalid name or the server's permission or
+    /// availability error.
     fn delete_deployment(&self, py: Python<'_>, name: &str) -> WyrdPyResult<Py<PyAny>> {
         let name = Self::deployment_name(name)?;
         Self::run(py, self.inner.delete_deployment(&name))
@@ -246,7 +249,8 @@ impl PyGateway {
     /// # Errors
     ///
     /// Raises `WyrdError` for an invalid body or the server's permission,
-    /// invalid-configuration, conflict, or availability error.
+    /// invalid-configuration, or availability error. A changed stored pricing
+    /// version is an invalid-configuration error.
     fn put_governance_policy(
         &self,
         py: Python<'_>,

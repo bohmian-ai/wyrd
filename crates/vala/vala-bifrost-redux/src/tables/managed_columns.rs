@@ -1,115 +1,173 @@
-use arrow::datatypes::{DataType, Field, TimeUnit};
+//! The one declaration of every server-managed column Bifrost appends.
+//!
+//! [`MANAGED_COLUMNS`] is the only place a managed column's name, physical
+//! type, nullability, and physical order are declared. Every
+//! physical schema — dynamic tables, pre-declared domain tables, and the
+//! canonical signal tables — and every reserved-name check derives from it, so
+//! adding, retyping, or retiring a managed column is one edit here.
+
+use arrow::datatypes::{Field, TimeUnit};
 
 use crate::tables::CorrelationPolicy;
 use crate::tables::fields::{CanonicalField, CanonicalType, canonical_arrow_fields};
 use wyrd_spec::vala::{
-    CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
-    WYRD_REQUEST_ID,
+    CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
-/// Append the Bifrost system columns (and policy-gated correlation columns)
-/// to the user fields of a pre-declared domain table.
+/// Which tables a managed column is appended to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedScope {
+    /// Attribution that is the same on every retry of a batch, appended only
+    /// by a table's correlation policy.
+    Correlation,
+    /// The request that carried the rows, fresh on every attempt and appended
+    /// alongside the correlation columns.
+    Request,
+    /// Time axis appended to every table, whatever its correlation policy.
+    Time,
+}
+
+/// One server-managed column: its physical declaration and where it applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedColumn {
+    /// Name, physical type, and nullability of the column.
+    pub field: CanonicalField,
+    /// Which tables append the column.
+    pub scope: ManagedScope,
+}
+
+impl ManagedColumn {
+    /// Declare one UTF-8 identity column in `scope`.
+    const fn identity(name: &'static str, nullable: bool, scope: ManagedScope) -> Self {
+        Self {
+            field: CanonicalField::meta(name, CanonicalType::Utf8, nullable),
+            scope,
+        }
+    }
+
+    /// Declare one non-null UTC microsecond time column every table appends.
+    const fn time(name: &'static str) -> Self {
+        Self {
+            field: CanonicalField::meta(
+                name,
+                CanonicalType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
+                false,
+            ),
+            scope: ManagedScope::Time,
+        }
+    }
+
+    /// Project this column into an Arrow field without field metadata.
+    ///
+    /// Dynamic and pre-declared tables carry no sensitivity ledger, so their
+    /// managed fields carry no metadata either.
+    fn untagged_arrow(&self) -> Field {
+        Field::new(
+            self.field.name,
+            self.field.ty.to_arrow(),
+            self.field.nullable,
+        )
+    }
+}
+
+/// Every server-managed column, in physical order.
 ///
-/// Column order: policy correlation columns first, then system timestamp
-/// columns, then `wyrd_batch_id`. Tenant ownership is not a column: every
-/// Parquet file proves it in footer metadata.
+/// Correlation columns come first, then the two time columns:
 ///
-/// This is the single source of truth for what gets appended per policy.
-/// The appended columns here are excluded from `schema_fingerprint()`, which
-/// hashes `arrow_fields()` only.
+/// - `run_id`, `card_uid`: optional correlation to a run and a Card version;
+/// - `principal_id`: the authenticated writer;
+/// - `wyrd_request_id`: the request that wrote the row, the join key to audit;
+/// - `wyrd_event_time`: when the observed thing happened — the caller's value
+///   when supplied, otherwise equal to `wyrd_ingested_at`;
+/// - `wyrd_ingested_at`: when Wyrd accepted the row, read once per batch from
+///   `PostgreSQL` and never caller-supplied.
+///
+/// Tenant ownership is not a column: every Parquet file proves it in footer
+/// metadata. Field ids are assigned by each registered Iceberg table, never
+/// declared here.
+pub static MANAGED_COLUMNS: &[ManagedColumn] = &[
+    ManagedColumn::identity(RUN_ID, true, ManagedScope::Correlation),
+    ManagedColumn::identity(CARD_UID, true, ManagedScope::Correlation),
+    ManagedColumn::identity(PRINCIPAL_ID, false, ManagedScope::Correlation),
+    ManagedColumn::identity(WYRD_REQUEST_ID, false, ManagedScope::Request),
+    ManagedColumn::time(WYRD_EVENT_TIME),
+    ManagedColumn::time(WYRD_INGESTED_AT),
+];
+
+impl CorrelationPolicy {
+    /// Report whether a table under this policy appends `column`.
+    ///
+    /// Time columns are always appended. Correlation and request columns are
+    /// appended by `Observation` tables; `None` tables carry their own identity
+    /// columns and append neither.
+    #[must_use]
+    pub fn appends(self, column: &ManagedColumn) -> bool {
+        match (self, column.scope) {
+            (_, ManagedScope::Time) | (Self::Observation, _) => true,
+            (Self::None, _) => false,
+        }
+    }
+
+    /// The managed columns a table under this policy appends, in physical order.
+    pub fn managed_columns(self) -> impl Iterator<Item = &'static ManagedColumn> {
+        MANAGED_COLUMNS
+            .iter()
+            .filter(move |column| self.appends(column))
+    }
+}
+
+/// Report whether `name` is a server-managed column.
+///
+/// Writers may not declare a column with a managed name; the server stamps or
+/// resolves every one of them.
+#[must_use]
+pub fn is_managed_column(name: &str) -> bool {
+    MANAGED_COLUMNS
+        .iter()
+        .any(|column| column.field.name == name)
+}
+
+/// Report whether `name` is a managed correlation column.
+///
+/// Correlation columns attribute rows to a run, a Card version, and a writer.
+/// They are identical on every retry of one batch, unlike the request and time
+/// columns, which is what lets a retry be recognised as the same write.
+#[must_use]
+pub fn is_correlation_column(name: &str) -> bool {
+    MANAGED_COLUMNS
+        .iter()
+        .any(|column| column.scope == ManagedScope::Correlation && column.field.name == name)
+}
+
+/// Append the managed columns a policy declares to a table's user fields.
+///
+/// User fields stay first, in their declared order, followed by the policy's
+/// managed columns in [`MANAGED_COLUMNS`] order. The appended fields carry no
+/// field metadata. The user-schema fingerprint hashes the user fields alone,
+/// so appending them never perturbs it.
+#[must_use]
 pub fn ensure_managed_columns(
     mut user_fields: Vec<Field>,
     policy: CorrelationPolicy,
 ) -> Vec<Field> {
-    // Universal correlation columns per policy (C-01).
-    match policy {
-        CorrelationPolicy::Observation => {
-            user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));
-            user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
-            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
-            user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
-        }
-        CorrelationPolicy::CodeAxis => {
-            // run_id is declared as a code-axis user field; do not append the universal one.
-            user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
-            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
-            user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
-        }
-        CorrelationPolicy::None => {
-            // audit_log: no universal correlation columns appended.
-        }
-    }
-
-    // Bifrost system columns (always present on domain tables).
-    user_fields.push(Field::new(
-        WYRD_EVENT_TIME,
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        false,
-    ));
-    user_fields.push(Field::new(
-        WYRD_INGESTED_AT,
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        false,
-    ));
-    user_fields.push(Field::new(
-        WYRD_BATCH_ID,
-        DataType::FixedSizeBinary(16),
-        false,
-    ));
-
+    user_fields.extend(policy.managed_columns().map(ManagedColumn::untagged_arrow));
     user_fields
 }
-
-/// The Observation envelope appended to every canonical signal table.
-///
-/// These seven fields are physical schema authority: they carry stable ids
-/// 1000-1006 and the same names, types, order, and nullability
-/// [`ensure_managed_columns`] appends for [`CorrelationPolicy::Observation`],
-/// so a canonical table's envelope and a pre-declared table's envelope remain
-/// one contract. They are stripped from the canonical user batch and stamped
-/// from trusted Gate context, never supplied by a client.
-///
-/// The ids live in a range far above any signal ledger so a signal can add
-/// fields indefinitely without ever colliding with the envelope. Ids 1007 and
-/// 1008 are retired: they named the removed batch-local row ordinal and the
-/// removed per-row tenant column, and an envelope id is never reused for a
-/// different column.
-pub static CANONICAL_ENVELOPE_FIELDS: &[CanonicalField] = &[
-    CanonicalField::meta(1000, RUN_ID, CanonicalType::Utf8, true),
-    CanonicalField::meta(1001, CARD_UID, CanonicalType::Utf8, true),
-    CanonicalField::meta(1002, PRINCIPAL_ID, CanonicalType::Utf8, false),
-    CanonicalField::meta(1003, WYRD_REQUEST_ID, CanonicalType::Utf8, false),
-    CanonicalField::meta(
-        1004,
-        WYRD_EVENT_TIME,
-        CanonicalType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
-        false,
-    ),
-    CanonicalField::meta(
-        1005,
-        WYRD_INGESTED_AT,
-        CanonicalType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
-        false,
-    ),
-    CanonicalField::meta(
-        1006,
-        WYRD_BATCH_ID,
-        CanonicalType::FixedSizeBinary(16),
-        false,
-    ),
-];
 
 /// Build one canonical signal table's complete physical Arrow fields.
 ///
 /// The declared signal ledger comes first in declaration order, then the
-/// Observation envelope. Every field — signal and envelope, at every nesting
-/// depth — carries its stable id and sensitivity metadata, which is what lets
-/// Iceberg adopt the table's own ids and lets the canonical physical
-/// fingerprint cover the whole schema.
+/// `Observation` managed columns. Every field — ledger and managed, at every
+/// nesting depth — carries its sensitivity metadata, which is what lets the
+/// canonical physical fingerprint cover the whole schema.
 #[must_use]
 pub fn canonical_physical_fields(declared: &[CanonicalField]) -> Vec<Field> {
     let mut physical = canonical_arrow_fields(declared);
-    physical.extend(canonical_arrow_fields(CANONICAL_ENVELOPE_FIELDS));
+    physical.extend(
+        CorrelationPolicy::Observation
+            .managed_columns()
+            .map(|column| column.field.to_arrow()),
+    );
     physical
 }
 
@@ -117,17 +175,22 @@ pub fn canonical_physical_fields(declared: &[CanonicalField]) -> Vec<Field> {
 mod tests {
     use super::*;
 
+    /// Names of `fields` in order.
     fn field_names(fields: &[Field]) -> Vec<&str> {
         fields.iter().map(|f| f.name().as_str()).collect()
     }
 
+    /// Observation tables append every managed column in declared order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the order changes, a retired column reappears, or a
+    /// required identity becomes nullable.
     #[test]
-    /// Observation schemas match the non-null identities stamped by Scribe.
-    fn observation_policy_appends_all_three_then_system() {
+    fn observation_policy_appends_every_managed_column_in_order() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::Observation);
-        let names = field_names(&fields);
         assert_eq!(
-            names,
+            field_names(&fields),
             vec![
                 RUN_ID,
                 CARD_UID,
@@ -135,98 +198,87 @@ mod tests {
                 WYRD_REQUEST_ID,
                 WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,
-                WYRD_BATCH_ID,
             ]
         );
         assert!(!fields[2].is_nullable());
         assert!(!fields[3].is_nullable());
     }
 
+    /// Tables without a correlation policy append only the two time columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when anything other than the event and ingest time columns is
+    /// appended.
     #[test]
-    /// Code-axis schemas omit only the already-declared run identifier.
-    fn code_axis_policy_omits_run_id() {
-        let fields = ensure_managed_columns(vec![], CorrelationPolicy::CodeAxis);
-        let names = field_names(&fields);
-        assert!(
-            !names.contains(&RUN_ID),
-            "CodeAxis must not append universal run_id"
-        );
-        assert!(names.contains(&CARD_UID));
-        assert!(names.contains(&PRINCIPAL_ID));
-        assert!(names.contains(&WYRD_REQUEST_ID));
-    }
-
-    #[test]
-    /// Tables without correlation policy receive only physical system columns.
-    fn none_policy_only_managed_columns() {
+    fn none_policy_appends_only_the_time_columns() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::None);
-        let names = field_names(&fields);
-        assert!(!names.contains(&RUN_ID));
-        assert!(!names.contains(&CARD_UID));
-        assert!(!names.contains(&PRINCIPAL_ID));
-        assert!(names.contains(&WYRD_EVENT_TIME));
-        assert!(names.contains(&WYRD_BATCH_ID));
+        assert_eq!(
+            field_names(&fields),
+            vec![WYRD_EVENT_TIME, WYRD_INGESTED_AT]
+        );
     }
 
-    #[test]
     /// Caller-declared fields remain ahead of every server-managed field.
-    fn user_fields_come_before_system() {
-        let user = vec![Field::new("my_col", DataType::Utf8, true)];
+    ///
+    /// # Panics
+    ///
+    /// Panics when the caller's field is not first in the managed schema.
+    #[test]
+    fn user_fields_come_before_managed_columns() {
+        let user = vec![Field::new("my_col", arrow::datatypes::DataType::Utf8, true)];
         let fields = ensure_managed_columns(user, CorrelationPolicy::Observation);
         assert_eq!(fields[0].name(), "my_col");
     }
 
-    /// Pins the Redux managed-column contract after removal of the duplicate catalog.
+    /// The managed-name check covers exactly the declaration.
     ///
     /// # Panics
     ///
-    /// Panics when any managed field differs in name, type, order, or nullability.
+    /// Panics when a declared column is not reported as managed, or when the
+    /// retired batch column or a user name is.
     #[test]
-    fn redux_managed_columns_remain_stable() {
-        let user_fields = vec![Field::new("value", DataType::UInt64, false)];
-        let redux_dynamic = crate::schema::with_managed_columns(user_fields);
-        assert_eq!(
-            redux_dynamic
-                .iter()
-                .map(|field| (
-                    field.name().as_str(),
-                    field.data_type(),
-                    field.is_nullable()
-                ))
-                .collect::<Vec<_>>(),
-            vec![
-                ("value", &DataType::UInt64, false),
-                ("run_id", &DataType::Utf8, true),
-                ("card_uid", &DataType::Utf8, true),
-                ("principal_id", &DataType::Utf8, false),
-                ("wyrd_request_id", &DataType::Utf8, false),
-                (
-                    "wyrd_event_time",
-                    &DataType::Timestamp(
-                        arrow::datatypes::TimeUnit::Microsecond,
-                        Some("UTC".into())
-                    ),
-                    false,
-                ),
-                (
-                    "wyrd_ingested_at",
-                    &DataType::Timestamp(
-                        arrow::datatypes::TimeUnit::Microsecond,
-                        Some("UTC".into())
-                    ),
-                    false,
-                ),
-                ("wyrd_batch_id", &DataType::FixedSizeBinary(16), false),
-            ]
-        );
+    fn is_managed_column_covers_exactly_the_declaration() {
+        for column in MANAGED_COLUMNS {
+            assert!(
+                is_managed_column(column.field.name),
+                "{}",
+                column.field.name
+            );
+        }
+        assert!(!is_managed_column("wyrd_batch_id"));
+        assert!(!is_managed_column("value"));
+        assert!(is_correlation_column(RUN_ID));
+        assert!(is_correlation_column(PRINCIPAL_ID));
+        assert!(!is_correlation_column(WYRD_REQUEST_ID));
+        assert!(!is_correlation_column(WYRD_INGESTED_AT));
+    }
 
-        for managed in [
-            ensure_managed_columns(Vec::new(), CorrelationPolicy::Observation),
-            ensure_managed_columns(Vec::new(), CorrelationPolicy::CodeAxis),
-        ] {
+    /// Canonical tables tag the managed columns with sensitivity and no id.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a canonical managed field declares a field id or loses its
+    /// sensitivity marker.
+    #[test]
+    fn canonical_physical_fields_declare_no_managed_field_ids() {
+        for field in canonical_physical_fields(&[]) {
             assert_eq!(
-                managed.last().map(|field| field.name().as_str()),
-                Some("wyrd_batch_id")
+                field
+                    .metadata()
+                    .get(crate::tables::fields::PARQUET_FIELD_ID),
+                None,
+                "{}",
+                field.name()
+            );
+            assert_eq!(
+                field
+                    .metadata()
+                    .get(crate::tables::fields::WYRD_SENSITIVE)
+                    .map(String::as_str),
+                Some("false"),
+                "{}",
+                field.name()
             );
         }
     }

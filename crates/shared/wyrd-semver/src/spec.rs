@@ -123,7 +123,7 @@ impl<'de> Deserialize<'de> for VersionSpec {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct VersionSpecVisitor;
 
-        impl<'de> Visitor<'de> for VersionSpecVisitor {
+        impl Visitor<'_> for VersionSpecVisitor {
             type Value = VersionSpec;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {

@@ -1,5 +1,3 @@
-import json
-
 import pytest
 from pydantic import BaseModel
 from wyrd.prompt import Prompt, ResponseFormat, WyrdError
@@ -15,18 +13,7 @@ class Recipe(BaseModel):
     ingredients: list[Ingredient]
 
 
-def schema_from_request(prompt: Prompt) -> dict:
-    body = prompt.request.model_dump()["body"]
-    if "response_format" in body:
-        return body["response_format"]["json_schema"]["schema"]
-    if "text" in body:
-        return body["text"]["format"]["schema"]
-    if "generation_config" in body:
-        return body["generation_config"]["response_schema"]
-    return prompt.model_dump()["response_type"]["json_schema"]["schema"]
-
-
-def provider_prompts(response_format: object) -> list[Prompt]:
+def provider_prompts(response_format: type[BaseModel]) -> list[Prompt]:
     return [
         Prompt.openai_chat("gpt-4o", messages="Recipe", response_format=response_format),
         Prompt.openai_responses("gpt-4.1", messages="Recipe", response_format=response_format),
@@ -38,23 +25,26 @@ def provider_prompts(response_format: object) -> list[Prompt]:
 
 @pytest.mark.parametrize("prompt", provider_prompts(Recipe))
 def test_pydantic_basemodel_schema_extraction(prompt: Prompt) -> None:
-    schema = schema_from_request(prompt)
+    schema = prompt.response_schema
     round_tripped = Prompt.model_validate_json(prompt.model_dump_json())
 
+    assert schema is not None
     assert schema["type"] == "object"
     assert "ingredients" in schema["properties"]
-    assert schema_from_request(round_tripped) == schema
+    assert prompt.response_schema_name == "response"
+    assert round_tripped.response_schema == schema
+    assert round_tripped.response_schema_name == "response"
+
+
+def test_response_schema_is_none_without_structured_output() -> None:
+    prompt = Prompt.openai_chat("gpt-4o", messages="Recipe")
+
+    assert prompt.response_schema is None
+    assert prompt.response_schema_name is None
 
 
 def test_response_format_json_schema_rejects_non_object_schema() -> None:
     with pytest.raises(WyrdError) as error:
-        ResponseFormat.json_schema("bad", "not-object")
+        ResponseFormat.json_schema("bad", "not-object")  # ty: ignore[invalid-argument-type]
 
     assert error.value.code == "WYRD_PROMPT_400_INVALID_RESPONSE_SCHEMA"
-
-
-def test_structured_output_model_dump_json_preserves_schema() -> None:
-    prompt = Prompt.openai_chat("gpt-4o", messages="Recipe", response_format=Recipe)
-    decoded = json.loads(prompt.model_dump_json())
-
-    assert decoded["response_type"]["json_schema"]["schema"] == schema_from_request(prompt)

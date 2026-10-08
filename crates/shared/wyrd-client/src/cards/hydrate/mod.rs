@@ -52,6 +52,9 @@ pub struct CardGraphHydrator {
 
 impl CardGraphHydrator {
     /// Creates a graph hydrator from an authenticated registry context.
+    ///
+    /// # Arguments
+    /// * `context` - The authenticated registry context every read goes through.
     #[must_use]
     pub fn new(context: RegistryContext) -> Self {
         Self { context }
@@ -65,6 +68,11 @@ impl CardGraphHydrator {
     ///
     /// Cancellation can leave the operation's staging directory behind because cancellation
     /// prevents the explicit cleanup path from running.
+    ///
+    /// # Arguments
+    /// * `selector` - The root Card.
+    /// * `destination` - The bundle directory to publish.
+    /// * `mode` - Whether artifacts are downloaded and verified or only metadata is written.
     ///
     /// # Errors
     ///

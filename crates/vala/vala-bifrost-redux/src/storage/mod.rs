@@ -1396,7 +1396,10 @@ mod governed_request_tests {
         let panicking = storage
             .run_once(StorageOperation::Write, async {
                 panic!("an injected panic beneath the backend client");
-                #[allow(unreachable_code)]
+                #[allow(
+                    unreachable_code,
+                    reason = "the panic is the injected fault; the value fixes the block type"
+                )]
                 Ok::<(), opendal::Error>(())
             })
             .await

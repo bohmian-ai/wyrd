@@ -1,0 +1,36 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  name: judge-prompt
+  version: 1.0.0
+  space: default
+spec:
+  request:
+    provider: open_ai_chat_completion
+    body:
+      model: gpt-test
+      messages:
+        - role: user
+          content: Grade the answer ${answer}.
+      response_format:
+        type: json_schema
+        json_schema:
+          name: judge_result
+          schema:
+            type: object
+            properties:
+              passed: {type: boolean}
+            required: [passed]
+            additionalProperties: false
+  model: gpt-test
+  variables: [answer]
+  media_variables: []
+  response_type:
+    json_schema:
+      name: judge_result
+      schema:
+        type: object
+        properties:
+          passed: {type: boolean}
+        required: [passed]
+        additionalProperties: false

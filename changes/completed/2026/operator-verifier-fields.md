@@ -17,4 +17,3 @@ Current owners and evidence:
 - [Wyrd design](../../../architecture/wyrd-design.md) and [protocol doctrine](../../../architecture/wyrd-doctrine.mdx).
 - [Operator contract and field resolution](../../../crates/wyrd-spec/src/card/operator.rs), [Verifier activation](../../../crates/wyrd/wyrd-server/src/components/cards/resolve.rs), and [verification engines](../../../crates/wyrd/wyrd-server/src/verification/engines.rs).
 - [Operator journey coverage](../../../crates/wyrd/wyrd-cli/tests/operator_journey.rs).
-

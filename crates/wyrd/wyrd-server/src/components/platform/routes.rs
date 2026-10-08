@@ -2,8 +2,9 @@
 //!
 //! Every route here takes [`PlatformCaller`], so a tenant identity cannot reach
 //! them: the extractor is the only producer of a platform-scoped context and it
-//! accepts only a platform session. Authorization and its audit record happen
-//! inside each operation, in the transaction that performs it.
+//! accepts only a platform session. Authorization happens inside each
+//! operation, which stages its decision on the process audit outbox without
+//! waiting for the commit.
 //!
 //! These routes sit outside the `/v1` nest deliberately. That nest is
 //! default-deny on *tenant* access tokens, so a platform session would be
@@ -17,6 +18,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::Arc;
 use wyrd_auth::platform_sessions::{
     DEFAULT_PLATFORM_TOKEN_TTL_MINUTES, PlatformSessionError, PlatformSessions,
 };
@@ -32,6 +34,7 @@ use wyrd_spec::request_id::RequestId;
 
 use crate::auth::oauth::{OAuthError, OAuthForm, TOKEN_EXCHANGE, no_store};
 use crate::components::auth::PlatformCaller;
+use crate::components::platform::builtins::BuiltinTables;
 use crate::components::platform::provisioning::{ProvisionError, TenantProvisioning};
 use crate::components::platform::recovery::TenantRecovery;
 use crate::http::error::{WyrdErrorResponse, internal_failure, path_rejection};
@@ -83,7 +86,7 @@ pub fn platform_auth_router() -> OpenApiRouter<AppState> {
         (status = 400, description = "`invalid_request`, including every credential \
           rejection, `invalid_target`, or `unsupported_grant_type`", body = OAuthErrorResponse),
         (status = 500, description = "`server_error`: a platform store read or write \
-          failed, or the platform decision could not be audited", body = OAuthErrorResponse)
+          failed", body = OAuthErrorResponse)
     ),
     // No session exists yet at this operation, so it clears the document-wide
     // requirement instead of inheriting it.
@@ -119,7 +122,7 @@ async fn platform_token(
         return Err(OAuthError::from(not_configured().0));
     };
 
-    let sessions = PlatformSessions::new(operator, issuing_key);
+    let sessions = PlatformSessions::new(operator, issuing_key, Arc::clone(&state.audit_outbox));
     let presented = SecretString::from(subject_token.expose().to_owned());
     match sessions.exchange(&presented, request_id.as_str()).await {
         Ok(session) => Ok(no_store(
@@ -170,8 +173,7 @@ pub(crate) fn platform_session_response(session: &str) -> TokenResponse {
           (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No active tenant to recover, indistinguishably for every \
           cause (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -184,7 +186,7 @@ async fn recover_tenant_admin(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let recovery = TenantRecovery::new(operator);
+    let recovery = TenantRecovery::new(operator, Arc::clone(&state.audit_outbox));
     let conn = state
         .postgres
         .tenant_conn(request.tenant_id)
@@ -221,8 +223,7 @@ fn not_configured() -> WyrdErrorResponse {
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant creation not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 409, description = "Slug already in use by a live tenant (WYRD_SPEC_409_CONFLICT)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -232,10 +233,7 @@ async fn create_tenant(
     caller: PlatformCaller,
     Json(request): Json<CreateTenantRequest>,
 ) -> Result<Json<CreateTenantResponse>, WyrdErrorResponse> {
-    let Some(operator) = state.postgres.operator_pool() else {
-        return Err(not_configured());
-    };
-    let provisioning = TenantProvisioning::new(operator);
+    let provisioning = directory(&state)?;
 
     // Two phases because the tenant id is only settled by the directory claim:
     // a resumed attempt adopts the failed attempt's id. The connection is
@@ -274,7 +272,7 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
             message: "no active tenant to act on".to_owned(),
             details: serde_json::json!({ "resource": "tenant" }),
         }),
-        ProvisionError::AuditUnavailable(reason) | ProvisionError::Store(reason) => {
+        ProvisionError::Store(reason) => {
             WyrdErrorResponse::from(internal_failure("tenant provisioning failed", &reason))
         }
     }
@@ -293,8 +291,7 @@ fn provision_error(error: ProvisionError) -> WyrdErrorResponse {
          body = TenantListResponse),
         (status = 401, description = "Platform session required (WYRD_AUTH_401_UNAUTHENTICATED)", body = WyrdProblem),
         (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -327,8 +324,7 @@ async fn list_tenants(
         (status = 403, description = "Tenant reading not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No such tenant, indistinguishably for every cause \
           (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -365,8 +361,7 @@ async fn inspect_tenant(
         (status = 403, description = "Tenant suspension not granted (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "Tenant is not in the state this transition requires \
           (WYRD_SPEC_404_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "A platform store read or write failed, or the platform \
-          decision could not be audited (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
+        (status = 500, description = "A platform store read or write failed (WYRD_SPEC_500_INTERNAL)", body = WyrdProblem)
     ),
     tag = "Platform"
 )]
@@ -400,13 +395,18 @@ async fn set_tenant_status(
 
 /// Bind the tenant directory owner to this request, or report it unconfigured.
 ///
+/// The owner also carries the process's Bifrost catalog, through which a new
+/// tenant receives every built-in table before promotion.
+///
 /// # Errors
 /// Returns the unconfigured-plane error when the deployment has no operator
-/// connection.
+/// connection or this process retains no Bifrost catalog.
 fn directory(state: &AppState) -> Result<TenantProvisioning, WyrdErrorResponse> {
-    state
-        .postgres
-        .operator_pool()
-        .map(TenantProvisioning::new)
-        .ok_or_else(not_configured)
+    let operator = state.postgres.operator_pool().ok_or_else(not_configured)?;
+    let catalog = state.bifrost.catalog().ok_or_else(not_configured)?;
+    Ok(TenantProvisioning::new(
+        operator,
+        Arc::clone(&state.audit_outbox),
+        BuiltinTables::new(Arc::clone(catalog)),
+    ))
 }

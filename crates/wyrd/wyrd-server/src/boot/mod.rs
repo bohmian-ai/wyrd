@@ -6,7 +6,10 @@ pub mod init;
 pub mod issuer;
 pub mod node_identity;
 
+use crate::config::ForgeRuntimeConfig;
 use std::sync::Arc;
+use std::time::Duration;
+use vala_bifrost_redux::resources::ResourcePlan;
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
@@ -15,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
-    Forge as ForgeCoordinator, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectPages,
-    ForgeObjectStore, ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
+    Forge as ForgeCoordinator, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeError,
+    ForgeLeaderPeer, ForgeObjectPages, ForgeObjectStore, ForgeTelemetry, ForgeWorker,
+    ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
@@ -61,16 +65,22 @@ use crate::boot::data_root::{BifrostDataRoot, BifrostDataRootError};
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::operators::keys::{KeyError, KeyFailure, OperatorKeys};
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry, WyrdServerConfig};
-use crate::oracle::{OraclePeerAuthority, OracleQueryAudit, PostgresPeerSecurityAudit};
+use crate::oracle::{OraclePeerAuthority, PostgresPeerSecurityAudit};
 use crate::postgres::ServerPostgres;
 use crate::state::{
     AppState, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError, Scribe,
     ScribeCoordinationRuntime,
 };
+use vala_sql::audit_outbox::{AuditOutbox, AuditSink};
 
-const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Cadence of the leader's Forge maintenance timer when `[forge]` sets no
+/// `maintenance_interval_secs`; [`resolve_forge_config`] applies it.
+const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_hours(1);
+/// Bound on the advisory staging-file wake-up channel that feeds Forge
+/// promotion; wake-ups are advisory, so a full channel loses no durable work.
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
-const ORACLE_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Longest boot waits for the Oracle to finish startup before failing.
+const ORACLE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Number of listing entries the production Forge object store groups into one
 /// orphan-GC page. The producer owns page granularity: this bounds how much of
 /// an OpenDAL recursive walk materializes before orphan GC can check its page
@@ -415,7 +425,7 @@ pub enum ServerBootError {
     CardRecoveryPoolRequired,
     /// Forge configuration validation failed during boot.
     #[error(transparent)]
-    Forge(#[from] vala_bifrost_redux::forge::ForgeError),
+    Forge(#[from] ForgeError),
     /// Scribe WAL/runtime construction failed during boot.
     #[error("Scribe runtime construction failed: {0}")]
     Scribe(String),
@@ -428,6 +438,10 @@ pub enum ServerBootError {
     /// let two ready members disagree about durable data.
     #[error("peer mode requires shared object storage; file:// storage is local to one process")]
     PeerLocalStorage,
+    /// Startup could not ensure every canonical built-in table for every
+    /// active tenant, so the server must not report ready.
+    #[error(transparent)]
+    BuiltinTables(#[from] Box<crate::components::platform::builtins::BuiltinTablesError>),
 }
 
 /// Resolve the operator `forge` config section into a `ForgeConfig` plus the
@@ -442,34 +456,18 @@ pub enum ServerBootError {
 /// [`Forge::new`], which runs [`ForgeConfig::validate`] and the maintenance
 /// interval check; this function performs no validation itself and never
 /// panics.
-fn resolve_forge_config(
-    forge_runtime: &crate::config::ForgeRuntimeConfig,
-) -> (ForgeConfig, std::time::Duration) {
+fn resolve_forge_config(forge_runtime: &ForgeRuntimeConfig) -> (ForgeConfig, Duration) {
     let base = ForgeConfig::default();
     let config = ForgeConfig {
-        snapshot_retention: forge_runtime
-            .snapshot_retention_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.snapshot_retention),
-        retain_last: forge_runtime.retain_last.unwrap_or(base.retain_last),
         orphan_gc_ttl: forge_runtime
             .orphan_gc_ttl_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.orphan_gc_ttl),
-        maintenance_trigger_snapshot_count: forge_runtime
-            .maintenance_trigger_snapshot_count
-            .unwrap_or(base.maintenance_trigger_snapshot_count),
-        maintenance_trigger_interval: forge_runtime
-            .maintenance_trigger_interval_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.maintenance_trigger_interval),
+            .map_or(base.orphan_gc_ttl, Duration::from_secs),
         orphan_gc_max_list_pages: forge_runtime
             .orphan_gc_max_list_pages
             .unwrap_or(base.orphan_gc_max_list_pages),
         orphan_gc_run_budget: forge_runtime
             .orphan_gc_run_budget_secs
-            .map(std::time::Duration::from_secs)
-            .unwrap_or(base.orphan_gc_run_budget),
+            .map_or(base.orphan_gc_run_budget, Duration::from_secs),
         default_target_file_size_bytes: forge_runtime
             .target_file_size_bytes
             .unwrap_or(base.default_target_file_size_bytes),
@@ -477,8 +475,7 @@ fn resolve_forge_config(
     };
     let maintenance_interval = forge_runtime
         .maintenance_interval_secs
-        .map(std::time::Duration::from_secs)
-        .unwrap_or(DEFAULT_MAINTENANCE_INTERVAL);
+        .map_or(DEFAULT_MAINTENANCE_INTERVAL, Duration::from_secs);
     (config, maintenance_interval)
 }
 
@@ -632,8 +629,14 @@ async fn build_bifrost_external_dependencies(
 ///
 /// # Errors
 ///
-/// Returns [`ServerBootError`] when Scribe, Forge, Oracle, role fencing, or
-/// request-boundary construction fails before publication.
+/// Returns [`ServerBootError`] when built-in table reconciliation, Scribe,
+/// Forge, Oracle, role fencing, or request-boundary construction fails before
+/// publication.
+///
+/// # Panics
+///
+/// Panics if a Forge compaction runtime owner built around a live runtime
+/// yields no handle; construction guarantees one, so this is an invariant.
 pub async fn compose_bifrost(
     inputs: crate::state::BifrostBuildInputs,
 ) -> Result<crate::state::ComposedBifrost, ServerBootError> {
@@ -671,6 +674,13 @@ pub async fn compose_bifrost(
             .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
                 detail: "platform-admin operator pool is unavailable".to_owned(),
             })?;
+    // Every active tenant holds the whole built-in inventory before any role
+    // activates, so a table added to the inventory is backfilled on restart
+    // and a failure aborts boot rather than serving a partial tenant.
+    crate::components::platform::builtins::BuiltinTables::new(Arc::clone(&bifrost))
+        .reconcile(&operator_pool)
+        .await
+        .map_err(Box::new)?;
     let scribe_config = bifrost_config.scribe;
     let resource_plan = bifrost_resources.plan();
     let pod_memory_limit = resource_plan.managed_memory_bytes;
@@ -779,9 +789,7 @@ pub async fn compose_bifrost(
         #[cfg(feature = "test-support")]
         let wal_sync_delay = test_controls
             .as_ref()
-            .map_or(std::time::Duration::ZERO, |controls| {
-                controls.scribe_wal_sync_delay
-            });
+            .map_or(Duration::ZERO, |controls| controls.scribe_wal_sync_delay);
         let execution_pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::try_new_with_capacity(scribe_config.ingress_cpu_threads, 256)
                 .map_err(|error| {
@@ -801,7 +809,7 @@ pub async fn compose_bifrost(
                 }
                 #[cfg(not(feature = "test-support"))]
                 {
-                    std::time::Duration::ZERO
+                    Duration::ZERO
                 }
             })
             .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
@@ -814,14 +822,14 @@ pub async fn compose_bifrost(
         let admission_defaults = AdmissionConfig {
             memory_limit_bytes: pod_memory_limit,
             event_time_window: EventTimeWindow {
-                past: scribe_config
-                    .event_time_past_window_secs
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or_else(|| std::time::Duration::from_secs(30 * 24 * 60 * 60)),
-                future: scribe_config
-                    .event_time_future_window_secs
-                    .map(std::time::Duration::from_secs)
-                    .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60)),
+                past: scribe_config.event_time_past_window_secs.map_or_else(
+                    || std::time::Duration::from_hours(720),
+                    std::time::Duration::from_secs,
+                ),
+                future: scribe_config.event_time_future_window_secs.map_or_else(
+                    || std::time::Duration::from_hours(24),
+                    std::time::Duration::from_secs,
+                ),
             },
         };
         #[cfg(feature = "test-support")]
@@ -937,7 +945,7 @@ pub async fn compose_bifrost(
         #[cfg(not(feature = "test-support"))]
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
-        let coordinator = Arc::new(ForgeCoordinator::new(ForgeBuildConfig {
+        let coordinator = ForgeCoordinator::new(ForgeBuildConfig {
             resources: bifrost_resources.forge().ok_or_else(|| {
                 ServerBootError::ForgeSchedulerRequired {
                     detail: "Forge role selected without a composed Forge capability".to_owned(),
@@ -986,7 +994,17 @@ pub async fn compose_bifrost(
                 .as_ref()
                 .map(|controls| controls.forge_scheduler_trigger.clone()),
             telemetry: Arc::new(ForgeTelemetry::new()),
-        })?);
+        })?;
+        // A peer-mode coordinator publishes its private listener with every
+        // leader term, so commit notices from other replicas reach the leader.
+        // A dedicated Forge worker holds dial-only credentials: it never
+        // contends for a term, so its local advertise marker is never
+        // published, and the same route carries its pulls and reports.
+        let coordinator = Arc::new(match &peer_tls {
+            Some(tls) => coordinator
+                .with_leader_peer(ForgeLeaderPeer::new(advertise_addr.clone(), tls.clone())),
+            None => coordinator,
+        });
         // Only the Forge worker role runs admitted compaction plans, so only it
         // builds the dedicated executor. Its thread count is the resolved
         // effective CPU the same plan derived the memory budget from, rather
@@ -1005,7 +1023,7 @@ pub async fn compose_bifrost(
                 .enable_all()
                 .build()
                 .map_err(|error| {
-                    ServerBootError::Forge(vala_bifrost_redux::forge::ForgeError::InvalidConfig {
+                    ServerBootError::Forge(ForgeError::InvalidConfig {
                         detail: format!("Forge compaction runtime failed: {error}"),
                     })
                 })?;
@@ -1037,12 +1055,12 @@ pub async fn compose_bifrost(
         None
     };
 
-    let query_audit = roles
-        .contains(&BifrostRuntimeRole::Oracle)
-        .then(|| OracleQueryAudit::new(postgres.vala().clone()));
+    // The one process audit outbox: Gate, Oracle, peer security, and every
+    // request-path decision stage on it; `BoundServer::run` drains it last.
+    let audit_outbox = AuditSink::outbox(postgres.vala().clone());
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
-            crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres)
+            crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit_outbox))
                 .await
                 .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
@@ -1079,13 +1097,13 @@ pub async fn compose_bifrost(
         advertise_addr: &advertise_addr,
         peer_tls: peer_tls.clone(),
         local_scribe: scribe.clone(),
-        audit: query_audit.clone(),
+        audit: Arc::clone(&audit_outbox),
         shutdown: shutdown.clone(),
     }
     .build()
     .await?;
     let forwarding_audit = Arc::new(
-        PostgresPeerSecurityAudit::try_new(&postgres)
+        PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit_outbox))
             .await
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
     );
@@ -1114,12 +1132,17 @@ pub async fn compose_bifrost(
                 .map(|runtime| runtime.registered_role().fencing_token),
             tls: peer_tls,
             authority: forwarding_authority,
-            config: OracleConfig::default(),
+            config: OracleConfig {
+                default_deadline: bifrost_config.oracle.default_query_deadline(),
+                ..OracleConfig::default()
+            },
         },
     ));
     let interceptor =
         vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&token_verifier));
     let ingest_limits = scribe_config.ingest_limits();
+    let observation_runs =
+        crate::verification::observations::ObservationRunSink::outbox(postgres.wyrd().clone());
     let gate = match scribe.as_ref() {
         Some(runtime) => vala_bifrost_redux::gate::Gate::with_scribe(
             Arc::clone(runtime.ingest()),
@@ -1131,11 +1154,9 @@ pub async fn compose_bifrost(
     .with_query_dispatch(
         Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
     )
-    .with_audit(Arc::new(
-        crate::bifrost::gate_audit::PostgresGateAudit::new(postgres.as_ref().clone()),
-    ))
+    .with_audit(Arc::clone(&audit_outbox))
     .with_observation_ack(Arc::new(
-        crate::verification::observations::ObservationEnqueue::new(postgres.wyrd().clone()),
+        crate::verification::observations::ObservationEnqueue::new(Arc::clone(&observation_runs)),
     ));
     Ok(crate::state::ComposedBifrost {
         bifrost: crate::state::Bifrost::assembled(crate::state::BifrostComposition {
@@ -1148,6 +1169,8 @@ pub async fn compose_bifrost(
             token_verifier,
             query_forwarder: Some(query_forwarder),
             query_controls: Some(query_controls),
+            observation_runs,
+            audit_outbox,
             #[cfg(feature = "test-support")]
             resources: Some(bifrost_resources.clone()),
         }),
@@ -1162,24 +1185,24 @@ pub async fn compose_bifrost(
 /// Every bound comes from values the immutable [`ResourcePlan`] already
 /// resolved, so a node cannot admit compaction work its own resource plan did
 /// not reserve. Memory is not bounded here: each rewrite charges the shared
-/// governor through its own pool. Running parallelism is three units per effective CPU, matching upstream's
-/// task multiplier over its detected worker threads, and waiting parallelism is
+/// governor through its own pool. Running parallelism is twelve units per
+/// effective CPU, `RisingWave`'s Iceberg-mode compactor multiplier over its
+/// worker threads (`ceil(effective_cpu × 12)`), and waiting parallelism is
 /// four times that, so a burst of planned work queues rather than being refused
 /// while earlier plans still run. Tenant fairness is unrelated to either and
 /// stays with the SQL fair claim.
-///
-/// [`ResourcePlan`]: vala_bifrost_redux::resources::ResourcePlan
 fn forge_compaction_worker_config(
-    plan: &vala_bifrost_redux::resources::ResourcePlan,
-    forge_runtime: &crate::config::ForgeRuntimeConfig,
+    plan: &ResourcePlan,
+    forge_runtime: &ForgeRuntimeConfig,
 ) -> ForgeWorkerConfig {
-    let max_task_parallelism = u32::try_from(plan.effective_cpu.saturating_mul(3))
+    let max_task_parallelism = u32::try_from(plan.effective_cpu.saturating_mul(12))
         .unwrap_or(u32::MAX)
         .max(1);
     ForgeWorkerConfig {
         per_tenant_active_cap: forge_runtime.resolved_per_tenant_active_cap(),
         max_task_parallelism,
         pending_task_parallelism: max_task_parallelism.saturating_mul(4),
+        ..ForgeWorkerConfig::default()
     }
 }
 
@@ -1189,6 +1212,16 @@ fn forge_compaction_worker_config(
 /// admission queue, sized once at composition from the immutable resource plan.
 /// This entry point only supervises the resulting single event loop.
 ///
+/// The process supervisor calls this again to replace a failed instance. Every
+/// call clones the one boot-composed worker, so the replacement carries the
+/// same boot-resolved owner identity a process restart would, and its startup
+/// recovery reclaims lapsed claims and reconciles Prepared attempts exactly as
+/// after a restart. The failed instance cannot act again: its loop has
+/// returned only after joining its own plan runners and claim heartbeats, a
+/// same-owner table-lease acquisition bumps the fencing token so any lease it
+/// still held can no longer renew or commit, and a reclaimed claim settles
+/// only under its new attempt.
+///
 /// # Errors
 /// Returns [`ServerBootError::ForgeSchedulerRequired`] when Forge is absent or
 /// [`ServerBootError::Forge`] when the requested worker bound or per-tenant cap
@@ -1196,12 +1229,8 @@ fn forge_compaction_worker_config(
 pub fn spawn_forge_worker(
     state: &AppState,
     shutdown: CancellationToken,
-) -> Result<
-    impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
-    + Send
-    + 'static,
-    ServerBootError,
-> {
+) -> Result<impl Future<Output = Result<(), ForgeError>> + Send + 'static + use<>, ServerBootError>
+{
     let forge = state
         .bifrost
         .forge()
@@ -1296,8 +1325,7 @@ pub async fn build_state(
         config,
         &signing_key,
         sealing_key.clone(),
-    )
-    .await?;
+    )?;
     let verifier = auth
         .token_verifier
         .clone()
@@ -1343,6 +1371,7 @@ pub async fn build_state(
         shutdown.clone(),
     )
     .with_auth(auth);
+    let state = attach_human_logins(state, config, sealing_key.clone());
     let state = attach_config_fields(state, config, telemetry)?;
     if let Err(error) = seed_federation(&state, config, sealing_key.as_deref()).await {
         rollback_state_roles(&state).await;
@@ -1557,7 +1586,7 @@ pub async fn rewrap_sealed_secrets(
 /// # Errors
 /// Returns [`ServerBootError::SigningKey`] when production profile lacks a
 /// signing key, or when key material is invalid.
-async fn install_auth(
+fn install_auth(
     postgres: &ServerPostgres,
     config: &WyrdServerConfig,
     signing_key: &SecretString,
@@ -1580,25 +1609,6 @@ async fn install_auth(
         config.deployment_profile.screened_http(),
     )?;
 
-    let human_connections = HumanConnections::new(
-        postgres.wyrd().clone(),
-        sealing_key.clone(),
-        config.deployment_profile.screened_http(),
-        config.auth.public_origin.as_ref(),
-    );
-    // Platform federated login needs the cross-tenant boundary; one owner
-    // serves every platform login so its provider cache outlives a request.
-    let platform_login = postgres.operator_pool().map(|pool| {
-        PlatformLogin::new(
-            pool.clone(),
-            sealing_key.clone(),
-            Arc::new(PlatformSessions::new(
-                pool,
-                Arc::clone(&handles.issuing_key),
-            )),
-            config.deployment_profile.screened_http(),
-        )
-    });
     let token_exchange_settings = wyrd_auth::issuance::TokenExchangeSettings::default();
 
     Ok(ServerAuth {
@@ -1607,12 +1617,51 @@ async fn install_auth(
         external_verifier: Some(handles.external_verifier),
         trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
         workload_binding_resolver: Some(binding_resolver),
-        human_connections: Some(human_connections),
-        platform_login,
+        human_connections: None,
+        platform_login: None,
         oauth_clients: OAuthClients::new(config.auth.ui_client_secret_hashes.clone()),
         sealing_key: sealing_key.clone(),
         token_exchange_settings,
     })
+}
+
+/// Attach the human and platform login owners to `state`'s auth handles.
+///
+/// Both owners stage their decisions on the process audit outbox, which
+/// exists only once [`AppState::new`] has adopted the one `compose_bifrost`
+/// built, so they are attached here rather than in [`install_auth`]. One
+/// owner of each serves every login, so its provider cache outlives a
+/// request. Platform login needs the cross-tenant boundary and an issuing
+/// key; without either it stays unset.
+fn attach_human_logins(
+    mut state: AppState,
+    config: &WyrdServerConfig,
+    sealing_key: Option<Arc<SealingKeyring>>,
+) -> AppState {
+    state.auth.human_connections = Some(HumanConnections::new(
+        state.postgres.wyrd().clone(),
+        sealing_key.clone(),
+        config.deployment_profile.screened_http(),
+        config.auth.public_origin.as_ref(),
+        Arc::clone(&state.audit_outbox),
+    ));
+    state.auth.platform_login = state
+        .postgres
+        .operator_pool()
+        .zip(state.auth.issuing_key.clone())
+        .map(|(pool, issuing_key)| {
+            PlatformLogin::new(
+                pool.clone(),
+                sealing_key,
+                Arc::new(PlatformSessions::new(
+                    pool,
+                    issuing_key,
+                    Arc::clone(&state.audit_outbox),
+                )),
+                config.deployment_profile.screened_http(),
+            )
+        });
+    state
 }
 
 /// Builds and registers the local Oracle role after security dependencies verify.
@@ -1654,13 +1703,13 @@ struct OracleRoleBuilder<'a> {
     peer_tls: Option<BifrostPeerTls>,
     /// Co-located Scribe a process-local Oracle lists and reads in-process.
     local_scribe: Option<Arc<crate::state::Scribe>>,
-    /// Query audit for the leader's read decisions and tenant refusals.
-    audit: Option<Arc<OracleQueryAudit>>,
+    /// Process audit outbox for the leader's read decisions and tenant refusals.
+    audit: Arc<AuditOutbox>,
     /// One process-wide shutdown token injected into every Oracle owner.
     shutdown: CancellationToken,
 }
 
-impl<'a> OracleRoleBuilder<'a> {
+impl OracleRoleBuilder<'_> {
     /// Constructs the combined fenced API-serving follower without publishing a partial peer.
     ///
     /// # Errors
@@ -1707,11 +1756,8 @@ impl<'a> OracleRoleBuilder<'a> {
         // The same immutable identity serves Scribe-tail discovery and the
         // Analytical east-west plane; naming it twice would let the two drift.
         let tail_tls = peer_tls.clone();
-        let audit = audit.ok_or_else(|| {
-            ServerBootError::OraclePeer("selected Oracle role has no query audit owner".to_owned())
-        })?;
         let security_audit = Arc::new(
-            PostgresPeerSecurityAudit::try_new(&postgres)
+            PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&audit))
                 .await
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
@@ -1772,19 +1818,12 @@ impl<'a> OracleRoleBuilder<'a> {
                 |value| value.queue_capacity,
             ),
             max_queue_wait: calibrated.as_ref().map_or(
-                std::time::Duration::from_millis(config.oracle.max_queue_wait_ms),
+                Duration::from_millis(config.oracle.max_queue_wait_ms),
                 |value| value.max_queue_wait,
             ),
-            default_deadline: std::time::Duration::from_millis(
-                config.oracle.default_query_deadline_ms,
-            ),
+            default_deadline: config.oracle.default_query_deadline(),
             ..OracleConfig::default()
         };
-        let operator_pool = postgres.operator_pool().ok_or_else(|| {
-            ServerBootError::OraclePeer(
-                "Oracle reader-epoch authority requires the operator pool".to_owned(),
-            )
-        })?;
         let capabilities = OracleCapabilitiesV1 {
             storage_protocol_version: 1,
             cpu_cores: configured_cpu,
@@ -1888,23 +1927,20 @@ impl<'a> OracleRoleBuilder<'a> {
             shutdown: shutdown.clone(),
             catalog: Arc::clone(&catalog),
             vala: postgres.vala().clone(),
-            operator_pool,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
             memory: OracleMemoryResources {
                 resources,
                 reconciliation_limit_bytes,
             },
-            audit: audit.clone(),
+            audit,
             reservations,
             stage_authority: Some(stage_authority),
             peer_tls,
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),
             config: oracle_config,
-        })
-        .await
-        {
+        }) {
             Ok(oracle) => Arc::new(oracle),
             Err(error) => {
                 release_failed_oracle_role(&cluster, &role, "construction").await;
@@ -1917,7 +1953,6 @@ impl<'a> OracleRoleBuilder<'a> {
             role,
             peer,
             cluster,
-            audit,
             resources: oracle_resources,
             shutdown,
         })
@@ -1957,8 +1992,6 @@ struct BuiltOracleRole {
     peer: Arc<crate::oracle::OraclePeerRuntime>,
     /// Cluster owner used for activation and snapshot publication.
     cluster: Arc<ClusterRegistry>,
-    /// Outbox writer for Oracle read decisions and tenant tripwires.
-    audit: Arc<OracleQueryAudit>,
     /// Root-derived Oracle resource capability.
     resources: vala_bifrost_redux::resources::OracleResources,
     /// One process-wide shutdown token retained through lifecycle publication.
@@ -1986,7 +2019,6 @@ impl BuiltOracleRole {
             role,
             peer,
             cluster,
-            audit,
             resources,
             shutdown,
         } = self;
@@ -2031,7 +2063,6 @@ impl BuiltOracleRole {
             catalog,
             registered_role: role.clone(),
             cluster: Arc::clone(&cluster),
-            audit,
             lifecycle_transport,
             resources,
             peer,
@@ -2267,11 +2298,7 @@ pub fn spawn_maintenance_scheduler(
     state: &AppState,
     shutdown: CancellationToken,
 ) -> Result<
-    Option<
-        impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
-        + Send
-        + 'static,
-    >,
+    Option<impl Future<Output = Result<(), ForgeError>> + Send + 'static + use<>>,
     ServerBootError,
 > {
     let Some(forge) = state.forge_handle().cloned() else {
@@ -2314,13 +2341,13 @@ fn build_bifrost_peer_tls(
 pub fn check_card_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
     check_card_recovery_pool_inner(
         state.postgres.operator_pool().is_some(),
-        &state.deployment_profile,
+        state.deployment_profile,
     )
 }
 
 fn check_card_recovery_pool_inner(
     has_operator_pool: bool,
-    profile: &crate::config::DeploymentProfile,
+    profile: crate::config::DeploymentProfile,
 ) -> Result<(), ServerBootError> {
     if !has_operator_pool {
         if profile.is_production() {
@@ -2383,7 +2410,7 @@ mod tests {
     /// admission bounds do not follow effective CPU.
     #[test]
     fn forge_runtime_is_role_scoped_and_cpu_sized() {
-        let mut plan = vala_bifrost_redux::resources::ResourcePlan {
+        let mut plan = ResourcePlan {
             memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             effective_cpu: 6,
             oracle_query_slot_limit: None,
@@ -2394,11 +2421,14 @@ mod tests {
             forge_enabled: true,
             scratch_limit_bytes: 1024 * 1024 * 1024,
         };
-        let forge_runtime = crate::config::ForgeRuntimeConfig::default();
+        let forge_runtime = ForgeRuntimeConfig::default();
         let worker = super::forge_compaction_worker_config(&plan, &forge_runtime);
-        assert_eq!(worker.max_task_parallelism, 18, "three per effective CPU");
         assert_eq!(
-            worker.pending_task_parallelism, 72,
+            worker.max_task_parallelism, 72,
+            "twelve per effective CPU, the Iceberg compactor multiplier"
+        );
+        assert_eq!(
+            worker.pending_task_parallelism, 288,
             "four times running parallelism may wait"
         );
         assert_eq!(worker.per_tenant_active_cap, 1);
@@ -2573,10 +2603,14 @@ mod tests {
     /// An empty `forge` config resolves to the compiled `ForgeConfig` default
     /// and the default maintenance interval, pinning byte-identical no-config
     /// behavior (AC1).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the resolved config or interval differs from the compiled
+    /// defaults, including the 1 GiB deployment file target.
     #[test]
     fn resolve_forge_config_defaults_match_compiled_defaults() {
-        let (config, maintenance_interval) =
-            resolve_forge_config(&crate::config::ForgeRuntimeConfig::default());
+        let (config, maintenance_interval) = resolve_forge_config(&ForgeRuntimeConfig::default());
         assert_eq!(config, ForgeConfig::default());
         assert_eq!(
             config.default_target_file_size_bytes,
@@ -2588,39 +2622,27 @@ mod tests {
 
     /// Supplied `forge` values override the compiled defaults on exactly the
     /// promoted fields, and the resolved config still validates fail-closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a supplied value is not carried into the resolved config or
+    /// when the overridden config fails validation.
     #[test]
     fn resolve_forge_config_applies_supplied_overrides() {
-        let runtime = crate::config::ForgeRuntimeConfig {
-            snapshot_retention_secs: Some(7_200),
-            retain_last: Some(3),
+        let runtime = ForgeRuntimeConfig {
             orphan_gc_ttl_secs: Some(3_600),
-            maintenance_trigger_snapshot_count: Some(8),
-            maintenance_trigger_interval_secs: Some(900),
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
             maintenance_interval_secs: Some(45),
             target_file_size_bytes: Some(2_147_483_648),
-            ..crate::config::ForgeRuntimeConfig::default()
+            ..ForgeRuntimeConfig::default()
         };
         let (config, maintenance_interval) = resolve_forge_config(&runtime);
         assert_eq!(config.default_target_file_size_bytes, 2_147_483_648);
-        assert_eq!(
-            config.snapshot_retention,
-            std::time::Duration::from_secs(7_200)
-        );
-        assert_eq!(config.retain_last, 3);
-        assert_eq!(config.orphan_gc_ttl, std::time::Duration::from_secs(3_600));
-        assert_eq!(config.maintenance_trigger_snapshot_count, 8);
-        assert_eq!(
-            config.maintenance_trigger_interval,
-            std::time::Duration::from_secs(900)
-        );
+        assert_eq!(config.orphan_gc_ttl, Duration::from_hours(1));
         assert_eq!(config.orphan_gc_max_list_pages, 64);
-        assert_eq!(
-            config.orphan_gc_run_budget,
-            std::time::Duration::from_secs(30)
-        );
-        assert_eq!(maintenance_interval, std::time::Duration::from_secs(45));
+        assert_eq!(config.orphan_gc_run_budget, Duration::from_secs(30));
+        assert_eq!(maintenance_interval, Duration::from_secs(45));
         config
             .validate()
             .expect("resolved override config must validate");
@@ -2630,11 +2652,14 @@ mod tests {
 
     /// A zeroed promoted duration resolves through and is rejected by the
     /// downstream `ForgeConfig::validate` fail-closed check.
+    ///
+    /// # Panics
+    /// Panics if `validate` accepts the zero orphan-GC TTL.
     #[test]
     fn resolve_forge_config_zero_value_is_rejected_by_validate() {
-        let runtime = crate::config::ForgeRuntimeConfig {
-            snapshot_retention_secs: Some(0),
-            ..crate::config::ForgeRuntimeConfig::default()
+        let runtime = ForgeRuntimeConfig {
+            orphan_gc_ttl_secs: Some(0),
+            ..ForgeRuntimeConfig::default()
         };
         let (config, _) = resolve_forge_config(&runtime);
         assert!(config.validate().is_err());
@@ -2748,8 +2773,8 @@ pub(crate) mod pg_tests {
     /// Builds the shared non-Bifrost application shell for focused boot tests.
     async fn make_test_state() -> AppState {
         crate::test_support::test_app_state(
-            crate::test_support::test_server_postgres().await,
-            crate::test_support::test_storage().await,
+            crate::test_support::test_server_postgres(),
+            crate::test_support::test_storage(),
             crate::test_support::test_catalog().await,
         )
     }
@@ -2840,10 +2865,7 @@ mod sealing_boot_pg_tests {
             .await
             .expect("connection seeds");
         conn.commit().await.expect("seed commits");
-        let superuser = fixture
-            .superuser_pool()
-            .await
-            .expect("superuser pool opens");
+        let superuser = fixture.superuser_pool().expect("superuser pool opens");
         sqlx::query(
             "UPDATE wyrd.auth_human_connections \
              SET client_auth = 'SecretPost', client_secret_enc = '\\x0102'::bytea \

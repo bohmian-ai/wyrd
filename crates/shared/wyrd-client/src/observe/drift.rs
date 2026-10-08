@@ -11,6 +11,8 @@ use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array, Stri
 use arrow::compute::cast;
 use arrow_schema::DataType;
 use chrono::Utc;
+#[cfg(feature = "internal")]
+use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::FeatureName;
@@ -145,7 +147,7 @@ pub(crate) fn rows(record: &DriftRecordObservation) -> Result<Vec<Vec<u8>>, Wyrd
 ///
 /// # Errors
 /// As [`rows`].
-fn projected_value(
+pub(crate) fn projected_value(
     series: &FeatureName,
     value: &FeatureValue,
 ) -> Result<(Value, Value), WyrdError> {
@@ -165,8 +167,9 @@ fn projected_value(
                     json!({ "series": series.as_str(), "value": number }),
                 ));
             }
+            let exact = *number as f64;
             Ok((
-                json!(*number as f64),
+                json!(exact),
                 json!(canonical_string(
                     Arc::new(Int64Array::from(vec![*number])),
                     series
@@ -258,6 +261,38 @@ fn check_scalar_values(object: &Map<String, Value>) -> Result<(), WyrdError> {
                     json!({ "series": key, "received": value_kind(value) }),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Refuse an integer literal in foreign JSON text that no 64-bit integer holds.
+///
+/// `serde_json` parses an integer literal beyond `i64`/`u64` as a lossy `f64`,
+/// after which [`check_scalar_values`] can no longer tell `18446744073709551616`
+/// from a legitimate float and would admit a value the caller never emitted.
+/// The Python and TypeScript boundaries hand Drift features over as JSON text,
+/// so this reads each top-level value's raw token first: a number token with no
+/// fraction or exponent that parses as neither `i64` nor `u64` is an integer
+/// beyond exact `Float64` range. Text whose root is not an object is left to
+/// [`observation`] and the JSON parser, which report it.
+///
+/// # Errors
+/// Returns `WYRD_SDK_400_INVALID_OBSERVATION` naming the first such feature.
+#[cfg(feature = "internal")]
+pub(crate) fn check_integer_literals(text: &str) -> Result<(), WyrdError> {
+    let Ok(object) = serde_json::from_str::<BTreeMap<String, Box<RawValue>>>(text) else {
+        return Ok(());
+    };
+    for (key, raw) in object {
+        let token = raw.get().trim();
+        let integral = token.starts_with(|c: char| c == '-' || c.is_ascii_digit())
+            && !token.contains(['.', 'e', 'E']);
+        if integral && token.parse::<i64>().is_err() && token.parse::<u64>().is_err() {
+            return Err(invalid_observation(
+                "integer feature exceeds exact Float64 range",
+                json!({ "series": key, "value": token }),
+            ));
         }
     }
     Ok(())

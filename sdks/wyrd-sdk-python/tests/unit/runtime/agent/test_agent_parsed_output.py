@@ -1,151 +1,89 @@
-"""AgentRun.parsed returns a typed model instance."""
+"""AgentRun.parsed returns the model's structured answer as an output-class instance."""
 
-from __future__ import annotations
+from collections.abc import Callable
 
 import pydantic
 import pytest
 from wyrd import Agent, Prompt, WyrdError
+from wyrd.agent import MockProvider
 
 
-def _response(text: str) -> dict:
-    return {
-        "id": "mock",
-        "object": "chat.completion",
-        "created": 0,
-        "model": "mock-model",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }
-        ],
-    }
+class Plan(pydantic.BaseModel):
+    summary: str
+    steps: list[str] = []
 
 
-def test_parsed_returns_pydantic_instance():
-    class Plan(pydantic.BaseModel):
-        summary: str
-        steps: list[str]
+@pytest.fixture
+def mock_agent() -> Callable[..., Agent]:
+    """Build an offline Agent whose model answers once with the given text."""
 
-    agent = Agent(
-        prompt=Prompt(
-            messages=["Plan it."],
-            model="mock-model",
-            provider="mock",
-            output=Plan,
-        ),
-        after_model_callback=lambda ctx, r: _response(
-            '{"summary":"Rust is great","steps":["learn ownership"]}'
-        ),
-    )
-    run = agent.run("go")
-    assert isinstance(run.parsed, Plan)
-    assert run.parsed.summary == "Rust is great"
-    assert run.parsed.steps == ["learn ownership"]
+    def build(
+        answer: str, output: type | dict[str, type], output_type: type | None = None
+    ) -> Agent:
+        return Agent(
+            prompt=Prompt(
+                messages=["Plan it."], model="mock-model", provider="mock", output=output
+            ),
+            mock_provider=MockProvider([answer]),
+            output_type=output_type,
+        )
+
+    return build
 
 
-def test_structured_output_still_dict_when_parsed_present():
-    class Plan(pydantic.BaseModel):
-        summary: str
+def test_parsed_returns_pydantic_instance(mock_agent: Callable[..., Agent]) -> None:
+    run = mock_agent('{"summary":"Rust is great","steps":["learn ownership"]}', Plan).run("go")
 
-    agent = Agent(
-        prompt=Prompt(messages=["go"], model="mock-model", provider="mock", output=Plan),
-        after_model_callback=lambda ctx, r: _response('{"summary":"hello"}'),
-    )
-    run = agent.run("go")
-    assert isinstance(run.structured_output, dict)
-    assert run.structured_output["summary"] == "hello"
-    assert isinstance(run.parsed, Plan)
+    assert run.parsed == Plan(summary="Rust is great", steps=["learn ownership"])
 
 
-def test_parsed_is_none_for_text_prompt():
+def test_structured_output_stays_a_dict_beside_parsed(mock_agent: Callable[..., Agent]) -> None:
+    run = mock_agent('{"summary":"hello"}', Plan).run("go")
+
+    assert run.structured_output == {"summary": "hello"}
+
+
+def test_parsed_is_none_for_text_prompt() -> None:
     agent = Agent(prompt=Prompt(messages=["go"], model="mock-model", provider="mock"))
     run = agent.run("go")
     assert run.parsed is None
     assert run.structured_output is None
 
 
-def test_parsed_via_agent_output_type():
-    """Agent(output_type=Plan) parses when schema is on the Prompt."""
+def test_agent_output_type_parses_a_prompt_schema(mock_agent: Callable[..., Agent]) -> None:
+    run = mock_agent('{"summary":"from agent"}', {"summary": str}, output_type=Plan).run("go")
 
-    class Plan(pydantic.BaseModel):
-        summary: str
-
-    agent = Agent(
-        prompt=Prompt(
-            messages=["go"],
-            model="mock-model",
-            provider="mock",
-            output={"summary": str},
-        ),
-        after_model_callback=lambda ctx, r: _response('{"summary":"from agent"}'),
-        output_type=Plan,
-    )
-    run = agent.run("go")
-    assert isinstance(run.parsed, Plan)
-    assert run.parsed.summary == "from agent"
+    assert run.parsed == Plan(summary="from agent")
 
 
-def test_parsed_via_run_output_type_overrides_agent():
-    """run(output_type=...) overrides Agent(output_type=...)."""
-
-    class Plan(pydantic.BaseModel):
-        summary: str
-
+def test_run_output_type_overrides_the_agent_output_type(mock_agent: Callable[..., Agent]) -> None:
     class Other(pydantic.BaseModel):
         summary: str
 
-    agent = Agent(
-        prompt=Prompt(
-            messages=["go"],
-            model="mock-model",
-            provider="mock",
-            output={"summary": str},
-        ),
-        after_model_callback=lambda ctx, r: _response('{"summary":"run-level"}'),
-        output_type=Other,
+    run = mock_agent('{"summary":"run-level"}', {"summary": str}, output_type=Other).run(
+        "go", output_type=Plan
     )
-    run = agent.run("go", output_type=Plan)
-    assert isinstance(run.parsed, Plan)
+
+    assert run.parsed == Plan(summary="run-level")
 
 
-def test_parsed_decode_failure_raises():
-    """model_validate_json failure surfaces as WyrdError."""
-
+def test_answer_that_does_not_fit_the_output_class_is_refused(
+    mock_agent: Callable[..., Agent],
+) -> None:
     class Strict(pydantic.BaseModel):
         required_field: str
 
-    agent = Agent(
-        prompt=Prompt(
-            messages=["go"],
-            model="mock-model",
-            provider="mock",
-            output=Strict,
-        ),
-        after_model_callback=lambda ctx, r: _response('{"wrong_field":"value"}'),
-    )
-    with pytest.raises((WyrdError, pydantic.ValidationError)):
-        agent.run("go")
+    with pytest.raises(WyrdError) as error:
+        mock_agent('{"wrong_field":"value"}', Strict).run("go")
+
+    assert error.value.code == "WYRD_AGENT_422_STRUCTURED_DECODE"
 
 
-def test_generic_callable_parsed():
-    """Non-Pydantic callable works via cls(**dict) path."""
-
+def test_plain_class_output_type_is_built_from_keywords(mock_agent: Callable[..., Agent]) -> None:
     class MyResult:
-        def __init__(self, value: str):
+        def __init__(self, value: str) -> None:
             self.value = value
 
-    agent = Agent(
-        prompt=Prompt(
-            messages=["go"],
-            model="mock-model",
-            provider="mock",
-            output={"value": str},
-        ),
-        after_model_callback=lambda ctx, r: _response('{"value":"hello"}'),
-        output_type=MyResult,
-    )
-    run = agent.run("go")
-    assert isinstance(run.parsed, MyResult)
+    run = mock_agent('{"value":"hello"}', {"value": str}, output_type=MyResult).run("go")
+
     assert run.parsed.value == "hello"

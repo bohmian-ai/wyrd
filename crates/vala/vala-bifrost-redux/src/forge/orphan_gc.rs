@@ -16,6 +16,7 @@ use vala_sql::TenantConn;
 use vala_sql::queries::file_list::list_nonterminal_file_paths;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::list_prepared_cleanup_candidates;
+use vala_sql::queries::oracle_reader_authority::ExclusiveTableAuthority;
 use vala_sql::row_types::forge_operations::{
     ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow, ForgeOperationTransition,
 };
@@ -195,8 +196,10 @@ impl MaintenanceProtection {
     /// draining that set may be running long afterwards, so every proof is
     /// re-taken here against refreshed catalog, SQL, and object evidence: the
     /// candidate must still be inside this tenant's table binding, destructive
-    /// maintenance must still be permitted, no retained head may reach it
-    /// again, and it must still clear the object age floor.
+    /// maintenance must still be permitted, and no retained head may reach it
+    /// again. It waits on no object age: a committed snapshot once referenced
+    /// it, so no in-flight writer can own it, and the active table read is
+    /// what protects readers.
     ///
     /// Unlike [`Self::gc_eligibility`] this admits any object the binding
     /// accepts, because expiry legitimately strands manifests, manifest lists,
@@ -211,12 +214,14 @@ impl MaintenanceProtection {
         self.eligibility(binding, path, evidence, MaintenanceScope::ExpiredCandidate)
     }
 
-    /// Decides one object under the scope-specific path rule.
+    /// Decides one object under the scope-specific path and age rules.
     ///
-    /// Scope changes only which paths are addressable at all. Every safety
-    /// proof after that — binding, destructive gate, live-set containment,
-    /// existence, object kind, and age — is shared, so the two destructive
-    /// protocols cannot diverge on what protects an object.
+    /// Scope changes which paths are addressable and whether object age
+    /// matters. Every other safety proof — binding, destructive gate, live-set
+    /// containment, existence, and object kind — is shared, so the two
+    /// destructive protocols cannot diverge on what protects an object. Only
+    /// never-published generations wait for the age floor, because only they
+    /// can belong to a writer still in flight.
     fn eligibility(
         &self,
         binding: &TenantTableBinding,
@@ -241,9 +246,10 @@ impl MaintenanceProtection {
         if metadata.mode() != EntryMode::FILE {
             return GcEligibility::NotFile;
         }
-        if metadata
-            .last_modified()
-            .is_none_or(|modified| modified > self.object_age_cutoff)
+        if scope == MaintenanceScope::AttemptGeneration
+            && metadata
+                .last_modified()
+                .is_none_or(|modified| modified > self.object_age_cutoff)
         {
             return GcEligibility::TooYoung;
         }
@@ -379,9 +385,8 @@ struct DurableProtectionRoots {
     hot_unpromoted: Vec<String>,
     /// Outputs produced or still producible by a nonterminal attempt.
     open_outputs: Vec<String>,
-    /// Snapshots a pinned Oracle cut still depends on.
-    pinned_snapshot_ids: Vec<i64>,
-    /// Whether any open or unreconciled operation forbids destructive work.
+    /// Whether an open or unreconciled operation, or an active Oracle table
+    /// read, forbids destructive work.
     blocked: bool,
 }
 
@@ -391,8 +396,6 @@ struct CatalogProtection {
     live: ProtectedLiveSet,
     /// Catalog location used to normalize SQL and audit paths.
     table_location: String,
-    /// Snapshot ids the traversal visited, so a reader pin can be corroborated.
-    traversed_snapshot_ids: Vec<i64>,
 }
 
 /// Returns output objects that nonterminal operations must retain.
@@ -995,8 +998,23 @@ struct GcDeletionTally {
     deferred: bool,
 }
 
-/// Build protection from every retained Iceberg object and every open workflow.
 impl Forge {
+    /// Build protection from every retained Iceberg object and every open workflow.
+    ///
+    /// Catalog reachability is loaded first, then the durable Postgres roots,
+    /// and the two are composed into one live set plus the blocked operations.
+    /// The object-age cutoff is the caller's pinned cutoff when the request
+    /// carries one, otherwise the configured GC age floor from `now`. The
+    /// method reads only; cancellation is checked before and after the reads,
+    /// so a stop leaves nothing behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Shutdown`] when the request's stop token is
+    /// cancelled, catalog or manifest errors from reachability, the SQL,
+    /// operation-state, and path-normalization errors of the durable roots,
+    /// and [`ForgeError::InvalidConfig`] when the cutoff cannot be represented
+    /// as an object-store timestamp.
     async fn load_maintenance_protection_inner(
         &self,
         request: ProtectionRequest<'_>,
@@ -1006,7 +1024,6 @@ impl Forge {
         let CatalogProtection {
             live,
             table_location,
-            traversed_snapshot_ids,
         } = self.load_catalog_protection(table_context.binding).await?;
         let durable = self
             .load_durable_protection_roots(&request, &table_location)
@@ -1015,13 +1032,11 @@ impl Forge {
 
         let composed = OrphanProtectionRoots {
             catalog: live,
-            traversed_snapshot_ids,
             hot_unpromoted: durable.hot_unpromoted,
             open_outputs: durable.open_outputs,
-            pinned_snapshot_ids: durable.pinned_snapshot_ids,
             blocked: durable.blocked,
         }
-        .compose()?;
+        .compose();
         let object_age_cutoff = match table_context.age_cutoff_ms {
             Some(cutoff_ms) => {
                 Timestamp::from_millisecond(cutoff_ms).map_err(|_| ForgeError::InvalidConfig {
@@ -1147,11 +1162,11 @@ impl Forge {
                 .open_outputs
                 .push(normalize(prepared.candidate.path.as_str())?);
         }
-        // Every snapshot on every proven ancestry chain, not just the chain
-        // endpoints: this pass protects the objects those snapshots reach, so a
-        // partial chain would leave the middle of a reader's history collectable.
-        roots.pinned_snapshot_ids = super::reader_protection::ReaderProtection::new(&mut conn)
-            .protected_snapshot_ids(key.tenant, &key.table_ref)
+        // An active Oracle table read may still open any object its cut
+        // named, so it blocks the pass. This is a lock-free hint: every
+        // deletion separately requires the table's exclusive authority.
+        roots.blocked |= super::table_authority::TableAuthority::new(&mut conn)
+            .has_active_reads(key.tenant, &key.table_ref)
             .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         Ok(roots)
@@ -1218,7 +1233,6 @@ impl Forge {
         }
         let mut live = ProtectedLiveSet::default();
         let table_location = table.metadata().location().to_owned();
-        let mut traversed_snapshot_ids = Vec::with_capacity(retained_snapshot_count);
         let mut add = |path: &str| self.add_path(&mut live, binding, &table_location, path);
         add(table
             .metadata_location_result()
@@ -1227,11 +1241,12 @@ impl Forge {
             add(&metadata_log.metadata_file)?;
         }
         for snapshot in table.metadata().snapshots() {
-            traversed_snapshot_ids.push(snapshot.snapshot_id());
             add(snapshot.manifest_list())?;
-            let manifest_list = table
-                .manifest_list_reader(snapshot)
-                .load()
+            // Boxed because Iceberg's manifest-list load runs through key
+            // decryption and its cache; inlining that chain into the worker's
+            // prepared-cleanup reconciliation future exceeds the compiler's
+            // layout depth limit.
+            let manifest_list = Box::pin(table.manifest_list_reader(snapshot).load())
                 .await
                 .map_err(ForgeError::Catalog)?;
             for manifest_file in manifest_list.entries() {
@@ -1262,7 +1277,6 @@ impl Forge {
         Ok(CatalogProtection {
             live,
             table_location,
-            traversed_snapshot_ids,
         })
     }
 
@@ -1392,18 +1406,24 @@ impl Forge {
     /// deleted-plus-skipped partition always covers the full candidate set and no
     /// deletion is attempted past the budget.
     ///
+    /// `exclusive` is the table's live exclusive maintenance authority; the
+    /// borrow lasts until every delete's outcome is known, so no Oracle read
+    /// can be admitted between the reader exclusion and any deletion.
+    ///
     /// # Errors
-    /// Returns cancellation, lease-fence, or object-store failures. A candidate
-    /// whose path escapes the table binding fails closed as a reconciliation
-    /// error before any deletion.
+    /// Returns authority-coverage, cancellation, lease-fence, or object-store
+    /// failures. A candidate whose path escapes the table binding fails closed
+    /// as a reconciliation error before any deletion.
     async fn apply_gc_deletions(
         &self,
         lease: &mut ForgeLease,
         table: &GcTableContext<'_>,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         protection: &MaintenanceProtection,
         candidate_paths: &[StoragePath],
         deadline: Option<Instant>,
     ) -> Result<GcDeletionTally, ForgeError> {
+        super::table_authority::require_covers(exclusive, table.key.tenant, &table.key.table_ref)?;
         let mut tally = GcDeletionTally::default();
         for path in candidate_paths {
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
@@ -1480,8 +1500,14 @@ impl Forge {
     /// deleted-plus-skipped partition still covers the full candidate set and no
     /// deletion is attempted past the budget.
     ///
+    /// The lease TTL bounds the exclusive table authority the deletions hold,
+    /// so a hung object store cannot block Oracle cuts on the table
+    /// indefinitely; the authority is surrendered at the bound and the batch
+    /// is left for the idempotent replay.
+    ///
     /// # Errors
-    /// Returns lease, catalog, object-store, SQL, or audit failures.
+    /// Returns lease, catalog, object-store, SQL, or audit failures, and
+    /// [`ForgeError::Timeout`] when the deletions outlive the lease TTL.
     async fn delete_gc_batch(
         &self,
         lease: &mut ForgeLease,
@@ -1516,13 +1542,53 @@ impl Forge {
                 cleanup_exemption: None,
             })
             .await?;
+        // The exclusive table authority is taken after the protection load
+        // and held through every delete's outcome. While a reader holds the table
+        // no authority exists and the whole batch is retained, exactly as a
+        // blocked protection retains it.
+        let mut authority_conn = self
+            .core
+            .vala
+            .tenant_conn(table.key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let tally = match super::table_authority::TableAuthority::new(&mut authority_conn)
+            .exclusive(table.key.tenant, &table.key.table_ref)
+            .await?
+        {
+            // The lease TTL bounds the authority hold: an Oracle cut waits on
+            // this row, and the store has no request timeout of its own. A
+            // batch cut off at the bound leaves its operation open, and the
+            // idempotent replay re-proves every candidate.
+            Some(exclusive) => tokio::time::timeout(
+                self.core.config.lease_ttl,
+                self.apply_gc_deletions(
+                    lease,
+                    table,
+                    &exclusive,
+                    &protection,
+                    candidate_paths,
+                    request.deadline,
+                ),
+            )
+            .await
+            .unwrap_or(Err(ForgeError::Timeout {
+                operation: "orphan-GC deletion under table authority",
+            })),
+            None => Ok(GcDeletionTally {
+                skipped: candidate_paths
+                    .iter()
+                    .map(|path| path.as_str().to_owned())
+                    .collect(),
+                ..GcDeletionTally::default()
+            }),
+        };
+        authority_conn.commit().await.map_err(ForgeError::Sql)?;
         let GcDeletionTally {
             deleted,
             skipped,
             deferred,
-        } = self
-            .apply_gc_deletions(lease, table, &protection, candidate_paths, request.deadline)
-            .await?;
+        } = tally?;
         require_running(table.stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let deleted_count = deleted.len();
@@ -2054,6 +2120,11 @@ mod tests {
     /// binding, the destructive-maintenance gate, fresh unreachability from
     /// every retained head, the object age floor, and the object's own
     /// existence and kind — and requires the deletion to be refused.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a candidate missing any one proof is classified as deletable,
+    /// or a fully proven candidate is not.
     #[test]
     fn forge_expired_cleanup_eligibility_matrix() {
         use crate::catalog::TableRef;
@@ -2122,7 +2193,7 @@ mod tests {
                 &young_manifest,
                 ObjectEvidence::Present(&young_metadata)
             ),
-            GcEligibility::TooYoung
+            GcEligibility::Eligible
         );
         assert_eq!(
             protection.expired_cleanup_eligibility(
@@ -2213,18 +2284,21 @@ mod tests {
                     set.insert(self.catalog_output.clone());
                     set
                 },
-                traversed_snapshot_ids: vec![10, 20],
                 hot_unpromoted: vec![self.hot_scribe.clone()],
                 open_outputs: vec![self.open_output.clone()],
-                pinned_snapshot_ids: vec![20],
                 blocked: false,
             }
         }
     }
 
     /// The fixed age cutoff and evaluation time every matrix case shares.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the fixed 48-hour evaluation time or 24-hour cutoff stops
+    /// being a representable timestamp.
     fn orphan_matrix_protection(roots: OrphanProtectionRoots) -> MaintenanceProtection {
-        let composed = roots.compose().expect("roots compose");
+        let composed = roots.compose();
         MaintenanceProtection::new(
             composed.live_set,
             composed.blocked,
@@ -2244,16 +2318,13 @@ mod tests {
     /// Each root defends its object differently, so "load-bearing" cannot be a
     /// single assertion: dropping catalog reachability or the open-output root
     /// flips an object to eligible, dropping the `file_list` root removes it
-    /// from the protected union without changing any verdict, and breaking the
-    /// lineage or reader-pin agreement must refuse to compose at all.
+    /// from the protected union without changing any verdict.
     #[derive(Debug, Clone, Copy)]
     enum RootLoss {
         /// The subject becomes deletable, which is the data-loss case.
         SubjectBecomesEligible,
         /// The subject leaves the protected union without a verdict change.
         SubjectLeavesLiveSet,
-        /// The root set no longer composes, so the pass refuses.
-        CompositionFailsClosed,
     }
 
     /// One independent protection root, its subject, and its removal.
@@ -2294,18 +2365,6 @@ mod tests {
                 subject: |paths| &paths.hot_scribe,
                 loss: RootLoss::SubjectLeavesLiveSet,
             },
-            RootCase {
-                authority: "an Oracle reader pin inside the proven lineage",
-                remove: |roots| roots.pinned_snapshot_ids = vec![30],
-                subject: |paths| &paths.orphan,
-                loss: RootLoss::CompositionFailsClosed,
-            },
-            RootCase {
-                authority: "the traversed snapshot lineage",
-                remove: |roots| roots.traversed_snapshot_ids.clear(),
-                subject: |paths| &paths.orphan,
-                loss: RootLoss::CompositionFailsClosed,
-            },
         ]
     }
 
@@ -2313,10 +2372,15 @@ mod tests {
     ///
     /// A root that can be dropped with no observable consequence is a root that
     /// is no longer protecting anything, so each case here must either expose an
-    /// object as unsafely eligible, remove it from the protected union, or fail
-    /// closed. Every case first asserts the complete root set does protect its
+    /// object as unsafely eligible or remove it from the protected union. Every
+    /// case first asserts the complete root set does protect its
     /// subject, so a removal can never pass because the subject was unprotected
     /// to begin with.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the complete root set fails to protect a case's subject, or
+    /// when removing that case's root leaves the subject protected.
     fn assert_each_orphan_root_is_load_bearing(paths: &OrphanMatrixPaths) {
         let aged = orphan_matrix_aged();
         for case in orphan_root_cases() {
@@ -2337,12 +2401,6 @@ mod tests {
                     complete.live_set.contains(subject),
                     "{authority} names its subject before it is removed"
                 ),
-                RootLoss::CompositionFailsClosed => {
-                    assert!(
-                        paths.roots().compose().is_ok(),
-                        "{authority} composes before it is broken"
-                    );
-                }
             }
 
             let mut mutated = paths.roots();
@@ -2361,16 +2419,13 @@ mod tests {
                     !orphan_matrix_protection(mutated).live_set.contains(subject),
                     "dropping {authority} removes the only authority naming its subject"
                 ),
-                RootLoss::CompositionFailsClosed => assert!(
-                    mutated.compose().is_err(),
-                    "breaking {authority} must refuse to compose rather than proceed"
-                ),
             }
         }
 
         // The destructive-maintenance gate is not a per-object root: lease loss,
-        // fence loss, and any open operation raise one gate over the whole
-        // table, so its subject is the otherwise-eligible orphan.
+        // fence loss, any open operation, and any active Oracle table read raise
+        // one gate over the whole table, so its subject is the otherwise-eligible
+        // orphan.
         let mut blocked = paths.roots();
         blocked.blocked = true;
         assert_eq!(

@@ -8,19 +8,93 @@ order: 30
 
 # Evaluate
 
-<Aside title="Reserved — coming when continuous Eval ships" data-variant="not">
+Continuous Eval ships as a server-run `Verifier` with
+`implementation.kind: eval`. Eval is a Verifier implementation, not a separate
+card kind.
 
-Evaluate recipes will be added as the continuous Eval runtime ships. Eval is a
-`Verifier` implementation (`implementation.kind: eval`), not a separate card
-kind; the Verifier spec is authored and its JSON Schema is checked in.
+## How continuous Eval runs
 
-</Aside>
+1. Attach an Eval Verifier to a Service, component, or Agent through a
+   `verified_by` binding with an `observations_ready` Trigger and zero or more
+   `on_failure` Operators. Registering it requires `cards:write`, plus
+   `operators:invoke` when it names an Operator.
+2. Write Eval input records for the subject through the SDK's Bifrost client.
+   Each committed row in [`vala.eval.observations`](/bifrost/schema/) activates
+   every matching `observations_ready` binding.
+3. The server runs the Eval task workflow and writes one row to
+   `vala.verification.results` plus one row per task outcome to
+   `vala.eval.result_items`.
+4. A `failed` verdict creates one durable dispatch per `on_failure` Operator.
+   See [Operator connections](/how-to/operate/operator-connections/).
 
-Evaluate capability covers:
+Run status is readable at `GET /v1/verification/runs/{run_id}` (`cards:read`);
+verdicts and task outcomes are queryable through Bifrost
+(`bifrost_query:read`).
 
-- Scoring agent runs against task definitions in CI
-- Comparing model outputs against collected production records
-- Running `wyrd eval` from the CLI
+## Scoring locally
 
-These how-to pages will be added alongside the continuous Eval runtime. See what runs
-today in the [Overview](/overview/).
+`wyrd eval run` scores pre-collected records against an Eval Verifier card file
+without a server. See the [CLI reference](/reference/cli/).
+
+## Judging input directly
+
+`POST /v1/verification/execute` runs one exact registered Verifier against one
+exact subject Card over input supplied in the request, and returns the judgment
+in the response. Use it to gate a deploy or check a candidate before its
+observations exist. Nothing durable is created: there is no run, no published
+result, no Operator dispatch, no Bifrost read or write, and no Eval sampling.
+
+```json
+{
+  "verifier_uid": "<Verifier card uid>",
+  "subject_card_uid": "<subject card uid>",
+  "input": { "kind": "drift_samples", "columns": { "latency": [12, 14, null] } }
+}
+```
+
+`input` is one of:
+
+- `{"kind": "drift_samples", "columns": {<feature>: [number | string | null]}}`
+  for Drift Verifiers. PSI and SPC score against the Verifier's `ready` fitted
+  baseline; Custom scores the mean of `profile.metric_name`.
+- `{"kind": "eval_record", "context": {...}, "media": [...]}` for
+  assertion-only and LLM-judge Evals. Judges receive the supplied context.
+
+A `200` response carries `execution_id`, the exact `verifier` and `subject`
+references, `kind`, `verdict` (`passed`, `failed`, or `inconclusive`),
+`summary`, `counts`, and `detail` (`{"drift": ...}` or `{"eval": ...}`). A
+`failed` verdict is a successful response. `execution_id` appears only in the
+response, the audit record, and the trace; it is not queryable.
+
+The caller needs `evals:run` scoped to both the Verifier and the subject. Each
+request records one allowed or denied audit decision. Bounds are a 1 MiB body,
+at most 64 columns × 100,000 values of `drift_samples`, a 256 KiB
+`eval_record.context`, and a 60-second execution deadline.
+
+| Status | Code | Condition |
+|---|---|---|
+| 400 | `WYRD_VERIFICATION_400_INPUT_INVALID` | Malformed request |
+| 403 | `WYRD_PERMISSION_403_DENIED_RBAC` | No `evals:run` for the Verifier or subject |
+| 404 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | Unknown or cross-tenant Verifier or subject |
+| 409 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | No `ready` fitted baseline |
+| 409 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | Baseline fitted under an earlier format |
+| 413 | `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` | A bound is exceeded |
+| 422 | `WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE` | Missing feature or type mismatch |
+| 422 | `WYRD_VERIFICATION_422_INPUT_UNSUPPORTED` | An Eval with trace or agent assertions |
+| 502 | `WYRD_VERIFICATION_502_DEPENDENCY_FAILED` | Judge provider failure after the task's own retries |
+| 504 | `WYRD_VERIFICATION_504_EXECUTION_TIMED_OUT` | The deadline elapsed |
+
+The operation is not idempotent, takes no `Idempotency-Key`, and no SDK retries
+it. Disconnecting cancels in-flight work, but judge provider calls already
+issued may have incurred cost.
+
+The SDKs reach the same operation from a hydrated `WyrdState` Run view, which
+judges its own subject with a Verifier bound to it in `verified_by`, named by
+the Verifier Card's `metadata.name`: `run.observe().verify(name, &input).await` in
+Rust, `run.observe.verify(name, input)` in Python (returning a
+`wyrd.observe.Judgment`), and `await run.observe.verify(name, input)` in
+TypeScript. An Eval Verifier takes one context object and optional media; a
+Drift Verifier takes a non-empty list of flat feature rows, sent as
+`drift_samples` columns. The MCP tool
+`verification.execute` takes the same request and appears only to a caller
+holding `evals:run`.

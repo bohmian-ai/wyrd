@@ -64,6 +64,7 @@ const SELF_JOIN_RESULT: [(i64, i64); 8] = [
 /// Builds one published-only strict request with the journey's deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
+        params: Vec::new(),
         sql: sql.to_owned(),
         deadline_ms: Some(30_000),
     }
@@ -423,7 +424,7 @@ async fn hold_and_release(
     pause: &AnalyticalCleanupPause,
     case: &str,
 ) -> Result<(), JourneyError> {
-    tokio::time::timeout(std::time::Duration::from_secs(120), pause.wait_entered())
+    tokio::time::timeout(std::time::Duration::from_mins(2), pause.wait_entered())
         .await
         .map_err(|_| format!("{case}: cleanup never reached the graph release pause"))?;
     query
@@ -642,7 +643,7 @@ async fn expect_single_build_failure(
     sql: &str,
     case: &str,
 ) -> Result<String, JourneyError> {
-    let before = cluster.physical_build_evidence(COORDINATOR)?;
+    let before = cluster.physical_build_evidence(COORDINATOR);
     let failure = match run_public(client, sql).await {
         Ok(settled) => {
             return Err(format!(
@@ -662,7 +663,7 @@ async fn expect_single_build_failure(
     if sdk_code(sdk) != "WYRD_VALA_500_QUERY_EXECUTION_FAILED" {
         return Err(format!("{case}: settled code {}: {sdk}", sdk_code(sdk)).into());
     }
-    let after = cluster.physical_build_evidence(COORDINATOR)?;
+    let after = cluster.physical_build_evidence(COORDINATOR);
     if after.total != before.total + 1 {
         return Err(format!(
             "{case}: entered the physical builder {} times, expected exactly one",
@@ -884,7 +885,7 @@ async fn prove_preparation_deadline(
         .collect::<Result<Vec<_>, JourneyError>>()?;
     // Physical builds are counted process-wide, so one total before the
     // statement covers every candidate coordinator at once.
-    let builds_before = cluster.physical_build_evidence(COORDINATOR)?.total;
+    let builds_before = cluster.physical_build_evidence(COORDINATOR).total;
     for index in &candidates {
         cluster.arm_preparation_pause(*index, &request_id)?;
     }
@@ -921,7 +922,7 @@ async fn prove_preparation_deadline(
             await_baseline(cluster, index, ownership).await?;
         }
         assert_eq!(
-            cluster.physical_build_evidence(COORDINATOR)?.total,
+            cluster.physical_build_evidence(COORDINATOR).total,
             builds_before,
             "expired pinning cannot build or publish a roster to execution"
         );
@@ -975,7 +976,7 @@ async fn prove_preparation_deadline(
     for (index, ownership) in baseline {
         await_baseline(cluster, index, ownership).await?;
     }
-    let builds = cluster.physical_build_evidence(COORDINATOR)?.total - builds_before;
+    let builds = cluster.physical_build_evidence(COORDINATOR).total - builds_before;
     assert_eq!(builds, 1, "preparation must retain one physical build");
     assert_eq!(
         advertised, accepted,
@@ -1181,6 +1182,7 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     // release, and a short deadline expires while it waits; what it may never
     // do is settle Analytical while the class is fully owned.
     let queued = BifrostQueryRequest {
+        params: Vec::new(),
         sql: analytical_sql.clone(),
         deadline_ms: Some(2_000),
     };
@@ -1302,7 +1304,7 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
     let bootstrap = query_server
         .bootstrap_service_in_tenant(tenant, "under-privileged-denied", &[])
         .await?;
-    let denied = client_from_bootstrap(query_server, bootstrap).await?;
+    let denied = client_from_bootstrap(query_server, bootstrap)?;
     let error = wyrd_client::Bifrost::query_only(&denied)
         .query(&request(&grouped))
         .await
@@ -1366,7 +1368,7 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     let paused = PEER_FOLLOWERS[0];
     let survivor = PEER_FOLLOWERS[1];
     let attempts_before = attempt_totals(&cluster)?;
-    let builds_before = cluster.physical_build_evidence(COORDINATOR)?.total;
+    let builds_before = cluster.physical_build_evidence(COORDINATOR).total;
     cluster.arm_execute_pause(paused)?;
     let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
     let query = {
@@ -1392,7 +1394,7 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     // active entry retains is the one its single build ran against, so the
     // terminal failure below cannot be reporting a rebuilt or repinned
     // membership.
-    let held = cluster.physical_build_evidence(COORDINATOR)?;
+    let held = cluster.physical_build_evidence(COORDINATOR);
     let [active_cut] = held.active_cut_fingerprints.as_slice() else {
         return Err(format!(
             "the paused query must be the coordinator's sole active query, saw {:?}",
@@ -1424,7 +1426,7 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
 
     // One build for the whole attempt: the lost peer produced no successor
     // ordinal, so the coordinator never re-entered the shared physical builder.
-    let builds = cluster.physical_build_evidence(COORDINATOR)?.total;
+    let builds = cluster.physical_build_evidence(COORDINATOR).total;
     if builds != builds_before + 1 {
         return Err(format!(
             "the lost peer entered the physical builder {} times, expected exactly one",

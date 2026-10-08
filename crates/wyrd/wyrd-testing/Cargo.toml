@@ -55,7 +55,9 @@ arrow = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+clap = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
+num-traits = { workspace = true }
 rcgen = { workspace = true }
 futures-util = { workspace = true }
 hdrhistogram = { workspace = true }
@@ -68,6 +70,14 @@ http-body-util = "0.1"
 opendal = { workspace = true }
 parquet = { workspace = true }
 rand = { workspace = true }
+# The capacity benchmark serves its judge mock over trusted TLS.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+# Roots the bound server's Eval judge at the test gateway's mock upstream.
+skald-runtime = { workspace = true }
+skald-spec = { workspace = true }
+# Journeys and the capacity benchmark build their native judge Prompt.
+skald-prompt = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
 secrecy = { workspace = true }
@@ -93,7 +103,7 @@ wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-crypt = { workspace = true }
-wyrd-client = { workspace = true, features = ["test-support"] }
+wyrd-client = { workspace = true, features = ["internal", "test-support"] }
 wyrd-queue = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
@@ -113,11 +123,12 @@ wiremock = { workspace = true }
 workspace-hack.workspace = true
 # The peer-context journey encodes a Scribe fragment exactly as a leader does.
 datafusion-proto = { workspace = true }
-# The continuous Eval journey builds its native judge Prompt and points the
-# production judge at a local OpenAI-compatible provider.
-skald-prompt = { workspace = true }
-skald-runtime = { workspace = true }
-skald-spec = { workspace = true }
+# The analytical-layout journey maps an Eval report through the production
+# result payload builder, whose Eval input is this crate's report type.
+vala-eval = { workspace = true }
+# The audit publication and Oracle journeys seed staged decisions directly
+# through the canonical append the outbox otherwise owns.
+vala-sql = { workspace = true, features = ["test-support"] }
 metrics = { workspace = true }
 # Local provider upstream of the native gateway ingress journey.
 wiremock = { workspace = true }
@@ -136,10 +147,20 @@ rmcp = { workspace = true, features = [
     "transport-streamable-http-client-reqwest",
 ] }
 
-# The opt-in single-pod query capacity benchmark. Run only through
-# `mise run bench:bifrost:query-capacity`; only its unit tests run in a lane,
-# with the crate's other tests.
+# The opt-in server capacity benchmark (REQ-171). Run only through
+# `mise run bench:capacity`; only its unit tests run in a lane, with the
+# crate's other tests.
 [[bin]]
-name = "bifrost_query_capacity"
-path = "src/bin/bifrost_query_capacity/main.rs"
+name = "capacity"
+path = "src/bin/capacity/main.rs"
 bench = false
+
+# The opt-in Forge capacity benchmark. Run only through
+# `mise run bench:bifrost:forge-capacity`; only its unit tests run in a lane.
+[[bin]]
+name = "bifrost_forge_capacity"
+path = "src/bin/bifrost_forge_capacity/main.rs"
+bench = false
+
+[lints]
+workspace = true

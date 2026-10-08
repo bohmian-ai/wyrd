@@ -1,4 +1,11 @@
-//! Typed, redacted detail carried by the transactional audit event.
+//! Typed, redacted detail carried by the staged audit event.
+#![cfg_attr(
+    feature = "server",
+    expect(
+        clippy::large_stack_arrays,
+        reason = "utoipa's ToSchema derive for the audit detail enum builds its variant schema array on the stack"
+    )
+)]
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -434,6 +441,9 @@ pub enum AuditErrorCode {
     /// The caller lacked the required permission.
     PermissionDenied,
     /// Audit staging was unavailable.
+    ///
+    /// No longer recorded: audit never refuses an operation. Retained so
+    /// retained history that carries it still decodes.
     AuditUnavailable,
     /// The supplied token was invalid.
     InvalidToken,
@@ -641,8 +651,6 @@ pub enum AuditDetail {
         current_snapshot_id: Option<i64>,
         /// Snapshot IDs at the heads of retained Iceberg refs.
         retained_ref_heads: Vec<i64>,
-        /// Strict timestamp cutoff used for selection.
-        cutoff_ms: i64,
         /// Exact snapshot IDs selected for expiry, sorted ascending.
         selected_snapshot_ids: Vec<i64>,
     },
@@ -983,6 +991,10 @@ pub enum StorageBackend {
 }
 
 /// Serialize detail into the deterministic JSON string used as the audit hash preimage.
+///
+/// # Panics
+///
+/// Panics if `AuditDetail` fails JSON serialization, which it cannot.
 #[must_use]
 pub fn audit_detail_canonical_json(detail: &AuditDetail) -> String {
     serde_jcs::to_string(detail).expect("AuditDetail is always JSON-serializable")

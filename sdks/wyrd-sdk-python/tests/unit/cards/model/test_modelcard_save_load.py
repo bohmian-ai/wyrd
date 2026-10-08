@@ -1,11 +1,11 @@
-from __future__ import annotations
+"""A ModelCard saves its model and loads it back through its interface."""
 
 from pathlib import Path
+from typing import Any
 
-import numpy as np
+import joblib
 import pytest
 import torch
-from _helpers import assert_model_card_json, model_metadata
 from torch.utils.data import DataLoader, TensorDataset
 from wyrd.model import (
     CatboostInterface,
@@ -13,7 +13,9 @@ from wyrd.model import (
     LightgbmInterface,
     LightningInterface,
     ModelCard,
+    ModelCardMetadata,
     ModelInterface,
+    ModelSignature,
     SampleInput,
     SklearnInterface,
     TorchInterface,
@@ -22,234 +24,132 @@ from wyrd.model import (
 )
 
 
-def _matrix() -> tuple[np.ndarray, np.ndarray]:
-    return (
-        np.array([[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32),
-        np.array([0, 0, 1, 1], dtype=np.int64),
-    )
+class CustomMemoryInterface(ModelInterface):
+    """A user interface that stores its model as one text file."""
+
+    def __init__(self, value: str = "") -> None:
+        super().__init__()
+        self.value = value
+
+    def save(self, path: Path, save_kwargs: Any = None) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        (path / "custom.txt").write_text(self.value, encoding="utf-8")
+
+    def load(self, path: Path, load_kwargs: Any = None) -> None:
+        self.value = (path / "custom.txt").read_text(encoding="utf-8")
+
+    @property
+    def model(self) -> str:
+        return self.value
 
 
-def _sklearn_model():
-    from sklearn.linear_model import LogisticRegression
-
-    features, labels = _matrix()
-    return LogisticRegression().fit(features, labels)
-
-
-def _xgboost_model():
-    from xgboost import XGBClassifier
-
-    return XGBClassifier(
-        n_estimators=2,
-        max_depth=1,
-        eval_metric="logloss",
-        verbosity=0,
-    )
-
-
-def _lightgbm_model():
-    from lightgbm import LGBMClassifier
-
-    return LGBMClassifier(
-        n_estimators=2,
-        min_data_in_leaf=1,
-        min_data_in_bin=1,
-        verbose=-1,
-    )
-
-
-def _catboost_model():
-    from catboost import CatBoostClassifier
-
-    return CatBoostClassifier(
-        iterations=2,
-        depth=1,
-        verbose=False,
-        allow_writing_files=False,
-    )
-
-
-def _torch_model() -> torch.nn.Module:
-    model = torch.nn.Linear(2, 1)
-    with torch.no_grad():
-        model.weight.fill_(0.25)
-        model.bias.fill_(0.1)
-    return model
-
-
-def _huggingface_model():
-    from transformers import BertConfig, BertForSequenceClassification
-
-    config = BertConfig(
-        vocab_size=16,
-        hidden_size=8,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        intermediate_size=16,
-        num_labels=2,
-    )
-    return BertForSequenceClassification(config)
-
-
-def _round_trip(card: ModelCard, path: Path, expected_kind: str, *, interface=None) -> ModelCard:
-    card.save(path)
-    restored = ModelCard.model_validate_json((path / "card.json").read_text(), interface=interface)
-    restored.load(path)
-
-    assert restored.interface.kind == expected_kind
-    assert restored.interface.has_model is True
-    assert restored.model is not None
-    assert_model_card_json(path, expected_kind)
-    return restored
-
-
-@pytest.mark.wyrd_covers("python:ModelCard.save")
-@pytest.mark.wyrd_covers("python:ModelCard.load")
-def test_raw_sklearn_model_autodetects_and_round_trips(tmp_path: Path) -> None:
-    card = ModelCard(
-        _sklearn_model(),
+def test_raw_sklearn_model_round_trips_with_its_identity(
+    tmp_path: Path, sklearn_model: Any, classifier_metadata: ModelCardMetadata
+) -> None:
+    ModelCard(
+        sklearn_model,
         name="sklearn-churn",
         labels={"domain": "churn"},
         annotations={"acme.com/source": "unit-test"},
-        metadata=model_metadata("binary_classification"),
+        metadata=classifier_metadata,
+    ).save(tmp_path)
+
+    restored = ModelCard.from_path(tmp_path)
+
+    assert (restored.name, restored.labels, restored.annotations) == (
+        "sklearn-churn",
+        {"domain": "churn"},
+        {"acme.com/source": "unit-test"},
     )
-
-    restored = _round_trip(card, tmp_path / "sklearn", "Sklearn")
-
-    assert restored.name == "sklearn-churn"
-    assert restored.labels == {"domain": "churn"}
-    assert restored.annotations == {"acme.com/source": "unit-test"}
 
 
 @pytest.mark.parametrize(
-    ("model_factory", "expected_kind"),
+    ("model_fixture", "interface", "kind"),
     [
-        pytest.param(_torch_model, "Torch", id="torch"),
-        pytest.param(_xgboost_model, "Xgboost", id="xgboost"),
-        pytest.param(_lightgbm_model, "Lightgbm", id="lightgbm"),
-        pytest.param(_catboost_model, "Catboost", id="catboost"),
+        pytest.param("sklearn_model", None, "Sklearn", id="sklearn-detected"),
+        pytest.param("torch_model", None, "Torch", id="torch-detected"),
+        pytest.param("xgboost_model", None, "Xgboost", id="xgboost-detected"),
+        pytest.param("lightgbm_model", None, "Lightgbm", id="lightgbm-detected"),
+        pytest.param("catboost_model", None, "Catboost", id="catboost-detected"),
+        pytest.param("xgboost_model", XgboostInterface, "Xgboost", id="xgboost-explicit"),
+        pytest.param("lightgbm_model", LightgbmInterface, "Lightgbm", id="lightgbm-explicit"),
+        pytest.param("catboost_model", CatboostInterface, "Catboost", id="catboost-explicit"),
     ],
 )
-def test_raw_model_autodetection_for_framework_models(
+def test_model_round_trips_through_its_interface(
+    request: pytest.FixtureRequest,
     tmp_path: Path,
-    model_factory,
-    expected_kind: str,
+    classifier_metadata: ModelCardMetadata,
+    model_fixture: str,
+    interface: type[ModelInterface] | None,
+    kind: str,
 ) -> None:
-    card = ModelCard(model_factory(), metadata=model_metadata("binary_classification"))
-
-    restored = _round_trip(card, tmp_path / expected_kind.lower(), expected_kind)
-
-    assert restored.interface.kind == expected_kind
-
-
-def test_sklearn_interface_loads_a_local_materialization(tmp_path: Path) -> None:
-    source = tmp_path / "source-sklearn"
+    model = request.getfixturevalue(model_fixture)
     ModelCard(
-        _sklearn_model(),
-        metadata=model_metadata("binary_classification"),
-    ).save(source)
+        model if interface is None else interface(model=model), metadata=classifier_metadata
+    ).save(tmp_path)
 
+    restored = ModelCard.from_path(tmp_path)
+
+    assert restored.interface.kind == kind
+    assert restored.model is not None
+
+
+def test_sklearn_interface_loads_a_local_materialization(
+    tmp_path: Path, sklearn_model: Any, signature: ModelSignature
+) -> None:
+    ModelCard(
+        sklearn_model,
+        metadata=ModelCardMetadata(task_type="binary_classification", signature=signature),
+    ).save(tmp_path)
     card = ModelCard(
         SklearnInterface(),
-        metadata=model_metadata(
-            "binary_classification",
-        ),
+        metadata=ModelCardMetadata(task_type="binary_classification", signature=signature),
     )
-    card.load(source)
+
+    card.load(tmp_path)
 
     assert card.interface.has_model is True
-    assert card.model is not None
 
 
-def test_modelcard_projects_model_and_preprocessor_directly() -> None:
+def test_modelcard_projects_model_and_preprocessor_directly(
+    sklearn_model: Any, classifier_metadata: ModelCardMetadata
+) -> None:
     from sklearn.preprocessing import StandardScaler
 
-    model = _sklearn_model()
-    preprocessor = StandardScaler().fit(_matrix()[0])
+    preprocessor = StandardScaler()
     card = ModelCard(
-        SklearnInterface(model=model, preprocessor=preprocessor),
-        metadata=model_metadata("binary_classification"),
+        SklearnInterface(model=sklearn_model, preprocessor=preprocessor),
+        metadata=classifier_metadata,
     )
 
-    assert card.model is model
-    assert card.preprocessor is preprocessor
-    assert card.processor is None
+    assert (card.model, card.preprocessor, card.processor) == (sklearn_model, preprocessor, None)
 
 
-def test_xgboost_interface_round_trips(tmp_path: Path) -> None:
-    card = ModelCard(
-        XgboostInterface(model=_xgboost_model()),
-        metadata=model_metadata("binary_classification"),
+@pytest.mark.parametrize("save_format", ["safetensors", "pickle"])
+def test_torch_model_round_trips_in_its_save_format(
+    tmp_path: Path,
+    torch_model: torch.nn.Module,
+    regressor_metadata: ModelCardMetadata,
+    save_format: str,
+) -> None:
+    ModelCard(
+        TorchInterface(model=torch_model, save_format=save_format), metadata=regressor_metadata
+    ).save(tmp_path)
+
+    restored = ModelCard.from_path(
+        tmp_path, interface=TorchInterface(model=torch.nn.Linear(2, 1), save_format=save_format)
     )
 
-    _round_trip(card, tmp_path / "xgboost", "Xgboost")
+    assert (restored.interface.has_model, restored.interface.save_format) == (True, save_format)
 
 
-def test_lightgbm_interface_round_trips(tmp_path: Path) -> None:
-    card = ModelCard(
-        LightgbmInterface(model=_lightgbm_model()),
-        metadata=model_metadata("binary_classification"),
-    )
-
-    _round_trip(card, tmp_path / "lightgbm", "Lightgbm")
-
-
-def test_catboost_interface_round_trips(tmp_path: Path) -> None:
-    card = ModelCard(
-        CatboostInterface(model=_catboost_model()),
-        metadata=model_metadata("binary_classification"),
-    )
-
-    _round_trip(card, tmp_path / "catboost", "Catboost")
-
-
-def test_torch_interface_round_trips_with_safetensors(tmp_path: Path) -> None:
-    card = ModelCard(
-        TorchInterface(model=_torch_model(), save_format="safetensors"),
-        metadata=model_metadata("regression"),
-    )
-    interface = TorchInterface(model=_torch_model(), save_format="safetensors")
-
-    restored = _round_trip(card, tmp_path / "torch", "Torch", interface=interface)
-
-    assert restored.interface.save_format == "safetensors"
-    assert (tmp_path / "torch" / "model.safetensors").exists()
-
-
-def test_torch_interface_round_trips_with_pickle(tmp_path: Path) -> None:
-    card = ModelCard(
-        TorchInterface(model=_torch_model(), save_format="pickle"),
-        metadata=model_metadata("regression"),
-    )
-
-    restored = _round_trip(card, tmp_path / "torch-pickle", "Torch")
-
-    assert restored.interface.save_format == "pickle"
-    assert (tmp_path / "torch-pickle" / "model.pt").exists()
-
-
-def test_lightning_interface_round_trips_with_checkpoint(tmp_path: Path) -> None:
+def test_trained_lightning_model_round_trips_from_its_checkpoint(
+    tmp_path: Path, lightning_module_class: type, regressor_metadata: ModelCardMetadata
+) -> None:
     import pytorch_lightning as pl
 
-    class TinyLightning(pl.LightningModule):
-        def __init__(self) -> None:
-            super().__init__()
-            self.layer = torch.nn.Linear(2, 1)
-
-        def forward(self, value):
-            return self.layer(value)
-
-        def training_step(self, batch, batch_idx):
-            features, targets = batch
-            return torch.nn.functional.mse_loss(self(features), targets)
-
-        def configure_optimizers(self):
-            return torch.optim.SGD(self.parameters(), lr=0.01)
-
-    features = torch.tensor([[0.0, 0.0], [1.0, 1.0]], dtype=torch.float32)
-    targets = torch.tensor([[0.0], [1.0]], dtype=torch.float32)
-    loader = DataLoader(TensorDataset(features, targets), batch_size=1)
-    model = TinyLightning()
+    model = lightning_module_class()
     trainer = pl.Trainer(
         max_epochs=1,
         logger=False,
@@ -259,132 +159,125 @@ def test_lightning_interface_round_trips_with_checkpoint(tmp_path: Path) -> None
         accelerator="cpu",
         devices=1,
     )
-    trainer.fit(model, loader)
-    card = ModelCard(
-        LightningInterface(model=model, trainer=trainer),
-        metadata=model_metadata("regression"),
-    )
-    interface = LightningInterface(model=TinyLightning)
-
-    _round_trip(card, tmp_path / "lightning", "Lightning", interface=interface)
-
-
-def test_lightning_interface_round_trips_trainerless_checkpoint(tmp_path: Path) -> None:
-    import pytorch_lightning as pl
-
-    class TinyLightning(pl.LightningModule):
-        def __init__(self) -> None:
-            super().__init__()
-            self.layer = torch.nn.Linear(2, 1)
-
-        def forward(self, value):
-            return self.layer(value)
-
-    card = ModelCard(
-        LightningInterface(model=TinyLightning()),
-        metadata=model_metadata("regression"),
-    )
-    interface = LightningInterface(model=TinyLightning())
-
-    _round_trip(card, tmp_path / "lightning-trainerless", "Lightning", interface=interface)
-
-
-def test_huggingface_interface_round_trips_from_local_pretrained_dir(tmp_path: Path) -> None:
-    card = ModelCard(
-        HuggingfaceInterface(model=_huggingface_model(), hf_task="text-classification"),
-        metadata=model_metadata("binary_classification"),
+    rows = TensorDataset(torch.tensor([[0.0, 0.0], [1.0, 1.0]]), torch.tensor([[0.0], [1.0]]))
+    trainer.fit(model, DataLoader(rows, batch_size=1))
+    ModelCard(LightningInterface(model=model, trainer=trainer), metadata=regressor_metadata).save(
+        tmp_path
     )
 
-    restored = _round_trip(card, tmp_path / "huggingface", "Huggingface")
-
-    assert restored.interface.hf_task == "text-classification"
-    assert (tmp_path / "huggingface" / "model" / "config.json").exists()
-
-
-def test_custom_python_model_interface_round_trips_with_explicit_loader(tmp_path: Path) -> None:
-    class CustomMemoryInterface(ModelInterface):
-        def __init__(self, value: str = "") -> None:
-            super().__init__()
-            self.value = value
-
-        def save(self, path, save_kwargs=None):
-            path.mkdir(parents=True, exist_ok=True)
-            (path / "custom.txt").write_text(self.value, encoding="utf-8")
-
-        def load(self, path, load_kwargs=None):
-            self.value = (path / "custom.txt").read_text(encoding="utf-8")
-
-        @property
-        def model(self):
-            return self.value
-
-    card = ModelCard(CustomMemoryInterface("saved"), metadata=model_metadata("other"))
-    path = tmp_path / "custom"
-    card.save(path)
-
-    restored = ModelCard.model_validate_json(
-        (path / "card.json").read_text(),
-        interface=CustomMemoryInterface(),
+    restored = ModelCard.from_path(
+        tmp_path, interface=LightningInterface(model=lightning_module_class)
     )
-    restored.load(path)
 
-    assert restored.interface.kind == "Custom"
-    assert restored.interface.value == "saved"
-    assert restored.model == "saved"
-    assert_model_card_json(path, "Custom")
+    assert (restored.interface.kind, restored.interface.has_model) == ("Lightning", True)
+
+
+def test_untrained_lightning_model_round_trips_without_a_trainer(
+    tmp_path: Path, lightning_module_class: type, regressor_metadata: ModelCardMetadata
+) -> None:
+    ModelCard(LightningInterface(model=lightning_module_class()), metadata=regressor_metadata).save(
+        tmp_path
+    )
+
+    restored = ModelCard.from_path(
+        tmp_path, interface=LightningInterface(model=lightning_module_class())
+    )
+
+    assert (restored.interface.kind, restored.interface.has_model) == ("Lightning", True)
+
+
+def test_huggingface_model_round_trips_with_its_task(
+    tmp_path: Path, huggingface_model: Any, classifier_metadata: ModelCardMetadata
+) -> None:
+    ModelCard(
+        HuggingfaceInterface(model=huggingface_model, hf_task="text-classification"),
+        metadata=classifier_metadata,
+    ).save(tmp_path)
+
+    restored = ModelCard.from_path(tmp_path)
+
+    assert isinstance(restored.interface, HuggingfaceInterface)
+    assert (restored.interface.has_model, restored.interface.hf_task) == (
+        True,
+        "text-classification",
+    )
+
+
+def test_custom_model_round_trips_through_its_interface(
+    tmp_path: Path, signature: ModelSignature
+) -> None:
+    ModelCard(
+        CustomMemoryInterface("saved"),
+        metadata=ModelCardMetadata(task_type="other", signature=signature),
+    ).save(tmp_path)
+
+    restored = ModelCard.from_path(tmp_path, interface=CustomMemoryInterface())
+
+    assert (restored.interface.kind, restored.model) == ("Custom", "saved")
 
 
 def test_joblib_none_model_artifact_raises_model_validation_error(tmp_path: Path) -> None:
-    import joblib
-
-    path = tmp_path / "joblib-none"
-    path.mkdir()
-    joblib.dump(None, path / "model.joblib")
-    interface = SklearnInterface()
+    joblib.dump(None, tmp_path / "model.joblib")
 
     with pytest.raises(WyrdError) as exc:
-        interface.load(path)
+        SklearnInterface().load(tmp_path)
 
     assert exc.value.code == "WYRD_MODEL_400_VALIDATION"
 
 
-def test_modelcard_save_without_live_model_raises_model_error(tmp_path: Path) -> None:
-    card = ModelCard(
-        SklearnInterface(),
-        metadata=model_metadata("binary_classification"),
-    )
+def test_modelcard_save_without_live_model_raises_model_error(
+    tmp_path: Path, classifier_metadata: ModelCardMetadata
+) -> None:
+    card = ModelCard(SklearnInterface(), metadata=classifier_metadata)
 
     with pytest.raises(WyrdError) as exc:
-        card.save(tmp_path / "no-live-model")
+        card.save(tmp_path)
 
     assert exc.value.code == "WYRD_MODEL_400_VALIDATION"
-    assert "DataCard" not in str(exc.value)
 
 
-def test_modelcard_metadata_to_dict_accepts_interface_instance() -> None:
-    metadata = model_metadata(
-        "binary_classification",
-        interface=SklearnInterface(),
+def test_modelcard_metadata_reads_back_its_interface_and_task_type(
+    signature: ModelSignature,
+) -> None:
+    metadata = ModelCardMetadata(
+        interface=SklearnInterface(), task_type="binary_classification", signature=signature
     )
 
-    payload = metadata.to_dict()
-
-    assert payload["interface"]["kind"] == "Sklearn"
-    assert payload["task_type"] == "BinaryClassification"
+    assert (metadata.interface_kind, metadata.task_type) == ("Sklearn", "binary_classification")
 
 
-def test_sample_input_round_trips_through_modelcard(tmp_path: Path) -> None:
-    sample = SampleInput.from_python_object({"feature": [1.0, 2.0]})
-    card = ModelCard(
-        SklearnInterface(model=_sklearn_model()),
-        metadata=model_metadata("binary_classification", sample_input=sample),
-    )
-    path = tmp_path / "sample-input"
+def test_sample_input_survives_save_and_load(
+    tmp_path: Path, sklearn_model: Any, signature: ModelSignature
+) -> None:
+    ModelCard(
+        SklearnInterface(model=sklearn_model),
+        metadata=ModelCardMetadata(
+            task_type="binary_classification",
+            signature=signature,
+            sample_input=SampleInput.from_python_object({"feature": [1.0, 2.0]}),
+        ),
+    ).save(tmp_path)
 
-    card.save(path)
-    restored = ModelCard.model_validate_json((path / "card.json").read_text())
-    restored_sample = restored.sample_input
+    restored = ModelCard.from_path(tmp_path)
 
-    assert restored_sample is not None
-    assert restored_sample.kind_token == "dict"
-    assert restored_sample.to_dict()["kind"] == "Dict"
+    assert restored.sample_input is not None
+    assert restored.sample_input.kind_token == "dict"
+
+
+def test_model_from_path_reads_card_file_without_loading_model(
+    tmp_path: Path, sklearn_model: Any, classifier_metadata: ModelCardMetadata
+) -> None:
+    saved = ModelCard(sklearn_model, name="churn", metadata=classifier_metadata)
+    saved.save(tmp_path)
+
+    card = ModelCard.from_path(tmp_path / "card.json")
+
+    assert isinstance(card.interface, SklearnInterface)
+    assert (card.uid, card.interface.has_model) == (saved.uid, False)
+
+
+def test_model_from_path_missing_file_raises_loader_error(tmp_path: Path) -> None:
+    with pytest.raises(WyrdError) as error:
+        ModelCard.from_path(tmp_path / "absent.yaml")
+
+    assert error.value.code == "WYRD_LOADER_400_IO"

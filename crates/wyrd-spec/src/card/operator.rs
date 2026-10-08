@@ -71,14 +71,16 @@ impl OperatorSpec {
     /// implementation (for example `drift.*` under an Eval Verifier) is
     /// refused; without it (a standalone Operator Card) every known field is
     /// allowed. It also requires a literal `https` (or loopback `http`) URL origin
-    /// with templates confined to its path and query, refuses server-owned
+    /// with templates confined to its path and query, or a `/`-prefixed
+    /// path-only URL whose origin comes from the named `auth` connection at
+    /// delivery, refuses server-owned
     /// headers, and refuses a custom auth header that is itself forbidden.
     /// Connection existence and authority are checked by the server, which
     /// owns the tenant's connections.
     ///
     /// # Errors
     /// Returns [`WyrdError::SpecInvalidOperator`] naming `field` and the first
-    /// violation found.
+    /// violation found, including a path-only URL without a named connection.
     pub fn validate(
         &self,
         field: &str,
@@ -134,7 +136,14 @@ impl OperatorSpec {
                 ..
             } => {
                 template(".url", url)?;
-                operator_url_origin(url).map_err(|reason| invalid(".url", reason))?;
+                if !url.starts_with('/') {
+                    operator_url_origin(url).map_err(|reason| invalid(".url", reason))?;
+                } else if auth.is_none() {
+                    return Err(invalid(
+                        ".url",
+                        "a path-only URL requires auth naming an http connection".to_owned(),
+                    ));
+                }
                 for (name, value) in headers {
                     let at = format!(".headers.{name}");
                     check_header_name(name).map_err(|reason| invalid(&at, reason))?;
@@ -190,7 +199,8 @@ impl OperatorSpec {
     /// The one compatibility predicate registration and every delivery
     /// attempt share. Slack and PagerDuty need only the matching provider; an
     /// authenticated HTTP Operator additionally needs its literal URL origin
-    /// to equal the connection origin and its auth scheme (and custom header
+    /// to equal the connection origin (a path-only URL takes the connection
+    /// origin and so always agrees) and its auth scheme (and custom header
     /// name, case-insensitively) to equal the stored scheme.
     #[must_use]
     pub fn matches_authority(&self, config: &OperatorConnectionConfig) -> bool {
@@ -226,7 +236,9 @@ impl OperatorSpec {
                     }
                     _ => false,
                 };
-                same_scheme && operator_url_origin(url).is_ok_and(|url| url == *origin)
+                same_scheme
+                    && (url.starts_with('/')
+                        || operator_url_origin(url).is_ok_and(|url| url == *origin))
             }
             _ => false,
         }
@@ -253,7 +265,9 @@ pub enum OperatorAction {
         /// HTTP method.
         method: HttpMethod,
         /// URL template; its origin is literal and `{{field}}` placeholders may
-        /// appear only in the path and query.
+        /// appear only in the path and query. A template beginning with `/` is
+        /// path-only and is sent to the origin stored on the `auth`
+        /// connection, read at each attempt; it requires `auth`.
         url: String,
         /// Optional request headers; values are templates.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -461,6 +475,10 @@ impl VerifierCounts {
     ///
     /// Derives `failed_tasks` and a pass rate rounded down, so a partial pass
     /// never reads `100`. `passed` above `total` is clamped to `total`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a percentage of at most 100 does not fit `u32`, which cannot happen.
     #[must_use]
     pub fn eval(passed: u32, total: u32) -> Self {
         let passed = passed.min(total);
@@ -888,5 +906,26 @@ mod tests {
             Value::Null,
         );
         assert!(open.connection().is_none());
+    }
+
+    /// A `/`-prefixed URL validates only with `auth` naming an http
+    /// connection, and then agrees with any stored origin of the same scheme.
+    #[test]
+    fn path_only_url_requires_a_named_http_connection() {
+        let auth = serde_json::json!({ "scheme": "bearer", "connection": "hooks" });
+        let named = http("/v1/{{run_id}}", serde_json::json!({}), auth);
+        assert!(named.validate("spec", None).is_ok());
+        assert!(named.matches_authority(&OperatorConnectionConfig::Http {
+            origin: HttpsOrigin::parse("https://staging.example.com").expect("origin"),
+            auth: HttpAuthScheme::Bearer,
+        }));
+        let anonymous = http("/v1/{{run_id}}", serde_json::json!({}), Value::Null);
+        assert_eq!(
+            anonymous
+                .validate("spec", None)
+                .expect_err("path-only URL without a connection")
+                .code(),
+            "WYRD_SPEC_400_INVALID_OPERATOR"
+        );
     }
 }

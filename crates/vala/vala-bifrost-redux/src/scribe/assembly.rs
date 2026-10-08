@@ -762,8 +762,15 @@ pub struct StagingAssembler {
     /// Members currently owned by an outstanding claim, by claim identity.
     outstanding: HashMap<StagingClaimId, StagingClaim>,
     /// Every member the assembler currently owns, ready or claimed.
-    owned: HashSet<(ScribeAssemblyKey, StagedMemberId)>,
+    owned: OwnedMembers,
 }
+
+/// Members an assembler owns, ready or claimed, by key and member identity.
+///
+/// A member leaves this set only when the claim that published it settles, so
+/// a snapshot of it names exactly the durable rows that were not yet published
+/// when it was taken.
+pub type OwnedMembers = HashSet<(ScribeAssemblyKey, StagedMemberId)>;
 
 impl StagingAssembler {
     /// Builds an empty assembler over validated controls.
@@ -1056,6 +1063,25 @@ impl StagingAssembler {
             .filter(|(_, index)| !index.members.is_empty())
             .map(|(key, _)| key.clone())
             .collect()
+    }
+
+    /// Returns a copy of every member this assembler owns, ready or claimed.
+    ///
+    /// An explicit flush takes this before it sweeps, so it can wait for the
+    /// members that were durable when it began without also waiting for
+    /// members that arrive while it runs.
+    #[must_use]
+    pub fn owned_members(&self) -> OwnedMembers {
+        self.owned.clone()
+    }
+
+    /// Returns whether any member of `snapshot` is still owned.
+    ///
+    /// A member settled since the snapshot is no longer owned, so this turns
+    /// false exactly when every snapshot member has published.
+    #[must_use]
+    pub fn owns_any(&self, snapshot: &OwnedMembers) -> bool {
+        !self.owned.is_disjoint(snapshot)
     }
 
     /// Refuses when every configured claim slot is already outstanding.

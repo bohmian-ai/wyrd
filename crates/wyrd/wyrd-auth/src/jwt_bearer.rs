@@ -18,9 +18,7 @@ use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
 use wyrd_sql::queries::auth::service_account_by_card_ref;
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
-use crate::audit::{
-    TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code, record_auth_audit_best_effort,
-};
+use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event, auth_failure_code};
 use crate::error::{auth_error_to_wyrd, store_error};
 use crate::issuance::{ExchangedToken, IssuanceError, TenantGrant, TenantTokenIssuer};
 use crate::issue_api_key::principal_kind_for_card;
@@ -83,11 +81,37 @@ impl JwtBearer {
         match result {
             Ok(token) => Ok(token),
             Err(error) => {
-                audit_workload_failure(postgres, tenant_id, audit_principal_id, request_id, &error)
-                    .await;
+                self.audit_workload_failure(tenant_id, audit_principal_id, request_id, &error);
                 Err(error)
             }
         }
+    }
+
+    /// Stage the audit of a refused workload `jwt-bearer` exchange.
+    ///
+    /// Stages one denied `auth.token.exchange` event with the closed failure
+    /// code on the issuer's process outbox; `principal_id` is nil when the
+    /// service account was never resolved. Staging never waits and never
+    /// replaces the caller's refusal.
+    fn audit_workload_failure(
+        &self,
+        tenant_id: DataTenantId,
+        principal_id: Uuid,
+        request_id: &str,
+        error: &WyrdError,
+    ) {
+        let event = auth_event(
+            request_id,
+            TOKEN_EXCHANGE_OPERATION,
+            PrincipalId::new(principal_id),
+            PrincipalKindTag::Service,
+            None,
+            AuditOutcome::Denied,
+            AuditDetail::AuthFailure {
+                error_code: auth_failure_code(error),
+            },
+        );
+        self.issuer.audit().stage(tenant_id, event);
     }
 
     async fn verify_workload_assertion(
@@ -156,32 +180,6 @@ async fn bound_service_account(
         .map_err(store_error)?
         .map(|row| row.id)
         .ok_or_else(|| principal_not_found_for_card_ref(card_ref))
-}
-
-/// Best-effort audit of a refused workload `jwt-bearer` exchange.
-///
-/// Stages one denied `auth.token.exchange` event with the closed failure code
-/// in its own transaction; `principal_id` is nil when the service account was
-/// never resolved. Staging failures are logged, never returned.
-async fn audit_workload_failure(
-    postgres: &WyrdPostgres,
-    tenant_id: DataTenantId,
-    principal_id: Uuid,
-    request_id: &str,
-    error: &WyrdError,
-) {
-    let event = auth_event(
-        request_id,
-        TOKEN_EXCHANGE_OPERATION,
-        PrincipalId::new(principal_id),
-        PrincipalKindTag::Service,
-        None,
-        AuditOutcome::Denied,
-        AuditDetail::AuthFailure {
-            error_code: auth_failure_code(error),
-        },
-    );
-    record_auth_audit_best_effort(postgres, tenant_id, &event).await;
 }
 
 fn principal_not_found(subject: &str, issuer: &IssuerUrl) -> WyrdError {

@@ -65,8 +65,6 @@ pub fn workflow_runs_router() -> OpenApiRouter<AppState> {
           WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY)", body = WyrdProblem),
         (status = 429, description = "Workflow run capacity is exhausted \
           (WYRD_WORKFLOW_429_RUN_CAPACITY)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem),
         (status = 503, description = "The server is shutting down, a route binding is \
           unavailable, or the registry is unavailable (WYRD_WORKFLOW_503_RUN_UNAVAILABLE, \
           WYRD_WORKFLOW_503_BINDING_UNAVAILABLE, WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE)", body = WyrdProblem)
@@ -111,9 +109,7 @@ async fn create_workflow_run_http(
         (status = 403, description = "The principal may not run Workflows \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)", body = WyrdProblem),
         (status = 404, description = "No such run is visible to the caller on this replica \
-          (WYRD_WORKFLOW_404_RUN_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem)
+          (WYRD_WORKFLOW_404_RUN_NOT_FOUND)", body = WyrdProblem)
     ),
     tag = "Workflows"
 )]
@@ -123,9 +119,7 @@ async fn get_workflow_run_http(
     caller: Caller,
     Path(run_id): Path<String>,
 ) -> Result<Json<WorkflowRun>, WyrdErrorResponse> {
-    Ok(Json(
-        WorkflowRunHost::new(state).get(&caller, &run_id).await?,
-    ))
+    Ok(Json(WorkflowRunHost::new(state).get(&caller, &run_id)?))
 }
 
 /// Cancel one of the caller's Workflow runs and return its terminal snapshot.
@@ -144,9 +138,7 @@ async fn get_workflow_run_http(
         (status = 403, description = "The principal may not run Workflows \
           (WYRD_PERMISSION_403_DENIED_RBAC, WYRD_AUTH_403_PRINCIPAL_ORPHANED)", body = WyrdProblem),
         (status = 404, description = "No such run is visible to the caller on this replica \
-          (WYRD_WORKFLOW_404_RUN_NOT_FOUND)", body = WyrdProblem),
-        (status = 500, description = "The authorization decision could not be audited \
-          (WYRD_VALA_500_AUDIT_UNAVAILABLE)", body = WyrdProblem)
+          (WYRD_WORKFLOW_404_RUN_NOT_FOUND)", body = WyrdProblem)
     ),
     tag = "Workflows"
 )]

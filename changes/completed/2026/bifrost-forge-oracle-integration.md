@@ -19,4 +19,3 @@ Current owners and evidence:
 - [Bifrost design](../../../architecture/bifrost-design.md).
 - [Forge implementation](../../../crates/vala/vala-bifrost-redux/src/forge), [Oracle implementation](../../../crates/vala/vala-bifrost-redux/src/oracle/mod.rs), and [reader authority](../../../crates/vala/vala-sql/src/queries/oracle_reader_authority.rs).
 - [Forge journeys](../../../crates/wyrd/wyrd-testing/tests/bifrost/forge).
-

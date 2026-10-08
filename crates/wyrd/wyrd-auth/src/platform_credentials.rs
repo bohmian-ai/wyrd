@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
-use wyrd_auth_issue::{IssueError, hash_api_key};
+use wyrd_auth_issue::{hash_secret, secret_matches};
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_sql::queries::platform::credentials::{
     insert_platform_credential_tx, platform_credential_by_prefix_tx, touch_platform_credential_tx,
@@ -21,8 +21,6 @@ use wyrd_sql::queries::platform::credentials::{
 use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit::principal_kind_tag;
-use crate::credential_verify::verify_presented;
-use tokio::task::JoinError;
 
 /// Prefix identifying a platform-scope credential on sight.
 ///
@@ -111,12 +109,6 @@ pub enum PlatformCredentialError {
     /// The presented credential is unusable, for any reason.
     #[error("invalid platform credential")]
     InvalidCredential,
-    /// Argon2 hashing failed.
-    #[error("platform credential hash failed")]
-    Hash(#[from] IssueError),
-    /// The hashing task could not be joined.
-    #[error("platform credential hash task failed")]
-    Join(#[from] JoinError),
     /// The platform store rejected the operation.
     #[error("platform credential store failed: {0}")]
     Store(#[from] SqlError),
@@ -124,8 +116,7 @@ pub enum PlatformCredentialError {
 
 /// Mint a credential for an existing platform principal.
 ///
-/// Generates the secret, hashes it off the async runtime because Argon2 is
-/// deliberately expensive, persists only the verifier, and hands the
+/// Generates the secret, persists only its SHA-256 verifier, and hands the
 /// plaintext back for its single exposure. `lifetime` is optional: an
 /// administrative credential established at initialization has no natural
 /// lifetime. `PostgreSQL` derives the stored expiry from that lifetime.
@@ -136,9 +127,7 @@ pub enum PlatformCredentialError {
 /// recorded permitting.
 ///
 /// # Errors
-/// Returns [`PlatformCredentialError::Hash`] or
-/// [`PlatformCredentialError::Join`] when hashing fails, and
-/// [`PlatformCredentialError::Store`] when the insert is rejected —
+/// Returns [`PlatformCredentialError::Store`] when the insert is rejected —
 /// including when `principal_id` names no platform principal.
 #[tracing::instrument(level = "debug", skip(conn), fields(principal_id = %principal_id), err)]
 pub async fn issue_platform_credential(
@@ -147,8 +136,7 @@ pub async fn issue_platform_credential(
     lifetime: Option<Duration>,
 ) -> Result<IssuedPlatformCredential, PlatformCredentialError> {
     let credential = PlatformCredential::generate();
-    let raw = credential.secret.clone();
-    let secret_hash = tokio::task::spawn_blocking(move || hash_api_key(&raw)).await??;
+    let secret_hash = hash_secret(credential.secret.expose_secret());
 
     let id = Uuid::new_v4();
     insert_platform_credential_tx(
@@ -190,15 +178,8 @@ pub async fn authenticate_for_session(
         None => None,
     };
 
-    // Exactly one verification, whatever was wrong with the input: a
-    // malformed shape, an unknown prefix, and a revoked, expired or
-    // suspended credential all used to answer before Argon2 ran, so a live
-    // prefix with a wrong tail took visibly longer than any of them and the
-    // endpoint enumerated live prefixes by clock.
-    let matched =
-        verify_presented(presented, row.as_ref().map(|row| row.secret_hash.as_str())).await?;
-
-    let Some(row) = row.filter(|_| matched) else {
+    let Some(row) = row.filter(|row| secret_matches(presented.expose_secret(), &row.secret_hash))
+    else {
         return Err(PlatformCredentialError::InvalidCredential);
     };
     touch_platform_credential_tx(conn, row.id).await?;
@@ -390,9 +371,10 @@ mod pg_tests {
             !stored.contains(plaintext.rsplit('_').next().expect("secret has a tail")),
             "the stored verifier does not contain the secret material"
         );
-        assert!(
-            stored.starts_with("$argon2"),
-            "an Argon2 verifier is stored"
+        assert_eq!(
+            stored,
+            wyrd_auth_issue::hash_secret(&plaintext),
+            "the SHA-256 verifier is stored"
         );
     }
 
@@ -453,17 +435,10 @@ mod pg_tests {
             ("suspended principal", suspended.credential.secret),
         ];
 
-        // Warm the dummy verifier so its one-off derivation is not mistaken for
-        // the per-request cost this measures.
-        let _ = authenticate_committed(&fixture, &SecretString::from("warm".to_owned())).await;
-
-        let mut elapsed = Vec::new();
         for (label, presented) in rejections {
-            let started = std::time::Instant::now();
             let error = authenticate_committed(&fixture, &presented)
                 .await
                 .expect_err("rejection");
-            elapsed.push((label, started.elapsed()));
             assert!(
                 matches!(error, PlatformCredentialError::InvalidCredential),
                 "{label} must be indistinguishable, got {error:?}"
@@ -472,23 +447,6 @@ mod pg_tests {
                 error.to_string(),
                 "invalid platform credential",
                 "{label} must render identically"
-            );
-        }
-
-        // Identical error bodies are not enough: a rejection that skips Argon2
-        // answers orders of magnitude sooner and says so. Argon2 dominates every
-        // one of these requests, so a shape that verified nothing would land
-        // far below the one that verified a real row against a wrong secret.
-        let wrong_secret_cost = elapsed
-            .iter()
-            .find(|(label, _)| *label == "wrong secret")
-            .expect("the known-prefix rejection was measured")
-            .1;
-        for (label, cost) in &elapsed {
-            assert!(
-                *cost * 3 >= wrong_secret_cost,
-                "{label} rejected in {cost:?} against {wrong_secret_cost:?} for a wrong secret, \
-                 so it skipped the verification that hides which prefixes are live"
             );
         }
 

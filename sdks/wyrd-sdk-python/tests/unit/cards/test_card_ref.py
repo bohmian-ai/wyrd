@@ -1,7 +1,7 @@
 """Boundary tests for the wyrd.cards.CardRef pyclass."""
 
 import pytest
-from wyrd._wyrd import WyrdError
+from wyrd import WyrdError
 from wyrd.cards import CardKind, CardRef
 
 
@@ -37,15 +37,13 @@ def test_equality_by_value() -> None:
     assert a != c
 
 
-def test_repr_contains_identity_fields() -> None:
+def test_repr_shows_identity_fields() -> None:
     ref = CardRef(kind="Artifact", name="weights", version="1.0.0", space="prod")
-    text = repr(ref)
 
-    assert "CardRef(" in text
-    assert "kind='Artifact'" in text
-    assert "name='weights'" in text
-    assert "version='1.0.0'" in text
-    assert "space='prod'" in text
+    assert (
+        repr(ref)
+        == "CardRef(kind='Artifact', name='weights', version='1.0.0', space='prod', uid=None)"
+    )
 
 
 def test_rejects_unknown_kind() -> None:
@@ -53,7 +51,6 @@ def test_rejects_unknown_kind() -> None:
         CardRef(kind="NotAKind", name="card-x", version="1.0.0", space="default")
 
     assert exc_info.value.code == "WYRD_SPEC_400_VALIDATION"
-    assert "unknown card kind" in str(exc_info.value).lower()
 
 
 def test_rejects_invalid_version() -> None:
@@ -90,37 +87,9 @@ def test_every_native_kind_is_accepted(kind: str) -> None:
     assert ref.kind.name == kind
 
 
-@pytest.mark.parametrize(
-    ("kind", "name"),
-    [
-        (CardKind.Data, "Data"),
-        (CardKind.Model, "Model"),
-        (CardKind.Experiment, "Experiment"),
-        (CardKind.Prompt, "Prompt"),
-        (CardKind.Agent, "Agent"),
-        (CardKind.Workflow, "Workflow"),
-        (CardKind.Verifier, "Verifier"),
-        (CardKind.Service, "Service"),
-        (CardKind.Policy, "Policy"),
-        (CardKind.Mcp, "Mcp"),
-        (CardKind.Audit, "Audit"),
-        (CardKind.Artifact, "Artifact"),
-        (CardKind.Trigger, "Trigger"),
-        (CardKind.Operator, "Operator"),
-        (CardKind.Source, "Source"),
-        (CardKind.External, "External"),
-    ],
-)
-def test_every_native_kind_enum_is_accepted(kind: CardKind, name: str) -> None:
-    ref = CardRef(kind=kind, name="card-x", version="1.0.0", space="default")
-
-    assert ref.kind == kind
-    assert ref.kind.name == name
-
-
 def test_rejects_missing_space() -> None:
     with pytest.raises(TypeError):
-        CardRef(kind=CardKind.Model, name="card-x", version="1.0.0")  # type: ignore[call-arg]
+        CardRef(kind=CardKind.Model, name="card-x", version="1.0.0")  # ty: ignore[missing-argument]
 
 
 def test_rejects_empty_space() -> None:

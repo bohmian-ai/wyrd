@@ -16,6 +16,10 @@ const MAX_WIRE_GROUP_DEPTH: usize = 8;
 
 /// Exact adapter facts established without constructing generated messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "every field is a byte count; the shared suffix names the unit"
+)]
 pub(crate) struct OtlpDecodePlan {
     /// Encoded protobuf bytes inspected by the preflight.
     pub(crate) wire_bytes: usize,
@@ -571,9 +575,8 @@ fn visit_scope(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErr
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1 | 2, WireValue::Bytes(_)) => {}
             (3, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (4, WireValue::Varint(_)) => {}
+            (1 | 2, WireValue::Bytes(_)) | (4, WireValue::Varint(_)) => {}
             (1..=4, _) => return Err(wrong_wire("instrumentation scope")),
             _ => {}
         }
@@ -632,9 +635,6 @@ fn visit_span(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErro
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1..=5, WireValue::Bytes(_)) => {}
-            (6 | 10 | 12 | 14, WireValue::Varint(_)) => {}
-            (7 | 8, WireValue::Fixed64(_)) => {}
             (9, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
             (11, WireValue::Bytes(event)) => {
                 facts.output.add(facts.widths.event);
@@ -647,7 +647,10 @@ fn visit_span(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestErro
                 visit_span_link(link, facts)?;
             }
             (15, WireValue::Bytes(status)) => visit_status(status, facts)?,
-            (16, WireValue::Fixed32(_)) => {}
+            (1..=5, WireValue::Bytes(_))
+            | (6 | 10 | 12 | 14, WireValue::Varint(_))
+            | (7 | 8, WireValue::Fixed64(_))
+            | (16, WireValue::Fixed32(_)) => {}
             (1..=16, _) => return Err(wrong_wire("span")),
             _ => {}
         }
@@ -690,8 +693,7 @@ fn visit_status(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), IngestEr
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (2, WireValue::Bytes(_)) => {}
-            (3, WireValue::Varint(_)) => {}
+            (2, WireValue::Bytes(_)) | (3, WireValue::Varint(_)) => {}
             (2 | 3, _) => return Err(wrong_wire("span status")),
             _ => {}
         }
@@ -711,9 +713,8 @@ fn visit_span_event(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Inge
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (2, WireValue::Bytes(_)) => {}
             (3, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (1, WireValue::Fixed64(_)) | (4, WireValue::Varint(_)) => {}
+            (2, WireValue::Bytes(_)) | (1, WireValue::Fixed64(_)) | (4, WireValue::Varint(_)) => {}
             (1..=4, _) => return Err(wrong_wire("span event")),
             _ => {}
         }
@@ -735,9 +736,10 @@ fn visit_span_link(bytes: &[u8], facts: &mut TraceWireFacts) -> Result<(), Inges
     let mut fields = WireFields::with_group_depth(bytes, facts.limits.value_depth);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1..=3, WireValue::Bytes(_)) => {}
             (4, WireValue::Bytes(attribute)) => visit_attribute(attribute, 0, facts)?,
-            (5, WireValue::Varint(_)) | (6, WireValue::Fixed32(_)) => {}
+            (1..=3, WireValue::Bytes(_))
+            | (5, WireValue::Varint(_))
+            | (6, WireValue::Fixed32(_)) => {}
             (1..=6, _) => return Err(wrong_wire("span link")),
             _ => {}
         }
@@ -1028,9 +1030,8 @@ fn decode_resource_spans(bytes: &[u8]) -> Result<ResourceSpans, IngestError> {
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(value)) => scope_spans.push(decode_scope_spans(value)?),
-            (3, WireValue::Bytes(_)) => {}
+            (1 | 3, WireValue::Bytes(_)) => {}
             (1..=3, _) => return Err(wrong_wire("resource spans")),
             _ => {}
         }
@@ -1143,9 +1144,8 @@ fn decode_scope_spans(bytes: &[u8]) -> Result<ScopeSpans, IngestError> {
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1, WireValue::Bytes(_)) => {}
             (2, WireValue::Bytes(value)) => spans.push(decode_span(value)?),
-            (3, WireValue::Bytes(_)) => {}
+            (1 | 3, WireValue::Bytes(_)) => {}
             (1..=3, _) => return Err(wrong_wire("scope spans")),
             _ => {}
         }
@@ -1246,7 +1246,6 @@ fn decode_span(bytes: &[u8]) -> Result<Span, IngestError> {
     let mut fields = WireFields::new(bytes);
     while let Some((tag, value)) = fields.next()? {
         match (tag, value) {
-            (1..=5, WireValue::Bytes(_)) => {}
             (6, WireValue::Varint(value)) => span.kind = protobuf_i32(value),
             (7, WireValue::Fixed64(value)) => span.start_time_unix_nano = value,
             (8, WireValue::Fixed64(value)) => span.end_time_unix_nano = value,
@@ -1258,7 +1257,7 @@ fn decode_span(bytes: &[u8]) -> Result<Span, IngestError> {
             (12, WireValue::Varint(value)) => span.dropped_events_count = protobuf_u32(value),
             (13, WireValue::Bytes(value)) => span.links.push(decode_link(value)?),
             (14, WireValue::Varint(value)) => span.dropped_links_count = protobuf_u32(value),
-            (15, WireValue::Bytes(_)) => {}
+            (1..=5 | 15, WireValue::Bytes(_)) => {}
             (16, WireValue::Fixed32(value)) => span.flags = value,
             (1..=16, _) => return Err(wrong_wire("span")),
             _ => {}
@@ -1392,8 +1391,7 @@ fn decode_key_value(bytes: &[u8]) -> Result<KeyValue, IngestError> {
     let mut fields = WireFields::new(bytes);
     while let Some((tag, wire_value)) = fields.next()? {
         match (tag, wire_value) {
-            (1, WireValue::Bytes(_)) => {}
-            (2, WireValue::Bytes(_)) => {}
+            (1 | 2, WireValue::Bytes(_)) => {}
             (1 | 2, _) => return Err(wrong_wire("key/value")),
             _ => {}
         }

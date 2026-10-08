@@ -1,12 +1,21 @@
+use std::io::Result as IoResult;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
-use vala_sql::TenantConn;
+use vala_sql::audit_outbox::AuditSink;
 use vala_sql::queries::audit_staging::{
     AuditPublicationRange, append_audit, freeze_publication_range, list_publication_batch,
 };
+use vala_sql::{TenantConn, ValaPostgres};
 use wyrd_server::audit::publication::{AuditPublisher, PublishOutcome};
 use wyrd_server::oracle::PostgresPeerSecurityAudit;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{GATEWAY_CAPTURE_PRINCIPAL, PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -23,7 +32,7 @@ const AUDIT_LOG: &str = "vala.system.audit_log";
 /// Bound on every wait for the server-owned publisher to make progress.
 const PUBLICATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// Counts retained audit rows recorded under one operation name.
+/// Counts retained audit rows matching one SQL `predicate`.
 ///
 /// The read goes through the server's own scheduled caller so the count is the
 /// one a caller of the public query surface would see, fused across the rows
@@ -41,7 +50,7 @@ const PUBLICATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(9
 async fn retained_rows(
     server: &WyrdTestServer,
     tenant: DataTenantId,
-    operation: &str,
+    predicate: &str,
 ) -> Result<Option<u64>, ServerJourneyError> {
     let outcome = wyrd_server::query::scheduled::ScheduledQueryCaller::new(
         server.state().clone(),
@@ -49,7 +58,8 @@ async fn retained_rows(
         tokio_util::sync::CancellationToken::new(),
     )
     .run(BifrostQueryRequest {
-        sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE operation = '{operation}'"),
+        params: Vec::new(),
+        sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE {predicate}"),
         deadline_ms: Some(60_000),
     })
     .await;
@@ -79,15 +89,37 @@ async fn await_retained(
     operation: &str,
     expected: u64,
 ) -> Result<(), ServerJourneyError> {
+    await_retained_where(
+        server,
+        tenant,
+        &format!("operation = '{operation}'"),
+        expected,
+    )
+    .await
+}
+
+/// Waits until exactly `expected` retained rows match `predicate`.
+///
+/// Polls the public read like [`await_retained`], for a caller that needs a
+/// narrower match than one operation name.
+///
+/// # Errors
+/// Returns the query failure, or a timeout naming the last observed count.
+async fn await_retained_where(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    predicate: &str,
+    expected: u64,
+) -> Result<(), ServerJourneyError> {
     let deadline = std::time::Instant::now() + PUBLICATION_BUDGET;
     loop {
-        let observed = retained_rows(server, tenant, operation).await?;
+        let observed = retained_rows(server, tenant, predicate).await?;
         if observed == Some(expected) {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "`{operation}` was retained {observed:?} times within the bounded wait \
+                "`{predicate}` was retained {observed:?} times within the bounded wait \
                  (None: visibility unavailable), expected {expected}"
             )
             .into());
@@ -271,7 +303,7 @@ async fn await_blocked_backends(
 
 /// Reads the tenant's in-flight publication bound without taking its lock.
 ///
-/// A plain read of `audit_chain_head` is not blocked by a settlement holding
+/// A plain read of `audit_publication` is not blocked by a settlement holding
 /// the row, so it observes the committed bound mid-interleaving.
 ///
 /// # Errors
@@ -282,7 +314,7 @@ async fn frozen_bound(
 ) -> Result<Option<i64>, ServerJourneyError> {
     let mut conn = server.tenant_conn_for(tenant).await?;
     let bound: Option<i64> =
-        sqlx::query_scalar("SELECT publishing_seq_hi FROM vala.audit_chain_head")
+        sqlx::query_scalar("SELECT publishing_seq_hi FROM vala.audit_publication")
             .fetch_one(&mut **conn.transaction())
             .await?;
     conn.commit().await?;
@@ -351,7 +383,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     let mut fence = fence_staged_rows(&server, tenant, appended).await?;
 
     // The bound is committed before any competitor starts, so every later
-    // freeze reads it rather than contending for the chain head.
+    // freeze reads it rather than contending for the progress row.
     let mut freezer = server.tenant_conn_for(tenant).await?;
     let range = freeze_publication_range(&mut freezer, 512)
         .await?
@@ -378,7 +410,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     // `survivor` freezes and reads the committed range, then pauses before its
     // append, so its own append can only follow the crash. `crashing` starts
     // only once `survivor` has read the range, so neither freeze can meet a
-    // settlement already holding the chain head.
+    // settlement already holding the progress row.
     let mut survivor_publisher = AuditPublisher::from_state(server.state())
         .ok_or("a Scribe-bearing server composes the audit publisher")?;
     let mut survivor_appended = survivor_publisher.observe_appends();
@@ -400,7 +432,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     // settlement back and the staged tail stays out of every in-flight batch.
     tokio::time::timeout(
         PUBLICATION_BUDGET,
-        crashing_appended.wait_for(|appended| appended.is_some()),
+        crashing_appended.wait_for(std::option::Option::is_some),
     )
     .await
     .map_err(|_| "the crashing cycle never reported its durable append")??;
@@ -437,7 +469,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
     survivor_release.add_permits(1);
     tokio::time::timeout(
         PUBLICATION_BUDGET,
-        survivor_appended.wait_for(|appended| appended.is_some()),
+        survivor_appended.wait_for(std::option::Option::is_some),
     )
     .await
     .map_err(|_| "the surviving cycle never replayed its durable append")??;
@@ -507,7 +539,7 @@ async fn frozen_audit_range_replays_once_while_its_tail_waits() -> Result<(), Se
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
 -> Result<(), ServerJourneyError> {
-    let metrics = wyrd_server::app::metrics::install_recorder()?;
+    let failures = wyrd_testing::AuditCommitFailures::install()?;
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
     let operation = format!(
@@ -523,9 +555,9 @@ async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
         .fetch_all(&mut **fence.transaction())
         .await?;
     let reads = vala_sql::postgres::vala_pool_config().max_connections * 2;
-    let failures_before = commit_failures(&metrics);
+    let failures_before = failures.count();
     for _ in 0..reads {
-        retained_rows(&server, tenant, &operation).await?;
+        retained_rows(&server, tenant, &format!("operation = '{operation}'")).await?;
     }
     let waiting = server.oracle_runtime_inspection()?.audit_pending;
     assert!(
@@ -533,9 +565,9 @@ async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
         "every served read's decision must wait for the chain head: {waiting} of {reads}"
     );
     assert_eq!(
-        commit_failures(&metrics) - failures_before,
+        failures.count() - failures_before,
         0,
-        "no decision may be dropped while the chain head is held"
+        "no audit write may fail while the chain head is held"
     );
     let spare = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -560,25 +592,13 @@ async fn reads_are_served_while_audit_commits_wait_on_the_chain_head()
     Ok(())
 }
 
-/// Reads the process total of Oracle audit decisions that did not commit.
-///
-/// A family the recorder has not yet seen reads as zero.
-fn commit_failures(metrics: &metrics_exporter_prometheus::PrometheusHandle) -> u64 {
-    metrics
-        .render()
-        .lines()
-        .find_map(|line| line.strip_prefix("oracle_audit_commit_failures_total "))
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .map_or(0, |value| value as u64)
-}
-
 /// One stalled tenant does not hold retained history back for another tenant.
 ///
 /// A sweep that published tenants one after another would make every tenant
-/// wait on the slowest: a tenant whose chain head is held by an unrelated
+/// wait on the slowest: a tenant whose progress row is held by an unrelated
 /// transaction would stall the whole directory behind it. The journey seeds a
 /// second tenant, appends a decision in each, then holds the boot tenant's
-/// chain-head row. A cycle that reaches that tenant afterwards cannot freeze;
+/// publication progress row, as a stalled competing publisher would. A cycle that reaches that tenant afterwards cannot freeze;
 /// one that froze and appended before the fence landed blocks in settlement
 /// until the fence is released. The second tenant must still reach retained
 /// history and drain inside the bounded wait — including the read decisions the
@@ -609,7 +629,13 @@ async fn a_stalled_tenant_does_not_block_another_tenants_history() -> Result<(),
     // The boot tenant sorts before a freshly minted UUIDv7 tenant, so a serial
     // sweep would reach the healthy tenant only after this fence is released.
     let mut fence = server.tenant_conn_for(stalled).await?;
-    sqlx::query("SELECT last_seq FROM vala.audit_chain_head FOR UPDATE")
+    sqlx::query(
+        "INSERT INTO vala.audit_publication (data_tenant_id) \
+         VALUES (wyrd.current_tenant()) ON CONFLICT DO NOTHING",
+    )
+    .execute(&mut **fence.transaction())
+    .await?;
+    sqlx::query("SELECT published_seq FROM vala.audit_publication FOR UPDATE")
         .fetch_all(&mut **fence.transaction())
         .await?;
 
@@ -624,37 +650,35 @@ async fn a_stalled_tenant_does_not_block_another_tenants_history() -> Result<(),
     Ok(())
 }
 
-/// A tenant's gateway capture decision publishes and does not hold later
+/// A tenant's Service-principal decision publishes and does not hold later
 /// history back.
 ///
-/// Gateway capture authenticates to Bifrost as the reserved tenant-bound
-/// card-free Service principal, so its Gate decision stages under that
-/// reserved id with `principal_kind = 'service'`. The publisher projects a
-/// frozen range before settling it; a projection that refused the decision
-/// would fail every retry, pin the watermark, and keep every later decision of
-/// the tenant out of retained history. The journey stages a capture decision
-/// and then a user decision through the production writer, and both must
-/// retain once while the tenant's staging drains to zero.
+/// A card-free Service principal's Gate decision stages with
+/// `principal_kind = 'service'`. The publisher projects a frozen range before
+/// settling it; a projection that refused the decision would fail every retry,
+/// pin the watermark, and keep every later decision of the tenant out of
+/// retained history. The journey stages a Service decision and then a user
+/// decision through the production writer, and both must retain once while
+/// the tenant's staging drains to zero.
 ///
 /// # Errors
 /// Returns the server, Postgres, publication, or query failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
-async fn gateway_capture_decisions_publish_ahead_of_later_history() -> Result<(), ServerJourneyError>
-{
+async fn service_decisions_publish_ahead_of_later_history() -> Result<(), ServerJourneyError> {
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
     let suffix = uuid::Uuid::now_v7().simple().to_string();
-    let capture_op = format!("wyrd.journey.audit_capture.{suffix}");
+    let service_op = format!("wyrd.journey.audit_service.{suffix}");
     let user_op = format!("wyrd.journey.audit_user.{suffix}");
 
-    let mut capture = decision(&capture_op);
-    capture.principal_id = GATEWAY_CAPTURE_PRINCIPAL;
-    capture.principal_kind = PrincipalKindTag::Service;
-    append_event(&server, tenant, &capture).await?;
+    let mut service = decision(&service_op);
+    service.principal_id = PrincipalId::new(uuid::Uuid::now_v7());
+    service.principal_kind = PrincipalKindTag::Service;
+    append_event(&server, tenant, &service).await?;
     append_decision(&server, tenant, &user_op).await?;
 
-    await_retained(&server, tenant, &capture_op, 1).await?;
+    await_retained(&server, tenant, &service_op, 1).await?;
     await_retained(&server, tenant, &user_op, 1).await?;
     await_drained(&server, tenant).await?;
 
@@ -706,12 +730,22 @@ async fn system_owner_security_rejections_retain_once() -> Result<(), ServerJour
     await_drained(&server, system).await?;
     let before = retained_audit_batches(&server, system).await?;
 
-    PostgresPeerSecurityAudit::try_new(&server.state().postgres)
-        .await
-        .map_err(|_| "the booted server carries the exact system sentinel")?
-        .append_unverified_ticket_rejection(BifrostSecurityViolationKind::PeerUnknownKey)
-        .await
-        .map_err(|_| "the system-owner rejection commits to staging")?;
+    PostgresPeerSecurityAudit::try_new(
+        &server.state().postgres,
+        std::sync::Arc::clone(&server.state().audit_outbox),
+    )
+    .await
+    .map_err(|_| "the booted server carries the exact system sentinel")?
+    .stage_unverified_ticket_rejection(BifrostSecurityViolationKind::PeerUnknownKey);
+    let unsettled = server
+        .state()
+        .audit_outbox
+        .settle(std::time::Instant::now() + PUBLICATION_BUDGET)
+        .await;
+    assert_eq!(
+        unsettled, 0,
+        "the system-owner rejection commits to staging"
+    );
 
     await_drained(&server, system).await?;
     assert_eq!(
@@ -781,11 +815,247 @@ async fn retained_matching(
         tokio_util::sync::CancellationToken::new(),
     )
     .run(BifrostQueryRequest {
+        params: Vec::new(),
         sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE operation = '{operation}' AND {predicate}"),
         deadline_ms: Some(60_000),
     })
     .await?;
     Ok(outcome.rows)
+}
+
+/// Where a [`CommitCutter`] breaks the next proxied `COMMIT`.
+#[derive(Clone, Copy)]
+enum Cut {
+    /// Forwards the `COMMIT`, then drops Postgres's reply and closes the
+    /// client: the transaction commits, but the writer sees its commit fail.
+    AckLost,
+    /// Closes both sides instead of forwarding the `COMMIT`: Postgres aborts
+    /// the transaction once its client is gone, and the writer sees its
+    /// commit fail.
+    CommitLost,
+}
+
+/// TCP proxy in front of the test Postgres that breaks one armed commit.
+///
+/// It relays the Postgres wire protocol byte for byte and frames only the
+/// client's messages, so it recognizes the simple-query `COMMIT` SQLx sends
+/// to end a transaction. Every other connection and statement passes through
+/// untouched, so the pool behind it, including the fresh connection the audit
+/// writer resolves a failed commit on, behaves as a direct pool would.
+struct CommitCutter {
+    /// Address the proxied pool connects to.
+    addr: SocketAddr,
+    /// The cut the next proxied `COMMIT` takes, when armed.
+    armed: Arc<Mutex<Option<Cut>>>,
+    /// How many armed cuts were performed.
+    fired: Arc<AtomicUsize>,
+}
+
+impl CommitCutter {
+    /// Starts the proxy on a loopback port in front of `upstream`'s server.
+    ///
+    /// # Errors
+    /// Returns the bind failure.
+    async fn start(upstream: &PgConnectOptions) -> Result<Self, ServerJourneyError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let target = (upstream.get_host().to_owned(), upstream.get_port());
+        let armed = Arc::new(Mutex::new(None));
+        let fired = Arc::new(AtomicUsize::new(0));
+        let (accept_armed, accept_fired) = (Arc::clone(&armed), Arc::clone(&fired));
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let (armed, fired) = (Arc::clone(&accept_armed), Arc::clone(&accept_fired));
+                let target = target.clone();
+                tokio::spawn(async move {
+                    if let Ok(upstream) = TcpStream::connect(target).await {
+                        let _closed = relay(client, upstream, &armed, &fired).await;
+                    }
+                });
+            }
+        });
+        Ok(Self { addr, armed, fired })
+    }
+
+    /// Arms `cut` for the next proxied `COMMIT`.
+    fn arm(&self, cut: Cut) {
+        *self.armed.lock().expect("cut lock is never poisoned") = Some(cut);
+    }
+
+    /// How many armed cuts were performed so far.
+    fn fired(&self) -> usize {
+        self.fired.load(Ordering::Acquire)
+    }
+
+    /// A Vala handle whose pool reaches Postgres through this proxy, as the
+    /// role and database of `upstream`, without TLS so the proxy can frame
+    /// the protocol.
+    ///
+    /// # Errors
+    /// Returns the connection failure.
+    async fn vala(&self, upstream: &PgConnectOptions) -> Result<ValaPostgres, ServerJourneyError> {
+        let options = upstream
+            .clone()
+            .host(&self.addr.ip().to_string())
+            .port(self.addr.port())
+            .ssl_mode(PgSslMode::Disable);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await?;
+        Ok(ValaPostgres::from_pool(pool))
+    }
+}
+
+/// Relays one proxied connection, performing an armed cut at its `COMMIT`.
+///
+/// Server bytes are relayed by a separate task. For [`Cut::AckLost`] the
+/// `COMMIT` is forwarded only after that task is told to swallow what follows,
+/// so Postgres commits but the client reads no reply; returning then closes the
+/// write side toward Postgres after the `COMMIT`, and the relay closes the
+/// client once the reply arrives. For [`Cut::CommitLost`] the `COMMIT` is
+/// never forwarded, so Postgres sees its client leave mid-transaction.
+///
+/// # Errors
+/// Returns the read or write failure of either side.
+async fn relay(
+    client: TcpStream,
+    upstream: TcpStream,
+    armed: &Mutex<Option<Cut>>,
+    fired: &AtomicUsize,
+) -> IoResult<()> {
+    let (mut client_rx, mut client_tx) = client.into_split();
+    let (mut upstream_rx, mut upstream_tx) = upstream.into_split();
+    let swallow = Arc::new(AtomicBool::new(false));
+    let replies_swallow = Arc::clone(&swallow);
+    tokio::spawn(async move {
+        let mut buffer = vec![0_u8; 8192];
+        loop {
+            let read = upstream_rx.read(&mut buffer).await?;
+            if read == 0 || replies_swallow.load(Ordering::Acquire) {
+                return Ok::<_, std::io::Error>(());
+            }
+            client_tx.write_all(&buffer[..read]).await?;
+        }
+    });
+
+    // The startup message carries no type byte, only its length.
+    let mut length = [0_u8; 4];
+    client_rx.read_exact(&mut length).await?;
+    let mut startup = vec![0_u8; (u32::from_be_bytes(length) as usize).saturating_sub(4)];
+    client_rx.read_exact(&mut startup).await?;
+    upstream_tx.write_all(&length).await?;
+    upstream_tx.write_all(&startup).await?;
+
+    loop {
+        let mut header = [0_u8; 5];
+        if client_rx.read_exact(&mut header).await.is_err() {
+            return Ok(());
+        }
+        let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        let mut body = vec![0_u8; length.saturating_sub(4)];
+        client_rx.read_exact(&mut body).await?;
+        if header[0] == b'Q' && body == b"COMMIT\0" {
+            let cut = armed.lock().expect("cut lock is never poisoned").take();
+            match cut {
+                Some(Cut::AckLost) => {
+                    swallow.store(true, Ordering::Release);
+                    upstream_tx.write_all(&header).await?;
+                    upstream_tx.write_all(&body).await?;
+                    fired.fetch_add(1, Ordering::AcqRel);
+                    return Ok(());
+                }
+                Some(Cut::CommitLost) => {
+                    fired.fetch_add(1, Ordering::AcqRel);
+                    return Ok(());
+                }
+                None => {}
+            }
+        }
+        upstream_tx.write_all(&header).await?;
+        upstream_tx.write_all(&body).await?;
+    }
+}
+
+/// A failed audit commit is resolved from Postgres before any retry, so each
+/// decision is staged and retained exactly once.
+///
+/// The production audit outbox writes through a proxy that breaks one armed
+/// `COMMIT` at a time, while the server's own publisher retires staged rows.
+/// Three times in a row a commit lands in Postgres but its acknowledgement is
+/// lost: the writer resolves the transaction as committed, sends nothing again,
+/// and the publisher retires the row before the next round. Then a commit is
+/// lost before Postgres sees it: the writer resolves the transaction as
+/// aborted and the outbox retries the batch, which commits once. Every
+/// decision is retained exactly once, and the tenant's retained chain holds
+/// every `seq` up to its head exactly once.
+///
+/// # Errors
+/// Returns the server, proxy, Postgres, publication, or query failure.
+///
+/// # Panics
+/// Panics when a cut does not fire or the outbox leaves work pending or lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn ambiguous_audit_commits_retain_each_decision_exactly_once()
+-> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::start_bound().await?;
+    await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
+    let tenant = server.data_tenant_id();
+    let suffix = uuid::Uuid::now_v7().simple().to_string();
+    let upstream = server.state().postgres.vala().pool().connect_options();
+    let cutter = CommitCutter::start(&upstream).await?;
+    let outbox = AuditSink::outbox(cutter.vala(&upstream).await?);
+    let settle = || std::time::Instant::now() + PUBLICATION_BUDGET;
+
+    for round in 1..=3 {
+        let operation = format!("wyrd.journey.audit_ack_lost.{round}.{suffix}");
+        cutter.arm(Cut::AckLost);
+        outbox.stage(tenant, decision(&operation));
+        assert_eq!(outbox.settle(settle()).await, 0, "round {round} settles");
+        assert_eq!(
+            cutter.fired(),
+            round,
+            "round {round} lost its acknowledgement"
+        );
+        server.await_audit_published(tenant).await?;
+        await_drained(&server, tenant).await?;
+        await_retained(&server, tenant, &operation, 1).await?;
+    }
+
+    let aborted = format!("wyrd.journey.audit_commit_lost.{suffix}");
+    cutter.arm(Cut::CommitLost);
+    outbox.stage(tenant, decision(&aborted));
+    assert_eq!(
+        outbox.settle(settle()).await,
+        0,
+        "the aborted batch is retried"
+    );
+    assert_eq!(
+        cutter.fired(),
+        4,
+        "the commit was lost before Postgres saw it"
+    );
+    server.await_audit_published(tenant).await?;
+    await_retained(&server, tenant, &aborted, 1).await?;
+
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let head: i64 = sqlx::query_scalar("SELECT last_seq FROM vala.audit_chain_head")
+        .fetch_one(&mut **conn.transaction())
+        .await?;
+    conn.commit().await?;
+    server.await_audit_published(tenant).await?;
+    await_retained_where(
+        &server,
+        tenant,
+        &format!("seq <= {head}"),
+        u64::try_from(head)?,
+    )
+    .await?;
+
+    assert_eq!(outbox.shutdown(settle()).await, 0, "nothing is lost");
+    server.shutdown().await?;
+    Ok(())
 }
 
 /// Retained history carries both credential shapes in one uninterrupted read.
@@ -833,6 +1103,199 @@ async fn retained_history_carries_both_credential_shapes() -> Result<(), ServerJ
         1,
         "the credentialed decision names the key it was made with"
     );
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// Unwraps a machine bootstrap into its raw API key.
+///
+/// # Errors
+/// Returns an error when the bootstrap is a user principal.
+fn machine_key(bootstrap: wyrd_testing::Bootstrap) -> Result<String, ServerJourneyError> {
+    match bootstrap {
+        wyrd_testing::Bootstrap::Machine { api_key, .. } => {
+            Ok(secrecy::ExposeSecret::expose_secret(&api_key).to_owned())
+        }
+        wyrd_testing::Bootstrap::User { .. } => Err("expected a machine principal".into()),
+    }
+}
+
+/// A Gate write, a run start, and an Oracle query succeed while every audit
+/// commit fails, and their decisions commit once the database recovers.
+///
+/// Permissions block and audits do not. After setup, a trigger refuses every
+/// insert into `vala.audit_staging`, so each audit write the three requests
+/// cause fails. Through the public client, the Gate write still becomes
+/// durable, the manual run still starts, and the Oracle query returns the
+/// written row while the failed writes are counted and nothing reaches
+/// staging. Once the trigger is dropped, the outbox's retry commits each
+/// decision exactly once, and the tenant chain publishes gap-free.
+///
+/// # Errors
+/// Returns the server, client, or Postgres failure.
+///
+/// # Panics
+/// Panics when any request is refused, a decision reaches staging while
+/// audit fails, no failed write is counted, or a decision does not commit
+/// exactly once after recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn a_gate_write_run_start_and_query_succeed_while_audit_commits_fail()
+-> Result<(), ServerJourneyError> {
+    let failures = wyrd_testing::AuditCommitFailures::install()?;
+    let root = tempfile::tempdir()?;
+    let verifier = root.path().join("verifier.yaml");
+    std::fs::write(
+        &verifier,
+        "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: audit-loss-drift\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: drift\n    spec:\n      method: Custom\n      signal:\n        kind: Metric\n        name: score\n      condition:\n        kind: Statistical\n      profile:\n        kind: Custom\n        metric_name: score\n        baseline_value: 1.0\n        alert_threshold: 0.5\n",
+    )?;
+    let service = root.path().join("service.yaml");
+    std::fs::write(
+        &service,
+        "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: audit-loss-service\n  version: 1.0.0\n  space: default\nspec:\n  verified_by:\n    - verifier:\n        kind: Verifier\n        name: audit-loss-drift\n        version: 1.0.0\n        space: default\n      runs_on:\n        kind: schedule\n        cron: \"0 2 * * *\"\n",
+    )?;
+
+    let server = WyrdTestServer::start_bound().await?;
+    let base_url = server
+        .base_url()
+        .ok_or("bound server has a URL")?
+        .to_owned();
+    let grpc_url = server.grpc_url();
+    let client = |credential: &str| {
+        wyrd_client::bifrost::client_from_options(
+            Some(&base_url),
+            Some(credential),
+            grpc_url.as_deref(),
+        )
+    };
+    let admin_bootstrap = server
+        .bootstrap_service("audit_loss_admin", &["admin"])
+        .await?;
+    let admin_id = admin_bootstrap.id();
+    let admin_reads =
+        format!("operation = 'bifrost.query.read_decision' AND audit_principal_id = '{admin_id}'");
+    let admin = client(&machine_key(admin_bootstrap)?)?;
+    let cards = wyrd_client::cards::Cards::with_client(wyrd_client::WyrdClient::clone(&admin));
+    Box::pin(cards.register_from_path(&verifier)).await?;
+    let receipt = Box::pin(cards.register_from_path(&service)).await?;
+    let binding_id = cards
+        .get(wyrd_client::cards::CardSelector::exact(
+            receipt.root.clone(),
+        ))
+        .await?
+        .status
+        .and_then(|status| status.verification)
+        .ok_or("a binding owner serves verification status")?
+        .binding_ids[0];
+    let runner = client(&machine_key(
+        server
+            .credential_registered_service(&receipt.root, &["writer"])
+            .await?,
+    )?)?;
+    let dataset = format!("vala.datasets.audit_loss_{}", uuid::Uuid::now_v7().simple());
+    let table = wyrd_client::bifrost::TableConfig::from_json_schema(
+        &dataset,
+        &serde_json::json!({
+            "type": "object",
+            "properties": { "value": { "type": "integer" } },
+            "required": ["value"],
+        }),
+    )?;
+    let writer = wyrd_client::Bifrost::connect_with_table(&admin, table).await?;
+    writer.register().await?;
+    let tenant = server.data_tenant_id();
+    server.await_audit_published(tenant).await?;
+    let writes_before = server
+        .retained_audit_operation_count(tenant, "bifrost.record.write")
+        .await?;
+    let starts_before = server
+        .retained_audit_operation_count(tenant, "verification.run.start")
+        .await?;
+
+    let superuser = server.pg_fixture().superuser_pool()?;
+    server.pg_fixture().fail_audit_staging().await?;
+
+    writer.insert(
+        serde_json::to_vec(&serde_json::json!({ "value": 1 }))?,
+        wyrd_client::bifrost::Correlation::default(),
+    )?;
+    writer.flush().await?;
+    let run_request: wyrd_spec::verification::StartVerificationRunRequest =
+        serde_json::from_value(serde_json::json!({
+            "target": { "kind": "binding", "binding_id": binding_id.to_string() },
+            "input": {
+                "kind": "drift_window",
+                "start": "2026-09-17T00:00:00Z",
+                "end": "2026-09-17T01:00:00Z",
+            },
+        }))?;
+    let run_id = runner
+        .submit_idempotent::<_, wyrd_spec::verification::StartVerificationRunResponse>(
+            reqwest::Method::POST,
+            "/v1/verification/runs",
+            &run_request,
+        )
+        .await?
+        .run_id;
+    let run: wyrd_spec::verification::VerificationRunStatus = runner
+        .request_json::<(), _>(
+            reqwest::Method::GET,
+            &format!("/v1/verification/runs/{run_id}"),
+            None,
+        )
+        .await?;
+    assert_eq!(run.run_id, run_id, "the run started");
+    writer.shutdown().await?;
+    failures
+        .await_failure(std::time::Duration::from_secs(30))
+        .await?;
+
+    let staged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging \
+          WHERE operation IN ('bifrost.record.write', 'verification.run.start')",
+    )
+    .fetch_one(&superuser)
+    .await?;
+    assert_eq!(staged, 0, "no decision reaches staging while audit fails");
+    server.flush_bifrost().await?;
+    let rows = wyrd_client::Bifrost::query_only(&admin)
+        .sql(&format!("SELECT value FROM {dataset}"), &[])
+        .await?;
+    assert_eq!(
+        rows.num_rows(),
+        1,
+        "the Oracle query serves the durable Gate write while audit fails"
+    );
+    let staged_reads: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_staging \
+          WHERE operation = 'bifrost.query.read_decision' AND principal_id = $1",
+    )
+    .bind(admin_id.as_uuid())
+    .fetch_one(&superuser)
+    .await?;
+    assert_eq!(
+        staged_reads, 0,
+        "the query's decision waits while audit fails"
+    );
+
+    server.pg_fixture().restore_audit_staging().await?;
+    server.await_audit_published(tenant).await?;
+    assert_eq!(
+        server
+            .retained_audit_operation_count(tenant, "bifrost.record.write")
+            .await?,
+        writes_before + 1,
+        "the Gate write's decision commits exactly once after recovery"
+    );
+    assert_eq!(
+        server
+            .retained_audit_operation_count(tenant, "verification.run.start")
+            .await?,
+        starts_before + 1,
+        "the run start's decision commits exactly once after recovery"
+    );
+    await_retained_where(&server, tenant, &admin_reads, 1).await?;
 
     server.shutdown().await?;
     Ok(())

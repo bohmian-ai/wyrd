@@ -4,7 +4,7 @@
 //! sole source of truth for Wyrd auth and transport. LocalFs plans reuse
 //! the authenticated transport; cloud plans (S3/GCS/Azure) go through the
 //! same connection pool via
-//! [`WyrdClient::request_external_stream`], without leaking Wyrd
+//! `WyrdClient::request_external_stream`, without leaking Wyrd
 //! credentials cross-origin.
 
 #![deny(missing_docs)]
@@ -51,6 +51,10 @@ pub struct WyrdStorageClient {
 impl WyrdStorageClient {
     /// Build a storage client that shares the given [`WyrdClient`]'s auth and
     /// transport.
+    ///
+    /// # Arguments
+    ///
+    /// * `client` - Client whose auth, retry policy, base URL, and pool are shared.
     #[must_use]
     pub fn new(client: &WyrdClient) -> Self {
         Self {
@@ -64,6 +68,14 @@ impl WyrdStorageClient {
     /// This is the default no-progress artifact-upload operation exposed to
     /// registry callers. Provider-specific dispatch, part URL minting, backend
     /// outcomes, and the server completion request remain inside this client.
+    ///
+    /// # Arguments
+    ///
+    /// * `upload_id` - Server-assigned id of the upload record to complete.
+    /// * `plan` - Server-minted upload plan selecting the backend protocol and its URLs.
+    /// * `source` - Artifact bytes to upload; its size hint enforces exact-length transfers.
+    /// * `idempotency_key` - Stable key replayed on backend and completion requests so a retry
+    ///   never double-commits.
     ///
     /// # Errors
     /// Returns a storage-client error when the plan is invalid, the source
@@ -87,6 +99,15 @@ impl WyrdStorageClient {
     /// single-request providers report as their request body consumes chunks.
     /// An unknown source size is represented by `None` rather than a sentinel
     /// byte count.
+    ///
+    /// # Arguments
+    ///
+    /// * `upload_id` - Server-assigned id of the upload record to complete.
+    /// * `plan` - Server-minted upload plan selecting the backend protocol and its URLs.
+    /// * `source` - Artifact bytes to upload; its size hint enforces exact-length transfers.
+    /// * `idempotency_key` - Stable key replayed on backend and completion requests so a retry
+    ///   never double-commits.
+    /// * `progress` - Sink receiving cumulative uploaded bytes; `None` reports nothing.
     ///
     /// # Errors
     /// Returns the same errors as [`Self::upload_artifact`].
@@ -185,6 +206,7 @@ impl WyrdStorageClient {
         let path = format!("/v1/cards/upload/{upload_id}/part-url?part_number={part_number}");
         let response: PartUrlResponse = self
             .client
+            .http
             .request_json(reqwest::Method::POST, &path, None::<&()>)
             .await
             .map_err(crate::storage::error::from_authenticated)?;
@@ -208,6 +230,7 @@ impl WyrdStorageClient {
     ) -> Result<UploadCompleteResponse, StorageClientError> {
         let path = format!("/v1/cards/upload/{upload_id}/complete");
         self.client
+            .http
             .submit_with_idempotency_key(reqwest::Method::POST, &path, request, idempotency_key)
             .await
             .map_err(crate::storage::error::from_authenticated)
@@ -241,6 +264,15 @@ impl WyrdStorageClient {
     /// Download an artifact and verify it against the server-declared digest
     /// and byte length.
     ///
+    /// # Arguments
+    ///
+    /// * `plan` - Server-minted download plan with a presigned GET URL or authenticated LocalFs
+    ///   endpoint.
+    /// * `dest` - Local file path the artifact is written to.
+    /// * `expected_sha256` - Server-declared SHA-256 digest, base64-encoded (standard
+    ///   alphabet).
+    /// * `expected_size_bytes` - Server-declared artifact length in bytes.
+    ///
     /// # Errors
     /// Returns [`StorageClientError::VerifyFailed`] when the downloaded bytes
     /// do not match either declared value.
@@ -270,6 +302,16 @@ impl WyrdStorageClient {
     /// This internal-capability seam lets registry loading own artifact
     /// presentation while this client reports cumulative bytes at its streaming
     /// write boundary.
+    ///
+    /// # Arguments
+    ///
+    /// * `plan` - Server-minted download plan with a presigned GET URL or authenticated LocalFs
+    ///   endpoint.
+    /// * `dest` - Local file path the artifact is written to.
+    /// * `expected_sha256` - Server-declared SHA-256 digest, base64-encoded (standard
+    ///   alphabet).
+    /// * `expected_size_bytes` - Server-declared artifact length in bytes.
+    /// * `progress` - Called with cumulative bytes written and the total when known.
     ///
     /// # Errors
     /// Returns [`StorageClientError::VerifyFailed`] when the downloaded bytes

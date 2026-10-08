@@ -26,6 +26,7 @@ use rand::RngCore as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
+use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_oidc::{CodeRedemption, MappedClaims, TrustedIssuer};
 use wyrd_runtime::{PrincipalId, RoleRef};
 use wyrd_spec::DataTenantId;
@@ -43,11 +44,11 @@ use wyrd_sql::queries::auth::{
     user_id_by_identity,
 };
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
-use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
+use wyrd_sql::{SqlError, TenantConn};
 
 use crate::audit::{
-    LOGIN_OPERATION, TOKEN_EXCHANGE_OPERATION, USER_ROLES_SYNC_OPERATION, append_auth_audit,
-    auth_event, auth_failure_code, principal_event, record_auth_audit_best_effort,
+    LOGIN_OPERATION, TOKEN_EXCHANGE_OPERATION, USER_ROLES_SYNC_OPERATION, auth_event,
+    auth_failure_code, principal_event,
 };
 use crate::connections::HumanConnections;
 use crate::error::{relying_party_error, store_error};
@@ -148,7 +149,7 @@ impl AuthorizationCodeExchange {
     /// [`WyrdError::DiscoveryUnavailable`] or
     /// [`WyrdError::AuthVerifyUnavailable`] when the provider or store is
     /// unavailable; and the errors of [`Self::finish_id_token_exchange`].
-    /// Every refusal after the tenant is known is audited best-effort before
+    /// Every refusal after the tenant is known is staged on the audit outbox before
     /// it is returned, and an authorization-request login's refusal after
     /// its state was consumed is returned as [`LoginCompletion::Refused`]
     /// instead. A failure after the consume commit leaves the state spent:
@@ -185,7 +186,7 @@ impl AuthorizationCodeExchange {
         // names no principal.
         match &result {
             Err(error) | Ok(LoginCompletion::Refused { error, .. }) => {
-                audit_authorization_code_failure(postgres, tenant_id, request_id, error).await;
+                audit_authorization_code_failure(self.issuer.audit(), tenant_id, request_id, error);
             }
             Ok(_) => {}
         }
@@ -332,7 +333,8 @@ impl AuthorizationCodeExchange {
     /// those the verified groups map to (unmapped groups and unknown role
     /// names grant nothing; connection default roles are never applied to
     /// human login) and, when that changed the user's durable roles, stages
-    /// one allowed `auth.user.roles.sync` audit event for the User. Finally it
+    /// one allowed `auth.user.roles.sync` audit event for the User after the
+    /// commit. Finally it
     /// records the outcome and commits:
     ///
     /// - an authorization-request login attaches a fresh authorization code
@@ -342,9 +344,9 @@ impl AuthorizationCodeExchange {
     /// - a device login records the principal and connection as the approval
     ///   of its device authorization, which must still be pending.
     ///
-    /// Either outcome appends one allowed `auth.login` event for the User on
-    /// the same transaction, so the login, its roles, and its code or
-    /// approval commit together with their audit or not at all.
+    /// Either outcome stages one allowed `auth.login` event for the User on
+    /// the process audit outbox once the login, its roles, and its code or
+    /// approval have committed together; the audit never fails the login.
     ///
     /// No token is minted here; the token endpoint mints the session when the
     /// code or device code is redeemed.
@@ -362,8 +364,7 @@ impl AuthorizationCodeExchange {
     /// awaits a code or the device authorization was denied, expired, or
     /// deleted meanwhile, the errors of
     /// [`HumanConnections::stamp_test_sign_in`] for a connection test, and the
-    /// store and audit errors; nothing commits unless every step succeeds, so
-    /// a failed audit append leaves no role change, code, or approval.
+    /// store errors; nothing commits unless every step succeeds.
     pub async fn finish_id_token_exchange(
         &self,
         state_hash: &Sha256Hex,
@@ -413,12 +414,9 @@ impl AuthorizationCodeExchange {
         // in Wyrd grants a user a role. Recording it here is what makes the
         // grant table the truth every later token is minted from.
         let role_names = roles.iter().map(RoleRef::as_str).collect::<Vec<_>>();
-        if replace_user_roles(&mut conn, principal_id, &role_names)
+        let roles_changed = replace_user_roles(&mut conn, principal_id, &role_names)
             .await
-            .map_err(store_error)?
-        {
-            append_auth_audit(&mut conn, &roles_sync_event(request_id, principal_id)).await?;
-        }
+            .map_err(store_error)?;
         let completion = match &login_state.initiation {
             LoginInitiation::Authorize(authorization) => {
                 let code = SecretString::from(format!("{tenant_id}.{}", new_code_secret()));
@@ -464,8 +462,12 @@ impl AuthorizationCodeExchange {
                 ));
             }
         };
-        append_auth_audit(&mut conn, &login_event(request_id, principal_id)).await?;
         conn.commit().await.map_err(store_error)?;
+        let audit = self.issuer.audit();
+        if roles_changed {
+            audit.stage(tenant_id, roles_sync_event(request_id, principal_id));
+        }
+        audit.stage(tenant_id, login_event(request_id, principal_id));
         Ok(completion)
     }
 
@@ -487,8 +489,8 @@ impl AuthorizationCodeExchange {
     /// already redeemed, or mismatched code or verifier;
     /// [`WyrdError::AuthVerifyUnavailable`] when the store fails; and the
     /// issuance errors, including a connection that is no longer Active or a
-    /// suspended User. Every refusal for a routed tenant is audited
-    /// best-effort.
+    /// suspended User. Every refusal for a routed tenant is staged on
+    /// the audit outbox.
     pub async fn redeem_code(
         &self,
         code: &SecretBearer,
@@ -513,13 +515,7 @@ impl AuthorizationCodeExchange {
             )
             .await;
         if let Err(error) = &result {
-            audit_authorization_code_failure(
-                self.connections.postgres(),
-                tenant_id,
-                request_id,
-                error,
-            )
-            .await;
+            audit_authorization_code_failure(self.issuer.audit(), tenant_id, request_id, error);
         }
         result
     }
@@ -667,14 +663,14 @@ pub async fn ensure_user_identity(
     Ok(canonical)
 }
 
-/// Best-effort audit of a refused human authorization-code exchange.
+/// Stage the audit of a refused human authorization-code exchange.
 ///
 /// Stages one denied `auth.token.exchange` event carrying the closed failure
-/// code in its own transaction. A refusal rolls back any user it resolved, so
-/// the event names the nil principal. Staging failures are logged, never
-/// returned, so the caller's original error still reaches the client.
-pub async fn audit_authorization_code_failure(
-    postgres: &WyrdPostgres,
+/// code on the process outbox. A refusal rolls back any user it resolved, so
+/// the event names the nil principal. Staging never waits and never fails, so
+/// the caller's original error still reaches the client.
+pub fn audit_authorization_code_failure(
+    audit: &AuditOutbox,
     tenant_id: DataTenantId,
     request_id: &str,
     error: &WyrdError,
@@ -690,7 +686,7 @@ pub async fn audit_authorization_code_failure(
             error_code: auth_failure_code(error),
         },
     );
-    record_auth_audit_best_effort(postgres, tenant_id, &event).await;
+    audit.stage(tenant_id, event);
 }
 
 /// Bind an authorization response to the issuer its login state recorded

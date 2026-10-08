@@ -13,6 +13,13 @@ use crate::conversation::Conversation;
     feature = "python",
     pyo3::pyclass(module = "wyrd.agent", name = "RunConfig", skip_from_py_object)
 )]
+#[cfg_attr(
+    feature = "python",
+    expect(
+        clippy::unsafe_derive_deserialize,
+        reason = "the only unsafe is PyO3's generated glue, which deserialization never reaches"
+    )
+)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunConfig {
     /// Maximum loop iterations before [`crate::AgentError::MaxIterations`].
@@ -133,6 +140,13 @@ impl RunConfig {
         skip_from_py_object
     )
 )]
+#[cfg_attr(
+    feature = "python",
+    expect(
+        clippy::unsafe_derive_deserialize,
+        reason = "the only unsafe is PyO3's generated glue, which deserialization never reaches"
+    )
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
@@ -165,6 +179,13 @@ pub struct RunError {
 #[cfg_attr(
     feature = "python",
     pyo3::pyclass(module = "wyrd.agent", name = "AgentRun", skip_from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    expect(
+        clippy::unsafe_derive_deserialize,
+        reason = "the only unsafe is PyO3's generated glue, which deserialization never reaches"
+    )
 )]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRun {

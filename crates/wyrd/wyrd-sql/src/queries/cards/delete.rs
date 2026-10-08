@@ -16,14 +16,14 @@ use crate::queries::cards::lifecycle::{CardManifestCompletionRow, manifest_compl
 use crate::row_types::cards::{CardRow, CardStatus, ParsedCardRow};
 use crate::tenant_conn::TenantConn;
 
-const SELECT_FOR_DELETE: &str = r#"
+const SELECT_FOR_DELETE: &str = r"
     SELECT card_uid, data_tenant_id, kind, space, name, version,
            spec, spec_hash, artifact_hash, labels, annotations,
            status, created_by, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
     WHERE card_uid = $1
     FOR UPDATE
-"#;
+";
 
 /// Card state captured before a delete transition commits.
 #[derive(Debug, Clone)]
@@ -38,8 +38,8 @@ pub struct CardDeleteState {
 
 /// Soft-delete a card: set `status = 'deleted'`.
 ///
-/// Idempotent on already-deleted cards. The caller records the authorization
-/// audit through the server's outbox write in the same transaction.
+/// Idempotent on already-deleted cards. The caller stages the authorization
+/// decision on the server's audit outbox, outside this transaction.
 ///
 /// # Errors
 /// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when the uid is not present.

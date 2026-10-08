@@ -64,7 +64,7 @@ const SHORTER_DEADLINE_MS: u32 = 10_000;
 const QUERY_TIMEOUT_CODE: &str = "WYRD_VALA_504_QUERY_TIMEOUT";
 
 /// Bound for every wait on a run, a pause, or the upstream.
-const PATIENCE: Duration = Duration::from_secs(60);
+const PATIENCE: Duration = Duration::from_mins(1);
 
 /// Interval between reads of a run or query state being waited on.
 const POLL: Duration = Duration::from_millis(100);
@@ -106,7 +106,7 @@ async fn workflow_forwarded_query_settles_before_the_run_ends() {
         TerminalCause::ShorterDeadline,
         TerminalCause::PodKill,
     ] {
-        prove_forwarded_query_settles(cause)
+        Box::pin(prove_forwarded_query_settles(cause))
             .await
             .unwrap_or_else(|error| panic!("{cause:?}: {error}"));
     }
@@ -120,6 +120,10 @@ async fn workflow_forwarded_query_settles_before_the_run_ends() {
 /// # Errors
 ///
 /// Returns the first claim that broke.
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn prove_forwarded_query_settles(cause: TerminalCause) -> Result<(), JourneyError> {
     let upstream = Upstream::start().await?;
     let mut cluster = PeerCluster::start_with_gateway_provider_root(

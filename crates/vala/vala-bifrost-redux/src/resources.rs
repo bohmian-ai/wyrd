@@ -1221,6 +1221,15 @@ pub struct ScribeResources {
 }
 
 impl ScribeResources {
+    /// Returns the pod's effective CPU count from its checked resource plan.
+    ///
+    /// Persistence sizes its claim-merge lane by it, so concurrent merges never
+    /// ask for more threads than the pod's CPU quota grants.
+    #[must_use]
+    pub(crate) fn effective_cpu(&self) -> usize {
+        self.governor.plan().effective_cpu
+    }
+
     /// Builds an isolated Scribe capability over a production-floor test root.
     ///
     /// Writer and assembly tests charge their materialized buffers against it.
@@ -2056,8 +2065,9 @@ impl BifrostResourceGovernor {
     ///
     /// Returns [`BifrostResourceError::InvalidPlan`] when an override inflates a
     /// detected resource, weakens a minimum floor, or checked plan arithmetic
-    /// cannot fit every enabled role.
-    pub(crate) fn from_snapshot(
+    /// cannot fit every enabled role. Private to this module so the runtime
+    /// resources owner is the only place a root governor is built.
+    fn from_snapshot(
         snapshot: SystemResourceSnapshot,
         policy: BifrostResourcePolicy,
     ) -> Result<Self, BifrostResourceError> {
@@ -3887,10 +3897,15 @@ impl OracleQueryMemoryReservation {
 
 impl Drop for OracleQueryResources {
     /// Releases the complete envelope exactly once and poisons on corruption.
+    ///
+    /// The query's spill directory goes with it, even when the release itself
+    /// fails: a directory is disk, not governed memory, and keeping it would
+    /// only add a second residue to the one the poison already reports.
     fn drop(&mut self) {
         if let Err(error) = self.release() {
             tracing::error!(%error, "Oracle query resource cleanup failed");
         }
+        self.execution.remove_spill_directories();
     }
 }
 
@@ -4093,6 +4108,29 @@ impl OracleExecution {
     #[must_use]
     pub fn runtime(&self) -> &Arc<RuntimeEnv> {
         &self.runtime
+    }
+
+    /// Removes the runtime's `DataFusion` spill directories now.
+    ///
+    /// `DataFusion` removes them only when the last `Arc<RuntimeEnv>` drops,
+    /// and an upstream task context can hold the runtime after its query has
+    /// ended. The query envelope that owns this execution calls this as it
+    /// drops, so the directory ends with the query rather than trailing it.
+    /// A holder that spills afterwards gets an IO error on a query that is
+    /// already over; the runtime's own later cleanup ignores the missing path.
+    /// Failures are logged, never raised, because this runs inside `Drop`.
+    fn remove_spill_directories(&self) {
+        for path in self.runtime.disk_manager.temp_dir_paths() {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "Oracle query spill directory removal failed"
+                ),
+            }
+        }
     }
 
     /// Returns the grant's memory view, the pool of [`Self::runtime`].
@@ -5686,6 +5724,43 @@ mod tests {
                 "detection may only fail through the shared checked stage: {error}"
             ),
         }
+    }
+
+    /// A query's spill directory ends with its envelope, not its runtime.
+    ///
+    /// An upstream task context can hold the query runtime after the query has
+    /// ended; the directory must still go when the envelope drops, so a
+    /// trailing holder can never leave disk behind its released query.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the query runtime has no spill directory, or when one
+    /// survives the envelope while a foreign runtime holder is still alive.
+    #[test]
+    fn query_spill_directory_ends_with_its_envelope_not_its_runtime() {
+        let root = tempfile::tempdir().expect("scratch root");
+        let mut policy = policy(&[BifrostRole::Oracle]);
+        policy.scratch_root = Some(root.path().to_owned());
+        let runtime = BifrostRuntimeResources::from_snapshot(snapshot(2 * 1024 * MIB), policy)
+            .expect("an Oracle plan with a scratch root");
+        let roles = runtime.compose_roles().expect("composition");
+        let oracle = roles.oracle().expect("Oracle capability");
+        let query = oracle
+            .try_acquire_query(analytical_query(0.0))
+            .expect("an idle Oracle admits one analytical query");
+        let holder = Arc::clone(query.execution().runtime());
+        let directories = holder.disk_manager.temp_dir_paths();
+        assert!(
+            !directories.is_empty() && directories.iter().all(|path| path.exists()),
+            "a spilling query owns a live spill directory: {directories:?}"
+        );
+
+        drop(query);
+        assert!(
+            directories.iter().all(|path| !path.exists()),
+            "the envelope removed its spill directory while a holder kept the runtime"
+        );
+        drop(holder);
     }
 
     /// One composition issues every capability from the single retained root.

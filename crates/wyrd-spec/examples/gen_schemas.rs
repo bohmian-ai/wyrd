@@ -1,6 +1,9 @@
-//! Generate JSON schema goldens.
+//! Generate the committed JSON schemas under `crates/wyrd-spec/schemas/`.
+//!
+//! The drift tests and `mise run codegen:check` compare against these files.
 
 use std::error::Error as StdError;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
@@ -91,178 +94,181 @@ use wyrd_spec::verification::{
     VerificationRunStatus,
 };
 
+/// Regenerates every committed wyrd-spec schema, test schema fixture, and the
+/// TypeScript error-code union. Run from the repository root.
+///
+/// # Errors
+/// Returns serialization or filesystem failures from any output.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = Path::new("crates/wyrd-spec/schemas");
-    let golden = Path::new("crates/wyrd-spec/tests/schemas");
     fs::create_dir_all(out)?;
-    fs::create_dir_all(golden)?;
-    ProblemExamples { out, golden }.write()?;
+    write_problem_examples(out)?;
 
-    write::<Card>(out, golden, "card")?;
-    write::<CardKind>(out, golden, "card_kind")?;
-    write::<CardRef>(out, golden, "card_ref")?;
-    write::<RunKind>(out, golden, "run_kind")?;
-    write::<RunRef>(out, golden, "run_ref")?;
-    write::<ServiceLock>(out, golden, "service_lock")?;
-    write::<LockedComponent>(out, golden, "locked_component")?;
-    write::<FieldSpec>(out, golden, "field_spec")?;
-    write::<DataSchema>(out, golden, "data_schema")?;
-    write::<SplitStrategy>(out, golden, "split_strategy")?;
-    write::<DataSplit>(out, golden, "data_split")?;
-    write::<DataInterface>(out, golden, "data_interface")?;
-    write::<SqlLogic>(out, golden, "sql_logic")?;
-    write::<DataStats>(out, golden, "data_stats")?;
-    write::<DataSpec>(out, golden, "data_spec")?;
-    write::<ModelSpec>(out, golden, "model_spec")?;
-    write::<ModelInterface>(out, golden, "model_interface")?;
-    write::<TaskType>(out, golden, "task_type")?;
-    write::<ModelSignature>(out, golden, "model_signature")?;
-    write::<SampleInput>(out, golden, "sample_input")?;
-    write::<SampleInputKind>(out, golden, "sample_input_kind")?;
-    write::<TorchSaveFormat>(out, golden, "torch_save_format")?;
-    write::<TfSaveFormat>(out, golden, "tf_save_format")?;
-    write::<HuggingFaceTask>(out, golden, "hugging_face_task")?;
-    write::<ExperimentSpec>(out, golden, "experiment_spec")?;
-    write::<PromptSpec>(out, golden, "prompt_spec")?;
-    write::<PromptRef>(out, golden, "prompt_ref")?;
-    write::<ParameterName>(out, golden, "parameter_name")?;
-    write::<AgentSpec>(out, golden, "agent_spec")?;
-    write::<WorkflowSpec>(out, golden, "workflow_spec")?;
-    write::<WorkflowRun>(out, golden, "workflow_run")?;
-    write::<CreateWorkflowRunRequest>(out, golden, "create_workflow_run_request")?;
-    write::<CardEvalSpec>(out, golden, "eval_spec")?;
-    write::<DriftSpec>(out, golden, "drift_spec")?;
-    write::<TriggerSpec>(out, golden, "trigger_spec")?;
-    write::<TriggerActivation>(out, golden, "trigger_activation")?;
-    write::<VerifierSpec>(out, golden, "verifier_spec")?;
-    write::<VerifierImplementation>(out, golden, "verifier_implementation")?;
-    write::<VerificationBinding>(out, golden, "verification_binding")?;
-    write::<OperatorSpec>(out, golden, "operator_spec")?;
-    write::<OperatorAction>(out, golden, "operator_action")?;
-    write::<NotifyChannel>(out, golden, "notify_channel")?;
-    write::<HttpMethod>(out, golden, "http_method")?;
-    write::<HttpAuth>(out, golden, "http_auth")?;
-    write::<OperatorBudget>(out, golden, "operator_budget")?;
-    write::<PagerDutySeverity>(out, golden, "pager_duty_severity")?;
-    write::<OperatorFailureContext>(out, golden, "operator_failure_context")?;
-    write::<SourceSpec>(out, golden, "source_spec")?;
-    write::<SourceKind>(out, golden, "source_kind")?;
-    write::<SqlConnection>(out, golden, "sql_connection")?;
-    write::<MetricsConnection>(out, golden, "metrics_connection")?;
-    write::<LogConnection>(out, golden, "log_connection")?;
-    write::<TraceConnection>(out, golden, "trace_connection")?;
-    write::<SourceAuth>(out, golden, "source_auth")?;
-    write::<ServiceSpec>(out, golden, "service_spec")?;
-    write::<ServiceRuntime>(out, golden, "service_runtime")?;
-    write::<ServiceRuntimeKind>(out, golden, "service_runtime_kind")?;
-    write::<ServiceRuntimeMode>(out, golden, "service_runtime_mode")?;
-    write::<ServiceRuntimePolicy>(out, golden, "service_runtime_policy")?;
-    write::<PolicySpec>(out, golden, "policy_spec")?;
-    write::<InvokeContext>(out, golden, "invoke_context")?;
-    write::<InvokeOutcome>(out, golden, "invoke_outcome")?;
-    write::<PolicyDecision>(out, golden, "policy_decision")?;
-    write::<McpSpec>(out, golden, "mcp_spec")?;
-    write::<AuditSpec>(out, golden, "audit_spec")?;
-    write::<ArtifactSpec>(out, golden, "artifact_spec")?;
-    write::<FrameworkAdapterRef>(out, golden, "framework_adapter_ref")?;
-    write::<UploadInitRequest>(out, golden, "upload_init_request")?;
-    write::<UploadInitResponse>(out, golden, "upload_init_response")?;
-    write::<UploadPlan>(out, golden, "upload_plan")?;
-    write::<UploadCompleteRequest>(out, golden, "upload_complete_request")?;
-    write::<UploadCompleteResponse>(out, golden, "upload_complete_response")?;
-    write::<PartUrlResponse>(out, golden, "part_url_response")?;
-    write::<AbortResponse>(out, golden, "abort_response")?;
-    write::<LocalBlobUploadResponse>(out, golden, "local_blob_upload_response")?;
-    write::<DownloadInitRequest>(out, golden, "download_init_request")?;
-    write::<DownloadInitResponse>(out, golden, "download_init_response")?;
-    write::<DownloadPlan>(out, golden, "download_plan")?;
-    write::<WireProtocol>(out, golden, "wire_protocol")?;
-    write::<VerificationGuarantee>(out, golden, "verification_guarantee")?;
+    write::<Card>(out, "card")?;
+    write::<CardKind>(out, "card_kind")?;
+    write::<CardRef>(out, "card_ref")?;
+    write::<RunKind>(out, "run_kind")?;
+    write::<RunRef>(out, "run_ref")?;
+    write::<ServiceLock>(out, "service_lock")?;
+    write::<LockedComponent>(out, "locked_component")?;
+    write::<FieldSpec>(out, "field_spec")?;
+    write::<DataSchema>(out, "data_schema")?;
+    write::<SplitStrategy>(out, "split_strategy")?;
+    write::<DataSplit>(out, "data_split")?;
+    write::<DataInterface>(out, "data_interface")?;
+    write::<SqlLogic>(out, "sql_logic")?;
+    write::<DataStats>(out, "data_stats")?;
+    write::<DataSpec>(out, "data_spec")?;
+    write::<ModelSpec>(out, "model_spec")?;
+    write::<ModelInterface>(out, "model_interface")?;
+    write::<TaskType>(out, "task_type")?;
+    write::<ModelSignature>(out, "model_signature")?;
+    write::<SampleInput>(out, "sample_input")?;
+    write::<SampleInputKind>(out, "sample_input_kind")?;
+    write::<TorchSaveFormat>(out, "torch_save_format")?;
+    write::<TfSaveFormat>(out, "tf_save_format")?;
+    write::<HuggingFaceTask>(out, "hugging_face_task")?;
+    write::<ExperimentSpec>(out, "experiment_spec")?;
+    write::<PromptSpec>(out, "prompt_spec")?;
+    write::<PromptRef>(out, "prompt_ref")?;
+    write::<ParameterName>(out, "parameter_name")?;
+    write::<AgentSpec>(out, "agent_spec")?;
+    write::<WorkflowSpec>(out, "workflow_spec")?;
+    write::<WorkflowRun>(out, "workflow_run")?;
+    write::<CreateWorkflowRunRequest>(out, "create_workflow_run_request")?;
+    write::<CardEvalSpec>(out, "eval_spec")?;
+    write::<DriftSpec>(out, "drift_spec")?;
+    write::<TriggerSpec>(out, "trigger_spec")?;
+    write::<TriggerActivation>(out, "trigger_activation")?;
+    write::<VerifierSpec>(out, "verifier_spec")?;
+    write::<VerifierImplementation>(out, "verifier_implementation")?;
+    write::<VerificationBinding>(out, "verification_binding")?;
+    write::<OperatorSpec>(out, "operator_spec")?;
+    write::<OperatorAction>(out, "operator_action")?;
+    write::<NotifyChannel>(out, "notify_channel")?;
+    write::<HttpMethod>(out, "http_method")?;
+    write::<HttpAuth>(out, "http_auth")?;
+    write::<OperatorBudget>(out, "operator_budget")?;
+    write::<PagerDutySeverity>(out, "pager_duty_severity")?;
+    write::<OperatorFailureContext>(out, "operator_failure_context")?;
+    write::<SourceSpec>(out, "source_spec")?;
+    write::<SourceKind>(out, "source_kind")?;
+    write::<SqlConnection>(out, "sql_connection")?;
+    write::<MetricsConnection>(out, "metrics_connection")?;
+    write::<LogConnection>(out, "log_connection")?;
+    write::<TraceConnection>(out, "trace_connection")?;
+    write::<SourceAuth>(out, "source_auth")?;
+    write::<ServiceSpec>(out, "service_spec")?;
+    write::<ServiceRuntime>(out, "service_runtime")?;
+    write::<ServiceRuntimeKind>(out, "service_runtime_kind")?;
+    write::<ServiceRuntimeMode>(out, "service_runtime_mode")?;
+    write::<ServiceRuntimePolicy>(out, "service_runtime_policy")?;
+    write::<PolicySpec>(out, "policy_spec")?;
+    write::<InvokeContext>(out, "invoke_context")?;
+    write::<InvokeOutcome>(out, "invoke_outcome")?;
+    write::<PolicyDecision>(out, "policy_decision")?;
+    write::<McpSpec>(out, "mcp_spec")?;
+    write::<AuditSpec>(out, "audit_spec")?;
+    write::<ArtifactSpec>(out, "artifact_spec")?;
+    write::<FrameworkAdapterRef>(out, "framework_adapter_ref")?;
+    write::<UploadInitRequest>(out, "upload_init_request")?;
+    write::<UploadInitResponse>(out, "upload_init_response")?;
+    write::<UploadPlan>(out, "upload_plan")?;
+    write::<UploadCompleteRequest>(out, "upload_complete_request")?;
+    write::<UploadCompleteResponse>(out, "upload_complete_response")?;
+    write::<PartUrlResponse>(out, "part_url_response")?;
+    write::<AbortResponse>(out, "abort_response")?;
+    write::<LocalBlobUploadResponse>(out, "local_blob_upload_response")?;
+    write::<DownloadInitRequest>(out, "download_init_request")?;
+    write::<DownloadInitResponse>(out, "download_init_response")?;
+    write::<DownloadPlan>(out, "download_plan")?;
+    write::<WireProtocol>(out, "wire_protocol")?;
+    write::<VerificationGuarantee>(out, "verification_guarantee")?;
 
     // Card registration wire contracts (task 01).
-    write::<CardSubmission>(out, golden, "card_submission")?;
-    write::<ArtifactManifestEntry>(out, golden, "artifact_manifest_entry")?;
-    write::<CardRegistrationOutcome>(out, golden, "card_registration_outcome")?;
-    write::<CardUploadPlan>(out, golden, "card_upload_plan")?;
-    write::<CardUploadEntry>(out, golden, "card_upload_entry")?;
-    write::<CreateCardRequest>(out, golden, "create_card_request")?;
-    write::<CreateCardResponse>(out, golden, "create_card_response")?;
-    write::<RegistrationReplaySeed>(out, golden, "registration_replay_seed")?;
-    write::<RegistrationOperationId>(out, golden, "registration_operation_id")?;
-    write::<RelativeArtifactPath>(out, golden, "relative_artifact_path")?;
-    write::<CardLifecycleStatus>(out, golden, "card_lifecycle_status")?;
-    write::<RegistrationOutcomeKind>(out, golden, "registration_outcome_kind")?;
-    write::<GetCardResponse>(out, golden, "get_card_response")?;
-    write::<DeleteCardResponse>(out, golden, "delete_card_response")?;
-    write::<CardSummary>(out, golden, "card_summary")?;
-    write::<ListCardsRequest>(out, golden, "list_cards_request")?;
-    write::<ListCardsResponse>(out, golden, "list_cards_response")?;
-    write::<ListVersionsResponse>(out, golden, "list_versions_response")?;
-    write::<CardLocator>(out, golden, "card_locator")?;
-    write::<ArtifactInventoryResponse>(out, golden, "artifact_inventory_response")?;
-    write::<StoredArtifactEntry>(out, golden, "stored_artifact_entry")?;
+    write::<CardSubmission>(out, "card_submission")?;
+    write::<ArtifactManifestEntry>(out, "artifact_manifest_entry")?;
+    write::<CardRegistrationOutcome>(out, "card_registration_outcome")?;
+    write::<CardUploadPlan>(out, "card_upload_plan")?;
+    write::<CardUploadEntry>(out, "card_upload_entry")?;
+    write::<CreateCardRequest>(out, "create_card_request")?;
+    write::<CreateCardResponse>(out, "create_card_response")?;
+    write::<RegistrationReplaySeed>(out, "registration_replay_seed")?;
+    write::<RegistrationOperationId>(out, "registration_operation_id")?;
+    write::<RelativeArtifactPath>(out, "relative_artifact_path")?;
+    write::<CardLifecycleStatus>(out, "card_lifecycle_status")?;
+    write::<RegistrationOutcomeKind>(out, "registration_outcome_kind")?;
+    write::<GetCardResponse>(out, "get_card_response")?;
+    write::<DeleteCardResponse>(out, "delete_card_response")?;
+    write::<CardSummary>(out, "card_summary")?;
+    write::<ListCardsRequest>(out, "list_cards_request")?;
+    write::<ListCardsResponse>(out, "list_cards_response")?;
+    write::<ListVersionsResponse>(out, "list_versions_response")?;
+    write::<CardLocator>(out, "card_locator")?;
+    write::<ArtifactInventoryResponse>(out, "artifact_inventory_response")?;
+    write::<StoredArtifactEntry>(out, "stored_artifact_entry")?;
 
     // Auth contracts.
-    write::<TokenRequest>(out, golden, "auth_token_request")?;
-    write::<TokenResponse>(out, golden, "auth_token_response")?;
-    write::<AbsoluteUrl>(out, golden, "auth_url")?;
-    write::<IssuerUrl>(out, golden, "auth_issuer_url")?;
-    write::<LoginInitResponse>(out, golden, "auth_login_init_response")?;
-    write::<CallbackQuery>(out, golden, "auth_callback_query")?;
-    write::<PrincipalKindTag>(out, golden, "auth_principal_kind")?;
-    write::<RevokePrincipalRequest>(out, golden, "auth_revoke_principal_request")?;
+    write::<TokenRequest>(out, "auth_token_request")?;
+    write::<TokenResponse>(out, "auth_token_response")?;
+    write::<AbsoluteUrl>(out, "auth_url")?;
+    write::<IssuerUrl>(out, "auth_issuer_url")?;
+    write::<LoginInitResponse>(out, "auth_login_init_response")?;
+    write::<CallbackQuery>(out, "auth_callback_query")?;
+    write::<PrincipalKindTag>(out, "auth_principal_kind")?;
+    write::<RevokePrincipalRequest>(out, "auth_revoke_principal_request")?;
 
     // Phase 4 section 16: shared security primitives.
-    write::<SecretRef>(out, golden, "security_secret_ref")?;
-    write::<TlsConfig>(out, golden, "security_tls_config")?;
+    write::<SecretRef>(out, "security_secret_ref")?;
+    write::<TlsConfig>(out, "security_tls_config")?;
 
     // Gateway V1 administration, accounting, and capture contracts.
-    write::<GatewayAccess>(out, golden, "auth_gateway_access")?;
-    write::<ProviderCredentialWrite>(out, golden, "gateway_provider_credential_write")?;
-    write::<ProviderCredentialView>(out, golden, "gateway_provider_credential_view")?;
-    write::<ProviderDeployment>(out, golden, "gateway_provider_deployment")?;
-    write::<GatewayFallbackPolicy>(out, golden, "gateway_fallback_policy")?;
-    write::<GatewayFallbackOverride>(out, golden, "gateway_fallback_override")?;
-    write::<GatewayGovernancePolicy>(out, golden, "gateway_governance_policy")?;
-    write::<GatewayCapturePolicyWrite>(out, golden, "gateway_capture_policy_write")?;
-    write::<GatewayCapturePolicy>(out, golden, "gateway_capture_policy")?;
-    write::<GatewayAccountingEntryV1>(out, golden, "gateway_accounting_entry_v1")?;
-    write::<GatewayCallPayloadV1>(out, golden, "gateway_call_payload_v1")?;
-    write::<GatewayAttemptSpanFieldsV1>(out, golden, "gateway_attempt_span_fields_v1")?;
+    write::<GatewayAccess>(out, "auth_gateway_access")?;
+    write::<ProviderCredentialWrite>(out, "gateway_provider_credential_write")?;
+    write::<ProviderCredentialView>(out, "gateway_provider_credential_view")?;
+    write::<ProviderDeployment>(out, "gateway_provider_deployment")?;
+    write::<GatewayFallbackPolicy>(out, "gateway_fallback_policy")?;
+    write::<GatewayFallbackOverride>(out, "gateway_fallback_override")?;
+    write::<GatewayGovernancePolicy>(out, "gateway_governance_policy")?;
+    write::<GatewayCapturePolicyWrite>(out, "gateway_capture_policy_write")?;
+    write::<GatewayCapturePolicy>(out, "gateway_capture_policy")?;
+    write::<GatewayAccountingEntryV1>(out, "gateway_accounting_entry_v1")?;
+    write::<GatewayCallPayloadV1>(out, "gateway_call_payload_v1")?;
+    write::<GatewayAttemptSpanFieldsV1>(out, "gateway_attempt_span_fields_v1")?;
 
     // Stage 3 C2a: Bifrost wire contract (table management + query).
-    write::<BifrostTableEntry>(out, golden, "bifrost_table_entry")?;
-    write::<BifrostTableDescription>(out, golden, "bifrost_table_description")?;
-    write::<TableStatus>(out, golden, "bifrost_table_status")?;
-    write::<DataTypeSpec>(out, golden, "bifrost_data_type_spec")?;
-    write::<BifrostFieldSpec>(out, golden, "bifrost_field_spec")?;
-    write::<TimeUnit>(out, golden, "bifrost_time_unit")?;
-    write::<TimeGranularityWire>(out, golden, "bifrost_time_granularity")?;
-    write::<SortDirectionWire>(out, golden, "bifrost_sort_direction")?;
-    write::<NullOrderWire>(out, golden, "bifrost_null_order")?;
-    write::<SortKeyWire>(out, golden, "bifrost_sort_key")?;
-    write::<PhysicalLayoutWire>(out, golden, "bifrost_physical_layout")?;
-    write::<RegisterTableRequest>(out, golden, "bifrost_register_table_request")?;
-    write::<RegisterOutcome>(out, golden, "bifrost_register_outcome")?;
-    write::<RegisterTableResponse>(out, golden, "bifrost_register_table_response")?;
-    write::<BifrostQueryRequest>(out, golden, "bifrost_query_request")?;
-    write::<RunningQueryLifecycleState>(out, golden, "bifrost_running_query_lifecycle_state")?;
-    write::<RunningQueryProgress>(out, golden, "bifrost_running_query_progress")?;
-    write::<RunningQuerySummary>(out, golden, "bifrost_running_query_summary")?;
-    write::<ListRunningQueriesResponse>(out, golden, "bifrost_list_running_queries_response")?;
-    write::<GetRunningQueryRequest>(out, golden, "bifrost_get_running_query_request")?;
-    write::<CancelRunningQueryRequest>(out, golden, "bifrost_cancel_running_query_request")?;
-    write::<CancelRunningQueryResponse>(out, golden, "bifrost_cancel_running_query_response")?;
-    write::<AuditEvent>(out, golden, "bifrost_audit_event")?;
-    write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;
-    write::<AuditOutcome>(out, golden, "bifrost_audit_outcome")?;
-    write::<StartVerificationRunRequest>(out, golden, "start_verification_run_request")?;
-    write::<StartVerificationRunResponse>(out, golden, "start_verification_run_response")?;
-    write::<VerificationBindingStatus>(out, golden, "verification_binding_status")?;
-    write::<VerificationRunStatus>(out, golden, "verification_run_status")?;
-    write::<CreateOperatorConnectionRequest>(out, golden, "create_operator_connection_request")?;
-    write::<UpdateOperatorConnectionRequest>(out, golden, "update_operator_connection_request")?;
-    write::<OperatorConnectionView>(out, golden, "operator_connection_view")?;
+    write::<BifrostTableEntry>(out, "bifrost_table_entry")?;
+    write::<BifrostTableDescription>(out, "bifrost_table_description")?;
+    write::<TableStatus>(out, "bifrost_table_status")?;
+    write::<DataTypeSpec>(out, "bifrost_data_type_spec")?;
+    write::<BifrostFieldSpec>(out, "bifrost_field_spec")?;
+    write::<TimeUnit>(out, "bifrost_time_unit")?;
+    write::<TimeGranularityWire>(out, "bifrost_time_granularity")?;
+    write::<SortDirectionWire>(out, "bifrost_sort_direction")?;
+    write::<NullOrderWire>(out, "bifrost_null_order")?;
+    write::<SortKeyWire>(out, "bifrost_sort_key")?;
+    write::<PhysicalLayoutWire>(out, "bifrost_physical_layout")?;
+    write::<RegisterTableRequest>(out, "bifrost_register_table_request")?;
+    write::<RegisterOutcome>(out, "bifrost_register_outcome")?;
+    write::<RegisterTableResponse>(out, "bifrost_register_table_response")?;
+    write::<BifrostQueryRequest>(out, "bifrost_query_request")?;
+    write::<RunningQueryLifecycleState>(out, "bifrost_running_query_lifecycle_state")?;
+    write::<RunningQueryProgress>(out, "bifrost_running_query_progress")?;
+    write::<RunningQuerySummary>(out, "bifrost_running_query_summary")?;
+    write::<ListRunningQueriesResponse>(out, "bifrost_list_running_queries_response")?;
+    write::<GetRunningQueryRequest>(out, "bifrost_get_running_query_request")?;
+    write::<CancelRunningQueryRequest>(out, "bifrost_cancel_running_query_request")?;
+    write::<CancelRunningQueryResponse>(out, "bifrost_cancel_running_query_response")?;
+    write::<AuditEvent>(out, "bifrost_audit_event")?;
+    write::<AuthMethod>(out, "bifrost_audit_auth_method")?;
+    write::<AuditOutcome>(out, "bifrost_audit_outcome")?;
+    write::<StartVerificationRunRequest>(out, "start_verification_run_request")?;
+    write::<StartVerificationRunResponse>(out, "start_verification_run_response")?;
+    write::<VerificationBindingStatus>(out, "verification_binding_status")?;
+    write::<VerificationRunStatus>(out, "verification_run_status")?;
+    write::<CreateOperatorConnectionRequest>(out, "create_operator_connection_request")?;
+    write::<UpdateOperatorConnectionRequest>(out, "update_operator_connection_request")?;
+    write::<OperatorConnectionView>(out, "operator_connection_view")?;
     let eval_fixtures = Path::new("crates/wyrd-spec/tests/fixtures/eval/schemas");
     fs::create_dir_all(eval_fixtures)?;
     write_fixture::<EvalSpec>(eval_fixtures, "eval_spec")?;
@@ -315,10 +321,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Returns filesystem failures writing `path`.
 fn write_ts_error_codes(path: &Path) -> Result<(), Box<dyn StdError>> {
     let codes: std::collections::BTreeSet<&str> = WyrdError::codes().into_iter().collect();
-    let variants: String = codes
-        .iter()
-        .map(|code| format!("\n  | \"{code}\""))
-        .collect();
+    let variants = codes.iter().fold(String::new(), |mut variants, code| {
+        write!(variants, "\n  | \"{code}\"").expect("writing to a String cannot fail");
+        variants
+    });
     fs::write(
         path,
         format!(
@@ -330,16 +336,21 @@ fn write_ts_error_codes(path: &Path) -> Result<(), Box<dyn StdError>> {
     Ok(())
 }
 
+/// Writes `T`'s JSON schema to `out/<name>.json` with the 2020-12 meta-schema.
+///
+/// The bytes match what the in-crate drift tests regenerate, so a changed
+/// wire type shows up as a drift until this generator is rerun.
+///
+/// # Errors
+/// Returns serialization or filesystem failures.
 fn write<T: schemars::JsonSchema>(
     out: &Path,
-    golden: &Path,
     name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut schema = schema_for!(T);
     schema.meta_schema = Some("https://json-schema.org/draft/2020-12/schema".to_string());
     let json = serde_json::to_string_pretty(&schema)?;
     fs::write(out.join(format!("{name}.json")), format!("{json}\n"))?;
-    fs::write(golden.join(format!("{name}.json")), format!("{json}\n"))?;
     Ok(())
 }
 
@@ -354,90 +365,81 @@ fn write_fixture<T: schemars::JsonSchema>(
     Ok(())
 }
 
-/// Exports safe BFF examples using the same error projection as the Rust server.
-struct ProblemExamples<'a> {
-    /// Public generated contract directory.
-    out: &'a Path,
-    /// Golden directory checked by the existing codegen lane.
-    golden: &'a Path,
-}
-
-impl ProblemExamples<'_> {
-    /// Write catalog-derived examples without duplicating wire metadata.
-    ///
-    /// # Errors
-    /// Returns serialization or filesystem failures from either output.
-    fn write(&self) -> Result<(), Box<dyn StdError>> {
-        let examples = [
-            (
-                "validation",
-                WyrdError::Validation {
-                    message: String::new(),
-                    details: json!({}),
-                },
-            ),
-            (
-                "notFound",
-                WyrdError::NotFound {
-                    message: String::new(),
-                    details: json!({}),
-                },
-            ),
-            (
-                "conflict",
-                WyrdError::Conflict {
-                    message: String::new(),
-                    details: json!({}),
-                },
-            ),
-            (
-                "unauthenticated",
-                WyrdError::Unauthenticated {
-                    message: String::new(),
-                    details: json!({}),
-                },
-            ),
-            (
-                "expired",
-                WyrdError::TokenExpired {
-                    message: String::new(),
-                    details: json!({}),
-                },
-            ),
-            (
-                "denied",
-                WyrdError::PermissionDeniedRbac {
-                    message: String::new(),
-                    details: json!({}),
-                },
-            ),
-            (
-                "internal",
-                WyrdError::Internal {
-                    message: String::new(),
-                    details: json!({}),
-                },
-            ),
-            (
-                "upstream",
-                WyrdError::UpstreamFailure {
-                    message: String::new(),
-                    details: json!({}),
-                },
-            ),
-        ];
-        let mut catalog = Map::new();
-        for (name, error) in examples {
-            let mut value = error.as_problem_json();
-            value["detail"] = Value::from(error.title());
-            catalog.insert(name.to_owned(), value);
-        }
-        let output = to_string_pretty(&sort_keys(Value::Object(catalog)))? + "\n";
-        for directory in [self.out, self.golden] {
-            fs::write(directory.join("ui_problem_examples.json"), &output)?;
-        }
-        Ok(())
+/// Exports safe BFF examples to `out` using the same error projection as the Rust server.
+///
+/// The UI imports `ui_problem_examples.json` so its problem payloads match the
+/// derive-backed catalog without duplicating wire metadata.
+///
+/// # Errors
+/// Returns serialization or filesystem failures.
+fn write_problem_examples(out: &Path) -> Result<(), Box<dyn StdError>> {
+    let examples = [
+        (
+            "validation",
+            WyrdError::Validation {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "notFound",
+            WyrdError::NotFound {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "conflict",
+            WyrdError::Conflict {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "unauthenticated",
+            WyrdError::Unauthenticated {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "expired",
+            WyrdError::TokenExpired {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "denied",
+            WyrdError::PermissionDeniedRbac {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "internal",
+            WyrdError::Internal {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+        (
+            "upstream",
+            WyrdError::UpstreamFailure {
+                message: String::new(),
+                details: json!({}),
+            },
+        ),
+    ];
+    let mut catalog = Map::new();
+    for (name, error) in examples {
+        let mut value = error.as_problem_json();
+        value["detail"] = Value::from(error.title());
+        catalog.insert(name.to_owned(), value);
     }
+    let output = to_string_pretty(&sort_keys(Value::Object(catalog)))? + "\n";
+    fs::write(out.join("ui_problem_examples.json"), output)?;
+    Ok(())
 }
 
 /// Rebuilds `value` with every object's keys in sorted order.

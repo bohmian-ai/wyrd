@@ -250,6 +250,7 @@ impl QueryArguments {
     /// Project the SQL and optional deadline onto the public query request.
     pub(crate) fn to_request(&self) -> BifrostQueryRequest {
         BifrostQueryRequest {
+            params: Vec::new(),
             sql: self.sql.clone(),
             deadline_ms: self.deadline_ms.map(i64::from),
         }
@@ -453,7 +454,7 @@ impl ResultCollector {
                         }
                         Err(error) => {
                             stream.request_cancel();
-                            return Err(super::service::arrow_decode_error(&error));
+                            return Err(super::service::arrow_decode_error(error));
                         }
                     }
                 }
@@ -462,7 +463,7 @@ impl ResultCollector {
                         Ok(decoded) => decoded,
                         Err(error) => {
                             stream.request_cancel();
-                            return Err(super::service::arrow_decode_error(&error));
+                            return Err(super::service::arrow_decode_error(error));
                         }
                     };
                     let count = u64::try_from(decoded.num_rows())
@@ -500,7 +501,7 @@ impl ResultCollector {
                     }
                     if let Err(error) = ipc.accept_eos(&frame.arrow_ipc_eos) {
                         stream.request_cancel();
-                        return Err(super::service::arrow_decode_error(&error));
+                        return Err(super::service::arrow_decode_error(error));
                     }
                     terminal = Some(project_terminal(&frame));
                     *observed = Some(frame);

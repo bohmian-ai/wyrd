@@ -1,6 +1,6 @@
-"""Structured output pipeline with typed wire callbacks."""
+"""Structured output with typed wire callbacks."""
 
-from wyrd import Agent, Prompt, ProviderRequest, ProviderResponse, Workflow
+from wyrd import Agent, Prompt, ProviderRequest, ProviderResponse
 
 
 def log_request(ctx: object, request: ProviderRequest) -> None:
@@ -31,20 +31,10 @@ def main() -> None:
         before_model_callback=log_request,
         after_model_callback=log_response,
     )
-    writer = Agent(
-        name="writer",
-        prompt=Prompt(provider="mock", model="mock-model", messages=["Brief: ${summary}"]),
-    )
-    wf = (
-        Workflow.sequential("demo", planner, writer)
-        .with_step_inputs("writer", {"summary": "steps.planner.output.structured.summary"})
-        .with_outputs(
-            {"plan": "steps.planner.output.structured", "brief": "steps.writer.output.text"}
-        )
-    )
-    run = wf.run()
-    print("status:", run.status)
-    print("outputs:", run.outputs)
+    # The mock provider answers with the user message, so this is the plan.
+    run = planner.run(r'{"summary":"mock summary","steps":["read","write"]}')
+    print("finish:", run.finish_reason)
+    print("plan:", run.structured_output)
 
 
 if __name__ == "__main__":

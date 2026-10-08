@@ -59,8 +59,7 @@ fn should_inject_instance(response: &Response) -> bool {
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.starts_with("application/problem+json"))
-        .unwrap_or(false)
+        .is_some_and(|ct| ct.starts_with("application/problem+json"))
 }
 
 async fn inject_instance(
@@ -68,9 +67,8 @@ async fn inject_instance(
     request_id: &wyrd_spec::request_id::RequestId,
 ) -> Response {
     let (mut parts, body) = response.into_parts();
-    let bytes = match axum::body::to_bytes(body, 1024 * 1024).await {
-        Ok(b) => b,
-        Err(_) => return Response::from_parts(parts, Body::empty()),
+    let Ok(bytes) = axum::body::to_bytes(body, 1024 * 1024).await else {
+        return Response::from_parts(parts, Body::empty());
     };
     let mut json: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,

@@ -76,7 +76,7 @@ pub async fn renew_lease_fenced(
     // Dynamic query is intentional: maintenance leases are a cross-tenant
     // control-plane table accessed via the operator pool (BYPASSRLS).
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE vala.maintenance_leases
            SET expires_at     = now() + ($4 * interval '1 second'),
                heartbeat_at   = now()
@@ -84,7 +84,7 @@ pub async fn renew_lease_fenced(
            AND owner          = $2
            AND fencing_token  = $3
            AND expires_at     > now()
-        "#,
+        ",
     )
     .bind(lease_key)
     .bind(owner)
@@ -112,12 +112,12 @@ pub async fn release_lease_fenced(
     fencing_token: i64,
 ) -> Result<bool, SqlError> {
     let result = sqlx::query(
-        r#"
+        r"
         DELETE FROM vala.maintenance_leases
          WHERE lease_key = $1
            AND owner = $2
            AND fencing_token = $3
-        "#,
+        ",
     )
     .bind(lease_key)
     .bind(owner)
@@ -164,7 +164,7 @@ pub async fn try_acquire_lease(
     // in `renew_lease` requires (owner, fencing_token) match). A different
     // owner is still blocked until the current owner's lease expires.
     let acquisition = sqlx::query_as::<_, (i64, bool)>(
-        r#"
+        r"
         WITH clock AS MATERIALIZED (
           SELECT statement_timestamp() AS now
         ),
@@ -206,7 +206,7 @@ pub async fn try_acquire_lease(
                ) AS takeover
         FROM acquired
         CROSS JOIN decision
-        "#,
+        ",
     )
     .bind(lease_key)
     .bind(owner)

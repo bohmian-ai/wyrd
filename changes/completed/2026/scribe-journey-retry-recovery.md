@@ -17,4 +17,3 @@ Current owners and evidence:
 - [Bifrost design](../../../architecture/bifrost-design.md).
 - [Scribe implementation](../../../crates/vala/vala-bifrost-redux/src/scribe).
 - [Retry and recovery journey](../../../crates/wyrd/wyrd-testing/tests/bifrost/scribe/source_boundary_recovery.rs) and [Scribe journey family](../../../crates/wyrd/wyrd-testing/tests/bifrost/scribe).
-

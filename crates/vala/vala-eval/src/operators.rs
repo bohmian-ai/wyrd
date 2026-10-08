@@ -79,7 +79,17 @@ pub fn evaluate_operator(
     op: &ComparisonOperator,
     right: &Value,
 ) -> Result<OperatorVerdict, EvalExecError> {
-    use ComparisonOperator::*;
+    use ComparisonOperator::{
+        AllOf, AnyOf, ApproximatelyEquals, BetweenPercentiles, Contains, ContainsIgnoreCase,
+        CosineSimilarityAtLeast, DivergenceLessThan, EndsWith, Equals, GreaterThan,
+        GreaterThanOrEquals, HasMaxLength, HasMinLength, In, InRange, IsBoolean, IsDisjoint,
+        IsEmail, IsEmpty, IsFalsy, IsIpv4, IsIpv6, IsJson, IsNegative, IsNonEmpty, IsNotNull,
+        IsNull, IsNumber, IsObject, IsPositive, IsString, IsSubset, IsSuperset, IsTruthy, IsType,
+        IsUrl, IsUuid, IsZero, Length, LengthGreaterThan, LengthLessThan, LessThan,
+        LessThanOrEquals, MatchesRegex, NoneOf, NotContains, NotEquals, NotIn, NotInRange,
+        NotMatchesRegex, StartsWith, UniqueValues, WithinAbsTolerance, WithinPctTolerance,
+        WithinStdDev,
+    };
 
     match op {
         Equals => Ok(OperatorVerdict::outcome(
@@ -507,15 +517,17 @@ fn json_kind(v: &Value) -> &'static str {
 }
 
 fn json_num(n: f64) -> Value {
-    serde_json::Number::from_f64(n)
-        .map(Value::Number)
-        .unwrap_or(Value::Null)
+    serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number)
 }
 
 fn str_val(s: &str) -> Value {
     Value::String(s.to_string())
 }
 
+#[expect(
+    clippy::float_cmp,
+    reason = "JSON number equality is exact by contract: 1 and 1.0 match, 0.1 + 0.2 does not equal 0.3"
+)]
 fn json_equals(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Number(_), Value::Number(_)) => match (a.as_f64(), b.as_f64()) {
@@ -670,7 +682,7 @@ fn is_truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
-        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
         Value::String(s) => !s.is_empty(),
         Value::Array(a) => !a.is_empty(),
         Value::Object(o) => !o.is_empty(),

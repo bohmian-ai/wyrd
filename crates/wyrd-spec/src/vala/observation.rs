@@ -209,9 +209,6 @@ mod observation_tests {
 
         use schemars::schema_for;
 
-        let dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/observation/schemas");
-
         fn assert_schema_matches<T: schemars::JsonSchema>(dir: &std::path::Path, name: &str) {
             let mut schema = schema_for!(T);
             schema.meta_schema = Some("https://json-schema.org/draft/2020-12/schema".to_string());
@@ -231,6 +228,9 @@ mod observation_tests {
                 "schema drift in {name}.schema.json; run mise run codegen:regen"
             );
         }
+
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/observation/schemas");
 
         assert_schema_matches::<ObservationEnvelope>(&dir, "observation_envelope");
         assert_schema_matches::<ObservationKind>(&dir, "observation_kind");

@@ -47,7 +47,6 @@ vala-drift = { path = "crates/vala/vala-drift", version = "0.0.1" }
 vala-eval = { path = "crates/vala/vala-eval", version = "0.0.1" }
 wyrd-utils = { path = "crates/shared/wyrd-utils", version = "0.0.1" }
 wyrd-version = { path = "crates/shared/wyrd-version", version = "0.0.1" }
-wyrd-test-contract-macros = { path = "crates/shared/wyrd-test-contract-macros", version = "0.0.1" }
 wyrd-error-derive = { path = "crates/shared/wyrd-error-derive", version = "0.0.1" }
 wyrd-config = { path = "crates/wyrd/wyrd-config", version = "0.0.1" }
 wyrd-crypt = { path = "crates/shared/wyrd-crypt", version = "0.0.1" }
@@ -80,6 +79,7 @@ clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "query", "rustls-no-provider", "gzip", "brotli", "stream", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"] }
 # Test-only certificate authority used by the Bifrost peer harnesses to mint a
 # CA plus one distinct dual-EKU leaf per simulated replica. Never a production
 # dependency: Wyrd does not issue certificates.
@@ -133,7 +133,6 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 chrono-tz = "0.10"
 croner = { version = "4", default-features = false, features = ["chrono"] }
 dashmap = "6.1"
-crossbeam-queue = "0.3"
 flate2 = "1.*"
 zstd = "0.13"
 walkdir = "2.*"
@@ -193,7 +192,7 @@ wyrd-telemetry = { path = "crates/shared/wyrd-telemetry", version = "0.0.1" }
 arc-swap = "1.7"
 # Client-safe baseline (no `transport`/`server` → no axum). `wyrd-tonic` adds the
 # client `channel`/`tls` features and gates `tonic/server` behind its `server`
-# feature. Only `wyrd-tonic` may depend on tonic (check:no-tonic-outside-wyrd-tonic).
+# feature. Only `wyrd-tonic` depends on tonic.
 tonic = { version = "0.14", default-features = false, features = ["codegen"] }
 tonic-health = "0.14"
 tonic-reflection = "0.14"
@@ -236,20 +235,20 @@ lru = "=0.12.5"
 datafusion = "=55.0.0"
 datafusion-proto = "=55.0.0"
 parquet = "59.2"
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a" }
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
-iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f" }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a" }
 # Non-blocking local-filesystem Iceberg storage for Scribe staged-run reads;
 # already in the graph through the managed compaction core.
-iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "330fe331b5a312ed60d9ff6760100137a83a934f", default-features = false, features = ["opendal-fs"] }
+iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "97c32f6377cbdfe51dbeb69e77a2a726669de93a", default-features = false, features = ["opendal-fs"] }
 # FINAL_CORE_SHA. The managed compaction core Forge plans and rewrites through.
 # It resolves the same SCRIBE_ICEBERG_SHA iceberg crates and the same DataFusion
 # 55 / Arrow 59 line as the workspace, so embedding it adds no second native
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "6773e192c995d4d9423536f44f05f99b6ea81e5a" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "4e9f325d993d900bcdec2fa74239c6a6173f49cd" }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.
@@ -262,15 +261,33 @@ unsafe_code = "deny"
 pedantic = { level = "warn", priority = -1 }
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
+doc_markdown = "allow"
+# A length heuristic: end-to-end journey tests read as one sequence.
+too_many_lines = "allow"
+# Fires on `map_err(convert)` converters and PyO3 `Py<T>` arguments, where a
+# reference makes the call site worse.
+needless_pass_by_value = "allow"
 # Idiomatic Rust for namespaced crates (wyrd_cards::CardRef, skald_agent::AgentSpec, etc.);
 # the "repetition" is the crate namespace, not accidental noise. Blanket-allowed to
 # avoid 11+ per-crate `#![allow]` lines and per-site `// justification:` overhead.
 module_name_repetitions = "allow"
+# Flags readable pairs such as `decoder`/`decoded` and `owned`/`owner`.
+similar_names = "allow"
+# AGENTS.md puts owner workflows on the owning struct even when a method
+# reads no field; this lint pushes the opposite shape.
+unused_self = "allow"
+# Integer-to-float conversions of counts, sizes, and durations stay exact up
+# to 2^53; the truncating, sign-losing, and wrapping cast lints stay on.
+cast_precision_loss = "allow"
+# Fallible calls propagate errors outside tests; see clippy.toml.
+unwrap_used = "warn"
+# Every lint suppression states why it is sound.
+allow_attributes_without_reason = "warn"
 
-# Third-party dependencies keep file:line tables for backtraces but drop full
-# debug info, shrinking target/ and link time for every dev and test binary.
-# Workspace crates keep full debug info.
-[profile.dev.package."*"]
+# Dev and test binaries keep file:line tables for backtraces but drop full
+# debug info. Every test binary statically links the whole dependency cone, so
+# full debug info costs gigabytes of linker memory and target/ per binary.
+[profile.dev]
 debug = "line-tables-only"
 
 # Local image builds, test lanes, and benchmarks. Four codegen units recover

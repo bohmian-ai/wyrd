@@ -20,7 +20,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
@@ -30,18 +29,14 @@ use tracing_subscriber::fmt::format::FmtSpan;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_sql::ValaPostgres;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
-use wyrd_client::config::ClientConfig;
-use wyrd_client::{Bifrost as BifrostClient, WyrdClient};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::{
     AttemptRecord, AttemptResult, AttemptUsage, CallExecution, CallPlan, CredentialResolver,
     DeploymentHealth, FailureClass, GatewayCost, GatewayEngine, IngressDialect, ManagedSecretKeys,
     MediaAnswer, ProviderAttempt, ProviderDispatch, ProviderSecret, ResponseBody, ResponseCapture,
 };
-use wyrd_queue::{MockSink, QueueConfig};
 use wyrd_runtime::{
     Action, Permission, PermissionSet, Principal, PrincipalId, PrincipalKind, Resource, RoleRef,
 };
@@ -65,11 +60,15 @@ use wyrd_sql::row_types::gateway::GatewayBatchRow;
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
 use super::capture::object_path;
+use super::capture::recording::RecordingScribe;
 use super::ledger::{GatewayLedger, LedgerCall};
 use super::pg_administration_tests::{
-    admin, audit_decisions, await_lock_waiters, keyring, managed_keys, state_with_vala, test_state,
+    admin, audit_decisions, await_lock_waiters, keyring, managed_keys, test_state,
 };
-use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
+use super::{
+    GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayCapture,
+    GatewayInvocation,
+};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::{AppState, LimitsConfig};
@@ -692,20 +691,26 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
         dispatched,
         "no refusal reached the provider"
     );
+    drain_gateway(&state).await;
+    drain_gateway(&restarted).await;
+    drain_gateway(&rotated).await;
+    drain_gateway(&unconfigured).await;
+    drain_gateway(&retired).await;
+    drain_gateway(&foreign).await;
 }
 
-/// An authorized invoke dispatches without waiting on its own audit append,
-/// and an append that cannot commit neither refuses the call nor leaves a row.
+/// An authorized invoke dispatches without waiting on its own audit commit,
+/// and a commit that cannot land neither refuses the call nor is lost.
 ///
-/// The invocation audit is deliberately non-blocking: the decision is staged
-/// on the gateway task tracker that shutdown drains, so an unreachable audit
-/// database costs the call nothing. Administration keeps the opposite,
-/// transactional contract.
+/// The invocation audit is non-blocking: the decision is staged on the
+/// process audit outbox, so a failing audit write costs the call nothing. The
+/// failed write is counted and retried, and the decision commits exactly once
+/// when staging recovers.
 ///
 /// # Panics
 ///
-/// Panics when the invoke fails, waits for the unreachable audit database, or
-/// leaves an audit decision behind.
+/// Panics when the invoke fails, waits for the failing audit write, stages a
+/// decision while audit fails, or does not commit it once after recovery.
 #[tokio::test]
 async fn gateway_invocation_dispatches_without_waiting_for_the_audit_append() {
     let recorder = SeriesRecorder::default();
@@ -713,22 +718,17 @@ async fn gateway_invocation_dispatches_without_waiting_for_the_audit_append() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let healthy = replica(&fixture, dispatch.clone()).await;
-    configure(&healthy, tenant, json!([]), json!([]), "allow_unpriced").await;
+    let state = replica(&fixture, dispatch.clone()).await;
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    drain_gateway(&state).await;
     let before = audit_decisions(&fixture, tenant).await;
-    let unreachable = PgPoolOptions::new()
-        .acquire_timeout(Duration::from_secs(2))
-        .connect_lazy_with(PgConnectOptions::new().host("127.0.0.1").port(1));
-    let broken = state_with_vala(&fixture, ValaPostgres::from_pool(unreachable))
+    fixture
+        .fail_audit_staging()
         .await
-        .with_gateway_engine(GatewayEngine::new(
-            CredentialResolver::default(),
-            DeploymentHealth::default(),
-            dispatch.clone(),
-        ));
+        .expect("audit failure installs");
     dispatch.push(Step::Return(completed(10, 5)));
     let started = std::time::Instant::now();
-    GatewayInvocation::new(&broken)
+    GatewayInvocation::new(&state)
         .invoke(
             &invoker(tenant, 1, [model_access("acme/a")]),
             request("acme/a", None, Duration::from_secs(10)),
@@ -737,24 +737,48 @@ async fn gateway_invocation_dispatches_without_waiting_for_the_audit_append() {
         .expect("an unaudited allow still dispatches");
     assert!(
         started.elapsed() < Duration::from_secs(2),
-        "the call waited for the unreachable audit database"
+        "the call waited for the failing audit write"
     );
     assert_eq!(dispatch.seen(), ["dep-a"]);
 
-    // The failed append is tracked work: it drains on shutdown, is counted and
-    // logged there, and persists no decision.
-    broken.gateway_tasks.close();
-    tokio::time::timeout(Duration::from_secs(30), broken.gateway_tasks.wait())
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !recorder
+        .series
+        .lock()
+        .expect("series")
+        .contains("outbox_write_failures_total{outbox=audit}")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the failed audit write is counted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        audit_decisions(&fixture, tenant).await,
+        before,
+        "nothing is staged while audit fails"
+    );
+    let queued = state.audit_outbox.pending();
+    fixture
+        .restore_audit_staging()
         .await
-        .expect("the staged audit append drains");
-    assert_eq!(audit_decisions(&fixture, tenant).await, before);
-    assert!(
-        recorder
-            .series
-            .lock()
-            .expect("series")
-            .contains("gateway_audit_commit_failures_total{}"),
-        "the failed append is counted"
+        .expect("audit staging restores");
+    drain_gateway(&state).await;
+    let after = audit_decisions(&fixture, tenant).await;
+    let recovered = &after[before.len()..];
+    assert_eq!(
+        recovered.len(),
+        queued,
+        "every queued decision commits exactly once: {recovered:?}"
+    );
+    assert_eq!(
+        recovered
+            .iter()
+            .filter(|decision| *decision == &("gateway.invoke".to_owned(), "allowed".to_owned()))
+            .count(),
+        1,
+        "the invoke's allowance commits exactly once: {recovered:?}"
     );
 }
 
@@ -894,6 +918,8 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     .expect("call entries counted");
     conn.commit().await.expect("count commits");
     assert_eq!(calls, 3, "internal and public calls share one ledger");
+    drain_gateway(&fresh).await;
+    drain_gateway(&state).await;
 }
 
 /// Two replicas share limits and budgets: a parked call's concurrency lease
@@ -986,6 +1012,8 @@ async fn gateway_admission_holds_limits_and_budgets_across_replicas() {
         .await
         .expect("accounting releases the lease");
     assert_eq!(second.seen(), ["dep-a", "dep-a"]);
+    drain_gateway(&a).await;
+    drain_gateway(&b).await;
 }
 
 /// The ledger fences replays, admission reconciles an abandoned expired
@@ -1089,6 +1117,7 @@ async fn gateway_ledger_fences_replays_and_settles_unknown_cost() {
         "a replayed call entry is fenced"
     );
     assert_eq!(entries(&fixture, tenant, call_id).await.len(), ledger.len());
+    drain_gateway(&state).await;
 }
 
 /// A reservation covers every billable `(candidate, deployment)` attempt, a
@@ -1165,6 +1194,8 @@ async fn gateway_budget_reservations_cover_attempts_in_exact_periods() {
     let (actual, released) = settlement(&ledger);
     assert_cost(actual, "0");
     assert_cost(released, "0.012");
+    drain_gateway(&state).await;
+    drain_gateway(&fresh).await;
 }
 
 /// A token limit holds the call's bounded token exposure at admission so a
@@ -1294,6 +1325,7 @@ async fn gateway_token_limits_hold_exposure_in_the_admission_window() {
     conn.commit().await.expect("window read commits");
     assert_eq!(admitted_window, 42);
     assert_eq!(window_tokens(&fixture, tenant).await, 150 + 150 + 42);
+    drain_gateway(&state).await;
 }
 
 /// Model-targeted token limits settle only the attempts their target covers:
@@ -1418,6 +1450,7 @@ async fn gateway_targeted_token_limits_settle_covered_attempts_only() {
         conn.commit().await.expect("call commits");
         assert_eq!((window("acme/a").await, window("acme/b").await), expected);
     }
+    drain_gateway(&state).await;
 }
 
 /// Races [`RACE_CALLS`] bounded, priced calls across two replicas under
@@ -1450,7 +1483,7 @@ async fn race_admissions(limits: Value, budgets: Value) -> (usize, Vec<WyrdError
     ];
     configure(&replicas[0], tenant, limits, budgets, "allow_unpriced").await;
 
-    let superuser = fixture.superuser_pool().await.expect("superuser pool");
+    let superuser = fixture.superuser_pool().expect("superuser pool");
     let mut barrier = superuser.begin().await.expect("barrier begins");
     sqlx::query("LOCK TABLE wyrd.gateway_accounting_entries IN SHARE MODE")
         .execute(&mut *barrier)
@@ -1487,6 +1520,9 @@ async fn race_admissions(limits: Value, budgets: Value) -> (usize, Vec<WyrdError
         joined
             .expect("call task joins")
             .expect("admitted call completes");
+    }
+    for replica in &replicas {
+        drain_gateway(replica).await;
     }
     (admitted, rejected)
 }
@@ -1552,6 +1588,15 @@ async fn gateway_simultaneous_admissions_across_replicas_never_oversubscribe() {
 /// or when a call, stream, refusal, rejection, or accounting assertion differs.
 #[tokio::test]
 async fn gateway_onboards_compatible_provider_at_runtime() {
+    // Every JSON family refuses a missing or mistyped required member with
+    // the stable error envelope before dispatch.
+    type Handler = fn(
+        State<AppState>,
+        Result<Caller, WyrdErrorResponse>,
+        Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = axum::response::Response> + Send>,
+    >;
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let upstream = MockServer::start().await;
@@ -1856,15 +1901,6 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         assert_eq!(received, expected, "the Responses body round-trips");
     }
 
-    // Every JSON family refuses a missing or mistyped required member with
-    // the stable error envelope before dispatch.
-    type Handler = fn(
-        State<AppState>,
-        Result<Caller, WyrdErrorResponse>,
-        Result<Json<Value>, axum::extract::rejection::JsonRejection>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = axum::response::Response> + Send>,
-    >;
     let model_name = "deepseek/deepseek-chat";
     let cases: [(Handler, Value, &str); 8] = [
         (
@@ -2316,6 +2352,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         dispatched,
         "drain dispatches nothing new"
     );
+    drain_gateway(&state).await;
 }
 
 /// Serves one streaming chat answer that sends `frame` and then holds the
@@ -2777,6 +2814,8 @@ async fn gateway_batches_converge_replays_on_one_upstream_batch() {
     let kept =
         super::routes::get_batch(State(a.clone()), Ok(caller), axum::extract::Path(batch_id)).await;
     assert_eq!(kept.status(), StatusCode::OK);
+    drain_gateway(&a).await;
+    drain_gateway(&b).await;
 }
 
 /// Stores the `deepseek-batch` deployment serving `deepseek/deepseek-chat`
@@ -3017,38 +3056,25 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
     let status = replayed.status();
     assert_eq!(status, StatusCode::OK, "{}", body_json(replayed).await);
     assert_eq!(created().await, 4);
+    drain_gateway(&a).await;
+    drain_gateway(&b).await;
+    drain_gateway(&c).await;
+    drain_gateway(&d).await;
 }
 
-/// Installs a mock-sink capture producer for `tenant` on `state`, returning
-/// the producer and the sink its batches land in.
-async fn capture_sink(
-    state: &AppState,
-    tenant: DataTenantId,
-) -> (Arc<BifrostClient>, Arc<MockSink>) {
-    let sink = Arc::new(MockSink::new());
-    let client = WyrdClient::with_config(ClientConfig {
-        credential: Some(secrecy::SecretString::from("secret")),
-        ..ClientConfig::default()
-    })
-    .expect("client assembles without IO");
-    let producer = Arc::new(BifrostClient::with_sink(
-        &client,
-        None,
-        Arc::clone(&sink) as _,
-        QueueConfig::default(),
-    ));
-    state
-        .gateway_capture
-        .install(tenant, Arc::clone(&producer))
-        .await;
-    (producer, sink)
+/// Routes `state`'s capture writer to a recording Scribe standing in for the
+/// pod's own, returning the state and the Scribe its batches land in.
+fn recorded(mut state: AppState) -> (AppState, Arc<RecordingScribe>) {
+    let scribe = Arc::new(RecordingScribe::default());
+    state.gateway_capture = Arc::new(GatewayCapture::local(Arc::clone(&scribe) as _));
+    (state, scribe)
 }
 
-/// Waits for every spawned gateway task — the staged invocation audit append,
-/// accounting, and post-answer capture — then reopens the tracker.
+/// Waits for every spawned gateway task — accounting and post-answer
+/// capture — then reopens the tracker, and settles the audit outbox.
 ///
 /// Invocation audit is non-blocking, so a decision row exists only once the
-/// tracker that shutdown drains has drained here too.
+/// outbox has committed it.
 ///
 /// # Panics
 ///
@@ -3059,12 +3085,18 @@ async fn drain_gateway(state: &AppState) {
         .await
         .expect("gateway tasks drain");
     state.gateway_tasks.reopen();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    assert_eq!(
+        state.audit_outbox.settle(deadline).await,
+        0,
+        "audit settles"
+    );
 }
 
 /// Proves capture follows the admitted policy without changing the call:
-/// `Disabled` enqueues nothing and constructs no producer, `Metadata`
-/// publishes one row plus one span per attempt, and an unconstructible
-/// producer drops capture while the call still answers and accounts.
+/// `Disabled` submits nothing, `Metadata` delivers one row plus one span per
+/// attempt under the admitting request, and a pod reaching no Scribe drops
+/// capture while the call still answers and accounts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     let fixture = PgFixture::start().await.expect("fixture starts");
@@ -3075,31 +3107,14 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     let caller = invoker(tenant, 1, [provider_access()]);
     let call = || request("acme/a", Some((1000, 500)), Duration::from_secs(10));
 
-    let disabled = replica(&fixture, dispatch.clone()).await;
-    let (producer, sink) = capture_sink(&disabled, tenant).await;
+    let (disabled, scribe) = recorded(replica(&fixture, dispatch.clone()).await);
     dispatch.push(Step::Return(completed(100, 50)));
     GatewayInvocation::new(&disabled)
         .invoke(&caller, call())
         .await
         .expect("disabled call completes");
     drain_gateway(&disabled).await;
-    producer.shutdown().await.expect("capture producer drains");
-    assert!(
-        sink.received().is_empty(),
-        "a disabled call enqueues nothing"
-    );
-    let untouched = replica(&fixture, dispatch.clone()).await;
-    dispatch.push(Step::Return(completed(100, 50)));
-    GatewayInvocation::new(&untouched)
-        .invoke(&caller, call())
-        .await
-        .expect("disabled call completes");
-    drain_gateway(&untouched).await;
-    assert_eq!(
-        untouched.gateway_capture.producer_count().await,
-        0,
-        "a disabled tenant constructs no producer"
-    );
+    assert_eq!(scribe.attempts(), 0, "a disabled call submits nothing");
 
     GatewayAdministration::new(&state)
         .put_capture(
@@ -3112,8 +3127,7 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         .await
         .expect("metadata policy stores");
 
-    let captured = replica(&fixture, dispatch.clone()).await;
-    let (producer, sink) = capture_sink(&captured, tenant).await;
+    let (captured, scribe) = recorded(replica(&fixture, dispatch.clone()).await);
     dispatch.push(Step::Return(failed(1000, 0)));
     dispatch.push(Step::Return(completed(100, 50)));
     let response = GatewayInvocation::new(&captured)
@@ -3121,22 +3135,28 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         .await
         .expect("captured call completes");
     drain_gateway(&captured).await;
-    producer.shutdown().await.expect("capture producer drains");
-    let receipts = sink.received();
-    let rows: u64 = receipts.iter().map(|receipt| receipt.rows).sum();
-    assert_eq!(rows, 3, "one call row and two attempt spans publish");
+    let received = scribe.received();
     assert_eq!(
-        receipts.len(),
-        2,
-        "the call row and its spans publish apart"
+        scribe.rows(),
+        3,
+        "one call row and two attempt spans deliver"
     );
-    for receipt in &receipts {
+    let tables = received
+        .iter()
+        .map(|frame| frame.table.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tables,
+        ["vala.gateway.calls", "vala.traces.spans"],
+        "the call row delivers before its spans"
+    );
+    for frame in &received {
         assert_eq!(
-            receipt.request_id.as_ref(),
-            Some(&caller.request_id),
-            "{} publishes under the admitting request",
-            receipt.table
+            frame.request_id, caller.request_id,
+            "{} delivers under the admitting request",
+            frame.table
         );
+        assert_eq!(frame.tenant, tenant);
     }
     assert!(
         entries(&fixture, tenant, response.call_id)
@@ -3151,9 +3171,8 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     let answered = GatewayInvocation::new(&unavailable)
         .invoke(&caller, call())
         .await
-        .expect("an unavailable capture producer never fails the call");
+        .expect("a pod reaching no Scribe never fails the call");
     drain_gateway(&unavailable).await;
-    assert_eq!(unavailable.gateway_capture.producer_count().await, 0);
     assert!(
         entries(&fixture, tenant, answered.call_id)
             .await
@@ -3263,7 +3282,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .await
         .expect("payload policy stores");
     let caller = invoker(tenant, 1, [provider_access()]);
-    let (producer, sink) = capture_sink(&state, tenant).await;
+    let (state, scribe) = recorded(state);
     let invocation = GatewayInvocation::new(&state);
     for _ in 0..2 {
         dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
@@ -3273,17 +3292,12 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
             .expect("the captured call completes");
     }
     drain_gateway(&state).await;
-    producer.shutdown().await.expect("capture producer drains");
 
     let digest = format!(
         "sha256:{}",
         hex::encode(Sha256::digest(PAYLOAD_OBJECT_BYTES))
     );
-    let published = sink
-        .received()
-        .iter()
-        .map(|receipt| String::from_utf8_lossy(&receipt.bytes).into_owned())
-        .collect::<String>();
+    let published = scribe.published();
     assert!(
         published.contains(&digest),
         "the row carries the typed reference: {published}"
@@ -3313,9 +3327,9 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
 
     let table = TableRef::new(BifrostNamespace::Gateway, "calls");
     let catalog = state.bifrost.catalog().expect("catalog");
-    // The installed producer stands in for the embedded client, so it skips the
-    // first-use connect that registers the capture destinations; register them
-    // here so the retrieval path resolves the same table a real tenant has.
+    // The recording Scribe stands in for the pod's own, so nothing registered
+    // the capture destination; register it here so the retrieval path resolves
+    // the same table a real tenant has.
     catalog
         .ensure_builtin(
             tenant,
@@ -3451,7 +3465,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .expect("a self-referencing link makes the object unreadable");
     unavailable(fetch(reader.clone(), digest.clone()).await).await;
     std::fs::remove_file(&unreadable).expect("the unreadable link is removed");
-    let owner = fixture.superuser_pool().await.expect("superuser pool");
+    let owner = fixture.superuser_pool().expect("superuser pool");
     sqlx::query("ALTER TABLE vala.bifrost_tables RENAME TO bifrost_tables_offline")
         .execute(&owner)
         .await
@@ -3473,6 +3487,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .await
         .expect("the catalog table is restored");
 
+    drain_gateway(&state).await;
     let decisions = audit_decisions(&fixture, tenant).await;
     let retrievals = decisions
         .iter()
@@ -3497,21 +3512,20 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .put_object(&prefix, b"not a directory".to_vec())
         .await
         .expect("the blocker writes where the object directory must go");
-    let (blocked, unpublished) = capture_sink(&failing, tenant).await;
+    let (failing, unpublished) = recorded(failing);
     dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
     let unaffected = GatewayInvocation::new(&failing)
         .invoke(&caller, request("acme/a", None, Duration::from_secs(10)))
         .await
         .expect("unavailable storage never fails the call");
     drain_gateway(&failing).await;
-    blocked.shutdown().await.expect("capture producer drains");
     assert!(
         matches!(&unaffected.body, ResponseBody::Media(answer) if answer.bytes == PAYLOAD_OBJECT_BYTES),
         "the caller's answer is unchanged"
     );
     assert!(
-        unpublished.received().is_empty(),
-        "the whole capture is dropped before any row is enqueued"
+        unpublished.attempts() == 0,
+        "the whole capture is dropped before any row is submitted"
     );
     assert!(
         entries(&fixture, tenant, unaffected.call_id)
@@ -3546,17 +3560,19 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
             .mount(&upstream)
             .await;
     }
-    let state = replica_with_fixture_catalog(
-        &fixture,
-        Arc::new(
-            wyrd_gateway::HttpProviderDispatch::new(
-                skald_providers::EndpointPolicy::new(false),
-                wyrd_gateway::BuiltinEndpoints::default(),
-            )
-            .expect("gateway dispatch builds"),
-        ),
-    )
-    .await;
+    let (state, scribe) = recorded(
+        replica_with_fixture_catalog(
+            &fixture,
+            Arc::new(
+                wyrd_gateway::HttpProviderDispatch::new(
+                    skald_providers::EndpointPolicy::new(false),
+                    wyrd_gateway::BuiltinEndpoints::default(),
+                )
+                .expect("gateway dispatch builds"),
+            ),
+        )
+        .await,
+    );
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
@@ -3592,7 +3608,6 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
                 .expect("payload policy stores");
         }
     };
-    let (producer, sink) = capture_sink(&state, tenant).await;
     let speak = |voice: &'static str| {
         let state = state.clone();
         async move {
@@ -3620,15 +3635,10 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
         "caller bytes are unchanged"
     );
     drain_gateway(&state).await;
-    producer.shutdown().await.expect("capture producer drains");
 
     let digest_of = |bytes: &[u8]| format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
     let digest = digest_of(SPOKEN);
-    let published = sink
-        .received()
-        .iter()
-        .map(|receipt| String::from_utf8_lossy(&receipt.bytes).into_owned())
-        .collect::<String>();
+    let published = scribe.published();
     assert!(published.contains(&digest), "{published}");
     assert!(!published.contains("spoken-speech-bytes"), "{published}");
     let unselected = object_path(tenant, &digest_of(UNSELECTED)).expect("key derives");
@@ -3684,16 +3694,15 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
 
 /// Proves post-response capture is bounded by the admitted call's absolute
 /// deadline. With the captured object's storage read parked on a FIFO, and
-/// separately with first-use producer construction parked on the catalog's
-/// registration lock, each call still answers and accounts, its capture is
-/// dropped once as unavailable when the deadline passes, no row is enqueued,
-/// and the capture task ends so tracked gateway work drains while the
-/// dependency is still parked.
+/// separately with the Scribe never acknowledging, each call still answers
+/// and accounts, its capture is dropped once as unavailable when the deadline
+/// passes, nothing is delivered, and the capture task ends so tracked gateway
+/// work drains while the dependency is still parked.
 ///
 /// # Panics
 ///
 /// Panics when a call fails, a parked capture outlives the call's deadline,
-/// a row is published, or a producer is constructed.
+/// or a row is delivered.
 #[tokio::test]
 async fn gateway_capture_work_ends_at_the_call_deadline() {
     let recorder = SeriesRecorder::default();
@@ -3701,25 +3710,12 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let state = replica_with_fixture_catalog(&fixture, dispatch.clone())
-        .await
-        .with_auth(crate::components::auth::ServerAuth {
-            issuing_key: Some(Arc::new(
-                wyrd_auth_issue::IssuingKey::from_ed_pem(
-                    wyrd_auth_issue::IssuingKey::generate_ephemeral_pem()
-                        .expect("ephemeral key generates"),
-                    wyrd_auth_verify::Kid::new("k1").expect("kid is valid"),
-                    "wyrd",
-                )
-                .expect("test issuing key loads"),
-            )),
-            ..crate::components::auth::ServerAuth::default()
-        });
+    let (state, scribe) = recorded(replica_with_fixture_catalog(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     let caller = invoker(tenant, 1, [provider_access()]);
     let deadline = Duration::from_millis(500);
     let dropped = "wyrd_gateway_capture_total{outcome=unavailable}";
-    let enqueued = "wyrd_gateway_capture_total{outcome=enqueued}";
+    let delivered = "wyrd_gateway_capture_total{outcome=delivered}";
 
     // Object get: the selected answer's object path is a FIFO no writer opens.
     GatewayAdministration::new(&state)
@@ -3732,7 +3728,6 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
         )
         .await
         .expect("payload policy stores");
-    let (producer, sink) = capture_sink(&state, tenant).await;
     let digest = format!(
         "sha256:{}",
         hex::encode(Sha256::digest(PAYLOAD_OBJECT_BYTES))
@@ -3762,15 +3757,10 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
         "the caller's answer is unchanged"
     );
     drain_gateway(&state).await;
-    producer.shutdown().await.expect("capture producer drains");
-    assert!(sink.received().is_empty(), "no row is enqueued");
+    assert_eq!(scribe.attempts(), 0, "no row is submitted");
     assert!(
         recorder.series.lock().expect("series").contains(dropped),
         "the expired capture is dropped as unavailable"
-    );
-    assert!(
-        !recorder.series.lock().expect("series").contains(enqueued),
-        "nothing is enqueued"
     );
     assert!(
         entries(&fixture, tenant, answered.call_id)
@@ -3786,9 +3776,8 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
             .open(&fifo)
             .expect("the FIFO opens"),
     );
-    state.gateway_capture.shutdown().await;
 
-    // First-use construction: the catalog's registration lock is held.
+    // Delivery: the Scribe accepts the submission and never acknowledges it.
     GatewayAdministration::new(&state)
         .put_capture(
             &admin(tenant),
@@ -3799,48 +3788,18 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
         )
         .await
         .expect("metadata policy stores");
-    let mut lock = fixture
-        .vala_postgres()
-        .pool()
-        .acquire()
-        .await
-        .expect("lock connection");
-    sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
-        .bind(format!(
-            "{}:{}",
-            tenant.as_uuid(),
-            TableRef::new(BifrostNamespace::Gateway, "calls").fqn()
-        ))
-        .execute(&mut *lock)
-        .await
-        .expect("the registration lock is held");
+    scribe.park();
     dispatch.push(Step::Return(completed(100, 50)));
     let answered = GatewayInvocation::new(&state)
-        .invoke(&caller, request("acme/a", None, Duration::from_secs(2)))
+        .invoke(&caller, request("acme/a", None, deadline))
         .await
-        .expect("parked construction never fails the call");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        let waiting = || {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
-            )
-            .fetch_one(fixture.vala_postgres().pool())
-        };
-        while waiting().await.expect("locks read") == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("construction parks on the registration lock");
+        .expect("a parked Scribe never fails the call");
     drain_gateway(&state).await;
-    assert_eq!(
-        state.gateway_capture.producer_count().await,
-        0,
-        "no producer is constructed past the deadline"
-    );
+    assert_eq!(scribe.attempts(), 1, "the row batch was submitted once");
+    assert!(scribe.received().is_empty(), "nothing is acknowledged");
     assert!(
-        !recorder.series.lock().expect("series").contains(enqueued),
-        "nothing is enqueued"
+        !recorder.series.lock().expect("series").contains(delivered),
+        "nothing is delivered"
     );
     assert!(
         entries(&fixture, tenant, answered.call_id)
@@ -3849,83 +3808,7 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
             .any(|entry| matches!(entry, GatewayAccountingEntryV1::CallAccounted { .. })),
         "accounting is unaffected"
     );
-    sqlx::query("SELECT pg_advisory_unlock_all()")
-        .execute(&mut *lock)
-        .await
-        .expect("the registration lock releases");
-    tokio::time::timeout(Duration::from_secs(10), state.gateway_capture.shutdown())
-        .await
-        .expect("shutdown is bounded");
-}
-
-/// Proves the process-wide tenant producer ceiling: with
-/// [`QueueConfig::MAX_LIVE_ENTRIES`] tenants already capturing, a new tenant's
-/// capture is refused and counted as saturated without constructing a client
-/// while its call still answers, and a tenant already holding a producer keeps
-/// publishing at the ceiling.
-#[tokio::test]
-async fn gateway_capture_tenant_ceiling_refuses_new_tenants_without_construction() {
-    let recorder = SeriesRecorder::default();
-    let _metrics = metrics::set_default_local_recorder(&recorder);
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let tenant = fixture.data_tenant_id();
-    let dispatch = Scripted::shared();
-    let state = replica(&fixture, dispatch.clone()).await;
-    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
-    GatewayAdministration::new(&state)
-        .put_capture(
-            &admin(tenant),
-            GatewayCapturePolicyWrite {
-                mode: GatewayCaptureMode::Metadata,
-                payload_fields: BTreeSet::new(),
-            },
-        )
-        .await
-        .expect("metadata policy stores");
-    let caller = invoker(tenant, 1, [provider_access()]);
-    let call = || request("acme/a", Some((1000, 500)), Duration::from_secs(10));
-
-    let full = replica(&fixture, dispatch.clone()).await;
-    for _ in 0..QueueConfig::MAX_LIVE_ENTRIES {
-        capture_sink(&full, DataTenantId::new_v7()).await;
-    }
-    dispatch.push(Step::Return(completed(100, 50)));
-    GatewayInvocation::new(&full)
-        .invoke(&caller, call())
-        .await
-        .expect("a refused capture never fails the call");
-    drain_gateway(&full).await;
-    assert_eq!(
-        full.gateway_capture.producer_count().await,
-        QueueConfig::MAX_LIVE_ENTRIES,
-        "no client is constructed past the ceiling"
-    );
-    assert!(
-        recorder
-            .series
-            .lock()
-            .expect("series")
-            .contains("wyrd_gateway_capture_total{outcome=saturated}"),
-        "the refusal is counted as saturated"
-    );
-
-    let serving = replica(&fixture, dispatch.clone()).await;
-    for _ in 1..QueueConfig::MAX_LIVE_ENTRIES {
-        capture_sink(&serving, DataTenantId::new_v7()).await;
-    }
-    let (producer, sink) = capture_sink(&serving, tenant).await;
-    dispatch.push(Step::Return(completed(100, 50)));
-    GatewayInvocation::new(&serving)
-        .invoke(&caller, call())
-        .await
-        .expect("an existing tenant's call completes");
-    drain_gateway(&serving).await;
-    producer.shutdown().await.expect("capture producer drains");
-    let rows: u64 = sink.received().iter().map(|receipt| receipt.rows).sum();
-    assert_eq!(
-        rows, 2,
-        "an existing tenant keeps publishing at the ceiling"
-    );
+    drain_gateway(&state).await;
 }
 
 /// Proves capture follows the policy admitted with each call: disabling
@@ -3936,7 +3819,7 @@ async fn gateway_capture_policy_change_affects_only_later_admissions() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let state = replica(&fixture, dispatch.clone()).await;
+    let (state, scribe) = recorded(replica(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     let gateway = GatewayAdministration::new(&state);
     let write = |mode| GatewayCapturePolicyWrite {
@@ -3947,7 +3830,6 @@ async fn gateway_capture_policy_change_affects_only_later_admissions() {
         .put_capture(&admin(tenant), write(GatewayCaptureMode::Metadata))
         .await
         .expect("metadata policy stores");
-    let (producer, sink) = capture_sink(&state, tenant).await;
     let caller = invoker(tenant, 1, [provider_access()]);
     let call = || request("acme/a", Some((1000, 500)), Duration::from_secs(10));
 
@@ -3979,11 +3861,10 @@ async fn gateway_capture_policy_change_affects_only_later_admissions() {
         .await
         .expect("the call admitted under Disabled completes");
     drain_gateway(&state).await;
-    producer.shutdown().await.expect("capture producer drains");
-    let rows: u64 = sink.received().iter().map(|receipt| receipt.rows).sum();
     assert_eq!(
-        rows, 2,
-        "only the Metadata admission publishes its call row and attempt span"
+        scribe.rows(),
+        2,
+        "only the Metadata admission delivers its call row and attempt span"
     );
 }
 
@@ -4134,7 +4015,12 @@ impl<'a> MakeWriter<'a> for TraceBuffer {
 /// Panics when a fixture fails or a leak, label, gauge, correlation, capture,
 /// or terminal-result assertion differs.
 #[tokio::test]
+#[expect(
+    clippy::float_cmp,
+    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
+)]
 async fn gateway_observations_are_bounded_correlated_and_secret_free() {
+    use std::fmt::Write as _;
     const CANARY: &str = "sk-gateway-canary-5e1d";
     let recorder = SeriesRecorder::default();
     let _metrics = metrics::set_default_local_recorder(&recorder);
@@ -4236,35 +4122,37 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         .await;
     let secret = tempfile::NamedTempFile::new().expect("secret file");
     std::fs::write(secret.path(), format!("{CANARY}\n")).expect("secret writes");
-    let state = test_state(&fixture)
-        .await
-        .with_gateway(crate::config::GatewayConfig {
-            credential_bindings: std::collections::BTreeMap::from([(
-                wyrd_spec::ids::CredentialBindingName::new("canary-file").expect("binding"),
-                crate::config::GatewayCredentialBinding {
-                    secret: wyrd_spec::security::SecretRef::File {
-                        path: secret.path().display().to_string(),
+    let (state, scribe) = recorded(
+        test_state(&fixture)
+            .await
+            .with_gateway(crate::config::GatewayConfig {
+                credential_bindings: std::collections::BTreeMap::from([(
+                    wyrd_spec::ids::CredentialBindingName::new("canary-file").expect("binding"),
+                    crate::config::GatewayCredentialBinding {
+                        secret: wyrd_spec::security::SecretRef::File {
+                            path: secret.path().display().to_string(),
+                        },
+                        assignment: wyrd_gateway::CredentialAssignment {
+                            host: Some("127.0.0.1".to_owned()),
+                            ..super::pg_administration_tests::assigned(tenant, "deepseek")
+                        },
                     },
-                    assignment: wyrd_gateway::CredentialAssignment {
-                        host: Some("127.0.0.1".to_owned()),
-                        ..super::pg_administration_tests::assigned(tenant, "deepseek")
-                    },
-                },
-            )]),
-            secret_backends: std::collections::BTreeMap::new(),
-            ..Default::default()
-        })
-        .with_gateway_engine(GatewayEngine::new(
-            CredentialResolver::default(),
-            DeploymentHealth::default(),
-            Arc::new(
-                wyrd_gateway::HttpProviderDispatch::new(
-                    skald_providers::EndpointPolicy::new(false),
-                    wyrd_gateway::BuiltinEndpoints::default(),
-                )
-                .expect("gateway dispatch builds"),
-            ),
-        ));
+                )]),
+                secret_backends: std::collections::BTreeMap::new(),
+                ..Default::default()
+            })
+            .with_gateway_engine(GatewayEngine::new(
+                CredentialResolver::default(),
+                DeploymentHealth::default(),
+                Arc::new(
+                    wyrd_gateway::HttpProviderDispatch::new(
+                        skald_providers::EndpointPolicy::new(false),
+                        wyrd_gateway::BuiltinEndpoints::default(),
+                    )
+                    .expect("gateway dispatch builds"),
+                ),
+            )),
+    );
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
     gateway
@@ -4348,7 +4236,6 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         )
         .await
         .expect("payload policy stores");
-    let (producer, sink) = capture_sink(&state, tenant).await;
     let answered = invocation
         .invoke(&caller, call("answered"))
         .await
@@ -4415,7 +4302,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
             .await
             .expect("a non-JSON refusal is relayed");
         assert_eq!(refusal.status, 401);
-        encoded_refusals.push_str(&format!("{:?}", refusal.body));
+        let _ = write!(encoded_refusals, "{:?}", refusal.body);
     }
     assert!(
         encoded_refusals.contains("HTTP 401") && !encoded_refusals.contains(&encoded),
@@ -4426,13 +4313,8 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         .await
         .expect_err("an unauthorized caller is refused");
     drain_gateway(&state).await;
-    producer.shutdown().await.expect("capture producer drains");
 
-    let published = sink
-        .received()
-        .iter()
-        .map(|receipt| String::from_utf8_lossy(&receipt.bytes).into_owned())
-        .collect::<String>();
+    let published = scribe.published();
     for marker in [
         "Incorrect API key provided",
         "nested-marker",
@@ -4498,7 +4380,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
     .into_iter()
     .chain(streams.iter().copied())
     {
-        ledger.push_str(&format!("{:?}", entries(&fixture, tenant, call_id).await));
+        let _ = write!(ledger, "{:?}", entries(&fixture, tenant, call_id).await);
     }
     let series = recorder
         .series
@@ -4566,7 +4448,6 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         "wyrd_gateway_routing_total",
         "wyrd_gateway_tokens_total",
         "wyrd_gateway_capture_total",
-        "wyrd_gateway_capture_backlog_bytes",
     ] {
         assert!(series.contains(name), "{name} is recorded: {series}");
     }
@@ -4776,6 +4657,7 @@ async fn gateway_batch_listing_is_one_bounded_pruned_read() {
         before + 4,
         "one decision per listed model"
     );
+    drain_gateway(&state).await;
 }
 
 /// Every terminal call and attempt closes with classifiable span evidence:
@@ -4814,7 +4696,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
         )
         .expect("gateway dispatch builds"),
     );
-    let state = replica(&fixture, Arc::clone(&dispatch)).await;
+    let (state, scribe) = recorded(replica(&fixture, Arc::clone(&dispatch)).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
@@ -4828,7 +4710,6 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
         )
         .await
         .expect("payload policy stores");
-    let (producer, sink) = capture_sink(&state, tenant).await;
     // Deploys `acme/<name>` against a provider that sends `frame` and holds.
     let held = |name: &'static str, frame: &'static str| {
         let gateway = &gateway;
@@ -5029,7 +4910,6 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
     ));
 
     drain_gateway(&state).await;
-    producer.shutdown().await.expect("capture producer drains");
     let drained = caller(10);
     state.shutdown_token.cancel();
     let error = invocation
@@ -5117,15 +4997,12 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
             .contains("wyrd_gateway_requests_total{operation=chat_completions,outcome=succeeded}"),
         "{series}"
     );
-    let published = sink
-        .received()
-        .iter()
-        .map(|receipt| String::from_utf8_lossy(&receipt.bytes).into_owned())
-        .collect::<String>();
+    let published = scribe.published();
     assert!(
         published.contains("held-marker") && !published.contains("late-marker"),
         "the capture holds exactly the delivered events"
     );
+    drain_gateway(&state).await;
 }
 
 /// A buffered call whose provider attempt completed but whose accounting then
@@ -5158,7 +5035,7 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let state = replica(&fixture, dispatch.clone()).await;
+    let (state, scribe) = recorded(replica(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     GatewayAdministration::new(&state)
         .put_capture(
@@ -5170,7 +5047,6 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         )
         .await
         .expect("metadata policy stores");
-    let (producer, sink) = capture_sink(&state, tenant).await;
     let caller = invoker(tenant, 1, [provider_access()]);
 
     dispatch.push(Step::Park(completed(10, 5)));
@@ -5183,7 +5059,7 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         }
     });
     dispatch.entered.notified().await;
-    let superuser = fixture.superuser_pool().await.expect("superuser pool");
+    let superuser = fixture.superuser_pool().expect("superuser pool");
     sqlx::query(
         "ALTER TABLE wyrd.gateway_accounting_entries ADD CONSTRAINT attempt_accounting_fault \
          CHECK (kind <> 'attempt_accounted') NOT VALID",
@@ -5197,7 +5073,6 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         .expect("call task joins")
         .expect_err("failed accounting prevents the answer");
     drain_gateway(&state).await;
-    producer.shutdown().await.expect("capture producer drains");
 
     let series = recorder
         .series
@@ -5223,13 +5098,13 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         "no success or accounted usage and cost is reported: {series}"
     );
     let published = |table: &str| {
-        let receipts = sink
+        let frames = scribe
             .received()
             .into_iter()
-            .filter(|receipt| receipt.table.contains(table))
+            .filter(|frame| frame.table.contains(table))
             .collect::<Vec<_>>();
-        assert_eq!(receipts.len(), 1, "one {table} batch");
-        String::from_utf8_lossy(&receipts[0].bytes).into_owned()
+        assert_eq!(frames.len(), 1, "one {table} batch");
+        String::from_utf8_lossy(&frames[0].ipc).into_owned()
     };
     let row = published("calls");
     let upstream = wyrd_gateway::outcome_error_code(GatewayCallOutcome::Failed)
@@ -5272,6 +5147,7 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
         "{call:?}"
     );
     assert!(attempt[0].contains("outcome=\"succeeded\""), "{attempt:?}");
+    drain_gateway(&state).await;
 }
 
 /// One public inference ingress that reads the `wyrd-gateway-fallback`

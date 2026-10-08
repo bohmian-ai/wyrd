@@ -10,6 +10,7 @@
 
 #![deny(missing_docs)]
 
+pub mod audit_outbox;
 pub mod postgres;
 pub mod queries;
 pub mod row_types;
@@ -179,7 +180,9 @@ mod tests {
                 "migration file {file_name} must start with its version {prefix}"
             );
             assert!(
-                file_name.ends_with(".sql"),
+                std::path::Path::new(file_name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sql")),
                 "migration file {file_name} must be forward-only .sql"
             );
             assert!(
@@ -369,7 +372,11 @@ mod tests {
                     .into_string()
                     .expect("migration filename is utf-8")
             })
-            .filter(|file_name| file_name.ends_with(".sql"))
+            .filter(|file_name| {
+                std::path::Path::new(file_name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+            })
             .collect::<Vec<_>>();
         files.sort();
         files

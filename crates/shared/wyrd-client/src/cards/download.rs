@@ -30,6 +30,7 @@ pub(crate) async fn download_artifact(
     display: Arc<DownloadProgressDisplay>,
 ) -> Result<(), RegistryEngineError> {
     let response: DownloadInitResponse = client
+        .http
         .request_json(
             reqwest::Method::POST,
             "/v1/cards/download/init",

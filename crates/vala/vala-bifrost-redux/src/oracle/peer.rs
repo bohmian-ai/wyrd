@@ -717,9 +717,6 @@ pub enum PeerSecurityError {
     /// Claims do not bind all required attempt identities.
     #[error("peer context claims do not match the attempt")]
     Claims,
-    /// A required durable security audit could not commit.
-    #[error("peer security audit is unavailable")]
-    AuditUnavailable,
     /// The context names a different operation than the one presented.
     #[error("peer context names a different operation")]
     Operation,
@@ -728,32 +725,25 @@ pub enum PeerSecurityError {
     Body,
 }
 
-/// Failure returned by the narrow durable peer-security audit collaborator.
+/// Failure composing the peer-security audit collaborator.
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[error("peer security audit append failed")]
+#[error("peer security audit cannot be composed")]
 pub struct PeerSecurityAuditError;
 
-/// Server-owned durable audit capability used before a rejected peer request returns.
-#[async_trait]
+/// Server-owned, non-blocking audit capability for rejected peer requests.
+///
+/// Both methods only stage the rejection and return; the refusal never waits
+/// for, or depends on, the audit commit.
 pub trait PeerSecurityAudit: Send + Sync {
-    /// Appends a rejection whose claims cannot select an audit tenant.
-    ///
-    /// # Errors
-    /// Returns [`PeerSecurityAuditError`] when the system-tenant row cannot commit.
-    async fn append_unverified_ticket_rejection(
-        &self,
-        violation: BifrostSecurityViolationKind,
-    ) -> Result<(), PeerSecurityAuditError>;
+    /// Stages a rejection whose claims cannot select an audit tenant.
+    fn stage_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind);
 
-    /// Appends a violation to the context-named tenant's audit chain.
-    ///
-    /// # Errors
-    /// Returns [`PeerSecurityAuditError`] when the tenant-scoped row cannot commit.
-    async fn append_verified_ticket_violation(
+    /// Stages a violation on the context-named tenant's audit chain.
+    fn stage_verified_ticket_violation(
         &self,
         tenant_id: DataTenantId,
         violation: BifrostSecurityViolationKind,
-    ) -> Result<(), PeerSecurityAuditError>;
+    );
 }
 
 /// Narrow context verification capability implemented by the server authority.
@@ -817,7 +807,6 @@ pub fn assignment_authority_digest_for(
                 scribe_cut: assignment.scribe_provider_cut.as_ref(),
                 required_columns: &assignment.required_columns,
                 predicates: &assignment.predicates,
-                reader_cut: &assignment.reader_cut,
             },
         )
         .collect::<Vec<_>>();
@@ -845,7 +834,7 @@ pub struct AuthorizedStage {
 ///
 /// The contract lives here, next to the claims and binding it operates on, so
 /// the Oracle follower ingress can require authorization without depending on
-/// the server crate that owns the durable security audit. The server
+/// the server crate that owns the security audit. The server
 /// implements it on its existing peer authority.
 #[async_trait]
 pub trait OracleStageAuthority: Send + Sync {
@@ -858,9 +847,8 @@ pub trait OracleStageAuthority: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns the closed [`PeerSecurityError`] for the first failed check, or
-    /// [`PeerSecurityError::AuditUnavailable`] when the required audit row
-    /// cannot commit. A rejection never returns claims.
+    /// Returns the closed [`PeerSecurityError`] for the first failed check. A
+    /// rejection never returns claims.
     async fn authorize_stage(
         &self,
         context: &PeerContext,

@@ -19,7 +19,9 @@ controls required to operate those boundaries.
 - Tenant-scoped SQL runs through `TenantConn` under Postgres RLS. Cross-tenant
   work runs only through the explicitly privileged `OperatorPool` capability.
 - Security uncertainty fails closed. Verification, authorization, policy,
-  tenant binding, fencing, and audit failures deny the operation.
+  tenant binding, and fencing failures deny the operation. Audit is
+  non-blocking: a decision that fails to commit is logged and counted and does
+  not deny the operation.
 - Secrets are resolved from a deployment secret provider at runtime. They are
   never Card fields, generated artifacts, logs, traces, errors, or audit
   payloads.
@@ -65,31 +67,46 @@ Card-free machine principal therefore carries no emit scope. `tenant_admin`,
 `global_admin`, and `user` never bind a Card — an administrative or human
 identity is not a registered AI-system component.
 
-Gateway capture runs as the reserved `GATEWAY_CAPTURE_PRINCIPAL`, a
-tenant-bound, card-free `service` principal. Only the server's signing key
-issues it, as a token of at most 900 seconds carrying an empty Card-reference
-scope, only the informational `gateway_capture` Role, and exactly the two
-table-scoped record-write grants for `vala.gateway.calls` and
-`vala.traces.spans`, which the verifier requires. Public credential,
-workload, refresh, delegation, and impersonation flows refuse it; it never
-appears in a delegation chain, holds no persisted credential, and never
-replaces the invocation caller in audit.
+Gateway capture is a server-internal write that holds no token, evaluates no
+permission, and writes no audit decision. Its rows carry the reserved
+`GATEWAY_CAPTURE_PRINCIPAL`, which, like `PLATFORM_AUDIT_PRINCIPAL`, never
+appears in a token: every issuer refuses it, every verifier rejects a token
+naming it, it never appears in a delegation chain, and it never replaces the
+invocation caller in audit. Gate refuses every public write to
+`vala.gateway.calls`. A pod without Scribe sends capture over the peer plane's
+capture-only RPC, admitted by `wyrd-peer` mTLS alone; that RPC accepts only the
+two capture tables and, with a Verifier attribution, the three result tables,
+and never the reserved system tenant, so a compromised
+cluster member, already out of scope, is the only caller that could misuse
+it.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
+The first projection grants the built-in `wyrd_default` role
+(`bifrost_table:read`, `bifrost_record:write`, `evals:run`) in the registration
+transaction, so the workload can emit and verify its evidence; its Card scope
+still bounds which Cards it may emit for and verify. Tenant-wide Bifrost query
+reads come only from an explicit grant of the built-in `workload` role.
+Re-applying a Card never grants the role again, so an administrator's
+revocation stands. A tenant administrator (`*`, not `service_accounts:write`)
+grants further roles to a Card-bound principal with `POST /v1/auth/grant-role`
+(`wyrd auth grant-role`); the decision is staged on the audit outbox as
+`auth.principal.role.grant`, and the role reaches tokens at the next key
+exchange.
 Credential issuance is a separate privileged operation and is policy-gated.
 The verification runtime also provisions one UUIDv7 `system` principal per
 tenant, the server's own identity for continuous verification work that has no
-direct principal. It is not Card-bound or publicly manageable and has no
-credential, role grant, refresh, workload, or delegation path. It has three
-separately scoped, server-minted uses: an access token scoped to one exact
-Verifier Card for writing the reserved verification result tables; an access
-token scoped to one exact Verifier Card for reading the tenant's
-`vala.drift.observations` table; and an in-process, tokenless
-`bifrost_query:read` authority scoped by table UID to exactly continuous Eval's
-input tables (`vala.eval.observations` and `vala.traces.spans`). None is a
-general Bifrost grant, and Oracle authorizes and audits every read under them
-like any caller's. The server never fabricates a user or other identity for its
+direct principal. It is not Card-bound or publicly manageable, has no
+credential, role grant, refresh, workload, or delegation path, and never
+appears in a token: every issuer refuses it and every verifier rejects a
+`system` claim set. It has two in-process uses. It attributes verification
+results, which the server's internal capture writer submits to Scribe like
+gateway capture, without a token or Gate; Gate refuses every public write to
+the result tables. And it carries a tokenless `bifrost_query:read` authority
+scoped by table UID to exactly one run's input tables
+(`vala.drift.observations` for Drift; `vala.eval.observations` and
+`vala.traces.spans` for Eval). Neither is a general Bifrost grant, and Oracle
+authorizes and audits every read under it like any caller's. The server never fabricates a user or other identity for its
 own reads.
 
 A tenant administrator is created once, during tenant provisioning, and is the
@@ -440,26 +457,29 @@ the Wyrd gateway, and a `wyrd_gateway` request never carries binding secrets.
 ## Audit integrity and privacy
 
 Audit cardinality follows authorization decisions, not HTTP requests and not
-engine mechanics. Except for the explicitly non-blocking Oracle read and
-gateway invocation paths below, every decision that evaluates a principal's
-permission appends its audit row in the same transaction that made it. Scribe
-batch commits and Forge maintenance transitions evaluate no permission: they
-are recorded as lineage in `vala.scribe_batch_commits` and
-`vala.forge_operations` and emit no audit event.
+engine mechanics. Permissions are blocking; audits are non-blocking. Every
+audited surface stages its decision on the one process audit outbox once the
+decision is known, outside the operation's transaction, and never waits for
+the commit. The outbox has no count limit: a tenant batch whose commit fails
+stays at the front of that tenant's queue and is retried with backoff while
+other tenants keep committing, each failed attempt logged with its tenant and
+counted in `outbox_write_failures_total{outbox="audit"}`. A commit that returns
+an error is resolved from Postgres transaction status (`pg_xact_status`) before
+any retry: a committed batch is not written again, an aborted one is retried,
+and the writer waits while the outcome is still unknown. Each decision is
+therefore staged and retained once. A decision is lost only at abrupt process
+loss, when graceful shutdown reaches its deadline with it still unwritten, or
+when Postgres no longer holds the status of its failed commit; each is counted
+in `outbox_events_lost_total{outbox="audit"}`. Scribe batch commits and Forge
+maintenance transitions evaluate no permission: they are recorded as lineage
+in `vala.scribe_batch_commits` and `vala.forge_operations` and emit no audit
+event.
 
-Oracle query admission uses a stronger local durability handoff: the serving
-process fsyncs a versioned, CRC-framed local acceptance record before returning
-rows, then a bounded at-least-once relay appends the canonical tenant
-`vala.audit_staging` entry. Relay identity makes replay safe and observable.
-
-Gateway invocation authorization is evaluated synchronously before protected
-work, but its audit event is committed to the same canonical
-`vala.audit_staging` path by tracked non-blocking server work. Slow or failed
-audit persistence does not delay or reverse the authorization verdict; failure
-is metered and logged, and shutdown drains tracked work. Gateway administration
-decisions remain transactional with their mutations. No gateway-specific audit
-WAL, disk spool, durable queue, relay, table, publisher, or sink exists; abrupt
-process loss may therefore lose an invocation event that has not committed.
+Oracle query admission, gateway invocation and administration, and direct
+verification execution follow the same rule with no surface-specific
+exception: each evaluates its permission synchronously before protected work
+and stages its decision on the process outbox. No surface-specific audit WAL,
+disk spool, durable queue, relay, table, publisher, or sink exists.
 
 `vala.audit_staging` is transient transactional write-ahead state with no
 external consumer. Retained audit history lives in the
@@ -502,7 +522,7 @@ chain.
 
 Security events include credential issuance and revocation, token replay,
 unknown signing keys, policy unavailability, repeated authorization denial,
-peer context refusal, tenant-tripwire failure, Oracle audit commit failure, audit-chain or
+peer context refusal, tenant-tripwire failure, audit outbox write failure, audit-chain or
 publication failure, SSRF rejection, secret-resolution failure, and privileged
 operator use.
 

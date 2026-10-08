@@ -80,11 +80,11 @@ pub struct PgFixture {
     ///
     /// Callers receive cheap clones and must drop them normally. They must not
     /// call [`PgPool::close`] because SQLx closes the shared pool across every
-    /// clone. This field precedes `_test_db` so the pool owner drops before the
+    /// clone. This field precedes `test_db` so the pool owner drops before the
     /// ephemeral database is forcibly removed.
     assertion_pool: PgPool,
     /// Database owner whose drop implementation cleans up the isolated database.
-    _test_db: TestDatabase,
+    test_db: TestDatabase,
 }
 
 /// Errors returned while starting a shared Postgres fixture.
@@ -145,7 +145,7 @@ impl PgFixture {
             data_tenant_id,
             tenant_slug,
             assertion_pool,
-            _test_db: test_db,
+            test_db,
         })
     }
 
@@ -155,7 +155,7 @@ impl PgFixture {
     /// attaches to the same database rather than creating its own.
     #[must_use]
     pub fn database_name(&self) -> &str {
-        &self._test_db.name
+        &self.test_db.name
     }
 
     /// Open a tenant-scoped transaction bound to the seeded tenant.
@@ -200,10 +200,50 @@ impl PgFixture {
     /// Returns [`SqlError`] when the fixture database DSNs cannot be resolved
     /// or either fresh runtime pool graph cannot connect.
     pub async fn fresh_runtime_handles(&self) -> Result<(WyrdPostgres, ValaPostgres), SqlError> {
-        let dsns = self._test_db.resolved_dsns()?;
+        let dsns = self.test_db.resolved_dsns()?;
         let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
         let vala = ValaPostgres::connect_from_dsns(&dsns).await?;
         Ok((wyrd, vala))
+    }
+
+    /// Makes every insert into `vala.audit_staging` fail until
+    /// [`Self::restore_audit_staging`].
+    ///
+    /// Audit outbox tests use this to stand in for an unavailable database:
+    /// each attempt to commit staged audit fails and is retried, while the rest
+    /// of the database keeps serving the audited operation itself.
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when the trigger cannot be installed.
+    pub async fn fail_audit_staging(&self) -> Result<(), FixtureError> {
+        sqlx::raw_sql(
+            r"CREATE OR REPLACE FUNCTION vala.test_fail_audit_staging()
+               RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN
+                 RAISE EXCEPTION 'injected audit staging failure';
+               END;
+               $$;
+             CREATE TRIGGER test_fail_audit_staging
+               BEFORE INSERT ON vala.audit_staging
+               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_audit_staging();",
+        )
+        .execute(&self.assertion_pool)
+        .await
+        .map_err(SqlError::from)?;
+        Ok(())
+    }
+
+    /// Lets inserts into `vala.audit_staging` succeed again after
+    /// [`Self::fail_audit_staging`].
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when the trigger cannot be dropped.
+    pub async fn restore_audit_staging(&self) -> Result<(), FixtureError> {
+        sqlx::raw_sql("DROP TRIGGER IF EXISTS test_fail_audit_staging ON vala.audit_staging")
+            .execute(&self.assertion_pool)
+            .await
+            .map_err(SqlError::from)?;
+        Ok(())
     }
 
     /// Borrow the runtime `wyrd_app` pool.
@@ -289,7 +329,7 @@ impl PgFixture {
     /// The result remains fallible for API compatibility. Pool construction
     /// errors are returned by fixture startup, so this method returns `Ok`
     /// after a fixture has started successfully.
-    pub async fn superuser_pool(&self) -> Result<PgPool, FixtureError> {
+    pub fn superuser_pool(&self) -> Result<PgPool, FixtureError> {
         Ok(self.assertion_pool.clone())
     }
 
@@ -316,7 +356,7 @@ impl PgFixture {
             data_tenant_id,
             tenant_slug,
             assertion_pool,
-            _test_db: test_db,
+            test_db,
         })
     }
 }
@@ -660,7 +700,7 @@ mod pg_tests {
     /// neither serving login can create or drop databases.
     async fn assert_database_authority_boundary(fixture: &PgFixture) {
         let admin = build_pool(
-            fixture._test_db.admin_dsn.expose_secret(),
+            fixture.test_db.admin_dsn.expose_secret(),
             PoolConfig::migrator_defaults(),
         )
         .await
@@ -669,14 +709,14 @@ mod pg_tests {
             "SELECT owner.rolname FROM pg_database database \
              JOIN pg_roles owner ON owner.oid=database.datdba WHERE database.datname=$1",
         )
-        .bind(&fixture._test_db.name)
+        .bind(&fixture.test_db.name)
         .fetch_one(&admin)
         .await
         .expect("database owner reads");
         assert_eq!(owner, "wyrd_test_admin");
         admin.close().await;
 
-        let fixture_admin_dsn = database_dsn(&fixture._test_db.admin_dsn, &fixture._test_db.name)
+        let fixture_admin_dsn = database_dsn(&fixture.test_db.admin_dsn, &fixture.test_db.name)
             .expect("fixture administrator DSN rewrites");
         let fixture_admin = build_pool(
             fixture_admin_dsn.expose_secret(),
@@ -703,7 +743,7 @@ mod pg_tests {
         fixture_admin.close().await;
 
         let serving = fixture
-            ._test_db
+            .test_db
             .resolved_dsns()
             .expect("fixture DSNs resolve");
         for login in [&serving.app, &serving.platform_admin] {
@@ -725,7 +765,7 @@ mod pg_tests {
                 assert_eq!(
                     error
                         .as_database_error()
-                        .and_then(|database| database.code())
+                        .and_then(sqlx::error::DatabaseError::code)
                         .as_deref(),
                     Some("42501"),
                     "{statement}"
@@ -742,7 +782,7 @@ mod pg_tests {
     #[tokio::test]
     async fn validate_schema_refuses_drifted_or_unprotected_schemas() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let owner = fixture.superuser_pool().await.expect("owner pool");
+        let owner = fixture.superuser_pool().expect("owner pool");
         let operator = fixture.operator_pool();
         fixture
             .wyrd_postgres()
@@ -891,8 +931,8 @@ mod pg_tests {
     #[tokio::test]
     async fn validate_schema_refuses_substituted_serving_logins() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let owner = fixture.superuser_pool().await.expect("owner pool");
-        let suffix = fixture._test_db.name.clone();
+        let owner = fixture.superuser_pool().expect("owner pool");
+        let suffix = fixture.test_db.name.clone();
         let app_imposter = format!("wyrd_app_imposter_{suffix}");
         let platform_imposter = format!("wyrd_platform_imposter_{suffix}");
         for (role, attributes) in [
@@ -907,7 +947,7 @@ mod pg_tests {
             .expect("owner creates an imposter login");
         }
 
-        let dsns = fixture._test_db.resolved_dsns().expect("serving DSNs");
+        let dsns = fixture.test_db.resolved_dsns().expect("serving DSNs");
         for (dsns, pool) in [
             (
                 ResolvedDsns {
@@ -984,10 +1024,7 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
 
         for expected in 0_i32..32 {
-            let assertion_pool = fixture
-                .superuser_pool()
-                .await
-                .expect("assertion pool clone");
+            let assertion_pool = fixture.superuser_pool().expect("assertion pool clone");
             let (current_user, bypasses_rls, observed): (String, bool, i32) = sqlx::query_as(
                 "SELECT current_user, rolbypassrls, $1::integer FROM pg_roles WHERE rolname = current_user",
             )
@@ -1010,11 +1047,9 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let first = fixture
             .superuser_pool()
-            .await
             .expect("first assertion pool clone");
         let second = fixture
             .superuser_pool()
-            .await
             .expect("second assertion pool clone");
 
         let (current_user, bypasses_rls): (String, bool) = sqlx::query_as(

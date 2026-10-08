@@ -10,6 +10,16 @@ pub struct Conversation {
     pub turns: Vec<ConversationTurn>,
 }
 
+impl<'a> IntoIterator for &'a Conversation {
+    type Item = &'a ConversationTurn;
+    type IntoIter = std::slice::Iter<'a, ConversationTurn>;
+
+    /// Iterates over turns in insertion order, so `for turn in &conversation` works.
+    fn into_iter(self) -> Self::IntoIter {
+        self.turns.iter()
+    }
+}
+
 impl Conversation {
     /// Creates an empty conversation.
     #[must_use]

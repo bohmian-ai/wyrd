@@ -520,6 +520,10 @@ impl EffectiveSpecs {
 /// Server Workflow admission bounds on a graph's declared shape and the JCS
 /// bytes of the bodies it executes.
 #[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "every field is an upper bound; the shared prefix names that"
+)]
 pub(crate) struct GraphBounds {
     /// Declared steps one Workflow may have.
     pub(crate) max_steps: usize,
@@ -674,21 +678,20 @@ async fn active_row(
     conn: &mut TenantConn<'_>,
     card_ref: &CardRef,
 ) -> Result<ParsedCardRow, WyrdError> {
-    let row = match &card_ref.uid {
-        Some(uid) => get_card_by_uid(conn, uid).await?,
-        None => {
-            let space = card_ref.space.as_ref().ok_or_else(|| {
-                WyrdError::registry_invalid_card_spec("CardRef.space is required for a card read")
-            })?;
-            get_card_by_ref(
-                conn,
-                card_ref.kind.clone(),
-                space,
-                &card_ref.name,
-                &card_ref.version,
-            )
-            .await?
-        }
+    let row = if let Some(uid) = &card_ref.uid {
+        get_card_by_uid(conn, uid).await?
+    } else {
+        let space = card_ref.space.as_ref().ok_or_else(|| {
+            WyrdError::registry_invalid_card_spec("CardRef.space is required for a card read")
+        })?;
+        get_card_by_ref(
+            conn,
+            card_ref.kind.clone(),
+            space,
+            &card_ref.name,
+            &card_ref.version,
+        )
+        .await?
     };
     let pinned = CardRef {
         kind: row.kind.clone(),
@@ -1029,6 +1032,7 @@ fn display_ref(card_ref: &CardRef) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::collections::{BTreeSet, HashMap};
 
     use uuid::Uuid;
@@ -1073,8 +1077,8 @@ mod tests {
                         .expect("test_setup: submission space is valid"),
                 ),
                 uid: None,
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::default(),
+                annotations: BTreeMap::default(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,

@@ -198,7 +198,7 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(completion())
-                .set_delay(Duration::from_secs(60)),
+                .set_delay(Duration::from_mins(1)),
         )
         .mount(&journey.upstream)
         .await;
@@ -282,19 +282,17 @@ async fn invoke_decisions(pool: &PgPool, tenant: DataTenantId) -> Vec<String> {
     rows
 }
 
-/// Proves that graceful shutdown drains an invocation audit append that is
+/// Proves that graceful shutdown drains an invocation audit decision that is
 /// still pending when it begins.
 ///
 /// The tenant's audit chain head is held under `FOR UPDATE` by this test, which
-/// is exactly what the canonical append takes, so the call's staged append
-/// blocks on it. The caller's completion still arrives — the invocation audit
-/// is deliberately non-blocking — and the decision row is absent while the lock
-/// is held. Production shutdown then runs: `BoundServer::run` closes the gateway
-/// task tracker and waits on it inside `shutdown.drain_ms`, so releasing the
-/// lock after the listener has stopped accepting leaves the append to finish
-/// inside that budget. A clean return proves it did; had the tracker still held
-/// the append at the deadline, the server would have exited terminally with
-/// `gateway call accounting did not drain before the shutdown deadline`.
+/// is exactly what the audit outbox's batch commit takes, so the call's staged
+/// decision blocks on it. The caller's completion still arrives — audit is
+/// non-blocking — and the decision row is absent while the lock is held.
+/// Production shutdown then runs: `BoundServer::run` drains the audit outbox
+/// inside `shutdown.drain_ms`, so releasing the lock after the listener has
+/// stopped accepting leaves the commit to finish inside that budget, and the
+/// row is present once shutdown returns.
 ///
 /// # Panics
 /// Panics when the call, the lock, the drain, or an audit expectation fails.
@@ -313,6 +311,13 @@ async fn a_pending_invocation_audit_append_drains_before_shutdown_completes() {
     // in-place teardown below takes on the server.
     let pool = journey.server.pg_fixture().vala_postgres().pool().clone();
     let tenant = journey.server.data_tenant_id();
+    // Commit the deployment's own decisions before the head is held, so only
+    // the call's decision is left pending behind it.
+    journey
+        .server
+        .wait_oracle_audit_staged(Duration::from_secs(30))
+        .await
+        .expect("setup decisions commit");
     let mut head = TenantConn::acquire(&pool, tenant)
         .await
         .expect("vala tenant conn");

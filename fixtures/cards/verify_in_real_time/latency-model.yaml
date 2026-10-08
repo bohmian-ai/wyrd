@@ -1,0 +1,25 @@
+apiVersion: wyrd/v1
+kind: Model
+metadata:
+  name: latency-model
+  version: 1.0.0
+  space: default
+spec:
+  interface:
+    kind: Custom
+    meta:
+      framework_version: 0.1.0
+      loader_module: assistant
+      loader_class: LatencyModel
+      extra: {}
+  task_type: Other
+  signature:
+    inputs:
+      - name: latency
+        dtype: float64
+    outputs:
+      - name: score
+        dtype: float64
+artifacts:
+  - relative_path: latency-model.bin
+    content_type: application/octet-stream

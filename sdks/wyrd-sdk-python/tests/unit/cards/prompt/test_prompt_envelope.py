@@ -1,4 +1,4 @@
-import json
+"""A PromptCard built from a Prompt."""
 
 from wyrd.prompt import Prompt, PromptCard
 
@@ -10,10 +10,5 @@ def test_happy_path_promptcard_construction() -> None:
     assert card.parameters == ["name"]
 
 
-def test_promptcard_json_envelope_shape() -> None:
-    card = PromptCard(Prompt.openai_chat("gpt-4o", messages="Hello"), name="hello")
-    envelope = json.loads(card.model_dump_json())
-
-    assert envelope["apiVersion"] == "wyrd/v1"
-    assert envelope["kind"] == "Prompt"
-    assert envelope["metadata"]["name"] == "hello"
+def test_promptcard_takes_its_name() -> None:
+    assert PromptCard(Prompt.openai_chat("gpt-4o", messages="Hello"), name="hello").name == "hello"

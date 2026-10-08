@@ -53,7 +53,7 @@ pub fn load_scenario_collection(path: &Path) -> Result<EvalScenarioCollection, E
 
     let scenarios = match path.extension().and_then(|extension| extension.to_str()) {
         Some("json") => parse_json(&raw, &path_display)?,
-        Some("yaml") | Some("yml") => parse_yaml(&raw, &path_display)?,
+        Some("yaml" | "yml") => parse_yaml(&raw, &path_display)?,
         Some("jsonl") => parse_jsonl(&raw, &path_display)?,
         other => {
             return Err(EvalPlanError::ScenarioFileExtUnsupported {
@@ -315,9 +315,8 @@ fn evaluate_passenger_condition(
 
         acc = match (acc, pending) {
             (None, _) => Some(this),
-            (Some(prev), Some(ConditionCombinator::And)) => Some(prev && this),
+            (Some(prev), Some(ConditionCombinator::And) | None) => Some(prev && this),
             (Some(prev), Some(ConditionCombinator::Or)) => Some(prev || this),
-            (Some(prev), None) => Some(prev && this),
         };
         pending = node.combinator;
 
@@ -341,7 +340,7 @@ fn response_json_path() -> Result<JsonPath, EvalExecError> {
 
 fn elapsed_ms(start: chrono::DateTime<chrono::Utc>) -> u64 {
     let diff = Utc::now().signed_duration_since(start);
-    diff.num_milliseconds().max(0) as u64
+    u64::try_from(diff.num_milliseconds()).unwrap_or(0)
 }
 
 #[cfg(test)]

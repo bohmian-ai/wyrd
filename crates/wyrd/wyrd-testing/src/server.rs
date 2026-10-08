@@ -1,5 +1,6 @@
 //! Real-socket Wyrd server test harness.
 
+use num_traits::ToPrimitive;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -9,8 +10,9 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wyrd_sql::OperatorPool;
+use wyrd_storage::StorageError;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use axum::body::{Body, to_bytes};
@@ -26,9 +28,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::{
-    BIFROST_CATALOG_NAME, BifrostCatalog, TableRef, TenantTableBinding,
-};
+use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
 use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
 use vala_bifrost_redux::forge::{
     ForgeClock, ForgeClockControl, ForgeConfig, ForgeSchedulerTrigger, ForgeWorker,
@@ -43,9 +43,7 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::storage::StorageInspection;
-use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
-use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
+use vala_bifrost_redux::storage::{BifrostStorage, StorageInspection};
 use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantGrant, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
@@ -66,6 +64,7 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::boot::data_root::BifrostDataRoot;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::boot::{build_workload_bindings, rewrap_sealed_secrets};
+use wyrd_server::components::platform::builtins::BuiltinTables;
 use wyrd_server::config::{
     BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
     GatewayConfig, GatewayManagedSecretKeys, IssuerEntry, OperatorKeySource, OperatorKeysConfig,
@@ -79,15 +78,16 @@ use wyrd_server::state::{
 };
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{FencingToken, NodeId};
+use wyrd_spec::vala::api::NodeId;
 use wyrd_sql::queries::auth::service_account_by_card_ref;
 use wyrd_telemetry::TelemetryGuard;
 
 use crate::bifrost::ForgeObjectStoreControl;
 
 use wyrd_spec::auth::{TokenAudience, TokenResponse};
+use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
 use wyrd_spec::envelope::{CardKind, Spec};
-use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+use wyrd_spec::ids::{BindingId, CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
@@ -95,7 +95,8 @@ use wyrd_sql::queries::auth::{
     insert_user, provision_system_principal, revoke_role_from_service_account,
     revoke_role_from_user, role_by_name, trusted_issuer_by_url, workload_binding_by_subject,
 };
-use wyrd_storage::{BackendConfig, StorageSettings};
+use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
+use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
 use crate::time::ClockHandle;
 use crate::verification::{VerificationFixture, VerificationFixtureError};
@@ -146,6 +147,28 @@ fn serve_task_outcome(
 }
 
 /// Wyrd server test harness supporting in-process and real-socket modes.
+///
+/// # Test controls
+///
+/// Client journeys in every SDK steer the server through exactly three
+/// controls, each driving the production code path rather than a substitute:
+///
+/// - [`flush_bifrost`](Self::flush_bifrost) publishes every accepted row now,
+///   so the next query sees it;
+/// - [`wait_for_baseline`](Self::wait_for_baseline) returns once a Drift
+///   Verifier's fitted baseline is ready, or fails at its deadline with the
+///   last observed baseline state;
+/// - [`make_binding_due`](Self::make_binding_due) makes a binding's schedule
+///   due now.
+///
+/// The Python and TypeScript test servers project these three and nothing
+/// else that steers or inspects server state. The remaining public methods are
+/// runtime-only facilities for the Rust server, Bifrost, and reliability
+/// tiers; they are not part of the SDK test contract.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag records one independent opt-in the harness started with"
+)]
 pub struct WyrdTestServer {
     inner: WyrdTestServerInner,
     mode: Mode,
@@ -158,7 +181,7 @@ pub struct WyrdTestServer {
     /// Peer identity this server presents and verifies on the private plane.
     peer_tls: Option<TestBifrostPeerTls>,
     /// Retains generated peer PEM files for as long as this server exists.
-    _peer_tls_root: Option<Arc<tempfile::TempDir>>,
+    _peer_tls_root: Option<Arc<TempDir>>,
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Test-only readiness failure requested by the builder.
@@ -192,13 +215,18 @@ pub struct WyrdTestServer {
 /// the Bifrost shutdown that follows it. Expiry falls through to an abort.
 const TEARDOWN_BUDGET: Duration = Duration::from_secs(2);
 
+/// Resources one running test server owns until it shuts down.
+///
+/// Holding the guards here ties every temporary directory, data root, and
+/// fixture handle to the server's lifetime, so nothing is removed while a
+/// background task may still read it.
 struct WyrdTestServerInner {
     /// Lifetime guard of the generated Operator key directory, when used.
     operator_keys_dir: Option<TempDir>,
     /// Lifetime guard retained only for local storage-backed servers.
-    _storage_root: Option<Arc<tempfile::TempDir>>,
+    storage_root: Option<Arc<TempDir>>,
     /// Lifetime guard for a harness-created Bifrost data directory.
-    _bifrost_data_dir: Arc<tempfile::TempDir>,
+    _bifrost_data_dir: Arc<TempDir>,
     /// Exclusive owner of this server's one Bifrost data root.
     bifrost_data_root: BifrostDataRoot,
     /// Lifetime guard for the mounted managed-secret key files this server
@@ -223,8 +251,6 @@ struct WyrdTestServerInner {
     node_id: NodeId,
     /// Atomic one-shot query truncation controls for language journeys.
     query_stream_fault: QueryStreamFaultController,
-    /// Atomic lifecycle-audit fault controls for causal query tests.
-    query_control_audit_fault: wyrd_server::state::QueryControlAuditFaultController,
     /// Every notification-backed schema stall armed, newest last.
     ///
     /// Retained so a journey holding several stalled queries can still resolve
@@ -284,6 +310,93 @@ pub struct BifrostQueryResourceSnapshot {
     pub peer_slots: u64,
 }
 
+/// Reads the process audit outbox's write-failure counter.
+///
+/// Every audited surface stages its decision on one non-blocking outbox. A
+/// tenant batch that cannot commit is retried, never dropped, and each failed
+/// attempt is counted in `outbox_write_failures_total{outbox="audit"}` rather
+/// than refusing the request. A journey proving that borrows the server's
+/// process-global Prometheus recorder through this owner, waits for a failed
+/// attempt, then restores the database and proves the decision commits.
+///
+/// The recorder is the one [`crate::bifrost::shared_process_telemetry_for_test`]
+/// installs, which every in-process test server also shares, so this works
+/// whether or not another test in the process started first. The counter is
+/// process-wide, so [`Self::count`] reports only failures since
+/// [`Self::install`].
+#[derive(Clone)]
+pub struct AuditCommitFailures {
+    /// Read-only capture over the shared process recorder.
+    capture: crate::bifrost::BifrostTelemetryCapture,
+    /// Process-wide failure count when this owner was installed.
+    baseline: u64,
+}
+
+impl std::fmt::Debug for AuditCommitFailures {
+    /// Formats the baseline only; the capture holds no printable state.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditCommitFailures")
+            .field("baseline", &self.baseline)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuditCommitFailures {
+    /// Borrows the shared process recorder, installing it on first use, and
+    /// records the current failure count as this owner's baseline.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Audit`] when the shared process
+    /// telemetry cannot be installed, for example because a recorder outside
+    /// the shared owner already holds the process.
+    pub fn install() -> Result<Self, WyrdTestServerError> {
+        let (_guard, capture) = crate::bifrost::shared_process_telemetry_for_test()
+            .map_err(|error| WyrdTestServerError::Audit(error.to_string()))?;
+        let baseline = Self::total(&capture);
+        Ok(Self { capture, baseline })
+    }
+
+    /// Returns the failed audit write attempts since [`Self::install`]; a
+    /// series never recorded reads zero.
+    #[must_use]
+    pub fn count(&self) -> u64 {
+        Self::total(&self.capture).saturating_sub(self.baseline)
+    }
+
+    /// Reads the process-wide `outbox_write_failures_total{outbox="audit"}`
+    /// sample from `capture`, or zero when the series was never recorded.
+    fn total(capture: &crate::bifrost::BifrostTelemetryCapture) -> u64 {
+        capture
+            .render()
+            .lines()
+            .find_map(|line| line.strip_prefix("outbox_write_failures_total{outbox=\"audit\"} "))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .and_then(|value| value.to_u64())
+            .unwrap_or(0)
+    }
+
+    /// Waits up to `budget` until at least one audit write attempt has failed,
+    /// returning the count.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Audit`] when no attempt failed in time.
+    pub async fn await_failure(&self, budget: Duration) -> Result<u64, WyrdTestServerError> {
+        let deadline = Instant::now() + budget;
+        loop {
+            let count = self.count();
+            if count > 0 {
+                return Ok(count);
+            }
+            if Instant::now() >= deadline {
+                return Err(WyrdTestServerError::Audit(format!(
+                    "no audit write attempt failed within {budget:?}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
 /// Production-owner Oracle residual state captured without a test adapter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OracleRuntimeInspection {
@@ -297,7 +410,7 @@ pub struct OracleRuntimeInspection {
     pub peer_running: u64,
     /// Analytical graph grants a leader's admit stream still holds open.
     pub held_grants: u64,
-    /// Oracle audit outbox commits still in flight.
+    /// Process audit outbox commits still in flight.
     pub audit_pending: u64,
     /// Active Oracle-owned process/query scratch directories.
     pub spill_directories: u64,
@@ -377,8 +490,6 @@ pub struct PublishedHotFileInspection {
 /// Durable pre-snapshot Forge workflow state for one tenant table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeWorkflowInspection {
-    /// Whether a coalesced planning demand remains.
-    pub has_demand: bool,
     /// Durable strategy/state pairs in creation order.
     pub tasks: Vec<(String, String)>,
     /// Tasks retaining active claims.
@@ -412,9 +523,15 @@ enum Mode {
 }
 
 /// Builder for [`WyrdTestServer`].
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one independent builder opt-in"
+)]
 pub struct WyrdTestServerBuilder {
     storage_settings: Option<StorageSettings>,
-    storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
+    /// Prebuilt storage handle to share instead of constructing one from
+    /// `storage_settings`.
+    storage_handle: Option<Arc<StorageHandle>>,
     access_ttl: Option<ChronoDuration>,
     auth_verify_settings: Option<WyrdAuthVerifySettings>,
     trusted_issuer_configs: Vec<IssuerEntry>,
@@ -444,11 +561,11 @@ pub struct WyrdTestServerBuilder {
     /// Closed role set constructed for this server instance.
     bifrost_roles: BTreeSet<BifrostRuntimeRole>,
     /// Cluster-retained Bifrost data directory reused across restarts.
-    bifrost_data_dir: Option<Arc<tempfile::TempDir>>,
+    bifrost_data_dir: Option<Arc<TempDir>>,
     /// Caller-owned durable Bifrost data root that outlives this process.
     ///
     /// A multi-process harness needs a root a restarted child re-mounts, which
-    /// a process-local [`tempfile::TempDir`] cannot be.
+    /// a process-local [`TempDir`] cannot be.
     bifrost_data_path: Option<std::path::PathBuf>,
     /// Complete process observations injected into the production resource policy.
     system_resources: Option<SystemResourceSnapshot>,
@@ -471,7 +588,7 @@ pub struct WyrdTestServerBuilder {
     /// Peer identity for this server; provisioned by the builder when absent.
     peer_tls: Option<TestBifrostPeerTls>,
     /// Temporary root retaining generated peer PEM files for this server's life.
-    peer_tls_root: Option<Arc<tempfile::TempDir>>,
+    peer_tls_root: Option<Arc<TempDir>>,
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Production Forge process role used by bound test servers.
@@ -493,6 +610,9 @@ pub struct WyrdTestServerBuilder {
     /// Built-in provider base URLs of an attached HTTP gateway engine; `None`
     /// keeps the default engine that dispatches nothing.
     gateway_endpoints: Option<BuiltinEndpoints>,
+    /// `OpenAI`-compatible mock upstream every Eval judge, queued or direct,
+    /// calls, set with the gateway provider root.
+    verification_provider: Option<Url>,
     /// Address and token variable the declared test Vault backend uses.
     ///
     /// `None` keeps the unreachable default address and the default token
@@ -598,7 +718,7 @@ impl Default for WyrdTestServerBuilder {
             sealing_keyring: None,
             public_origin: None,
             ui_client_secret_hash: None,
-            forge_interval: Duration::from_secs(60),
+            forge_interval: Duration::from_mins(1),
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
@@ -633,6 +753,7 @@ impl Default for WyrdTestServerBuilder {
             limits: None,
             workflow_config: None,
             gateway_endpoints: None,
+            verification_provider: None,
             gateway_vault_backend: None,
             stalled_drain_for_test: None,
             shutdown_drain_for_test: None,
@@ -711,6 +832,19 @@ pub enum WyrdTestServerError {
     /// SQL operation failed.
     #[error("sql error: {0}")]
     Sql(String),
+    /// A Drift Verifier's baseline was not ready by the caller's deadline.
+    #[error(
+        "baseline of verifier {verifier} was not ready within {timeout:?}; last observed: {last:?}"
+    )]
+    BaselineNotReady {
+        /// The Verifier Card whose baseline was awaited.
+        verifier: CardUid,
+        /// The deadline the caller allowed.
+        timeout: Duration,
+        /// The last baseline status read, `None` when the Verifier has no
+        /// fitted baseline at all.
+        last: Option<Box<DriftBaselineStatus>>,
+    },
 }
 
 impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
@@ -738,6 +872,15 @@ impl From<WyrdTestServerError> for wyrd_spec::error::WyrdError {
                     details: serde_json::json!({}),
                 }
             }
+            WyrdTestServerError::BaselineNotReady { verifier, last, .. } => {
+                wyrd_spec::error::WyrdError::VerificationBaselineNotReady {
+                    message: msg,
+                    details: serde_json::json!({
+                        "verifier_uid": verifier,
+                        "baseline": last,
+                    }),
+                }
+            }
         }
     }
 }
@@ -754,7 +897,7 @@ impl WyrdTestServer {
     /// # Errors
     /// Returns an error when database, storage, auth, or router state cannot be created.
     pub async fn start_in_process() -> Result<Self, WyrdTestServerError> {
-        Self::builder().start_in_process().await
+        Box::pin(Self::builder().start_in_process()).await
     }
 
     /// Start a Wyrd server bound to a real OS-assigned TCP socket.
@@ -762,7 +905,7 @@ impl WyrdTestServer {
     /// # Errors
     /// Returns an error when startup or socket binding fails.
     pub async fn start_bound() -> Result<Self, WyrdTestServerError> {
-        Self::builder().start_bound().await
+        Box::pin(Self::builder().start_bound()).await
     }
 
     /// Shut down the server, settling its lifecycle owners before dropping fixtures.
@@ -822,8 +965,8 @@ impl WyrdTestServer {
         self.inner.state.shutdown_token.cancel();
         let mut outcome = Ok(());
         if let Some(mut handle) = self.serve_handle.take() {
-            match tokio::time::timeout(budget, &mut handle).await {
-                Ok(join) => match serve_task_outcome(join) {
+            if let Ok(join) = tokio::time::timeout(budget, &mut handle).await {
+                match serve_task_outcome(join) {
                     Ok(Ok(_report)) => {
                         self.bifrost_settled |= matches!(self.mode, Mode::Bound { .. });
                     }
@@ -831,17 +974,16 @@ impl WyrdTestServer {
                         tracing::warn!(?exit, "bound serve task exited terminally during shutdown");
                     }
                     Err(error) => outcome = Err(error),
-                },
-                Err(_) => {
-                    tracing::warn!("serve task did not drain within the teardown budget; aborting");
-                    handle.abort();
-                    if let Err(error) = handle.await
-                        && error.is_panic()
-                    {
-                        outcome = Err(WyrdTestServerError::Join(format!(
-                            "bound serve task: {error}"
-                        )));
-                    }
+                }
+            } else {
+                tracing::warn!("serve task did not drain within the teardown budget; aborting");
+                handle.abort();
+                if let Err(error) = handle.await
+                    && error.is_panic()
+                {
+                    outcome = Err(WyrdTestServerError::Join(format!(
+                        "bound serve task: {error}"
+                    )));
                 }
             }
         }
@@ -883,13 +1025,12 @@ impl WyrdTestServer {
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
         let fixture = Arc::clone(&self.inner.fixture);
         let storage = Arc::clone(&self.inner.state.storage);
-        let storage_root = self.inner._storage_root.clone();
+        let storage_root = self.inner.storage_root.clone();
         self.shutdown().await?;
         if builder.bind_addrs.is_none() {
             builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
-        builder
-            .start_with_resources(fixture, storage, storage_root)
+        Box::pin(builder.start_with_resources(fixture, storage, storage_root))
             .await?
             .bind()
             .await
@@ -910,13 +1051,12 @@ impl WyrdTestServer {
         &self,
         builder: WyrdTestServerBuilder,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
-        builder
-            .start_with_resources(
-                Arc::clone(&self.inner.fixture),
-                Arc::clone(&self.inner.state.storage),
-                self.inner._storage_root.clone(),
-            )
-            .await
+        Box::pin(builder.start_with_resources(
+            Arc::clone(&self.inner.fixture),
+            Arc::clone(&self.inner.state.storage),
+            self.inner.storage_root.clone(),
+        ))
+        .await
     }
 
     /// Start `builder` as a second replica like
@@ -932,7 +1072,7 @@ impl WyrdTestServer {
         if builder.bind_addrs.is_none() {
             builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
-        self.start_replica(builder).await?.bind().await
+        Box::pin(self.start_replica(builder)).await?.bind().await
     }
 
     /// Cancel the serve task, join it in place, and return its drain outcome.
@@ -1347,30 +1487,6 @@ impl WyrdTestServer {
             .set_next(QueryStreamFault::EofAfterBatch);
     }
 
-    /// Fails cancellation audit gates before owner dispatch until restored.
-    pub fn fail_query_cancel_attempt_audit(&self) {
-        self.inner.query_control_audit_fault.fail_cancel_attempts();
-    }
-
-    /// Restores cancellation audit gates after a deterministic fault.
-    pub fn restore_query_cancel_attempt_audit(&self) {
-        self.inner
-            .query_control_audit_fault
-            .restore_cancel_attempts();
-    }
-
-    /// Fails the authoritative object-denial audit append until restored.
-    pub fn fail_query_object_denial_audit(&self) {
-        self.inner.query_control_audit_fault.fail_object_denials();
-    }
-
-    /// Restores the authoritative object-denial audit append.
-    pub fn restore_query_object_denial_audit(&self) {
-        self.inner
-            .query_control_audit_fault
-            .restore_object_denials();
-    }
-
     /// Stall the next query after its schema frame using test-tier notifications.
     pub fn stall_next_query_after_schema(&self) {
         let stall = self.inner.query_stream_fault.stall_next_after_schema();
@@ -1448,7 +1564,7 @@ impl WyrdTestServer {
             .inner
             .state
             .bifrost_resources()
-            .and_then(|resources| resources.oracle())
+            .and_then(vala_bifrost_redux::resources::BifrostRoleResources::oracle)
             .ok_or_else(|| WyrdTestServerError::Start("Oracle role is not hosted".to_owned()))?
             .memory_hold())
     }
@@ -1503,7 +1619,8 @@ impl WyrdTestServer {
             self.inner.state.bifrost_query().ok_or_else(|| {
                 WyrdTestServerError::Start("Oracle runtime is not hosted".to_owned())
             })?;
-        let (admission, audit_pending) = runtime.oracle_runtime_inspection();
+        let admission = runtime.oracle_runtime_inspection();
+        let audit_pending = self.inner.state.audit_outbox.pending();
         let (spill_directories, spill_files, spill_file_bytes) = self.inspect_oracle_spill()?;
         Ok(OracleRuntimeInspection {
             active_queries: admission.active_queries,
@@ -1641,6 +1758,15 @@ impl WyrdTestServer {
         self.inner.forge_scheduler_trigger.request_pass();
     }
 
+    /// Wake the already-running leader maintenance timer for one test pass.
+    ///
+    /// The pass runs manifest rewrite, snapshot expiry, and expired and orphan
+    /// cleanup exactly as one production timer tick does, and counts as one
+    /// completed scheduler pass. A replica without the leader term skips it.
+    pub fn request_forge_maintenance_pass_for_test(&self) {
+        self.inner.forge_scheduler_trigger.request_maintenance();
+    }
+
     /// Return completed production scheduler passes observed by the test trigger.
     #[must_use]
     pub fn completed_forge_scheduler_passes_for_test(&self) -> usize {
@@ -1668,7 +1794,7 @@ impl WyrdTestServer {
         &self,
         tenant: DataTenantId,
     ) -> Result<i64, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vala.forge_tasks WHERE data_tenant_id = $1 AND state IN ('ready', 'claimed', 'running', 'prepared')",
         )
@@ -1697,7 +1823,7 @@ impl WyrdTestServer {
         namespace: &str,
         table_name: &str,
     ) -> Result<Vec<PublishedHotFileInspection>, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         let rows: Vec<PublishedHotFileRow> = sqlx::query_as(
             "SELECT id,file_path,file_size,row_count,file_ordinal,file_checksum,promotion_record,\
              wal_lsn_min,wal_lsn_max \
@@ -1748,52 +1874,31 @@ impl WyrdTestServer {
             .collect()
     }
 
-    /// Wait until no Oracle audit outbox commit is still in flight.
+    /// Wait until no audit outbox commit is still in flight.
     ///
-    /// Oracle stages each read decision in `vala.audit_staging` from a
-    /// background task, so a journey that asserts on staging first waits for
-    /// those commits. The returned count is the real residual; a nonzero
-    /// return within `budget` means commits did not finish.
+    /// Every surface stages its decisions in `vala.audit_staging` through the
+    /// process audit outbox's background writer, so a journey that asserts on
+    /// staging first waits for those commits without closing the outbox. The
+    /// returned count is the real residual; a nonzero return within `budget`
+    /// means commits did not finish.
     ///
     /// # Errors
     ///
-    /// Returns a start error when this server does not host an Oracle role.
+    /// This wait itself cannot fail; the `Result` keeps the projected Python
+    /// and TypeScript harness signatures unchanged.
     pub async fn wait_oracle_audit_staged(
         &self,
         budget: std::time::Duration,
     ) -> Result<u64, WyrdTestServerError> {
-        let deadline = std::time::Instant::now() + budget;
-        loop {
-            let pending = self.oracle_runtime_inspection()?.audit_pending;
-            if pending == 0 || std::time::Instant::now() >= deadline {
-                return Ok(pending);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
+        let residual = self
+            .inner
+            .state
+            .audit_outbox
+            .settle(std::time::Instant::now() + budget)
+            .await;
+        Ok(residual as u64)
     }
 
-    /// Counts retained audit rows matching one predicate, through the read path.
-    ///
-    /// `vala.audit_staging` is transient: the server's publisher moves a
-    /// tenant's staged rows into retained history every few seconds and deletes
-    /// them, so a test that reads staging to prove a decision *was* recorded
-    /// races that sweep. This reads the durable table instead, fused and strict
-    /// so a row Scribe still holds counts the same as one already in an object.
-    ///
-    /// `predicate` is the `WHERE` fragment naming the exact rows under
-    /// assertion, so one owner serves every shape a journey needs
-    /// (operation/resource/outcome, or a single request's decision). Every
-    /// query additionally excludes [`AUDIT_INSPECTION_PRINCIPAL`], so a count
-    /// of read decisions never counts the inspection reads that produced it.
-    ///
-    /// A tenant that has never published owns no retained table yet, which is an
-    /// honest zero rather than a failure. A public read may also refuse
-    /// with the retryable `QueryVisibilityUnavailable` while publication moves
-    /// the live cut; that yields `None` so a bounded poll retries instead of
-    /// failing early.
-    ///
-    /// # Errors
-    /// Returns the authorization failure or any non-retryable query failure.
     /// Builds the authorized context every retained-audit inspection runs under.
     ///
     /// It is the same context the public query service builds, except that its
@@ -1857,6 +1962,7 @@ impl WyrdTestServer {
             .query_sql(
                 context,
                 wyrd_spec::vala::api::BifrostQueryRequest {
+                    params: Vec::new(),
                     sql: format!(
                         "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
                          AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
@@ -1917,6 +2023,28 @@ impl WyrdTestServer {
         Ok(records)
     }
 
+    /// Counts retained audit rows matching one predicate, through the read path.
+    ///
+    /// `vala.audit_staging` is transient: the server's publisher moves a
+    /// tenant's staged rows into retained history every few seconds and deletes
+    /// them, so a test that reads staging to prove a decision *was* recorded
+    /// races that sweep. This reads the durable table instead, fused and strict
+    /// so a row Scribe still holds counts the same as one already in an object.
+    ///
+    /// `predicate` is the `WHERE` fragment naming the exact rows under
+    /// assertion, so one owner serves every shape a journey needs
+    /// (operation/resource/outcome, or a single request's decision). Every
+    /// query additionally excludes [`AUDIT_INSPECTION_PRINCIPAL`], so a count
+    /// of read decisions never counts the inspection reads that produced it.
+    ///
+    /// A tenant that has never published owns no retained table yet, which is an
+    /// honest zero rather than a failure. A public read may also refuse
+    /// with the retryable `QueryVisibilityUnavailable` while publication moves
+    /// the live cut; that yields `None` so a bounded poll retries instead of
+    /// failing early.
+    ///
+    /// # Errors
+    /// Returns the authorization failure or any non-retryable query failure.
     async fn retained_audit_rows(
         &self,
         tenant: DataTenantId,
@@ -1929,6 +2057,7 @@ impl WyrdTestServer {
         let outcome =
             ScheduledQueryCaller::new(self.inner.state.clone(), context, CancellationToken::new())
                 .run(wyrd_spec::vala::api::BifrostQueryRequest {
+                    params: Vec::new(),
                     sql: format!(
                         "SELECT seq FROM {AUDIT_LOG} WHERE ({predicate}) \
                  AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}'"
@@ -2010,10 +2139,10 @@ impl WyrdTestServer {
     ///
     /// This is synchronization, never an assertion source: it settles the
     /// server-owned publisher so a following retained-history read sees every
-    /// decision committed so far. Oracle's read-decision commits are tracked
-    /// tasks that land in staging slightly after the query returns, so those
-    /// are drained first; the chain head then reports the publisher's own
-    /// progress as `published_seq` catching up to `last_seq`. A tenant with no
+    /// decision committed so far. Every decision lands in staging through the
+    /// audit outbox slightly after its request returns, so the outbox is
+    /// settled first; the chain head then reports the publisher's own
+    /// progress as its `published_seq` catching up to the chain head's `last_seq`. A tenant with no
     /// chain-head row has appended nothing and owes nothing.
     ///
     /// # Errors
@@ -2023,21 +2152,21 @@ impl WyrdTestServer {
         &self,
         tenant: DataTenantId,
     ) -> Result<(), WyrdTestServerError> {
-        if self.oracle_runtime_inspection().is_ok() {
-            let pending = self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
-            if pending != 0 {
-                return Err(WyrdTestServerError::Audit(format!(
-                    "read-audit commits did not finish: {pending} pending after \
-                     {RETAINED_AUDIT_BUDGET:?}"
-                )));
-            }
+        let pending = self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
+        if pending != 0 {
+            return Err(WyrdTestServerError::Audit(format!(
+                "audit outbox commits did not finish: {pending} pending after \
+                 {RETAINED_AUDIT_BUDGET:?}"
+            )));
         }
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         let deadline = std::time::Instant::now() + RETAINED_AUDIT_BUDGET;
         loop {
             let head = sqlx::query_as::<_, (i64, i64)>(
-                "SELECT last_seq, published_seq FROM vala.audit_chain_head \
-                 WHERE data_tenant_id = $1",
+                "SELECT head.last_seq, COALESCE(progress.published_seq, 0) \
+                   FROM vala.audit_chain_head head \
+                   LEFT JOIN vala.audit_publication progress USING (data_tenant_id) \
+                  WHERE head.data_tenant_id = $1",
             )
             .bind(tenant.as_uuid())
             .fetch_optional(&pool)
@@ -2109,13 +2238,15 @@ impl WyrdTestServer {
     /// describe it serves, so this is the server-observed describe count a
     /// journey uses to prove a writer reused its cached schema. Start the
     /// server without audit publication: the publisher retires staged rows,
-    /// which would shrink the count mid-test.
+    /// which would shrink the count mid-test. The count first waits for the
+    /// audit outbox to commit every decision already staged.
     ///
     /// # Errors
     /// Returns an error when the fixture's superuser pool cannot be acquired
     /// or the audit query fails.
     pub async fn table_describe_count(&self, fqn: &str) -> Result<i64, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1 \
              AND operation = 'vala.bifrost.describe' AND resource = $2 AND outcome = 'allowed'",
@@ -2141,7 +2272,7 @@ impl WyrdTestServer {
         &self,
         owner: &CardUid,
     ) -> Result<Option<DateTime<Utc>>, WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         sqlx::query_scalar(
             "SELECT last_authenticated_at FROM wyrd.auth_service_accounts \
              WHERE data_tenant_id = $1 AND card_uid = $2",
@@ -2153,64 +2284,38 @@ impl WyrdTestServer {
         .map_err(sql)
     }
 
-    /// Make every fixture-tenant describe of `fqn` fail until restored.
+    /// Rewrite the registered schema fingerprint of the fixture tenant's table
+    /// `fqn`, as a server-side schema change leaves its control row.
     ///
-    /// Installs a Postgres trigger that refuses the describe's audit append, so
-    /// the real server fails closed with `WYRD_VALA_500_AUDIT_UNAVAILABLE` for that
-    /// one table while every other describe proceeds. This lets a journey drive
-    /// the startup refusal of either fixed observation table independently.
-    /// Installing again replaces the previous fault; undo it with
-    /// [`Self::restore_table_describe`].
+    /// A writer that described the table earlier keeps sealing batches under
+    /// the schema it cached, so Scribe's registration lookup now refuses each
+    /// of them at the fingerprint fence with
+    /// `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`. The rewrite is permanent
+    /// for the server's lifetime.
     ///
     /// # Errors
-    /// Returns [`WyrdTestServerError::Unsupported`] when `fqn` is not a plain
-    /// dotted identifier, and an SQL error when the trigger cannot be installed.
-    pub async fn fail_table_describe(&self, fqn: &str) -> Result<(), WyrdTestServerError> {
-        // Trigger arguments are literals, so the FQN is interpolated only after
-        // proving it cannot close the quote.
-        if fqn.is_empty()
-            || !fqn
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
-        {
+    /// Returns [`WyrdTestServerError::Unsupported`] when the tenant has no
+    /// registered table `fqn`, and an SQL error when the update fails.
+    pub async fn change_table_fingerprint_for_test(
+        &self,
+        fqn: &str,
+    ) -> Result<(), WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
+        let changed = sqlx::query(
+            "UPDATE vala.bifrost_tables SET fingerprint = sha256(fingerprint), updated_at = now() \
+             WHERE data_tenant_id = $1 AND fqn = $2",
+        )
+        .bind(self.data_tenant_id().as_uuid())
+        .bind(fqn)
+        .execute(&pool)
+        .await
+        .map_err(sql)?
+        .rows_affected();
+        if changed != 1 {
             return Err(WyrdTestServerError::Unsupported(format!(
-                "describe fault needs a plain table FQN, got {fqn:?}"
+                "no registered table {fqn:?} to change"
             )));
         }
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        for statement in [
-            "CREATE OR REPLACE FUNCTION vala.wyrd_test_fail_describe() RETURNS trigger \
-             LANGUAGE plpgsql AS $$ BEGIN \
-             IF NEW.operation = 'vala.bifrost.describe' AND NEW.resource = TG_ARGV[0] \
-             AND NEW.data_tenant_id = TG_ARGV[1]::uuid THEN \
-             RAISE EXCEPTION 'test fault: describe of % refused', NEW.resource; \
-             END IF; RETURN NEW; END $$"
-                .to_owned(),
-            "DROP TRIGGER IF EXISTS wyrd_test_fail_describe ON vala.audit_staging".to_owned(),
-            format!(
-                "CREATE TRIGGER wyrd_test_fail_describe BEFORE INSERT ON vala.audit_staging \
-                 FOR EACH ROW EXECUTE FUNCTION vala.wyrd_test_fail_describe('{fqn}', '{}')",
-                self.data_tenant_id().as_uuid()
-            ),
-        ] {
-            sqlx::query(sqlx::AssertSqlSafe(statement))
-                .execute(&pool)
-                .await
-                .map_err(sql)?;
-        }
-        Ok(())
-    }
-
-    /// Remove the fault [`Self::fail_table_describe`] installed, if any.
-    ///
-    /// # Errors
-    /// Returns an SQL error when the trigger cannot be dropped.
-    pub async fn restore_table_describe(&self) -> Result<(), WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        sqlx::query("DROP TRIGGER IF EXISTS wyrd_test_fail_describe ON vala.audit_staging")
-            .execute(&pool)
-            .await
-            .map_err(sql)?;
         Ok(())
     }
 
@@ -2586,13 +2691,15 @@ impl WyrdTestServer {
 
     /// Provision one canonical built-in table for a test tenant.
     ///
-    /// A canonical signal table is materialized on first use, so a journey
-    /// that writes it through the public Arrow door - rather than through an
-    /// OTLP export, which provisions on ingest - must ask for it first.
+    /// Built-ins are created eagerly at startup and by [`Self::seed_tenant`];
+    /// a tenant seeded directly through the Postgres fixture after boot gets
+    /// neither, and ingest never creates one, so such a test asks for it here
+    /// or for the whole inventory through
+    /// [`Self::ensure_builtin_tables_for_test`]. Repeating it is a no-op.
     ///
     /// # Errors
     /// Returns an error when no built-in owns `namespace.name` or the catalog
-    /// cannot materialize it.
+    /// cannot create it.
     pub async fn ensure_builtin_table_for_test(
         &self,
         tenant: DataTenantId,
@@ -2617,7 +2724,7 @@ impl WyrdTestServer {
         self.inner.forge_publisher.clone()
     }
 
-    /// Inspect durable Forge demand and task state without requiring an Iceberg snapshot.
+    /// Inspect durable Forge task state without requiring an Iceberg snapshot.
     ///
     /// # Errors
     ///
@@ -2634,7 +2741,7 @@ impl WyrdTestServer {
         .await
     }
 
-    /// Inspect durable Forge demand and task state for one namespace-qualified
+    /// Inspect durable Forge task state for one namespace-qualified
     /// table without requiring an Iceberg snapshot.
     ///
     /// This is the authoritative body; the `&str` form above is the
@@ -2650,16 +2757,7 @@ impl WyrdTestServer {
     ) -> Result<ForgeWorkflowInspection, WyrdTestServerError> {
         let namespace = table.namespace.as_str();
         let table = table.name.as_str();
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
-        let has_demand = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3)",
-        )
-        .bind(tenant.as_uuid())
-        .bind(namespace)
-        .bind(table)
-        .fetch_one(&pool)
-        .await
-        .map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         let tasks = sqlx::query_as::<_, (String, String)>(
             "SELECT strategy,state FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3 ORDER BY created_at,task_id",
         )
@@ -2688,7 +2786,6 @@ impl WyrdTestServer {
         .await
         .map_err(sql)?;
         Ok(ForgeWorkflowInspection {
-            has_demand,
             tasks,
             active_claims: u64::try_from(active_claims).map_err(|_| {
                 WyrdTestServerError::Start("negative Forge active claim count".to_owned())
@@ -2811,6 +2908,7 @@ impl WyrdTestServer {
         wyrd_auth::platform_sessions::PlatformSessions::new(
             self.operator_pool(),
             std::sync::Arc::clone(&self.inner.issuing_key),
+            std::sync::Arc::clone(&self.inner.state.audit_outbox),
         )
         .issue_federated(
             &issuer,
@@ -2899,7 +2997,7 @@ impl WyrdTestServer {
             .inner
             .state
             .auth
-            .tenant_issuer()
+            .tenant_issuer(&self.inner.state.audit_outbox)
             .ok_or_else(|| WyrdTestServerError::Auth("no issuing key".to_owned()))?;
         let exchanged = issuer
             .issue(
@@ -2980,11 +3078,7 @@ impl WyrdTestServer {
         let tenant_id = self.data_tenant_id();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let api_key = WyrdApiKey::generate(tenant_id);
-        let raw = api_key.secret.clone();
-        let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-            .await
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+        let key_hash = wyrd_auth_issue::hash_secret(api_key.secret.expose_secret());
 
         let mut conn = self.tenant_conn_for(tenant_id).await?;
         let principal = service_account_by_card_ref(&mut conn, "service", &binding)
@@ -3002,7 +3096,7 @@ impl WyrdTestServer {
             &api_key.prefix,
             &key_hash,
             creator_id,
-            Some(Duration::from_secs(365 * 24 * 60 * 60)),
+            Some(Duration::from_hours(8760)),
         )
         .await
         .map_err(sql)?;
@@ -3024,14 +3118,19 @@ impl WyrdTestServer {
         })
     }
 
-    /// Provision a second active tenant: seed its row and built-in roles.
+    /// Provision a second active tenant: seed its row, built-in roles, and
+    /// every canonical built-in table.
     ///
     /// The fixture seeds one tenant at boot; the same-issuer-two-tenant
     /// isolation test calls this to stand up tenant B so a subject bound only in
-    /// tenant A fails closed in B. Returns the new tenant's isolation key.
+    /// tenant A fails closed in B. Built-in tables are ensured through the same
+    /// [`BuiltinTables`] owner tenant provisioning uses, because a tenant seeded
+    /// after boot misses startup reconciliation. Returns the new tenant's
+    /// isolation key.
     ///
     /// # Errors
-    /// Returns an error when the tenant insert or role seed fails.
+    /// Returns an error when the tenant insert, role seed, or built-in table
+    /// provisioning fails.
     pub async fn seed_tenant(&self, slug: &str) -> Result<DataTenantId, WyrdTestServerError> {
         let tenant_id = self
             .inner
@@ -3045,7 +3144,27 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         provision_system_principal(&mut conn).await.map_err(sql)?;
         conn.commit().await.map_err(sql)?;
+        self.ensure_builtin_tables_for_test(tenant_id).await?;
         Ok(tenant_id)
+    }
+
+    /// Ensure every canonical built-in table for a tenant seeded after boot.
+    ///
+    /// Startup reconciliation covers tenants that exist when the server
+    /// starts; a tenant seeded later through the Postgres fixture directly
+    /// receives its inventory here, through the same [`BuiltinTables`] owner
+    /// tenant provisioning uses. Repeating it is a no-op.
+    ///
+    /// # Errors
+    /// Returns an error when the catalog cannot ensure a built-in.
+    pub async fn ensure_builtin_tables_for_test(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<(), WyrdTestServerError> {
+        BuiltinTables::new(self.bifrost_catalog())
+            .ensure_tenant(tenant)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
     /// Return the raw sealed client secret of the tenant's human connection in
@@ -3327,6 +3446,10 @@ impl WyrdTestServer {
     ///
     /// # Errors
     /// Returns an error when the card kind is not Service/Agent, or SQL fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a generated UUIDv7 fails `CardUid` validation.
     pub async fn seed_card_principal_in_tenant(
         &self,
         tenant_id: DataTenantId,
@@ -3437,11 +3560,7 @@ impl WyrdTestServer {
         let principal_id = Uuid::now_v7();
         let creator_id = self.ensure_fixture_admin_for(tenant_id).await?;
         let api_key = WyrdApiKey::generate(tenant_id);
-        let raw = api_key.secret.clone();
-        let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
-            .await
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
-            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+        let key_hash = wyrd_auth_issue::hash_secret(api_key.secret.expose_secret());
 
         let mut conn = self.tenant_conn_for(tenant_id).await?;
         seed_machine_card(&mut conn, &card_ref, creator_id).await?;
@@ -3463,7 +3582,7 @@ impl WyrdTestServer {
             &api_key.prefix,
             &key_hash,
             creator_id,
-            Some(std::time::Duration::from_secs(365 * 24 * 60 * 60)),
+            Some(std::time::Duration::from_hours(8760)),
         )
         .await
         .map_err(sql)?;
@@ -3529,45 +3648,34 @@ impl WyrdTestServer {
             .map_err(sql)
     }
 
-    /// Reads one accepted Oracle epoch's validated durable table protection.
+    /// Counts the active Oracle table reads one table currently holds.
     ///
-    /// Resolves the registered table UID under tenant RLS and ends the read
-    /// transaction before returning, so inspection holds no maintenance lock.
+    /// Reads `vala.oracle_active_table_reads` under tenant RLS by the
+    /// registered table UID and ends the read transaction before returning, so
+    /// inspection holds no maintenance lock and never discards an abandoned
+    /// row.
     ///
     /// # Errors
-    /// Returns a harness SQL error for missing or invalid identity, a malformed
-    /// frontier, an unrepresentable fence, or a failed read transaction.
-    pub async fn oracle_table_protection_for_test(
+    /// Returns a harness SQL error when the table is unregistered or the read
+    /// transaction fails.
+    pub async fn oracle_active_table_reads_for_test(
         &self,
         binding: &TenantTableBinding,
-        node: NodeId,
-        fence: FencingToken,
-    ) -> Result<Option<ProtectionRecord>, WyrdTestServerError> {
+    ) -> Result<i64, WyrdTestServerError> {
         let mut conn = self.tenant_conn_for(binding.tenant).await?;
-        let stored: Vec<u8> =
-            sqlx::query_scalar("SELECT table_uid FROM vala.bifrost_tables WHERE fqn = $1")
-                .bind(binding.table_ref.fqn())
-                .fetch_one(&mut **conn.transaction())
-                .await
-                .map_err(sql)?;
-        let identity = TableAuthorityIdentity {
-            tenant: binding.tenant,
-            table_uid: <[u8; 16]>::try_from(stored.as_slice()).map_err(sql)?,
-            catalog_name: BIFROST_CATALOG_NAME.to_owned(),
-            namespace_name: binding.table_ref.namespace.as_str().to_owned(),
-            table_name: binding.table_ref.name.clone(),
-        };
-        let record = OracleTableProtections::new(&mut conn)
-            .read(
-                &identity,
-                node.as_uuid(),
-                i64::try_from(fence).map_err(sql)?,
-            )
-            .await
-            .map_err(sql)?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.oracle_active_table_reads r \
+             JOIN vala.bifrost_tables t ON t.table_uid = r.table_uid \
+             WHERE t.fqn = $1",
+        )
+        .bind(binding.table_ref.fqn())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(sql)?;
         conn.commit().await.map_err(sql)?;
-        Ok(record)
+        Ok(count)
     }
+
     /// Return the durable Scribe WAL root this fixture composed the server with.
     ///
     /// Durability assertions replay the WAL directly rather than trusting an
@@ -3625,6 +3733,76 @@ impl WyrdTestServer {
             self.inner.fixture.data_tenant_id(),
         )
         .await
+    }
+
+    /// Wait until the fixture tenant's Drift Verifier `verifier` has a ready
+    /// fitted baseline.
+    ///
+    /// Reads the baseline through [`DriftBaselineQueue::status`], the same
+    /// owner that projects `card.status.verification.baseline` on a Card
+    /// read, so readiness here is readiness a client observes. Polls until the
+    /// state is `ready`; a `failed` state is not final while the fitter still
+    /// retries it, so it is waited through rather than returned early.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::BaselineNotReady`] carrying the last
+    /// observed status when `timeout` elapses first, and
+    /// [`WyrdTestServerError::Sql`] when the status read fails.
+    pub async fn wait_for_baseline(
+        &self,
+        verifier: &CardUid,
+        timeout: Duration,
+    ) -> Result<(), WyrdTestServerError> {
+        let deadline = Instant::now() + timeout;
+        let sql = |error: &dyn std::fmt::Display| WyrdTestServerError::Sql(error.to_string());
+        loop {
+            let mut conn = self
+                .inner
+                .state
+                .postgres
+                .wyrd()
+                .tenant_conn(self.data_tenant_id())
+                .await
+                .map_err(|error| sql(&error))?;
+            let last = DriftBaselineQueue::default()
+                .status(&mut conn, verifier)
+                .await
+                .map_err(|error| sql(&error))?;
+            conn.rollback().await.map_err(|error| sql(&error))?;
+            if last
+                .as_ref()
+                .is_some_and(|status| status.state == DriftBaselineState::Ready)
+            {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(WyrdTestServerError::BaselineNotReady {
+                    verifier: verifier.clone(),
+                    timeout,
+                    last: last.map(Box::new),
+                });
+            }
+            tokio::time::sleep(BASELINE_POLL_INTERVAL.min(deadline - now)).await;
+        }
+    }
+
+    /// Bring binding `binding`'s schedule cursor to database time, so the
+    /// verification runtime schedules its next occurrence now.
+    ///
+    /// Delegates to [`VerificationFixture::make_binding_due`]; the real
+    /// scheduler still claims, runs, and settles the occurrence.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Sql`] when the fixture tenant cannot be
+    /// opened or the cursor update fails.
+    pub async fn make_binding_due(&self, binding: BindingId) -> Result<(), WyrdTestServerError> {
+        self.verification_fixture()
+            .await
+            .map_err(|error| WyrdTestServerError::Sql(error.to_string()))?
+            .make_binding_due(binding)
+            .await
+            .map_err(|error| WyrdTestServerError::Sql(error.to_string()))
     }
 
     /// Cancel and drain a partially started bound server while preserving the
@@ -3691,8 +3869,9 @@ impl WyrdTestServer {
             config.shutdown.drain_ms = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
         }
 
-        let bound = WyrdServer::new(config, state)
-            .map_err(|e| WyrdTestServerError::Start(e.to_string()))?
+        let server = WyrdServer::new(config, state)
+            .map_err(|e| WyrdTestServerError::Start(e.to_string()))?;
+        let bound = server
             .bind(ServeMode::Both)
             .await
             .map_err(|e| WyrdTestServerError::Bind(format!("{e:?}")))?;
@@ -3751,7 +3930,7 @@ impl WyrdTestServer {
                 ))
                 .await);
         }
-        if let Err(error) = wait_for_ready(&base_url).await {
+        if let Err(error) = wait_for_ready(&base_url, &self.inner.state).await {
             return Err(self.rollback_bound_startup(error).await);
         }
 
@@ -3880,11 +4059,15 @@ impl WyrdTestServerBuilder {
     ///
     /// `OpenAI` is served under `root`'s `/v1` segment; Anthropic, Gemini, and
     /// Vertex at `root` itself, where each provider's native paths begin.
-    /// Delegates to [`Self::with_gateway_endpoints_for_test`].
+    /// Delegates to [`Self::with_gateway_endpoints_for_test`]. The same `/v1`
+    /// upstream also serves the `OpenAI` Eval judge of a bound server's queued
+    /// runs and direct executions, so a language journey roots both model
+    /// paths at one local mock.
     #[must_use]
-    pub fn with_gateway_provider_root_for_test(self, root: Url) -> Self {
+    pub fn with_gateway_provider_root_for_test(mut self, root: Url) -> Self {
         let mut openai = root.clone();
         openai.set_path("/v1");
+        self.verification_provider = Some(openai.clone());
         self.with_gateway_endpoints_for_test(BuiltinEndpoints {
             openai: Some(openai),
             anthropic: Some(root.clone()),
@@ -4078,7 +4261,7 @@ impl WyrdTestServerBuilder {
     /// server skips the boot health probe. Takes precedence over
     /// [`Self::with_storage_settings`].
     #[must_use]
-    pub fn with_storage_handle(mut self, handle: Arc<wyrd_storage::StorageHandle>) -> Self {
+    pub fn with_storage_handle(mut self, handle: Arc<StorageHandle>) -> Self {
         self.storage_handle = Some(handle);
         self
     }
@@ -4260,10 +4443,7 @@ impl WyrdTestServerBuilder {
 
     /// Reuse a cluster-owned local Bifrost data directory for this node.
     #[must_use]
-    pub(crate) fn with_bifrost_data_dir(
-        mut self,
-        data_dir: Option<Arc<tempfile::TempDir>>,
-    ) -> Self {
+    pub(crate) fn with_bifrost_data_dir(mut self, data_dir: Option<Arc<TempDir>>) -> Self {
         self.bifrost_data_dir = data_dir;
         self
     }
@@ -4379,30 +4559,28 @@ impl WyrdTestServerBuilder {
         let (storage_root, storage) = if let Some(handle) = self.storage_handle.take() {
             (None, handle)
         } else {
-            let (root, settings) = match self.storage_settings.take() {
-                Some(settings) => (None, settings),
-                None => {
-                    let root = tempfile::tempdir()
-                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-                    let settings = StorageSettings {
-                        backend: BackendConfig::Local {
-                            root: root.path().to_path_buf(),
-                        },
-                        require_encryption: false,
-                        presign_ttl: Duration::from_secs(600),
-                        part_size_bytes: 16 * 1024 * 1024,
-                        multipart_threshold_bytes: 100 * 1024 * 1024,
-                    };
-                    (Some(Arc::new(root)), settings)
-                }
+            let (root, settings) = if let Some(settings) = self.storage_settings.take() {
+                (None, settings)
+            } else {
+                let root = tempfile::tempdir()
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+                let settings = StorageSettings {
+                    backend: BackendConfig::Local {
+                        root: root.path().to_path_buf(),
+                    },
+                    require_encryption: false,
+                    presign_ttl: Duration::from_mins(10),
+                    part_size_bytes: 16 * 1024 * 1024,
+                    multipart_threshold_bytes: 100 * 1024 * 1024,
+                };
+                (Some(Arc::new(root)), settings)
             };
             let handle = fixture_storage_handle(settings)
                 .await
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (root, handle)
         };
-        self.start_with_resources(fixture, storage, storage_root)
-            .await
+        Box::pin(self.start_with_resources(fixture, storage, storage_root)).await
     }
 
     /// Start a server over shared cluster resources.
@@ -4417,11 +4595,15 @@ impl WyrdTestServerBuilder {
     /// or fixture resources, authentication state, Forge, Scribe, or the
     /// application router cannot be constructed. Cancellation may leave
     /// fixture-owned database setup committed, but no server task is retained.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the static test signing key id is rejected as invalid.
     pub(crate) async fn start_with_resources(
         mut self,
         fixture: Arc<PgFixture>,
-        storage: Arc<wyrd_storage::StorageHandle>,
-        storage_root: Option<Arc<tempfile::TempDir>>,
+        storage: Arc<StorageHandle>,
+        storage_root: Option<Arc<TempDir>>,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
         wyrd_tls::install_crypto_provider()
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -4498,7 +4680,7 @@ impl WyrdTestServerBuilder {
         let external_verifier = Arc::new(ExternalVerifier::new(
             Arc::new(JwksCache::new(
                 wyrd_auth_oidc::ScreenedHttp::allowing_internal(),
-                Duration::from_secs(300),
+                Duration::from_mins(5),
                 Duration::from_secs(5),
             )),
             Arc::clone(&issuer_resolver),
@@ -4514,21 +4696,6 @@ impl WyrdTestServerBuilder {
             TokenExchangeSettings::default()
         };
 
-        let human_connections = HumanConnections::new(
-            runtime_wyrd.clone(),
-            Some(Arc::clone(&sealing_key)),
-            DeploymentProfile::Development.screened_http(),
-            self.public_origin.as_ref(),
-        );
-        let platform_login = wyrd_auth::platform_login::PlatformLogin::new(
-            fixture.operator_pool().clone(),
-            Some(Arc::clone(&sealing_key)),
-            Arc::new(wyrd_auth::platform_sessions::PlatformSessions::new(
-                fixture.operator_pool().clone(),
-                Arc::clone(&issuing_key),
-            )),
-            DeploymentProfile::Development.screened_http(),
-        );
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
         let resource_roles = self
             .bifrost_roles
@@ -4578,7 +4745,7 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         // Same boot order as production: resources, then the one storage owner,
         // then the catalog that runs its Iceberg I/O through it.
-        let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
+        let bifrost_storage = Arc::new(BifrostStorage::new(
             Arc::clone(&storage),
             vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
                 self.bifrost_storage_io.to_storage_config(),
@@ -4713,11 +4880,8 @@ impl WyrdTestServerBuilder {
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
         let query_stream_fault = QueryStreamFaultController::default();
-        let query_control_audit_fault =
-            wyrd_server::state::QueryControlAuditFaultController::default();
         let mut state = AppState::new(postgres, storage, bifrost_runtime, shutdown)
             .with_query_stream_fault(query_stream_fault.clone())
-            .with_query_control_audit_fault(query_control_audit_fault.clone())
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 issuing_key: Some(Arc::clone(&issuing_key)),
                 token_verifier: (!self.omit_token_verifier).then(|| Arc::clone(&verifier)),
@@ -4726,8 +4890,8 @@ impl WyrdTestServerBuilder {
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
-                human_connections: Some(human_connections),
-                platform_login: Some(platform_login),
+                human_connections: None,
+                platform_login: None,
                 oauth_clients: wyrd_server::auth::oauth::OAuthClients::new(
                     self.ui_client_secret_hash.into_iter().collect(),
                 ),
@@ -4738,6 +4902,25 @@ impl WyrdTestServerBuilder {
                 managed_secret_key_root.path(),
             )?);
         let start = |error: String| WyrdTestServerError::Start(error);
+        // The login owners stage on the state's process audit outbox, so they
+        // attach once the state exists.
+        state.auth.human_connections = Some(HumanConnections::new(
+            state.postgres.wyrd().clone(),
+            state.auth.sealing_key.clone(),
+            DeploymentProfile::Development.screened_http(),
+            self.public_origin.as_ref(),
+            Arc::clone(&state.audit_outbox),
+        ));
+        state.auth.platform_login = Some(wyrd_auth::platform_login::PlatformLogin::new(
+            fixture.operator_pool().clone(),
+            state.auth.sealing_key.clone(),
+            Arc::new(wyrd_auth::platform_sessions::PlatformSessions::new(
+                fixture.operator_pool().clone(),
+                Arc::clone(&issuing_key),
+                Arc::clone(&state.audit_outbox),
+            )),
+            DeploymentProfile::Development.screened_http(),
+        ));
         let gateway_secret_keys = Arc::new(
             state
                 .gateway
@@ -4765,6 +4948,15 @@ impl WyrdTestServerBuilder {
         if let Some(limits) = self.limits {
             state = state.with_limits(limits);
         }
+        if let Some(provider) = &self.verification_provider {
+            let providers = skald_runtime::ProviderRegistry::for_provider(
+                &skald_spec::ProviderName::OpenAi,
+                provider.as_str(),
+                Some("wyrd-test-provider-key"),
+            )
+            .map_err(|error| start(error.to_string()))?;
+            state = state.with_judge_providers(Arc::new(providers));
+        }
         if let Some(workflow) = self.workflow_config {
             state = state.with_workflow_config(workflow);
         }
@@ -4788,7 +4980,7 @@ impl WyrdTestServerBuilder {
             inner: WyrdTestServerInner {
                 fixture,
                 operator_keys_dir,
-                _storage_root: storage_root,
+                storage_root,
                 _bifrost_data_dir: data_dir,
                 bifrost_data_root,
                 _managed_secret_key_root: managed_secret_key_root,
@@ -4804,7 +4996,6 @@ impl WyrdTestServerBuilder {
                 forge_process_role: self.forge_process_role,
                 node_id,
                 query_stream_fault,
-                query_control_audit_fault,
                 query_stream_stall: std::sync::Mutex::new(Vec::new()),
                 _coordination_runtime: coordination_runtime,
                 _compaction_runtime: compaction_runtime,
@@ -4847,8 +5038,8 @@ impl WyrdTestServerBuilder {
         if self.bind_addrs.is_none() {
             self.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
-        let srv = self.start_in_process().await?;
-        srv.bind().await
+        let srv = Box::pin(self.start_in_process()).await?;
+        Box::pin(srv.bind()).await
     }
 }
 
@@ -4857,7 +5048,10 @@ impl WyrdTestServerBuilder {
 /// A flush that cannot settle is a wedged Scribe, not a slow one: without this
 /// bound a journey polling for published rows blocks its caller forever and
 /// reports nothing, so the harness names the failure instead.
-const FLUSH_BIFROST_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+const FLUSH_BIFROST_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Pause between baseline status reads in [`WyrdTestServer::wait_for_baseline`].
+const BASELINE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Operator binding every test server declares for `Environment` gateway credentials.
 pub const TEST_GATEWAY_CREDENTIAL_BINDING: &str = "test-provider-key";
@@ -5080,11 +5274,11 @@ fn reservation_band() -> Option<Range<u16>> {
 /// [`RESERVATION_ATTEMPTS`], when the port claim directory is unusable, or
 /// when loopback binding or address lookup fails.
 pub(crate) fn reserve_loopback_addr() -> Result<SocketAddr, WyrdTestServerError> {
+    /// Process-wide offset into the band so successive reservations probe fresh ports.
+    static CURSOR: AtomicU32 = AtomicU32::new(0);
     let Some(band) = reservation_band() else {
         return bound_loopback_addr(0);
     };
-    /// Process-wide offset into the band so successive reservations probe fresh ports.
-    static CURSOR: AtomicU32 = AtomicU32::new(0);
     let span = u32::from(band.end - band.start);
     let seed = std::process::id().wrapping_mul(2_654_435_761);
     let mut last = None;
@@ -5156,11 +5350,11 @@ fn claim_port(port: u16) -> Result<bool, WyrdTestServerError> {
 ///
 /// # Errors
 ///
-/// Returns the [`wyrd_storage::StorageError`] from building the operator or
+/// Returns the [`StorageError`] from building the operator or
 /// opening the handle.
 pub(crate) async fn fixture_storage_handle(
     settings: StorageSettings,
-) -> Result<Arc<wyrd_storage::StorageHandle>, wyrd_storage::StorageError> {
+) -> Result<Arc<StorageHandle>, StorageError> {
     if matches!(settings.backend, BackendConfig::Local { .. }) {
         let operator = wyrd_storage::factory::build_operator(&settings.backend)?.layer(
             opendal::layers::CapabilityOverrideLayer::new(|mut capability| {
@@ -5168,9 +5362,9 @@ pub(crate) async fn fixture_storage_handle(
                 capability
             }),
         );
-        wyrd_storage::StorageHandle::from_settings_with_operator(settings, operator).await
+        StorageHandle::from_settings_with_operator(settings, operator).await
     } else {
-        wyrd_storage::StorageHandle::from_settings(settings).await
+        StorageHandle::from_settings(settings).await
     }
 }
 
@@ -5187,7 +5381,14 @@ fn bound_loopback_addr(port: u16) -> Result<SocketAddr, WyrdTestServerError> {
         .map_err(|error| WyrdTestServerError::Bind(error.to_string()))
 }
 
-/// Poll a bound test server until its HTTP health endpoint reports readiness.
+/// Poll a bound test server until it answers HTTP and its Oracle can route.
+///
+/// `/healthz` proves only that HTTP serves. A peer-mode Oracle activates later
+/// in the peer serve task, and until that activation publishes membership a
+/// query is refused as unroutable. So the poll also waits for
+/// [`Oracle::is_ready`](wyrd_server::state::Oracle::is_ready), the same check
+/// `/readyz` reports, read in process rather than through the cached readiness
+/// snapshot.
 ///
 /// # Errors
 ///
@@ -5195,7 +5396,7 @@ fn bound_loopback_addr(port: u16) -> Result<SocketAddr, WyrdTestServerError> {
 /// owns the process, or [`WyrdTestServerError::Bind`] when the server does not
 /// become ready within the bounded retry window. Cancellation stops polling
 /// without stopping the independently owned server task.
-async fn wait_for_ready(base_url: &str) -> Result<(), WyrdTestServerError> {
+async fn wait_for_ready(base_url: &str, state: &AppState) -> Result<(), WyrdTestServerError> {
     wyrd_tls::install_crypto_provider()
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
     let client = reqwest::Client::new();
@@ -5206,6 +5407,7 @@ async fn wait_for_ready(base_url: &str) -> Result<(), WyrdTestServerError> {
             .send()
             .await
             .is_ok_and(|r| r.status().is_success())
+            && state.bifrost_query().is_none_or(|oracle| oracle.is_ready())
         {
             return Ok(());
         }
@@ -5352,7 +5554,7 @@ async fn insert_fixture_card(
         .ok_or_else(|| WyrdTestServerError::Auth("machine CardRef must carry a uid".to_owned()))?;
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO wyrd.cards (
             card_uid,
             data_tenant_id,
@@ -5383,7 +5585,7 @@ async fn insert_fixture_card(
             'active',
             $8
         )
-        "#,
+        ",
     )
     .bind(uid.as_uuid())
     .bind(card_ref.kind.wire_name())
@@ -5463,7 +5665,7 @@ fn sql(error: impl std::fmt::Display) -> WyrdTestServerError {
 /// to its SQL catalog or construct its storage-backed Iceberg catalog.
 pub(crate) async fn test_catalog(
     fixture: &PgFixture,
-    storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
+    storage: Arc<BifrostStorage>,
 ) -> Result<Arc<BifrostCatalog>, WyrdTestServerError> {
     let catalog = BifrostCatalog::new(
         fixture.catalog_dsn().expose_secret(),
@@ -5485,18 +5687,17 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 /// Builds a control-plane storage owner over one already-built backend handle.
 ///
 /// Used by cluster and Forge harnesses that need a catalog handle before any
-/// node has composed its resources. It allocates no metadata cache, because a
-/// control-plane catalog reads no hot Parquet footer; each simulated node still
-/// constructs its own Oracle-funded owner when it starts.
+/// node has composed its resources, and by the Forge capacity benchmark,
+/// which commits table properties as an operator. It allocates no metadata
+/// cache, because a control-plane catalog reads no hot Parquet footer; each
+/// simulated node still constructs its own Oracle-funded owner when it starts.
 ///
 /// # Panics
 /// Panics when the default storage policy does not resolve, which would mean
 /// the shipped defaults are themselves invalid.
 #[must_use]
-pub(crate) fn test_storage_owner(
-    storage: &Arc<wyrd_storage::StorageHandle>,
-) -> Arc<vala_bifrost_redux::storage::BifrostStorage> {
-    Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
+pub fn test_storage_owner(storage: &Arc<StorageHandle>) -> Arc<BifrostStorage> {
+    Arc::new(BifrostStorage::new(
         Arc::clone(storage),
         vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
             vala_bifrost_redux::storage::BifrostStorageConfig::default(),
@@ -5618,11 +5819,13 @@ mod teardown_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn shutdown_aborts_and_joins_a_serve_task_that_outlives_its_drain() {
         let aborted = Arc::new(AtomicBool::new(false));
-        let server = WyrdTestServer::builder()
-            .with_stalled_drain_for_test(Arc::clone(&aborted))
-            .start_bound()
-            .await
-            .expect("bound test server starts");
+        let server = Box::pin(
+            WyrdTestServer::builder()
+                .with_stalled_drain_for_test(Arc::clone(&aborted))
+                .start_bound(),
+        )
+        .await
+        .expect("bound test server starts");
 
         server
             .shutdown()
@@ -5671,7 +5874,7 @@ mod teardown_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn dropping_an_in_process_server_with_live_storage_work_awaits_abort_before_fixture_release()
      {
-        let server = WyrdTestServer::start_in_process()
+        let server = Box::pin(WyrdTestServer::start_in_process())
             .await
             .expect("in-process test server starts");
         let storage = Arc::clone(
@@ -5711,6 +5914,169 @@ mod teardown_tests {
                 .expect("the parked request joins")
                 .expect_err("the abort terminates the parked request"),
             BifrostStorageError::Closed
+        );
+    }
+}
+
+/// Proves the SDK test contract is exactly the three sanctioned controls.
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::WyrdTestServer;
+
+    /// Published Python stub of `wyrd.testing`, which Python callers see.
+    const PYTHON_STUB: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../sdks/wyrd-sdk-python/python/wyrd/testing/__init__.pyi"
+    ));
+
+    /// Generated TypeScript declaration of `@wyrd/testing`.
+    const TYPESCRIPT_DECLARATION: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../sdks/wyrd-sdk-ts/testing/index.d.ts"
+    ));
+
+    /// The three Python controls REQ-195 sanctions.
+    const PYTHON_CONTROLS: [&str; 3] = ["flush_bifrost", "wait_for_baseline", "make_binding_due"];
+
+    /// The same three controls in TypeScript's camelCase projection.
+    const TYPESCRIPT_CONTROLS: [&str; 3] = ["flushBifrost", "waitForBaseline", "makeBindingDue"];
+
+    /// Python members that start, address, or credential the server and so
+    /// neither steer nor inspect its state.
+    const PYTHON_SETUP: [&str; 18] = [
+        "__init__",
+        "__enter__",
+        "__exit__",
+        "base_url",
+        "api_key",
+        "tenant_id",
+        "access_token",
+        "bootstrap_service",
+        "credential_registered_service",
+        "scoped_api_key",
+        "revoke_scoped_role",
+        "seed_tenant",
+        "bootstrap_service_in_tenant",
+        "activate_human_sso",
+        "save_human_login",
+        "expire_saved_login",
+        "saved_login_is_stale",
+        "revoke_saved_login",
+    ];
+
+    /// TypeScript members that start, address, or credential the server.
+    const TYPESCRIPT_SETUP: [&str; 16] = [
+        "baseUrl",
+        "grpcUrl",
+        "token",
+        "tableFqn",
+        "apiKey",
+        "cardRef",
+        "scopedApiKey",
+        "seedTenant",
+        "bootstrapServiceInTenant",
+        "credentialRegisteredService",
+        "activateHumanSso",
+        "saveHumanLogin",
+        "expireSavedLogin",
+        "savedLoginIsStale",
+        "revokeSavedLogin",
+        "shutdown",
+    ];
+
+    /// Member names declared in the body of `class` in `source`.
+    ///
+    /// The body runs from the `header` line to the first following line that
+    /// is not indented, blank, or a doc line; `member` extracts a name from
+    /// one indented line, or `None` for a line that declares nothing.
+    fn members(
+        source: &str,
+        header: &str,
+        member: impl Fn(&str) -> Option<&str>,
+    ) -> BTreeSet<String> {
+        source
+            .lines()
+            .skip_while(|line| !line.starts_with(header))
+            .skip(1)
+            .take_while(|line| line.is_empty() || line.starts_with(' '))
+            .filter_map(&member)
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Name of a method or property a Python stub line declares at class depth.
+    fn python_member(line: &str) -> Option<&str> {
+        line.strip_prefix("    def ")
+            .and_then(|rest| rest.split('(').next())
+    }
+
+    /// Name of a method or getter a napi declaration line declares.
+    fn typescript_member(line: &str) -> Option<&str> {
+        let rest = line.strip_prefix("  ")?;
+        if rest.starts_with([' ', '/', '*']) {
+            return None;
+        }
+        let rest = rest.strip_prefix("get ").unwrap_or(rest);
+        rest.split('(').next()
+    }
+
+    /// Assert `declared` is exactly `controls` plus members of `setup`.
+    fn assert_only_controls(
+        language: &str,
+        declared: &BTreeSet<String>,
+        controls: &[&str],
+        setup: &[&str],
+    ) {
+        for control in controls {
+            assert!(
+                declared.contains(*control),
+                "{language} WyrdTestServer must document `{control}`"
+            );
+        }
+        let hooks: Vec<_> = declared
+            .iter()
+            .filter(|name| !controls.contains(&name.as_str()) && !setup.contains(&name.as_str()))
+            .collect();
+        assert!(
+            hooks.is_empty(),
+            "{language} WyrdTestServer exposes test hooks outside the three sanctioned controls: {hooks:?}"
+        );
+    }
+
+    /// Rust, Python, and TypeScript test servers expose `flush_bifrost`,
+    /// `wait_for_baseline`, and `make_binding_due`, and the Python and
+    /// TypeScript projections expose no other hook that steers or inspects
+    /// server state.
+    #[test]
+    fn public_controls_are_the_three_sanctioned_operations() {
+        let rust_controls = [
+            std::any::type_name_of_val(&WyrdTestServer::flush_bifrost),
+            std::any::type_name_of_val(&WyrdTestServer::wait_for_baseline),
+            std::any::type_name_of_val(&WyrdTestServer::make_binding_due),
+        ];
+        for (path, control) in rust_controls.iter().zip(PYTHON_CONTROLS) {
+            assert!(
+                path.ends_with(&format!("WyrdTestServer::{control}")),
+                "Rust control {path} must be `WyrdTestServer::{control}`"
+            );
+        }
+        assert_only_controls(
+            "Python",
+            &members(PYTHON_STUB, "class WyrdTestServer", python_member),
+            &PYTHON_CONTROLS,
+            &PYTHON_SETUP,
+        );
+        assert_only_controls(
+            "TypeScript",
+            &members(
+                TYPESCRIPT_DECLARATION,
+                "export declare class NativeWyrdTestServer",
+                typescript_member,
+            ),
+            &TYPESCRIPT_CONTROLS,
+            &TYPESCRIPT_SETUP,
         );
     }
 }

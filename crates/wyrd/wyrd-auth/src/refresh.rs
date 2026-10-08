@@ -23,11 +23,9 @@ use wyrd_sql::queries::auth::{
     revoke_refresh_chain,
 };
 
-use crate::audit::{
-    REFRESH_FAMILY_REVOKE_OPERATION, append_auth_audit, auth_event, principal_kind_tag,
-};
-use crate::exchange_api_key::token_hash;
+use crate::audit::{REFRESH_FAMILY_REVOKE_OPERATION, auth_event, principal_kind_tag};
 use crate::issuance::{ExchangedToken, IssuanceError, TenantTokenIssuer};
+use wyrd_auth_issue::hash_secret;
 
 /// Refresh-token grant service.
 ///
@@ -95,9 +93,9 @@ impl From<RefreshError> for WyrdError {
 impl RefreshTokens {
     /// Execute the refresh-token grant for the authenticated `client`.
     ///
-    /// The full rotation, reuse-detection, and audit write run inside the
-    /// transaction owned by `conn`. The caller must call `conn.commit()` on
-    /// success.
+    /// The full rotation and reuse detection run inside the transaction owned
+    /// by `conn`; the decision audit is staged on the process outbox without
+    /// waiting. The caller must call `conn.commit()` on success.
     ///
     /// Algorithm (F07 atomicity):
     /// 1. SHA-256 the presented JWT string.
@@ -141,7 +139,7 @@ impl RefreshTokens {
         client: OAuthClientId,
         request_id: &str,
     ) -> Result<ExchangedToken, RefreshError> {
-        let hash = token_hash(presented.expose_secret());
+        let hash = hash_secret(presented.expose_secret());
         let Some(stored) = refresh_by_hash(conn, &hash).await? else {
             tracing::debug!("refresh token not found for presented hash");
             return Err(RefreshError::NotFound);
@@ -207,7 +205,7 @@ impl RefreshTokens {
             // reports a theft is the only one that cannot say which of
             // a principal's refresh rows was presented.
             .with_credential_id(Some(stored.id));
-            append_auth_audit(conn, &event).await?;
+            self.issuer.audit().stage(conn.data_tenant_id(), event);
 
             tracing::warn!(
                 principal_id = %stored.principal_id,
@@ -304,7 +302,6 @@ mod pg_tests {
 
     use chrono::{Duration, Utc};
     use secrecy::{ExposeSecret, SecretString};
-    use sha2::{Digest, Sha256};
     use uuid::Uuid;
     use wyrd_auth_issue::{IssueError, IssuingKey};
     use wyrd_auth_verify::{AccessTokenClaims, Kid, public_key_from_pem, verify_eddsa};
@@ -330,10 +327,12 @@ mod pg_tests {
     use wyrd_spec::vala::api::AuditOutcome;
 
     use super::{RefreshError, RefreshTokens};
+    use crate::audit::test_outbox::{drain, outbox};
     use crate::audit::{REFRESH_FAMILY_REVOKE_OPERATION, principal_event};
     use crate::connections::HumanConnections;
     use crate::issuance::{IssuanceError, TenantTokenIssuer, TokenExchangeSettings};
     use crate::revoke::pg_tests::wait_for_advisory_lock_wait;
+    use vala_sql::audit_outbox::AuditOutbox;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -348,9 +347,17 @@ mod pg_tests {
         )
     }
 
-    fn refresh_service() -> RefreshTokens {
+    /// The refresh grant under test, staging its audit on `audit`.
+    ///
+    /// The test owns `audit` and drains it before its fixture drops, so no audit
+    /// commit is still logging in when the fixture drops its database.
+    fn refresh_service(audit: &Arc<AuditOutbox>) -> RefreshTokens {
         RefreshTokens {
-            issuer: TenantTokenIssuer::new(test_issuing_key(), TokenExchangeSettings::default()),
+            issuer: TenantTokenIssuer::new(
+                test_issuing_key(),
+                TokenExchangeSettings::default(),
+                Arc::clone(audit),
+            ),
         }
     }
 
@@ -362,10 +369,6 @@ mod pg_tests {
             space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
-    }
-
-    fn hash_of(token: &SecretString) -> String {
-        format!("{:x}", Sha256::digest(token.expose_secret().as_bytes()))
     }
 
     fn issue_refresh_jwt(
@@ -474,18 +477,19 @@ mod pg_tests {
     #[tokio::test]
     async fn rotation_copies_the_connection_binding() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user_id = insert_test_user(&mut conn, tenant).await;
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let original_hash = hash_of(&refresh_jwt);
+        let original_hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "user", user_id, &original_hash).await;
         let binding = seed_active_human_connection(&mut conn)
             .await
             .expect("connection reads");
 
-        let exchanged = refresh_service()
+        let exchanged = refresh_service(&audit)
             .execute(
                 &mut conn,
                 refresh_jwt,
@@ -495,7 +499,13 @@ mod pg_tests {
             .await
             .expect("rotation succeeds");
 
-        let new_hash = hash_of(exchanged.refresh_token.as_ref().expect("refresh token"));
+        let new_hash = wyrd_auth_issue::hash_secret(
+            exchanged
+                .refresh_token
+                .as_ref()
+                .expect("refresh token")
+                .expose_secret(),
+        );
         let new_row = refresh_by_hash(&mut conn, &new_hash)
             .await
             .expect("lookup")
@@ -505,6 +515,7 @@ mod pg_tests {
             new_row.human_connection_revision,
             Some(binding.connection_revision)
         );
+        drain(&audit).await;
     }
 
     /// A family whose connection is no longer Active, or which carries no
@@ -512,6 +523,7 @@ mod pg_tests {
     #[tokio::test]
     async fn rotation_refuses_an_inactive_or_unbound_connection() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -523,12 +535,12 @@ mod pg_tests {
             Uuid::new_v4(),
             "user",
             user_id,
-            &hash_of(&unbound_jwt),
+            &wyrd_auth_issue::hash_secret(unbound_jwt.expose_secret()),
             Utc::now() + Duration::days(30),
         )
         .await
         .expect("unbound row inserts");
-        let unbound = refresh_service()
+        let unbound = refresh_service(&audit)
             .execute(
                 &mut conn,
                 unbound_jwt,
@@ -545,12 +557,18 @@ mod pg_tests {
         );
 
         let bound_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        seed_active_refresh(&mut conn, "user", user_id, &hash_of(&bound_jwt)).await;
+        seed_active_refresh(
+            &mut conn,
+            "user",
+            user_id,
+            &wyrd_auth_issue::hash_secret(bound_jwt.expose_secret()),
+        )
+        .await;
         sqlx::query("UPDATE wyrd.auth_human_connections SET state = 'Inactive'")
             .execute(&mut **conn.transaction())
             .await
             .expect("connection deactivates");
-        let result = refresh_service()
+        let result = refresh_service(&audit)
             .execute(&mut conn, bound_jwt, OAuthClientId::WyrdCli, "req-inactive")
             .await;
         assert!(
@@ -570,6 +588,7 @@ mod pg_tests {
             user_rows, 0,
             "no successor is written for a refused rotation"
         );
+        drain(&audit).await;
     }
 
     /// A human session rotates: the consumed row is retired and the successor
@@ -577,6 +596,7 @@ mod pg_tests {
     #[tokio::test]
     async fn happy_rotation_mints_new_pair_and_revokes_old_row() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -584,10 +604,10 @@ mod pg_tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let original_hash = hash_of(&refresh_jwt);
+        let original_hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "user", user_id, &original_hash).await;
 
-        let result = refresh_service()
+        let result = refresh_service(&audit)
             .execute(
                 &mut conn,
                 refresh_jwt,
@@ -607,11 +627,12 @@ mod pg_tests {
         assert_eq!(old_row.revoked_reason.as_deref(), Some("rotated"));
 
         // New row exists and links back via rotated_from.
-        let new_hash = hash_of(
+        let new_hash = wyrd_auth_issue::hash_secret(
             exchanged
                 .refresh_token
                 .as_ref()
-                .expect("rotation issues a refresh token"),
+                .expect("rotation issues a refresh token")
+                .expose_secret(),
         );
         let new_row = refresh_by_hash(&mut conn, &new_hash)
             .await
@@ -641,6 +662,7 @@ mod pg_tests {
             new_row.expires_at.timestamp(),
             "signed exp equals the stored successor row expiry"
         );
+        drain(&audit).await;
     }
 
     /// Replaying a rotated token revokes only its own rotation chain.
@@ -658,6 +680,7 @@ mod pg_tests {
     #[tokio::test]
     async fn rotated_replay_revokes_only_its_chain() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -668,8 +691,13 @@ mod pg_tests {
             .expect("connection seeds");
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let replayed =
-            seed_active_refresh(&mut conn, "user", user_id, &hash_of(&refresh_jwt)).await;
+        let replayed = seed_active_refresh(
+            &mut conn,
+            "user",
+            user_id,
+            &wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret()),
+        )
+        .await;
         sqlx::query(
             "UPDATE wyrd.auth_refresh_tokens
                 SET revoked_at = now(), revoked_reason = 'rotated'
@@ -701,7 +729,7 @@ mod pg_tests {
             .expect("session row inserts");
         }
 
-        let result = refresh_service()
+        let result = refresh_service(&audit)
             .execute(&mut conn, refresh_jwt, OAuthClientId::WyrdCli, "req-reuse")
             .await;
         assert!(
@@ -720,6 +748,7 @@ mod pg_tests {
                 .expect("row exists");
             assert_eq!(row.revoked_reason.as_deref(), expected, "{hash}");
         }
+        drain(&audit).await;
         let containments: Vec<Option<Uuid>> = sqlx::query_scalar(
             "SELECT credential_id FROM vala.audit_staging
               WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
@@ -731,6 +760,7 @@ mod pg_tests {
         .await
         .expect("audit query runs");
         assert_eq!(containments, vec![Some(replayed)]);
+        drain(&audit).await;
     }
 
     /// F07 race: the second caller presenting the same token after the first has
@@ -738,6 +768,7 @@ mod pg_tests {
     #[tokio::test]
     async fn f07_race_second_caller_gets_reused_after_commit() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -745,14 +776,14 @@ mod pg_tests {
         let user_id = insert_test_user(&mut setup_conn, tenant).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let original_hash = hash_of(&refresh_jwt);
+        let original_hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut setup_conn, "user", user_id, &original_hash).await;
         setup_conn.commit().await.expect("setup commits");
 
         // First caller: present the token, rotate, and commit.
         let mut conn_a = fixture.tenant_conn().await.expect("conn_a opens");
         let token_a = SecretString::from(refresh_jwt.expose_secret().to_owned());
-        let result_a = refresh_service()
+        let result_a = refresh_service(&audit)
             .execute(&mut conn_a, token_a, OAuthClientId::WyrdCli, "req-race-a")
             .await;
         assert!(result_a.is_ok(), "first caller rotates: {result_a:?}");
@@ -761,7 +792,7 @@ mod pg_tests {
         // Second caller: present the same original token after the first has committed.
         let mut conn_b = fixture.tenant_conn().await.expect("conn_b opens");
         let token_b = SecretString::from(refresh_jwt.expose_secret().to_owned());
-        let result_b = refresh_service()
+        let result_b = refresh_service(&audit)
             .execute(&mut conn_b, token_b, OAuthClientId::WyrdCli, "req-race-b")
             .await;
 
@@ -773,11 +804,12 @@ mod pg_tests {
         // The successor token from conn_a's rotation should also be revoked
         // by the family revoke triggered by reuse detection.
         let exchanged_a = result_a.unwrap();
-        let successor_hash = hash_of(
+        let successor_hash = wyrd_auth_issue::hash_secret(
             exchanged_a
                 .refresh_token
                 .as_ref()
-                .expect("rotation issues a refresh token"),
+                .expect("rotation issues a refresh token")
+                .expose_secret(),
         );
         let successor = refresh_by_hash(&mut conn_b, &successor_hash)
             .await
@@ -788,11 +820,13 @@ mod pg_tests {
             Some("reuse_detected"),
             "successor token revoked by reuse-detection family revoke"
         );
+        drain(&audit).await;
     }
 
     #[tokio::test]
     async fn unknown_token_returns_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -802,7 +836,7 @@ mod pg_tests {
         let refresh_jwt =
             issue_refresh_jwt(&key, PrincipalKindTag::Service, Uuid::new_v4(), tenant);
 
-        let result = refresh_service()
+        let result = refresh_service(&audit)
             .execute(
                 &mut conn,
                 refresh_jwt,
@@ -812,6 +846,7 @@ mod pg_tests {
             .await;
 
         assert!(matches!(result, Err(RefreshError::NotFound)));
+        drain(&audit).await;
     }
 
     /// An expired row, and a row revoked by logout, administration, or an
@@ -826,6 +861,7 @@ mod pg_tests {
     #[tokio::test]
     async fn inactive_rows_are_refused_without_containment() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -842,7 +878,13 @@ mod pg_tests {
         ];
         for (case, reason) in cases {
             let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-            let id = seed_active_refresh(&mut conn, "user", user_id, &hash_of(&refresh_jwt)).await;
+            let id = seed_active_refresh(
+                &mut conn,
+                "user",
+                user_id,
+                &wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret()),
+            )
+            .await;
             sqlx::query(
                 "UPDATE wyrd.auth_refresh_tokens
                     SET expires_at = CASE WHEN $2::text IS NULL
@@ -857,7 +899,7 @@ mod pg_tests {
             .await
             .expect("row retires");
 
-            let result = refresh_service()
+            let result = refresh_service(&audit)
                 .execute(
                     &mut conn,
                     refresh_jwt,
@@ -876,6 +918,7 @@ mod pg_tests {
             .expect("lookup")
             .expect("sibling exists");
         assert!(sibling.revoked_at.is_none(), "the other login stays active");
+        drain(&audit).await;
         let containments: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM vala.audit_staging
               WHERE data_tenant_id = $1 AND operation = $2",
@@ -886,6 +929,7 @@ mod pg_tests {
         .await
         .expect("audit query runs");
         assert_eq!(containments, 0, "no theft is recorded");
+        drain(&audit).await;
     }
 
     /// `active_refresh` resolves only an active row of the bound tenant.
@@ -964,6 +1008,7 @@ mod pg_tests {
     #[tokio::test]
     async fn f08_audit_row_written_on_rotation() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -971,7 +1016,7 @@ mod pg_tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let hash = hash_of(&refresh_jwt);
+        let hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "user", user_id, &hash).await;
         let consumed = refresh_by_hash(&mut conn, &hash)
             .await
@@ -979,7 +1024,7 @@ mod pg_tests {
             .expect("seeded row exists")
             .id;
 
-        refresh_service()
+        refresh_service(&audit)
             .execute(
                 &mut conn,
                 refresh_jwt,
@@ -989,6 +1034,7 @@ mod pg_tests {
             .await
             .expect("rotation succeeds");
 
+        drain(&audit).await;
         let credentials: Vec<Option<Uuid>> = sqlx::query_scalar(
             "SELECT credential_id FROM vala.audit_staging
               WHERE data_tenant_id = $1
@@ -1006,6 +1052,7 @@ mod pg_tests {
             vec![Some(consumed)],
             "the rotation is audited once, naming the consumed refresh row"
         );
+        drain(&audit).await;
     }
 
     /// A rotated human session keeps the authority its login established.
@@ -1019,6 +1066,7 @@ mod pg_tests {
     #[tokio::test]
     async fn rotation_carries_the_roles_login_persisted() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
@@ -1045,10 +1093,10 @@ mod pg_tests {
         );
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let hash = hash_of(&refresh_jwt);
+        let hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "user", user_id, &hash).await;
 
-        let exchanged = refresh_service()
+        let exchanged = refresh_service(&audit)
             .execute(
                 &mut conn,
                 refresh_jwt,
@@ -1077,6 +1125,7 @@ mod pg_tests {
             vec!["runtime_admin".to_owned()],
             "the successor carries the session's authority"
         );
+        drain(&audit).await;
     }
 
     /// R2-4: replay containment survives the refused request.
@@ -1091,20 +1140,21 @@ mod pg_tests {
     #[tokio::test]
     async fn f09_replay_containment_commits_and_kills_the_successor() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
 
         let mut setup_conn = fixture.tenant_conn().await.expect("setup conn opens");
         let user_id = insert_test_user(&mut setup_conn, tenant).await;
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let original_hash = hash_of(&refresh_jwt);
+        let original_hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         let consumed_id =
             seed_active_refresh(&mut setup_conn, "user", user_id, &original_hash).await;
         setup_conn.commit().await.expect("setup commits");
 
         // The legitimate rotation, committed the way the route commits it.
         let mut conn_a = fixture.tenant_conn().await.expect("conn_a opens");
-        let rotated = refresh_service()
+        let rotated = refresh_service(&audit)
             .execute(
                 &mut conn_a,
                 SecretString::from(refresh_jwt.expose_secret().to_owned()),
@@ -1117,11 +1167,11 @@ mod pg_tests {
         let successor = rotated
             .refresh_token
             .expect("rotation issues a refresh token");
-        let successor_hash = hash_of(&successor);
+        let successor_hash = wyrd_auth_issue::hash_secret(successor.expose_secret());
 
         // The replay. The route commits this transaction for `Reused` alone.
         let mut conn_b = fixture.tenant_conn().await.expect("conn_b opens");
-        let replay = refresh_service()
+        let replay = refresh_service(&audit)
             .execute(
                 &mut conn_b,
                 SecretString::from(refresh_jwt.expose_secret().to_owned()),
@@ -1150,6 +1200,7 @@ mod pg_tests {
             "the successor is revoked in committed state"
         );
 
+        drain(&audit).await;
         let revocations: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM vala.audit_staging
               WHERE data_tenant_id = $1
@@ -1188,7 +1239,7 @@ mod pg_tests {
             "the replay record names the consumed refresh row"
         );
 
-        let successor_replay = refresh_service()
+        let successor_replay = refresh_service(&audit)
             .execute(
                 &mut conn_c,
                 successor,
@@ -1200,6 +1251,7 @@ mod pg_tests {
             matches!(successor_replay, Err(RefreshError::NotFound)),
             "the contained successor is an ordinary inactive token: {successor_replay:?}"
         );
+        drain(&audit).await;
     }
 
     /// Replaying ancestor `A` while current token `B` rotates still revokes
@@ -1213,15 +1265,21 @@ mod pg_tests {
     #[tokio::test]
     async fn ancestor_replay_overlapping_rotation_revokes_successor() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
-        let service = refresh_service();
+        let service = refresh_service(&audit);
 
         let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
         let user_id = insert_test_user(&mut setup, tenant).await;
         let ancestor = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        let ancestor_id =
-            seed_active_refresh(&mut setup, "user", user_id, &hash_of(&ancestor)).await;
+        let ancestor_id = seed_active_refresh(
+            &mut setup,
+            "user",
+            user_id,
+            &wyrd_auth_issue::hash_secret(ancestor.expose_secret()),
+        )
+        .await;
         let current = service
             .execute(
                 &mut setup,
@@ -1273,15 +1331,19 @@ mod pg_tests {
         replaying.commit().await.expect("the route commits Reused");
 
         let mut fresh = fixture.tenant_conn().await.expect("fresh conn opens");
-        let successor_row = refresh_by_hash(&mut fresh, &hash_of(&successor))
-            .await
-            .expect("lookup")
-            .expect("C exists");
+        let successor_row = refresh_by_hash(
+            &mut fresh,
+            &wyrd_auth_issue::hash_secret(successor.expose_secret()),
+        )
+        .await
+        .expect("lookup")
+        .expect("C exists");
         assert_eq!(
             successor_row.revoked_reason.as_deref(),
             Some("reuse_detected"),
             "C is revoked in committed state"
         );
+        drain(&audit).await;
         let containments: Vec<Option<Uuid>> = sqlx::query_scalar(
             "SELECT credential_id FROM vala.audit_staging
               WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
@@ -1309,6 +1371,7 @@ mod pg_tests {
             matches!(successor_rotation, Err(RefreshError::NotFound)),
             "contained C is an ordinary inactive token: {successor_rotation:?}"
         );
+        drain(&audit).await;
     }
 
     /// Poll until some backend is blocked on this tenant's human-connection
@@ -1369,20 +1432,28 @@ mod pg_tests {
     #[tokio::test]
     async fn connection_deactivation_overlapping_rotation_ends_successor() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
-        let service = refresh_service();
+        let service = refresh_service(&audit);
         let connections = HumanConnections::new(
             fixture.wyrd_postgres().clone(),
             None,
             ScreenedHttp::allowing_internal(),
             None,
+            Arc::clone(&audit),
         );
 
         let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
         let user_id = insert_test_user(&mut setup, tenant).await;
         let current = issue_refresh_jwt(&key, PrincipalKindTag::User, user_id, tenant);
-        seed_active_refresh(&mut setup, "user", user_id, &hash_of(&current)).await;
+        seed_active_refresh(
+            &mut setup,
+            "user",
+            user_id,
+            &wyrd_auth_issue::hash_secret(current.expose_secret()),
+        )
+        .await;
         setup.commit().await.expect("setup commits");
 
         // The legitimate rotation of B, held open with C written.
@@ -1440,6 +1511,7 @@ mod pg_tests {
         .await
         .expect("family count reads");
         assert_eq!(family, 2, "no successor of C was minted");
+        drain(&audit).await;
     }
 
     /// A machine principal's refresh row cannot rotate.
@@ -1451,6 +1523,7 @@ mod pg_tests {
     #[tokio::test]
     async fn a_machine_refresh_row_cannot_rotate() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let key = test_issuing_key();
         let card_ref = service_card_ref();
@@ -1460,10 +1533,10 @@ mod pg_tests {
         let sa_id = insert_test_service_account(&mut conn, user_id, &card_ref).await;
 
         let refresh_jwt = issue_refresh_jwt(&key, PrincipalKindTag::Service, sa_id, tenant);
-        let hash = hash_of(&refresh_jwt);
+        let hash = wyrd_auth_issue::hash_secret(refresh_jwt.expose_secret());
         seed_active_refresh(&mut conn, "service", sa_id, &hash).await;
 
-        let result = refresh_service()
+        let result = refresh_service(&audit)
             .execute(
                 &mut conn,
                 refresh_jwt,
@@ -1481,6 +1554,7 @@ mod pg_tests {
             ),
             "a machine refresh row is refused: {result:?}"
         );
+        drain(&audit).await;
     }
 
     /// The unverified payload read exposes the three routing claims intact.

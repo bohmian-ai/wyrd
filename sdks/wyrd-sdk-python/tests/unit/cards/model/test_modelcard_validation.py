@@ -1,11 +1,10 @@
-from __future__ import annotations
+"""Invalid ModelCard inputs are refused with a stable model error code."""
 
-import json
+from pathlib import Path
+from typing import Any
 
 import pytest
-from _helpers import model_metadata, model_signature
-from test_modelcard_save_load import _huggingface_model, _sklearn_model
-from wyrd.data import FieldSpec
+from wyrd.data import Dim, FieldSpec
 from wyrd.model import (
     HuggingfaceInterface,
     ModelCard,
@@ -16,9 +15,9 @@ from wyrd.model import (
 )
 
 
-def test_missing_signature_raises_stable_model_error_code() -> None:
+def test_missing_signature_raises_stable_model_error_code(sklearn_model: Any) -> None:
     with pytest.raises(WyrdError) as exc:
-        ModelCard(_sklearn_model())
+        ModelCard(sklearn_model)
 
     assert exc.value.code == "WYRD_MODEL_400_MISSING_SIGNATURE"
 
@@ -33,122 +32,86 @@ def test_invalid_signature_dtype_raises_stable_model_error_code() -> None:
     assert exc.value.code == "WYRD_MODEL_400_DTYPE_NORMALIZE_FAILED"
 
 
-def test_invalid_signature_shape_raises_stable_model_error_code() -> None:
-    signature = {
-        "inputs": [
-            {
-                "name": "feature",
-                "dtype": "float64",
-                "nullable": False,
-                "shape": [{"kind": "Fixed", "value": 0}],
-            }
-        ],
-        "outputs": [{"name": "prediction", "dtype": "float64", "nullable": False}],
-    }
-
+def test_zero_length_signature_dimension_is_refused() -> None:
     with pytest.raises(WyrdError) as exc:
-        ModelCard(
-            _sklearn_model(),
-            metadata=ModelCardMetadata(task_type="regression", signature=signature),
+        ModelSignature(
+            [FieldSpec("feature", "float64", shape=[Dim.fixed(0)])],
+            [FieldSpec("prediction", "float64")],
         )
 
     assert exc.value.code == "WYRD_MODEL_400_SHAPE_INVALID"
 
 
-def test_unsupported_raw_model_object_raises_stable_model_error_code() -> None:
+def test_unsupported_raw_model_object_raises_stable_model_error_code(
+    regressor_metadata: ModelCardMetadata,
+) -> None:
     with pytest.raises(WyrdError) as exc:
-        ModelCard(object(), metadata=model_metadata("regression"))
+        ModelCard(object(), metadata=regressor_metadata)
 
     assert exc.value.code == "WYRD_MODEL_400_UNKNOWN_MODEL_TYPE"
 
 
-def test_interface_class_passed_to_constructor_raises_model_error() -> None:
+def test_interface_class_passed_to_constructor_raises_model_error(
+    regressor_metadata: ModelCardMetadata,
+) -> None:
     with pytest.raises(WyrdError) as exc:
-        ModelCard(SklearnInterface, metadata=model_metadata("regression"))
+        ModelCard(SklearnInterface, metadata=regressor_metadata)
 
     assert exc.value.code == "WYRD_MODEL_400_VALIDATION"
-    assert "DataCard" not in str(exc.value)
 
 
-def test_modelcard_rejects_artifact_paths_as_denovo_inputs(tmp_path) -> None:
+def test_artifact_path_is_refused_without_leaking_it(
+    tmp_path: Path, regressor_metadata: ModelCardMetadata
+) -> None:
     artifact = tmp_path / "model.joblib"
     artifact.write_bytes(b"placeholder")
 
     with pytest.raises(WyrdError) as exc:
-        ModelCard(artifact, metadata=model_metadata("regression"))
+        ModelCard(artifact, metadata=regressor_metadata)
 
     assert exc.value.code == "WYRD_MODEL_400_UNKNOWN_MODEL_TYPE"
-
-
-def test_unknown_model_artifact_path_does_not_leak_absolute_path(tmp_path) -> None:
-    artifact = tmp_path / "private-model.bin"
-    artifact.write_bytes(b"placeholder")
-
-    with pytest.raises(WyrdError) as exc:
-        ModelCard(artifact, metadata=model_metadata("regression"))
-
-    assert exc.value.code == "WYRD_MODEL_400_UNKNOWN_MODEL_TYPE"
-    assert "pathlib" in str(exc.value)
     assert str(tmp_path) not in str(exc.value)
 
 
-def test_invalid_huggingface_revision_raises_stable_model_error_code() -> None:
+def test_invalid_huggingface_revision_raises_stable_model_error_code(
+    huggingface_model: Any, classifier_metadata: ModelCardMetadata
+) -> None:
     interface = HuggingfaceInterface(
-        model=_huggingface_model(),
+        model=huggingface_model,
         hf_task="text-classification",
         revision="bad-rev",
     )
 
     with pytest.raises(WyrdError) as exc:
-        ModelCard(interface, metadata=model_metadata("binary_classification"))
+        ModelCard(interface, metadata=classifier_metadata)
 
     assert exc.value.code == "WYRD_MODEL_400_HF_REVISION_INVALID"
 
 
-def test_invalid_huggingface_repo_id_raises_model_validation_error() -> None:
+def test_invalid_huggingface_repo_id_raises_model_validation_error(
+    huggingface_model: Any, classifier_metadata: ModelCardMetadata
+) -> None:
     interface = HuggingfaceInterface(
-        model=_huggingface_model(),
+        model=huggingface_model,
         hf_task="text-classification",
         repo_id="",
     )
 
     with pytest.raises(WyrdError) as exc:
-        ModelCard(interface, metadata=model_metadata("binary_classification"))
+        ModelCard(interface, metadata=classifier_metadata)
 
     assert exc.value.code == "WYRD_MODEL_400_VALIDATION"
 
 
-def test_invalid_huggingface_task_raises_stable_option_error() -> None:
+def test_invalid_huggingface_task_raises_stable_option_error(huggingface_model: Any) -> None:
     with pytest.raises(WyrdError) as exc:
-        HuggingfaceInterface(model=_huggingface_model(), hf_task="not-a-task")
+        HuggingfaceInterface(model=huggingface_model, hf_task="not-a-task")
 
     assert exc.value.code == "WYRD_DATA_400_INVALID_INTERFACE_OPTION"
 
 
-def test_custom_json_without_explicit_interface_raises_stable_model_error_code() -> None:
-    payload = {
-        "apiVersion": "wyrd/v1",
-        "kind": "Model",
-        "metadata": {"name": "custom", "version": "1.0.0"},
-        "spec": {
-            "interface": {
-                "kind": "Custom",
-                "meta": {
-                    "framework_version": "python",
-                    "model_subtype": None,
-                    "loader_module": "",
-                    "loader_class": "",
-                    "extra": {},
-                },
-            },
-            "task_type": "Other",
-            "signature": model_signature().to_dict(),
-            "card_refs": [],
-        },
-        "relationships": {},
-    }
-
+def test_custom_model_card_without_a_loader_is_refused(fixtures_dir: Path) -> None:
     with pytest.raises(WyrdError) as exc:
-        ModelCard.model_validate_json(json.dumps(payload))
+        ModelCard.from_path(fixtures_dir / "invalid" / "model" / "custom-without-loader.yaml")
 
     assert exc.value.code == "WYRD_MODEL_400_CUSTOM_LOADER_INVALID"

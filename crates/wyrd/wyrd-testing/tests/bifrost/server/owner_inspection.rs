@@ -90,6 +90,7 @@ async fn published_values(
     )
     .run_with(
         wyrd_spec::vala::api::BifrostQueryRequest {
+            params: Vec::new(),
             sql: format!("SELECT value FROM vala.bifrost.{table} ORDER BY value"),
             deadline_ms: Some(30_000),
         },
@@ -166,7 +167,6 @@ async fn scribe_wal_fault_is_role_local() -> Result<(), super::query::ServerJour
             )],
             tenant: server.data_tenant_id(),
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let fqn = format!("vala.bifrost.{table}");
@@ -217,9 +217,7 @@ async fn scribe_wal_fault_is_role_local() -> Result<(), super::query::ServerJour
         "a faulted Scribe keeps its WAL files"
     );
 
-    let server = server
-        .restart_bound(combined_target(data_root.path()))
-        .await?;
+    let server = Box::pin(server.restart_bound(combined_target(data_root.path()))).await?;
     super::query::await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
     let (_, body) = readyz(&server).await?;
     assert_eq!(
@@ -240,7 +238,7 @@ async fn scribe_wal_fault_is_role_local() -> Result<(), super::query::ServerJour
         .ok_or("a data role reports resource health")?
         .poison(vala_bifrost_redux::resources::BifrostResourcePoisonReason::Accounting);
     let terminal = server
-        .await_terminal_failure_for_test(std::time::Duration::from_secs(60))
+        .await_terminal_failure_for_test(std::time::Duration::from_mins(1))
         .await?;
     assert!(
         terminal.contains("bifrost_resource_health"),
@@ -306,7 +304,6 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
             )],
             tenant: server.data_tenant_id(),
             physical_layout: None,
-            audit: None,
         })
         .await?;
     let fqn = format!("vala.bifrost.{table}");
@@ -336,9 +333,7 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
     );
     let before = wal_segments(&wal_root)?;
 
-    let server = server
-        .restart_bound(combined_target(data_root.path()))
-        .await?;
+    let server = Box::pin(server.restart_bound(combined_target(data_root.path()))).await?;
     super::query::await_server_ready(server.base_url().ok_or("missing HTTP URL")?).await?;
     let (status, body) = readyz(&server).await?;
     assert_eq!(status, 200, "the other roles keep the target ready: {body}");
@@ -395,7 +390,7 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
     let keeper = worker
         .start_replica(wyrd_testing::WyrdTestServer::builder())
         .await?;
-    let pool = keeper.pg_fixture().superuser_pool().await?;
+    let pool = keeper.pg_fixture().superuser_pool()?;
     let task_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,\

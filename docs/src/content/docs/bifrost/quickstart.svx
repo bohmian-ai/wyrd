@@ -61,7 +61,7 @@ Use `bifrost.describe_table("traces", "spans")` for the exact column list.
 ## What happens inside
 
 1. `Bifrost.flush` ships the buffered rows as an Arrow IPC batch.
-2. **Gate** authenticates, resolves `DataTenantId` + `TableRef` for the target table, validates the schema fingerprint, stamps `wyrd_event_time` and `wyrd_batch_id`, and dispatches to any Scribe.
+2. **Gate** authenticates, resolves `DataTenantId` + `TableRef` for the target table, validates the schema fingerprint and the request's `wyrd_batch_id` idempotency key, and dispatches to any Scribe, which stamps the managed columns, including `wyrd_ingested_at` from PostgreSQL.
 3. **Scribe** appends the batch to its WAL, fsyncs, acks. The rows accumulate in a memtable keyed by `(tenant, table, event_day)` until a seal trigger fires (50k rows, 1s, 128 MiB, or 5s inactivity).
 4. **Scribe** seals: freeze memtable, encode Parquet with the tenant recorded in the file footer, PUT to object store, atomic Postgres tx to insert into `vala.file_list` and append audit rows. The row is now visible to Oracle.
 5. The SQL query routes through Gate to Oracle. Oracle plans it with DataFusion over the caller's tenant-qualified table, and proves each opened file's footer tenant before reading any row.

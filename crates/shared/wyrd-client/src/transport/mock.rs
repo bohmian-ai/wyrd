@@ -36,6 +36,9 @@ pub struct MockTransport {
 
 impl MockTransport {
     /// Build a transport from a [`MockConfig`].
+    ///
+    /// # Arguments
+    /// * `config` - Label and optional failing drain call number.
     #[must_use]
     pub fn new(config: &MockConfig) -> Self {
         Self {
@@ -63,6 +66,9 @@ impl MockTransport {
     /// Increments the internal call counter. If `fail_on_drain` is configured
     /// and the current call number matches, returns
     /// [`WyrdClientError::TransportDown`] without recording the payload.
+    ///
+    /// # Arguments
+    /// * `payload` - Bytes recorded unless this call is the configured failure.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::TransportDown`] when `fail_on_drain` matches

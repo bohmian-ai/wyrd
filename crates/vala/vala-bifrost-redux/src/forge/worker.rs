@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-#[cfg(feature = "test-support")]
 use std::sync::Mutex;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::AtomicBool;
@@ -23,6 +22,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
+use vala_sql::queries::oracle_reader_authority::ExclusiveTableAuthority;
 use vala_sql::row_types::forge_operations::ForgeExpirationAuthority;
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
@@ -30,7 +30,7 @@ use vala_sql::row_types::forge_tasks::{
     FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate, ForgePreparedTaskClaim,
     ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskRowEvidence, ForgeTaskState,
     ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, MAINTENANCE_STRATEGIES,
-    SnapshotWatermark, TaskProgressEffect,
+    NewForgeTask, SnapshotWatermark, TaskProgressEffect,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
@@ -41,13 +41,15 @@ use super::compact::ForgeGroupKey;
 use super::error::{ForgeError, ForgeFailureClass};
 use super::expire::ExpiryTaskAuthority;
 use super::identity::task_table_binding;
+use super::leader::{ForgeCompactionDispatch, ForgeCompactionOutcome};
 use super::lease::{ForgeLease, forge_lease_key};
-use super::metrics::{ForgeTaskResult, ForgeTelemetry};
+use super::metrics::{ForgeCleanupRefusalStage, ForgeTaskResult, ForgeTelemetry};
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
     ForgePromotionCommit, ForgePromotionSettlement, PromotionPlanStatus, ScribePromotionPlan,
 };
+use super::settings::ForgeCompactionType;
 use super::{Forge, ForgeRoleReadiness};
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::forge_data_location;
@@ -59,13 +61,16 @@ use crate::catalog::layout::forge_data_location;
 /// rewrite even if its strategy column says otherwise.
 pub(super) const LIVE_REWRITE_PARAMETER_KIND: &str = "live_rewrite";
 
+/// `RisingWave`'s compactor pull period.
+pub const DEFAULT_PULL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Everything one rewrite publication holds constant across its attempts.
 ///
 /// The derivation, the commit, and the three audit transitions all read the
-/// same identity, group, partition, policy, and deadline. Owning them here is
-/// what keeps a retried attempt provably bound to the same operation as the
-/// first one: nothing in the retry loop can recompute a deadline, re-derive a
-/// partition, or open a second operation identity.
+/// same identity, group, partition, and policy. Owning them here is what keeps
+/// a retried attempt provably bound to the same operation as the first one:
+/// nothing in the retry loop can re-derive a partition or open a second
+/// operation identity.
 struct RewritePublication<'publication> {
     /// Durable task this publication is settling.
     claim: &'publication ForgeTaskClaim,
@@ -81,8 +86,6 @@ struct RewritePublication<'publication> {
     target_file_size_bytes: u64,
     /// Schema identity the plan was authorized against.
     planned_schema_id: i32,
-    /// One commit budget, captured before the first attempt and never renewed.
-    deadline: super::publication::RewritePublicationDeadline,
 }
 
 impl RewritePublication<'_> {
@@ -142,7 +145,11 @@ fn rewrite_operation(phase: ForgeIcebergRewritePhase) -> String {
 }
 
 /// Maximum number of attempt-consuming failures before audited terminalization.
-const ATTEMPT_BOUND: u32 = 5;
+///
+/// Promotion also bounds its operation-generation walk by it: each reset
+/// generation ends one attempt, so a task never resets more generations than
+/// it can attempt.
+pub(super) const ATTEMPT_BOUND: u32 = 5;
 
 /// Returns whether the next classified failure must terminalize at the worker boundary.
 #[must_use]
@@ -302,15 +309,6 @@ struct ForgeRewriteAttempt {
     /// Geometry planning resolved once; every plan executes, publishes, and
     /// audits under its file target.
     policy: super::managed::policy::ForgeTablePolicy,
-    /// One absolute publication budget every plan of this attempt shares.
-    ///
-    /// Attempt-scoped, not plan-scoped: the budget bounds how long this claim
-    /// may keep asking the catalog to accept work planned against one table
-    /// read, and a per-plan budget would let an attempt with many plans keep
-    /// submitting for a multiple of the configured window. A plan that finds
-    /// the budget spent refuses before it prepares anything, which is ordinary
-    /// planning debt the next attempt replans.
-    deadline: super::publication::RewritePublicationDeadline,
 }
 
 /// One claimed ownership episode's observation frame.
@@ -727,6 +725,11 @@ pub struct ForgeWorkerConfig {
     /// Must be at least [`Self::max_task_parallelism`], otherwise the queue
     /// could not hold one maximally parallel plan.
     pub pending_task_parallelism: u32,
+    /// Minimum time between two compaction pulls from the leader.
+    ///
+    /// `RisingWave`'s compactor polls every five seconds; each pull completes
+    /// (is acknowledged) before the next is sent.
+    pub pull_interval: Duration,
 }
 
 /// One admitted rewrite attempt's publication evidence, keyed by its identities.
@@ -1874,6 +1877,7 @@ impl Default for ForgeWorkerConfig {
             per_tenant_active_cap: 1,
             max_task_parallelism: 3,
             pending_task_parallelism: 12,
+            pull_interval: DEFAULT_PULL_INTERVAL,
         }
     }
 }
@@ -1895,6 +1899,11 @@ impl ForgeWorkerConfig {
         if self.max_task_parallelism == 0 {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge compaction running parallelism must be positive".to_owned(),
+            });
+        }
+        if self.pull_interval.is_zero() {
+            return Err(ForgeError::InvalidConfig {
+                detail: "Forge compaction pull interval must be positive".to_owned(),
             });
         }
         if self.pending_task_parallelism < self.max_task_parallelism {
@@ -1943,6 +1952,16 @@ struct ClaimExecutionOutcome<'task> {
     result: Result<ForgeSettledAttempt, ForgeError>,
 }
 
+/// Reports whether a Prepared reconciliation outcome must stop the worker's slot.
+///
+/// Every reconciliation failure is slot-fatal except
+/// [`ForgeError::CleanupRetained`]: that outcome left the exact prepared
+/// cleanup identity intact by design, so the slot keeps running and the same
+/// prepared-task route replays the candidate on a later pass.
+fn reconciliation_is_fatal<T>(result: &Result<T, ForgeError>) -> bool {
+    matches!(result, Err(error) if !matches!(error, ForgeError::CleanupRetained { .. }))
+}
+
 /// Classifies whether prepared evidence represents progress beyond its base.
 fn prepared_effect_progressed(evidence: &ForgeTaskEvidence, base_snapshot_id: i64) -> bool {
     evidence.committed_snapshot_id != Some(base_snapshot_id) || evidence.deleted_candidate_count > 0
@@ -1971,6 +1990,8 @@ pub struct ForgeWorker {
     /// a [`tokio::runtime::Handle`] ever reaches this worker; the `Runtime`
     /// itself is owned by the server composition that outlives supervision.
     compaction_runtime: Option<tokio::runtime::Handle>,
+    /// Leader dispatches this worker accepted, by task, awaiting their report.
+    dispatched: Arc<Mutex<HashMap<Uuid, ForgeCompactionDispatch>>>,
 }
 
 impl ForgeWorker {
@@ -1995,6 +2016,7 @@ impl ForgeWorker {
             config,
             loop_handles: None,
             compaction_runtime: None,
+            dispatched: Arc::default(),
         })
     }
 
@@ -2020,7 +2042,7 @@ impl ForgeWorker {
         let Some(controls) = &self.loop_handles else {
             return;
         };
-        controls.readiness.publish(false);
+        publish_worker_readiness(&controls.readiness, false);
         controls.stop.cancel();
     }
 
@@ -2052,6 +2074,9 @@ impl ForgeWorker {
     /// itself: a durable healthy-worker registration, and a complete recovery
     /// drain of every `Prepared` attempt and lapsed claim it already owns.
     /// Readiness is published by the caller only when this returns `true`.
+    /// The start is logged with this worker's local admission bounds, which
+    /// the composition derived from the node's effective CPU, so an operator
+    /// can confirm the bounds a cgroup quota produced.
     ///
     /// # Errors
     ///
@@ -2069,7 +2094,12 @@ impl ForgeWorker {
                 detail: "injected Forge worker registration failure".to_owned(),
             }));
         }
-        tracing::info!(worker = %self.owner, "Forge worker started");
+        tracing::info!(
+            worker = %self.owner,
+            max_task_parallelism = self.config.max_task_parallelism,
+            pending_task_parallelism = self.config.pending_task_parallelism,
+            "Forge worker started"
+        );
         // Readiness is recovery-gated. A Prepared attempt or a lapsed claim is
         // durable evidence a reader can already observe, so this worker
         // resolves all of it before advertising itself and taking new work.
@@ -2106,7 +2136,7 @@ impl ForgeWorker {
         if !self.start_and_drain(&shutdown).await? {
             return Ok(());
         }
-        readiness.publish(true);
+        publish_worker_readiness(&readiness, true);
         let stop = shutdown.child_token();
         self.loop_handles = Some(ForgeWorkerLoopHandles {
             readiness: readiness.clone(),
@@ -2117,7 +2147,7 @@ impl ForgeWorker {
         // stack in debug builds.
         let outcome = Box::pin(self.run_event_loop(stop)).await;
         if let Err(error) = outcome {
-            readiness.publish(false);
+            publish_worker_readiness(&readiness, false);
             tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after it could not settle its work");
             return Err(error);
         }
@@ -2295,13 +2325,41 @@ impl ForgeWorker {
 
     /// Reclaims expired durable attempts.
     ///
+    /// A reclaimed leader-dispatched attempt closes as cancelled, and is
+    /// reported Failed so the leader reschedules its table at once, as
+    /// `RisingWave` cancels an expired compactor's tasks; a lost report is
+    /// covered by the leader's report deadline.
+    ///
     /// # Errors
-    /// Returns SQL errors from the bounded operator reclaim.
+    /// Returns SQL errors from the bounded operator reclaim or the dispatch
+    /// read.
     async fn reclaim_expired_attempts(&self, cap: u32) -> Result<Vec<(Uuid, Uuid)>, ForgeError> {
-        self.tasks
+        let reclaimed = self
+            .tasks
             .reclaim_expired_attempts(cap)
             .await
-            .map_err(ForgeError::Sql)
+            .map_err(ForgeError::Sql)?;
+        if reclaimed.is_empty() {
+            return Ok(reclaimed);
+        }
+        let task_ids: Vec<Uuid> = reclaimed.iter().map(|(task_id, _)| *task_id).collect();
+        for (tenant, table, task_id) in self
+            .tasks
+            .cancelled_dispatches(&task_ids)
+            .await
+            .map_err(ForgeError::Sql)?
+        {
+            let dispatch = ForgeCompactionDispatch {
+                task_id,
+                key: super::ForgeTableKey { tenant, table },
+                branch: super::scribe_promotion::PROMOTION_BRANCH.to_owned(),
+                // A report carries only the key and task id.
+                compaction_type: ForgeCompactionType::default(),
+            };
+            self.report_dispatch(&dispatch, ForgeCompactionOutcome::Failed)
+                .await;
+        }
+        Ok(reclaimed)
     }
 
     /// Reclaims expired attempts through the production worker owner in tests.
@@ -2340,22 +2398,85 @@ impl ForgeWorker {
     /// cancellation-release failures. Each leaves durable state that no longer
     /// describes what this owner did, so the loop stops rather than claiming
     /// again. An execution failure this attempt durably settled is not one of
-    /// them: it stays a healthy exit that permits the next claim.
+    /// them: it stays a healthy exit that permits the next claim. Neither is a
+    /// loop read the database never answered: reclaim, the recovery claim, the
+    /// unattended-authority question, and the fair claim back off through
+    /// [`Self::answered`] with readiness retracted, and the next turn retries.
+    ///
+    /// # Cancellation
+    ///
+    /// Every exit, including a failure, first joins every plan runner and
+    /// claim heartbeat this loop spawned, so a stopped loop leaves no task of
+    /// its own behind.
     async fn run_event_loop(&mut self, shutdown: CancellationToken) -> Result<(), ForgeError> {
-        let claim_limits = self.claim_limits()?;
-        // One worker owns exactly one maintenance execution position, and it is
-        // outside the compaction queue: maintenance strategies are tried first
-        // on every pass so a ready snapshot expiry is never starved behind
-        // compaction backlog.
-        let reserved_maintenance = true;
         // One FIFO, one attempt map, and one completion channel for the whole
         // worker. Constructing them here rather than per attempt is what makes
         // the parallelism and memory budgets describe this worker's real load:
         // two tasks claimed a moment apart compete for the same room, in the
         // order their plans were offered.
         let mut pool = ForgeAttemptPool::new(&self.config);
+        // Boxed for the same layout-depth reason `run` boxes this loop.
+        let outcome = Box::pin(self.drive_event_loop(&mut pool, shutdown.clone())).await;
+        shutdown.cancel();
+        Self::join_spawned(&mut pool).await;
+        outcome
+    }
+
+    /// Joins every task the event loop spawned and still holds.
+    ///
+    /// Called with the loop's stop token already cancelled. Running plans
+    /// observe it at their safe boundaries and send their one completion; each
+    /// completion is recorded so the attempt it drains can be joined. Every
+    /// attempt left in the pool then has its claim heartbeat joined; the
+    /// heartbeat exits because its operation token is a child of the cancelled
+    /// stop token. Nothing is settled here: whatever an unsettled attempt left
+    /// durable is recovered by the next owner's startup drain.
+    ///
+    /// # Cancellation
+    ///
+    /// Waits for each running plan to reach a safe boundary, exactly as a clean
+    /// shutdown does; a plan that never completes holds this join.
+    async fn join_spawned(pool: &mut ForgeAttemptPool) {
+        let mut drained = Vec::new();
+        while pool.attempts.values().any(|state| state.running > 0) {
+            let Some(completion) = pool.completion_rx.recv().await else {
+                break;
+            };
+            match Self::record_plan_completion(pool, completion) {
+                Ok(Some(state)) => drained.push(state),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, "Forge plan completion could not be recorded while joining a stopped loop");
+                }
+            }
+        }
+        drained.extend(pool.attempts.drain().map(|(_, state)| state));
+        for state in drained {
+            if let Err(error) = state.fenced.heartbeat.await {
+                tracing::warn!(error = %error, "Forge claim heartbeat failed to join while stopping the loop");
+            }
+        }
+    }
+
+    /// Runs the event loop body over the worker's one attempt pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failures documented on [`Self::run_event_loop`].
+    async fn drive_event_loop(
+        &mut self,
+        pool: &mut ForgeAttemptPool,
+        shutdown: CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let claim_limits = self.claim_limits()?;
+        // One worker owns exactly one maintenance execution position, and it is
+        // outside the compaction queue: maintenance strategies are tried first
+        // on every pass so a ready snapshot expiry is never starved behind
+        // compaction backlog.
+        let reserved_maintenance = true;
+        let mut next_pull = Instant::now();
         loop {
-            let stranded = self.start_fitting_plans(&mut pool, &shutdown);
+            let stranded = self.start_fitting_plans(pool, &shutdown);
             for state in stranded {
                 self.settle_or_release_attempt(state, &shutdown).await?;
             }
@@ -2372,7 +2493,7 @@ impl ForgeWorker {
                     // now may be written durably, and the successor owns that
                     // proof.
                     if let Some(completion) = pool.completion_rx.recv().await
-                        && let Some(state) = Self::record_plan_completion(&mut pool, completion)?
+                        && let Some(state) = Self::record_plan_completion(pool, completion)?
                     {
                         self.settle_or_release_attempt(state, &shutdown).await?;
                     }
@@ -2382,15 +2503,26 @@ impl ForgeWorker {
                 // with nothing in flight and nothing idle cannot exist.
                 return Ok(());
             }
-            self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
-                .await?;
+            let reclaimed = self
+                .reclaim_expired_attempts(claim_limits.max_active_per_tenant)
+                .await;
+            if self.answered(reclaimed, pool, &shutdown).await?.is_none() {
+                continue;
+            }
             // Checked immediately before each durable claim so a stop signal
             // lands before this loop takes new work.
             if shutdown.is_cancelled() {
                 continue;
             }
-            if self.reconcile_one_prepared(claim_limits, &shutdown).await? {
-                continue;
+            let prepared = self.claim_prepared(claim_limits).await;
+            match self.answered(prepared, pool, &shutdown).await? {
+                Some(Some(prepared)) => {
+                    if self.reconcile_claimed_prepared(prepared, &shutdown).await? {
+                        continue;
+                    }
+                }
+                Some(None) => {}
+                None => continue,
             }
             if shutdown.is_cancelled() {
                 continue;
@@ -2399,7 +2531,7 @@ impl ForgeWorker {
             // authority is acquired, so the budget a finished plan freed is the
             // budget the pull calculation below sees.
             while let Ok(completion) = pool.completion_rx.try_recv() {
-                if let Some(state) = Self::record_plan_completion(&mut pool, completion)? {
+                if let Some(state) = Self::record_plan_completion(pool, completion)? {
                     self.settle_or_release_attempt(state, &shutdown).await?;
                 }
             }
@@ -2409,7 +2541,11 @@ impl ForgeWorker {
             if shutdown.is_cancelled() {
                 continue;
             }
-            if self.holds_unattended_authority(&pool).await? {
+            let unattended = self.holds_unattended_authority(pool).await;
+            let Some(unattended) = self.answered(unattended, pool, &shutdown).await? else {
+                continue;
+            };
+            if unattended {
                 // This owner released an attempt it could not account for: the
                 // task is still Running under its name, its operation is still
                 // Prepared, and its claim is owned until the lease lapses.
@@ -2419,20 +2555,25 @@ impl ForgeWorker {
                 // taken. Attempts already admitted keep draining: they are
                 // attended work with owners that can still settle them.
                 self.publish_readiness(false);
-                self.wait_for_progress(&mut pool, &shutdown).await?;
+                self.wait_for_progress(pool, &shutdown).await?;
                 continue;
             }
             self.publish_readiness(true);
-            if (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4) == 0
-            {
+            if self.free_pull_room(pool) == 0 {
                 // No running parallelism remains, so this turn acquires no
                 // authority at all. Waiting plans keep their pending
                 // reservation; it does not authorize a pull.
-                Box::pin(self.await_loop_event(&mut pool, &shutdown)).await?;
+                Box::pin(self.await_loop_event(pool, None, &shutdown)).await?;
                 continue;
             }
             let Some(claimed) = self
-                .pull_claimed_tasks(&mut pool, claim_limits, reserved_maintenance, &shutdown)
+                .pull_claimed_tasks(
+                    pool,
+                    claim_limits,
+                    reserved_maintenance,
+                    &mut next_pull,
+                    &shutdown,
+                )
                 .await?
             else {
                 return Ok(());
@@ -2449,20 +2590,24 @@ impl ForgeWorker {
             }
             // Nothing to claim while this worker still holds work: waiting on a
             // running plan is the idle wait, because polling for new work on a
-            // timer would delay the settlement that frees its budget.
-            Box::pin(self.await_loop_event(&mut pool, &shutdown)).await?;
+            // timer would delay the settlement that frees its budget. The one
+            // timer is the leader pull, which this worker has room for.
+            Box::pin(self.await_loop_event(pool, Some(next_pull), &shutdown)).await?;
         }
     }
 
     /// Claims and admits tasks for one pull turn, up to this worker's free room.
     ///
-    /// The pull budget is recomputed after every claim's plans are offered, so
-    /// a task that filled the queue ends the turn instead of letting the next
-    /// claim overcommit the same parallelism. Claims are taken one at a time
-    /// through the fair SQL selection, which is what keeps two workers from
-    /// splitting a tenant's backlog unevenly.
+    /// Durable work already queued in SQL (maintenance and retries) is taken
+    /// first through the fair claim. What room remains is offered to the
+    /// leader as one capacity pull, at most once per
+    /// [`ForgeWorkerConfig::pull_interval`]: `min(max_task_parallelism -
+    /// running parallelism, 4)` table-level tasks, as `RisingWave`'s compactor
+    /// requests. The pull budget is recomputed after every admitted task, so a
+    /// task that filled the queue ends the turn. Each leader pull logs, at
+    /// debug, how many tasks it requested and how many the leader returned.
     ///
-    /// Returns the number of tasks claimed, or `None` when a stop signal or a
+    /// Returns the number of tasks started, or `None` when a stop signal or a
     /// test-support abandonment ended this worker's loop.
     ///
     /// # Errors
@@ -2474,75 +2619,317 @@ impl ForgeWorker {
         pool: &mut ForgeAttemptPool,
         claim_limits: ForgeClaimLimits,
         reserved_maintenance: bool,
+        next_pull: &mut Instant,
         shutdown: &CancellationToken,
     ) -> Result<Option<u32>, ForgeError> {
-        // One pull turn asks for at most
-        // the parallelism this worker still has free, and never more than four
-        // tasks.
-        let mut pending_pull_task_count =
-            (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4);
+        let mut pending_pull_task_count = self.free_pull_room(pool);
         let mut claimed = 0_u32;
         while pending_pull_task_count > 0 {
             let claim = self
                 .claim_next(claim_limits, reserved_maintenance)
                 .await
-                .map_err(ForgeError::Sql)?;
+                .map_err(ForgeError::Sql);
+            // The claims this turn already started are admitted work; only the
+            // unanswered claim is retried.
+            let Some(claim) = self.answered(claim, pool, shutdown).await? else {
+                return Ok(Some(claimed));
+            };
             let Some(claim) = claim else {
                 break;
             };
             claimed += 1;
-            let started = Instant::now();
-            let active = Self::metric_strategy(&claim.strategy)
-                .map(|strategy| self.forge.core.telemetry.active_task(strategy));
-            #[cfg(feature = "test-support")]
-            let task_id = claim.task_id;
-            #[cfg(feature = "test-support")]
-            if let Some(observer) = &self.completion_observer {
-                observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
-                    task_id,
-                    worker_id: self.owner,
-                });
-            }
-            #[cfg(feature = "test-support")]
-            if let Some(observer) = &self.completion_observer {
-                observer.pause_after_claim_for_test().await;
-                if observer.abandon_claim_for_test(&claim, self.owner) {
-                    return Ok(None);
-                }
-            }
-            if shutdown.is_cancelled() {
-                self.release_claim_at_shutdown(&claim, started).await?;
+            if self.start_claim(claim, pool, shutdown).await?.is_none() {
                 return Ok(None);
-            }
-            #[cfg(feature = "test-support")]
-            let strategy = claim.strategy.clone();
-            let open = Self::open_claim_episode(claim, started, active);
-            match self.begin_claim_episode(open, shutdown, pool).await {
-                // The attempt's plans are on the queue; it settles when they drain.
-                ClaimStep::Admitted => {}
-                ClaimStep::Closed(result) => {
-                    #[cfg(feature = "test-support")]
-                    self.observe_settled_claim(task_id, &strategy, &result)
-                        .await;
-                    result?;
-                }
             }
             // This claim consumed one unit of the turn's allowance, and the
             // remainder is clamped to the room recomputed after its plans were
             // offered. Consuming the unit is what bounds one turn to four
             // tasks even when no plan has started yet.
-            pending_pull_task_count = pending_pull_task_count.saturating_sub(1).min(
-                (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4),
-            );
+            pending_pull_task_count = pending_pull_task_count
+                .saturating_sub(1)
+                .min(self.free_pull_room(pool));
+        }
+        if pending_pull_task_count == 0 || Instant::now() < *next_pull || shutdown.is_cancelled() {
+            return Ok(Some(claimed));
+        }
+        *next_pull = Instant::now() + self.config.pull_interval;
+        let dispatches = match self
+            .forge
+            .pull_compaction(usize::try_from(pending_pull_task_count).unwrap_or(usize::MAX))
+            .await
+        {
+            Ok(dispatches) => dispatches,
+            Err(error) => {
+                tracing::warn!(worker = %self.owner, error = %error, "Forge compaction pull failed; retrying at the next pull");
+                Vec::new()
+            }
+        };
+        tracing::debug!(
+            worker = %self.owner,
+            requested = pending_pull_task_count,
+            returned = dispatches.len(),
+            "Forge compaction pull"
+        );
+        let mut dispatches = dispatches.into_iter();
+        while let Some(dispatch) = dispatches.next() {
+            match self
+                .admit_dispatch(dispatch, pool, claim_limits, shutdown)
+                .await?
+            {
+                Some(true) => claimed += 1,
+                Some(false) => {}
+                None => {
+                    for undelivered in dispatches {
+                        self.report_dispatch(&undelivered, ForgeCompactionOutcome::NotStarted)
+                            .await;
+                    }
+                    return Ok(None);
+                }
+            }
         }
         Ok(Some(claimed))
     }
 
-    /// Waits for the next plan completion or stop signal.
+    /// Returns how many tasks one pull may request now.
+    ///
+    /// `RisingWave`'s formula: running parallelism still free, capped at four.
+    /// Waiting plans have their own pending budget and do not reduce it.
+    fn free_pull_room(&self, pool: &ForgeAttemptPool) -> u32 {
+        (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4)
+    }
+
+    /// Opens and starts one durable claim, from the fair claim or a dispatch.
+    ///
+    /// Returns `None` when a stop signal or a test-support abandonment ended
+    /// this worker's loop before the claim started.
+    ///
+    /// # Errors
+    ///
+    /// Returns the slot-fatal failures of the claim's episode.
+    async fn start_claim(
+        &self,
+        claim: ForgeTaskClaim,
+        pool: &mut ForgeAttemptPool,
+        shutdown: &CancellationToken,
+    ) -> Result<Option<()>, ForgeError> {
+        let started = Instant::now();
+        let active = Self::metric_strategy(&claim.strategy)
+            .map(|strategy| self.forge.core.telemetry.active_task(strategy));
+        #[cfg(feature = "test-support")]
+        let task_id = claim.task_id;
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
+                task_id,
+                worker_id: self.owner,
+            });
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.pause_after_claim_for_test().await;
+            if observer.abandon_claim_for_test(&claim, self.owner) {
+                return Ok(None);
+            }
+        }
+        if shutdown.is_cancelled() {
+            self.release_claim_at_shutdown(&claim, started).await?;
+            return Ok(None);
+        }
+        #[cfg(feature = "test-support")]
+        let strategy = claim.strategy.clone();
+        let open = Self::open_claim_episode(claim, started, active);
+        match self.begin_claim_episode(open, shutdown, pool).await {
+            // The attempt's plans are on the queue; it settles when they drain.
+            ClaimStep::Admitted => {}
+            ClaimStep::Closed(result) => {
+                #[cfg(feature = "test-support")]
+                self.observe_settled_claim(task_id, &strategy, &result)
+                    .await;
+                result?;
+            }
+        }
+        Ok(Some(()))
+    }
+
+    /// Returns the physical compaction type a rewrite claim plans with.
+    ///
+    /// A leader dispatch carries its table's type in the attempt parameters;
+    /// a claim without one plans small files, the strategy it names.
+    fn claim_compaction_type(claim: &ForgeTaskClaim) -> ForgeCompactionType {
+        claim
+            .plan
+            .parameters
+            .get("compaction_type")
+            .and_then(Value::as_str)
+            .and_then(|raw| ForgeCompactionType::parse(raw).ok())
+            .unwrap_or(ForgeCompactionType::SmallFiles)
+    }
+
+    /// Turns one leader dispatch into this worker's own claimed attempt.
+    ///
+    /// The worker loads the current table and binds the attempt to its head:
+    /// every live data file is the attempt's input bound, and the managed
+    /// planner chooses the files to rewrite from that same head when the
+    /// attempt runs. A table with no live data reports success without a
+    /// rewrite. A table that already has an active or queued attempt reports
+    /// the dispatch not started, so the leader keeps its commits and offers
+    /// it again on a later pull.
+    ///
+    /// Returns `Some(true)` when an attempt started, `Some(false)` when the
+    /// dispatch was answered without one, and `None` when the worker stopped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL failure recording the attempt and the slot-fatal
+    /// failures of its episode.
+    async fn admit_dispatch(
+        &self,
+        dispatch: ForgeCompactionDispatch,
+        pool: &mut ForgeAttemptPool,
+        claim_limits: ForgeClaimLimits,
+        shutdown: &CancellationToken,
+    ) -> Result<Option<bool>, ForgeError> {
+        if shutdown.is_cancelled() {
+            self.report_dispatch(&dispatch, ForgeCompactionOutcome::NotStarted)
+                .await;
+            return Ok(None);
+        }
+        let task = match self.dispatch_envelope(&dispatch).await {
+            Ok(Some(task)) => task,
+            Ok(None) => {
+                self.report_dispatch(&dispatch, ForgeCompactionOutcome::Succeeded)
+                    .await;
+                return Ok(Some(false));
+            }
+            Err(error) => {
+                tracing::warn!(task_id = %dispatch.task_id, table = %dispatch.key.table.table, error = %error, "Forge could not load a dispatched table");
+                self.report_dispatch(&dispatch, ForgeCompactionOutcome::Failed)
+                    .await;
+                return Ok(Some(false));
+            }
+        };
+        let claimed = self
+            .tasks
+            .insert_claimed(
+                dispatch.task_id,
+                &task,
+                self.owner,
+                claim_limits.lease_seconds,
+            )
+            .await;
+        let claim = match claimed {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                self.report_dispatch(&dispatch, ForgeCompactionOutcome::NotStarted)
+                    .await;
+                return Ok(Some(false));
+            }
+            Err(error) => {
+                self.report_dispatch(&dispatch, ForgeCompactionOutcome::NotStarted)
+                    .await;
+                return Err(ForgeError::Sql(error));
+            }
+        };
+        ForgeTelemetry::record_task_created(task.strategy);
+        self.dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(dispatch.task_id, dispatch);
+        Ok(self
+            .start_claim(claim, pool, shutdown)
+            .await?
+            .map(|()| true))
+    }
+
+    /// Builds the attempt envelope for one dispatched table from its head.
+    ///
+    /// Returns `None` when the table has no snapshot or no live data file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the binding, catalog and manifest-read failures.
+    async fn dispatch_envelope(
+        &self,
+        dispatch: &ForgeCompactionDispatch,
+    ) -> Result<Option<NewForgeTask>, ForgeError> {
+        let binding = task_table_binding(
+            dispatch.key.tenant,
+            dispatch.key.tenant,
+            &dispatch.key.table,
+        )?;
+        let table = self.forge.load_table(&binding.table_ident()).await?;
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(None);
+        };
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ForgeError::Catalog)?;
+        let mut live = std::collections::BTreeMap::new();
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .map_err(ForgeError::Catalog)?;
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                let file = entry.data_file();
+                if file.content_type() == iceberg::spec::DataContentType::Data {
+                    live.insert(file.file_path().to_owned(), file.file_size_in_bytes());
+                }
+            }
+        }
+        if live.is_empty() {
+            return Ok(None);
+        }
+        let bytes = live.values().copied().fold(0_u64, u64::saturating_add);
+        let plan = vala_sql::row_types::forge_tasks::ForgeTaskPlan {
+            version: vala_sql::row_types::forge_tasks::FORGE_TASK_PAYLOAD_VERSION,
+            inputs: live.into_keys().collect(),
+            parameters: serde_json::json!({
+                "kind": LIVE_REWRITE_PARAMETER_KIND,
+                "compaction_type": dispatch.compaction_type.as_str(),
+                // The leader's task id makes each dispatch its own plan
+                // identity, so the leader's retry of an unchanged head is a new
+                // attempt rather than a duplicate of the closed one.
+                "dispatch": dispatch.task_id.to_string(),
+            }),
+        };
+        Ok(Some(NewForgeTask {
+            data_tenant_id: dispatch.key.tenant,
+            table_ref: dispatch.key.table.clone(),
+            strategy: ForgeTaskStrategy::SmallFiles,
+            base_snapshot_id: snapshot.snapshot_id(),
+            plan_hash: super::planner::plan_hash(&plan)?,
+            estimates: vala_sql::row_types::forge_tasks::ForgeTaskEstimates {
+                files: u32::try_from(plan.inputs.len()).unwrap_or(u32::MAX),
+                bytes: bytes.max(1),
+            },
+            plan,
+            ready_at: None,
+        }))
+    }
+
+    /// Reports one dispatch's outcome to the leader; failures are logged.
+    ///
+    /// A lost report costs nothing durable: the leader's report deadline
+    /// makes the table eligible again.
+    async fn report_dispatch(
+        &self,
+        dispatch: &ForgeCompactionDispatch,
+        outcome: ForgeCompactionOutcome,
+    ) {
+        if let Err(error) = self.forge.report_compaction(dispatch, outcome).await {
+            tracing::warn!(task_id = %dispatch.task_id, ?outcome, error = %error, "Forge compaction report was not delivered");
+        }
+    }
+
+    /// Waits for the next plan completion, stop signal, or due pull.
     ///
     /// This is the loop's only wait once it holds work. A completion is
     /// recorded and, when it drained its attempt, settled or released; a stop
-    /// signal returns so the caller re-reads it.
+    /// signal or the `pull_at` instant (when this worker has room to pull)
+    /// returns so the caller re-reads its state.
     ///
     /// # Errors
     ///
@@ -2551,10 +2938,18 @@ impl ForgeWorker {
     async fn await_loop_event(
         &self,
         pool: &mut ForgeAttemptPool,
+        pull_at: Option<Instant>,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
+        let pull_due = async {
+            match pull_at {
+                Some(at) => tokio::time::sleep_until(at.into()).await,
+                None => std::future::pending().await,
+            }
+        };
         let completion = tokio::select! {
             () = shutdown.cancelled() => None,
+            () = pull_due => None,
             completion = pool.completion_rx.recv() => completion,
         };
         if let Some(completion) = completion
@@ -2576,6 +2971,11 @@ impl ForgeWorker {
     /// operation, and a lapsed claim lease is what the next owner's table-wide
     /// reconciliation pass classifies, whether this worker exited cleanly, was
     /// killed, or simply lost one commit response and kept running.
+    ///
+    /// A leader dispatch behind the attempt is reported failed, which is volatile
+    /// leader state rather than a durable write: the table becomes due again
+    /// instead of waiting out its report deadline, and its re-dispatch is not
+    /// started while this task's durable row still holds the table.
     ///
     /// A local closure failure is logged rather than returned: nothing durable
     /// depends on the closure, and an unreleased fence lapses on its own TTL.
@@ -2611,6 +3011,15 @@ impl ForgeWorker {
                 "Forge table lease release failed; the fence lapses on its TTL"
             );
         }
+        let dispatch = self
+            .dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&task_id);
+        if let Some(dispatch) = dispatch {
+            self.report_dispatch(&dispatch, ForgeCompactionOutcome::Failed)
+                .await;
+        }
         // The one final snapshot of what this attempt may have written is read
         // before its shared context is dropped, so a successor's operator has
         // the object names even though nothing durable is settled here. The
@@ -2645,8 +3054,9 @@ impl ForgeWorker {
     /// # Errors
     ///
     /// Returns the SQL failure the predicate raised. The answer gates readiness
-    /// and new claims, so an unanswered question must stop the loop rather than
-    /// be read as "nothing unresolved".
+    /// and new claims, so an unanswered question is never read as "nothing
+    /// unresolved": the loop stops, or backs off without claiming when the
+    /// database could not be reached.
     async fn holds_unattended_authority(
         &self,
         pool: &ForgeAttemptPool,
@@ -2681,7 +3091,42 @@ impl ForgeWorker {
             }
             return Ok(());
         }
-        Box::pin(self.await_loop_event(pool, shutdown)).await
+        Box::pin(self.await_loop_event(pool, None, shutdown)).await
+    }
+
+    /// Passes through one loop read's answer, or backs off when the
+    /// database could not answer it.
+    ///
+    /// Reclaim, the recovery claim, the unattended-authority question, and
+    /// the fair claim either answer or roll back, so a statement that never
+    /// reached the database leaves nothing to account for. Such a failure
+    /// retracts readiness, waits through [`Self::wait_for_progress`], and
+    /// returns `None` so the loop re-reads durable state; readiness returns
+    /// with the next turn that answers. Any other failure still stops the
+    /// loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the read's error unless
+    /// [`ForgeError::is_database_unavailable`] holds, and the settlement
+    /// failures a completion recorded during the wait raises.
+    async fn answered<T>(
+        &self,
+        read: Result<T, ForgeError>,
+        pool: &mut ForgeAttemptPool,
+        shutdown: &CancellationToken,
+    ) -> Result<Option<T>, ForgeError> {
+        match read {
+            Ok(answer) => Ok(Some(answer)),
+            Err(error) if error.is_database_unavailable() => {
+                tracing::warn!(worker = %self.owner, error = %error, "Forge worker could not reach the database; backing off");
+                ForgeTelemetry::record_worker_backoff();
+                self.publish_readiness(false);
+                self.wait_for_progress(pool, shutdown).await?;
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Publishes this loop's readiness, when it is running under a role handle.
@@ -2691,35 +3136,58 @@ impl ForgeWorker {
     /// owner that will not claim it.
     fn publish_readiness(&self, ready: bool) {
         if let Some(handles) = &self.loop_handles {
-            handles.readiness.publish(ready);
+            publish_worker_readiness(&handles.readiness, ready);
         }
     }
 
     /// Drains one claim this owner took as shutdown was signalled.
     ///
-    /// The claim is released back to `retryable` so a stopping worker leaves no
-    /// task owned by a process that will never run it, and the episode is still
-    /// observed so its duration is not lost.
+    /// A fair claim is released back to `retryable` so a stopping worker leaves
+    /// no task owned by a process that will never run it. A leader-dispatched
+    /// claim instead stays owned by the pull/report protocol: its bookkeeping
+    /// is removed here exactly once, the row closes as `cancelled` through
+    /// [`Self::close_dispatched`] so no fair claim can give it a second owner,
+    /// and the leader receives one `NotStarted` report, `RisingWave`'s failed
+    /// send, which keeps every pending commit due. A dispatched row that
+    /// already left this attempt commits nothing and sends no report: its
+    /// current owner, or the reclaim that cancelled it, reports instead. The
+    /// episode is observed either way so its duration is not lost.
     ///
     /// # Errors
     ///
-    /// Returns the release failure, which leaves the claim for lease-expiry
-    /// recovery and stops this owner.
+    /// Returns the release or close failure, which leaves the claim for
+    /// lease-expiry recovery (whose reclaim reports a dispatched row to the
+    /// leader) and stops this owner.
     async fn release_claim_at_shutdown(
         &self,
         claim: &ForgeTaskClaim,
         started: Instant,
     ) -> Result<(), ForgeError> {
         let task_id = claim.task_id;
-        let released = if let Some(attempt) = claim.attempt_id {
-            self.release_cancelled_claim(task_id, attempt).await
-        } else {
-            Ok(false)
+        let dispatch = self
+            .dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&task_id);
+        let released = match (claim.attempt_id, dispatch.is_some()) {
+            (Some(attempt), true) => {
+                self.close_dispatched(claim, attempt, &ForgeError::Shutdown)
+                    .await
+            }
+            (Some(attempt), false) => self
+                .release_cancelled_claim(task_id, attempt)
+                .await
+                .map(|released| released.then_some(ForgeTaskResult::Retry)),
+            (None, _) => Ok(None),
         };
         if let Err(error) = &released {
             self.close_after_fatal();
             tracing::error!(worker = %self.owner, task_id = %task_id, error = %error,
                 "Forge claim shutdown release failed; durable state retained for lease recovery");
+        }
+        if let (Some(dispatch), Ok(Some(_))) = (&dispatch, &released) {
+            self.report_dispatch(dispatch, ForgeCompactionOutcome::NotStarted)
+                .await;
         }
         self.record_task_execution_telemetry(
             claim.data_tenant_id,
@@ -2727,8 +3195,9 @@ impl ForgeWorker {
             Self::metric_strategy(&claim.strategy),
             &tracing::Span::none(),
             started,
-            // The release committed `retryable`; a no-match committed nothing.
-            matches!(released, Ok(true)).then_some(ForgeTaskResult::Retry),
+            // The committed `retryable` or `cancelled` result; a no-match
+            // committed nothing.
+            released.as_ref().ok().copied().flatten(),
         )
         .await;
         released.map(|_| ())
@@ -2855,7 +3324,9 @@ impl ForgeWorker {
     ///
     /// Returns [`ForgeError::Sql`] when the bounded recovery claim fails. A
     /// reconciliation or release failure retains exact evidence and stops the
-    /// slot before any later claim.
+    /// slot before any later claim. A retained cleanup candidate
+    /// ([`ForgeError::CleanupRetained`]) is not a failure: it returns
+    /// `Ok(false)` so the caller paces the next same-identity replay.
     ///
     /// # Cancellation
     ///
@@ -2865,14 +3336,46 @@ impl ForgeWorker {
         claim_limits: ForgeClaimLimits,
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
-        let Some(prepared) = self
-            .tasks
-            .claim_prepared_for_reconciliation(self.owner, claim_limits.lease_seconds)
-            .await
-            .map_err(ForgeError::Sql)?
-        else {
+        let Some(prepared) = self.claim_prepared(claim_limits).await? else {
             return Ok(false);
         };
+        self.reconcile_claimed_prepared(prepared, shutdown).await
+    }
+
+    /// Claims one `prepared` attempt for reconciliation by this owner, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the bounded recovery claim fails.
+    async fn claim_prepared(
+        &self,
+        claim_limits: ForgeClaimLimits,
+    ) -> Result<Option<ForgePreparedTaskClaim>, ForgeError> {
+        self.tasks
+            .claim_prepared_for_reconciliation(self.owner, claim_limits.lease_seconds)
+            .await
+            .map_err(ForgeError::Sql)
+    }
+
+    /// Reconciles one `prepared` attempt this owner already claimed.
+    ///
+    /// Returns `true` when the attempt was reconciled, and `false` when an
+    /// expired cleanup retained its candidate for replay, so the caller paces
+    /// the next replay instead of reclaiming the same refusing candidate.
+    ///
+    /// # Errors
+    ///
+    /// A reconciliation or release failure retains exact evidence and is
+    /// returned, stopping the slot before any later claim.
+    ///
+    /// # Cancellation
+    ///
+    /// A cancelled reconciliation leaves the attempt durable for a later owner.
+    async fn reconcile_claimed_prepared(
+        &self,
+        prepared: ForgePreparedTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
         #[cfg(feature = "test-support")]
         let (task_id, strategy) = (
             prepared.task.task_id,
@@ -2881,6 +3384,13 @@ impl ForgeWorker {
         let result = self.reconcile_prepared(prepared, shutdown).await;
         #[cfg(feature = "test-support")]
         self.pause_after_attempt_for_test(task_id).await;
+        if let Err(error @ ForgeError::CleanupRetained { .. }) = &result {
+            // The candidate stays prepared under its exact identity. Reporting
+            // no reconciliation lets the slot loop pace its next replay instead
+            // of spinning on a root that still refuses the delete.
+            tracing::warn!(worker = %self.owner, error = %error, "Prepared Forge cleanup retained its candidate for replay");
+            return Ok(false);
+        }
         if let Err(error) = result {
             tracing::error!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
             // A Prepared attempt already produced durable evidence a reader
@@ -3302,6 +3812,80 @@ impl ForgeWorker {
         self.execute_claim(claim, shutdown).await.map(|_| ())
     }
 
+    /// Records `task` as an attempt claimed by this worker and executes it.
+    ///
+    /// Forge work is chosen by the leader or by the coordinator that observed
+    /// it, never by a durable queue; the row exists only as the attempt's
+    /// evidence, so start, settlement and recovery stay those of
+    /// [`Self::execute_claim`]. Returns `Ok(false)` without effect when the
+    /// table already has an active attempt or the exact plan was recorded.
+    /// A cancelled `shutdown` — coordinator shutdown or the revocation of
+    /// the leader term that chose the work — records nothing, so no new
+    /// attempt starts once that authority has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Shutdown`] when `shutdown` is already cancelled,
+    /// validation and SQL errors from recording the attempt, and the errors
+    /// of [`Self::execute_claim`].
+    pub async fn execute_accepted(
+        &self,
+        task_id: Uuid,
+        task: &NewForgeTask,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        if shutdown.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
+        let Some(claim) = self
+            .tasks
+            .insert_claimed(
+                task_id,
+                task,
+                self.owner,
+                self.claim_limits()?.lease_seconds,
+            )
+            .await
+            .map_err(ForgeError::Sql)?
+        else {
+            return Ok(false);
+        };
+        super::metrics::ForgeTelemetry::record_task_created(task.strategy);
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.record_lifecycle(ForgeLifecycleEvent::Planned {
+                task_id,
+                tenant: task.data_tenant_id,
+                table: task.table_ref.table.clone(),
+                inputs: task.plan.inputs.clone(),
+            });
+        }
+        let result = self.execute_claim(claim, shutdown).await;
+        // Observed exactly like a claimed attempt, so a scenario waits on one
+        // seam whichever route ran the task.
+        #[cfg(feature = "test-support")]
+        self.observe_settled_claim(task_id, &ForgeClaimStrategy::Known(task.strategy), &result)
+            .await;
+        result
+    }
+
+    /// Promotes what one table owes through this executor, as the coordinator does.
+    ///
+    /// # Errors
+    ///
+    /// Returns every failure the coordinator's promotion route returns.
+    #[cfg(feature = "test-support")]
+    pub async fn promote_for_test(
+        &self,
+        tenant: DataTenantId,
+        table_ref: &ForgeTaskTableIdentity,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        self.forge
+            .promote_table(self, tenant, table_ref, shutdown)
+            .await
+    }
+
     /// Executes one exact claimed task through validation, table fencing,
     /// bounded rewrite, exact evidence persistence, and terminal audit.
     ///
@@ -3496,6 +4080,20 @@ impl ForgeWorker {
         } = open;
         if outcome.is_err() {
             self.close_after_fatal();
+        }
+        let dispatch = self
+            .dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&claim.task_id);
+        if let Some(dispatch) = dispatch {
+            let reported = match &outcome {
+                Ok(settled) if settled.result == Some(ForgeTaskResult::Succeeded) => {
+                    ForgeCompactionOutcome::Succeeded
+                }
+                _ => ForgeCompactionOutcome::Failed,
+            };
+            self.report_dispatch(&dispatch, reported).await;
         }
         #[cfg(feature = "test-support")]
         if outcome.is_err()
@@ -3830,6 +4428,9 @@ impl ForgeWorker {
     ///
     /// # Errors
     /// Returns the original reconciliation/release error; telemetry never replaces it.
+    /// Every error closes the worker's run controls except
+    /// [`ForgeError::CleanupRetained`], which leaves the prepared candidate for
+    /// a later same-identity replay.
     ///
     /// # Cancellation
     /// Retains exact Prepared evidence when recovery cannot finish under shutdown.
@@ -3859,13 +4460,12 @@ impl ForgeWorker {
             span.clone(),
         )
         .await;
-        if result.is_err() {
+        let fatal = reconciliation_is_fatal(&result);
+        if fatal {
             self.close_after_fatal();
         }
         #[cfg(feature = "test-support")]
-        if result.is_err()
-            && let Some(observer) = &self.completion_observer
-        {
+        if fatal && let Some(observer) = &self.completion_observer {
             observer.pause_fatal_observation_for_test().await;
         }
         self.record_task_execution_telemetry(
@@ -3920,6 +4520,8 @@ impl ForgeWorker {
     /// # Errors
     /// Returns identity, evidence, heartbeat, settlement, and release failures,
     /// preserving reconciliation failure ahead of a secondary release failure.
+    /// A retained cleanup candidate surfaces as [`ForgeError::CleanupRetained`]
+    /// after its lease is released, without closing the worker's run controls.
     ///
     /// # Cancellation
     /// Cancellation retains durable evidence for a later fenced owner.
@@ -3963,7 +4565,7 @@ impl ForgeWorker {
                 &operation_stop,
             )
             .await;
-        if reconciliation.is_err() {
+        if reconciliation_is_fatal(&reconciliation) {
             self.close_after_fatal();
         }
         operation_stop.cancel();
@@ -4017,7 +4619,7 @@ impl ForgeWorker {
         // table it can no longer prove it owns, so a release-only failure is
         // fatal too. When reconciliation already failed, that error stays
         // primary and the release failure is only a secondary diagnostic.
-        if result.is_err() {
+        if reconciliation_is_fatal(&result) {
             self.close_after_fatal();
         }
         self.release_prepared_lease(task.task_id, &mut lease, result)
@@ -4234,6 +4836,21 @@ impl ForgeWorker {
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
                 ForgeSnapshotExpiryIntent::parse(&task.strategy, parameters).is_some()
             }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
+                let compaction_type = parameters.get("compaction_type").map(|raw| {
+                    raw.as_str()
+                        .is_some_and(|raw| ForgeCompactionType::parse(raw).is_ok())
+                });
+                let dispatch = parameters
+                    .get("dispatch")
+                    .map(|raw| raw.as_str().is_some_and(|raw| Uuid::parse_str(raw).is_ok()));
+                parameters.get("kind").and_then(Value::as_str) == Some(expected_kind)
+                    && compaction_type.unwrap_or(true)
+                    && dispatch.unwrap_or(true)
+                    && parameters.len()
+                        == 1 + usize::from(compaction_type.is_some())
+                            + usize::from(dispatch.is_some())
+            }
             _ => {
                 parameters.get("kind").and_then(Value::as_str) == Some(expected_kind)
                     && parameters.len() == 1
@@ -4385,16 +5002,29 @@ impl ForgeWorker {
         ForgeError,
     > {
         match result {
-            ForgeDispatchResult::Committed(publication) => self
-                .committed_evidence(binding, &publication.table)
-                .await
-                .map(|evidence| {
-                    (
-                        evidence,
-                        ForgeExecutionEvidenceState::Fresh,
-                        publication.volume,
-                    )
-                }),
+            ForgeDispatchResult::Committed(publication) => {
+                if matches!(
+                    claim.strategy,
+                    ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion)
+                ) {
+                    self.forge
+                        .notify_promotion_commit(
+                            claim.data_tenant_id,
+                            &claim.table_ref,
+                            &publication.table,
+                        )
+                        .await;
+                }
+                self.committed_evidence(binding, &publication.table)
+                    .await
+                    .map(|evidence| {
+                        (
+                            evidence,
+                            ForgeExecutionEvidenceState::Fresh,
+                            publication.volume,
+                        )
+                    })
+            }
             ForgeDispatchResult::Cleaned(evidence) => {
                 Ok((*evidence, ForgeExecutionEvidenceState::Prepared, None))
             }
@@ -4813,6 +5443,10 @@ impl ForgeWorker {
             return Ok(());
         }
         let plan = Self::promotion_plan(claim)?;
+        let operation_id = self
+            .forge
+            .promotion_operation_id(binding, claim.task_id)
+            .await?;
         self.forge
             .settle_promotion(
                 lease,
@@ -4829,7 +5463,7 @@ impl ForgeWorker {
                             ForgeScribePromotionPhase::Committed
                         }
                     },
-                    operation_id: Self::promotion_operation_id(claim),
+                    operation_id,
                     base_snapshot_id: claim.base_snapshot_id,
                     committed_snapshot_id: evidence.committed_snapshot_id,
                 },
@@ -5103,26 +5737,25 @@ impl ForgeWorker {
                         .to_owned(),
             });
         }
-        let expiry_evidence =
-            if intent.snapshot_expiry_due && self.forge.core.config.snapshot_expiry_enabled {
-                self.forge
-                    .run_snapshot_expiry_for_table(
-                        lease,
-                        &key,
-                        binding,
-                        &ExpiryTaskAuthority {
-                            task: claim.task_id,
-                            attempt,
-                            worker: self.owner,
-                        },
-                        self.forge.core.clock.now()?,
-                        stop,
-                    )
-                    .await?
-                    .settled_evidence
-            } else {
-                None
-            };
+        let expiry_evidence = if intent.snapshot_expiry_due {
+            self.forge
+                .run_snapshot_expiry_for_table(
+                    lease,
+                    &key,
+                    binding,
+                    &ExpiryTaskAuthority {
+                        task: claim.task_id,
+                        attempt,
+                        worker: self.owner,
+                    },
+                    self.forge.core.clock.now()?,
+                    stop,
+                )
+                .await?
+                .settled_evidence
+        } else {
+            None
+        };
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
@@ -5212,9 +5845,7 @@ impl ForgeWorker {
     /// retry is permitted against it, and only after reloading the table and
     /// re-deriving the base and the request against it — replaying the same
     /// replacement against a stale base is what would delete files a concurrent
-    /// writer has already replaced. The deadline is captured once, before the
-    /// first attempt, so a slow first attempt cannot buy the retry more time
-    /// than the original commit budget allowed. Every other failure, including
+    /// writer has already replaced. Every other failure, including
     /// an uncertain one, is returned unchanged so the Prepared operation stays
     /// open for evidence-based recovery.
     ///
@@ -5223,9 +5854,7 @@ impl ForgeWorker {
     /// Returns [`ForgeError::Shutdown`] when the managed attempt drains before
     /// producing a publishable handoff, [`ForgeError::Reconciliation`] when the
     /// core made no progress, when the touched files do not share one time
-    /// partition, or when acceptance becomes unknown,
-    /// [`ForgeError::InvalidConfig`] when the configured Iceberg retry budget
-    /// is not representable as a deadline, and the capacity, audit, fence,
+    /// partition, or when acceptance becomes unknown, and the capacity, audit, fence,
     /// object-store, and catalog failures raised by execution, preparation, and
     /// the commit.
     async fn plan_rewrite_attempt(
@@ -5248,7 +5877,7 @@ impl ForgeWorker {
             evidence,
             plans,
             policy,
-        } = rewrite.plan().await?;
+        } = rewrite.plan(Self::claim_compaction_type(claim)).await?;
         if plans.is_empty() {
             self.acknowledge_compact_table(claim, attempt, &table, lease)
                 .await?;
@@ -5260,10 +5889,6 @@ impl ForgeWorker {
                 table,
                 evidence,
                 policy,
-                deadline: super::publication::RewritePublicationDeadline::new(
-                    self.forge.core.clock.now()?,
-                    self.forge.core.config.iceberg_total_retry_timeout,
-                )?,
             }),
             plans,
         ))
@@ -5610,13 +6235,8 @@ impl ForgeWorker {
             lease,
             TaskProgressEffect::NoOpAcknowledged {
                 snapshot_id: metadata.current_snapshot_id().unwrap_or(0),
-                commit_count: u64::try_from(
-                    metadata
-                        .snapshots()
-                        .count()
-                        .saturating_sub(self.forge.core.config.retain_last),
-                )
-                .unwrap_or(u64::MAX),
+                commit_count: u64::try_from(metadata.snapshots().count().saturating_sub(1))
+                    .unwrap_or(u64::MAX),
             },
         )
         .await
@@ -5888,8 +6508,8 @@ impl ForgeCompactionPlanRunner {
     /// Rewrites this plan and publishes it under its own operation.
     ///
     /// This is the whole of one plan's work, and it consumes the runner so it
-    /// can happen only once. The publication authority, deadline, and retry
-    /// budget are the single-plan ones: a sibling's refusal or failure neither
+    /// can happen only once. The publication authority and retry budget are
+    /// the single-plan ones: a sibling's refusal or failure neither
     /// cancels nor weakens it. The attempt identity stays shared, because it is
     /// what every object this attempt wrote is named for and what the
     /// unsettled-output ledger is keyed by.
@@ -5953,7 +6573,6 @@ impl ForgeCompactionPlanRunner {
             partition_spec_id: metadata.default_partition_spec_id(),
             target_file_size_bytes: self.shared.policy.target_file_size_bytes,
             planned_schema_id: metadata.current_schema_id(),
-            deadline: self.shared.deadline,
         };
         #[cfg(feature = "test-support")]
         self.record_rewrite_evidence_for_test(&context.identity);
@@ -6174,7 +6793,7 @@ impl ForgeCompactionPlanRunner {
     ///
     /// 1. [`Self::acquire_publication_authority`] reloads the table *after* the
     ///    handoff and decides every knowable authority — lease and fence,
-    ///    cancellation, the absolute deadline, branch, base, ancestry, and the
+    ///    cancellation, branch, base, ancestry, and the
     ///    planned schema/spec/sort policy — against that fresh metadata. The
     ///    pre-execution table is evidence, never authority, so a refusal here
     ///    arrives before any Prepared row and before any catalog mutation.
@@ -6183,13 +6802,11 @@ impl ForgeCompactionPlanRunner {
     ///    file-level authorities (selected inputs still live, delete scope), and
     ///    writes the Prepared audit exactly once — on the first pass only —
     ///    naming the inputs and outputs a successor would reconcile.
-    /// 3. The commit is submitted under `context.deadline`, one absolute budget
-    ///    shared by every pass. A definite conflict — the catalog *answered*,
-    ///    so nothing landed — buys a revalidated retry against the reloaded
-    ///    table: the fixed schedule permits three of them, delayed 1s, 2s and
-    ///    4s, and each one only while that same deadline still has budget for
-    ///    the delay plus a call. No retry renews the deadline, and the schedule
-    ///    is deliberately not configurable. Sibling plans of the same attempt
+    /// 3. The commit is submitted, each call bounded by the catalog request
+    ///    timeout. A definite conflict — the catalog *answered*, so nothing
+    ///    landed — buys a revalidated retry against the reloaded table: the
+    ///    fixed schedule permits three of them, delayed 1s, 2s and 4s, and the
+    ///    schedule is deliberately not configurable. Sibling plans of the same attempt
     ///    publish concurrently and independently while this one retries.
     /// 4. A committed submission settles the operation terminally through
     ///    [`Self::settle_committed_rewrite`], which writes the SQL settlement
@@ -6214,8 +6831,7 @@ impl ForgeCompactionPlanRunner {
     /// carrying the possible outputs as unsettled evidence;
     /// [`ForgeError::Shutdown`] or [`ForgeError::ShutdownRetained`] for a
     /// cancelled attempt, returned bare so the event loop can release the claim;
-    /// [`ForgeError::Timeout`] when the absolute deadline expires with a call
-    /// in flight; [`ForgeError::Invariant`] when a revalidated retry has no
+    /// [`ForgeError::Invariant`] when a revalidated retry has no
     /// reloaded table; and the lease, fence, audit, and SQL failures raised by
     /// the authority decision, the Prepared transition, and the terminal
     /// settlement. An audit or settlement failure replaces the originating
@@ -6262,7 +6878,6 @@ impl ForgeCompactionPlanRunner {
                     super::publication::ForgeRewriteCommit {
                         table: &current,
                         request,
-                        deadline: context.deadline,
                     },
                     stop,
                 )
@@ -6306,11 +6921,12 @@ impl ForgeCompactionPlanRunner {
                 );
                 // Every way that wait can fail is definite non-acceptance, so
                 // each closes the operation here.
-                if let Some(stopped) = self.conflict_backoff(context, retries_spent, stop).await? {
+                if let Err(stopped) =
+                    super::publication::RewriteConflictSchedule::wait(retries_spent, stop).await
+                {
                     let reason = match stopped {
                         super::publication::RewriteRetryStop::Cancelled => ForgeError::Shutdown,
-                        super::publication::RewriteRetryStop::Exhausted
-                        | super::publication::RewriteRetryStop::DeadlineTruncated => conflict,
+                        super::publication::RewriteRetryStop::Exhausted => conflict,
                     };
                     return Err(self
                         .abandon_unsubmitted_rewrite(context, Some(request), handoff, reason, lease)
@@ -6384,36 +7000,6 @@ impl ForgeCompactionPlanRunner {
         Err(conflict)
     }
 
-    /// Waits the definite-conflict backoff owed before the next revalidated
-    /// retry.
-    ///
-    /// The wait belongs before the revalidation, not after it: a plan that
-    /// reloaded metadata and then slept would resubmit against a picture of the
-    /// table that is already as old as the backoff.
-    ///
-    /// Returns the stop that ended the wait, or `None` when the retry may
-    /// proceed. Every stop is definite non-acceptance, so the caller closes the
-    /// operation rather than resubmitting.
-    ///
-    /// # Errors
-    ///
-    /// Returns the clock failure the deadline comparison raises.
-    async fn conflict_backoff(
-        &self,
-        context: &RewritePublication<'_>,
-        retries_spent: u32,
-        stop: &CancellationToken,
-    ) -> Result<Option<super::publication::RewriteRetryStop>, ForgeError> {
-        Ok(super::publication::RewriteConflictSchedule::wait(
-            retries_spent,
-            context.deadline,
-            self.forge.core.clock.now()?,
-            stop,
-        )
-        .await
-        .err())
-    }
-
     /// Reports the one authority a fresh publication pass fails, if any.
     ///
     /// Split out so the refusal is decided against `current` — metadata loaded
@@ -6426,8 +7012,8 @@ impl ForgeCompactionPlanRunner {
     /// # Errors
     ///
     /// Returns [`ForgeError::Lease`] or [`ForgeError::Sql`] when the lease
-    /// cannot be renewed, the clock failures the deadline comparison raises,
-    /// and the catalog failures the current-head live-set read raises.
+    /// cannot be renewed, and the catalog failures the current-head live-set
+    /// read raises.
     async fn rewrite_publication_refusal(
         &self,
         context: &RewritePublication<'_>,
@@ -6609,7 +7195,6 @@ impl ForgeCompactionPlanRunner {
             super::publication::RewriteAcceptance::Ambiguous => Ok((
                 acceptance.next_action(
                     retries_spent,
-                    false,
                     super::publication::RewriteCommitDecision::Proceed,
                 ),
                 None,
@@ -6647,11 +7232,7 @@ impl ForgeCompactionPlanRunner {
                         stop,
                     )
                     .await?;
-                let action = acceptance.next_action(
-                    retries_spent,
-                    context.deadline.passed(self.forge.core.clock.now()?),
-                    authority.decide(),
-                );
+                let action = acceptance.next_action(retries_spent, authority.decide());
                 Ok((action, Some(refreshed)))
             }
         }
@@ -6686,8 +7267,7 @@ impl ForgeCompactionPlanRunner {
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the lease cannot be renewed against the
-    /// operator pool, the clock failures the deadline comparison raises, and
-    /// the catalog and manifest failures the current-head live-set read raises.
+    /// operator pool, and the catalog and manifest failures the current-head live-set read raises.
     async fn rewrite_authority(
         &self,
         lease: &mut ForgeLease,
@@ -6710,7 +7290,6 @@ impl ForgeCompactionPlanRunner {
             },
             attempt: super::publication::RewriteAttemptAuthority {
                 cancelled: stop.is_cancelled(),
-                deadline_passed: context.deadline.passed(self.forge.core.clock.now()?),
             },
             table: super::publication::RewriteTableAuthority {
                 base_is_retained: metadata.snapshot_by_id(base_snapshot_id).is_some(),
@@ -6784,17 +7363,13 @@ impl ForgeWorker {
     /// retry is permitted against it, and only after reloading the table and
     /// revalidating the durable demand again — replaying the same plan against
     /// a stale base is what would promote a file set that no longer exists.
-    /// The deadline is captured once, before the first attempt, so a slow
-    /// first attempt cannot buy the retry more time than the original commit
-    /// budget allowed. Every other failure, including an uncertain one, is
+    /// Every other failure, including an uncertain one, is
     /// returned unchanged for evidence-based recovery.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Invariant`] when the persisted parameters do not
-    /// decode into an exact plan, [`ForgeError::InvalidConfig`] when the
-    /// configured Iceberg retry budget is not representable as a deadline, and
-    /// the audit, fence, object-store, and catalog failures raised by
+    /// decode into an exact plan, and the audit, fence, object-store, and catalog failures raised by
     /// preparation, revalidation, and the commit.
     async fn dispatch_scribe_promotion(
         &self,
@@ -6806,7 +7381,10 @@ impl ForgeWorker {
         stop: &CancellationToken,
     ) -> Result<ForgeDispatchResult, ForgeError> {
         let plan = Self::promotion_plan(claim)?;
-        let operation_id = Self::promotion_operation_id(claim);
+        let operation_id = self
+            .forge
+            .promotion_operation_id(binding, claim.task_id)
+            .await?;
         self.forge
             .settle_promotion(
                 lease,
@@ -6820,11 +7398,6 @@ impl ForgeWorker {
                 },
             )
             .await?;
-        let deadline = self.forge.core.clock.now()?
-            + chrono::Duration::from_std(self.forge.core.config.iceberg_total_retry_timeout)
-                .map_err(|_| ForgeError::InvalidConfig {
-                    detail: "Forge Iceberg retry timeout is not representable".to_owned(),
-                })?;
         let mut reloaded: Option<Table> = None;
         let mut retried = false;
         loop {
@@ -6889,7 +7462,7 @@ impl ForgeWorker {
                         .to_owned(),
                 });
             }
-            if retried || self.forge.core.clock.now()? >= deadline {
+            if retried {
                 // A definite conflict is certain non-acceptance, so this
                 // operation is closed here rather than left open for a
                 // successor to reconcile a commit that never happened. No row
@@ -6914,7 +7487,9 @@ impl ForgeWorker {
     /// been read back without this operation's effect, so the commit certainly
     /// did not land. Closing here is what keeps a successor from reconciling a
     /// commit that never happened; `committed_snapshot_id` stays `None`
-    /// because no snapshot was settled.
+    /// because no snapshot was settled. A reset operation is never reopened:
+    /// the task's next attempt resolves the next operation generation through
+    /// [`Forge::promotion_operation_id`] and prepares that one instead.
     ///
     /// # Errors
     ///
@@ -6959,17 +7534,6 @@ impl ForgeWorker {
                     detail: "Forge task parameters must be an object".to_owned(),
                 })?;
         ScribePromotionPlan::from_parameters(parameters)
-    }
-
-    /// Returns the stable operation identity for one promotion task.
-    ///
-    /// The durable task identity *is* the operation identity. A task is
-    /// enqueued once per exact file set and is retried in place rather than
-    /// re-planned, so binding the operation to it makes the identity survive
-    /// every retry, restart, and takeover without a second durable column to
-    /// keep consistent.
-    const fn promotion_operation_id(claim: &ForgeTaskClaim) -> Uuid {
-        claim.task_id
     }
 
     /// Marks one claimed task running and extends its claim lease once.
@@ -7302,17 +7866,24 @@ impl ForgeWorker {
 
     /// Deletes every remaining candidate through the two-phase protocol.
     ///
-    /// Each candidate is handled alone and in order: prepare durably, close
-    /// Postgres, take a fresh reachability proof, submit the delete, then
-    /// settle. Postgres is never open across the object-store call, and the
-    /// frontier advances only for a confirmed deletion or a proven absence, so
-    /// a refusal or an uncertain acceptance retains the exact candidate for
-    /// replay instead of skipping it.
+    /// Each candidate is handled alone and in order: take the table's
+    /// exclusive authority, prepare durably, take a fresh reachability proof,
+    /// submit the delete, surrender the authority, then settle. The authority
+    /// transaction is the one Postgres transaction open across the
+    /// object-store calls, and the lease TTL bounds it: a proof or delete still
+    /// running at the bound is an unknown acceptance, so a hung store cannot
+    /// block Oracle cuts on the table indefinitely. The frontier advances only
+    /// for a confirmed deletion or a proven absence, so a refusal or an
+    /// uncertain acceptance retains the exact candidate for replay instead of
+    /// skipping it.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Reconciliation`] when a candidate is refused or
-    /// its acceptance is unknown, plus protection, path-binding, object-store,
+    /// Returns [`ForgeError::CleanupRetained`] when a candidate is refused or
+    /// its acceptance is unknown and its settlement deliberately left it
+    /// prepared, or when an active table read refuses a later candidate's
+    /// preparation; [`ForgeError::Capacity`] when an active read refuses the
+    /// first preparation; plus protection, path-binding, object-store,
     /// fencing, audit, SQL, or cancellation failures.
     ///
     /// # Cancellation
@@ -7356,12 +7927,33 @@ impl ForgeWorker {
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "expired cleanup cursor named an absent candidate".to_owned(),
                 })?;
+            // The exclusive table authority is held from reader exclusion
+            // through this candidate's delete outcome, including a resumed
+            // preparation, and surrendered before settlement, which takes the
+            // same row on its own connection.
+            let mut authority_conn = self
+                .forge
+                .core
+                .vala
+                .tenant_conn(attempt.tenant)
+                .await
+                .map_err(ForgeError::Sql)?;
+            // No authority means an Oracle read holds the table. That is the
+            // typed refusal: nothing was written, and dropping the
+            // uncommitted authority connection takes no lock with it.
+            let Some(exclusive) = super::table_authority::TableAuthority::new(&mut authority_conn)
+                .exclusive(attempt.tenant, &attempt.binding.table_ref)
+                .await?
+            else {
+                return Err(Self::preparation_refused(index, prepared));
+            };
             if !prepared {
                 require_running(stop)?;
                 lease.require_fence(&self.forge.core.operator_pool).await?;
                 self.tasks
                     .prepare_expired_cleanup_candidate(
                         attempt.tenant,
+                        &exclusive,
                         ExpiredCleanupCandidateRequest {
                             authority: &authority,
                             table: &table,
@@ -7374,8 +7966,11 @@ impl ForgeWorker {
             }
             prepared = false;
             let outcome = self
-                .attempt_cleanup_delete(attempt, lease, index, candidate, stop)
-                .await?;
+                .bounded_cleanup_delete(attempt, lease, &exclusive, index, candidate, stop)
+                .await;
+            drop(exclusive);
+            authority_conn.commit().await.map_err(ForgeError::Sql)?;
+            let outcome = outcome?;
             self.tasks
                 .settle_expired_cleanup_candidate(
                     attempt.tenant,
@@ -7390,11 +7985,9 @@ impl ForgeWorker {
                 .await
                 .map_err(ForgeError::Sql)?;
             if !outcome.advances() {
-                return Err(ForgeError::Reconciliation {
-                    detail: format!(
-                        "expired cleanup retained candidate {index} for replay after {}",
-                        outcome.transition_name()
-                    ),
+                return Err(ForgeError::CleanupRetained {
+                    index,
+                    transition: outcome.transition_name(),
                 });
             }
             index = index.saturating_add(1);
@@ -7411,31 +8004,69 @@ impl ForgeWorker {
         })
     }
 
+    /// Maps an active read refusing one candidate's exclusive authority to its
+    /// outcome.
+    ///
+    /// The refusal precedes the candidate's preparation and delete and wrote
+    /// nothing, so the outcome depends only on what the durable row already
+    /// held. An unprepared index zero is the first preparation: the row is
+    /// still `running` with no evidence, so the claim is released through the
+    /// non-attempt-consuming [`ForgeError::Capacity`] path. A later index, or a
+    /// resumed candidate that is already `prepared`, means the row is already
+    /// `prepared`, which generic retry cannot settle. The exact frontier is
+    /// then retained as [`ForgeError::CleanupRetained`] for prepared-claim
+    /// replay.
+    ///
+    /// Each refusal is counted exactly once here, labelled by that outcome:
+    /// `prepare` for a released first preparation and `replay` for a frontier
+    /// retained for prepared-claim replay.
+    fn preparation_refused(index: u32, prepared: bool) -> ForgeError {
+        if index == 0 && !prepared {
+            ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Prepare);
+            return ForgeError::Capacity {
+                detail: "an Oracle query is still reading this table".to_owned(),
+            };
+        }
+        ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Replay);
+        ForgeError::CleanupRetained {
+            index,
+            transition: "forge.expired_cleanup.preparation_refused",
+        }
+    }
+
     /// Proves one prepared candidate is still safe to delete right now.
     ///
-    /// No Postgres transaction is alive here: the preparation committed and
-    /// closed before this runs, so the object-store call cannot hold a database
-    /// resource. The protection proof exempts exactly this task, attempt,
-    /// cursor index, and candidate, so the drain's own prepared row stops
-    /// protecting the object it is about to delete while every other
+    /// The preparation committed before this runs, so its evidence is durable;
+    /// the only transaction alive is the caller's `exclusive` table authority,
+    /// which keeps every Oracle cut acquisition on this table waiting until
+    /// the delete's outcome is known. The protection proof exempts exactly this task,
+    /// attempt, cursor index, and candidate, so the drain's own prepared row
+    /// stops protecting the object it is about to delete while every other
     /// unresolved preparation still does. `Ok(None)` reports an absence proven
     /// by a fresh stat, the only non-deleting outcome permitted to advance the
     /// cursor; `Ok(Some(path))` is the bound path the caller may delete.
     ///
     /// # Errors
     ///
-    /// Returns clock, protection, object-metadata, refreshed-eligibility,
-    /// path-binding, cancellation, and fencing failures. Every one of them
+    /// Returns authority-coverage, clock, protection, object-metadata,
+    /// refreshed-eligibility, path-binding, cancellation, and fencing
+    /// failures. Every one of them
     /// happens strictly before a deletion is constructed, so the caller settles
     /// them all as [`ExpiredCleanupOutcome::Refused`] rather than propagating.
     async fn prove_cleanup_candidate(
         &self,
         attempt: &CleanupAttempt<'_>,
         lease: &mut ForgeLease,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         index: u32,
         candidate: &ForgeCleanupCandidate,
         stop: &CancellationToken,
     ) -> Result<Option<String>, ForgeError> {
+        super::table_authority::require_covers(
+            exclusive,
+            attempt.tenant,
+            &attempt.binding.table_ref,
+        )?;
         let key = super::compact::ForgeTableKey {
             tenant: attempt.tenant,
             table_ref: attempt.binding.table_ref.clone(),
@@ -7487,14 +8118,52 @@ impl ForgeWorker {
         Ok(Some(path))
     }
 
+    /// Runs [`Self::attempt_cleanup_delete`] within the lease TTL.
+    ///
+    /// An Oracle cut waits on the exclusive authority this candidate holds,
+    /// and the object store has no request timeout of its own, so the lease
+    /// TTL bounds the hold. A proof or delete still running at the bound may
+    /// already have reached the store, so it is an unknown acceptance: the
+    /// candidate stays prepared for exact replay and the caller surrenders the
+    /// authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::attempt_cleanup_delete`] returns; the bound itself
+    /// never fails.
+    async fn bounded_cleanup_delete(
+        &self,
+        attempt: &CleanupAttempt<'_>,
+        lease: &mut ForgeLease,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
+        index: u32,
+        candidate: &ForgeCleanupCandidate,
+        stop: &CancellationToken,
+    ) -> Result<ExpiredCleanupOutcome, ForgeError> {
+        tokio::time::timeout(
+            self.forge.core.config.lease_ttl,
+            self.attempt_cleanup_delete(attempt, lease, exclusive, index, candidate, stop),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(
+                task_id = %attempt.task_id,
+                index,
+                "expired cleanup delete outlived the lease bound; surrendering table authority"
+            );
+            Ok(ExpiredCleanupOutcome::Uncertain)
+        })
+    }
+
     /// Takes one candidate's fresh proof and submits its deletion.
     ///
-    /// No Postgres transaction is alive here: the preparation committed and
-    /// closed before this runs, so the object-store call cannot hold a database
-    /// resource. The protection proof exempts exactly this task, attempt,
-    /// cursor index, and candidate, so the drain's own prepared row stops
-    /// protecting the object it is about to delete while every other
-    /// unresolved preparation still does.
+    /// `exclusive` is the table's live exclusive maintenance authority; the
+    /// borrow lasts until this returns the delete's outcome, so no Oracle read
+    /// can be admitted between the reader exclusion and the delete. The
+    /// protection proof exempts exactly this task, attempt, cursor index, and
+    /// candidate, so the drain's own prepared row stops protecting the object
+    /// it is about to delete while every other unresolved preparation still
+    /// does.
     ///
     /// # Errors
     ///
@@ -7507,12 +8176,13 @@ impl ForgeWorker {
         &self,
         attempt: &CleanupAttempt<'_>,
         lease: &mut ForgeLease,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         index: u32,
         candidate: &ForgeCleanupCandidate,
         stop: &CancellationToken,
     ) -> Result<ExpiredCleanupOutcome, ForgeError> {
         let path = match self
-            .prove_cleanup_candidate(attempt, lease, index, candidate, stop)
+            .prove_cleanup_candidate(attempt, lease, exclusive, index, candidate, stop)
             .await
         {
             Ok(Some(path)) => path,
@@ -7961,7 +8631,7 @@ impl ForgeWorker {
                 || evidence.deleted_candidate_count > 0,
         );
         self.tasks
-            .terminal_and_request_replan(
+            .terminal_success(
                 &mut terminal,
                 ForgeTaskTransition {
                     task_id: claim.task_id,
@@ -8005,7 +8675,7 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .terminal_and_request_replan(&mut terminal, transition, table_ref, progress_effect)
+            .terminal_success(&mut terminal, transition, table_ref, progress_effect)
             .await
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut terminal).await?;
@@ -8063,16 +8733,17 @@ impl ForgeWorker {
         }
         conn.commit().await.map_err(ForgeError::Sql)?;
         Self::record_settled_failure(claim, ForgeFailureClass::DataRefusal);
-        self.request_replan(claim.data_tenant_id, &claim.table_ref)
-            .await?;
         Ok(durable_task_result((ForgeTaskState::Failed, class)).unwrap_or(ForgeTaskResult::Failed))
     }
 
     /// Applies the closed bounded-retry policy at the audited worker boundary.
     ///
     /// Returns the durable result the settling transition committed, or `None`
-    /// when this call committed nothing: a post-effect retention, or a
-    /// shutdown release whose claim had already advanced.
+    /// when this call committed nothing: a post-effect retention, a retained
+    /// prepared cleanup candidate, or a shutdown release whose claim had
+    /// already advanced. Neither retention enters the generic retry, terminal,
+    /// or dispatched-close transitions, whose guards accept only `claimed` or
+    /// `running` rows and would report a `prepared` row as lost ownership.
     ///
     /// # Errors
     /// Returns SQL or audit errors; failure retains the fenced claim for reclaim.
@@ -8082,6 +8753,14 @@ impl ForgeWorker {
         attempt: Uuid,
         error: &ForgeError,
     ) -> Result<Option<ForgeTaskResult>, ForgeError> {
+        if self.is_dispatched(claim.task_id)
+            && !matches!(
+                error,
+                ForgeError::ShutdownRetained | ForgeError::CleanupRetained { .. }
+            )
+        {
+            return self.close_dispatched(claim, attempt, error).await;
+        }
         match error {
             ForgeError::Shutdown => Ok(self
                 .release_cancelled_claim(claim.task_id, attempt)
@@ -8095,7 +8774,10 @@ impl ForgeWorker {
                     Some(ForgeFailureClass::CapacityRefused),
                 )))
             }
-            ForgeError::ShutdownRetained => Ok(None),
+            // A retained cleanup candidate is still `prepared` under this exact
+            // attempt; its settlement already committed the only transition it
+            // may make, and the prepared-task reconciliation route owns replay.
+            ForgeError::ShutdownRetained | ForgeError::CleanupRetained { .. } => Ok(None),
             _ => {
                 let class = error.failure_class();
                 let attempts = self
@@ -8121,6 +8803,57 @@ impl ForgeWorker {
                 Ok(durable_task_result((state, Some(class))))
             }
         }
+    }
+
+    /// Whether `task_id` is a leader-dispatched attempt this worker still runs.
+    fn is_dispatched(&self, task_id: Uuid) -> bool {
+        self.dispatched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&task_id)
+    }
+
+    /// Settles a failed leader-dispatched attempt terminally.
+    ///
+    /// The leader retries a dispatched table after its Failed report, so the
+    /// row must not also become `retryable`: a fair claim would then run the
+    /// same work under a second owner whose result the leader never hears.
+    /// Pre-effect shutdown and capacity refusal close as `cancelled`; every
+    /// other failure closes as `failed` under its class. A row that already
+    /// advanced past the pre-effect guard stays retained and commits nothing.
+    ///
+    /// # Errors
+    /// Returns SQL errors from the guarded close.
+    async fn close_dispatched(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        error: &ForgeError,
+    ) -> Result<Option<ForgeTaskResult>, ForgeError> {
+        let class = match error {
+            ForgeError::Shutdown | ForgeError::Capacity { .. } => None,
+            _ => Some(error.failure_class()),
+        };
+        let closed = self
+            .tasks
+            .close_dispatched(
+                claim.task_id,
+                attempt,
+                self.owner,
+                class.map(ForgeFailureClass::as_str),
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
+        if !closed {
+            return Ok(None);
+        }
+        Ok(match class {
+            Some(class) => {
+                Self::record_settled_failure(claim, class);
+                durable_task_result((ForgeTaskState::Failed, Some(class)))
+            }
+            None => Some(ForgeTaskResult::Cancelled),
+        })
     }
 
     /// Counts one settled durable failure under its exact class.
@@ -8187,11 +8920,11 @@ impl ForgeWorker {
         conn.commit().await.map_err(ForgeError::Sql)
     }
 
-    /// Atomically cancels a superseded claim and creates its successor demand.
+    /// Atomically cancels a superseded claim; the leader's next pass replans.
     ///
     /// # Errors
     ///
-    /// Returns tenant transaction, exact lifecycle, audit, release, demand,
+    /// Returns tenant transaction, exact lifecycle, audit, release,
     /// or commit errors. Rollback preserves the original claim for repair.
     async fn cancel_superseded(&self, claim: &ForgeTaskClaim) -> Result<(), ForgeError> {
         let mut conn = self
@@ -8206,29 +8939,6 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)
-    }
-
-    /// Re-enqueues authoritative planning after one terminal table mutation.
-    ///
-    /// # Errors
-    ///
-    /// Returns SQL errors when the durable periodic demand cannot be advanced.
-    async fn request_replan(
-        &self,
-        data_tenant_id: DataTenantId,
-        table_ref: &ForgeTaskTableIdentity,
-    ) -> Result<(), ForgeError> {
-        let table = ForgeTaskTableIdentity::new(
-            table_ref.catalog.clone(),
-            table_ref.namespace.clone(),
-            table_ref.table.clone(),
-        )
-        .map_err(ForgeError::Sql)?;
-        self.tasks
-            .upsert_periodic(data_tenant_id, &table)
-            .await
-            .map(|_| ())
-            .map_err(ForgeError::Sql)
     }
 
     /// Reports whether the loaded current snapshot is the exact task commit.
@@ -8348,12 +9058,22 @@ fn task_progress_effect(
 ///
 /// Held for the whole `run` body so quarantine, registration failure, a slot
 /// failure, and an unwind all clear readiness on the same path.
-struct ForgeWorkerReadinessGuard(super::ForgeRoleReadiness);
+struct ForgeWorkerReadinessGuard(ForgeRoleReadiness);
 
 impl Drop for ForgeWorkerReadinessGuard {
+    /// Publishes not-ready, which also covers a stop by panic unwind.
     fn drop(&mut self) {
-        self.0.publish(false);
+        publish_worker_readiness(&self.0, false);
     }
+}
+
+/// Publishes the worker's readiness and mirrors the resulting bit to its gauge.
+///
+/// The gauge reads the bit back after publishing rather than echoing `ready`,
+/// so a role the shutdown owner already closed reports not ready.
+fn publish_worker_readiness(readiness: &ForgeRoleReadiness, ready: bool) {
+    readiness.publish(ready);
+    ForgeTelemetry::record_worker_ready(readiness.is_ready());
 }
 
 #[cfg(test)]
@@ -8718,6 +9438,7 @@ mod tests {
             per_tenant_active_cap: 8,
             max_task_parallelism: 2,
             pending_task_parallelism: 8,
+            ..ForgeWorkerConfig::default()
         }
         .validate()
         .expect("a per-tenant cap above running parallelism is legal");
@@ -8728,6 +9449,7 @@ mod tests {
             per_tenant_active_cap: 1,
             max_task_parallelism: 8,
             pending_task_parallelism: 32,
+            ..ForgeWorkerConfig::default()
         }
         .validate()
         .expect("a per-tenant cap below running parallelism is legal");

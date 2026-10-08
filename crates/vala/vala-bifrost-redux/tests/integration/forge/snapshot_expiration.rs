@@ -1,24 +1,35 @@
 //! Tier-2 coverage for the Postgres boundaries that bracket the one pinned
 //! Iceberg snapshot-expiration call.
 //!
-//! Preparation closes and releases its lock before the catalog gate, a definite
+//! Preparation commits before the catalog gate while the table's exclusive
+//! maintenance authority stays held through the commit's outcome, a definite
 //! rejection releases the claims without expiring anything, an unproven outcome
 //! retains every claim under the preparing worker's immutable evidence, and a
 //! takeover settles the same operation under its own live fence while storing
 //! the exact cleanup candidates and deleting nothing.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::Duration as ChronoDuration;
+use iceberg::spec::{ManifestContentType, Operation};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
-use vala_bifrost_redux::forge::{ForgeError, ForgeWorker, ForgeWorkerConfig};
+use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
+use vala_bifrost_redux::forge::{
+    ForgeCompactionOutcome, ForgeError, ForgeHeldTerm, ForgeTableKey, ForgeTableSettings,
+    ForgeWorker, ForgeWorkerConfig,
+};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
+use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use wyrd_spec::DataTenantId;
 
+use super::expired_cleanup::expire_claim;
 use super::support::{
-    CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
-    manual_clock,
+    CountingObjectStore, ForgeTelemetryCheckpoint, PromotionCatalogSeam,
+    PromotionIntegrationFixture, SupervisedPromotion, manual_clock, set_table_properties,
 };
 use vala_bifrost_redux::forge::ForgeClockControl;
 
@@ -31,8 +42,9 @@ struct ExpiryState {
     claims: i64,
     /// Current operation phase, if the projection row exists.
     operation_phase: Option<String>,
-    /// Current planning-demand generation for the table.
-    demand_generation: Option<i64>,
+    /// Whether a committed expiration left a cleanup handoff for the
+    /// leader's next maintenance pass to consume.
+    cleanup_handoff: bool,
 }
 
 /// Reads the complete durable expiration state for one task and table.
@@ -63,21 +75,23 @@ async fn expiry_state(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> E
     .fetch_optional(pool)
     .await
     .expect("operation phase");
-    let demand_generation: Option<i64> = sqlx::query_scalar(
-        "SELECT generation FROM vala.forge_planning_demands \
-         WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3",
+    let identity = vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
+        "wyrd-redux",
+        fixture.binding.table_ref.namespace.as_str(),
+        &fixture.binding.table_ref.name,
     )
-    .bind(fixture.tenant.as_uuid())
-    .bind(fixture.binding.table_ref.namespace.as_str())
-    .bind(&fixture.binding.table_ref.name)
-    .fetch_optional(pool)
-    .await
-    .expect("planning demand");
+    .expect("fixture table identity");
+    let cleanup_handoff =
+        vala_sql::queries::forge_tasks::ForgeTasks::new(fixture.operator_pool.clone())
+            .unconsumed_expiration_handoff(fixture.tenant, &identity)
+            .await
+            .expect("cleanup handoff read")
+            .is_some();
     ExpiryState {
         task_state,
         claims,
         operation_phase,
-        demand_generation,
+        cleanup_handoff,
     }
 }
 
@@ -86,7 +100,7 @@ async fn expiry_state(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> E
 /// # Panics
 ///
 /// Panics when the seeding statement fails.
-async fn seed_running_task(
+pub(super) async fn seed_running_task(
     fixture: &PromotionIntegrationFixture,
     tenant: DataTenantId,
     attempt_id: Uuid,
@@ -209,8 +223,8 @@ async fn prepare_and_abandon_at_the_catalog_gate(
         let early = tokio::time::timeout(std::time::Duration::from_secs(5), parked).await;
         panic!("the expiration never reached the catalog gate: {early:?}");
     }
-    // Postgres closed before the catalog gate: the preparation is fully durable
-    // and holds no lock while the commit is parked.
+    // The preparation committed before the catalog gate, so it is fully
+    // durable while the commit is parked under the held table authority.
     let prepared = expiry_state(fixture, task).await;
     assert_eq!(prepared.task_state, "prepared");
     assert!(prepared.claims > 0, "preparation claims every selection");
@@ -251,7 +265,7 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         supervised,
         control: _control,
         watermark,
-    } = expirable_table("expiry_bracket", false).await;
+    } = expirable_table("expiry_bracket").await;
     let forge = supervised.forge();
 
     reject_releases_every_claim(&fixture, &seam, &store, &forge, watermark).await;
@@ -274,7 +288,10 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         .execute(fixture.operator_pool.pool())
         .await
         .expect("a new owner takes the prepared task over");
-    let before_demand = prepared.demand_generation;
+    assert!(
+        !prepared.cleanup_handoff,
+        "a prepared expiration hands nothing off"
+    );
     let deletes_before = store.deletes();
     let evidence = forge
         .run_snapshot_expiry_for_test(&fixture.binding, settle_task, attempt, settling_worker)
@@ -291,9 +308,8 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("committed"));
     assert!(
-        settled.demand_generation > before_demand,
-        "settlement creates cleanup demand: {before_demand:?} -> {:?}",
-        settled.demand_generation
+        settled.cleanup_handoff,
+        "settlement hands its cleanup to the leader's next pass"
     );
     assert_eq!(
         store.deletes(),
@@ -341,18 +357,13 @@ pub(super) async fn head_watermark(fixture: &PromotionIntegrationFixture) -> (i6
         .expect("a promotion left a current snapshot")
 }
 
-/// Promotes twice and ages the clock so the older snapshot is expirable.
-///
-/// `worker_routed` enables the fixture's `snapshot_expiry_enabled` config so a
-/// maintenance dispatch reaches the expiry owner. It is a fixture capability
-/// flag, not production phase activation, which TASK-055 still owns.
+/// Promotes twice so the older snapshot is replaced and expirable.
 ///
 /// # Panics
 ///
 /// Panics when the fixture cannot promote twice or the table has no head.
-pub(super) async fn expirable_table(name: &str, worker_routed: bool) -> ExpirableTable {
-    let mut fixture = PromotionIntegrationFixture::start(name).await;
-    fixture.config.snapshot_expiry_enabled = worker_routed;
+pub(super) async fn expirable_table(name: &str) -> ExpirableTable {
+    let fixture = PromotionIntegrationFixture::start(name).await;
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
@@ -362,15 +373,15 @@ pub(super) async fn expirable_table(name: &str, worker_routed: bool) -> Expirabl
         Arc::clone(&store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
         clock,
     );
-    // Two real promotion commits leave two snapshots, so the retained head
-    // still leaves an expirable ancestor under `retain_last = 1`.
+    // Two real promotion commits leave two snapshots, so the replaced first
+    // one is expirable as soon as nothing reads the table.
     supervised.run_one_success().await;
     fixture.seal_more(2).await;
     supervised.restart_worker();
     supervised.run_one_success().await;
-    // Every existing snapshot is now older than the retention cutoff. Each
-    // later advance moves the cutoff, so every pass derives its own
-    // deterministic operation identity instead of replaying the previous one.
+    // Snapshot expiry has no age rule; this advance only puts the Forge clock
+    // past the orphan TTL, so a never-published object seeded afterwards is
+    // old enough for orphan collection.
     control
         .advance(ChronoDuration::hours(48))
         .expect("manual clock advance");
@@ -494,7 +505,7 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
         supervised,
         control: _control,
         watermark,
-    } = expirable_table("expiry_lost_response", false).await;
+    } = expirable_table("expiry_lost_response").await;
     let forge = supervised.forge();
 
     let attempt = Uuid::now_v7();
@@ -563,8 +574,8 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("recovered"));
     assert!(
-        settled.demand_generation > retained.demand_generation,
-        "recovered settlement creates cleanup demand"
+        !retained.cleanup_handoff && settled.cleanup_handoff,
+        "recovered settlement hands its cleanup to the leader's next pass"
     );
     assert_eq!(
         store.deletes(),
@@ -636,7 +647,7 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
         supervised,
         control: _control,
         watermark,
-    } = expirable_table("expiry_worker_settles", true).await;
+    } = expirable_table("expiry_worker_settles").await;
     let worker = ForgeWorker::new(
         supervised.forge(),
         ForgeWorkerConfig::default(),
@@ -681,10 +692,9 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
     assert_eq!(settled.task_state, "succeeded");
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("committed"));
-    assert_eq!(
-        settled.demand_generation,
-        Some(before.demand_generation.unwrap_or(0) + 1),
-        "settlement advances planning demand exactly once"
+    assert!(
+        !before.cleanup_handoff && settled.cleanup_handoff,
+        "settlement hands its cleanup to the leader's next pass"
     );
     let owner: Option<Uuid> =
         sqlx::query_scalar("SELECT claimed_by FROM vala.forge_tasks WHERE task_id = $1")
@@ -741,7 +751,7 @@ impl ConcurrentSettlementEvent {
 /// Panics when the attempt does not return success, when a terminal owner is
 /// written twice, or when any durable expiration fact is not the settled one.
 async fn settled_expiration_outranks(event: ConcurrentSettlementEvent) {
-    let table = expirable_table(event.fixture_name(), true).await;
+    let table = expirable_table(event.fixture_name()).await;
     let worker = ForgeWorker::new(
         table.supervised.forge(),
         ForgeWorkerConfig::default(),
@@ -788,10 +798,9 @@ async fn settled_expiration_outranks(event: ConcurrentSettlementEvent) {
         Some("committed"),
         "{event:?}"
     );
-    assert_eq!(
-        settled.demand_generation,
-        Some(before.demand_generation.unwrap_or(0) + 1),
-        "{event:?} advances planning demand exactly once"
+    assert!(
+        !before.cleanup_handoff && settled.cleanup_handoff,
+        "{event:?} hands its cleanup to the leader's next pass"
     );
 
     table.supervised.shutdown().await;
@@ -805,7 +814,7 @@ async fn settled_expiration_outranks(event: ConcurrentSettlementEvent) {
 /// # Panics
 ///
 /// Panics when the staging operator rejects the write.
-async fn seed_never_published_object(fixture: &PromotionIntegrationFixture) -> String {
+pub(super) async fn seed_never_published_object(fixture: &PromotionIntegrationFixture) -> String {
     let path = format!(
         "{}/data/forge/{FORGE_WRITER_RECIPE}/{}-00001-{}.parquet",
         fixture.binding.object_prefix,
@@ -883,7 +892,7 @@ async fn assert_orphan_survives_expiration(
 /// owner cannot delete the same object afterwards.
 #[tokio::test]
 async fn worker_expiration_never_runs_orphan_cleanup() {
-    let fresh = expirable_table("expiry_no_orphan_fresh", true).await;
+    let fresh = expirable_table("expiry_no_orphan_fresh").await;
     let orphan = seed_never_published_object(&fresh.fixture).await;
     let deletes_before = fresh.store.deletes();
     let worker = ForgeWorker::new(
@@ -910,7 +919,7 @@ async fn worker_expiration_never_runs_orphan_cleanup() {
     assert_orphan_survives_expiration(&fresh, &orphan, deletes_before).await;
     fresh.supervised.shutdown().await;
 
-    let recovered = expirable_table("expiry_no_orphan_takeover", true).await;
+    let recovered = expirable_table("expiry_no_orphan_takeover").await;
     let orphan = seed_never_published_object(&recovered.fixture).await;
     let deletes_before = recovered.store.deletes();
     let forge = recovered.supervised.forge();
@@ -954,4 +963,760 @@ async fn worker_expiration_never_runs_orphan_cleanup() {
     assert_orphan_survives_expiration(&recovered, &orphan, deletes_before).await;
 
     recovered.supervised.shutdown().await;
+}
+
+/// Head-snapshot shape the maintenance assertions compare across one pass.
+#[derive(Debug)]
+pub(super) struct HeadShape {
+    /// Current snapshot id.
+    pub(super) snapshot_id: i64,
+    /// Current snapshot operation.
+    pub(super) operation: Operation,
+    /// Data manifests the current snapshot's manifest list names.
+    pub(super) data_manifests: usize,
+    /// Every snapshot the table metadata retains.
+    pub(super) snapshots: BTreeSet<i64>,
+}
+
+/// Reads the fixture table's head shape from the catalog.
+///
+/// # Panics
+///
+/// Panics when the table, its head, or its manifest list cannot be read.
+pub(super) async fn head_shape(fixture: &PromotionIntegrationFixture) -> HeadShape {
+    let table = fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table loads");
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("a promotion left a head");
+    let manifests = table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .expect("the head manifest list loads");
+    HeadShape {
+        snapshot_id: snapshot.snapshot_id(),
+        operation: snapshot.summary().operation.clone(),
+        data_manifests: manifests
+            .entries()
+            .iter()
+            .filter(|manifest| manifest.content == ManifestContentType::Data)
+            .count(),
+        snapshots: table
+            .metadata()
+            .snapshots()
+            .map(|snapshot| snapshot.snapshot_id())
+            .collect(),
+    }
+}
+
+/// Runs one leader maintenance pass and returns the head before and after.
+///
+/// # Panics
+///
+/// Panics when the pass misses its bound or the head cannot be read.
+pub(super) async fn maintain_once(table: &ExpirableTable) -> (HeadShape, HeadShape) {
+    let before = head_shape(&table.fixture).await;
+    table.supervised.maintain_only().await;
+    (before, head_shape(&table.fixture).await)
+}
+
+/// Starts a compaction-enabled table whose only Forge actor is the leader.
+///
+/// The worker is joined before anything is owed, so every compaction the
+/// scenario pulls stays pulled and never starts: the leader's in-memory
+/// track is then the only record of its watermark. The first promotion runs
+/// on the leader's own heartbeat pass.
+///
+/// # Panics
+///
+/// Panics when a fixture dependency fails or the first promotion commits no
+/// snapshot.
+pub(super) async fn leader_only_table(name: &str) -> ExpirableTable {
+    let fixture = PromotionIntegrationFixture::start(name).await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
+    let (clock, control) = manual_clock();
+    let mut supervised = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+        clock,
+    );
+    supervised.join_worker().await;
+    supervised.schedule_only().await;
+    let watermark = head_watermark(&fixture).await;
+    ExpirableTable {
+        fixture,
+        store,
+        seam,
+        supervised,
+        control,
+        watermark,
+    }
+}
+
+/// Promotes one more sealed batch on the leader's pass and returns the new head.
+///
+/// # Panics
+///
+/// Panics when the seal or the pass fails, or the head does not move.
+pub(super) async fn commit_snapshot(table: &ExpirableTable) -> i64 {
+    let (before, _) = head_watermark(&table.fixture).await;
+    table.fixture.seal_more(1).await;
+    table.supervised.schedule_only().await;
+    let (after, _) = head_watermark(&table.fixture).await;
+    assert_ne!(after, before, "the leader pass promoted the sealed batch");
+    after
+}
+
+/// Returns the leader schedule's key for the fixture table.
+///
+/// # Panics
+///
+/// Panics when the fixture identity is invalid.
+fn table_key(fixture: &PromotionIntegrationFixture) -> ForgeTableKey {
+    ForgeTableKey {
+        tenant: fixture.tenant,
+        table: ForgeTaskTableIdentity::new(
+            "wyrd-redux",
+            fixture.binding.table_ref.namespace.as_str(),
+            &fixture.binding.table_ref.name,
+        )
+        .expect("fixture table identity"),
+    }
+}
+
+/// Returns the schedule of the leader term the supervisor holds.
+///
+/// # Panics
+///
+/// Panics when the supervisor's Forge holds no leader term.
+fn leader_term(table: &ExpirableTable) -> Arc<ForgeHeldTerm> {
+    table
+        .supervised
+        .forge()
+        .held_leader_term()
+        .expect("the supervisor's pass holds the leader term")
+}
+
+/// Lists the URIs of one retained snapshot's manifest list and manifests.
+///
+/// # Panics
+///
+/// Panics when the table, the snapshot, or its manifest list cannot be read.
+pub(super) async fn snapshot_files(
+    fixture: &PromotionIntegrationFixture,
+    snapshot_id: i64,
+) -> Vec<String> {
+    let table = fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table loads");
+    let snapshot = table
+        .metadata()
+        .snapshot_by_id(snapshot_id)
+        .expect("the snapshot is retained");
+    let manifests = table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .expect("the manifest list loads");
+    std::iter::once(snapshot.manifest_list().to_owned())
+        .chain(
+            manifests
+                .entries()
+                .iter()
+                .map(|manifest| manifest.manifest_path.clone()),
+        )
+        .collect()
+}
+
+/// Asserts every named Iceberg file still exists in table storage.
+///
+/// # Panics
+///
+/// Panics when a file is missing or its existence cannot be read.
+pub(super) async fn assert_files_exist(
+    fixture: &PromotionIntegrationFixture,
+    files: &[String],
+    why: &str,
+) {
+    let table = fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table loads");
+    for file in files {
+        assert!(
+            table
+                .file_io()
+                .exists(file)
+                .await
+                .expect("file existence reads"),
+            "{why}: {file} was deleted"
+        );
+    }
+}
+
+/// The one expired-cleanup task a committed expiration's handoff became.
+pub(super) struct CleanupTask {
+    /// Durable task identity.
+    pub(super) task_id: Uuid,
+    /// Current `vala.forge_tasks.state`.
+    pub(super) state: String,
+    /// Exact candidate paths the task's immutable plan copied from the handoff.
+    pub(super) paths: Vec<String>,
+}
+
+/// Reads the fixture tenant's newest expired-cleanup task and its candidates.
+///
+/// # Panics
+///
+/// Panics when no cleanup task exists or its plan cannot be read.
+pub(super) async fn latest_cleanup_task(fixture: &PromotionIntegrationFixture) -> CleanupTask {
+    let pool = fixture.operator_pool.pool();
+    let (task_id, state): (Uuid, String) = sqlx::query_as(
+        "SELECT task_id, state FROM vala.forge_tasks \
+         WHERE data_tenant_id = $1 AND strategy = 'expired_cleanup' \
+         ORDER BY task_id DESC LIMIT 1",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .fetch_one(pool)
+    .await
+    .expect("a committed expiration's handoff became one cleanup task");
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT candidate->>'path' FROM vala.forge_tasks, \
+         jsonb_array_elements(plan #> '{parameters,cleanup_candidates}') \
+         WITH ORDINALITY AS c(candidate, ordinal) \
+         WHERE task_id = $1 ORDER BY ordinal",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await
+    .expect("cleanup candidates read");
+    CleanupTask {
+        task_id,
+        state,
+        paths,
+    }
+}
+
+/// Counts the fixture tenant's recorded snapshot-expiry attempts.
+///
+/// # Panics
+///
+/// Panics when the read-only count fails.
+async fn expiry_attempts(fixture: &PromotionIntegrationFixture) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks \
+         WHERE data_tenant_id = $1 AND strategy = 'snapshot_expiry'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("expiry attempt count")
+}
+
+/// An in-flight compaction's watermark clamps expiry; no watermark skips it.
+///
+/// Phase one pulls a compaction through the production pull route after two
+/// commits, so the leader holds its watermark in memory only, then commits
+/// twice more. The maintenance pass must expire the one snapshot older than
+/// the watermark and keep the watermark and everything after it; a further
+/// pass, with nothing outside the held chain left, must not open an expiry
+/// attempt. Phase two runs a manual compaction on a
+/// table the leader has observed no commit for, so the dispatch carries no
+/// watermark at all, and the pass must expire nothing.
+///
+/// # Panics
+///
+/// Panics when a protected snapshot is expired, an unprotected one survives,
+/// or the leader routes misbehave.
+async fn assert_compaction_watermark_blocks_expiry(table: &ExpirableTable) {
+    let forge = table.supervised.forge();
+    let key = table_key(&table.fixture);
+    let first = table.watermark.0;
+    let held = commit_snapshot(table).await;
+    let dispatch = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(dispatch.len(), 1, "the promoted table is due: {dispatch:?}");
+    assert_eq!(
+        leader_term(table).schedule().processing_watermark(&key),
+        Some(Some(held)),
+        "the pull captured the latest observed snapshot"
+    );
+    let later = [commit_snapshot(table).await, commit_snapshot(table).await];
+    let held_files = snapshot_files(&table.fixture, held).await;
+    let (_, after) = maintain_once(table).await;
+    assert_eq!(
+        after.snapshots,
+        BTreeSet::from([held, later[0], later[1]]),
+        "expiry removes only what precedes the in-flight watermark {held} (first was {first})"
+    );
+    assert_files_exist(&table.fixture, &held_files, "the watermark snapshot").await;
+    // With the watermark now the oldest snapshot, the held chain covers every
+    // snapshot, so the leader records no expiry attempt at all.
+    let attempts = expiry_attempts(&table.fixture).await;
+    let (before, after) = maintain_once(table).await;
+    assert_eq!(after.snapshots, before.snapshots);
+    assert_eq!(
+        expiry_attempts(&table.fixture).await,
+        attempts,
+        "a held chain covering every snapshot opens no expiry attempt"
+    );
+    forge
+        .report_compaction(&dispatch[0], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+
+    // A table whose compaction is disabled has no track, so a manual run
+    // creates one that has observed no snapshot. The request carries the
+    // table's declared opt-out, so its track is temporary.
+    set_table_properties(
+        &table.fixture.catalog,
+        &table.fixture.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
+    commit_snapshot(table).await;
+    assert!(
+        leader_term(table).schedule().track_for_test(&key).is_none(),
+        "a disabled table's idle track is dropped"
+    );
+    leader_term(table).schedule().request_compaction(
+        &key,
+        &ForgeTableSettings {
+            compaction_enabled: false,
+            ..ForgeTableSettings::default()
+        },
+        forge.clock_for_test().now().expect("Forge clock reads"),
+    );
+    let manual = forge.pull_compaction(4).await.expect("leader pull");
+    assert_eq!(manual.len(), 1, "the manual run is due: {manual:?}");
+    assert_eq!(
+        leader_term(table).schedule().processing_watermark(&key),
+        Some(None),
+        "a manual run on an unobserved table holds no watermark"
+    );
+    let (before, after) = maintain_once(table).await;
+    assert_eq!(
+        after.snapshots, before.snapshots,
+        "a compaction without an observed snapshot skips expiry entirely"
+    );
+    forge
+        .report_compaction(&manual[0], ForgeCompactionOutcome::Succeeded)
+        .await
+        .expect("leader report");
+    assert!(
+        leader_term(table).schedule().track_for_test(&key).is_none(),
+        "the manual run's temporary track is removed after its report"
+    );
+}
+
+/// A cleanup that fails after expiry commits is retried for exactly its files.
+///
+/// The first delete's acknowledgement is lost, so the catalog expiry commits
+/// while its cleanup task retains that candidate, prepared, for replay under
+/// its claim. Once the claim lapses, the production worker loop reclaims the
+/// task and must drain exactly the handed-off candidates: the replayed one
+/// advances on a stat that proves it absent, every other one is deleted once,
+/// and the retained head's files are untouched.
+///
+/// # Panics
+///
+/// Panics when the expiry does not commit, the failed cleanup advances, the
+/// retry deletes more or fewer objects than were handed off, or a retained
+/// file is removed.
+async fn assert_failed_cleanup_retries_exactly(table: &mut ExpirableTable) {
+    let head = commit_snapshot(table).await;
+    let head_files = snapshot_files(&table.fixture, head).await;
+    table.store.fail_next_deletes(1);
+    let deletes_before = table.store.deletes();
+    let (_, after) = maintain_once(table).await;
+    assert_eq!(
+        after.snapshots,
+        BTreeSet::from([head]),
+        "the catalog expiry commits although its cleanup fails"
+    );
+    let failed = latest_cleanup_task(&table.fixture).await;
+    assert_eq!(
+        failed.state, "prepared",
+        "an unknown delete acceptance retains its candidate for replay"
+    );
+    assert!(
+        !failed.paths.is_empty(),
+        "expiry handed off the files it freed"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before + 1,
+        "the failed cleanup stopped at its first delete"
+    );
+    assert!(
+        !object_exists(&table.fixture, &failed.paths[0]).await,
+        "the delete whose acknowledgement was lost still took effect"
+    );
+    for path in &failed.paths[1..] {
+        assert!(
+            object_exists(&table.fixture, path).await,
+            "nothing after the uncertain candidate was deleted: {path}"
+        );
+    }
+
+    expire_claim(table.fixture.operator_pool.pool(), failed.task_id).await;
+    let retry_before = table.store.deletes();
+    table.supervised.restart_worker();
+    table.supervised.settle_one_success().await;
+    let retried = latest_cleanup_task(&table.fixture).await;
+    assert_eq!(retried.task_id, failed.task_id, "the same task is retried");
+    assert_eq!(retried.state, "succeeded");
+    for path in &retried.paths {
+        assert!(
+            !object_exists(&table.fixture, path).await,
+            "the retry deleted handed-off {path}"
+        );
+    }
+    assert_eq!(
+        table.store.deletes() - retry_before,
+        retried.paths.len() - 1,
+        "the replayed candidate is proven absent, and each other one is deleted once"
+    );
+    assert_eq!(
+        table.store.deletes() - deletes_before,
+        retried.paths.len(),
+        "the failed pass and its retry delete each handed-off file exactly once"
+    );
+    assert_files_exist(&table.fixture, &head_files, "the retained head").await;
+}
+
+/// Leader maintenance never expires what an active watermark protects.
+///
+/// Drives the production leader maintenance pass, never a seeded task, over
+/// one table: an in-flight compaction's watermark holds its chain and a
+/// watermark-less one skips expiry; and a cleanup that fails after its expiry
+/// committed is
+/// retried, once its claim lapses, for exactly the handed-off files.
+///
+/// # Panics
+///
+/// Panics when any phase's retained snapshots, files, or deletes differ.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn active_watermark_blocks_expiry_and_failed_cleanup_retries_exactly() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let mut table = leader_only_table("expiry_protection").await;
+    assert_compaction_watermark_blocks_expiry(&table).await;
+    assert_failed_cleanup_retries_exactly(&mut table).await;
+    table.supervised.shutdown().await;
+}
+
+/// Which catalog outcome a lease-bounded expiration leaves unknown.
+#[derive(Clone, Copy, Debug)]
+enum UnknownExpiryOutcome {
+    /// The catalog accepted the expiration; the pass is cut off by the Forge
+    /// lease bound while it is held after the accepted response.
+    Accepted,
+    /// The submitted commit never reaches the catalog; the pass is cut off by
+    /// the commit timeout while the commit is parked unlanded.
+    Rejected,
+}
+
+/// Acquires and releases one production Oracle cut, returning its pointer.
+///
+/// # Errors
+///
+/// Returns the catalog error of a refused acquisition unchanged, so a scenario
+/// can assert its public mapping.
+///
+/// # Panics
+///
+/// Panics when an hour-long deadline is already exhausted, the acquisition
+/// returns no table, or the release fails.
+async fn cut_pointer(
+    fixture: &PromotionIntegrationFixture,
+    tenant: DataTenantId,
+    table: &TableRef,
+) -> Result<String, BifrostCatalogError> {
+    let query_id = Uuid::now_v7();
+    let cut = fixture
+        .catalog
+        .acquire_active_cut(
+            tenant,
+            ActiveReadOwner {
+                query_id,
+                node_id: Uuid::now_v7(),
+                fencing_token: 1,
+            },
+            std::time::Instant::now() + std::time::Duration::from_hours(1),
+            std::slice::from_ref(table),
+        )
+        .await?
+        .expect("an hour remains before the deadline")
+        .pop()
+        .expect("one acquired table");
+    fixture
+        .catalog
+        .release_active_reads(tenant, query_id)
+        .await
+        .expect("the probe read releases");
+    Ok(cut.metadata_location)
+}
+
+/// Reads the fixture table's current catalog pointer from the real catalog.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or has no metadata location.
+async fn catalog_pointer(fixture: &PromotionIntegrationFixture) -> String {
+    fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table loads")
+        .metadata_location()
+        .expect("a committed table has a metadata location")
+        .to_owned()
+}
+
+/// Proves unresolved claims bar cuts of their own table and nothing else.
+///
+/// The claimed table's cut fails with the stable visibility-unavailable error
+/// and records no active read, while the same tenant's `ordinary` table and
+/// `other_tenant`'s same-named table both acquire.
+///
+/// # Panics
+///
+/// Panics when the claimed table acquires or maps to another error, a refused
+/// cut leaves an active read, or either unrelated table is refused.
+async fn assert_only_claimed_table_barred(
+    fixture: &PromotionIntegrationFixture,
+    barred: &TableRef,
+    ordinary: &TableRef,
+    other_tenant: DataTenantId,
+) {
+    let refused = cut_pointer(fixture, fixture.tenant, barred)
+        .await
+        .expect_err("an unresolved expiration refuses the cut");
+    assert!(
+        matches!(refused, BifrostCatalogError::UnresolvedExpiry(_)),
+        "the refusal names the unresolved expiration: {refused:?}"
+    );
+    assert_eq!(
+        refused.into_public().code(),
+        "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE"
+    );
+    let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.oracle_active_table_reads")
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("active read count");
+    assert_eq!(recorded, 0, "a refused cut records no active read");
+    cut_pointer(fixture, fixture.tenant, ordinary)
+        .await
+        .expect("the same tenant's ordinary table still acquires");
+    cut_pointer(fixture, other_tenant, barred)
+        .await
+        .expect("another tenant's same-named table still acquires");
+}
+
+/// Lapses the preparing worker's lease and reconciles the task as a new owner
+/// of the short-lease `forge`.
+///
+/// A rejected outcome stays pending until the uncertainty bound passes on the
+/// Forge clock, so the clock is advanced past it first; an accepted outcome is
+/// recovered at once from the advanced metadata.
+///
+/// # Panics
+///
+/// Panics when the takeover statements fail or reconciliation does not settle
+/// the prepared task.
+async fn take_over_and_reconcile(
+    table: &ExpirableTable,
+    forge: &vala_bifrost_redux::forge::Forge,
+    outcome: UnknownExpiryOutcome,
+    task: Uuid,
+    attempt: Uuid,
+) {
+    let fixture = &table.fixture;
+    sqlx::query("UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 hour'")
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("the preparing worker's lease lapses");
+    let settling_worker = Uuid::now_v7();
+    sqlx::query("UPDATE vala.forge_tasks SET claimed_by = $2 WHERE task_id = $1")
+        .bind(task)
+        .bind(settling_worker)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("a new owner takes the prepared task over");
+    if matches!(outcome, UnknownExpiryOutcome::Rejected) {
+        let bound = ChronoDuration::from_std(fixture.config.uncertainty_bound)
+            .expect("bounded uncertainty window");
+        table
+            .control
+            .advance(bound + ChronoDuration::seconds(1))
+            .expect("manual clock advance");
+    }
+    forge
+        .run_snapshot_expiry_for_test(&fixture.binding, task, attempt, settling_worker)
+        .await
+        .expect("takeover reconciles the unknown outcome")
+        .expect("reconciliation settles the prepared task");
+}
+
+/// Proves an unknown expiration outcome bars cuts of only its own table until
+/// reconciliation establishes the stable pointer.
+///
+/// A short-lease Forge leaves one expiration's acceptance unknown, either cut
+/// off by the lease bound after the catalog accepted it or by the commit
+/// timeout before the parked commit landed. The prepared claims survive and
+/// the table authority is free, yet a cut of that table fails with the stable
+/// visibility-unavailable error and records no active read. The same tenant's
+/// ordinary table and another tenant's same-named table still acquire. Once
+/// the preparing worker's lease lapses, takeover reconciliation settles the
+/// claims and the next cut returns the pointer the catalog now holds.
+///
+/// # Panics
+///
+/// Panics when the pass does not end as a retained reconciliation, a cut of
+/// the barred table succeeds or maps to another error, an unrelated table is
+/// refused, reconciliation does not settle the claims, or the later cut does
+/// not observe the catalog's established pointer.
+async fn unknown_expiry_outcome_bars_cuts_until_reconciled(outcome: UnknownExpiryOutcome) {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let name = match outcome {
+        UnknownExpiryOutcome::Accepted => "expiry_unknown_accepted",
+        UnknownExpiryOutcome::Rejected => "expiry_unknown_rejected",
+    };
+    let mut table = expirable_table(name).await;
+    let lease_ttl = std::time::Duration::from_secs(6);
+    table.fixture.config = vala_bifrost_redux::forge::ForgeConfig {
+        lease_ttl,
+        iceberg_total_retry_timeout: std::time::Duration::from_secs(2),
+        catalog_request_timeout: std::time::Duration::from_secs(2),
+        uncertainty_margin: std::time::Duration::from_secs(1),
+        ..table.fixture.config.clone()
+    };
+    let forge = table.fixture.build_forge_for_test(
+        Arc::clone(&table.seam) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&table.store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+        table.supervised.forge().clock_for_test(),
+        vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
+        vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(Uuid::now_v7()),
+    );
+    let fixture = &table.fixture;
+    let barred = fixture.binding.table_ref.clone();
+    let ordinary = TableRef::new(BifrostNamespace::Bifrost, "ordinary");
+    fixture.register_and_seal_table("ordinary", 0).await;
+    let other_tenant = fixture.seed_tenant(&format!("{name}-other")).await;
+    fixture
+        .register_and_seal_table_for(other_tenant, &barred.name, 0)
+        .await;
+    let replaced = cut_pointer(fixture, fixture.tenant, &barred)
+        .await
+        .expect("an unclaimed table acquires");
+    let snapshots_before = retained_snapshots(fixture).await;
+
+    let (attempt, preparing_worker) = (Uuid::now_v7(), Uuid::now_v7());
+    let task = seed_running_task(
+        fixture,
+        fixture.tenant,
+        attempt,
+        preparing_worker,
+        table.watermark,
+        "33",
+    )
+    .await;
+    match outcome {
+        UnknownExpiryOutcome::Accepted => forge.expiry_controls_for_test().arm_expiry_accepted(),
+        UnknownExpiryOutcome::Rejected => table.seam.park_next_commit(),
+    }
+    let error = tokio::time::timeout(
+        lease_ttl * 4,
+        forge.run_snapshot_expiry_for_test(&fixture.binding, task, attempt, preparing_worker),
+    )
+    .await
+    .expect("the exclusive scope ends at the lease bound")
+    .expect_err("an unknown acceptance does not settle the expiration");
+    let ForgeError::Reconciliation { detail } = &error else {
+        panic!("an unknown acceptance is left to reconciliation: {error:?}");
+    };
+    match outcome {
+        UnknownExpiryOutcome::Accepted => {
+            assert!(
+                detail.contains("lease bound"),
+                "the lease bound ended the accepted pass: {detail}"
+            );
+            assert!(
+                retained_snapshots(fixture).await < snapshots_before,
+                "the catalog accepted the expiration"
+            );
+        }
+        UnknownExpiryOutcome::Rejected => {
+            table.seam.wait_for_parked_commit_drop().await;
+            assert_eq!(
+                retained_snapshots(fixture).await,
+                snapshots_before,
+                "the parked commit never landed"
+            );
+        }
+    }
+    assert_uncertain_preparation_retained(fixture, task, attempt, preparing_worker).await;
+
+    assert_only_claimed_table_barred(fixture, &barred, &ordinary, other_tenant).await;
+    take_over_and_reconcile(&table, &forge, outcome, task, attempt).await;
+    let fixture = &table.fixture;
+    let settled = expiry_state(fixture, task).await;
+    assert_eq!(settled.task_state, "succeeded");
+    assert_eq!(settled.claims, 0, "reconciliation resolves every claim");
+    assert!(
+        retained_snapshots(fixture).await < snapshots_before,
+        "the established pointer carries the expiration"
+    );
+    let established = cut_pointer(fixture, fixture.tenant, &barred)
+        .await
+        .expect("a reconciled table acquires");
+    assert_ne!(established, replaced);
+    assert_eq!(
+        established,
+        catalog_pointer(fixture).await,
+        "the cut names the pointer reconciliation established"
+    );
+    table.supervised.shutdown().await;
+}
+
+/// Proves an accepted expiration cut off at the lease bound bars cuts until
+/// reconciliation recovers it.
+///
+/// # Panics
+///
+/// Panics when [`unknown_expiry_outcome_bars_cuts_until_reconciled`] does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accepted_expiry_past_the_lease_bound_bars_cuts_until_reconciled() {
+    Box::pin(unknown_expiry_outcome_bars_cuts_until_reconciled(
+        UnknownExpiryOutcome::Accepted,
+    ))
+    .await;
+}
+
+/// Proves an unlanded expiration of unknown outcome bars cuts until
+/// reconciliation commits it.
+///
+/// # Panics
+///
+/// Panics when [`unknown_expiry_outcome_bars_cuts_until_reconciled`] does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_expiry_of_unknown_outcome_bars_cuts_until_reconciled() {
+    Box::pin(unknown_expiry_outcome_bars_cuts_until_reconciled(
+        UnknownExpiryOutcome::Rejected,
+    ))
+    .await;
 }

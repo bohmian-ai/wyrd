@@ -96,8 +96,7 @@ impl ScheduledQueryCaller {
     ///
     /// Returns `RunningQueryControlUnavailable` when this process has no query
     /// controls, the stable pre-stream query error (an object denial is
-    /// audited first, or replaced by audit-unavailable when that append
-    /// fails), a frame or Arrow decode
+    /// staged for audit first), a frame or Arrow decode
     /// error, [`WyrdError`] for a failed terminal, unconfirmed lifecycle routing,
     /// and a protocol error when
     /// the stream ended without a terminal frame.
@@ -186,8 +185,7 @@ impl ScheduledQueryCaller {
     /// # Errors
     ///
     /// Returns the stable pre-stream admission or query error. A bound-context
-    /// object denial is audited first, or replaced by audit-unavailable when
-    /// that append fails.
+    /// object denial is staged for audit first.
     async fn dispatch(&self, request: BifrostQueryRequest) -> Result<OracleQueryStream, WyrdError> {
         match &self.caller {
             Some(caller) => {
@@ -202,23 +200,22 @@ impl ScheduledQueryCaller {
             {
                 Ok(stream) => Ok(stream),
                 Err(denial @ BifrostError::QueryForbidden) => {
-                    Err(self.record_object_denial(denial.into()).await)
+                    Err(self.record_object_denial(denial.into()))
                 }
                 Err(error) => Err(error.into()),
             },
         }
     }
 
-    /// Durably records Oracle's object denial of this caller's statement.
+    /// Stages Oracle's object denial of this caller's statement.
     ///
     /// Oracle refuses a statement over any resolved table the bound
     /// principal is not granted. That refusal is an authorization decision, so
     /// it is audited exactly as the public query entry audits it: one `denied`
     /// row for the bound principal through [`QueryAuthority`].
     ///
-    /// Returns audit-unavailable when the append fails, and otherwise
-    /// `denial` unchanged.
-    async fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
+    /// Returns `denial` unchanged.
+    fn record_object_denial(&self, denial: WyrdError) -> WyrdError {
         let caller = Caller {
             data_tenant_id: self.context.data_tenant_id,
             principal: self.context.principal.clone(),
@@ -227,7 +224,6 @@ impl ScheduledQueryCaller {
         };
         QueryAuthority::new(&self.state, &caller, "vala.query.sync", "vala.query")
             .record_object_denial(denial)
-            .await
     }
 
     /// Consumes one dispatched stream to a valid terminal followed by clean EOF.
@@ -328,7 +324,7 @@ impl ScheduledQueryCaller {
                     }
                     decoder
                         .accept_eos(&terminal.arrow_ipc_eos)
-                        .map_err(|error| super::service::arrow_decode_error(&error))?;
+                        .map_err(super::service::arrow_decode_error)?;
                     *observed = Some(terminal.clone());
                     settled = Some(ScheduledQueryOutcome { rows, terminal });
                 }
@@ -598,20 +594,6 @@ mod tests {
     /// cancellation yields an outcome.
     #[tokio::test]
     async fn scheduled_sink_folds_batches_and_refusal_ends_the_stream() {
-        let (prefix, fragments, eos) = split_ipc_stream(&[&[1, 2], &[3]]);
-        let frames = || {
-            let mut frames = vec![QueryStreamFrame::Schema(QuerySchemaFrame {
-                schema_fingerprint: "test".to_owned(),
-                arrow_ipc_schema: prefix.clone(),
-            })];
-            frames.extend(fragments.iter().map(|fragment| {
-                QueryStreamFrame::Batch(QueryBatchFrame {
-                    arrow_ipc_batch: fragment.clone(),
-                })
-            }));
-            frames.push(QueryStreamFrame::Terminal(success_terminal(3, eos.clone())));
-            futures_util::stream::iter(frames.into_iter().map(Ok::<_, BifrostError>))
-        };
         /// Consumes `stream` into `sink` under `cancellation` and a live deadline.
         async fn consume<S, F>(
             mut stream: S,
@@ -631,6 +613,20 @@ mod tests {
             )
             .await
         }
+        let (prefix, fragments, eos) = split_ipc_stream(&[&[1, 2], &[3]]);
+        let frames = || {
+            let mut frames = vec![QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "test".to_owned(),
+                arrow_ipc_schema: prefix.clone(),
+            })];
+            frames.extend(fragments.iter().map(|fragment| {
+                QueryStreamFrame::Batch(QueryBatchFrame {
+                    arrow_ipc_batch: fragment.clone(),
+                })
+            }));
+            frames.push(QueryStreamFrame::Terminal(success_terminal(3, eos.clone())));
+            futures_util::stream::iter(frames.into_iter().map(Ok::<_, BifrostError>))
+        };
 
         let mut seen = Vec::new();
         let outcome = consume(frames(), CancellationToken::new(), |batch: RecordBatch| {

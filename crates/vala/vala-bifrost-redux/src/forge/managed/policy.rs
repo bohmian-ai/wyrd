@@ -12,18 +12,45 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::spec::{TableMetadata, TableProperties};
+use iceberg::table::Table;
+use iceberg_compaction_core::compaction::{CompactionPlan, CompactionPlanner};
 use iceberg_compaction_core::config::{
     CompactionConfig, CompactionExecutionConfig, CompactionExecutionConfigBuilder,
-    CompactionPlanningConfig, WyrdIdentityAwareConfig,
+    CompactionPlanningConfig, FileGroupScope, FilesWithDeletesConfig, FullCompactionConfig,
+    GroupFilters, GroupingStrategy, SmallFilesConfig,
 };
-use iceberg_compaction_core::managed::{
-    OpenPartitionPolicy, WriterRecipeResolver, WyrdSelectionPolicy,
-};
+use iceberg_compaction_core::file_selection::{FileSelector, PlanStrategy};
+use iceberg_compaction_core::managed::{SelectedFile, SelectionReport, SelectionStrategyKind};
 use wyrd_spec::DataTenantId;
 
 use crate::catalog::layout::{FORGE_WRITER_RECIPE, forge_data_location};
 use crate::forge::compact::ForgeConfig;
 use crate::forge::error::ForgeError;
+use crate::forge::settings::ForgeCompactionType;
+
+/// `RisingWave`'s compactor runner `max_parallelism` default.
+const RUNNER_MAX_PARALLELISM: usize = 4;
+
+/// `RisingWave`'s compactor runner `min_size_per_partition` default (1 GiB).
+const RUNNER_MIN_SIZE_PER_PARTITION: u64 = 1024 * 1024 * 1024;
+
+/// `RisingWave`'s compactor runner `max_file_count_per_partition` default.
+const RUNNER_MAX_FILE_COUNT_PER_PARTITION: usize = 32;
+
+/// `RisingWave`'s Iceberg sink `delete_files_count_threshold` default.
+const DELETE_FILES_COUNT_THRESHOLD: usize = 256;
+
+/// Minimum files in one explicit `SmallFiles` group.
+///
+/// Two, so a lone small file in its partition waits for a partner rather than
+/// being rewritten alone, which would only copy it.
+const SMALL_FILES_MIN_GROUP_FILE_COUNT: usize = 2;
+
+/// Upstream Auto's minimum small-file count for a small-file plan.
+const AUTO_MIN_SMALL_FILES: usize = 5;
+
+/// Upstream Auto's minimum delete-heavy file count for a delete plan.
+const AUTO_MIN_DELETE_HEAVY_FILES: usize = 1;
 
 /// Iceberg property naming the encoded row-group target for Parquet writers.
 ///
@@ -55,9 +82,10 @@ const OVERSIZED_CEILING_PERCENT: u64 = 180;
 /// Registration cannot see a worker's operator limits, so it checks only what
 /// holds under every deployment: the target is representable on this platform,
 /// its oversized ceiling does not overflow, and it is at least the default
-/// row-group target a newly registered table writes with, which also places it
-/// above the default small-file threshold. [`ForgeTablePolicy::extract`] re-checks the
-/// full table and worker combination at planning.
+/// row-group target a newly registered table writes with. The small-file
+/// threshold is a share of the target, so it sits below any admitted target.
+/// [`ForgeTablePolicy::extract`] re-checks the full table and worker
+/// combination at planning.
 #[must_use]
 pub(crate) fn registrable_target_file_size_bytes(bytes: u64) -> bool {
     bytes >= ROW_GROUP_TARGET_DEFAULT
@@ -69,7 +97,8 @@ pub(crate) fn registrable_target_file_size_bytes(bytes: u64) -> bool {
 ///
 /// Every field is derived, never defaulted at the point of use: the identity
 /// triple and both size targets come from the table, the small-file threshold
-/// and plan budget come from validated operator limits, and the data location
+/// is the operator's percentage of the table's resolved file target, and the
+/// data location
 /// and writer recipe come from the registered Forge path layout. Construction
 /// is the only place these can disagree, so construction is where they are
 /// checked.
@@ -79,7 +108,8 @@ pub struct ForgeTablePolicy {
     pub(crate) target_file_size_bytes: u64,
     /// Independent encoded row-group target applied to the Parquet writer.
     pub(crate) row_group_target_bytes: u64,
-    /// Size at or below which a live file is small enough to be reselected.
+    /// Size below which a live file is a small-file candidate: the operator's
+    /// percentage of [`Self::target_file_size_bytes`], rounded down.
     pub(crate) small_file_threshold_bytes: u64,
     /// Current schema a produced file must carry to be considered settled.
     pub(crate) schema_id: i32,
@@ -100,6 +130,9 @@ impl ForgeTablePolicy {
     /// when declared, otherwise the deployment default in
     /// [`ForgeConfig::default_target_file_size_bytes`]. It is resolved here
     /// once; execution, publication, and audit all read this policy's value.
+    /// The small-file threshold is
+    /// [`ForgeConfig::small_file_threshold_percent`] of that resolved target,
+    /// so it moves with a declared target.
     ///
     /// There is no admitted-memory term. Execution charges the shared Bifrost
     /// memory root as it grows, so a row-group target is never checked
@@ -144,7 +177,10 @@ impl ForgeTablePolicy {
         let policy = Self {
             target_file_size_bytes,
             row_group_target_bytes,
-            small_file_threshold_bytes: config.small_file_threshold_bytes,
+            small_file_threshold_bytes: percent_of(
+                target_file_size_bytes,
+                config.small_file_threshold_percent,
+            ),
             schema_id: metadata.current_schema_id(),
             partition_spec_id: metadata.default_partition_spec_id(),
             sort_order_id: i32::try_from(metadata.default_sort_order().order_id).map_err(|_| {
@@ -213,40 +249,110 @@ impl ForgeTablePolicy {
         Ok(())
     }
 
-    /// Projects this policy onto the core's canonical selection policy.
+    /// Builds `RisingWave`'s planning configuration for one task type.
     ///
-    /// Both size terms cross unchanged: the core derives its own oversized
-    /// ceiling from the target, so clamping or rounding here would move the
-    /// selection boundary away from the geometry the table declared.
+    /// Mirrors `build_task_planning_config`
+    /// (`iceberg_compactor_runner.rs:477-590` at e23ddf95) with its runner
+    /// defaults: parallelism four, 1 GiB minimum per partition, 32 files per
+    /// partition, heuristic output parallelism off, single grouping, and a
+    /// delete-file threshold of 256. The file target and small-file threshold
+    /// are this policy's. Copy-on-write plans `Full` over the whole table, as
+    /// `RisingWave` does for a copy-on-write sink.
     ///
-    /// Open-partition suppression is left off deliberately. Bifrost's demand
-    /// side decides *which* tables are worth an attempt; the selection policy's
-    /// job is only to describe what a settled file looks like, and a
-    /// still-filling partition that is genuinely fragmented is not exempt from
-    /// that. Repeated no-op churn is prevented by the semantic-debt refusal,
-    /// not by hiding partitions from the selector.
-    pub(crate) fn to_selection_policy(&self) -> WyrdSelectionPolicy {
-        WyrdSelectionPolicy {
-            schema_id: self.schema_id,
-            partition_spec_id: self.partition_spec_id,
-            sort_order_id: self.sort_order_id,
-            writer_recipe: self.writer_recipe.clone(),
-            recipe_resolver: WriterRecipeResolver::forge(),
-            target_file_size_bytes: self.target_file_size_bytes,
-            small_file_threshold_bytes: self.small_file_threshold_bytes,
-            open_partitions: OpenPartitionPolicy::AllClosed,
-            emit_open_partition_tail: false,
-            event_time_field_id: None,
+    /// Forge departs from the runner in one place: an explicit `SmallFiles`
+    /// task keeps only groups of at least [`SMALL_FILES_MIN_GROUP_FILE_COUNT`]
+    /// files, so a lone staged file waits for a partner instead of being
+    /// rewritten into a copy of itself. `Auto`'s small-file candidate keeps the
+    /// upstream configuration.
+    #[must_use]
+    pub(crate) fn planning(
+        &self,
+        compaction_type: ForgeCompactionType,
+        copy_on_write: bool,
+    ) -> ForgeTaskPlanning {
+        let compaction_type = if copy_on_write {
+            ForgeCompactionType::Full
+        } else {
+            compaction_type
+        };
+        match compaction_type {
+            ForgeCompactionType::Full => {
+                ForgeTaskPlanning::Explicit(CompactionPlanningConfig::Full(FullCompactionConfig {
+                    target_file_size_bytes: self.target_file_size_bytes,
+                    min_size_per_partition: RUNNER_MIN_SIZE_PER_PARTITION,
+                    max_file_count_per_partition: RUNNER_MAX_FILE_COUNT_PER_PARTITION,
+                    max_input_parallelism: RUNNER_MAX_PARALLELISM,
+                    max_output_parallelism: RUNNER_MAX_PARALLELISM,
+                    enable_heuristic_output_parallelism: false,
+                    grouping_strategy: GroupingStrategy::Single,
+                    file_group_scope: if copy_on_write {
+                        FileGroupScope::Table
+                    } else {
+                        FileGroupScope::Partition
+                    },
+                    max_file_sequence_number: None,
+                }))
+            }
+            ForgeCompactionType::SmallFiles => ForgeTaskPlanning::Explicit(
+                CompactionPlanningConfig::SmallFiles(SmallFilesConfig {
+                    group_filters: Some(GroupFilters {
+                        min_group_file_count: Some(SMALL_FILES_MIN_GROUP_FILE_COUNT),
+                        ..GroupFilters::default()
+                    }),
+                    ..self.small_files()
+                }),
+            ),
+            ForgeCompactionType::FilesWithDelete => ForgeTaskPlanning::Explicit(
+                CompactionPlanningConfig::FilesWithDeletes(self.files_with_deletes()),
+            ),
+            ForgeCompactionType::Auto => ForgeTaskPlanning::Auto {
+                files_with_deletes: self.files_with_deletes(),
+                small_files: self.small_files(),
+            },
         }
     }
 
-    /// Builds the complete core configuration one attempt executes under.
+    /// `RisingWave`'s `SmallFiles` configuration under this policy.
+    fn small_files(&self) -> SmallFilesConfig {
+        SmallFilesConfig {
+            target_file_size_bytes: self.target_file_size_bytes,
+            min_size_per_partition: RUNNER_MIN_SIZE_PER_PARTITION,
+            max_file_count_per_partition: RUNNER_MAX_FILE_COUNT_PER_PARTITION,
+            max_input_parallelism: RUNNER_MAX_PARALLELISM,
+            max_output_parallelism: RUNNER_MAX_PARALLELISM,
+            enable_heuristic_output_parallelism: false,
+            small_file_threshold_bytes: self.small_file_threshold_bytes,
+            grouping_strategy: GroupingStrategy::Single,
+            file_group_scope: FileGroupScope::Partition,
+            max_file_sequence_number: None,
+            group_filters: None,
+        }
+    }
+
+    /// `RisingWave`'s `FilesWithDelete` configuration under this policy.
+    fn files_with_deletes(&self) -> FilesWithDeletesConfig {
+        FilesWithDeletesConfig {
+            target_file_size_bytes: self.target_file_size_bytes,
+            min_size_per_partition: RUNNER_MIN_SIZE_PER_PARTITION,
+            max_file_count_per_partition: RUNNER_MAX_FILE_COUNT_PER_PARTITION,
+            max_input_parallelism: RUNNER_MAX_PARALLELISM,
+            max_output_parallelism: RUNNER_MAX_PARALLELISM,
+            enable_heuristic_output_parallelism: false,
+            grouping_strategy: GroupingStrategy::Single,
+            file_group_scope: FileGroupScope::Partition,
+            max_file_sequence_number: None,
+            min_delete_file_count_threshold: DELETE_FILES_COUNT_THRESHOLD,
+            group_filters: None,
+        }
+    }
+
+    /// Builds the complete core configuration one plan executes under.
     ///
     /// `data_file_prefix` is the attempt identity, which is what makes every
     /// object an attempt produced attributable to it by path alone. `tenant`
     /// is the table binding's tenant, stamped into every output footer.
-    /// Each selected group reaches one rolling stream, preserving the admitted
-    /// writer working set and avoiding repeated undersized stream residues.
+    /// `planning` is carried only because the core's configuration requires
+    /// one; a rewrite reads the execution terms alone.
     ///
     /// # Errors
     ///
@@ -255,6 +361,7 @@ impl ForgeTablePolicy {
     /// builder term is left unset.
     pub(crate) fn to_core_config(
         &self,
+        planning: CompactionPlanningConfig,
         data_file_prefix: String,
         bloom_columns: &[String],
         max_concurrent_closes: usize,
@@ -278,21 +385,173 @@ impl ForgeTablePolicy {
             .map_err(|error| ForgeError::InvalidConfig {
                 detail: format!("Forge rewrite execution configuration is incomplete: {error}"),
             })?;
-        let planning = WyrdIdentityAwareConfig {
-            // ponytail: one stream matches the admitted writer working set;
-            // widen only with a per-writer envelope that preserves rolling geometry.
-            max_output_parallelism: 1,
-            // The complete real plan set must survive planning: deferral is
-            // the worker queue's job, and a truncated set would make the
-            // selection report describe work the plans do not contain.
-            ..WyrdIdentityAwareConfig::new(self.to_selection_policy())
-                .with_max_selection_plans(usize::MAX)
-        };
-        Ok(Arc::new(CompactionConfig::new(
-            CompactionPlanningConfig::WyrdIdentityAware(planning),
-            execution,
-        )))
+        Ok(Arc::new(CompactionConfig::new(planning, execution)))
     }
+}
+
+/// `RisingWave`'s per-task planning choice: one explicit mode, or Auto.
+///
+/// Auto is not planned by the pinned fork, whose Auto selector diverges from
+/// upstream; [`Self::plan`] ports upstream's `AutoCompactionPlanner` instead.
+#[derive(Debug, Clone)]
+pub(crate) enum ForgeTaskPlanning {
+    /// Full, `SmallFiles` or `FilesWithDeletes`, planned by the core as is.
+    Explicit(CompactionPlanningConfig),
+    /// Upstream Auto: delete-heavy plans first, else small-file plans.
+    Auto {
+        /// Configuration used when enough delete-heavy files exist.
+        files_with_deletes: FilesWithDeletesConfig,
+        /// Configuration used when enough small files exist.
+        small_files: SmallFilesConfig,
+    },
+}
+
+impl ForgeTaskPlanning {
+    /// Plans one loaded table's branch and reports what was selected.
+    ///
+    /// Auto follows upstream `AutoCompactionPlanner` at nimtable `74bdc45`
+    /// (`compaction/auto.rs:130-300`): one scan; nothing for a table with at
+    /// most one data file; a delete-heavy candidate when at least one file
+    /// carries the delete threshold, a small-file candidate when at least five
+    /// files are small; the delete-heavy plans win when nonempty, otherwise
+    /// the small-file plans. Every plan is bound to `branch` at its snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when the branch has no snapshot, the
+    /// manifests cannot be read, or the core refuses its configuration.
+    pub(crate) async fn plan(
+        &self,
+        table: &Table,
+        branch: &str,
+    ) -> Result<(Vec<CompactionPlan>, SelectionReport), ForgeError> {
+        let core_error = |error: iceberg_compaction_core::CompactionError| {
+            ForgeError::Catalog(iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                format!("Forge managed planning failed: {error}"),
+            ))
+        };
+        let (files_with_deletes, small_files) = match self {
+            Self::Explicit(config) => {
+                return CompactionPlanner::new(config.clone())
+                    .plan_compaction_with_report(table, branch)
+                    .await
+                    .map_err(core_error);
+            }
+            Self::Auto {
+                files_with_deletes,
+                small_files,
+            } => (files_with_deletes, small_files),
+        };
+        let snapshot_id = table
+            .metadata()
+            .snapshot_for_ref(branch)
+            .map(|snapshot| snapshot.snapshot_id())
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: format!("branch '{branch}' has no snapshot to plan from"),
+            })?;
+        let tasks = FileSelector::scan_data_files(table, snapshot_id)
+            .await
+            .map_err(core_error)?;
+        let small = tasks
+            .iter()
+            .filter(|task| task.length < small_files.small_file_threshold_bytes)
+            .count();
+        let delete_heavy = tasks
+            .iter()
+            .filter(|task| task.deletes.len() >= files_with_deletes.min_delete_file_count_threshold)
+            .count();
+        let candidates = auto_candidates(tasks.len(), small, delete_heavy)
+            .into_iter()
+            .map(|kind| {
+                let config = if kind == SelectionStrategyKind::UpstreamFilesWithDeletes {
+                    CompactionPlanningConfig::FilesWithDeletes(files_with_deletes.clone())
+                } else {
+                    CompactionPlanningConfig::SmallFiles(small_files.clone())
+                };
+                (config, kind)
+            });
+        for (config, kind) in candidates {
+            let plans = FileSelector::group_tasks_with_strategy(
+                tasks.clone(),
+                PlanStrategy::from(&config),
+                &config,
+            )
+            .map_err(core_error)?
+            .into_iter()
+            .map(|group| CompactionPlan::new(group, branch.to_owned(), snapshot_id))
+            .filter(CompactionPlan::has_files)
+            .collect::<Vec<_>>();
+            if !plans.is_empty() {
+                return Ok((plans.clone(), selection_report(kind, snapshot_id, &plans)?));
+            }
+        }
+        Ok((
+            Vec::new(),
+            selection_report(SelectionStrategyKind::UpstreamAuto, snapshot_id, &[])?,
+        ))
+    }
+}
+
+/// Returns upstream Auto's candidate strategies for one scanned snapshot, in
+/// the order [`ForgeTaskPlanning::plan`] tries them.
+///
+/// This is nimtable `74bdc45`'s table-wide gate (`config/mod.rs:596-660`,
+/// `compaction/auto.rs:131-202`): a snapshot with at most one data file has
+/// no candidate; a delete-heavy candidate exists once
+/// [`AUTO_MIN_DELETE_HEAVY_FILES`] files carry the delete threshold, and it
+/// precedes a small-file candidate, which exists once
+/// [`AUTO_MIN_SMALL_FILES`] files are small. The caller takes the first
+/// candidate whose plans are nonempty, so delete-heavy work wins.
+fn auto_candidates(
+    total_files: usize,
+    small_files: usize,
+    delete_heavy_files: usize,
+) -> Vec<SelectionStrategyKind> {
+    let mut candidates = Vec::new();
+    if total_files <= 1 {
+        return candidates;
+    }
+    if delete_heavy_files >= AUTO_MIN_DELETE_HEAVY_FILES {
+        candidates.push(SelectionStrategyKind::UpstreamFilesWithDeletes);
+    }
+    if small_files >= AUTO_MIN_SMALL_FILES {
+        candidates.push(SelectionStrategyKind::UpstreamSmallFiles);
+    }
+    candidates
+}
+
+/// Builds the selection report one upstream strategy's plans describe.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the core refuses the report.
+fn selection_report(
+    kind: SelectionStrategyKind,
+    snapshot_id: i64,
+    plans: &[CompactionPlan],
+) -> Result<SelectionReport, ForgeError> {
+    let reason = kind.uniform_reason();
+    let selected = plans
+        .iter()
+        .flat_map(|plan| plan.file_group.data_files.iter())
+        .map(|task| SelectedFile {
+            file_path: task.data_file_path.clone(),
+            reason,
+        })
+        .collect();
+    SelectionReport::new(kind, snapshot_id, selected).map_err(|error| ForgeError::Invariant {
+        detail: format!("Forge selection report is not canonical: {error}"),
+    })
+}
+
+/// Returns `percent` percent of `bytes`, rounded down, without overflow.
+///
+/// Splitting `bytes` into its hundreds and remainder keeps every intermediate
+/// product within `u64` for any target and any percentage below 256.
+fn percent_of(bytes: u64, percent: u8) -> u64 {
+    let percent = u64::from(percent);
+    bytes / 100 * percent + bytes % 100 * percent / 100
 }
 
 /// Reads one declared byte-valued table property, or its documented default.
@@ -319,70 +578,9 @@ fn declared_bytes(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use iceberg::scan::FileScanTask;
-    use iceberg::spec::DataFileFormat;
-    use iceberg_compaction_core::file_selection::FileGroup;
+    use SelectionStrategyKind::{UpstreamFilesWithDeletes, UpstreamSmallFiles};
 
-    /// Native rolling receives each selected group without premature stream residue.
-    ///
-    /// # Panics
-    /// Panics if valid policy projection or native planning fails, or selected
-    /// rows are split between writers before the encoded file target can roll.
-    #[test]
-    fn forge_table_policy_keeps_rolling_stream_whole() {
-        let metadata = metadata_with(vec![(FILE_TARGET_PROPERTY, "1073741824")]);
-        let policy = ForgeTablePolicy::extract(
-            &metadata,
-            &ForgeConfig {
-                small_file_threshold_bytes: 768 * 1024 * 1024,
-                ..limits()
-            },
-        )
-        .expect("valid production geometry");
-        let config = policy
-            .to_core_config(
-                "attempt".to_owned(),
-                &[],
-                2,
-                wyrd_spec::DataTenantId::new_v7(),
-            )
-            .expect("native configuration");
-        for sizes_mib in [&[700_u64, 700][..], &[256, 256], &[2048]] {
-            let files = sizes_mib
-                .iter()
-                .enumerate()
-                .map(|(index, size)| FileScanTask {
-                    start: 0,
-                    length: size * 1024 * 1024,
-                    record_count: Some(100),
-                    first_row_id: None,
-                    data_sequence_number: None,
-                    file_sequence_number: None,
-                    data_file_path: format!("file:///warehouse/input-{index}.parquet"),
-                    data_file_format: DataFileFormat::Parquet,
-                    schema: Arc::clone(metadata.current_schema()),
-                    project_field_ids: vec![1],
-                    predicate: None,
-                    deletes: vec![],
-                    sequence_number: 1,
-                    file_size_in_bytes: size * 1024 * 1024,
-                    partition: None,
-                    partition_spec: None,
-                    name_mapping: None,
-                    unified_partition_type: None,
-                    case_sensitive: true,
-                    key_metadata: None,
-                })
-                .collect();
-            let group = FileGroup::with_parallelism(files, &config.planning)
-                .expect("native group parallelism");
-            assert_eq!(
-                group.output_parallelism, 1,
-                "{sizes_mib:?} MiB must reach one rolling stream, allowing target files and a remainder"
-            );
-        }
-    }
+    use super::*;
 
     /// Builds table metadata carrying an explicit Forge geometry.
     ///
@@ -430,12 +628,9 @@ mod tests {
         .metadata
     }
 
-    /// A validated Forge owner configuration with a usable small-file floor.
+    /// A validated Forge owner configuration with the default threshold share.
     fn limits() -> ForgeConfig {
-        ForgeConfig {
-            small_file_threshold_bytes: 32 * 1024 * 1024,
-            ..ForgeConfig::default()
-        }
+        ForgeConfig::default()
     }
 
     /// The declared file target survives every hop, and stays its own term.
@@ -448,6 +643,13 @@ mod tests {
     /// file geometry without any operator asking for it. An undeclared table
     /// falls back to the deployment file target — 1 GiB unless the operator
     /// moved it, never Iceberg's 512 MiB — and the Iceberg row-group default.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a declared geometry is refused, when either declared target
+    /// is altered or conflated on its way to the selection policy or execution
+    /// configuration, or when an undeclared table misses the deployment and
+    /// Iceberg defaults.
     #[test]
     fn forge_table_policy_preserves_declared_target_geometry() {
         let metadata = metadata_with(vec![
@@ -459,13 +661,18 @@ mod tests {
 
         assert_eq!(policy.target_file_size_bytes, 268_435_456);
         assert_eq!(policy.row_group_target_bytes, 134_217_728);
+        let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::SmallFiles(selection)) =
+            policy.planning(ForgeCompactionType::SmallFiles, false)
+        else {
+            panic!("small-files planning is explicit");
+        };
         assert_eq!(
-            policy.to_selection_policy().target_file_size_bytes,
-            268_435_456,
+            selection.target_file_size_bytes, 268_435_456,
             "the declared target reaches selection unchanged"
         );
         let config = policy
             .to_core_config(
+                CompactionPlanningConfig::default(),
                 "attempt".to_owned(),
                 &["value".to_owned()],
                 2,
@@ -521,6 +728,51 @@ mod tests {
         );
     }
 
+    /// Each task type maps to `RisingWave`'s runner configuration, and
+    /// copy-on-write forces `Full` over the whole table.
+    ///
+    /// # Panics
+    /// Panics when a task type maps to the wrong planner, scope, or runner term.
+    #[test]
+    fn forge_table_policy_plans_risingwave_task_types() {
+        let policy = ForgeTablePolicy::extract(&metadata_with(Vec::new()), &limits())
+            .expect("default geometry is admissible");
+        let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::Full(full)) =
+            policy.planning(ForgeCompactionType::Full, false)
+        else {
+            panic!("full planning is explicit");
+        };
+        assert_eq!(full.file_group_scope, FileGroupScope::Partition);
+        assert_eq!(full.max_output_parallelism, RUNNER_MAX_PARALLELISM);
+        assert!(!full.enable_heuristic_output_parallelism);
+        for requested in [
+            ForgeCompactionType::Auto,
+            ForgeCompactionType::SmallFiles,
+            ForgeCompactionType::FilesWithDelete,
+            ForgeCompactionType::Full,
+        ] {
+            let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::Full(cow)) =
+                policy.planning(requested, true)
+            else {
+                panic!("copy-on-write forces full planning for {requested:?}");
+            };
+            assert_eq!(cow.file_group_scope, FileGroupScope::Table);
+        }
+        let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::FilesWithDeletes(deletes)) =
+            policy.planning(ForgeCompactionType::FilesWithDelete, false)
+        else {
+            panic!("files-with-delete planning is explicit");
+        };
+        assert_eq!(
+            deletes.min_delete_file_count_threshold,
+            DELETE_FILES_COUNT_THRESHOLD
+        );
+        assert!(matches!(
+            policy.planning(ForgeCompactionType::Auto, false),
+            ForgeTaskPlanning::Auto { .. }
+        ));
+    }
+
     /// Registration admits exactly the targets planning can honor under the
     /// default threshold and row-group target.
     ///
@@ -546,11 +798,16 @@ mod tests {
     /// Every impossible geometry is refused before any planning happens.
     ///
     /// One case per way the geometry can be impossible: a zero target, a
-    /// non-numeric target, a threshold that is not below the target, a row-group
+    /// non-numeric target, a target whose threshold share rounds to zero, a row-group
     /// target above the file target, a target whose oversized ceiling overflows,
     /// and a data location that is not the registered recipe location. Each is
     /// a condition under which an admitted attempt could only produce wrong or
     /// no work, so the refusal belongs at extraction rather than mid-rewrite.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any impossible geometry is admitted or refused with a
+    /// different error, or when the smallest registrable target is refused.
     #[test]
     fn forge_table_policy_rejects_impossible_geometry() {
         assert!(matches!(
@@ -567,12 +824,15 @@ mod tests {
         assert!(
             matches!(
                 ForgeTablePolicy::extract(
-                    &metadata_with(vec![(FILE_TARGET_PROPERTY, "1024")]),
+                    &metadata_with(vec![
+                        (FILE_TARGET_PROPERTY, "1"),
+                        (ROW_GROUP_TARGET_PROPERTY, "1"),
+                    ]),
                     &limits(),
                 ),
-                Err(ForgeError::InvalidConfig { .. })
+                Err(ForgeError::InvalidConfig { detail }) if detail.contains("small-file threshold")
             ),
-            "a threshold at or above the target selects every file forever"
+            "a target too small to leave a positive threshold share selects nothing"
         );
         assert!(
             matches!(
@@ -609,6 +869,112 @@ mod tests {
                 Err(ForgeError::InvalidConfig { .. })
             ),
             "outputs written outside the recipe location can never settle"
+        );
+    }
+
+    /// The small-file threshold is 75% of the table's resolved file target.
+    ///
+    /// At the 1 GiB deployment default that is 768 MiB, which selects a
+    /// 512 MiB staged file and never a merged output that reached the target.
+    /// A declared target moves the threshold with it.
+    ///
+    /// # Panics
+    /// Panics when a default or declared target derives the wrong threshold.
+    #[test]
+    fn small_file_threshold_is_three_quarters_of_the_resolved_target() {
+        let defaulted =
+            ForgeTablePolicy::extract(&metadata_with(Vec::new()), &ForgeConfig::default())
+                .expect("default geometry is admissible");
+        assert_eq!(defaulted.target_file_size_bytes, 1024 * 1024 * 1024);
+        assert_eq!(defaulted.small_file_threshold_bytes, 768 * 1024 * 1024);
+
+        let declared = ForgeTablePolicy::extract(
+            &metadata_with(vec![(FILE_TARGET_PROPERTY, "268435456")]),
+            &ForgeConfig::default(),
+        )
+        .expect("declared geometry is admissible");
+        assert_eq!(declared.small_file_threshold_bytes, 201_326_592);
+
+        let odd = ForgeTablePolicy::extract(
+            &metadata_with(vec![(FILE_TARGET_PROPERTY, "134217731")]),
+            &ForgeConfig::default(),
+        )
+        .expect("an odd declared target is admissible");
+        assert_eq!(
+            odd.small_file_threshold_bytes, 100_663_298,
+            "the threshold is the floor of 75% of the declared target"
+        );
+    }
+
+    /// Only `SmallFiles` keeps a lone small file waiting for a partner.
+    ///
+    /// The group filter requires two files per group, so a single staged
+    /// file in a partition is not rewritten into an identical copy of
+    /// itself. `Full`, `FilesWithDelete`, and both of `Auto`'s strategies keep
+    /// the upstream configuration with no group filter.
+    ///
+    /// # Panics
+    /// Panics when a task type carries the wrong group filter.
+    #[test]
+    fn only_small_files_requires_a_partner_file() {
+        let policy = ForgeTablePolicy::extract(&metadata_with(Vec::new()), &ForgeConfig::default())
+            .expect("default geometry is admissible");
+        let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::SmallFiles(small)) =
+            policy.planning(ForgeCompactionType::SmallFiles, false)
+        else {
+            panic!("small-files planning is explicit");
+        };
+        assert_eq!(
+            small.group_filters,
+            Some(GroupFilters {
+                min_group_file_count: Some(2),
+                ..GroupFilters::default()
+            })
+        );
+        let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::Full(_)) =
+            policy.planning(ForgeCompactionType::Full, false)
+        else {
+            panic!("full planning is explicit and has no group filter term");
+        };
+        let ForgeTaskPlanning::Explicit(CompactionPlanningConfig::FilesWithDeletes(deletes)) =
+            policy.planning(ForgeCompactionType::FilesWithDelete, false)
+        else {
+            panic!("files-with-delete planning is explicit");
+        };
+        assert_eq!(deletes.group_filters, None);
+        let ForgeTaskPlanning::Auto {
+            files_with_deletes,
+            small_files,
+        } = policy.planning(ForgeCompactionType::Auto, false)
+        else {
+            panic!("auto planning chooses between upstream strategies");
+        };
+        assert_eq!(files_with_deletes.group_filters, None);
+        assert_eq!(small_files.group_filters, None);
+    }
+
+    /// Auto gates on table-wide counts and tries delete-heavy work first, as
+    /// upstream `74bdc45` does, rather than the fork's union selector.
+    ///
+    /// # Panics
+    /// Panics when the one-file guard, either count floor, or the
+    /// delete-first order departs from upstream.
+    #[test]
+    fn auto_candidates_follow_upstream_thresholds_and_delete_first_order() {
+        assert!(
+            auto_candidates(1, 1, 1).is_empty(),
+            "one file plans nothing"
+        );
+        assert!(
+            auto_candidates(4, 4, 0).is_empty(),
+            "four small files stay below the floor"
+        );
+        assert_eq!(auto_candidates(5, 5, 0), vec![UpstreamSmallFiles]);
+        assert_eq!(auto_candidates(2, 0, 1), vec![UpstreamFilesWithDeletes]);
+        assert_eq!(
+            auto_candidates(6, 5, 1),
+            vec![UpstreamFilesWithDeletes, UpstreamSmallFiles],
+            "delete-heavy work is tried before small files"
         );
     }
 }

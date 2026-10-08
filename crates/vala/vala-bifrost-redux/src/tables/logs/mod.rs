@@ -149,7 +149,7 @@ mod tests {
     ///
     /// Panics when any canonical body byte, event name, raw flag word,
     /// nanosecond timestamp, optional correlation id, presence distinction,
-    /// stable field id, or sensitivity marker differs, when a malformed
+    /// field-id absence, or sensitivity marker differs, when a malformed
     /// canonical payload is accepted, or when caller-supplied schema identity
     /// survives validation instead of being restamped from the ledger.
     #[test]
@@ -282,8 +282,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a declared field is missing, carries a different stable id
-    /// or sensitivity marker, or fails canonical validation.
+    /// Panics when a declared field is missing, declares a field id, carries a
+    /// different sensitivity marker, or fails canonical validation.
     fn assert_schema_identity(batch: &RecordBatch) {
         for declared in LOG_FIELDS {
             let field = batch
@@ -293,8 +293,8 @@ mod tests {
                 .clone();
             assert_eq!(
                 field.metadata().get(PARQUET_FIELD_ID),
-                Some(&declared.id.to_string()),
-                "field {} carries its stable id",
+                None,
+                "field {} declares no id; the registered table assigns it",
                 declared.name
             );
             assert_eq!(
@@ -314,8 +314,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when non-canonical attribute bytes validate successfully, or when
-    /// a caller-supplied stable field id or sensitivity marker survives
-    /// validation instead of being replaced by the ledger's.
+    /// a caller-supplied field id survives validation or a caller-supplied
+    /// sensitivity marker is not replaced by the ledger's.
     fn assert_non_canonical_inputs_are_rejected(batch: &RecordBatch) {
         let malformed = RecordBatch::try_new(
             canonical_log_schema(),
@@ -381,8 +381,8 @@ mod tests {
             .clone();
         assert_eq!(
             body.metadata().get(PARQUET_FIELD_ID),
-            Some(&declared_body.id.to_string()),
-            "the server restamps the ledger's stable id over the caller's"
+            None,
+            "the server drops a caller-supplied field id"
         );
         assert_eq!(
             body.metadata().get(WYRD_SENSITIVE),

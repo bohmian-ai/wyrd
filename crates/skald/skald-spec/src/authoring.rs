@@ -366,14 +366,14 @@ messages: "Just one message"
 
     #[test]
     fn model_settings_temperature_decoded() {
-        let yaml = r#"
+        let yaml = r"
 provider: openai
 model: gpt-4o
 messages:
   - Hello
 model_settings:
   temperature: 0.2
-"#;
+";
         let draft: PromptDraft = serde_yaml::from_str(yaml).unwrap();
         let prompt = draft.compile().expect("settings compile");
         let ProviderRequest::OpenAiChatCompletion(req) = &prompt.request else {

@@ -1,14 +1,60 @@
 #### begin imports ####
 
 from collections.abc import Mapping
-from typing import Protocol, TypeAlias, overload
+from os import PathLike
+from pathlib import Path
+from typing import Any, Literal, Protocol, TypeAlias, TypeVar, overload
 
+from .._card_types import (
+    AgentSpec,
+    DataSpec,
+    DriftBaselineState,
+    DriftBaselineStatus,
+    ModelSpec,
+    OperatorSpec,
+    PromptSpec,
+    RegisteredAgentCard,
+    RegisteredArtifactCard,
+    RegisteredAuditCard,
+    RegisteredCard,
+    RegisteredDataCard,
+    RegisteredExperimentCard,
+    RegisteredMcpCard,
+    RegisteredModelCard,
+    RegisteredOperatorCard,
+    RegisteredPolicyCard,
+    RegisteredPromptCard,
+    RegisteredServiceCard,
+    RegisteredSourceCard,
+    RegisteredTriggerCard,
+    RegisteredUntypedCard,
+    RegisteredVerifierCard,
+    RegisteredWorkflowCard,
+    ServiceSpec,
+    TriggerSpec,
+    TypedCardKind,
+    VerificationStatus,
+    VerifierSpec,
+)
+from .._card_types import (
+    Metadata as CardMetadata,
+)
+from .._card_types import (
+    Relationships as CardRelationships,
+)
+from .._card_types import (
+    Status as CardStatus,
+)
 from ..agent import Workflow
+from ..client import WyrdClient
 from ..data import DataCard, DataInterface
 from ..model import ModelCard, ModelInterface
 from ..prompt import Prompt, PromptCard, PromptReference
 
 #### end of imports ####
+
+_DataInterfaceT = TypeVar("_DataInterfaceT", bound=DataInterface)
+_ModelInterfaceT = TypeVar("_ModelInterfaceT", bound=ModelInterface)
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -31,7 +77,7 @@ class Card(Protocol):
         """Return the holder's single Wyrd envelope conversion."""
         ...
 
-RegisterableCard: TypeAlias = DataCard | ModelCard | PromptCard
+RegisterableCard: TypeAlias = DataCard[Any] | ModelCard[Any] | PromptCard
 
 class AgentCard:
     """Local Agent Card holder backed by the native Agent envelope.
@@ -39,6 +85,15 @@ class AgentCard:
     Use `PromptReference.inline(prompt)` for an inline prompt or
     `PromptReference.card(...)` for a registered Prompt Card reference. The
     holder contains no runtime, registry, storage, or artifact state.
+
+    Attributes:
+        spec: the durable Agent spec as a dict.
+        cascade_children: the referenced Prompt Card when the prompt is
+            card-backed; empty for an inline prompt.
+        prompt_ref: the durable prompt reference.
+        prompt: the inline `Prompt`, or `None` while the prompt is a
+            reference to a registered Prompt Card.
+        kind: the Card kind, always ``"Agent"``.
     """
 
     space: str
@@ -51,6 +106,7 @@ class AgentCard:
     cascade_children: list[CardRef]
     prompt_ref: PromptReference
     prompt: Prompt | None
+    kind: str
 
     def __init__(
         self,
@@ -65,27 +121,61 @@ class AgentCard:
         """Create an Agent Card from one prompt reference.
 
         Args:
-            prompt: Inline prompt or registered Prompt Card reference.
-            space: Card space. Defaults to the repository's Agent space.
-            name: Card name. Defaults to `agent`.
-            version: Semantic version. Defaults to `0.1.0`.
-            uid: Optional server identity. A new local UID is generated when omitted.
-            labels: Queryable labels.
-            annotations: Free-form annotations.
+            prompt: the inline prompt or registered Prompt Card reference.
+            space: the Card space. Omitted, the workspace ``wyrd.toml``
+                ``[kind.Agent]`` or ``[defaults]`` space applies, else
+                ``"default"``.
+            name: the Card name. ``"agent"`` if omitted.
+            version: the semantic version. ``"0.1.0"`` if omitted.
+            uid: the Card UID. A new UUIDv7 is generated if omitted.
+            labels: queryable labels, merged per key with the workspace
+                ``wyrd.toml`` defaults; your keys win.
+            annotations: free-form annotations, merged like ``labels``.
+
+        Raises:
+            WyrdError: for an invalid label or annotation, or identity values
+                the Agent envelope rejects.
+
         """
         ...
 
     def model_dump(self) -> dict[str, JsonValue]:
-        """Return the complete Agent Card envelope as a dictionary."""
+        """Return the complete Agent Card envelope as a dictionary.
+
+        Returns:
+            The envelope as plain Python values.
+
+        Raises:
+            WyrdError: If the envelope cannot be serialized.
+        """
         ...
 
     def model_dump_json(self) -> str:
-        """Return the complete Agent Card envelope as JSON."""
+        """Return the complete Agent Card envelope as JSON.
+
+        Returns:
+            The envelope as a JSON string.
+
+        Raises:
+            WyrdError: If the envelope cannot be serialized.
+        """
         ...
 
     @staticmethod
     def model_validate_json(json_string: str) -> AgentCard:
-        """Hydrate an Agent Card from a complete persisted envelope."""
+        """Hydrate an Agent Card from a complete persisted envelope.
+
+        Args:
+            json_string: an envelope as produced by ``model_dump_json()``.
+
+        Returns:
+            The hydrated `AgentCard`.
+
+        Raises:
+            WyrdError: when the JSON is not a complete Agent Card envelope or
+                lacks ``metadata.uid``.
+
+        """
         ...
 
     def _to_card_envelope_json(self) -> str:
@@ -97,7 +187,8 @@ class CardKind:
 
     Kind-specific registry views use these values internally. Most Python
     callers use `cards.data`, `cards.model`, or `cards.prompt`, which already
-    select the kind and return the matching card type.
+    select the kind and return the matching card type. `External` marks a
+    foreign schema descriptor and cannot be registered.
     """
 
     Data: CardKind
@@ -118,7 +209,9 @@ class CardKind:
     External: CardKind
 
     @property
-    def name(self) -> str: ...
+    def name(self) -> str:
+        """The kind's wire name, identical to the attribute name, such as ``"Model"``."""
+        ...
 
 class CardRef:
     """Reference to one exact registered Card.
@@ -143,21 +236,52 @@ class CardRef:
         *,
         space: str,
         uid: str | None = ...,
-    ) -> None: ...
+    ) -> None:
+        """Build a reference from its kind, name, version, and space.
+
+        Args:
+            kind: The Card kind, as a `CardKind` or its wire name.
+            name: The Card name.
+            version: The exact Card version.
+            space: The Card space.
+            uid: The server-assigned Card UID, when known.
+
+        Raises:
+            WyrdError: ``WYRD_SPEC_400_VALIDATION`` if a field is invalid.
+        """
+        ...
+    def to_dict(self) -> dict[str, JsonValue]:
+        """Return this reference as its ``CardRef`` mapping, satisfying ``CardRefLike``.
+
+        Returns:
+            The ``kind``, ``name``, ``version``, ``space``, and ``uid`` mapping.
+
+        Raises:
+            WyrdError: If the reference cannot be converted to Python values.
+        """
+        ...
+    def __str__(self) -> str:
+        """The canonical ``space/Kind/name@version`` text of this reference."""
+        ...
     def __repr__(self) -> str: ...
 
 class VersionBump:
-    """Version intent applied by registration.
+    """How registration derives the next version.
 
-    `Cards.register` defaults to `VersionBump.Patch`.
-    compatible correction, `Major` for a breaking change, or one of the
-    factory methods when the version also needs pre-release or build metadata.
+    The server applies the bump to the latest stable registered version in
+    the Card's version line when the Card's version is empty or a scope such
+    as ``"1"`` or ``"1.2"``; with no registered version, the line's first
+    version is used. A Card whose version is an exact ``major.minor.patch``
+    pin registers that version and accepts no bump. `Major`, `Minor`, and
+    `Patch` increment their component and clear pre-release and build
+    metadata; `pre`, `build`, and `pre_build` set metadata on the current
+    version without incrementing it.
 
     Example:
         ```python
-        cards.model.register(card, VersionBump.Patch)
-        cards.model.register(card, VersionBump.pre("rc1"))
-        cards.model.register(card, VersionBump.pre_build("rc1", "linux"))
+        cards.model.register(card, VersionBump.Minor)
+        cards.model.register(card, VersionBump.pre("rc.1"))
+        cards.model.register(card, VersionBump.pre_build("rc.1", "linux"))
         ```
     """
 
@@ -166,11 +290,41 @@ class VersionBump:
     Patch: VersionBump
 
     @staticmethod
-    def pre(identifier: str) -> VersionBump: ...
+    def pre(identifier: str) -> VersionBump:
+        """Set the SemVer pre-release identifier, such as ``"rc.1"``.
+
+        Args:
+            identifier: The pre-release identifier. The server validates it
+                at registration.
+
+        Returns:
+            The pre-release bump.
+        """
+        ...
     @staticmethod
-    def build(metadata: str) -> VersionBump: ...
+    def build(metadata: str) -> VersionBump:
+        """Set the SemVer build metadata, such as ``"sha-abc123"``.
+
+        Args:
+            metadata: The build metadata. The server validates it at
+                registration.
+
+        Returns:
+            The build-metadata bump.
+        """
+        ...
     @staticmethod
-    def pre_build(pre: str, build: str) -> VersionBump: ...
+    def pre_build(pre: str, build: str) -> VersionBump:
+        """Set both the pre-release identifier and the build metadata.
+
+        Args:
+            pre: The pre-release identifier, such as ``"rc.1"``.
+            build: The build metadata, such as ``"linux"``.
+
+        Returns:
+            The combined bump.
+        """
+        ...
 
 class DataSaveArgs:
     """Options forwarded to a `DataCard` interface during registration.
@@ -178,9 +332,6 @@ class DataSaveArgs:
     These values are passed to the data interface's `save` implementation
     while Wyrd materializes the local artifact directory that is uploaded with
     the Card. They are not registry query options.
-
-    `copy_bytes` is a Wyrd data-interface option. Additional JSON-compatible
-    values depend on the selected interface.
     """
 
     def __init__(
@@ -188,8 +339,29 @@ class DataSaveArgs:
         values: Mapping[str, JsonValue] | None = ...,
         *,
         copy_bytes: bool | None = ...,
-    ) -> None: ...
-    def to_dict(self) -> dict[str, JsonValue]: ...
+    ) -> None:
+        """Collect data-interface save options.
+
+        Args:
+            values: interface-specific options, copied into a new dict;
+                accepted keys depend on the interface. Omitted, no options.
+            copy_bytes: for the manifest-backed image and text interfaces,
+                ``True`` also copies the referenced files into the artifact;
+                other built-in interfaces ignore it. Overrides a
+                ``copy_bytes`` key in ``values``. Omitted, the key is not set.
+
+        Raises:
+            WyrdError: If ``values`` cannot be converted by ``dict()``.
+
+        """
+        ...
+    def to_dict(self) -> dict[str, JsonValue]:
+        """Return the options dict handed to the interface.
+
+        Returns:
+            A dict of the collected options.
+        """
+        ...
 
 class ModelSaveArgs:
     """Options forwarded to a `ModelCard` interface during registration.
@@ -198,20 +370,68 @@ class ModelSaveArgs:
     identity or version selection.
     """
 
-    def __init__(self, values: Mapping[str, JsonValue] | None = ...) -> None: ...
-    def to_dict(self) -> dict[str, JsonValue]: ...
+    def __init__(self, values: Mapping[str, JsonValue] | None = ...) -> None:
+        """Collect interface-specific options, copied into a new dict.
+
+        Args:
+            values: Interface-specific options; accepted keys depend on the
+                interface. Omitted, the interface receives no options.
+
+        Raises:
+            WyrdError: If ``values`` cannot be converted by ``dict()``.
+        """
+        ...
+    def to_dict(self) -> dict[str, JsonValue]:
+        """Return the options dict handed to the interface.
+
+        Returns:
+            A dict of the collected options.
+        """
+        ...
 
 class DataLoadArgs:
     """Options forwarded to a `DataCard` interface during `DataCard.load`."""
 
-    def __init__(self, values: Mapping[str, JsonValue] | None = ...) -> None: ...
-    def to_dict(self) -> dict[str, JsonValue]: ...
+    def __init__(self, values: Mapping[str, JsonValue] | None = ...) -> None:
+        """Collect interface-specific options, copied into a new dict.
+
+        Args:
+            values: Interface-specific options; accepted keys depend on the
+                interface. Omitted, the interface receives no options.
+
+        Raises:
+            WyrdError: If ``values`` cannot be converted by ``dict()``.
+        """
+        ...
+    def to_dict(self) -> dict[str, JsonValue]:
+        """Return the options dict handed to the interface.
+
+        Returns:
+            A dict of the collected options.
+        """
+        ...
 
 class ModelLoadArgs:
     """Options forwarded to a `ModelCard` interface during `ModelCard.load`."""
 
-    def __init__(self, values: Mapping[str, JsonValue] | None = ...) -> None: ...
-    def to_dict(self) -> dict[str, JsonValue]: ...
+    def __init__(self, values: Mapping[str, JsonValue] | None = ...) -> None:
+        """Collect interface-specific options, copied into a new dict.
+
+        Args:
+            values: Interface-specific options; accepted keys depend on the
+                interface. Omitted, the interface receives no options.
+
+        Raises:
+            WyrdError: If ``values`` cannot be converted by ``dict()``.
+        """
+        ...
+    def to_dict(self) -> dict[str, JsonValue]:
+        """Return the options dict handed to the interface.
+
+        Returns:
+            A dict of the collected options.
+        """
+        ...
 
 class Cards:
     """Tenant-scoped client for registered Wyrd Cards.
@@ -223,35 +443,33 @@ class Cards:
     from wyrd import Cards
 
     cards = Cards()
-    latest = cards.model.resolve_latest(space="ml", name="fraud-model")
+    latest = cards.model.resolve_latest(space="risk", name="fraud-model")
     card = cards.model.get(uid=latest.uid)
     card.load()
     ```
 
     `get` retrieves and validates the serialized Card envelope. It does not
-    download model or data bytes. Call `ModelCard.load` or `DataCard.load`
-    afterward to hydrate those artifacts.
-
-    Args:
-        server_url: Optional Wyrd server URL. When omitted, the shared Wyrd
-            client configuration supplies it.
-        credential: Optional credential override for this handle. When omitted, the
-            shared Wyrd client configuration supplies credentials.
-        tenant: Optional tenant route key that selects one server\'s
-            saved login or the workload-token tenant; an explicit credential, access token, or API key
-            already names its tenant and refuses it.
-
-    Raises:
-        WyrdError: If local configuration or the API-key override cannot be
-            loaded.
+    download model or data bytes unless `eager_load=True`; otherwise call
+    `ModelCard.load` or `DataCard.load` afterward to hydrate those artifacts.
     """
 
-    def __init__(
-        self,
-        server_url: str | None = ...,
-        credential: str | None = ...,
-        tenant: str | None = ...,
-    ) -> None: ...
+    def __init__(self, client: WyrdClient | None = None) -> None:
+        """Build a registry client. No network call or token exchange happens here.
+
+        Args:
+            client: the ``WyrdClient`` to act as, sharing its transport and
+                token cache. Omitted, the ambient client resolves from
+                ``[client]`` in the Wyrd ``config.toml``
+                (``~/.config/wyrd/config.toml`` by default), then the
+                environment, then the saved ``wyrd auth login``.
+
+        Raises:
+            WyrdError: ``WYRD_CLIENT_400_CONFIG_INVALID`` for an unreadable
+                ``config.toml``; ``WYRD_CLIENT_401_NO_CREDENTIALS`` when no
+                ambient credential resolves.
+
+        """
+        ...
     @property
     def data(self) -> DataCardRegistry:
         """Return the typed registry view for `DataCard` operations."""
@@ -284,7 +502,7 @@ class Cards:
         ModelCard artifacts through the attached interface, uploads the
         resulting manifest, and waits for server completion. On success, the
         same `card` object is updated with the server-assigned `uid`, resolved
-        version, and normalized identity fields.
+        version, and normalized identity fields; on failure it is unchanged.
 
         Use the kind-specific view when you want static type checking for the
         card argument. The unscoped method is useful when the Card kind is
@@ -292,28 +510,28 @@ class Cards:
 
         Args:
             card: A `DataCard`, `ModelCard`, or `PromptCard`.
-            version_bump: Version intent. Defaults to `VersionBump.Patch`.
-                `VersionBump.pre`, `build`, and `pre_build` add version
-                metadata.
-            save_args: Interface-specific save options. Use `DataSaveArgs`
-                for `DataCard` and `ModelSaveArgs` for `ModelCard`. Prompt
-                cards do not accept save arguments.
+            version_bump: how the server derives the version; see
+                `VersionBump`. Omitted, `VersionBump.Patch`. Passing one for
+                a Card whose version is an exact pin is an error.
+            save_args: `DataSaveArgs` for a `DataCard` or `ModelSaveArgs` for
+                a `ModelCard`, forwarded to its interface. A `PromptCard`
+                accepts none.
 
         Returns:
             A receipt containing the resolved root reference and one outcome
             for each registered Card.
 
         Raises:
-            WyrdError: If `card` is not a supported native holder, required
-                interface data is missing, serialization or artifact saving
-                fails, the server rejects the registration, or completion
-                fails.
+            WyrdError: If `card` is not a supported native holder, the
+                arguments do not match its kind, required interface data is
+                missing, serialization or artifact saving fails, the server
+                rejects the registration, or completion fails.
 
         Example:
             ```python
             card = PromptCard(
                 Prompt.openai_chat("gpt-4o", messages="Hello {{name}}"),
-                space="ml",
+                space="growth",
                 name="welcome",
                 version="0.1.0",
             )
@@ -323,8 +541,8 @@ class Cards:
         """
         ...
 
-    def register_from_path(self, path: str) -> RegistrationReceipt:
-        """Register a declarative Card bundle from a local directory.
+    def register_from_path(self, path: str | PathLike[str]) -> RegistrationReceipt:
+        """Register a declarative Card from a Card file or a bundle directory.
 
         This is the file-based registration path. For Python-authored
         `DataCard`, `ModelCard`, and `PromptCard` objects, prefer `register`
@@ -332,7 +550,7 @@ class Cards:
         operation.
 
         Args:
-            path: Directory containing the declarative Card bundle.
+            path: A Card file or a bundle directory.
 
         Returns:
             A receipt for the completed registration.
@@ -343,6 +561,160 @@ class Cards:
         """
         ...
 
+    def get(self, card_ref: CardRef) -> RegisteredCard:
+        """Fetch one registered Card by exact reference, typed by its kind.
+
+        The result is a frozen dataclass chosen by `kind`, read by attribute:
+        `spec` and `status` are typed for Data, Model, Prompt, Agent,
+        Verifier, Service, Trigger, and Operator Cards, including a Drift
+        Verifier's `status.verification.baseline` state. Other kinds return
+        `RegisteredUntypedCard`, whose `spec` is a plain mapping. No artifact
+        bytes are downloaded.
+
+        Args:
+            card_ref: Exact reference carrying its space and version.
+
+        Returns:
+            The registered envelope with server-derived relationships and
+            status.
+
+        Raises:
+            WyrdError: If the Card is absent or the server request fails.
+
+        Example:
+            ```python
+            card = cards.get(CardRef("Verifier", "churn-drift", "1.0.0", space="ml"))
+            if card.kind == "Verifier" and card.status is not None:
+                verification = card.status.verification
+            ```
+        """
+        ...
+
+    def list(
+        self,
+        *,
+        kind: CardKind | str | None = None,
+        space: str | None = ...,
+        name: str | None = ...,
+        version_range: str | None = ...,
+        status: str | None = ...,
+        filter: str | None = ...,
+        include_prerelease: bool = ...,
+        limit: int | None = ...,
+        cursor: str | None = ...,
+    ) -> CardList:
+        """List metadata-only summaries of registered Cards of any kind.
+
+        Args:
+            kind: Only Cards of this kind. Omitted, every kind.
+            space: Only Cards in this space.
+            name: Only Cards with this name.
+            version_range: Only versions in this SemVer range.
+            status: Only this lifecycle status, as for
+                ``DataCardRegistry.list()``.
+            filter: A metadata query over labels, annotations, and reserved
+                columns.
+            include_prerelease: Include pre-release versions. Default
+                ``False``.
+            limit: Page size from 1 to 200. Omitted, 50.
+            cursor: The `next_cursor` of the previous page.
+
+        Returns:
+            One cursor-paginated `CardList`.
+
+        Raises:
+            WyrdError: A validation error for an unknown `kind` or another
+                invalid argument, as for ``DataCardRegistry.list()``.
+        """
+        ...
+
+    def resolve_latest(self, kind: CardKind | str, space: str, name: str) -> CardRef:
+        """Resolve the latest Active version of one named Card.
+
+        Args:
+            kind: The Card kind.
+            space: The Card space.
+            name: The Card name.
+
+        Returns:
+            The exact reference of the latest Active version.
+
+        Raises:
+            WyrdError: If `kind`, `space`, or `name` is invalid, or no Active
+                Card matches.
+        """
+        ...
+
+    def delete(self, card_ref: CardRef) -> None:
+        """Delete one registered Card, of any kind, by exact reference.
+
+        The Card is marked ``deleted`` and its stored artifacts are removed.
+
+        Args:
+            card_ref: Exact reference carrying its space and version.
+
+        Raises:
+            WyrdError: ``WYRD_REGISTRY_404_CARD_NOT_FOUND`` when no Card
+                matches; ``WYRD_SPEC_409_CONFLICT`` when the Card is not
+                Active or another visible Card references it.
+        """
+        ...
+
+    def hydrate(
+        self,
+        card_ref: CardRef,
+        destination: str | PathLike[str],
+        metadata_only: bool = False,
+    ) -> HydrationSummary:
+        """Download a registered Card's reachable graph as a local bundle.
+
+        The bundle is published atomically under `destination`, ready for
+        ``WyrdState.from_path``.
+
+        Args:
+            card_ref: The root Card's exact reference.
+            destination: The bundle directory to publish.
+            metadata_only: ``True`` writes Card metadata only; ``False``
+                also downloads and verifies every artifact.
+
+        Returns:
+            What was published.
+
+        Raises:
+            WyrdError: If the graph cannot be resolved, the destination is
+                invalid, an artifact cannot be downloaded or verified, or the
+                bundle cannot be published.
+        """
+        ...
+
+class HydrationSummary:
+    """Result of one published ``Cards.hydrate``."""
+
+    @property
+    def root(self) -> CardRef:
+        """The exact resolved root reference."""
+        ...
+    @property
+    def destination(self) -> Path:
+        """The published bundle directory."""
+        ...
+    @property
+    def mode(self) -> Literal["complete", "metadata"]:
+        """``"complete"`` or ``"metadata"``."""
+        ...
+    @property
+    def card_count(self) -> int:
+        """Number of unique Cards in the bundle."""
+        ...
+    @property
+    def artifact_count(self) -> int:
+        """Number of server-owned artifact inventory entries."""
+        ...
+    @property
+    def downloaded_artifact_count(self) -> int:
+        """Number of artifact payloads downloaded and verified."""
+        ...
+
 class DataCardRegistry:
     """Typed operations for registered `DataCard` objects.
 
@@ -351,77 +723,97 @@ class DataCardRegistry:
 
     ```python
     cards = Cards()
-    data_card = cards.data.get(space="ml", name="training-data")
+    data_card = cards.data.get(space="risk", name="training-data")
     data_card.load()
     ```
     """
 
     def register(
         self,
-        card: DataCard,
+        card: DataCard[Any],
         version_bump: VersionBump = ...,
         save_args: DataSaveArgs | None = ...,
     ) -> RegistrationReceipt:
         """Register a `DataCard` and upload its saved data artifacts.
 
-        The caller-owned card is updated with the server-assigned identity
-        after registration completes. `save_args` is passed to the card's
-        data interface; it is not sent as registry metadata.
+        As ``Cards.register()``, restricted to `DataCard`. `save_args` is
+        passed to the card's data interface; it is not sent as registry
+        metadata.
 
         Args:
-            card: DataCard to register.
-            version_bump: Version intent. Defaults to `VersionBump.Patch`.
-            save_args: Optional `DataSaveArgs` forwarded to the data interface.
+            card: The `DataCard` to register; it receives the server identity.
+            version_bump: How the server derives the version; see
+                `VersionBump`. Omitted, `VersionBump.Patch`.
+            save_args: `DataSaveArgs` forwarded to the data interface.
 
         Returns:
-            Receipt for the completed registration.
+            A receipt containing the resolved root reference and one outcome
+            for each registered Card.
 
         Raises:
-            WyrdError: If the card has no usable data interface, saving,
-                serialization, upload, validation, or server completion fails.
+            WyrdError: If `card` is not a `DataCard` or has no usable data
+                interface, or saving, serialization, upload, validation, or
+                server completion fails.
         """
         ...
+    @overload
     def get(
         self,
+        card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
-        interface: DataInterface | type[DataInterface] | None = ...,
+        interface: None = ...,
         eager_load: bool = ...,
         load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> DataCard:
+        """Retrieve a `DataCard` whose built-in interface is rebuilt from its metadata."""
+        ...
+    @overload
+    def get(
+        self,
+        card_ref: CardRef | None = None,
+        *,
+        uid: str | None = ...,
+        space: str | None = ...,
+        name: str | None = ...,
+        version: str | None = ...,
+        interface: _DataInterfaceT | type[_DataInterfaceT],
+        eager_load: bool = ...,
+        load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> DataCard[_DataInterfaceT]:
         """Retrieve and validate one complete `DataCard` envelope.
 
-        Pass `uid` for an exact lookup. Without `uid`, `space` and `name` are
-        required, and omitting `version` selects the server's latest resolved
-        version. A custom data interface must be supplied here when the
-        serialized Card uses one. Set `eager_load` to download verified
-        artifacts and load the holder before return. `load_kwargs` is forwarded
-        only to that eager holder load; otherwise artifact bytes are loaded
-        later by `DataCard.load`.
+        Pass a `CardRef` alone, `uid` for an exact lookup, or `space` and
+        `name` for a named one.
 
         Args:
+            card_ref: Exact `CardRef` of a Data Card, used alone in place of
+                the other selector fields.
             uid: Exact server-assigned Card UID. When present, it takes
-                precedence over the named selector; supplied identity fields
-                are checked against the returned Card.
+                precedence over the named selector; supplied `space`, `name`,
+                and `version` are checked against the returned Card.
             space: Card space, required when `uid` is omitted.
             name: Card name, required when `uid` is omitted.
-            version: Exact version. Omit it to resolve the latest version.
-            interface: Built-in or custom `DataInterface` instance/class used
-                to rebuild the Python interface from Card metadata.
-            eager_load: Whether to download verified artifacts and load the
-                data holder before returning.
-            load_kwargs: Optional `DataLoadArgs` or JSON-compatible mapping
-                forwarded only to the eager data holder load.
+            version: Exact version. Omitted, the latest Active version.
+            interface: Built-in or custom `DataInterface` instance or class
+                used to rebuild the Python interface from Card metadata.
+                Required when the serialized Card uses a custom interface.
+            eager_load: ``True`` downloads the verified artifacts and loads
+                the data before returning. Default ``False`` defers that to
+                `DataCard.load`.
+            load_kwargs: `DataLoadArgs` or a JSON-compatible mapping forwarded
+                to the load; used only with ``eager_load=True``.
 
         Returns:
             A native `DataCard` populated from the server-stored Card JSON.
 
         Raises:
-            WyrdError: If the selector is invalid, the Card is not found, the
-                envelope fails validation, or a custom interface is missing.
+            WyrdError: ``WYRD_REGISTRY_404_CARD_NOT_FOUND`` when no Card
+                matches, or a validation error for an invalid selector, an
+                envelope that fails validation, or a missing custom interface.
         """
         ...
     def list(
@@ -443,43 +835,53 @@ class DataCardRegistry:
         for this operation. Use `get` when you need the full holder.
 
         Args:
-            space: Optional space filter.
-            name: Optional name filter.
-            version_range: Optional semantic-version range.
-            status: Optional lifecycle status filter.
-            filter: Optional metadata query expression.
-            include_prerelease: Include pre-release versions in the result.
-            limit: Maximum number of summaries in this page.
-            cursor: Opaque cursor returned by a previous page.
+            space: Only Cards in this space.
+            name: Only Cards with this name.
+            version_range: Only versions in this SemVer range, such as
+                ``"^1.2"``, ``"1.*"``, or ``">=1.0,<2.0"``.
+            status: Only this lifecycle status, case-insensitive:
+                ``"pending"``, ``"active"``, ``"deprecated"``, ``"failed"``,
+                ``"expired"``, or ``"deleted"``. Omitted, every status except
+                ``"deleted"``.
+            filter: A metadata query over labels, annotations, and reserved
+                columns, such as ``'labels.env = "prod"'``.
+            include_prerelease: Include pre-release versions. Default
+                ``False``.
+            limit: Page size from 1 to 200. Omitted, 50.
+            cursor: The `next_cursor` of the previous page.
 
         Returns:
             One cursor-paginated `CardList`.
 
         Raises:
-            WyrdError: If a filter, version range, or server request is invalid.
+            WyrdError: ``WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE`` for a bad
+                `limit`, ``WYRD_QUERY_400_INVALID_SYNTAX`` for a malformed
+                `filter`, or a validation error for another invalid argument.
         """
         ...
 
     def resolve_latest(self, *, space: str, name: str) -> CardRef:
-        """Resolve the latest DataCard reference for a name.
+        """Resolve the latest Active DataCard version to an exact reference.
 
-        This returns identity only. Call `get(uid=reference.uid)` to retrieve
-        the complete card envelope.
+        This returns identity only. Call `get(reference)` to retrieve the
+        complete card envelope.
 
         Args:
-            space: Card space.
-            name: Card name.
+            space: The Card space.
+            name: The Card name.
 
         Returns:
-            The latest exact `CardRef` selected by the server.
+            The exact reference of the latest Active version.
 
         Raises:
-            WyrdError: If the identity is invalid or no matching Card exists.
+            WyrdError: If `space` or `name` is invalid or no Active Card
+                matches.
         """
         ...
 
     def delete(
         self,
+        card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
         space: str | None = ...,
@@ -488,12 +890,24 @@ class DataCardRegistry:
     ) -> None:
         """Delete a registered DataCard and its stored artifacts.
 
-        Provide `uid` for an exact deletion. Otherwise provide `space`,
-        `name`, and the exact `version`.
+        The Card is marked ``deleted`` and its artifacts are removed. Deleting
+        an already deleted Card is a no-op. Provide a `CardRef` alone or
+        `uid` for an exact deletion; otherwise provide `space`, `name`, and
+        the exact `version`.
+
+        Args:
+            card_ref: Exact `CardRef` of a Data Card, used alone in place of
+                the other selector fields.
+            uid: Exact server-assigned Card UID.
+            space: Card space, required when `uid` is omitted.
+            name: Card name, required when `uid` is omitted.
+            version: Exact version, required with `space` and `name`.
 
         Raises:
-            WyrdError: If the selector is invalid, the Card is not found, or
-                deletion is rejected.
+            WyrdError: ``WYRD_REGISTRY_400_VERSION_REQUIRED`` for a named
+                selector without `version`; ``WYRD_REGISTRY_404_CARD_NOT_FOUND``
+                when no Card matches; ``WYRD_SPEC_409_CONFLICT`` when the Card
+                is not Active or another visible Card references it.
         """
         ...
 
@@ -506,68 +920,85 @@ class ModelCardRegistry:
 
     def register(
         self,
-        card: ModelCard,
+        card: ModelCard[Any],
         version_bump: VersionBump = ...,
         save_args: ModelSaveArgs | None = ...,
     ) -> RegistrationReceipt:
         """Register a `ModelCard` and upload its saved model artifacts.
 
+        As ``Cards.register()``, restricted to `ModelCard`. `save_args` is
+        passed to the card's model interface.
+
         Args:
-            card: ModelCard to register.
-            version_bump: Version intent. Defaults to `VersionBump.Patch`.
-            save_args: Optional `ModelSaveArgs` forwarded to the model
-                interface.
+            card: The `ModelCard` to register; it receives the server identity.
+            version_bump: How the server derives the version; see
+                `VersionBump`. Omitted, `VersionBump.Patch`.
+            save_args: `ModelSaveArgs` forwarded to the model interface.
 
         Returns:
-            Receipt for the completed registration. The caller-owned card is
-            updated with the resolved server identity.
+            A receipt containing the resolved root reference and one outcome
+            for each registered Card.
 
         Raises:
-            WyrdError: If the model interface is missing or saving,
-                serialization, upload, validation, or server completion fails.
+            WyrdError: If `card` is not a `ModelCard`, the model interface is
+                missing, or saving, serialization, upload, validation, or
+                server completion fails.
         """
         ...
+    @overload
     def get(
         self,
+        card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
-        interface: ModelInterface | type[ModelInterface] | None = ...,
+        interface: None = ...,
         eager_load: bool = ...,
         load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> ModelCard:
+        """Retrieve a `ModelCard` whose built-in interface is rebuilt from its metadata."""
+        ...
+    @overload
+    def get(
+        self,
+        card_ref: CardRef | None = None,
+        *,
+        uid: str | None = ...,
+        space: str | None = ...,
+        name: str | None = ...,
+        version: str | None = ...,
+        interface: _ModelInterfaceT | type[_ModelInterfaceT],
+        eager_load: bool = ...,
+        load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> ModelCard[_ModelInterfaceT]:
         """Retrieve and validate one complete `ModelCard` envelope.
 
-        Pass `uid` for an exact lookup. Without `uid`, `space` and `name` are
-        required, and omitting `version` selects the latest resolved version.
-        Supply a custom model interface here when the serialized Card cannot
-        rebuild its interface from built-in metadata. Set `eager_load` to
-        download verified artifacts and load the holder before return.
-        `load_kwargs` is forwarded only to that eager holder load; otherwise
-        call `ModelCard.load` afterward.
+        As ``DataCardRegistry.get()``, with a `ModelInterface` for
+        `interface`, `ModelLoadArgs` for `load_kwargs`, and `ModelCard.load`
+        as the deferred load.
 
         Args:
+            card_ref: Exact `CardRef` of a Model Card, used alone in place of
+                the other selector fields.
             uid: Exact server-assigned Card UID. When present, it takes
                 precedence over the named selector.
             space: Card space, required when `uid` is omitted.
             name: Card name, required when `uid` is omitted.
-            version: Exact version. Omit it to resolve the latest version.
-            interface: Built-in or custom `ModelInterface` instance/class used
-                to rebuild the Python interface from Card metadata.
-            eager_load: Whether to download verified artifacts and load the
-                model holder before returning.
-            load_kwargs: Optional `ModelLoadArgs` or JSON-compatible mapping
-                forwarded only to the eager model holder load.
+            version: Exact version. Omitted, the latest Active version.
+            interface: Built-in or custom `ModelInterface` instance or class
+                used to rebuild the Python interface from Card metadata.
+            eager_load: ``True`` downloads the verified artifacts and loads
+                the model before returning. Default ``False``.
+            load_kwargs: `ModelLoadArgs` or a JSON-compatible mapping
+                forwarded to the load; used only with ``eager_load=True``.
 
         Returns:
             A native `ModelCard` populated from the server-stored Card JSON.
 
         Raises:
-            WyrdError: If the selector is invalid, the Card is not found, the
-                envelope fails validation, or a required custom interface is
-                missing.
+            WyrdError: As for ``DataCardRegistry.get()``.
         """
         ...
     def list(
@@ -584,46 +1015,51 @@ class ModelCardRegistry:
     ) -> CardList:
         """List metadata-only ModelCard summaries.
 
-        This operation does not fetch model bytes. Use `get` for the full
-        envelope and `ModelCard.load` for artifact hydration.
+        As ``DataCardRegistry.list()``. No model bytes are fetched.
 
         Args:
-            space: Optional space filter.
-            name: Optional name filter.
-            version_range: Optional semantic-version range.
-            status: Optional lifecycle status filter.
-            filter: Optional metadata query expression.
-            include_prerelease: Include pre-release versions in the result.
-            limit: Maximum number of summaries in this page.
-            cursor: Opaque cursor returned by a previous page.
+            space: Only Cards in this space.
+            name: Only Cards with this name.
+            version_range: Only versions in this SemVer range.
+            status: Only this lifecycle status, as for
+                ``DataCardRegistry.list()``.
+            filter: A metadata query over labels, annotations, and reserved
+                columns.
+            include_prerelease: Include pre-release versions. Default
+                ``False``.
+            limit: Page size from 1 to 200. Omitted, 50.
+            cursor: The `next_cursor` of the previous page.
 
         Returns:
             One cursor-paginated `CardList`.
 
         Raises:
-            WyrdError: If a filter, version range, or server request is invalid.
+            WyrdError: A validation error for an invalid argument, as for
+                ``DataCardRegistry.list()``.
         """
         ...
 
     def resolve_latest(self, *, space: str, name: str) -> CardRef:
-        """Resolve the latest ModelCard reference for a name.
+        """Resolve the latest Active ModelCard version.
 
-        Call `get(uid=reference.uid)` to retrieve the complete card envelope.
+        As ``DataCardRegistry.resolve_latest()``.
 
         Args:
-            space: Card space.
-            name: Card name.
+            space: The Card space.
+            name: The Card name.
 
         Returns:
-            The latest exact `CardRef` selected by the server.
+            The exact reference of the latest Active version.
 
         Raises:
-            WyrdError: If the identity is invalid or no matching Card exists.
+            WyrdError: If `space` or `name` is invalid or no Active Card
+                matches.
         """
         ...
 
     def delete(
         self,
+        card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
         space: str | None = ...,
@@ -632,12 +1068,18 @@ class ModelCardRegistry:
     ) -> None:
         """Delete a registered ModelCard and its stored artifacts.
 
-        Provide `uid` for an exact deletion. Otherwise provide `space`,
-        `name`, and the exact `version`.
+        As ``DataCardRegistry.delete()``.
+
+        Args:
+            card_ref: Exact `CardRef` of a Model Card, used alone in place of
+                the other selector fields.
+            uid: Exact server-assigned Card UID.
+            space: Card space, required when `uid` is omitted.
+            name: Card name, required when `uid` is omitted.
+            version: Exact version, required with `space` and `name`.
 
         Raises:
-            WyrdError: If the selector is invalid, the Card is not found, or
-                deletion is rejected.
+            WyrdError: As for ``DataCardRegistry.delete()``.
         """
         ...
 
@@ -685,6 +1127,24 @@ class WorkflowCards:
         ...
 
     @overload
+    def load(self, card_ref: CardRef) -> Workflow:
+        """Load one registered Workflow by its exact `CardRef`.
+
+        Args:
+            card_ref (CardRef): The Workflow's exact reference, such as a
+                registration receipt's `root`.
+
+        Returns:
+            Workflow: A validated, runnable `wyrd.agent.Workflow` whose Agents
+                and Prompts are the exact versions it was registered with.
+
+        Raises:
+            WyrdError: `WYRD_WORKFLOW_400_INVALID_CARD_REF` for a reference to
+                another kind; otherwise as the identity overload.
+        """
+        ...
+
+    @overload
     def load(self, *, uid: str) -> Workflow:
         """Load one registered Workflow by its UID.
 
@@ -718,20 +1178,25 @@ class PromptCardRegistry:
     ) -> RegistrationReceipt:
         """Register a `PromptCard` and update its server identity.
 
+        As ``Cards.register()``, restricted to `PromptCard`.
+
         Args:
-            card: PromptCard to register.
-            version_bump: Version intent. Defaults to `VersionBump.Patch`.
+            card: The `PromptCard` to register; it receives the server identity.
+            version_bump: How the server derives the version; see
+                `VersionBump`. Omitted, `VersionBump.Patch`.
 
         Returns:
-            Receipt for the completed registration.
+            A receipt containing the resolved root reference and one outcome
+            for each registered Card.
 
         Raises:
-            WyrdError: If serialization, validation, upload, or server
-                completion fails.
+            WyrdError: If `card` is not a `PromptCard`, or serialization,
+                validation, upload, or server completion fails.
         """
         ...
     def get(
         self,
+        card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
         space: str | None = ...,
@@ -740,22 +1205,25 @@ class PromptCardRegistry:
     ) -> PromptCard:
         """Retrieve and validate one complete `PromptCard` envelope.
 
-        Pass `uid` for an exact lookup. Without `uid`, `space` and `name` are
-        required, and omitting `version` selects the latest resolved version.
-        Prompt cards do not have a separate artifact hydration step.
+        As ``DataCardRegistry.get()`` for `uid`, `space`, `name`, and
+        `version`. Prompt cards have no separate artifact hydration step.
 
         Args:
-            uid: Exact server-assigned Card UID.
+            card_ref: Exact `CardRef` of a Prompt Card, used alone in place
+                of the other selector fields.
+            uid: Exact server-assigned Card UID. When present, it takes
+                precedence over the named selector.
             space: Card space, required when `uid` is omitted.
             name: Card name, required when `uid` is omitted.
-            version: Exact version. Omit it to resolve the latest version.
+            version: Exact version. Omitted, the latest Active version.
 
         Returns:
             A native `PromptCard` populated from the server-stored Card JSON.
 
         Raises:
-            WyrdError: If the selector is invalid, the Card is not found, or
-                the envelope fails validation.
+            WyrdError: ``WYRD_REGISTRY_404_CARD_NOT_FOUND`` when no Card
+                matches, or a validation error for an invalid selector or an
+                envelope that fails validation.
         """
         ...
     def list(
@@ -772,43 +1240,51 @@ class PromptCardRegistry:
     ) -> CardList:
         """List metadata-only PromptCard summaries.
 
+        As ``DataCardRegistry.list()``.
+
         Args:
-            space: Optional space filter.
-            name: Optional name filter.
-            version_range: Optional semantic-version range.
-            status: Optional lifecycle status filter.
-            filter: Optional metadata query expression.
-            include_prerelease: Include pre-release versions in the result.
-            limit: Maximum number of summaries in this page.
-            cursor: Opaque cursor returned by a previous page.
+            space: Only Cards in this space.
+            name: Only Cards with this name.
+            version_range: Only versions in this SemVer range.
+            status: Only this lifecycle status, as for
+                ``DataCardRegistry.list()``.
+            filter: A metadata query over labels, annotations, and reserved
+                columns.
+            include_prerelease: Include pre-release versions. Default
+                ``False``.
+            limit: Page size from 1 to 200. Omitted, 50.
+            cursor: The `next_cursor` of the previous page.
 
         Returns:
             One cursor-paginated `CardList`.
 
         Raises:
-            WyrdError: If a filter, version range, or server request is invalid.
+            WyrdError: A validation error for an invalid argument, as for
+                ``DataCardRegistry.list()``.
         """
         ...
 
     def resolve_latest(self, *, space: str, name: str) -> CardRef:
-        """Resolve the latest PromptCard reference for a name.
+        """Resolve the latest Active PromptCard version.
 
-        Call `get(uid=reference.uid)` to retrieve the complete prompt Card.
+        As ``DataCardRegistry.resolve_latest()``.
 
         Args:
-            space: Card space.
-            name: Card name.
+            space: The Card space.
+            name: The Card name.
 
         Returns:
-            The latest exact `CardRef` selected by the server.
+            The exact reference of the latest Active version.
 
         Raises:
-            WyrdError: If the identity is invalid or no matching Card exists.
+            WyrdError: If `space` or `name` is invalid or no Active Card
+                matches.
         """
         ...
 
     def delete(
         self,
+        card_ref: CardRef | None = None,
         *,
         uid: str | None = ...,
         space: str | None = ...,
@@ -817,12 +1293,18 @@ class PromptCardRegistry:
     ) -> None:
         """Delete a registered PromptCard and its stored Card envelope.
 
-        Provide `uid` for an exact deletion. Otherwise provide `space`,
-        `name`, and the exact `version`.
+        As ``DataCardRegistry.delete()``.
+
+        Args:
+            card_ref: Exact `CardRef` of a Prompt Card, used alone in place of
+                the other selector fields.
+            uid: Exact server-assigned Card UID.
+            space: Card space, required when `uid` is omitted.
+            name: Card name, required when `uid` is omitted.
+            version: Exact version, required with `space` and `name`.
 
         Raises:
-            WyrdError: If the selector is invalid, the Card is not found, or
-                deletion is rejected.
+            WyrdError: As for ``DataCardRegistry.delete()``.
         """
         ...
 
@@ -831,6 +1313,15 @@ class CardSummary:
 
     A summary contains enough information to select an exact Card, but it does
     not contain the serialized envelope or local data/model artifacts.
+
+    Attributes:
+        spec_hash: BLAKE3 hash of the Card spec.
+        artifact_hash: BLAKE3 hash of the artifact manifest, or `None` for a
+            Card without artifacts.
+        status: lifecycle status: ``"pending"``, ``"active"``,
+            ``"deprecated"``, ``"failed"``, ``"expired"``, or ``"deleted"``.
+        created_at: RFC 3339 creation time.
+        updated_at: RFC 3339 time of the last update.
     """
 
     uid: str
@@ -848,7 +1339,9 @@ class CardSummary:
 class CardList:
     """One cursor-paginated page of metadata-only Card summaries.
 
-    Request another page by passing `next_cursor` as `cursor` to `list`.
+    `refs` holds each summary's `card_ref` in the same order. Request the
+    next page by passing `next_cursor` as `cursor` to `list`; it is `None` on
+    the last page.
     """
 
     items: list[CardSummary]
@@ -860,6 +1353,15 @@ class RegistrationOutcome:
 
     The outcome includes the exact reference and hashes that the server
     accepted after validation and artifact completion.
+
+    Attributes:
+        status: the Card's lifecycle status, as in `CardSummary.status`.
+        outcome: ``"registered"`` for a new version, ``"deduplicated"`` when
+            an Active Card with identical content already existed and was
+            reused, or ``"idempotent_noop"`` when the same exact version was
+            already registered with identical content.
+        card_blob_uri: where the Card envelope was stored, when one was
+            written.
     """
 
     card_ref: CardRef
@@ -870,16 +1372,16 @@ class RegistrationOutcome:
     card_blob_uri: str | None
 
 class RegistrationReceipt:
-    """Result returned after registration and artifact completion succeed.
-
-    `root` identifies the requested Card. `outcomes` contains the root and any
-    dependency Cards registered as part of the operation.
-    """
+    """Result returned after registration and artifact completion succeed."""
 
     @property
-    def root(self) -> CardRef: ...
+    def root(self) -> CardRef:
+        """The server-resolved reference of the Card you registered."""
+        ...
     @property
-    def outcomes(self) -> list[RegistrationOutcome]: ...
+    def outcomes(self) -> list[RegistrationOutcome]:
+        """One outcome per Card in the registration, root included, dependencies first."""
+        ...
 
 __all__ = [
     "AgentCard",
@@ -899,5 +1401,38 @@ __all__ = [
     "CardList",
     "RegistrationOutcome",
     "RegistrationReceipt",
+    "HydrationSummary",
     "WorkflowCards",
+    "AgentSpec",
+    "CardMetadata",
+    "CardRelationships",
+    "CardStatus",
+    "DataSpec",
+    "DriftBaselineState",
+    "DriftBaselineStatus",
+    "ModelSpec",
+    "OperatorSpec",
+    "PromptSpec",
+    "RegisteredAgentCard",
+    "RegisteredCard",
+    "RegisteredDataCard",
+    "RegisteredModelCard",
+    "RegisteredOperatorCard",
+    "RegisteredPromptCard",
+    "RegisteredServiceCard",
+    "RegisteredTriggerCard",
+    "RegisteredUntypedCard",
+    "RegisteredVerifierCard",
+    "RegisteredArtifactCard",
+    "RegisteredAuditCard",
+    "RegisteredExperimentCard",
+    "RegisteredMcpCard",
+    "RegisteredPolicyCard",
+    "RegisteredSourceCard",
+    "RegisteredWorkflowCard",
+    "ServiceSpec",
+    "TriggerSpec",
+    "TypedCardKind",
+    "VerificationStatus",
+    "VerifierSpec",
 ]

@@ -14,6 +14,7 @@
 
 use serde_json::Result as JsonResult;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::io::Cursor;
 use std::sync::Mutex;
@@ -31,12 +32,14 @@ use wyrd_client::bifrost::TableConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, PhysicalLayoutWire};
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire, QueryParam, QueryTerminalFrame,
+};
 use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult, json_to_pyobject};
 
 use wyrd_client::bifrost::Correlation;
-use wyrd_client::bifrost::{BifrostClientError, QueryResultStream, client_from_options};
+use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 
 /// Widens one Bifrost client failure into the shared Wyrd Python boundary error.
 ///
@@ -60,13 +63,47 @@ fn invalid_argument(field: &str, reason: impl Display) -> WyrdPyError {
     })
 }
 
-/// Sentinel the native poll uses to distinguish a missing terminal from a
-/// terminal that failed to serialize.
+/// Converts optional Python bind values into the shared typed scalars.
 ///
-/// Both arrive as the same `Err(String)` from the terminal projection, so the
-/// poll compares against this marker to raise the stable incomplete-stream
-/// code instead of an internal error.
-const MISSING_TERMINAL: &str = "query stream ended before its required terminal frame";
+/// `None`, `bool`, `int`, `float`, and `str` map onto [`QueryParam`] in order;
+/// `bool` is checked before `int` because Python booleans are integers. Range
+/// and finiteness are left to `BifrostQueryRequest::validate`, except an `int`
+/// outside `i64`, which cannot be represented at all.
+///
+/// # Errors
+///
+/// Returns `WYRD_SPEC_400_VALIDATION` naming `params[i]` for an unsupported
+/// type or an out-of-range integer.
+fn query_params(params: Option<Vec<Bound<'_, PyAny>>>) -> WyrdPyResult<Vec<QueryParam>> {
+    use pyo3::types::{PyBool, PyFloat, PyInt, PyString};
+    params
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let field = format!("params[{index}]");
+            if value.is_none() {
+                Ok(QueryParam::Null)
+            } else if let Ok(value) = value.cast::<PyBool>() {
+                Ok(QueryParam::Bool(value.is_true()))
+            } else if value.is_instance_of::<PyInt>() {
+                value
+                    .extract::<i64>()
+                    .map(QueryParam::Int)
+                    .map_err(|error| invalid_argument(&field, error))
+            } else if let Ok(value) = value.cast::<PyFloat>() {
+                Ok(QueryParam::Float(value.value()))
+            } else if let Ok(value) = value.cast::<PyString>() {
+                Ok(QueryParam::String(value.to_string()))
+            } else {
+                Err(invalid_argument(
+                    &field,
+                    "must be None, bool, int, float, or str",
+                ))
+            }
+        })
+        .collect()
+}
 
 /// Builds one boundary internal failure for a broken local invariant.
 ///
@@ -115,29 +152,41 @@ impl PyTableConfig {
     /// public Python wrapper assembles it from its keyword arguments so the
     /// wire contract stays the only layout shape. `compaction_target_file_size_bytes`,
     /// when present, is the explicit Forge file target the register call
-    /// requests; the server validates it.
+    /// requests; the server validates it. `compaction_type`, when present, is
+    /// one hyphenated wire spelling of the Forge compaction type.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` when the table is not `namespace.name`, the document
-    /// is not one mappable JSON Schema, a declared column is server-owned, or
-    /// the layout is not one physical-layout declaration.
+    /// is not one mappable JSON Schema, a declared column is server-owned, the
+    /// layout is not one physical-layout declaration, or the compaction type
+    /// is not one known spelling.
     #[staticmethod]
-    #[pyo3(signature = (table, schema_json, layout_json=None, compaction_target_file_size_bytes=None))]
+    #[pyo3(signature = (
+        table,
+        schema_json,
+        layout_json=None,
+        compaction_target_file_size_bytes=None,
+        compaction_type=None,
+    ))]
     fn from_json_schema(
         table: &str,
         schema_json: &str,
         layout_json: Option<&str>,
         compaction_target_file_size_bytes: Option<u64>,
+        compaction_type: Option<&str>,
     ) -> WyrdPyResult<Self> {
         let schema: Value = serde_json::from_str(schema_json)
             .map_err(|error| invalid_argument("schema_json", error))?;
         let config = TableConfig::from_json_schema(table, &schema).map_err(client_error)?;
         Ok(Self {
-            inner: apply_compaction_target(
-                apply_layout(config, layout_json)?,
-                compaction_target_file_size_bytes,
-            ),
+            inner: apply_compaction_type(
+                apply_compaction_target(
+                    apply_layout(config, layout_json)?,
+                    compaction_target_file_size_bytes,
+                ),
+                compaction_type,
+            )?,
         })
     }
 
@@ -152,29 +201,41 @@ impl PyTableConfig {
     /// Raises `WyrdError` when the bytes are not one Arrow IPC schema, the
     /// table is not `namespace.name`, a declared column is server-owned, or the
     /// layout is not one physical-layout declaration. The optional compaction
-    /// target is applied as in [`Self::from_json_schema`].
+    /// target and type are applied as in [`Self::from_json_schema`].
     #[staticmethod]
-    #[pyo3(signature = (table, schema_ipc, layout_json=None, compaction_target_file_size_bytes=None))]
+    #[pyo3(signature = (
+        table,
+        schema_ipc,
+        layout_json=None,
+        compaction_target_file_size_bytes=None,
+        compaction_type=None,
+    ))]
     fn from_arrow_ipc(
         table: &str,
         schema_ipc: &[u8],
         layout_json: Option<&str>,
         compaction_target_file_size_bytes: Option<u64>,
+        compaction_type: Option<&str>,
     ) -> WyrdPyResult<Self> {
         let schema = decode_schema_ipc(schema_ipc)?;
         let config = TableConfig::from_arrow(table, schema).map_err(client_error)?;
         Ok(Self {
-            inner: apply_compaction_target(
-                apply_layout(config, layout_json)?,
-                compaction_target_file_size_bytes,
-            ),
+            inner: apply_compaction_type(
+                apply_compaction_target(
+                    apply_layout(config, layout_json)?,
+                    compaction_target_file_size_bytes,
+                ),
+                compaction_type,
+            )?,
         })
     }
 
-    /// Fetches an already-registered table's config by name.
+    /// Fetches an already-registered table's config by name, as `client`.
     ///
-    /// Every transport argument is optional and resolves through the same chain
-    /// the constructor uses when omitted.
+    /// # Arguments
+    /// * `table` - The `namespace.name` table to describe.
+    /// * `client` - The `WyrdClient` the read is sent as, or `None` for the
+    ///   ambient chain.
     ///
     /// # Errors
     ///
@@ -182,17 +243,13 @@ impl PyTableConfig {
     /// nothing resolves a credential, and the catalog code for not-found,
     /// authorization, transport, or schema-projection failures.
     #[staticmethod]
-    #[pyo3(signature = (table, server_url=None, credential=None, grpc_url=None, tenant=None))]
+    #[pyo3(signature = (table, client=None))]
     fn describe(
         py: Python<'_>,
         table: &str,
-        server_url: Option<&str>,
-        credential: Option<&str>,
-        grpc_url: Option<&str>,
-        tenant: Option<&str>,
+        client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
     ) -> WyrdPyResult<Self> {
-        let client =
-            client_from_options(server_url, credential, grpc_url, tenant).map_err(client_error)?;
+        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
         let inner = py
             .detach(|| wyrd_runtime::runtime().block_on(TableConfig::describe(&client, table)))
             .map_err(client_error)?;
@@ -226,6 +283,16 @@ impl PyTableConfig {
         self.inner.compaction_target_file_size_bytes()
     }
 
+    /// The explicit Forge compaction type in its hyphenated wire spelling,
+    /// declared or described; `None` compacts with the `small-files` default.
+    #[getter]
+    fn compaction_type(&self) -> Option<String> {
+        self.inner
+            .compaction_type()
+            .and_then(|kind| serde_json::to_value(kind).ok())
+            .and_then(|value| value.as_str().map(str::to_owned))
+    }
+
     /// The server-assigned `(table_uid, fingerprint)`, or `None` while inert.
     #[getter]
     fn resolved(&self) -> Option<(String, String)> {
@@ -237,9 +304,9 @@ impl PyTableConfig {
 
 /// Python-facing collected query result.
 ///
-/// Holds the decoded Rust batches; [`PyQueryResult::to_ipc`] encodes them once
-/// so Python builds its own Arrow table, and the terminal is handed over as
-/// JSON so the wire contract stays the only terminal shape.
+/// Holds the decoded Rust batches; [`PyQueryResult::to_bytes`] encodes them once
+/// so Python builds its own Arrow table, and the terminal is projected as a
+/// typed [`PyQueryTerminal`] over the wire frame.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "QueryResult")]
 pub struct PyQueryResult {
     /// The native result every projection reads.
@@ -253,20 +320,14 @@ impl PyQueryResult {
     /// # Errors
     ///
     /// Raises `WyrdError` when IPC encoding fails.
-    fn to_ipc(&self) -> WyrdPyResult<Vec<u8>> {
-        self.inner.to_ipc().map_err(client_error)
+    fn to_bytes(&self) -> WyrdPyResult<Vec<u8>> {
+        self.inner.to_bytes().map_err(client_error)
     }
 
-    /// The validated terminal frame, serialized.
-    ///
-    /// # Errors
-    ///
-    /// Raises `WyrdError` when the terminal cannot be serialized.
+    /// The validated terminal frame the server closed the stream with.
     #[getter]
-    fn terminal_json(&self) -> WyrdPyResult<String> {
-        serde_json::to_string(self.inner.terminal()).map_err(|error| {
-            boundary_internal(format!("query terminal is not serializable: {error}"))
-        })
+    fn terminal(&self) -> PyQueryTerminal {
+        PyQueryTerminal(self.inner.terminal().clone())
     }
 
     /// Total decoded rows across every batch.
@@ -275,12 +336,124 @@ impl PyQueryResult {
     }
 }
 
+/// Python-facing typed view of one validated query terminal frame.
+///
+/// Closed wire enums read back as their snake_case wire names, so Python sees
+/// the same vocabulary the HTTP and gRPC contracts publish without decoding
+/// JSON. The frame is immutable once validated by the native stream.
+#[pyclass(module = "wyrd._wyrd.bifrost", name = "QueryTerminal", frozen)]
+pub struct PyQueryTerminal(QueryTerminalFrame);
+
+/// Returns the serde wire name of one closed unit-variant wire enum.
+///
+/// # Errors
+///
+/// Raises `WyrdError` when the value does not serialize to a JSON string,
+/// which a closed `rename_all = "snake_case"` enum never does.
+fn wire_name(value: &impl serde::Serialize) -> WyrdPyResult<String> {
+    match serde_json::to_value(value) {
+        Ok(Value::String(name)) => Ok(name),
+        _ => Err(boundary_internal("query terminal enum has no wire name")),
+    }
+}
+
+#[pymethods]
+impl PyQueryTerminal {
+    /// Stream outcome: `success`, `degraded`, or `failed`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the outcome has no wire name.
+    #[getter]
+    fn outcome(&self) -> WyrdPyResult<String> {
+        wire_name(&self.0.outcome)
+    }
+
+    /// Path Oracle ran the query on: `interactive` or `analytical`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the class has no wire name.
+    #[getter]
+    fn query_class(&self) -> WyrdPyResult<String> {
+        wire_name(&self.0.query_class)
+    }
+
+    /// Rows already emitted in batch frames.
+    #[getter]
+    fn row_count(&self) -> u64 {
+        self.0.row_count
+    }
+
+    /// Closed warnings the server attached, as wire names.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when a warning has no wire name.
+    #[getter]
+    fn warnings(&self) -> WyrdPyResult<Vec<String>> {
+        self.0.warnings.iter().map(wire_name).collect()
+    }
+
+    /// Completion outcome per source tier present in the cut.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when a source or outcome has no wire name.
+    #[getter]
+    fn source_completion(&self) -> WyrdPyResult<BTreeMap<String, String>> {
+        self.0
+            .source_completion
+            .iter()
+            .map(|entry| Ok((wire_name(&entry.source)?, wire_name(&entry.outcome)?)))
+            .collect()
+    }
+
+    /// Stable failure code for a failed terminal, otherwise `None`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when the code has no wire name.
+    #[getter]
+    fn error_code(&self) -> WyrdPyResult<Option<String>> {
+        self.0
+            .error
+            .as_ref()
+            .map(|error| wire_name(&error.code))
+            .transpose()
+    }
+
+    /// Scrubbed failure diagnostic for a failed terminal, when the server sent one.
+    #[getter]
+    fn error_detail(&self) -> Option<&str> {
+        self.0
+            .error
+            .as_ref()
+            .and_then(|error| error.detail.as_ref())
+            .map(wyrd_spec::vala::api::QueryErrorDetail::as_str)
+    }
+
+    /// Compact debugging representation naming outcome, class, and rows.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WyrdError` when an enum has no wire name.
+    fn __repr__(&self) -> WyrdPyResult<String> {
+        Ok(format!(
+            "QueryTerminal(outcome={:?}, query_class={:?}, row_count={})",
+            self.outcome()?,
+            self.query_class()?,
+            self.0.row_count
+        ))
+    }
+}
+
 /// Python-facing [`NativeBifrost`]: query any authorized table, write to the
 /// active one.
 ///
-/// Construction dials the ingest channel, so it performs IO; every transport
-/// argument is optional and falls through the existing resolution chain exactly
-/// once when omitted.
+/// Construction dials the ingest channel, so it performs IO. Its one identity
+/// argument is an optional `WyrdClient`; omitted, the ambient chain resolves
+/// exactly once.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "Bifrost")]
 pub struct Bifrost {
     /// The one native client both public Python facades drive.
@@ -291,52 +464,38 @@ pub struct Bifrost {
 impl Bifrost {
     /// Connects one client, optionally already bound to a write target.
     ///
-    /// Without `client`, the transport resolves from the explicit options and
-    /// then the environment chain exactly as before. With `client`, the
-    /// supplied Rust `WyrdClient` — plain or delegated — is used as is, so no
-    /// second credential is resolved; it cannot be combined with
-    /// `server_url`, `credential`, `grpc_url`, or `tenant`.
+    /// The supplied `WyrdClient`, plain or delegated, is used as is; omitted,
+    /// the ambient chain resolves once. `client_byte_limit_bytes` overrides
+    /// the handle-wide ingestion byte budget (256 MiB by default).
+    ///
+    /// # Arguments
+    /// * `table` - The active write target, or `None` for a query-only client.
+    /// * `client` - The `WyrdClient` every call is sent as, or `None` for the
+    ///   ambient chain.
+    /// * `client_byte_limit_bytes` - The handle-wide ingestion byte budget.
     ///
     /// # Errors
     ///
-    /// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` when `client` is
-    /// combined with a transport option, `WYRD_CLIENT_401_NO_CREDENTIALS` when
-    /// nothing in the chain resolves a credential, and the catalog code for a
-    /// failure to dial the ingest channel.
+    /// Raises `WyrdError` carrying `WYRD_CLIENT_400_CONFIG_INVALID` when the
+    /// byte budget cannot seal one message, `WYRD_CLIENT_401_NO_CREDENTIALS`
+    /// when nothing in the chain resolves a credential, and the catalog code
+    /// for a failure to dial the ingest channel.
     #[new]
-    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None, client=None, tenant=None))]
+    #[pyo3(signature = (table=None, client=None, client_byte_limit_bytes=None))]
     fn __new__(
         py: Python<'_>,
         table: Option<PyTableConfig>,
-        server_url: Option<&str>,
-        credential: Option<&str>,
-        grpc_url: Option<&str>,
         client: Option<PyRef<'_, crate::client::PyWyrdClient>>,
-        tenant: Option<&str>,
+        client_byte_limit_bytes: Option<usize>,
     ) -> WyrdPyResult<Self> {
-        let client = match client {
-            Some(_)
-                if server_url.is_some()
-                    || credential.is_some()
-                    || grpc_url.is_some()
-                    || tenant.is_some() =>
-            {
-                return Err(invalid_argument(
-                    "client",
-                    "cannot be combined with server_url, credential, grpc_url, or tenant",
-                ));
-            }
-            Some(client) => client.inner().clone(),
-            None => client_from_options(server_url, credential, grpc_url, tenant)
-                .map_err(client_error)?,
-        };
+        let client = crate::client::PyWyrdClient::resolve(client.as_deref())?;
         let table = table.map(|table| table.inner);
         let handle = py
             .detach(|| {
                 wyrd_runtime::runtime().block_on(NativeBifrost::connect_with_config(
                     &client,
                     table,
-                    wyrd_queue::QueueConfig::default(),
+                    wyrd_queue::QueueConfig::with_client_byte_limit(client_byte_limit_bytes),
                 ))
             })
             .map_err(client_error)?;
@@ -452,34 +611,54 @@ impl Bifrost {
 
     /// Runs one SQL SELECT and collects every batch.
     ///
+    /// `params` bind the `$1..$n` placeholders in order as typed data; they
+    /// are never interpolated into `query`.
+    ///
     /// # Errors
     ///
     /// Raises `WyrdError` carrying `WYRD_VALA_502_QUERY_STREAM_INCOMPLETE`
     /// when the response ends without its required terminal, and the catalog
     /// code for invalid SQL, the query floor's refusal, or transport and
     /// authorization failures.
-    fn sql(&self, py: Python<'_>, query: &str) -> WyrdPyResult<PyQueryResult> {
+    #[pyo3(signature = (query, params=None))]
+    fn sql(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        params: Option<Vec<Bound<'_, PyAny>>>,
+    ) -> WyrdPyResult<PyQueryResult> {
+        let params = query_params(params)?;
         let inner = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.handle.sql(query)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.sql(query, &params)))
             .map_err(client_error)?;
         Ok(PyQueryResult { inner })
     }
 
     /// Starts one query and returns its terminal-validating native stream.
     ///
+    /// `params` bind positionally exactly as in [`PyBifrost::sql`].
+    ///
+    /// # Arguments
+    /// * `query` - One SQL SELECT statement.
+    /// * `params` - Values bound to `$1..$n` in order, or `None`.
+    /// * `deadline_ms` - The query deadline in milliseconds, or `None` for the
+    ///   server default.
+    ///
     /// # Errors
     ///
-    /// Raises `WyrdError` with the catalog code for request-contract or
-    /// transport failures.
-    #[pyo3(signature = (sql, deadline_ms=None))]
+    /// Raises `WyrdError` with the catalog code for request-contract, bind
+    /// value, or transport failures.
+    #[pyo3(signature = (query, params=None, deadline_ms=None))]
     fn stream(
         &self,
         py: Python<'_>,
-        sql: &str,
+        query: &str,
+        params: Option<Vec<Bound<'_, PyAny>>>,
         deadline_ms: Option<i64>,
     ) -> WyrdPyResult<PyBifrostQueryStream> {
         let request = BifrostQueryRequest {
-            sql: sql.to_owned(),
+            params: query_params(params)?,
+            sql: query.to_owned(),
             deadline_ms,
         };
         let stream = py
@@ -491,7 +670,7 @@ impl Bifrost {
             consumer: Mutex::new(()),
             stream: Mutex::new(Some(Box::new(stream))),
             poll_abort: Mutex::new(PollAbortState::new()),
-            terminal_json: Mutex::new(None),
+            terminal: Mutex::new(None),
         })
     }
 
@@ -546,8 +725,7 @@ impl Bifrost {
     ) -> WyrdPyResult<Py<PyAny>> {
         let description = py
             .detach(|| {
-                wyrd_runtime::runtime()
-                    .block_on(self.handle.describe(&format!("{namespace}.{name}")))
+                wyrd_runtime::runtime().block_on(self.handle.describe_table(namespace, name))
             })
             .map_err(client_error)?;
         to_python_json(py, serde_json::to_value(description))
@@ -593,6 +771,26 @@ fn apply_compaction_target(config: TableConfig, bytes: Option<u64>) -> TableConf
     match bytes {
         None => config,
         Some(bytes) => config.with_compaction_target_file_size_bytes(bytes),
+    }
+}
+
+/// Applies one optional explicit compaction type to a config.
+///
+/// The spelling is the hyphenated wire value, parsed by the wire type's own
+/// serde contract so Python accepts exactly what the server accepts.
+///
+/// # Errors
+///
+/// Returns the stable Wyrd invalid-argument error when the spelling is not one
+/// known compaction type.
+fn apply_compaction_type(config: TableConfig, raw: Option<&str>) -> WyrdPyResult<TableConfig> {
+    match raw {
+        None => Ok(config),
+        Some(raw) => {
+            let kind: CompactionTypeWire = serde_json::from_value(Value::String(raw.to_owned()))
+                .map_err(|error| invalid_argument("compaction_type", error))?;
+            Ok(config.with_compaction_type(kind))
+        }
     }
 }
 
@@ -701,8 +899,8 @@ pub struct PyBifrostQueryStream {
     stream: Mutex<Option<Box<QueryResultStream>>>,
     /// Short-held state for aborting the currently pending native poll.
     poll_abort: Mutex<PollAbortState>,
-    /// Serialized terminal retained after the Rust stream is released.
-    terminal_json: Mutex<Option<String>>,
+    /// Validated terminal retained after the Rust stream is released.
+    terminal: Mutex<Option<QueryTerminalFrame>>,
 }
 
 /// Abort state for exactly one serialized native query poll.
@@ -749,8 +947,8 @@ impl PollAbortState {
 enum NativePollOutcome {
     /// One Arrow batch encoded successfully.
     Batch(Vec<u8>),
-    /// The stream completed with serialized terminal metadata.
-    Complete(String),
+    /// The stream completed with its validated terminal.
+    Complete(QueryTerminalFrame),
     /// The stream was already closed before polling began.
     Closed,
     /// Explicit close aborted the pending network poll.
@@ -759,22 +957,22 @@ enum NativePollOutcome {
     QueryError {
         /// Structured SDK error projected after native ownership is released.
         error: BifrostClientError,
-        /// Optional serialized terminal retained before projecting the error.
-        terminal: Option<String>,
+        /// Optional terminal retained before projecting the error.
+        terminal: Option<QueryTerminalFrame>,
     },
     /// Local serialization or Arrow encoding failed.
     ProjectionError(String),
 }
 
 impl PyBifrostQueryStream {
-    /// Retains one serialized terminal so `terminal_json` can return it after the poll.
+    /// Retains one terminal so `terminal` can return it after the poll.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` when the terminal lock is poisoned.
-    fn retain_terminal(&self, terminal: String) -> WyrdPyResult<()> {
+    fn retain_terminal(&self, terminal: QueryTerminalFrame) -> WyrdPyResult<()> {
         *self
-            .terminal_json
+            .terminal
             .lock()
             .map_err(|_| boundary_internal("terminal lock poisoned"))? = Some(terminal);
         Ok(())
@@ -823,18 +1021,9 @@ impl PyBifrostQueryStream {
                                 NativePollOutcome::Aborted
                             }
                             Ok(Err(error)) => {
-                                let terminal = stream
-                                    .terminal()
-                                    .map(serde_json::to_string)
-                                    .transpose()
-                                    .map_err(|error| error.to_string());
+                                let terminal = stream.terminal().cloned();
                                 drop(stream_slot.take());
-                                match terminal {
-                                    Ok(terminal) => {
-                                        NativePollOutcome::QueryError { error, terminal }
-                                    }
-                                    Err(error) => NativePollOutcome::ProjectionError(error),
-                                }
+                                NativePollOutcome::QueryError { error, terminal }
                             }
                             Ok(Ok(Some(batch))) => match encode_batch(&batch) {
                                 Ok(batch) => NativePollOutcome::Batch(batch),
@@ -844,24 +1033,14 @@ impl PyBifrostQueryStream {
                                 }
                             },
                             Ok(Ok(None)) => {
-                                let terminal = stream
-                                    .terminal()
-                                    .map(serde_json::to_string)
-                                    .transpose()
-                                    .map_err(|error| error.to_string())
-                                    .and_then(|terminal| {
-                                        terminal.ok_or_else(|| MISSING_TERMINAL.to_owned())
-                                    });
+                                let terminal = stream.terminal().cloned();
                                 drop(stream_slot.take());
                                 match terminal {
-                                    Ok(terminal) => NativePollOutcome::Complete(terminal),
-                                    Err(error) if error == MISSING_TERMINAL => {
-                                        NativePollOutcome::QueryError {
-                                            error: BifrostClientError::IncompleteQueryStream,
-                                            terminal: None,
-                                        }
-                                    }
-                                    Err(error) => NativePollOutcome::ProjectionError(error),
+                                    Some(terminal) => NativePollOutcome::Complete(terminal),
+                                    None => NativePollOutcome::QueryError {
+                                        error: BifrostClientError::IncompleteQueryStream,
+                                        terminal: None,
+                                    },
                                 }
                             }
                         }
@@ -898,16 +1077,16 @@ impl PyBifrostQueryStream {
         })
     }
 
-    /// Returns serialized terminal metadata after validated completion.
+    /// Returns the typed terminal after validated completion, else `None`.
     ///
     /// # Errors
     ///
     /// Raises `WyrdError` when internal synchronization was poisoned.
     #[getter]
-    fn terminal_json(&self) -> WyrdPyResult<Option<String>> {
-        self.terminal_json
+    fn terminal(&self) -> WyrdPyResult<Option<PyQueryTerminal>> {
+        self.terminal
             .lock()
-            .map(|terminal| terminal.clone())
+            .map(|terminal| terminal.clone().map(PyQueryTerminal))
             .map_err(|_| boundary_internal("terminal lock poisoned"))
     }
 
@@ -953,10 +1132,23 @@ impl PyBifrostQueryStream {
 /// application has bound. Queue saturation is swallowed and counted on the
 /// client's drop counter instead of being raised.
 ///
+/// The Python facade serializes the caller's schema mapping and row before
+/// this call, so `schema` and `row` arrive as JSON text.
+///
+/// # Arguments
+/// * `bifrost` - The client whose producers carry the row.
+/// * `table` - The destination `<namespace>.<name>` table.
+/// * `schema` - The table's JSON Schema as JSON text.
+/// * `row` - One row as JSON object text.
+/// * `card_ref` - The optional `space/Kind/name@version` stamped on the row.
+/// * `run_id` - The optional run identifier stamped on the row.
+///
 /// # Errors
 ///
-/// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` for a malformed JSON
-/// schema, an unsupported schema node, or an invalid card reference.
+/// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` for schema text that
+/// is not JSON or an invalid card reference, and the shared mapper's
+/// `WYRD_VALA_400_SCHEMA_PARSE` for a schema with no mappable columns, the
+/// same code `TableConfig.from_json_schema` raises.
 #[pyfunction]
 #[pyo3(signature = (bifrost, table, schema, row, card_ref=None, run_id=None))]
 fn record(
@@ -970,7 +1162,7 @@ fn record(
     let schema_value: Value =
         serde_json::from_str(schema).map_err(|error| invalid_argument("schema", error))?;
     let schema = wyrd_queue::json_schema_to_arrow(&schema_value)
-        .map_err(|error| invalid_argument("schema", error))?;
+        .map_err(|error| client_error(error.into()))?;
     wyrd_client::bifrost::observe::record(
         &bifrost.borrow().handle,
         table,
@@ -989,6 +1181,7 @@ pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Bifrost>()?;
     module.add_class::<PyTableConfig>()?;
     module.add_class::<PyQueryResult>()?;
+    module.add_class::<PyQueryTerminal>()?;
     module.add_class::<PyBifrostQueryStream>()?;
     Ok(())
 }

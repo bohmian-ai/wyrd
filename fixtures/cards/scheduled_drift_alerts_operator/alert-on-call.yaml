@@ -1,0 +1,14 @@
+apiVersion: wyrd/v1
+kind: Operator
+metadata:
+  name: alert-on-call
+  version: 1.0.0
+  space: default
+spec:
+  description: Page the on-call hook when latency shifts. The origin comes from the connection.
+  kind: http
+  method: post
+  url: /hooks/latency-shift
+  auth:
+    scheme: bearer
+    connection: on-call-hooks

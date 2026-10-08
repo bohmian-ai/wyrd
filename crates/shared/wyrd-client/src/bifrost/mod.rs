@@ -12,12 +12,12 @@
 //!   requested physical layout, built from Arrow or JSON Schema or fetched by
 //!   name. The server stays authoritative for the uid and fingerprint it
 //!   reports back through [`ResolvedTable`].
-//! - [`BifrostIngestSink`] — the `wyrd-queue` [`BatchSink`] that maps one sealed
+//! - `BifrostIngestSink` — the `wyrd-queue` [`BatchSink`] that maps one sealed
 //!   batch onto the ingest RPC (`table`, `wyrd_batch_id`, Arrow IPC frames),
 //!   preserving `batch_id` so the server's commit dedup holds across retries.
 //! - [`observe`] — fire-and-forget telemetry that never breaks its caller.
 //!
-//! Query streaming and lifecycle — [`Bifrost::query`], [`Bifrost::collect_bounded`],
+//! Query streaming and lifecycle — [`Bifrost::sql`], [`Bifrost::stream`],
 //! [`Bifrost::running`], [`Bifrost::status`], and [`Bifrost::cancel`] — and the
 //! ingest transport are reached only through the facade; the query mechanic
 //! behind them is not publicly nameable:
@@ -30,7 +30,7 @@
 //! use wyrd_client::bifrost::RawQueryStream;
 //! ```
 //!
-//! [`ClientScope`] is a credential fingerprint the **token-opaque** client tier
+//! `ClientScope` is a credential fingerprint the **token-opaque** client tier
 //! computes without ever decoding a JWT: `(server_url, SHA-256 of the resolved
 //! credential's secret material)`. Backpressure is asymmetric — [`Bifrost::insert`]
 //! propagates queue-full to the caller, while [`observe::record`] swallows it,
@@ -48,7 +48,11 @@ mod scope;
 mod sink;
 mod table;
 
-pub use facade::{Bifrost, QueryResult, client_from_options, register_outcome_name};
+pub use facade::{Bifrost, QueryResult};
+/// Binding plumbing: the explicit-option client door and the shared register
+/// outcome spelling the Python and TypeScript bindings project.
+#[cfg(feature = "internal")]
+pub use facade::{client_from_options, register_outcome_name};
 /// Raw ingest transport, exposed only to test harnesses that must submit exact
 /// sealed batches (replay and deduplication journeys) without the facade.
 #[cfg(feature = "test-support")]
@@ -57,16 +61,21 @@ pub use handle::BifrostMetrics;
 pub use query::{
     BifrostClientError, CollectedQueryLimits, CollectedQueryResult, QueryResultStream,
 };
-pub use scope::{ClientScope, SinkKind};
+/// The producer-pool scope key, nameable only by internal consumers.
+#[cfg(feature = "internal")]
+pub use scope::ClientScope;
+pub use scope::SinkKind;
+/// The owned-batch ingest seam, nameable only by internal test harnesses.
+#[cfg(feature = "internal")]
 pub use sink::{BifrostIngestSink, IngestTransport};
 pub use table::{Correlation, ResolvedTable, TableConfig, WriterTable};
 /// The bounded producer-queue configuration a Bifrost writer is connected with.
 pub use wyrd_queue::QueueConfig;
-
-// C4a forward schema helpers, re-exported so SDK users build the user Arrow
-// schema from a `FieldSpec` set or a JSON-Schema value without reaching into
-// `wyrd-queue` directly.
-pub use wyrd_queue::{fieldspec_to_arrow, json_schema_to_arrow};
+/// The physical compaction type a [`TableConfig`] declares, re-exported so SDK
+/// users name it through this public Bifrost surface.
+pub use wyrd_spec::vala::api::CompactionTypeWire;
+/// One typed positional bind value for [`Bifrost::sql`] and its siblings.
+pub use wyrd_spec::vala::api::QueryParam;
 
 /// Server-free unit lane for the Bifrost client: scope identity, producer pooling, and
 /// the asymmetric backpressure contract — all driven through mock/stall sinks.
@@ -148,16 +157,15 @@ mod sdk {
         br#"{"id": 1}"#.to_vec()
     }
 
-    /// Config that saturates fast: a stalled sink parks the drain, the tiny channel
-    /// fills, and further enqueues return queue-full.
+    /// Config that saturates fast: every row seals at once, a stalled sink
+    /// never releases a frame, the small byte budget fills, and further
+    /// enqueues return queue-full.
     fn saturating_config() -> QueueConfig {
         QueueConfig {
-            channel_capacity: 2,
-            staging_capacity: 8,
-            flush_max_rows: 1,
-            flush_interval_ms: 0,
+            client_byte_limit_bytes: 8 * 1024,
+            linger_ms: 0,
             flush_timeout_ms: 60_000,
-            max_message_bytes: 4 * 1024 * 1024,
+            max_message_bytes: 2 * 1024,
             ..QueueConfig::default()
         }
     }
@@ -281,86 +289,27 @@ mod sdk {
             .expect("an uncorrelated row is a valid write");
     }
 
-    /// Refuses a distinct producer before the handle grows beyond its configured cap.
+    /// One handle serves a thousand tables with no producer cap, and an idle
+    /// producer holds no bytes.
     #[test]
-    fn bifrost_producer_cap_refuses_before_registry_growth() {
-        let bifrost = pool(
-            Arc::new(MockSink::new()),
-            QueueConfig {
-                max_producers: 1,
-                ..QueueConfig::default()
-            },
-        );
+    fn a_thousand_tables_share_one_handle_budget() {
+        let bifrost = pool(Arc::new(MockSink::new()), QueueConfig::default());
         let schema = test_schema();
-        bifrost
-            .insert("ns.first", &schema, row(), Some(card()), None)
-            .expect("first producer accepted");
-        assert!(matches!(
-            bifrost.insert("ns.second", &schema, row(), Some(card()), None),
-            Err(wyrd_queue::WyrdQueueError::Backpressure)
-        ));
-        assert_eq!(
-            bifrost.producer_count(),
-            1,
-            "rejection precedes pool growth"
-        );
-    }
-
-    /// Admits at most the default 64 producer envelopes inside one 32 MiB owner.
-    #[test]
-    fn default_producer_envelopes_charge_before_registry_growth() {
-        let bifrost = pool(
-            Arc::new(MockSink::new()),
-            QueueConfig {
-                // Disable timer work so the test isolates default cardinality
-                // admission rather than concurrent frame construction.
-                flush_interval_ms: 0,
-                ..QueueConfig::default()
-            },
-        );
-        let schema = test_schema();
-        for index in 0..QueueConfig::MAX_LIVE_ENTRIES {
+        for index in 0..1_000 {
             bifrost
                 .insert(
-                    &format!("ns.capacity_{index}"),
+                    &format!("ns.table_{index}"),
                     &schema,
                     row(),
                     Some(card()),
                     None,
                 )
-                .expect("default producer envelope fits before construction");
+                .expect("no table count is refused");
         }
-        let admitted = bifrost.metrics();
-        assert_eq!(admitted.producers, QueueConfig::MAX_LIVE_ENTRIES);
-        assert!(
-            admitted.total_reserved_bytes <= QueueConfig::MAX_CLIENT_BYTE_LIMIT,
-            "fixed and dynamic ownership stays inside the one 32 MiB budget: {admitted:?}"
-        );
-        assert!(matches!(
-            bifrost.insert("ns.capacity_overflow", &schema, row(), Some(card()), None),
-            Err(wyrd_queue::WyrdQueueError::Backpressure)
-        ));
-        let refused = bifrost.metrics();
-        assert_eq!(
-            refused.producers,
-            QueueConfig::MAX_LIVE_ENTRIES,
-            "refusal occurs before the registry can grow"
-        );
-        assert!(
-            refused.total_reserved_bytes <= QueueConfig::MAX_CLIENT_BYTE_LIMIT,
-            "refusal cannot oversubscribe the owner: {refused:?}"
-        );
-        let shutdown = bifrost.shutdown();
-        assert!(
-            shutdown.is_ok(),
-            "default producer cleanup: {shutdown:?}; metrics={:?}",
-            bifrost.metrics()
-        );
-        assert_eq!(
-            bifrost.metrics().total_reserved_bytes,
-            0,
-            "shutdown removes producer fixed-storage charges"
-        );
+        assert_eq!(bifrost.metrics().producers, 1_000);
+        bifrost.shutdown().expect("every table drains");
+        let settled = bifrost.metrics();
+        assert_eq!((settled.producers, settled.owned_bytes), (0, 0));
     }
 
     /// A saturated queue reaches the caller of the public client as a stable
@@ -514,15 +463,14 @@ mod sdk {
         );
     }
 
-    /// Flush visits every producer and shutdown releases fixed storage after terminal settlement.
+    /// Flush visits every producer and shutdown removes terminally settled producers.
     #[test]
     fn lifecycle_drains_all_producers_after_first_error() {
         let sink = Arc::new(LifecycleSink::default());
         let bifrost = pool(
             Arc::clone(&sink) as Arc<dyn BatchSink<ClientByteGuard>>,
             QueueConfig {
-                flush_max_rows: 2,
-                flush_interval_ms: 0,
+                linger_ms: 60_000,
                 ..QueueConfig::default()
             },
         );
@@ -542,7 +490,7 @@ mod sdk {
 
         bifrost
             .shutdown()
-            .expect("terminally settled producers release their fixed storage on shutdown");
+            .expect("terminally settled producers shut down");
         assert!(
             bifrost
                 .insert("b", &schema, row(), Some(card()), None)
@@ -571,6 +519,99 @@ mod sdk {
             bifrost.dropped() > 0,
             "overflow on the telemetry path is counted, never surfaced"
         );
+    }
+
+    /// A sink that parks every send until released, then acknowledges and
+    /// counts the rows it delivered.
+    #[derive(Default)]
+    struct ReleasingSink {
+        /// Set once the first send reaches the sink.
+        started: AtomicBool,
+        /// Set once the test lets parked sends acknowledge.
+        released: AtomicBool,
+        /// Rows acknowledged after release.
+        sent_rows: std::sync::atomic::AtomicUsize,
+        /// Wakes parked sends on release.
+        wake: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl BatchSink<ClientByteGuard> for ReleasingSink {
+        /// Parks until released, then acknowledges the batch and counts its rows.
+        ///
+        /// # Errors
+        ///
+        /// None; the `Result` is the [`BatchSink`] contract.
+        async fn send(
+            &self,
+            batch: &SealedBatch<ClientByteGuard>,
+        ) -> Result<DurableBatchAck, SinkError> {
+            self.started.store(true, Ordering::SeqCst);
+            while !self.released.load(Ordering::SeqCst) {
+                let notified = self.wake.notified();
+                if self.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
+            let rows = usize::try_from(batch.rows).unwrap_or(usize::MAX);
+            self.sent_rows.fetch_add(rows, Ordering::SeqCst);
+            Ok(DurableBatchAck {
+                batch_id: batch.batch_id,
+                rows: batch.rows,
+            })
+        }
+    }
+
+    /// A stalled downstream refuses with a bounded queue-full, and once it
+    /// drains every accepted row is delivered and the next write is accepted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stall produces no refusal, a refusal carries another
+    /// code, or the released sink does not deliver exactly the accepted rows.
+    #[test]
+    fn downstream_stall_remains_bounded_and_recovers_after_drain() {
+        let sink = Arc::new(ReleasingSink::default());
+        let bifrost = client_over(sink.clone(), saturating_config());
+        bifrost.use_table(table("ns.tbl"));
+        let wait_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done() {
+                assert!(Instant::now() < deadline, "{what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        bifrost.insert(row(), correlated()).expect("first accepted");
+        wait_for("the sink never started", &|| {
+            sink.started.load(Ordering::SeqCst)
+        });
+        let mut accepted = 1_usize;
+        let mut rejected = 0_usize;
+        for _ in 0..100 {
+            match bifrost.insert(row(), correlated()) {
+                Ok(()) => accepted += 1,
+                Err(error) => {
+                    assert_eq!(WyrdError::from(&error).code(), "WYRD_CLIENT_429_QUEUE_FULL");
+                    rejected += 1;
+                }
+            }
+        }
+        assert!(rejected > 0, "a stalled downstream refuses, bounded");
+
+        sink.released.store(true, Ordering::SeqCst);
+        sink.wake.notify_waiters();
+        wait_for("the released sink did not drain", &|| {
+            sink.sent_rows.load(Ordering::SeqCst) >= accepted
+        });
+        bifrost
+            .insert(row(), correlated())
+            .expect("post-drain write accepted");
+        wait_for("the post-drain write was not delivered", &|| {
+            sink.sent_rows.load(Ordering::SeqCst) > accepted
+        });
+        assert_eq!(sink.sent_rows.load(Ordering::SeqCst), accepted + 1);
     }
 
     struct RecordingTransport {
@@ -668,6 +709,91 @@ mod sdk {
         );
     }
 
+    /// A table swapped in while registration is in flight keeps its own identity.
+    ///
+    /// `register` releases the active-table lock for its network round trip, so
+    /// the response can arrive after `use_table` has rebound the client. The
+    /// swap is deterministic rather than timed: the register future is polled
+    /// exactly once, which builds its request and parks on the HTTP response,
+    /// and only then is the binding replaced. Each table's registration answers
+    /// with its own identity, so a stamped foreign identity is visible.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the in-flight response overwrites the rebound table's
+    /// identity or a registration does not complete.
+    #[tokio::test]
+    async fn register_never_stamps_one_tables_identity_onto_another() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wyrd_spec::vala::api::RegisterOutcome;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-access-token",
+                "refresh_token": "unused-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .mount(&server)
+            .await;
+        for (name, uid, fingerprint) in [
+            ("bound", "11".repeat(16), "aa".repeat(32)),
+            ("inflight", "22".repeat(16), "bb".repeat(32)),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/v1/bifrost/tables"))
+                .and(body_partial_json(serde_json::json!({ "name": name })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "outcome": "Created",
+                    "table_uid": uid,
+                    "fingerprint": fingerprint
+                })))
+                .mount(&server)
+                .await;
+        }
+        let client = crate::WyrdClient::with_config(config_with_key(&server.uri(), "secret"))
+            .expect("client assembles");
+        let bifrost = Bifrost::with_sink(
+            &client,
+            Some(table("vala.datasets.bound")),
+            Arc::new(MockSink::new()),
+            QueueConfig::default(),
+        );
+        assert_eq!(
+            bifrost.register().await.expect("register the bound table"),
+            RegisterOutcome::Created
+        );
+        let bound = bifrost.table().expect("the bound table stays bound");
+        let bound_identity = bound.resolved().cloned().expect("bound table resolved");
+
+        bifrost.use_table(table("vala.datasets.inflight"));
+        let register = bifrost.register();
+        tokio::pin!(register);
+        tokio::select! {
+            biased;
+            _ = &mut register => panic!("register cannot settle before the server answers"),
+            () = std::future::ready(()) => {}
+        }
+        bifrost.use_table(bound);
+        assert_eq!(
+            register
+                .await
+                .expect("the in-flight registration completes"),
+            RegisterOutcome::Created
+        );
+
+        let active = bifrost.table().expect("the rebound table stays bound");
+        assert_eq!(active.fqn(), "vala.datasets.bound");
+        assert_eq!(
+            active.resolved(),
+            Some(&bound_identity),
+            "a response must never overwrite the identity of a different table"
+        );
+    }
+
     /// Names every query streaming and lifecycle operation through the async and
     /// blocking facades, so removing or renaming one fails compilation.
     ///
@@ -683,7 +809,7 @@ mod sdk {
             Bifrost::running,
             Bifrost::status,
             Bifrost::cancel,
-            Bifrost::describe,
+            Bifrost::describe_table,
         );
         let _ = (
             crate::bifrost::blocking::Bifrost::query,
@@ -693,7 +819,7 @@ mod sdk {
             crate::bifrost::blocking::Bifrost::running,
             crate::bifrost::blocking::Bifrost::status,
             crate::bifrost::blocking::Bifrost::cancel,
-            crate::bifrost::blocking::Bifrost::describe,
+            crate::bifrost::blocking::Bifrost::describe_table,
         );
     }
 }

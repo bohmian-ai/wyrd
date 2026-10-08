@@ -7,10 +7,8 @@
 //! Data Card versions the row pins, reads that Data Card's registered
 //! `data/data.parquet` artifact from storage, fits it with the existing
 //! `vala-drift` fitter off the async runtime, and settles the same row
-//! `ready` or `failed`. Every fit holds one slot of the Verifier permits the
-//! runner shares, taken before the claim and kept through settlement, so fits
-//! and runs together respect the global and per-tenant ceilings; many
-//! processes share the queue through `SKIP LOCKED` claims. Decoding stops at a
+//! `ready` or `failed`. Fits do not compete with Verifier runs for execution
+//! permits; processes share the queue through `SKIP LOCKED` claims. Decoding stops at a
 //! decoded-byte budget. Shutdown closes claim admission at once, gives a fit
 //! admitted before it the runtime's drain grace to finish and settle, and then
 //! cancels it; the blocking decode and fit observe that cancellation and the
@@ -44,7 +42,6 @@ use super::CapabilityCrash;
 use super::RuntimeLimits;
 #[cfg(feature = "test-support")]
 use super::health::RuntimeCapability;
-use super::permits::VerifierPermits;
 
 /// Stable error code when the pinned Verifier or Data Card cannot be used.
 pub const BASELINE_DATA_UNAVAILABLE: &str = "baseline_data_unavailable";
@@ -85,8 +82,6 @@ pub struct BaselineFitter {
     lease: chrono::Duration,
     /// Idle wait between passes.
     poll_interval: Duration,
-    /// Global and per-tenant capacity shared with the Verifier runner.
-    permits: Arc<VerifierPermits>,
     /// Deadline of one fit; exceeding it stops the fit and fails the row.
     execution_timeout: Duration,
     /// How long shutdown lets an admitted fit finish before cancelling it.
@@ -105,14 +100,12 @@ impl BaselineFitter {
     /// The fitter carries no coordination clock: due times, leases, and retry
     /// deadlines are PostgreSQL's. From `limits` it takes the lease length,
     /// the execution timeout, the shutdown drain grace, and its idle poll
-    /// interval, the same values the runner uses. `permits` is the one
-    /// capacity owner the Verifier runner also draws from.
+    /// interval, the same values the runner uses. Fits need no execution permits.
     #[must_use]
     pub fn new(
         postgres: WyrdPostgres,
         operator: OperatorPool,
         storage: Arc<StorageHandle>,
-        permits: Arc<VerifierPermits>,
         limits: &RuntimeLimits,
     ) -> Self {
         Self {
@@ -122,7 +115,6 @@ impl BaselineFitter {
             queue: DriftBaselineQueue::default(),
             lease: chrono::Duration::from_std(limits.lease).unwrap_or(chrono::Duration::MAX),
             poll_interval: limits.poll_interval,
-            permits,
             execution_timeout: limits.execution_timeout,
             drain_grace: limits.drain_grace,
             #[cfg(feature = "test-support")]
@@ -179,10 +171,8 @@ impl BaselineFitter {
 
     /// Fit at most one due baseline of every tenant with due work.
     ///
-    /// Returns how many fits were settled. Each tenant's fit first takes a
-    /// shared permit, held through settlement; a tenant at its ceiling is
-    /// skipped with its row unclaimed, and the pass ends when global capacity
-    /// is exhausted. A tenant whose claim or settlement fails is logged and
+    /// Returns how many fits were settled. Verifier runs never prevent a fit
+    /// from being claimed. A tenant whose claim or settlement fails is logged and
     /// skipped. Once `stop` is cancelled every claim is refused at the
     /// durable boundary in [`fit_next`](Self::fit_next), which ends the pass.
     ///
@@ -195,18 +185,12 @@ impl BaselineFitter {
             .await?;
         let mut settled = 0;
         for tenant in tenants {
-            if self.permits.saturated() {
-                break;
-            }
-            let Some(_permit) = self.permits.try_acquire(tenant) else {
-                continue;
-            };
             match self.fit_next(tenant, stop).await {
                 Ok(true) => settled += 1,
                 Ok(false) if stop.is_cancelled() => break,
                 Ok(false) => {}
                 Err(error) => {
-                    tracing::warn!(%tenant, %error, "drift baseline fit failed to settle")
+                    tracing::warn!(%tenant, %error, "drift baseline fit failed to settle");
                 }
             }
         }

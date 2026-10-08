@@ -18,6 +18,7 @@ default = []
 [dependencies]
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
+num-traits = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 statrs = { workspace = true }
 thiserror = { workspace = true }
@@ -29,3 +30,6 @@ workspace-hack.workspace = true
 serde_json = { workspace = true }
 wyrd-semver = { workspace = true }
 arrow = { workspace = true }
+
+[lints]
+workspace = true

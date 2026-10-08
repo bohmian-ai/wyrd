@@ -1,0 +1,31 @@
+apiVersion: wyrd/v1
+kind: Workflow
+metadata:
+  space: examples
+  name: research-and-write-gemini
+  version: "0.1.0"
+spec:
+  description: Research a topic with a search tool, then write a two-sentence summary.
+  inputs:
+    input:
+      type: str
+      value: ""
+
+  steps:
+    - id: researcher
+      action:
+        type: agent
+        target: ./agents/researcher.yaml
+      inputs:
+        topic: input.input
+
+    - id: writer
+      action:
+        type: agent
+        target: ./agents/writer.yaml
+      depends_on: [researcher]
+      inputs:
+        research: steps.researcher.output.text
+
+  outputs:
+    summary: steps.writer.output.text

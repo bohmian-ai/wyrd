@@ -62,126 +62,6 @@ impl ForgeFailureClass {
     }
 }
 
-/// Closed origin of a coalesced Forge planning request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForgePlanningDemandSource {
-    /// A Scribe commit requested prompt planning.
-    Hint,
-    /// Periodic active-roster repair requested planning.
-    Periodic,
-}
-
-impl ForgePlanningDemandSource {
-    /// Returns the stable SQL spelling used by the private demand table.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Hint => "hint",
-            Self::Periodic => "periodic",
-        }
-    }
-
-    /// Reconstructs a persisted source without accepting unknown values.
-    ///
-    /// # Errors
-    /// Returns an invariant violation for malformed persisted state.
-    pub(crate) fn from_sql(value: &str) -> Result<Self, SqlError> {
-        match value {
-            "hint" => Ok(Self::Hint),
-            "periodic" => Ok(Self::Periodic),
-            _ => Err(SqlError::InvariantViolation {
-                detail: format!("unknown Forge planning demand source {value}"),
-            }),
-        }
-    }
-}
-
-/// One bounded durable request for exact Forge planning.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForgePlanningDemand {
-    /// Tenant whose table must be planned.
-    pub data_tenant_id: DataTenantId,
-    /// Validated logical table identity.
-    pub table_ref: ForgeTaskTableIdentity,
-    /// Time at which the coalesced demand was first observed.
-    pub first_requested_at: DateTime<Utc>,
-    /// Time at which its generation was most recently advanced.
-    pub last_requested_at: DateTime<Utc>,
-    /// Most recent request source.
-    pub last_source: ForgePlanningDemandSource,
-    /// Positive monotonic generation captured for CAS acknowledgement.
-    pub generation: i64,
-    /// Snapshot cause most recently acknowledged by a successful maintenance no-op.
-    pub acknowledged_snapshot_id: Option<i64>,
-    /// Retained commit count paired with the acknowledged snapshot cause.
-    pub acknowledged_commit_count: Option<u64>,
-}
-
-/// SQL projection used to validate demand rows before catalog access.
-#[derive(sqlx::FromRow)]
-pub(crate) struct ForgePlanningDemandSqlRow {
-    /// Persisted tenant UUID.
-    pub data_tenant_id: Uuid,
-    /// Persisted catalog component.
-    pub catalog_name: String,
-    /// Persisted namespace component.
-    pub namespace_name: String,
-    /// Persisted table component.
-    pub table_name: String,
-    /// First demand timestamp.
-    pub first_requested_at: DateTime<Utc>,
-    /// Most recent demand timestamp.
-    pub last_requested_at: DateTime<Utc>,
-    /// Persisted closed source.
-    pub last_source: String,
-    /// Persisted CAS generation.
-    pub generation: i64,
-    /// Persisted acknowledged snapshot cause.
-    pub acknowledged_snapshot_id: Option<i64>,
-    /// Persisted acknowledged retained commit count.
-    pub acknowledged_commit_count: Option<i64>,
-}
-
-impl TryFrom<ForgePlanningDemandSqlRow> for ForgePlanningDemand {
-    type Error = SqlError;
-
-    /// Validates every persisted identity and generation component.
-    fn try_from(row: ForgePlanningDemandSqlRow) -> Result<Self, Self::Error> {
-        let data_tenant_id =
-            DataTenantId::new(row.data_tenant_id).map_err(|_| SqlError::InvariantViolation {
-                detail: "Forge planning demand contains malformed tenant identity".to_owned(),
-            })?;
-        let table_ref =
-            ForgeTaskTableIdentity::new(row.catalog_name, row.namespace_name, row.table_name)
-                .map_err(|_| SqlError::InvariantViolation {
-                    detail: "Forge planning demand contains malformed table identity".to_owned(),
-                })?;
-        if row.generation <= 0 {
-            return Err(SqlError::InvariantViolation {
-                detail: "Forge planning demand generation must be positive".to_owned(),
-            });
-        }
-        let acknowledged_commit_count = row
-            .acknowledged_commit_count
-            .map(|value| {
-                u64::try_from(value).map_err(|_| SqlError::InvariantViolation {
-                    detail: "Forge acknowledged commit count must be non-negative".to_owned(),
-                })
-            })
-            .transpose()?;
-        Ok(Self {
-            data_tenant_id,
-            table_ref,
-            first_requested_at: row.first_requested_at,
-            last_requested_at: row.last_requested_at,
-            last_source: ForgePlanningDemandSource::from_sql(&row.last_source)?,
-            generation: row.generation,
-            acknowledged_snapshot_id: row.acknowledged_snapshot_id,
-            acknowledged_commit_count,
-        })
-    }
-}
-
 /// Durable consequence of one successful Forge task attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskProgressEffect {
@@ -217,11 +97,6 @@ impl ForgeTaskTableIdentity {
         namespace: impl Into<String>,
         table: impl Into<String>,
     ) -> Result<Self, SqlError> {
-        let value = Self {
-            catalog: catalog.into(),
-            namespace: namespace.into(),
-            table: table.into(),
-        };
         const NAMESPACES: &[&str] = &[
             "vala.system",
             "vala.bifrost",
@@ -235,6 +110,11 @@ impl ForgeTaskTableIdentity {
             "vala.datasets",
             "vala.gateway",
         ];
+        let value = Self {
+            catalog: catalog.into(),
+            namespace: namespace.into(),
+            table: table.into(),
+        };
         if value.catalog != "wyrd-redux"
             || !NAMESPACES.contains(&value.namespace.as_str())
             || !safe_identity(&value.table)
@@ -491,6 +371,7 @@ impl OrphanCleanupPayload {
     /// `persisted`, for a non-object value, unknown or missing fields, an
     /// unknown version, a wrong `kind`, or a negative cutoff.
     pub fn from_value(value: &serde_json::Value, persisted: bool) -> Result<Self, SqlError> {
+        const FIELDS: [&str; 3] = ["version", "kind", "age_cutoff_ms"];
         let fail = |detail: &str| {
             let detail = detail.to_owned();
             if persisted {
@@ -502,7 +383,6 @@ impl OrphanCleanupPayload {
         let object = value
             .as_object()
             .ok_or_else(|| fail("orphan cleanup payload is not an object"))?;
-        const FIELDS: [&str; 3] = ["version", "kind", "age_cutoff_ms"];
         if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
             return Err(fail("orphan cleanup payload has unknown or missing fields"));
         }
@@ -575,6 +455,7 @@ impl OrphanCleanupCursor {
         prefix: &str,
         persisted: bool,
     ) -> Result<Self, SqlError> {
+        const FIELDS: [&str; 2] = ["version", "start_after"];
         let fail = |detail: &str| {
             let detail = detail.to_owned();
             if persisted {
@@ -586,7 +467,6 @@ impl OrphanCleanupCursor {
         let object = value
             .as_object()
             .ok_or_else(|| fail("orphan cleanup cursor is not an object"))?;
-        const FIELDS: [&str; 2] = ["version", "start_after"];
         if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
             return Err(fail("orphan cleanup cursor has unknown or missing fields"));
         }
@@ -808,6 +688,15 @@ impl ExpiredCleanupPayload {
     /// Returns [`SqlError::Conflict`], or [`SqlError::InvariantViolation`] when
     /// `persisted`, for any departure from the closed shape.
     pub fn from_value(value: &serde_json::Value, persisted: bool) -> Result<Self, SqlError> {
+        const FIELDS: [&str; 7] = [
+            "version",
+            "kind",
+            "source_task_id",
+            "committed_snapshot_id",
+            "committed_metadata_location",
+            "committed_metadata_digest",
+            "cleanup_candidates",
+        ];
         let fail = |detail: &str| {
             let detail = detail.to_owned();
             if persisted {
@@ -819,15 +708,6 @@ impl ExpiredCleanupPayload {
         let object = value
             .as_object()
             .ok_or_else(|| fail("expired cleanup payload is not an object"))?;
-        const FIELDS: [&str; 7] = [
-            "version",
-            "kind",
-            "source_task_id",
-            "committed_snapshot_id",
-            "committed_metadata_location",
-            "committed_metadata_digest",
-            "cleanup_candidates",
-        ];
         if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
             return Err(fail(
                 "expired cleanup payload has unknown or missing fields",
@@ -1295,35 +1175,6 @@ fn evidence_from_value(value: serde_json::Value) -> Result<ForgeTaskEvidence, Sq
         deleted_candidate_count,
         prepared_candidate_index,
     })
-}
-
-/// Authoritative unacknowledged planning-demand status for one complete scan.
-///
-/// Published by the fenced coordinator after a complete pass. `demands` is the
-/// exact row count rather than a page, and `oldest_requested_at` is the stored
-/// request time so a consumer can derive age itself and keep seeing it grow if
-/// the producer later stalls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForgeDemandStatus {
-    /// Exact count of unacknowledged planning demands.
-    pub demands: u64,
-    /// Earliest `first_requested_at` across those demands, if any exist.
-    pub oldest_requested_at: Option<DateTime<Utc>>,
-}
-
-/// Authoritative pending-task status for one strategy after a complete scan.
-///
-/// Pending means exactly `ready` or `retryable`: an owned row belongs to the
-/// worker that claimed it. A strategy with no pending row produces no value,
-/// so the publisher supplies its explicit zero.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForgePendingTaskStatus {
-    /// Work type this status describes.
-    pub strategy: ForgeTaskStrategy,
-    /// Exact count of `ready` or `retryable` rows for this strategy.
-    pub pending: u64,
-    /// Earliest `ready_at` across those rows.
-    pub oldest_ready_at: Option<DateTime<Utc>>,
 }
 
 /// Closed Forge task strategies.

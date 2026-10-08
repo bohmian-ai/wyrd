@@ -7,6 +7,8 @@
 #[cfg(feature = "python")]
 mod bifrost;
 #[cfg(feature = "python")]
+mod cli;
+#[cfg(feature = "python")]
 mod client;
 #[cfg(feature = "python")]
 mod gateway;
@@ -18,8 +20,8 @@ mod operators;
 mod state;
 #[cfg(feature = "testing")]
 mod testing;
-#[cfg(feature = "python")]
-mod verification;
+#[cfg(feature = "testing")]
+mod testing_cli;
 #[cfg(feature = "python")]
 mod workflow;
 
@@ -43,7 +45,7 @@ use pyo3::types::PyModule;
 #[pymodule]
 fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_utils::py::register_wyrd_error_exception(m)?;
-    wyrd_cli::python::register(m)?;
+    cli::register_entrypoint(m)?;
 
     let agent = PyModule::new(py, "agent")?;
     skald_agent::python_register(&agent)?;
@@ -102,6 +104,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&providers)?;
     register_submodule(py, "wyrd._wyrd.providers", &providers)?;
 
+    let cli = PyModule::new(py, "cli")?;
+    cli::register(&cli)?;
+    m.add_submodule(&cli)?;
+    register_submodule(py, "wyrd._wyrd.cli", &cli)?;
+
     let client = PyModule::new(py, "client")?;
     client::register_client(&client)?;
     m.add_submodule(&client)?;
@@ -128,17 +135,16 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&operators)?;
     register_submodule(py, "wyrd._wyrd.operators", &operators)?;
 
-    let verification = PyModule::new(py, "verification")?;
-    verification::register(&verification)?;
-    m.add_submodule(&verification)?;
-    register_submodule(py, "wyrd._wyrd.verification", &verification)?;
-
     #[cfg(feature = "testing")]
     {
         let testing = PyModule::new(py, "testing")?;
         testing::register(&testing)?;
         m.add_submodule(&testing)?;
         register_submodule(py, "wyrd._wyrd.testing", &testing)?;
+        let testing_cli = PyModule::new(py, "cli")?;
+        testing_cli::register(&testing_cli)?;
+        testing.add_submodule(&testing_cli)?;
+        register_submodule(py, "wyrd._wyrd.testing.cli", &testing_cli)?;
     }
 
     Ok(())

@@ -5,11 +5,11 @@
 
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use wyrd_auth_verify::{
     ActClaim, AuthError, TokenAudience, TokenPrincipalRef, TokenVerifier, VerifiedToken,
 };
 use wyrd_runtime::{DelegationStep, PrincipalRef, RoleRef};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
@@ -19,11 +19,11 @@ use wyrd_sql::queries::auth::{
 };
 use wyrd_sql::{SqlError, TenantConn};
 
-use crate::audit::{TOKEN_EXCHANGE_OPERATION, append_auth_audit, auth_event};
-use crate::credential_verify::verify_presented;
+use crate::audit::{TOKEN_EXCHANGE_OPERATION, auth_event};
 use crate::error::auth_error_to_wyrd;
 use crate::issuance::{ExchangedToken, IssuanceError, TenantGrant, TenantTokenIssuer};
 use crate::issue_api_key::WyrdApiKey;
+use wyrd_auth_issue::secret_matches;
 
 /// API-key exchange service.
 #[derive(Clone, Debug)]
@@ -70,12 +70,9 @@ pub enum ExchangeError {
     /// principal or an unknown key.
     #[error("tenant does not admit credentials")]
     TenantNotAdmitting,
-    /// Key exists but Argon2 hash verification failed.
+    /// Key exists but its secret does not match the stored verifier.
     #[error("api key hash mismatch")]
     HashMismatch,
-    /// Blocking task failed.
-    #[error("api key verify task failed")]
-    Join(#[from] tokio::task::JoinError),
     /// Database operation failed.
     #[error("database operation failed")]
     Database(#[from] sqlx::Error),
@@ -125,16 +122,12 @@ pub enum DelegateError {
 }
 
 impl DelegateError {
-    /// Whether the failure left the transaction unable to record a decision:
-    /// a store read, or an audit append that already failed.
+    /// Whether the failure was a store read, which leaves the transaction
+    /// unable to record a decision.
     fn is_store_failure(&self) -> bool {
         matches!(
             self,
-            Self::Database(_)
-                | Self::Issuance(
-                    IssuanceError::Database(_)
-                        | IssuanceError::Wyrd(WyrdError::AuditUnavailable { .. })
-                )
+            Self::Database(_) | Self::Issuance(IssuanceError::Database(_))
         )
     }
 }
@@ -155,9 +148,9 @@ impl ExchangeApiKey {
     /// Exchange a Wyrd API key for a tenant access token.
     ///
     /// Verifies the key itself — format, tenant, an unexpired unrevoked row
-    /// for its prefix, and the Argon2 secret — at a fixed cost, records the
-    /// key's use, then mints through the shared issuance workflow, which
-    /// refuses an inactive tenant or principal and resolves current grants.
+    /// for its prefix, and the SHA-256 verifier — records the key's use, then
+    /// mints through the shared issuance workflow, which refuses an inactive
+    /// tenant or principal and resolves current grants.
     ///
     /// # Errors
     /// All authentication failures map to `WyrdError::ApiKeyInvalid` at the HTTP
@@ -183,50 +176,61 @@ impl ExchangeApiKey {
             )
             .await?)
     }
+
+    /// Authenticate one request by a Wyrd API key, without minting a token.
+    ///
+    /// The same key verification and use record as [`Self::execute`], then
+    /// [`TenantTokenIssuer::verify`]: the request runs as the principal the
+    /// exchanged token would name, with the authority it would carry. For
+    /// stock exporters that send a static key header on every request.
+    ///
+    /// # Errors
+    /// As [`Self::execute`].
+    #[tracing::instrument(level = "debug", skip(self, conn, api_key), err)]
+    pub async fn authenticate(
+        &self,
+        conn: &mut TenantConn<'_>,
+        api_key: &SecretString,
+    ) -> Result<VerifiedToken, ExchangeError> {
+        let row = verify_api_key(conn, api_key).await?;
+        touch_api_key_last_used(conn, row.api_key_id).await?;
+        Ok(self
+            .issuer
+            .verify(
+                conn,
+                row.principal_id,
+                TenantGrant::ApiKey {
+                    credential_id: row.api_key_id,
+                },
+            )
+            .await?)
+    }
 }
 
-/// Verify a presented tenant API key at a fixed cost and return its row.
+/// Verify a presented tenant API key and return its row.
 ///
 /// Shared by the API-key exchange and the tenant connection recovery-key
-/// check, so both refuse identically. Every refusal is decided first and
-/// answered last, because Argon2 is what a refusal costs: a malformed key,
-/// another tenant's key, or an unknown prefix must not return before
-/// verification runs, or a live prefix with a wrong tail would take measurably
-/// longer than any of them — enough to enumerate live prefixes by clock.
+/// check, so both refuse identically: the key must parse, name this
+/// connection's tenant, match an unexpired unrevoked row by prefix, and match
+/// that row's SHA-256 verifier in constant time.
 ///
 /// # Errors
 /// Returns [`ExchangeError::NotFound`] for a malformed key or unknown prefix,
 /// [`ExchangeError::CrossTenant`] for another tenant's key,
 /// [`ExchangeError::HashMismatch`] when the secret does not verify,
-/// [`ExchangeError::Database`] when the lookup fails, and
-/// [`ExchangeError::Join`] when the verification task fails.
-///
-/// # Panics
-/// Panics only if the refusal bookkeeping below is ever changed so that an
-/// absent credential row leaves no refusal — the invariant the `expect` names.
+/// and [`ExchangeError::Database`] when the lookup fails.
 pub(crate) async fn verify_api_key(
     conn: &mut TenantConn<'_>,
     api_key: &SecretString,
 ) -> Result<ApiKeyLookupRow, ExchangeError> {
-    let (row, refusal) = match WyrdApiKey::parse(api_key.expose_secret()) {
-        Err(_) => (None, Some(ExchangeError::NotFound)),
-        Ok(parsed) if parsed.tenant_id != conn.data_tenant_id() => {
-            (None, Some(ExchangeError::CrossTenant))
-        }
-        Ok(parsed) => match api_key_by_prefix(conn, &parsed.prefix).await? {
-            None => (None, Some(ExchangeError::NotFound)),
-            Some(row) => (Some(row), None),
-        },
-    };
-
-    let matched = verify_presented(api_key, row.as_ref().map(|row| row.key_hash.as_str()))
-        .await
-        .map_err(ExchangeError::Join)?;
-    if let Some(refusal) = refusal {
-        return Err(refusal);
+    let parsed = WyrdApiKey::parse(api_key.expose_secret()).map_err(|_| ExchangeError::NotFound)?;
+    if parsed.tenant_id != conn.data_tenant_id() {
+        return Err(ExchangeError::CrossTenant);
     }
-    let row = row.expect("invariant: a refusal was recorded for every absent row");
-    if !matched {
+    let row = api_key_by_prefix(conn, &parsed.prefix)
+        .await?
+        .ok_or(ExchangeError::NotFound)?;
+    if !secret_matches(api_key.expose_secret(), &row.key_hash) {
         return Err(ExchangeError::HashMismatch);
     }
     Ok(row)
@@ -240,22 +244,24 @@ impl DelegateToken {
     /// Both tokens are verified locally for the connection's tenant, so a
     /// cross-tenant pair fails verification; unverifiable or malformed
     /// identity input is refused before any decision and records nothing.
-    /// Exactly one canonical audit row is then committed: an exchange that
-    /// mints commits the issuer's token-exchange row with the token; an
-    /// issuance refusal commits an allowed row with no effect.
+    /// Exactly one canonical audit event is then staged on the process outbox:
+    /// an exchange that mints stages the issuer's token-exchange event; an
+    /// issuance refusal stages an allowed event with no effect and rolls its
+    /// transaction back.
     /// The issued token names the subject as principal, the actor as its
     /// outermost `act` with the subject token's earlier actors nested inside,
     /// and carries the actor's current permissions narrowed to the subject's.
-    /// A store or audit failure commits nothing and serves no token.
+    /// A store failure commits nothing and serves no token; audit never
+    /// refuses or delays the exchange.
     ///
     /// # Errors
     /// Returns [`DelegateError::InvalidSubjectToken`] or
     /// [`DelegateError::InvalidActorToken`] for an unverifiable token,
     /// [`DelegateError::MalformedIdentity`] for input that cannot name one
     /// actor acting for one subject, [`DelegateError::ActorNotFound`] for a missing or
-    /// inactive actor, [`DelegateError::Issuance`] when issuance or an audit
-    /// append fails, [`DelegateError::Database`] when a read fails, and
-    /// [`DelegateError::Commit`] when the decision cannot be committed.
+    /// inactive actor, [`DelegateError::Issuance`] when issuance fails,
+    /// [`DelegateError::Database`] when a read fails, and
+    /// [`DelegateError::Commit`] when the minted grant cannot be committed.
     #[tracing::instrument(
         level = "debug",
         skip(self, conn, subject_token, actor_token),
@@ -300,27 +306,69 @@ impl DelegateToken {
             }
             Err(error) if error.is_store_failure() => Err(error),
             Err(error) => {
-                record_refusal(&mut conn, &subject, &chain, &actor, audience, request_id).await?;
-                conn.commit().await?;
+                self.record_refusal(tenant, &subject, &chain, &actor, audience, request_id);
                 Err(error)
             }
         }
+    }
+
+    /// Stage the exchange decision for an exchange whose issuance refused.
+    ///
+    /// A minted token's decision is the issuer's token-exchange row, so this is
+    /// only for an issuance refusal. Like every delegated request, the row is
+    /// recorded under the subject with the full actor chain, targets the
+    /// requested audience, and attaches the credential that authenticated the
+    /// actor. It is staged on the process outbox without waiting; the
+    /// refusal's own transaction is rolled back.
+    fn record_refusal(
+        &self,
+        tenant: DataTenantId,
+        subject: &VerifiedToken,
+        chain: &[DelegationStep],
+        actor: &VerifiedToken,
+        audience: TokenAudience,
+        request_id: &str,
+    ) {
+        let subject = &subject.principal;
+        let mut event = auth_event(
+            request_id,
+            TOKEN_EXCHANGE_OPERATION,
+            subject.id,
+            subject.kind.tag(),
+            subject.card_ref().cloned(),
+            AuditOutcome::Allowed,
+            AuditDetail::DelegationAttribution {
+                delegation_chain: wyrd_runtime::audit_delegation_chain(chain),
+            },
+        )
+        .with_credential_id(actor.principal.credential_id);
+        audience.as_str().clone_into(&mut event.resource);
+        self.issuer.audit().stage(tenant, event);
     }
 }
 
 /// Validate the exchange identity and build its actor chain, earliest first.
 ///
 /// The actor must present a direct token for a Card-bound Service or Agent,
-/// and must not be the subject itself; the subject's earlier actors precede
-/// the new actor in the chain.
+/// and must not be the subject itself; the subject must not be the internal
+/// SYSTEM writer, which takes part in no delegation or impersonation flow and
+/// can never hold a delegated tenant token. The subject's earlier actors
+/// precede the new actor in the chain.
 ///
 /// # Errors
-/// Returns [`DelegateError::MalformedIdentity`] for a delegated actor token,
-/// an actor without a Service or Agent Card, or a self-exchange.
+/// Returns [`DelegateError::MalformedIdentity`] for a SYSTEM subject, a
+/// delegated actor token, an actor without a Service or Agent Card, or a
+/// self-exchange.
 fn delegation_chain(
     subject: &VerifiedToken,
     actor: &VerifiedToken,
 ) -> Result<Vec<DelegationStep>, DelegateError> {
+    if matches!(
+        subject.principal.kind,
+        wyrd_runtime::PrincipalKind::System { .. }
+    ) {
+        return Err(DelegateError::MalformedIdentity("subject_is_system"));
+    }
     if !actor.delegation_chain.is_empty() {
         return Err(DelegateError::MalformedIdentity("actor_token_is_delegated"));
     }
@@ -338,43 +386,6 @@ fn delegation_chain(
             principal: PrincipalRef::from_principal(&actor.principal),
         }))
         .collect())
-}
-
-/// Append the exchange decision for an exchange whose issuance refused.
-///
-/// A minted token's decision is the issuer's token-exchange row, so this is
-/// only for an issuance refusal. Like every delegated request, the row is
-/// recorded under the subject with the full actor chain, targets the requested
-/// audience, and attaches the credential that authenticated the actor.
-///
-/// # Errors
-/// Returns [`DelegateError::Issuance`] carrying the audit-unavailable error
-/// when the append fails.
-async fn record_refusal(
-    conn: &mut TenantConn<'_>,
-    subject: &VerifiedToken,
-    chain: &[DelegationStep],
-    actor: &VerifiedToken,
-    audience: TokenAudience,
-    request_id: &str,
-) -> Result<(), DelegateError> {
-    let subject = &subject.principal;
-    let mut event = auth_event(
-        request_id,
-        TOKEN_EXCHANGE_OPERATION,
-        subject.id,
-        subject.kind.tag(),
-        subject.card_ref().cloned(),
-        AuditOutcome::Allowed,
-        AuditDetail::DelegationAttribution {
-            delegation_chain: wyrd_runtime::audit_delegation_chain(chain),
-        },
-    )
-    .with_credential_id(actor.principal.credential_id);
-    audience.as_str().clone_into(&mut event.resource);
-    append_auth_audit(conn, &event)
-        .await
-        .map_err(|error| DelegateError::Issuance(IssuanceError::Wyrd(error)))
 }
 
 /// Convert stored role names into runtime role references.
@@ -408,12 +419,6 @@ fn act_from_chain(
             act,
         }))
     })
-}
-
-/// Hash a bearer secret for storage lookup and comparison.
-#[must_use]
-pub(crate) fn token_hash(token: &str) -> String {
-    format!("{:x}", Sha256::digest(token.as_bytes()))
 }
 
 /// Disambiguate `ExchangeError::NotFound` by checking API-key lifecycle status.
@@ -477,12 +482,6 @@ pub async fn map_exchange_error_to_wyrd(
         // the log line: an operator still needs to know whether a key was
         // revoked or expired.
         ExchangeError::NotFound => resolve_not_found_reason(conn, prefix).await,
-        ExchangeError::Join(_) => {
-            return WyrdError::Internal {
-                message: "failed to exchange API key".to_owned(),
-                details: json!({}),
-            };
-        }
         ExchangeError::Issuance(error) => return error.into(),
         ExchangeError::Database(_) => {
             return WyrdError::AuthVerifyUnavailable {
@@ -547,7 +546,7 @@ pub(crate) mod pg_tests {
     use crate::audit::{CARD_SCOPE_MINT_OPERATION, TOKEN_EXCHANGE_OPERATION};
 
     use chrono::{Duration, Utc};
-    use secrecy::SecretString;
+    use secrecy::{ExposeSecret, SecretString};
     use serde_json::Value as JsonValue;
     use sqlx::types::Json;
     use uuid::Uuid;
@@ -572,11 +571,12 @@ pub(crate) mod pg_tests {
     use wyrd_spec::vala::api::AuditDetail;
     use wyrd_sql::TenantConn;
 
-    use crate::credential_verify;
+    use crate::audit::test_outbox::{assert_retrying, drain, outbox};
+    use vala_sql::audit_outbox::AuditOutbox;
     use wyrd_sql::queries::auth::{ApiKeyStatus, grant_role_to_service_account, insert_role};
 
     use super::{DelegateError, DelegateToken, ExchangeApiKey, ExchangeError};
-    use crate::issuance::{IssuanceError, TenantTokenIssuer, TokenExchangeSettings};
+    use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
     use crate::issue_api_key::WyrdApiKey;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -612,26 +612,36 @@ pub(crate) mod pg_tests {
         )
     }
 
-    fn test_issuer() -> TenantTokenIssuer {
-        TenantTokenIssuer::new(test_issuing_key(), TokenExchangeSettings::default())
+    /// The issuer under test, staging its audit on `audit`.
+    ///
+    /// The test owns `audit` and drains it before its fixture drops, so no audit
+    /// commit is still logging in when the fixture drops its database.
+    fn test_issuer(audit: &Arc<AuditOutbox>) -> TenantTokenIssuer {
+        TenantTokenIssuer::new(
+            test_issuing_key(),
+            TokenExchangeSettings::default(),
+            Arc::clone(audit),
+        )
     }
 
-    fn exchange_service() -> ExchangeApiKey {
+    /// The API-key exchange under test, staging its audit on `audit`.
+    fn exchange_service(audit: &Arc<AuditOutbox>) -> ExchangeApiKey {
         ExchangeApiKey {
-            issuer: test_issuer(),
+            issuer: test_issuer(audit),
         }
     }
 
-    /// Build an exchange service whose verifier trusts the test signing key.
+    /// Build an exchange service whose verifier trusts the test signing key
+    /// and whose issuer stages its audit on `audit`.
     ///
     /// # Panics
     /// Panics when the static test public key or key id fails to load.
-    fn delegate_service() -> DelegateToken {
+    fn delegate_service(audit: &Arc<AuditOutbox>) -> DelegateToken {
         let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
         let mut decoding_keys = HashMap::new();
         decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
         DelegateToken {
-            issuer: test_issuer(),
+            issuer: test_issuer(audit),
             verifier: Arc::new(TokenVerifier::new(
                 decoding_keys,
                 "wyrd",
@@ -784,14 +794,6 @@ pub(crate) mod pg_tests {
     }
 
     #[test]
-    fn argon2_runs_on_blocking_pool() {
-        let source = include_str!("exchange_api_key.rs");
-
-        assert!(source.contains("tokio::task::spawn_blocking"));
-        assert!(source.contains("wyrd_auth_issue::verify_api_key"));
-    }
-
-    #[test]
     fn act_from_chain_roundtrip() {
         use wyrd_runtime::{
             DelegationStep, PrincipalId, PrincipalKind, PrincipalRef as RuntimePrincipalRef,
@@ -863,7 +865,7 @@ pub(crate) mod pg_tests {
     /// Seed a live API key for `principal_id` in `conn`'s open transaction and
     /// return its row id and presentable secret.
     ///
-    /// Generates a tenant-bound key, stores its Argon2 hash and prefix in
+    /// Generates a tenant-bound key, stores its SHA-256 verifier and prefix in
     /// `wyrd.auth_api_keys` with a one-day expiry, and writes nothing else; the
     /// caller commits. The row id is what a grant record and the browser
     /// session tests' key-use reads must name, so callers need it rather than a
@@ -878,7 +880,7 @@ pub(crate) mod pg_tests {
         created_by: Uuid,
     ) -> (Uuid, SecretString) {
         let key = WyrdApiKey::generate(tenant);
-        let hash = wyrd_auth_issue::hash_api_key(&key.secret).expect("api key hashes");
+        let hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
         let api_key_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
@@ -942,6 +944,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn a_card_free_exchange_commits_one_attributed_grant_record() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -961,10 +964,12 @@ pub(crate) mod pg_tests {
         .expect("card-free administrator inserts");
         let (api_key_id, secret) = insert_live_api_key(&mut conn, tenant, admin_id, user_id).await;
 
-        exchange_service()
+        let service = exchange_service(&audit);
+        service
             .execute(&mut conn, secret, "req-cardfree-grant")
             .await
             .expect("a card-free administrator exchanges its credential");
+        drain(service.issuer.audit()).await;
 
         let (count, credential) = staged_exchange(&mut conn, tenant, admin_id).await;
         assert_eq!(count, 1, "exactly one grant record is staged");
@@ -973,6 +978,7 @@ pub(crate) mod pg_tests {
             Some(api_key_id),
             "the grant names the api key that was spent"
         );
+        drain(&audit).await;
     }
 
     /// A Card-bound tenant grant records the exchange and the scope mint.
@@ -987,6 +993,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn a_card_bound_exchange_records_the_grant_and_the_scope_mint() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
 
@@ -995,10 +1002,12 @@ pub(crate) mod pg_tests {
         let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
         let (api_key_id, secret) = insert_live_api_key(&mut conn, tenant, sa_id, user_id).await;
 
-        exchange_service()
+        let service = exchange_service(&audit);
+        service
             .execute(&mut conn, secret, "req-cardbound-grant")
             .await
             .expect("a card-bound service exchanges its credential");
+        drain(service.issuer.audit()).await;
 
         let (count, credential) = staged_exchange(&mut conn, tenant, sa_id).await;
         assert_eq!(count, 1, "exactly one grant record is staged");
@@ -1022,6 +1031,7 @@ pub(crate) mod pg_tests {
             mints, 1,
             "the distinct scope-mint decision is still recorded on its own"
         );
+        drain(&audit).await;
     }
 
     /// A machine exchange returns access only and writes no refresh row.
@@ -1033,6 +1043,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn api_key_exchange_issues_no_refresh_token_or_row() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
 
@@ -1041,7 +1052,7 @@ pub(crate) mod pg_tests {
         let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
 
         let key = WyrdApiKey::generate(tenant);
-        let hash = wyrd_auth_issue::hash_api_key(&key.secret).expect("api key hashes");
+        let hash = wyrd_auth_issue::hash_secret(key.secret.expose_secret());
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
                  (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)
@@ -1057,7 +1068,7 @@ pub(crate) mod pg_tests {
         .await
         .expect("live api key inserts");
 
-        let exchanged = exchange_service()
+        let exchanged = exchange_service(&audit)
             .execute(&mut conn, key.secret, "req-api-key-no-refresh")
             .await
             .expect("a live api key exchanges");
@@ -1075,6 +1086,7 @@ pub(crate) mod pg_tests {
         .await
         .expect("refresh row count runs");
         assert_eq!(rows, 0, "an api-key exchange stores no refresh row");
+        drain(&audit).await;
     }
 
     /// Every invalid API-key condition renders the same public problem.
@@ -1211,36 +1223,26 @@ pub(crate) mod pg_tests {
             .expect("second tenant seed commits");
         sqlx::query("UPDATE platform.tenants SET status = 'suspended' WHERE data_tenant_id = $1")
             .bind(unadmitted_tenant.as_uuid())
-            .execute(
-                &fixture
-                    .superuser_pool()
-                    .await
-                    .expect("superuser pool opens"),
-            )
+            .execute(&fixture.superuser_pool().expect("superuser pool opens"))
             .await
             .expect("second tenant suspends");
         (unadmitted_tenant, unadmitted)
     }
 
-    /// Every refusal path pays for exactly one Argon2 verification.
+    /// Every refusal renders the one invalid-key error.
     ///
-    /// The refusal-then-verify order in [`ExchangeApiKey::execute`] is what makes
-    /// the paths indistinguishable by clock: a malformed key, another tenant's
-    /// key, a tenant that no longer admits credentials, an unknown prefix, a
-    /// disabled account, a revoked or expired key, and a live prefix with the
-    /// wrong tail must all do the same work. Counting verifications is the only
-    /// way to assert that without measuring wall-clock time, which is unstable
-    /// under a shared test Postgres.
-    ///
-    /// The counter is process-global; `cargo nextest` runs each test in its own
-    /// process, so the deltas below belong to this test alone.
+    /// A malformed key, another tenant's key, a tenant that no longer admits
+    /// credentials, an unknown prefix, a disabled account, a revoked or
+    /// expired key, and a live prefix with the wrong tail are
+    /// indistinguishable to the caller, so no refusal is an oracle.
     ///
     /// # Panics
     ///
     /// Panics when the fixture cannot start or any assertion fails.
     #[tokio::test]
-    async fn every_invalid_api_key_costs_exactly_one_verification() {
+    async fn every_invalid_api_key_is_refused_identically() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
 
@@ -1277,7 +1279,7 @@ pub(crate) mod pg_tests {
         let disabled = seed_suspended_account_key(&mut conn, tenant, user_id, &card_ref).await;
 
         let expected = rendered(&super::api_key_invalid());
-        let service = exchange_service();
+        let service = exchange_service(&audit);
         let cases = [
             ("malformed", SecretString::from("not-a-wyrd-api-key")),
             ("cross_tenant", foreign.secret),
@@ -1287,16 +1289,10 @@ pub(crate) mod pg_tests {
             ("wrong_tail", wrong_tail.secret),
         ];
         for (label, presented) in cases {
-            let before = credential_verify::verifications_performed();
             let error = service
                 .execute(&mut conn, presented, &format!("req-{label}"))
                 .await
                 .expect_err("an invalid api key is refused");
-            assert_eq!(
-                credential_verify::verifications_performed() - before,
-                1,
-                "the {label} path did not perform exactly one verification"
-            );
             let prefix = "probe";
             assert_eq!(
                 rendered(&super::map_exchange_error_to_wyrd(&mut conn, prefix, error).await),
@@ -1313,17 +1309,11 @@ pub(crate) mod pg_tests {
             .tenant_conn_for(unadmitted_tenant)
             .await
             .expect("unadmitted tenant conn reopens");
-        let before = credential_verify::verifications_performed();
         let error = service
             .execute(&mut unadmitted_conn, unadmitted, "req-unadmitted")
             .await
             .expect_err("a tenant that does not admit credentials is refused");
         assert!(matches!(error, ExchangeError::TenantNotAdmitting));
-        assert_eq!(
-            credential_verify::verifications_performed() - before,
-            1,
-            "the unadmitted-tenant path did not perform exactly one verification"
-        );
         assert_eq!(
             rendered(
                 &super::map_exchange_error_to_wyrd(&mut unadmitted_conn, "probe", error).await
@@ -1331,6 +1321,7 @@ pub(crate) mod pg_tests {
             expected,
             "the unadmitted-tenant refusal is distinguishable"
         );
+        drain(&audit).await;
     }
 
     #[test]
@@ -1351,6 +1342,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn cross_tenant_key_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant_a = fixture.data_tenant_id();
         let tenant_b = DataTenantId::new_v7();
 
@@ -1364,16 +1356,18 @@ pub(crate) mod pg_tests {
             .tenant_conn_for(tenant_b)
             .await
             .expect("tenant B conn opens");
-        let result = exchange_service()
+        let result = exchange_service(&audit)
             .execute(&mut conn, key.secret, "req-cross-tenant")
             .await;
 
         assert!(matches!(result, Err(ExchangeError::CrossTenant)));
+        drain(&audit).await;
     }
 
     #[tokio::test]
     async fn revoked_key_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
         let key = WyrdApiKey::generate(tenant);
@@ -1399,16 +1393,18 @@ pub(crate) mod pg_tests {
         .await
         .expect("revoked api key inserts");
 
-        let result = exchange_service()
+        let result = exchange_service(&audit)
             .execute(&mut conn, key.secret, "req-revoked")
             .await;
 
         assert!(matches!(result, Err(ExchangeError::NotFound)));
+        drain(&audit).await;
     }
 
     #[tokio::test]
     async fn hash_mismatch_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
         let key = WyrdApiKey::generate(tenant);
@@ -1417,8 +1413,7 @@ pub(crate) mod pg_tests {
         let user_id = insert_test_user(&mut conn, tenant).await;
         let sa_id = insert_test_service_account(&mut conn, tenant, user_id, &card_ref).await;
 
-        // Store a hash that is not a valid Argon2 PHC string for this key.
-        // verify_api_key() returns false → HashMismatch.
+        // Store a verifier that is not this key's SHA-256 digest.
         sqlx::query(
             "INSERT INTO wyrd.auth_api_keys
                  (id, data_tenant_id, principal_id, prefix, key_hash, created_by, expires_at)
@@ -1433,11 +1428,12 @@ pub(crate) mod pg_tests {
         .await
         .expect("api key with wrong hash inserts");
 
-        let result = exchange_service()
+        let result = exchange_service(&audit)
             .execute(&mut conn, key.secret, "req-hash-mismatch")
             .await;
 
         assert!(matches!(result, Err(ExchangeError::HashMismatch)));
+        drain(&audit).await;
     }
 
     /// Card name of the seeded actor.
@@ -1484,20 +1480,23 @@ pub(crate) mod pg_tests {
         )
     }
 
-    /// Exchange `subject` and `actor` tokens for a Bifrost token.
+    /// Exchange `subject` and `actor` tokens for a Bifrost token, then commit
+    /// every audit decision the exchange staged.
     ///
     /// # Errors
     /// Returns the [`DelegateError`] the exchange refuses with, unchanged.
     ///
     /// # Panics
-    /// Panics when the tenant connection cannot be opened.
+    /// Panics when the tenant connection cannot be opened or the staged
+    /// decisions do not drain.
     async fn exchange(
         fixture: &PgFixture,
         subject: String,
         actor: String,
     ) -> Result<super::ExchangedToken, DelegateError> {
         let conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        delegate_service()
+        let service = delegate_service(&outbox(fixture));
+        let result = service
             .execute(
                 conn,
                 SecretString::from(subject),
@@ -1505,7 +1504,9 @@ pub(crate) mod pg_tests {
                 TokenAudience::Bifrost,
                 &Uuid::now_v7().to_string(),
             )
-            .await
+            .await;
+        drain(service.issuer.audit()).await;
+        result
     }
 
     /// Committed Bifrost exchange decisions `(outcome, permission, principal,
@@ -1655,6 +1656,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn an_exchange_names_subject_and_actor_and_carries_only_the_intersection() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = outbox(&fixture);
         let tenant = fixture.data_tenant_id();
         let table = Uuid::from_u128(0x51);
         let actor = seed_actor(
@@ -1699,7 +1701,7 @@ pub(crate) mod pg_tests {
             .await
             .expect("exchange succeeds");
 
-        let verifier = delegate_service().verifier;
+        let verifier = delegate_service(&audit).verifier;
         assert!(
             verifier.verify(&exchanged.access_token, &tenant).is_err(),
             "a Bifrost token is refused on a general Wyrd surface"
@@ -1744,45 +1746,55 @@ pub(crate) mod pg_tests {
         };
         assert_eq!(subject_principal_id.as_uuid(), subject_id);
         assert_eq!(actor_principal_id.as_uuid(), actor);
+        drain(&audit).await;
     }
 
-    /// An audit store that refuses the append fails the exchange closed: no
-    /// token and no committed decision.
+    /// An audit store that refuses the commit never refuses the exchange:
+    /// permissions block, audits do not. The token is issued, no decision
+    /// reaches staging while the store refuses, and the retried decision
+    /// commits exactly once when it recovers.
     ///
     /// # Panics
     /// Panics when the append privilege cannot be revoked or restored, the
-    /// exchange is not refused as audit-unavailable, or any decision commits.
+    /// exchange is refused, a decision commits while the store refuses, or
+    /// the allowance does not commit exactly once after recovery.
     #[tokio::test]
-    async fn a_refused_exchange_audit_issues_no_token() {
+    async fn a_refused_exchange_audit_still_issues_the_token() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let actor = seed_actor(&fixture, serde_json::json!([])).await;
-        let admin = fixture.superuser_pool().await.expect("superuser pool");
+        let admin = fixture.superuser_pool().expect("superuser pool");
         sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_app")
             .execute(&admin)
             .await
             .expect("append privilege revoked");
 
-        let result = exchange(
-            &fixture,
-            subject_token(tenant, PermissionSet::new()),
-            actor_token(actor, tenant),
-        )
-        .await;
+        let audit = outbox(&fixture);
+        let result = delegate_service(&audit)
+            .execute(
+                fixture.tenant_conn().await.expect("tenant conn opens"),
+                SecretString::from(subject_token(tenant, PermissionSet::new())),
+                SecretString::from(actor_token(actor, tenant)),
+                TokenAudience::Bifrost,
+                &Uuid::now_v7().to_string(),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "an audit failure never refuses an exchange, got: {result:?}"
+        );
+        assert_retrying(&audit, 1).await;
+        assert!(exchange_outcomes(&fixture).await.is_empty());
 
         sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
             .execute(&admin)
             .await
             .expect("append privilege restored");
-        assert!(
-            matches!(
-                result,
-                Err(DelegateError::Issuance(IssuanceError::Wyrd(
-                    WyrdError::AuditUnavailable { .. }
-                )))
-            ),
-            "an unrecordable exchange is refused as audit-unavailable, got: {result:?}"
+        drain(&audit).await;
+        assert_eq!(
+            exchange_outcomes(&fixture).await,
+            [("allowed".to_owned(), TOKEN_EXCHANGE_OPERATION.to_owned())],
+            "the retried allowance commits exactly once"
         );
-        assert!(exchange_outcomes(&fixture).await.is_empty());
     }
 }

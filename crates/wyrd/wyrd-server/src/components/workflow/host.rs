@@ -69,7 +69,7 @@ impl WorkflowRunHost {
     /// # Errors
     /// Returns `WYRD_WORKFLOW_422_RUN_REQUEST` for a reference that is not a
     /// spaced Workflow or a timeout outside `1..=max_timeout_seconds`; the
-    /// permission and audit errors of [`audit::authorize`]; the admission
+    /// permission errors of [`audit::authorize`]; the admission
     /// errors of [`super::runs::WorkflowRuns::admit`]; and every preparation
     /// failure of [`Preparation::prepare`].
     pub(crate) async fn create(
@@ -86,8 +86,7 @@ impl WorkflowRunHost {
             &Permission::workflow_run(),
             "workflow.run.create",
             &workflow_resource(&request.workflow),
-        )
-        .await?;
+        )?;
         let hash =
             blake3::hash(&serde_jcs::to_vec(&request).map_err(WyrdError::from_spec_serialization)?);
         let key = RunKey {
@@ -125,17 +124,11 @@ impl WorkflowRunHost {
     /// The current snapshot of `caller`'s run `run_id`.
     ///
     /// # Errors
-    /// Returns the permission and audit errors of [`audit::authorize`], and
+    /// Returns the permission errors of [`audit::authorize`], and
     /// `WYRD_WORKFLOW_404_RUN_NOT_FOUND` for a malformed id or a run the
     /// caller cannot see.
-    pub(crate) async fn get(
-        &self,
-        caller: &Caller,
-        run_id: &str,
-    ) -> Result<WorkflowRun, WyrdError> {
-        let run_id = self
-            .authorize_run(caller, "workflow.run.read", run_id)
-            .await?;
+    pub(crate) fn get(&self, caller: &Caller, run_id: &str) -> Result<WorkflowRun, WyrdError> {
+        let run_id = self.authorize_run(caller, "workflow.run.read", run_id)?;
         self.state
             .workflows
             .get(caller.data_tenant_id, caller.principal.id, run_id)
@@ -149,7 +142,7 @@ impl WorkflowRunHost {
     /// unchanged.
     ///
     /// # Errors
-    /// Returns the permission and audit errors of [`audit::authorize`], and
+    /// Returns the permission errors of [`audit::authorize`], and
     /// `WYRD_WORKFLOW_404_RUN_NOT_FOUND` for a malformed id or a run the
     /// caller cannot see.
     pub(crate) async fn cancel(
@@ -157,9 +150,7 @@ impl WorkflowRunHost {
         caller: &Caller,
         run_id: &str,
     ) -> Result<WorkflowRun, WyrdError> {
-        let run_id = self
-            .authorize_run(caller, "workflow.run.cancel", run_id)
-            .await?;
+        let run_id = self.authorize_run(caller, "workflow.run.cancel", run_id)?;
         let mut snapshots =
             self.state
                 .workflows
@@ -179,9 +170,9 @@ impl WorkflowRunHost {
     /// indistinguishable from an unknown one.
     ///
     /// # Errors
-    /// Returns the permission and audit errors of [`audit::authorize`], and
+    /// Returns the permission errors of [`audit::authorize`], and
     /// `WYRD_WORKFLOW_404_RUN_NOT_FOUND` for a malformed id.
-    async fn authorize_run(
+    fn authorize_run(
         &self,
         caller: &Caller,
         operation: &str,
@@ -198,8 +189,7 @@ impl WorkflowRunHost {
             &Permission::workflow_run(),
             operation,
             &resource,
-        )
-        .await?;
+        )?;
         parsed.map_err(|_| run_not_found())
     }
 

@@ -28,6 +28,7 @@ pub(crate) async fn download(
     dest: &Path,
 ) -> Result<DownloadOutcome, StorageClientError> {
     let response = client
+        .http
         .request_external_stream(reqwest::Method::GET, &plan.get_url, None, &[])
         .await
         .map_err(|_| StorageClientError::Transport {
@@ -53,6 +54,7 @@ pub(crate) async fn download_verified(
     progress: &DownloadProgressSink,
 ) -> Result<DownloadOutcome, StorageClientError> {
     let response = client
+        .http
         .request_external_stream(reqwest::Method::GET, &plan.get_url, None, &[])
         .await
         .map_err(|_| StorageClientError::Transport {

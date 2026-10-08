@@ -1,0 +1,11 @@
+apiVersion: wyrd/v1
+kind: Operator
+metadata:
+  name: notify-support
+  version: 1.0.0
+  space: default
+spec:
+  description: Tell the support team a reply failed its check.
+  kind: http
+  method: post
+  url: https://hooks.example.com/support

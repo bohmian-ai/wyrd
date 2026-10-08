@@ -12,15 +12,18 @@
 //! reports what committed so its caller can settle the claim and retire the
 //! members' staged bytes.
 
+use crate::scribe::hot_stage::HotStageError;
 use std::sync::Arc;
+
+use uuid::Uuid;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
 use crate::parquet::object_uploader::VerifiedParquetObject;
-use crate::scribe::assembly::StagingClaim;
+use crate::scribe::assembly::{ScribeAssemblyKey, StagedMemberId, StagingClaim};
 use crate::scribe::claim_assembly::{AssembledClaim, ClaimRuns};
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
-use crate::scribe::hot_stage::{ScribeHotStage, StagedMemberState};
+use crate::scribe::hot_stage::{ScribeHotStage, StagedHotSourceRecordV1, StagedMemberState};
 use crate::scribe::memory::PARQUET_TRANSFER_BUFFER_BYTES;
 use crate::scribe::persistence::{
     ScribePublicationOutcome, ScribePublicationReconciler, ScribeStageMover,
@@ -177,8 +180,8 @@ impl ClaimPublisher {
     /// rows — either way the publication must not report a clean handover.
     fn release_authority(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
-        member: crate::scribe::assembly::StagedMemberId,
+        key: &ScribeAssemblyKey,
+        member: StagedMemberId,
     ) -> Result<(), ScribeError> {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
@@ -218,8 +221,8 @@ impl ClaimPublisher {
     /// a reader may still open.
     async fn await_lease_drain(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
-        member: crate::scribe::assembly::StagedMemberId,
+        key: &ScribeAssemblyKey,
+        member: StagedMemberId,
     ) -> Result<(), ScribeError> {
         let Some(hot_sources) = &self.hot_sources else {
             return Ok(());
@@ -289,15 +292,16 @@ impl ClaimPublisher {
             request.binding,
             request.runs.wal(),
         )?;
-        let operation_id = uuid::Uuid::new_v4();
-        self.move_members(
-            request.claim,
-            StagedMemberState::Publishing {
-                claim_id: request.claim.id().to_string(),
-                operation_id,
-            },
-        )
-        .await?;
+        let operation_id = publication_operation_id(request.claim);
+        let records = self
+            .move_members(
+                request.claim,
+                StagedMemberState::Publishing {
+                    claim_id: request.claim.id().to_string(),
+                    operation_id,
+                },
+            )
+            .await?;
         let mut chunk = vec![0_u8; PARQUET_TRANSFER_BUFFER_BYTES];
         let (claims, verified) = self
             .mover
@@ -349,7 +353,7 @@ impl ClaimPublisher {
         };
         let object_identities: Vec<String> = rows.iter().map(|row| row.file_path.clone()).collect();
         self.advance_published(&request, &object_identities)?;
-        self.retire_members(&request, &outcome.commit_key, &object_identities)
+        self.retire_members(&request, &outcome.commit_key, &object_identities, &records)
             .await?;
         self.mover.cleanup_published(&claims).await?;
         Ok(PublishedClaim {
@@ -362,6 +366,9 @@ impl ClaimPublisher {
 
     /// Moves every member of one claim to the same next durable state.
     ///
+    /// Returns the members' new records in claim order; publication reads
+    /// each member's WAL range from them rather than reloading the member.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a member's record cannot be moved
@@ -370,92 +377,276 @@ impl ClaimPublisher {
         &self,
         claim: &StagingClaim,
         next: StagedMemberState,
-    ) -> Result<(), ScribeError> {
-        for member in claim.members() {
+    ) -> Result<Vec<StagedHotSourceRecordV1>, ScribeError> {
+        self.move_each(
+            claim.key(),
+            claim
+                .members()
+                .iter()
+                .map(|member| (member.id(), next.clone())),
+        )
+        .await
+    }
+
+    /// Moves several members of one key to their next durable states together.
+    ///
+    /// A claim moves through each lifecycle state as one step: every member's
+    /// record is written and synced concurrently, and the step returns only
+    /// once all of them are durable, so the next step never starts while a
+    /// member still lags behind it. Records are returned in input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] for the first member whose record
+    /// cannot be moved forward.
+    ///
+    /// # Cancellation
+    ///
+    /// A failure or cancellation drops the other members' moves; each member is
+    /// left in its previous state or the new one, which is the mixed-state
+    /// shape recovery resumes per member.
+    async fn move_each(
+        &self,
+        key: &ScribeAssemblyKey,
+        moves: impl IntoIterator<Item = (StagedMemberId, StagedMemberState)>,
+    ) -> Result<Vec<StagedHotSourceRecordV1>, ScribeError> {
+        futures_util::future::try_join_all(moves.into_iter().map(|(member, next)| async move {
+            let label = next.label();
             self.stage
-                .transition(claim.key(), member.id(), next.clone())
+                .transition(key, member, next)
                 .await
                 .map_err(|error| ScribeError::Internal {
                     detail: format!(
-                        "move staged member {}-{} to {}: {error}",
-                        member.id().shard(),
-                        member.id().generation(),
-                        next.label()
+                        "move staged member {}-{} to {label}: {error}",
+                        member.shard(),
+                        member.generation(),
                     ),
-                })?;
-        }
-        Ok(())
+                })
+        }))
+        .await
     }
 
     /// Records the commit on every member, then deletes their local files.
     ///
-    /// The published state is written before anything is deleted so a crash
-    /// between the two leaves members that name the object serving their rows,
-    /// rather than rows with no authority at all.
+    /// `records` are the members' `Publishing` records, which carry each
+    /// member's WAL range. The claim moves through each state as one step (see
+    /// [`Self::move_each`]): every member is durably `Published` before any is
+    /// `CleanupPending`, and every member is `CleanupPending` before any local
+    /// file is deleted. A crash between steps therefore leaves members that
+    /// name the object serving their rows, rather than rows with no authority
+    /// at all. After every member's readers drain, the members are removed
+    /// together with one sync of their key directory and their authority is
+    /// released.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when a member cannot record the commit
-    /// or its directory cannot be removed.
+    /// Returns [`ScribeError::Internal`] when a member cannot record the commit,
+    /// its readers cannot be drained, its directory cannot be removed, or its
+    /// authority cannot be released.
     async fn retire_members(
         &self,
         request: &PublishClaimRequest<'_>,
         commit_key: &FileListCommitKey,
         object_identities: &[String],
+        records: &[StagedHotSourceRecordV1],
     ) -> Result<(), ScribeError> {
         let key = request.claim.key();
-        for member in request.claim.members() {
-            let staged = self.stage.member(key, member.id()).await.map_err(|error| {
-                ScribeError::Internal {
-                    detail: format!(
-                        "reload staged member {}-{} before publishing it: {error}",
-                        member.id().shard(),
-                        member.id().generation()
-                    ),
-                }
-            })?;
-            let file_list_commit_key = format!(
-                "{}:{}:{}",
-                commit_key.node_id, commit_key.wal_lsn_min, commit_key.wal_lsn_max
-            );
-            let persisted_lsn_ranges = vec![staged.record().wal_range()];
-            let published = StagedMemberState::Published {
-                claim_id: request.claim.id().to_string(),
-                file_list_commit_key: file_list_commit_key.clone(),
-                published_object_identities: object_identities.to_vec(),
-                persisted_lsn_ranges: persisted_lsn_ranges.clone(),
-            };
-            self.stage
-                .transition(key, member.id(), published)
-                .await
-                .map_err(transition_failure(member.id()))?;
-            self.stage
-                .transition(
-                    key,
-                    member.id(),
-                    StagedMemberState::CleanupPending {
-                        claim_id: request.claim.id().to_string(),
-                        file_list_commit_key,
+        let claim_id = request.claim.id().to_string();
+        let file_list_commit_key = format!(
+            "{}:{}:{}",
+            commit_key.node_id, commit_key.wal_lsn_min, commit_key.wal_lsn_max
+        );
+        self.move_each(
+            key,
+            records.iter().map(|record| {
+                (
+                    record.member(),
+                    StagedMemberState::Published {
+                        claim_id: claim_id.clone(),
+                        file_list_commit_key: file_list_commit_key.clone(),
                         published_object_identities: object_identities.to_vec(),
-                        persisted_lsn_ranges,
+                        persisted_lsn_ranges: vec![record.wal_range()],
                     },
                 )
-                .await
-                .map_err(transition_failure(member.id()))?;
-            self.await_lease_drain(key, member.id()).await?;
-            self.stage
-                .retire(key, member.id())
+            }),
+        )
+        .await?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.reconciler.fail_claim_retirement() {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "test failure retiring claim {claim_id} after its members recorded the commit"
+                ),
+            });
+        }
+        self.move_each(
+            key,
+            records.iter().map(|record| {
+                (
+                    record.member(),
+                    StagedMemberState::CleanupPending {
+                        claim_id: claim_id.clone(),
+                        file_list_commit_key: file_list_commit_key.clone(),
+                        published_object_identities: object_identities.to_vec(),
+                        persisted_lsn_ranges: vec![record.wal_range()],
+                    },
+                )
+            }),
+        )
+        .await?;
+        let members: Vec<_> = records
+            .iter()
+            .map(StagedHotSourceRecordV1::member)
+            .collect();
+        for member in &members {
+            self.await_lease_drain(key, *member).await?;
+        }
+        self.stage
+            .retire_all(key, &members)
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("retire the published staged members of claim {claim_id}: {error}"),
+            })?;
+        for member in members {
+            self.release_authority(key, member)?;
+        }
+        Ok(())
+    }
+
+    /// Finishes one outstanding claim whose fenced commit already landed.
+    ///
+    /// A publication that fails after its members recorded the commit — a
+    /// refused `CleanupPending` move, a lease drain, a removal, an authority
+    /// release — leaves an outstanding claim with nothing left to publish.
+    /// Publishing it again would re-run a merge over members whose runs may
+    /// already be gone, so the driver of a retried claim calls this first and
+    /// publishes only when it returns `false`.
+    ///
+    /// The members' durable records decide. A member whose record is gone was
+    /// removed by retirement, which starts only once every member is
+    /// `CleanupPending`; a `Published` or `CleanupPending` member names the
+    /// commit itself. Either proves the claim committed, and the survivors are
+    /// then driven through the same terminal cleanup startup uses, in the
+    /// same order: `CleanupPending`, lease drain, removal, authority release.
+    /// Directories a removal left without their record are deleted, and their
+    /// authorities released if the failed attempt had not yet done so. When
+    /// every member is still before its commit, nothing is changed and the
+    /// claim publishes again under its own identity, which a replay-exact
+    /// fenced transaction recognises if the rows landed anyway.
+    ///
+    /// The claim's staged candidates and publication manifest are not removed
+    /// here: they are named by the claim's WAL union, which retired members no
+    /// longer carry. Startup publication recovery replays and removes them, as
+    /// it does after a crash between the commit and that cleanup.
+    ///
+    /// The caller must hold the claim's exclusive drive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a record cannot be read, when the
+    /// survivors contradict a committed claim (a member before its commit with
+    /// no committed sibling to take facts from, or a member of another claim),
+    /// or for the first transition, lease-drain, removal, or registry refusal.
+    /// The claim stays outstanding and the next attempt resumes from whatever
+    /// the refusal left durable.
+    pub(crate) async fn finish_committed(&self, claim: &StagingClaim) -> Result<bool, ScribeError> {
+        let key = claim.key();
+        let mut surviving = Vec::with_capacity(claim.members().len());
+        let mut retired = Vec::new();
+        for member in claim.members() {
+            let record = self
+                .stage
+                .surviving_record(key, member.id())
                 .await
                 .map_err(|error| ScribeError::Internal {
                     detail: format!(
-                        "retire published staged member {}-{}: {error}",
+                        "read staged member {}-{} before resuming its claim: {error}",
                         member.id().shard(),
                         member.id().generation()
                     ),
                 })?;
-            self.release_authority(key, member.id())?;
+            match record {
+                Some(record) => surviving.push(record),
+                None => retired.push(member.id()),
+            }
         }
-        Ok(())
+        let recorded_commit = surviving.iter().any(|record| {
+            matches!(
+                record.state(),
+                StagedMemberState::Published { .. } | StagedMemberState::CleanupPending { .. }
+            )
+        });
+        if retired.is_empty() && !recorded_commit {
+            return Ok(false);
+        }
+        let claim_id = claim.id().to_string();
+        if let Some(stranded) = surviving.iter().find(|record| {
+            record.state().claim_id() != Some(claim_id.as_str())
+                || match record.state() {
+                    StagedMemberState::Ready | StagedMemberState::Claimed { .. } => true,
+                    StagedMemberState::Publishing { .. } => !recorded_commit,
+                    StagedMemberState::Published { .. }
+                    | StagedMemberState::CleanupPending { .. } => false,
+                }
+        }) {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "staged member {}-{} is {} after claim {claim_id} committed",
+                    stranded.member().shard(),
+                    stranded.member().generation(),
+                    stranded.state().label()
+                ),
+            });
+        }
+        let surviving = surviving.iter().collect::<Vec<_>>();
+        self.recover_terminal_members(key, &surviving).await?;
+        self.stage
+            .retire_all(key, &retired)
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("retire the removed members of claim {claim_id}: {error}"),
+            })?;
+        for member in retired {
+            self.release_retired_authority(key, member)?;
+        }
+        Ok(true)
+    }
+
+    /// Releases the authority of a member retirement already removed.
+    ///
+    /// The failed attempt removes members before it releases them, so the
+    /// authority may or may not still be registered; an unregistered one was
+    /// released by that attempt and is not a refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses the release
+    /// for any other reason, which means nothing durable holds the rows.
+    fn release_retired_authority(
+        &self,
+        key: &ScribeAssemblyKey,
+        member: StagedMemberId,
+    ) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        match hot_sources.release(
+            &crate::scribe::seal_key::SealKey::new(
+                key.tenant(),
+                key.table().clone(),
+                key.partition(),
+            ),
+            crate::scribe::hot_source::GenerationOrdinal::new(member.shard(), member.generation()),
+        ) {
+            Ok(_) | Err(crate::scribe::hot_source::HotSourceError::Unregistered { .. }) => Ok(()),
+            Err(error) => Err(ScribeError::Internal {
+                detail: format!(
+                    "release the authority of retired staged member {}-{}: {error}",
+                    member.shard(),
+                    member.generation()
+                ),
+            }),
+        }
     }
 
     /// Drives recovered published members through terminal cleanup.
@@ -465,21 +656,25 @@ impl ClaimPublisher {
     /// prevents new leases through the restored published authority, drains
     /// existing leases, removes member storage, and releases registry authority.
     ///
+    /// `records` are the durable records of one key's surviving members:
+    /// every member startup recovered, or the survivors of one claim whose
+    /// retirement failed after its commit (see [`Self::finish_committed`]).
+    ///
     /// # Errors
     ///
     /// Returns the first durable transition, lease, filesystem, or registry
-    /// refusal. Unprocessed records remain intact for the next startup.
+    /// refusal. Unprocessed records remain intact for the next attempt.
     pub(crate) async fn recover_terminal_members(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
-        members: &[crate::scribe::hot_stage::StagedMember],
+        key: &ScribeAssemblyKey,
+        records: &[&StagedHotSourceRecordV1],
     ) -> Result<RecoveredTerminalCleanup, ScribeError> {
-        let terminal_facts = TerminalPublicationFacts::collect(members);
-        for member in members {
-            let Some(plan) = terminal_facts.plan_for(member) else {
+        let terminal_facts = TerminalPublicationFacts::collect(records);
+        for record in records {
+            let Some(plan) = terminal_facts.plan_for(record) else {
                 continue;
             };
-            self.retire_terminal_member(key, member.record().member(), plan)
+            self.retire_terminal_member(key, record.member(), plan)
                 .await?;
         }
         Ok(RecoveredTerminalCleanup {
@@ -501,8 +696,8 @@ impl ClaimPublisher {
     /// found it, which the next startup re-reads.
     async fn retire_terminal_member(
         &self,
-        key: &crate::scribe::assembly::ScribeAssemblyKey,
-        id: crate::scribe::assembly::StagedMemberId,
+        key: &ScribeAssemblyKey,
+        id: StagedMemberId,
         plan: TerminalMemberPlan,
     ) -> Result<(), ScribeError> {
         if plan.records_publication {
@@ -588,10 +783,10 @@ struct TerminalMemberPlan {
 
 impl TerminalPublicationFacts {
     /// Collects the committed facts every terminal claim in the cohort carries.
-    fn collect(members: &[crate::scribe::hot_stage::StagedMember]) -> Self {
-        let facts = members
+    fn collect(records: &[&StagedHotSourceRecordV1]) -> Self {
+        let facts = records
             .iter()
-            .filter_map(|member| match member.record().state() {
+            .filter_map(|record| match record.state() {
                 StagedMemberState::Published {
                     claim_id,
                     file_list_commit_key,
@@ -633,11 +828,8 @@ impl TerminalPublicationFacts {
     /// facts — but only when such a sibling exists, because nothing else proves
     /// its claim committed. A member is never transitioned onto the state it is
     /// already in; the stage refuses that as a lifecycle contradiction.
-    fn plan_for(
-        &self,
-        member: &crate::scribe::hot_stage::StagedMember,
-    ) -> Option<TerminalMemberPlan> {
-        match member.record().state() {
+    fn plan_for(&self, record: &StagedHotSourceRecordV1) -> Option<TerminalMemberPlan> {
+        match record.state() {
             StagedMemberState::Published { claim_id, .. } => {
                 let facts = self.facts_for(claim_id)?;
                 Some(TerminalMemberPlan {
@@ -658,7 +850,7 @@ impl TerminalPublicationFacts {
             }
             StagedMemberState::Publishing { claim_id, .. } => Some(TerminalMemberPlan {
                 facts: self.facts_for(claim_id)?,
-                persisted_lsn_ranges: vec![member.record().wal_range()],
+                persisted_lsn_ranges: vec![record.wal_range()],
                 records_publication: true,
                 needs_cleanup_transition: true,
             }),
@@ -691,10 +883,23 @@ impl std::fmt::Debug for ClaimPublisher {
     }
 }
 
+/// Derives the publication operation identity a claim's members record when
+/// they enter `Publishing`.
+///
+/// It is a function of the claim identity alone, so every attempt at one
+/// claim — a retry in this process or a resume after a restart — writes the
+/// identical `Publishing` state, which the stage accepts as an idempotent
+/// replay instead of refusing it as a backwards move. Nothing else reads the
+/// value; Forge derives its own promotion operation identities from its
+/// tasks.
+fn publication_operation_id(claim: &StagingClaim) -> Uuid {
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&claim.id().as_bytes()[..16]);
+    uuid::Builder::from_custom_bytes(bytes).into_uuid()
+}
+
 /// Builds the failure describing one member's refused durable transition.
-fn transition_failure(
-    member: crate::scribe::assembly::StagedMemberId,
-) -> impl Fn(crate::scribe::hot_stage::HotStageError) -> ScribeError {
+fn transition_failure(member: StagedMemberId) -> impl Fn(HotStageError) -> ScribeError {
     move |error| ScribeError::Internal {
         detail: format!(
             "record the publication of staged member {}-{}: {error}",

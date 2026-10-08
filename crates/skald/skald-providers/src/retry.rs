@@ -31,6 +31,7 @@ impl Default for RetryPolicy {
 
 impl RetryPolicy {
     /// Creates a policy with jitter disabled for deterministic tests.
+    #[must_use]
     pub fn without_jitter(mut self) -> Self {
         self.jitter = false;
         self

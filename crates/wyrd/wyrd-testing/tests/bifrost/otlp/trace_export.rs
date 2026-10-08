@@ -597,4 +597,161 @@ mod pg_tests {
 
         journey.shutdown().await;
     }
+
+    /// Access-token lifetime the API-key exporter journey outlives.
+    const SHORT_ACCESS_TTL: chrono::Duration = chrono::Duration::seconds(2);
+
+    /// A stock exporter holding only an API key keeps exporting past any token lifetime.
+    ///
+    /// The server mints two-second access tokens with no clock-skew allowance.
+    /// An unmodified upstream OTLP/gRPC exporter is configured with nothing
+    /// but its endpoint and an `x-wyrd-api-key` header, exports once, outlives
+    /// the token lifetime, and exports again on the same exporter; an
+    /// OTLP/HTTP export carrying the same header then lands too. A bearer
+    /// minted before the wait is refused afterwards, which is what proves the
+    /// lifetime was really crossed. An unknown key is refused on the OTLP
+    /// route, and the API-key header authenticates nothing outside OTLP. Every
+    /// accepted span then reads back through the public Bifrost client.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the exporter cannot be built or flushed, when an
+    /// API-key export is refused, when a refusal is answered with anything
+    /// other than `401`, or when an exported span does not read back.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn stock_exporter_authenticates_with_api_key_after_token_lifetime() {
+        use opentelemetry::trace::{Tracer, TracerProvider as _};
+        use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use secrecy::ExposeSecret;
+        use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+        use wyrd_tonic::prost::Message;
+
+        let journey = OtlpJourney::start_on(
+            wyrd_testing::WyrdTestServer::builder()
+                .with_access_ttl(SHORT_ACCESS_TTL)
+                .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
+                    allowed_clock_skew: std::time::Duration::ZERO,
+                }),
+        )
+        .await;
+        let api_key = journey.api_key().expose_secret().to_owned();
+        let mut metadata = wyrd_tonic::tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            "x-wyrd-api-key",
+            api_key
+                .parse()
+                .expect("the API key is valid ASCII metadata"),
+        );
+        let exporter = SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(journey.grpc_url())
+            .with_metadata(metadata)
+            .build()
+            .expect("the upstream OTLP span exporter builds against the bound collector");
+        let provider = SdkTracerProvider::builder()
+            .with_resource(support::stock_resource())
+            .with_batch_exporter(exporter)
+            .build();
+        let tracer = provider.tracer(support::STOCK_TRACE_SCOPE);
+
+        tracer.in_span("api-key-before-token-lifetime", |_| {});
+        provider
+            .force_flush()
+            .expect("the exporter flushes before the token lifetime");
+        tokio::time::sleep(
+            (SHORT_ACCESS_TTL + chrono::Duration::seconds(1))
+                .to_std()
+                .expect("the wait is a positive duration"),
+        )
+        .await;
+        tracer.in_span("api-key-after-token-lifetime", |_| {});
+        provider
+            .force_flush()
+            .expect("the exporter flushes after the token lifetime");
+        provider
+            .shutdown()
+            .expect("the upstream tracer provider shuts down");
+
+        let start = support::anchor_nanos();
+        let body = ExportTraceServiceRequest {
+            resource_spans: support::maximal_resource_spans(start, support::HTTP_PROTOBUF_SPAN),
+        }
+        .encode_to_vec();
+        let http = reqwest::Client::new();
+        let traces_url = format!("{}/v1/traces", journey.base_url());
+        let post = |header: &'static str, value: String| {
+            http.post(&traces_url)
+                .header("content-type", "application/x-protobuf")
+                .header(header, value)
+                .body(body.clone())
+                .send()
+        };
+        let accepted = post("x-wyrd-api-key", api_key.clone())
+            .await
+            .expect("the HTTP collector is reachable");
+        assert!(
+            accepted.status().is_success(),
+            "an OTLP/HTTP export with an API key is accepted after the token lifetime: {}",
+            accepted.status()
+        );
+        let expired = post("x-wyrd-access-token", format!("Bearer {}", journey.token()))
+            .await
+            .expect("the HTTP collector is reachable");
+        assert_eq!(
+            expired.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "the bearer minted before the wait has lapsed"
+        );
+        let unknown = post("x-wyrd-api-key", format!("{api_key}x"))
+            .await
+            .expect("the HTTP collector is reachable");
+        assert_eq!(
+            unknown.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "an unknown API key is refused on the OTLP route"
+        );
+        let elsewhere = http
+            .get(format!("{}/v1/cards", journey.base_url()))
+            .header("x-wyrd-api-key", api_key.clone())
+            .send()
+            .await
+            .expect("the HTTP API is reachable");
+        assert_eq!(
+            elsewhere.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "the API-key header authenticates only OTLP routes"
+        );
+
+        journey.publish().await;
+        let batches = journey
+            .query(&format!(
+                "SELECT name FROM {SPANS_TABLE} WHERE scope_name = '{}' \
+                 OR start_time_unix_nano = {start}",
+                support::STOCK_TRACE_SCOPE
+            ))
+            .await;
+        let mut names: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let names = support::column::<arrow::array::StringArray>(batch, "name");
+                (0..batch.num_rows())
+                    .map(|row| names.value(row).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "api-key-after-token-lifetime",
+                "api-key-before-token-lifetime",
+                support::SPAN_NAME,
+            ],
+            "every API-key export reads back exactly once"
+        );
+
+        journey.shutdown().await;
+    }
 }

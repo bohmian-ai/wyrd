@@ -1,104 +1,74 @@
 """Python packaging coverage for the shared Rust CLI implementation."""
 
-import json
+import os
 import sys
+from pathlib import Path
 
+import pytest
+import wyrd.cli
+from wyrd import WyrdError
 from wyrd.cli import run_wyrd_cli
+from wyrd.testing.cli import plan
+
+EX_FAILURE = 1
+EX_VERIFICATION_FAILED = 2
 
 
-def _run(monkeypatch, args: list[str]) -> int:
+@pytest.fixture
+def run_cli(monkeypatch: pytest.MonkeyPatch):
     """Invoke the packaged no-argument entrypoint with an isolated argv."""
-    monkeypatch.setattr(sys, "argv", args)
-    return run_wyrd_cli()
+
+    def run(*args: str) -> int:
+        monkeypatch.setattr(sys, "argv", ["wyrd", *args])
+        return run_wyrd_cli()
+
+    return run
 
 
-def test_packaged_cli_preserves_help_and_usage_codes(monkeypatch) -> None:
-    """The installed entrypoint preserves success and usage outcomes."""
-    assert _run(monkeypatch, ["wyrd", "--help"]) == 0
-    assert _run(monkeypatch, ["wyrd", "dev", "bootstrap"]) == 64
-
-
-def test_packaged_cli_preserves_runtime_codes(tmp_path, monkeypatch) -> None:
-    """Shared dispatch preserves generic failure and evaluation mismatch codes."""
-    spec = tmp_path / "eval.json"
-    spec.write_text(
-        json.dumps(
-            {
-                "apiVersion": "wyrd/v1",
-                "kind": "Verifier",
-                "metadata": {
-                    "name": "cli-exit",
-                    "version": "1.0.0",
-                    "space": "tests",
-                    "labels": {},
-                    "annotations": {},
-                },
-                "spec": {
-                    "implementation": {
-                        "kind": "eval",
-                        "spec": {
-                            "tasks": {
-                                "ok_check": {
-                                    "kind": "assertion",
-                                    "id": "ok_check",
-                                    "context_path": "$.ok",
-                                    "operator": "equals",
-                                    "expected": True,
-                                }
-                            },
-                            "pass_gate": {"kind": "all_pass"},
-                        },
-                    }
-                },
-                "relationships": {
-                    "outbound": [],
-                    "outbound_refs": [],
-                    "inbound": [],
-                    "inbound_refs": [],
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    common = [
-        "wyrd",
+@pytest.fixture
+def eval_run(fixtures_dir: Path, tmp_path: Path) -> list[str]:
+    """An ``eval run`` of the ok-check Verifier, short of its records."""
+    return [
         "eval",
         "run",
         "--eval",
-        str(spec),
+        str(fixtures_dir / "authoring" / "verifier" / "ok-check.yaml"),
         "--subject",
         "tests/Agent/agent-under-test@1.0.0",
         "--out",
         str(tmp_path / "out"),
     ]
-    assert (
-        _run(
-            monkeypatch,
-            [*common, "--records", str(tmp_path / "missing-records.jsonl")],
-        )
-        == 1
-    )
 
-    records = tmp_path / "records.jsonl"
-    records.write_text(
-        json.dumps(
-            {
-                "record_id": "00000000-0000-0000-0000-000000000002",
-                "context": {"ok": False},
-                "created_at": "2026-01-01T00:00:00Z",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    assert (
-        _run(
-            monkeypatch,
-            [
-                *common,
-                "--records",
-                str(records),
-            ],
-        )
-        == 2
-    )
+
+def test_production_cli_exposes_only_the_console_script() -> None:
+    assert wyrd.cli.__all__ == ["run_wyrd_cli"]
+    assert not hasattr(wyrd.cli, "apply")
+
+
+def test_help_exits_zero(run_cli) -> None:
+    assert run_cli("--help") == 0
+
+
+def test_unknown_subcommand_exits_with_usage(run_cli) -> None:
+    assert run_cli("dev", "bootstrap") == os.EX_USAGE
+
+
+def test_missing_records_file_exits_with_failure(
+    run_cli, eval_run: list[str], tmp_path: Path
+) -> None:
+    assert run_cli(*eval_run, "--records", str(tmp_path / "missing-records.jsonl")) == EX_FAILURE
+
+
+def test_failing_records_exit_with_verification_failed(
+    run_cli, eval_run: list[str], fixtures_dir: Path
+) -> None:
+    records = fixtures_dir / "authoring" / "verifier" / "not-ok-records.jsonl"
+
+    assert run_cli(*eval_run, "--records", str(records)) == EX_VERIFICATION_FAILED
+
+
+def test_in_process_plan_raises_catalog_error_for_missing_tree(tmp_path: Path) -> None:
+    """In-process commands raise WyrdError instead of exiting."""
+    with pytest.raises(WyrdError) as caught:
+        plan(str(tmp_path / "missing.yaml"))
+    assert caught.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"

@@ -398,7 +398,7 @@ fn correlation_text<'a>(
 
 /// The two nullable correlation fields every canonical signal projection appends.
 ///
-/// They are not ledger fields and carry no stable id: Scribe strips `card_ref`
+/// They are not ledger fields and carry no sensitivity tag: Scribe strips `card_ref`
 /// and relinquishes `run_id` before stamping the canonical envelope, and the
 /// source schema fingerprint excludes both, so appending them here cannot
 /// perturb a table's catalog or canonical physical identity.
@@ -589,8 +589,8 @@ pub fn f64_opt_column(values: Vec<Option<f64>>) -> ArrayRef {
 
 /// Assemble one `List` column from flattened child values and row lengths.
 ///
-/// `element` is the declared element field, complete with its stable id and
-/// sensitivity metadata, so the produced column matches the ledger exactly.
+/// `element` is the declared element field, complete with its sensitivity
+/// metadata, so the produced column matches the ledger exactly.
 /// `lengths` holds one entry per row; a null row is expressed by `None`.
 ///
 /// # Errors
@@ -695,9 +695,10 @@ pub fn required_binary(array: &BinaryArray, row: usize) -> Result<&[u8], &'stati
 /// authority sees one canonical column order. For each declared field the
 /// supplied field must agree on Arrow type shape and nullability, recursively
 /// through every nested child. Field metadata is deliberately not compared:
-/// the stable id and sensitivity tag are the server's own physical identity,
-/// re-derived here when the validated columns are reassembled under the
-/// declared schema, so a writer neither supplies nor can be wrong about them.
+/// the sensitivity tag is the server's own physical identity, re-derived here
+/// when the validated columns are reassembled under the declared schema, and
+/// any caller-supplied field id is dropped, so a writer neither supplies nor
+/// can be wrong about either.
 /// Canonical
 /// binary payloads are additionally decoded and re-encoded so a malformed or
 /// non-canonical protobuf value is refused before any row is accepted.

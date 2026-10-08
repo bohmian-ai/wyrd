@@ -64,16 +64,24 @@ pub struct CardSubmission {
 }
 
 /// One heavy artifact declared by a submission.
+///
+/// An author may omit `sha256` and `size_bytes`; the client computes both
+/// from the local file before any registration call, so a request sent to the
+/// server carries both and the server refuses an entry missing either.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct ArtifactManifestEntry {
     /// Validated path below the registered card's artifact prefix.
     pub relative_path: crate::registry::RelativeArtifactPath,
-    /// Base64-encoded SHA-256 digest of the artifact bytes.
-    pub sha256: String,
-    /// Declared artifact size in bytes.
-    pub size_bytes: u64,
+    /// Base64-encoded SHA-256 digest of the artifact bytes; computed by the
+    /// client when authored without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Artifact size in bytes; computed by the client when authored without
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
     /// Optional MIME type for the stored object.
     pub content_type: Option<String>,
 }
@@ -178,13 +186,14 @@ mod tests {
     use crate::envelope::{CardKind, Metadata};
     use crate::registry::{CardLifecycleStatus, RegistrationOutcomeKind, RelativeArtifactPath};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     /// Build a stable artifact entry for canonical-manifest tests.
     fn artifact(path: &str) -> ArtifactManifestEntry {
         ArtifactManifestEntry {
             relative_path: RelativeArtifactPath::new(path).expect("test artifact path is valid"),
-            sha256: "YWJj".to_owned(),
-            size_bytes: 3,
+            sha256: Some("YWJj".to_owned()),
+            size_bytes: Some(3),
             content_type: None,
         }
     }
@@ -211,8 +220,8 @@ mod tests {
                 bump: None,
                 space: Some("default".parse().expect("test space is valid")),
                 uid: None,
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::default(),
+                annotations: BTreeMap::default(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,

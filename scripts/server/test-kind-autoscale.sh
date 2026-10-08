@@ -81,8 +81,8 @@ forward() {
 
 sdk_phase() {
   WYRD_SERVER_URL="$http" WYRD_API_KEY="$api_key" WYRD_STARTUP_STATE_DIR="$work" \
-    cargo nextest run --locked -p wyrd-client --test startup_image_journey \
-    --run-ignored=only -E "test(=$1)"
+    cargo nextest run --locked -p wyrd-client --test integration \
+    --run-ignored=only -E "test(=startup_image_journey::$1)"
 }
 
 # Sum of one Prometheus counter's samples on pod $1 whose labels contain $3

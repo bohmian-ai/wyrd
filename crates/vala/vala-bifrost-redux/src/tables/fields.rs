@@ -4,22 +4,23 @@
 //! helpers every pre-declared domain table's `arrow_fields()` uses. Above them,
 //! [`CanonicalField`] is the declarative ledger entry the three canonical `OTel`
 //! signal tables are built from: one immutable record carrying a table-local
-//! stable field identity, its name, its physical type, nullability, and its
-//! projection/permission class. Every downstream representation — the Arrow
-//! schema, the `PARQUET:field_id` metadata, the Iceberg field ids, the
-//! canonical physical fingerprint, the sensitivity list, and the canonical
-//! Arrow validator — is derived from that one declaration, so no consumer ever
-//! re-encodes column order or field semantics.
+//! name, its physical type, nullability, and its projection/permission class.
+//! Every downstream representation — the Arrow schema, the canonical physical
+//! fingerprint, the sensitivity list, and the canonical Arrow validator — is
+//! derived from that one declaration, so no consumer ever re-encodes column
+//! order or field semantics. Numeric field ids are not part of a declaration:
+//! the registered Iceberg table assigns them, and Scribe stamps the table's
+//! ids onto every batch it accepts for that table.
 
 use std::collections::HashMap;
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-/// Arrow field metadata key Parquet and Iceberg read a stable field id from.
+/// Arrow field metadata key Parquet and Iceberg read a field id from.
 ///
-/// Writing this on every canonical field (including every nested child) is what
-/// lets `iceberg::arrow::arrow_schema_to_schema` adopt the table's own
-/// immutable ids instead of auto-assigning positional ones.
+/// Only the registered Iceberg table's assigned ids are ever written under this
+/// key: Scribe stamps them from the table on admission, so every Parquet object
+/// it seals carries exactly the ids Forge and Oracle resolve columns by.
 pub const PARQUET_FIELD_ID: &str = "PARQUET:field_id";
 
 /// Arrow field metadata key carrying the declared sensitivity of a field.
@@ -130,9 +131,8 @@ pub enum CanonicalType {
 impl CanonicalType {
     /// Project this declaration into its Arrow type, recursing into children.
     ///
-    /// Nested children carry their own `PARQUET:field_id` metadata, which is
-    /// what makes a nested Iceberg conversion adopt the ledger's ids rather
-    /// than renumbering the nested tree.
+    /// Nested children carry their own sensitivity metadata, so every
+    /// schema-only consumer sees the whole tree's classification.
     #[must_use]
     pub fn to_arrow(&self) -> DataType {
         match self {
@@ -176,14 +176,11 @@ impl CanonicalType {
 
 /// One immutable canonical ledger entry.
 ///
-/// A field's `id` is table-local, assigned once, and never renumbered or
-/// reused. Adding a field takes the next previously unused id; removing one
-/// retires its id permanently. The pair (`id`, `name`) is the identity every
-/// cross-schema mapping binds by, so no consumer may bind by position.
+/// A declaration carries no numeric field id. The registered Iceberg table
+/// assigns ids when it is created, and Scribe, Forge, and Oracle all read them
+/// from that table, so the ledger never competes with the table for identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonicalField {
-    /// Table-local immutable stable identity.
-    pub id: i32,
     /// Physical column or nested child name.
     pub name: &'static str,
     /// Declared physical type.
@@ -197,9 +194,8 @@ pub struct CanonicalField {
 impl CanonicalField {
     /// Declare one queryable metadata field.
     #[must_use]
-    pub const fn meta(id: i32, name: &'static str, ty: CanonicalType, nullable: bool) -> Self {
+    pub const fn meta(name: &'static str, ty: CanonicalType, nullable: bool) -> Self {
         Self {
-            id,
             name,
             ty,
             nullable,
@@ -209,9 +205,8 @@ impl CanonicalField {
 
     /// Declare one bulk, non-access-gated payload field.
     #[must_use]
-    pub const fn payload(id: i32, name: &'static str, ty: CanonicalType, nullable: bool) -> Self {
+    pub const fn payload(name: &'static str, ty: CanonicalType, nullable: bool) -> Self {
         Self {
-            id,
             name,
             ty,
             nullable,
@@ -221,9 +216,8 @@ impl CanonicalField {
 
     /// Declare one access-gated caller-content payload field.
     #[must_use]
-    pub const fn sensitive(id: i32, name: &'static str, ty: CanonicalType, nullable: bool) -> Self {
+    pub const fn sensitive(name: &'static str, ty: CanonicalType, nullable: bool) -> Self {
         Self {
-            id,
             name,
             ty,
             nullable,
@@ -233,19 +227,16 @@ impl CanonicalField {
 
     /// Project this entry into its Arrow field, stamping its semantic metadata.
     ///
-    /// The `PARQUET:field_id` and `wyrd:sensitive` metadata are written on this
-    /// field and, through [`CanonicalType::to_arrow`], on every nested child,
-    /// so the whole tree carries explicit ids into Parquet and Iceberg and
-    /// carries its sensitivity into every schema-only consumer.
+    /// The `wyrd:sensitive` metadata is written on this field and, through
+    /// [`CanonicalType::to_arrow`], on every nested child, so the whole tree
+    /// carries its sensitivity into every schema-only consumer. No field id is
+    /// written: the registered Iceberg table owns ids.
     #[must_use]
     pub fn to_arrow(&self) -> Field {
-        Field::new(self.name, self.ty.to_arrow(), self.nullable).with_metadata(HashMap::from([
-            (PARQUET_FIELD_ID.to_owned(), self.id.to_string()),
-            (
-                WYRD_SENSITIVE.to_owned(),
-                self.class.is_sensitive().to_string(),
-            ),
-        ]))
+        Field::new(self.name, self.ty.to_arrow(), self.nullable).with_metadata(HashMap::from([(
+            WYRD_SENSITIVE.to_owned(),
+            self.class.is_sensitive().to_string(),
+        )]))
     }
 }
 
@@ -263,27 +254,36 @@ pub fn canonical_arrow_fields(declared: &[CanonicalField]) -> Vec<Field> {
 mod tests {
     use super::*;
 
-    /// Nested children must carry their own stable ids, not only the root.
+    /// Nested children carry their own sensitivity and no declared field id.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a nested child loses its sensitivity marker or any level of
+    /// the tree declares a field id.
     #[test]
-    fn nested_declarations_stamp_every_child_field_id() {
+    fn nested_declarations_carry_sensitivity_and_no_field_id() {
+        /// Sensitive list element, the nested level under test.
         static CHILD: CanonicalField =
-            CanonicalField::payload(2, "item", CanonicalType::UInt64, false);
+            CanonicalField::sensitive("item", CanonicalType::UInt64, false);
+        /// Non-sensitive list column whose element is [`CHILD`].
         static ROOT: CanonicalField =
-            CanonicalField::payload(1, "counts", CanonicalType::List(&CHILD), true);
+            CanonicalField::payload("counts", CanonicalType::List(&CHILD), true);
 
         let field = ROOT.to_arrow();
+        assert_eq!(field.metadata().get(PARQUET_FIELD_ID), None);
         assert_eq!(
-            field.metadata().get(PARQUET_FIELD_ID),
-            Some(&"1".to_owned())
+            field.metadata().get(WYRD_SENSITIVE),
+            Some(&"false".to_owned())
         );
         let DataType::List(child) = field.data_type() else {
             panic!("list declaration must project an Arrow list");
         };
         assert_eq!(child.name(), "item");
         assert!(!child.is_nullable());
+        assert_eq!(child.metadata().get(PARQUET_FIELD_ID), None);
         assert_eq!(
-            child.metadata().get(PARQUET_FIELD_ID),
-            Some(&"2".to_owned())
+            child.metadata().get(WYRD_SENSITIVE),
+            Some(&"true".to_owned())
         );
     }
 

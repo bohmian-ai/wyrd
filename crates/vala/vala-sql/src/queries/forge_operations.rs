@@ -27,9 +27,7 @@ use wyrd_spec::vala::api::{
     ForgeSnapshotExpirePhase, audit_detail_canonical_json,
 };
 
-use crate::queries::oracle_reader_authority::{
-    BIFROST_CATALOG_NAME, invariant, read_protection_record,
-};
+use crate::queries::oracle_reader_authority::{BIFROST_CATALOG_NAME, ExclusiveTableAuthority};
 use crate::row_types::forge_operations::{
     ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
     ForgeExpirationResetOutcome, ForgeExpirationResetRequest, ForgeExpirationSettlementRequest,
@@ -38,7 +36,7 @@ use crate::row_types::forge_operations::{
     OpenForgeOperationPage,
 };
 use crate::row_types::forge_tasks::{ForgeTaskEvidence, evidence_to_value};
-use crate::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
+use crate::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use crate::{OperatorPool, SqlError, TenantConn};
 
 /// Scoped Forge operation state handle for one `(resource, family)`.
@@ -97,7 +95,8 @@ impl<'resource> ForgeOperations<'resource> {
     /// # Errors
     ///
     /// Returns [`SqlError::Conflict`] on invalid transition identity,
-    /// transition collision, or detail mismatch.
+    /// transition collision, detail mismatch, or a new rewrite on a table
+    /// whose Scribe promotion is still Prepared.
     /// Returns [`SqlError::InvariantViolation`] when stored data is malformed.
     /// Returns [`SqlError::Query`] when locking or projection IO fails.
     ///
@@ -130,7 +129,11 @@ impl<'resource> ForgeOperations<'resource> {
 
         match row {
             None => {
-                // Absent row: first Prepared for this operation.
+                // Absent row: first Prepared for this operation. A new rewrite
+                // waits for every promotion on its table to settle.
+                if self.family == ForgeOperationFamily::IcebergRewrite {
+                    self.refuse_unsettled_promotion(conn.transaction()).await?;
+                }
                 self.insert_prepared(conn.transaction(), operation_id, &detail)
                     .await?;
                 Ok(ForgeOperationTransition::Applied)
@@ -328,7 +331,7 @@ impl<'resource> ForgeOperations<'resource> {
         // turns "no cursor" into "every row", keeping one statement rather than
         // two that could drift apart.
         let rows: Vec<ForgeOperationStateSqlRow> = sqlx::query_as(
-            r#"
+            r"
             SELECT *
               FROM vala.forge_operation_state
              WHERE data_tenant_id = wyrd.current_tenant()
@@ -338,7 +341,7 @@ impl<'resource> ForgeOperations<'resource> {
                AND COALESCE((prepared_at, operation_id) > ($4, $5), TRUE)
              ORDER BY prepared_at, operation_id
              LIMIT $3
-            "#,
+            ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -453,7 +456,39 @@ impl<'resource> ForgeOperations<'resource> {
 // Private SQL helpers owned by ForgeOperations
 // ---------------------------------------------------------------------------
 
-impl<'resource> ForgeOperations<'resource> {
+impl ForgeOperations<'_> {
+    /// Refuses while this table resource has an unsettled Scribe promotion.
+    ///
+    /// A Prepared promotion may already have appended its objects to the
+    /// catalog without settling their `file_list` rows, so a rewrite or
+    /// expiration over that table would act on objects whose ownership is not
+    /// yet agreed. The promotion's own operation row is the barrier: once its
+    /// terminal transition commits the catalog and `file_list` agree and this
+    /// check passes again. Runs inside the caller's tenant transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when a promotion is still Prepared and
+    /// [`SqlError::Query`] when the read fails.
+    async fn refuse_unsettled_promotion(&self, conn: &mut PgConnection) -> Result<(), SqlError> {
+        let open: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM vala.forge_operation_state \
+              WHERE data_tenant_id = wyrd.current_tenant() AND resource = $1 \
+                AND family = $2 AND phase = 'prepared')",
+        )
+        .bind(self.resource)
+        .bind(ForgeOperationFamily::ScribePromotion.as_str())
+        .fetch_one(conn)
+        .await
+        .map_err(SqlError::from)?;
+        if open {
+            return Err(SqlError::Conflict {
+                detail: "a Scribe promotion on this table is not yet settled".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Acquires a transaction-scoped advisory lock on `(resource, family, operation_id)`.
     ///
     /// Every transition path acquires this lock before selecting state or appending
@@ -476,7 +511,7 @@ impl<'resource> ForgeOperations<'resource> {
         operation_id: Uuid,
     ) -> Result<(), SqlError> {
         sqlx::query(
-            r#"
+            r"
         SELECT pg_advisory_xact_lock(
             hashtextextended(
                 jsonb_build_array(
@@ -488,7 +523,7 @@ impl<'resource> ForgeOperations<'resource> {
                 0
             )
         )
-        "#,
+        ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -519,7 +554,7 @@ impl<'resource> ForgeOperations<'resource> {
         // against concurrent upsert races. The advisory lock ensures serialized
         // access, and FOR UPDATE provides an additional row-level safety layer.
         let row: Option<ForgeOperationStateSqlRow> = sqlx::query_as(
-            r#"
+            r"
         SELECT state.*
           FROM vala.forge_operation_state AS state
          WHERE state.data_tenant_id = wyrd.current_tenant()
@@ -527,7 +562,7 @@ impl<'resource> ForgeOperations<'resource> {
            AND state.family = $2
            AND state.operation_id = $3
          FOR UPDATE OF state
-        "#,
+        ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -571,7 +606,7 @@ impl<'resource> ForgeOperations<'resource> {
             })?;
 
         sqlx::query(
-            r#"
+            r"
         INSERT INTO vala.forge_operation_state
             (data_tenant_id, resource, family, operation_id, phase,
              prepared_detail, current_detail,
@@ -585,7 +620,7 @@ impl<'resource> ForgeOperations<'resource> {
                 prepared_at = EXCLUDED.prepared_at,
                 updated_at = EXCLUDED.updated_at
             WHERE vala.forge_operation_state.phase = 'reset'
-        "#,
+        ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -624,7 +659,7 @@ impl<'resource> ForgeOperations<'resource> {
             })?;
 
         sqlx::query(
-            r#"
+            r"
         UPDATE vala.forge_operation_state
            SET phase = $4,
                current_detail = $5::jsonb,
@@ -633,7 +668,7 @@ impl<'resource> ForgeOperations<'resource> {
            AND resource = $1
            AND family = $2
            AND operation_id = $3
-        "#,
+        ",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -698,8 +733,7 @@ fn validate_transition(
     if detail_phase != expected_phase {
         return Err(SqlError::Conflict {
             detail: format!(
-                "detail phase {:?} does not match expected {:?}",
-                detail_phase, expected_phase
+                "detail phase {detail_phase:?} does not match expected {expected_phase:?}"
             ),
         });
     }
@@ -708,8 +742,7 @@ fn validate_transition(
     if actual_group != expected_resource {
         return Err(SqlError::Conflict {
             detail: format!(
-                "detail group {} does not match resource {}",
-                actual_group, expected_resource
+                "detail group {actual_group} does not match resource {expected_resource}"
             ),
         });
     }
@@ -828,11 +861,17 @@ fn extract_detail_phase(detail: &AuditDetail) -> Result<ForgeOperationPhase, Sql
 impl ForgeOperations<'_> {
     /// Atomically prepares one snapshot-expiration selection.
     ///
+    /// `exclusive` is the caller's live table authority: holding it is what
+    /// proves no Oracle read exists and none can be admitted, and the caller
+    /// keeps holding it through the Iceberg effect this preparation precedes.
+    /// This transaction therefore never locks the authority row itself — it
+    /// would wait on the caller's own lock — and only verifies the capability
+    /// covers the request's exact tenant and table.
+    ///
     /// In one operator transaction this asserts the caller's live lease fence,
-    /// pins the exact running attempt, takes the table's maintenance-authority
-    /// row, refuses when any surviving reader protection frontier still covers
-    /// a selected snapshot, inserts the Prepared operation state, claims every
-    /// selected snapshot, and moves the task to Prepared with its evidence.
+    /// pins the exact running attempt, inserts the Prepared operation state,
+    /// claims every selected snapshot, and moves the task to Prepared with its
+    /// evidence.
     ///
     /// Replaying the identical preparation writes nothing. An identical
     /// selection whose previous pass was reset is prepared again, reopening
@@ -843,8 +882,9 @@ impl ForgeOperations<'_> {
     /// Returns [`SqlError::Conflict`] when the family is not
     /// `snapshot_expire`, the transition does not name this operation, the
     /// lease fence is lost, the task/attempt/owner/table identity does not
-    /// match, a surviving protection frontier covers a selected snapshot, or
-    /// the operation is already resolved.
+    /// match, `exclusive` does not cover the request's table, a Scribe
+    /// promotion on the table is unsettled, or the operation is already
+    /// resolved.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
     /// Returns [`SqlError::Query`] for statement failures.
     ///
@@ -857,9 +897,11 @@ impl ForgeOperations<'_> {
         &self,
         operator: &OperatorPool,
         tenant: DataTenantId,
+        exclusive: &ExclusiveTableAuthority<'_, '_>,
         request: &ForgeExpirationPreparation<'_>,
     ) -> Result<ForgeOperationTransition, SqlError> {
         self.require_snapshot_expire()?;
+        require_exclusive_authority(exclusive, tenant, request.table)?;
         let (detail, _, operation_id) = validate_transition(
             request.operation,
             request.detail,
@@ -880,8 +922,7 @@ impl ForgeOperations<'_> {
             &["running", "prepared"],
         )
         .await?;
-        let identity = lock_table_authority(&mut tx, tenant, request.table).await?;
-        refuse_protected_snapshots(&mut tx, &identity, &selected).await?;
+        self.refuse_unsettled_promotion(&mut tx).await?;
 
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         if let Some(sql_row) = self.select_state_for_update(&mut tx, operation_id).await? {
@@ -933,6 +974,13 @@ impl ForgeOperations<'_> {
     /// moves the task to Succeeded with its final cleanup evidence, and
     /// advances the table's planning demand — all in one transaction.
     ///
+    /// `exclusive` is the caller's live table authority when it still holds
+    /// the row from the commit it settles; this transaction then only verifies
+    /// coverage, because locking the row would wait on the caller's own lock.
+    /// Settling before that authority is surrendered means no Oracle cut ever
+    /// observes the claims of an expiration whose outcome is known. `None`
+    /// takes the row here.
+    ///
     /// # Errors
     ///
     /// Returns [`SqlError::Conflict`] when the family, transition identity,
@@ -949,6 +997,7 @@ impl ForgeOperations<'_> {
         &self,
         operator: &OperatorPool,
         tenant: DataTenantId,
+        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         request: &ForgeExpirationSettlementRequest<'_>,
     ) -> Result<ForgeOperationTransition, SqlError> {
         self.require_snapshot_expire()?;
@@ -966,7 +1015,7 @@ impl ForgeOperations<'_> {
         bind_tenant(&mut tx, tenant).await?;
         assert_lease_fence(&mut tx, request.authority).await?;
         let task_state = task_state(&mut tx, request.authority.task_id).await?;
-        lock_table_authority(&mut tx, tenant, request.table).await?;
+        hold_table_authority(&mut tx, tenant, exclusive, request.table).await?;
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         let state_row: ForgeOperationStateRow = self
             .select_state_for_update(&mut tx, operation_id)
@@ -1006,7 +1055,6 @@ impl ForgeOperations<'_> {
             Some(request.evidence),
         )
         .await?;
-        advance_planning_demand(&mut tx, tenant, request.table).await?;
 
         tx.commit().await.map_err(SqlError::from)?;
         Ok(ForgeOperationTransition::Applied)
@@ -1020,7 +1068,11 @@ impl ForgeOperations<'_> {
     /// `current_detail` and records the release only through the `reset` column
     /// phase. The same transaction deletes every claim, cancels the task, and
     /// advances the table's planning demand so the selection can be recomputed
-    /// against fresh reader protection.
+    /// against fresh table state.
+    ///
+    /// `exclusive` follows the same rule as in
+    /// [`Self::settle_snapshot_expiration`]: `Some` when the caller still holds
+    /// the table's authority row, `None` to take it here.
     ///
     /// # Errors
     ///
@@ -1038,6 +1090,7 @@ impl ForgeOperations<'_> {
         &self,
         operator: &OperatorPool,
         tenant: DataTenantId,
+        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         request: &ForgeExpirationResetRequest<'_>,
     ) -> Result<ForgeExpirationResetOutcome, SqlError> {
         self.require_snapshot_expire()?;
@@ -1047,7 +1100,7 @@ impl ForgeOperations<'_> {
         bind_tenant(&mut tx, tenant).await?;
         assert_lease_fence(&mut tx, request.authority).await?;
         let task_state = task_state(&mut tx, request.authority.task_id).await?;
-        lock_table_authority(&mut tx, tenant, request.table).await?;
+        hold_table_authority(&mut tx, tenant, exclusive, request.table).await?;
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         let state_row: ForgeOperationStateRow = self
             .select_state_for_update(&mut tx, operation_id)
@@ -1093,10 +1146,9 @@ impl ForgeOperations<'_> {
         self.delete_claims(&mut tx, operation_id).await?;
         self.resolve_task(&mut tx, "cancelled", request.authority, None)
             .await?;
-        let demand_generation = advance_planning_demand(&mut tx, tenant, request.table).await?;
 
         tx.commit().await.map_err(SqlError::from)?;
-        Ok(ForgeExpirationResetOutcome::Applied { demand_generation })
+        Ok(ForgeExpirationResetOutcome::Applied)
     }
 
     /// Returns this task's unresolved claims, letting reconciliation find the
@@ -1515,109 +1567,92 @@ pub(crate) async fn lock_table_authority(
     Ok(identity)
 }
 
-/// Refuses the whole preparation when any surviving reader protection frontier
-/// still covers a selected snapshot.
+/// Holds the table's maintenance authority for one expiration transaction.
 ///
-/// The refusal is deliberate: `operation_id` is derived from the exact
-/// selection and the Prepared audit detail is immutable, so silently narrowing
-/// the selection here would invalidate the identity the caller committed to.
-/// Coverage is proven ancestry-path membership — Iceberg remains the only
-/// ancestry authority, so this never re-derives lineage in SQL.
+/// With the caller's live `exclusive` capability the row is already held on
+/// the caller's connection, so this only verifies the capability covers the
+/// table; locking it here would wait on that lock. Without one it takes the
+/// row through [`lock_table_authority`].
 ///
 /// # Errors
-/// Returns [`SqlError::Conflict`] when a frontier covers a selected snapshot,
-/// and [`SqlError::InvariantViolation`] when a stored protection fails
-/// validation.
-async fn refuse_protected_snapshots(
+///
+/// Returns what [`require_exclusive_authority`] or [`lock_table_authority`]
+/// returns.
+async fn hold_table_authority(
     tx: &mut Transaction<'_, Postgres>,
-    identity: &TableAuthorityIdentity,
-    selected: &[i64],
+    tenant: DataTenantId,
+    exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
+    table: &ForgeClaimTable,
 ) -> Result<(), SqlError> {
-    let records = list_table_protection_in_operator_tx(tx, identity).await?;
-    for record in &records {
-        if let Some(covered) = selected
-            .iter()
-            .copied()
-            .find(|snapshot| record.frontier.covers(*snapshot))
-        {
-            return Err(SqlError::Conflict {
-                detail: format!(
-                    "snapshot {covered} is still covered by a surviving reader protection frontier"
-                ),
-            });
-        }
+    match exclusive {
+        Some(exclusive) => require_exclusive_authority(exclusive, tenant, table),
+        None => lock_table_authority(tx, tenant, table).await.map(|_| ()),
     }
-    Ok(())
 }
 
-/// Reads and validates every epoch's complete protection record for one table
-/// inside the preparation's own operator transaction.
+/// Fails closed unless the caller's exclusive authority covers exactly the
+/// tenant and table a destructive preparation names.
 ///
-/// Preparation already holds the table's `bifrost_table_maintenance_authority`
-/// row lock on an operator transaction whose `wyrd.current_tenant()` binding is
-/// established, and the frontier must be read under that same lock: a
-/// protection published between an earlier read and the lock would otherwise be
-/// invisible. Each epoch's record is read by the same
-/// [`read_protection_record`] statement the Oracle owner uses, so the tenant
-/// predicate, member ordering, header-identity check, digest check, and domain
-/// validation are one implementation rather than two that must be kept
-/// identical.
+/// Shared by every destructive Forge preparation, each of which runs on its own
+/// operator connection while the caller's capability holds the authority row.
 ///
 /// # Errors
-/// Returns [`SqlError::InvariantViolation`] when a stored header names another
-/// table, when a header or member fails validation, or when a header disappears
-/// inside this transaction, and [`SqlError`] when a statement fails.
-pub(crate) async fn list_table_protection_in_operator_tx(
+///
+/// Returns [`SqlError::Conflict`] when the capability covers another tenant or
+/// table.
+pub(crate) fn require_exclusive_authority(
+    exclusive: &ExclusiveTableAuthority<'_, '_>,
+    tenant: DataTenantId,
+    table: &ForgeClaimTable,
+) -> Result<(), SqlError> {
+    exclusive.require_covers(
+        tenant,
+        &table.table_uid,
+        &table.catalog_name,
+        &table.namespace_name,
+        &table.table_name,
+    )
+}
+
+/// Discards one table's abandoned active reads and reports whether any
+/// active read remains.
+///
+/// The caller's tenant-bound transaction must already hold the table's
+/// maintenance-authority row in a mode that excludes cut acquisition
+/// (`FOR UPDATE` or `FOR NO KEY UPDATE`), so the answer stays true for the
+/// rest of that transaction. A row is abandoned once PostgreSQL time has
+/// passed its `abandon_after`, the owning query's deadline bound at
+/// acquisition; a live query releases its own rows before then. The
+/// abandonment delete commits with the caller's transaction.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when either statement fails.
+pub(crate) async fn active_table_reads_exist(
     tx: &mut Transaction<'_, Postgres>,
     identity: &TableAuthorityIdentity,
-) -> Result<Vec<ProtectionRecord>, SqlError> {
-    identity.validate(BIFROST_CATALOG_NAME)?;
-    let epochs: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
+) -> Result<bool, SqlError> {
+    sqlx::query(
         r"
-        SELECT node_id, fencing_token
-          FROM vala.oracle_table_protections
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND table_uid = $1
-         ORDER BY node_id, fencing_token
+        DELETE FROM vala.oracle_active_table_reads r
+         WHERE r.data_tenant_id = wyrd.current_tenant()
+           AND r.table_uid = $1
+           AND r.abandon_after <= statement_timestamp()
         ",
     )
     .bind(identity.table_uid.as_slice())
-    .fetch_all(&mut **tx)
+    .execute(&mut **tx)
     .await
     .map_err(SqlError::from)?;
-
-    let mut records = Vec::with_capacity(epochs.len());
-    for (node_id, fencing_token) in epochs {
-        let record = read_protection_record(tx, identity, node_id, fencing_token)
-            .await?
-            .ok_or_else(|| {
-                invariant("reader protection header disappeared inside one transaction")
-            })?;
-        records.push(record);
-    }
-    Ok(records)
-}
-
-/// Advances the table's periodic planning demand so a resolved expiration is
-/// never durable without a request to replan against the new metadata.
-///
-/// # Errors
-/// Returns [`SqlError::Query`] when the upsert fails.
-async fn advance_planning_demand(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant: DataTenantId,
-    table: &ForgeClaimTable,
-) -> Result<i64, SqlError> {
-    sqlx::query_scalar::<_, i64>(
-        "INSERT INTO vala.forge_planning_demands (data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,$2,$3,$4,'periodic') ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name) DO UPDATE SET last_requested_at=statement_timestamp(),last_source='periodic',generation=vala.forge_planning_demands.generation+1,acknowledged_snapshot_id=NULL,acknowledged_commit_count=NULL RETURNING generation",
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM vala.oracle_active_table_reads \
+         WHERE data_tenant_id = wyrd.current_tenant() AND table_uid = $1)",
     )
-    .bind(tenant.as_uuid())
-    .bind(&table.catalog_name)
-    .bind(&table.namespace_name)
-    .bind(&table.table_name)
+    .bind(identity.table_uid.as_slice())
     .fetch_one(&mut **tx)
     .await
-    .map_err(SqlError::from)
+    .map_err(SqlError::from)?;
+    Ok(active)
 }
 
 /// Returns the exact ascending snapshot selection carried by a snapshot-expiry

@@ -10,7 +10,7 @@ tuple as the durable key; a tenant administrative principal or a tenant-created
 automation principal is representable with no Card.
 
 Credentials are principal-generic, and one principal may hold several at once.
-The server generates the secret, persists only an Argon2 verifier plus
+The server generates a 256-bit secret, persists only its SHA-256 verifier plus
 non-secret lookup and lifecycle metadata, and returns the plaintext exactly once
 in the response that created it. The non-secret prefix resolves the owning
 principal — and, for a tenant-scoped principal, its tenant — before verification:

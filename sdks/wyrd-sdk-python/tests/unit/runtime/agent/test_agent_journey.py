@@ -1,8 +1,10 @@
-from __future__ import annotations
+"""An Agent authored in Python, saved as a Card, and run offline."""
 
 from pathlib import Path
 
-from wyrd import Agent, AgentCard, FinishReason, Prompt, PromptReference, RunConfig, tool
+import pytest
+from wyrd import Agent, AgentCard, Prompt, PromptReference, RunConfig, WyrdError, tool
+from wyrd.agent import MockProvider
 
 
 @tool(name="t", description="echoes text")
@@ -10,31 +12,20 @@ def echo_text(input: str) -> str:
     return input
 
 
-def test_journey_author_save_load_run(tmp_path: Path) -> None:
+def test_saved_agent_loads_and_runs_on_the_mock_provider(tmp_path: Path) -> None:
     path = tmp_path / "agent.yaml"
-    saved = Agent(
-        prompt=Prompt.openai_chat("gpt-4o-mini", messages=["hello"]),
+    Agent(
+        prompt=Prompt(["hello"], "mock-model", provider="mock"),
         tools=[echo_text],
         name="planner",
         version="0.3.0",
         run_config=RunConfig(max_iterations=3),
-    )
-    saved.save(path)
-    loaded = Agent.from_yaml(path)
-    runner = Agent(
-        prompt=Prompt(["hello"], "mock-model", provider="mock"),
-        tools=[echo_text],
-        name=loaded.name,
-        version=loaded.version,
-        run_config=RunConfig(max_iterations=3),
-    )
-    run = runner.run("draft the doc")
+    ).save(path)
 
-    assert loaded.name == "planner"
-    assert loaded.version == "0.3.0"
-    assert loaded.tool_names == ["t"]
-    assert run.finish_reason == FinishReason.ModelStopped
-    assert "draft the doc" in run.output
+    loaded = Agent.from_yaml(path)
+
+    assert (loaded.name, loaded.version, loaded.tool_names) == ("planner", "0.3.0", ["t"])
+    assert "draft the doc" in loaded.run("draft the doc").output
 
 
 def test_journey_to_card_round_trip(tmp_path: Path) -> None:
@@ -47,20 +38,16 @@ def test_journey_to_card_round_trip(tmp_path: Path) -> None:
 
     card = agent.to_card()
 
-    assert card["apiVersion"] == "wyrd/v1"
-    assert card["kind"] == "Agent"
-    assert card["metadata"]["name"] == "planner"
-    assert card["metadata"]["version"] == "0.3.0"
-    assert card["spec"]["prompt"] is not None
+    assert isinstance(card, AgentCard)
+    assert (card.name, card.version) == ("planner", "0.3.0")
+    assert card.prompt is not None
+    assert card.prompt.model == "gpt-4o-mini"
 
     agent.save(path)
     loaded = Agent.from_yaml(path)
     loaded_card = loaded.to_card()
 
-    assert loaded_card["apiVersion"] == card["apiVersion"]
-    assert loaded_card["kind"] == card["kind"]
-    assert loaded_card["metadata"] == card["metadata"]
-    assert loaded_card["spec"] == card["spec"]
+    assert loaded_card.model_dump() == card.model_dump()
 
 
 def test_agent_card_json_round_trip() -> None:
@@ -72,7 +59,9 @@ def test_agent_card_json_round_trip() -> None:
 
     assert payload["apiVersion"] == "wyrd/v1"
     assert payload["kind"] == "Agent"
-    assert payload["metadata"]["space"] == "research"
+    metadata = payload["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["space"] == "research"
     assert restored.uid == card.uid
     assert restored.name == card.name
     assert isinstance(restored.prompt, Prompt)
@@ -99,6 +88,32 @@ def test_agent_card_preserves_unresolved_registered_prompt_reference() -> None:
     assert restored.prompt_ref.card_ref.version == "0.3.0"
 
 
+def test_mock_provider_returns_canned_responses_in_order_then_echoes() -> None:
+    mock = MockProvider(["first answer"])
+    mock.push("second answer")
+    agent = Agent(
+        prompt=Prompt(["hello"], "mock-model", provider="mock"),
+        mock_provider=mock,
+    )
+
+    assert mock.remaining == 2
+    assert agent.run("q1").output == "first answer"
+    assert agent.run("q2").output == "second answer"
+    assert mock.remaining == 0
+    assert "q3" in agent.run("q3").output
+
+
+def test_mock_provider_rejects_provider_base_url() -> None:
+    with pytest.raises(WyrdError) as error:
+        Agent(
+            prompt=Prompt(["hello"], "mock-model", provider="mock"),
+            mock_provider=MockProvider(),
+            provider_base_url="http://localhost:1",
+        )
+
+    assert error.value.code == "WYRD_AGENT_502_PROVIDER"
+
+
 def test_journey_delegate_via_agent_delegate_tool() -> None:
     child = Agent(
         prompt=Prompt(["child"], "mock-model", provider="mock"),
@@ -119,11 +134,11 @@ def test_journey_callbacks_fire_in_registration_order() -> None:
         return None
 
     def before_model(ctx, request):
-        calls.append(("before_model", ctx["agent_id"]))
+        calls.append(("before_model", ctx.agent_id))
         return None
 
     def after_model(ctx, response):
-        calls.append(("after_model", ctx["agent_id"]))
+        calls.append(("after_model", ctx.agent_id))
         return None
 
     def after_agent(ctx, run):
@@ -149,16 +164,3 @@ def test_journey_callbacks_fire_in_registration_order() -> None:
         "after_model",
         "after_agent",
     ]
-
-
-def test_journey_module_paths() -> None:
-    agent = Agent(
-        prompt=Prompt(["hello"], "mock-model", provider="mock"),
-        name="planner",
-        version="0.3.0",
-    )
-
-    assert Agent.__module__ == "wyrd.agent"
-    assert type(agent).__module__ == "wyrd.agent"
-    assert not hasattr(agent, "_inner")
-    assert AgentCard.__module__ == "wyrd.cards.agent"

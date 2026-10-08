@@ -1,6 +1,6 @@
 ---
 id: SPEC-verified-change-contract
-revision: 45
+revision: 70
 status: approved
 ---
 
@@ -60,6 +60,9 @@ to two replicas without a manual peer list.
 - Treating verification as approval, merge, deployment, or authorization.
 - UI layout or component behavior.
 - Offline Eval scenario Data Card registration and dataset-backed evaluation.
+- Refusing registration of Card kinds that are not yet implemented
+  (`Experiment`, `Workflow`, `Policy`, `Mcp`, `Audit`, `Artifact`,
+  `Source`). Deferred; REQ-193 only keeps them out of the SDKs.
 - Workflow Operator invocation. Its existing action shape remains parseable,
   but a verification binding cannot activate it until the separate server
   invocation change supplies an executable path.
@@ -77,10 +80,9 @@ contracts, in-memory demos, or disconnected engine tests. Their supported user
 workflows MUST run through real SDK, server, durable work, Bifrost persistence,
 status, result, Notify/HTTP Operator delivery, restart, authorization, and
 tenant-isolation boundaries. Accepted reliability ceilings are explicit:
-Eval run enqueue is best-effort after its observation commits, so a committed
-observation may not receive a run if that post-commit step fails or the process
-crashes; separate result-table acknowledgements can leave partial rows; and
-an ambiguous external Operator send may be delivered more than once.
+separate result-table acknowledgements can leave a run's detail rows visible
+before its summary; and an ambiguous external Operator send may be delivered
+more than once.
 
 Only Drift and Eval MAY appear as registrable `VerifierImplementation`
 variants or in generated public schemas in this change. Eval's existing internal
@@ -122,10 +124,9 @@ make the standalone LLM-judge Verifier implementation part of this delivery.
 - **Internal SYSTEM result writer**: one server-only tenant principal, persisted
   in the existing tenant machine-principal store with `kind: system`, a
   server-minted UUIDv7, and the fixed name `verification-results-writer`. It
-  has exactly three separately scoped uses: publishing Verification Result
-  batches under its exact-Verifier `bifrost_record:write` token, the fixed
-  Drift observation read under its own server-minted token, and reading
-  continuous Eval inputs under a separate server-minted, table-scoped
+  is an attribution identity only and never appears in a token. It has two
+  uses: stamping Verification Result rows written by the server-internal
+  result writer, and Verifier input reads under a tokenless, table-scoped
   `bifrost_query:read` authority (REQ-086). It has no public credential, Card,
   role grant, refresh, workload, delegation, or principal-management path.
 - **Operator connection**: one tenant-owned, provider-specific Postgres record
@@ -316,19 +317,41 @@ flows are listed in its "Input and queue boundary" section.
   MUST best-effort attach the selected CardRef and invocation ID to Python's
   execution-local OpenTelemetry context under the exact Bifrost attributes
   `wyrd.card_ref` and `wyrd.run_id`, set both attributes on an already-active
-  recording span, and ensure one idempotently registered span processor copies
-  both values from the parent context to every span started inside the scope.
-  Exiting MUST restore the prior context, including nested Card scopes, and
-  MUST NOT suppress a user exception. Normal context propagation MUST work
-  across `await` and asyncio task creation without storing one shared attach
-  token on the immutable Run. A framework using the global provider MUST need
-  no setup beyond `with state.run(...)`; the Python SDK MUST expose an
-  idempotent `wyrd.otel.install_run_correlation(provider)` escape hatch for a
-  framework-owned private provider. Missing OpenTelemetry packages, an
-  unsupported or absent provider, no active recording span, invalid runtime
-  context, processor failure, and attach/detach failure MUST all fail open as
-  no enrichment: they MUST NOT fail Run construction or entry/exit, application
-  execution, or explicit Wyrd observation emission. Unknown Card aliases,
+  recording span only when that span does not already carry `wyrd.card_ref`,
+  and ensure a Wyrd span processor copies the innermost scope's pair from the
+  parent context to every span started inside the scope.
+  The Wyrd scope stack lives inside the OpenTelemetry context value itself: a
+  tuple of `(card_ref, run_id)` pairs, innermost last, under one private
+  context key created at module import when OpenTelemetry is present. Entry
+  pushes and exit pops, each by a single context attach; no detach token
+  exists and detach is never called. Exit pops only when the top of the stack
+  equals that view's own `(card_ref, run_id)`; a mismatched or failed exit
+  changes nothing. Exiting MUST restore the prior Wyrd correlation in the
+  current context, including nested Card scopes, and MUST NOT suppress or mask
+  a user exception. Normal context propagation MUST work across `await` and
+  asyncio task creation without storing per-scope state on the immutable Run.
+  A framework using the global provider MUST need no setup beyond
+  `with state.run(...)`; the Python SDK MUST expose an idempotent
+  `wyrd.otel.install_run_correlation(provider)` escape hatch for a
+  framework-owned private provider. Registration carries exactly three
+  guarantees. (1) No processor pile-up: Run entry automatically registers the
+  Wyrd processor on the global tracer provider (and
+  `install_run_correlation(provider)` on an explicit private provider) and
+  marks that provider object with a private attribute so later entries skip
+  it. Registration is best effort; a duplicate processor (for example from a
+  concurrent first entry) is harmless because the processor is stateless and
+  enrichment is idempotent. (2) Never break the app: every optional-telemetry
+  failure, including absent OpenTelemetry packages, an unsupported or absent
+  provider, a provider without `add_span_processor`, an unmarkable provider,
+  a registration error, no active recording span, invalid runtime context,
+  processor failure, and context-update failure, is swallowed as no
+  enrichment: it MUST NOT fail Run construction or entry/exit, application
+  execution, Card errors, user exceptions, or explicit Wyrd observation
+  emission. (3) Correct stamping: the scope stack lives in the OpenTelemetry
+  context value as specified above; spans started inside the block receive the
+  innermost `(card_ref, run_id)`; nested, async, and same-Run concurrent tasks
+  stamp correctly; exit pops only that view's pair; and entry does not
+  overwrite an existing `wyrd.card_ref` on the already-active span. Unknown Card aliases,
   authorization, validation, and Wyrd writes remain fail-closed. The client
   MUST inject only CardRef and run ID; tenant, principal, Card UID, and request
   identity remain server-derived. The context manager MUST NOT start or end a
@@ -566,7 +589,7 @@ flows are listed in its "Input and queue boundary" section.
   inactive without changing Card lifecycle or credential status. Suspending
   or deleting the principal makes it inactive immediately.
 - **REQ-108**: Before creating a binding-driven Verifier run, the scheduler
-  or Eval post-commit enqueue MUST restrict new work to runtime-active exact
+  or the Eval run-request flusher MUST restrict new work to runtime-active exact
   owners. An inactive occurrence MUST create no activation or run and MUST NOT
   be backfilled after later authentication. Reauthentication starts eligibility
   with the next schedule occurrence after that authentication. A later
@@ -579,6 +602,11 @@ flows are listed in its "Input and queue boundary" section.
   Agent binding uses that Agent's principal activity. Activity is an
   admission gate for new binding-created runs, not a reason to cancel an
   already-admitted run whose input was frozen while active.
+  An Eval observation creates runs only for `observations_ready` bindings
+  whose exact owner's principal is the principal that wrote the observation.
+  That writer has just authenticated, so the Eval run-request flusher does no
+  separate activity check. Scheduled and Trigger runs keep the activity gate
+  above.
 
 The contract mapping is:
 
@@ -749,17 +777,29 @@ multi-table transaction design survives as an alternative.
   surface. This change MUST NOT retain it as a hidden second Eval execution
   path or repurpose it as continuous Eval. Future offline dataset evaluation
   may define its own Verifier-backed route when that journey ships.
-- **REQ-077**: Once Scribe acknowledges an Eval observation, the server MUST
-  attempt an asynchronous, idempotent insert of one verifier_runs row per
-  matching active binding, keyed by tenant, binding, and record identity. The
-  row MUST freeze `input_record_id` and `input_event_time`, where
-  `input_event_time` is the exact server-managed `wyrd_event_time` assigned to
-  the committed observation, not the client-authored `created_at`. The
-  insert MUST NOT be part of Scribe's batch-fence transaction, delay or roll
-  back the Bifrost acknowledgement, or add an outbox in this change. If enqueue
-  fails or the process stops before it completes, Bifrost retains the record,
-  no Eval run is guaranteed, and the server emits a structured tracing error.
-  This best-effort loss is accepted for the initial delivery.
+- **REQ-077**: Eval runs MUST be created through a batched run-request
+  outbox, the same shape as the audit outbox. Scribe acknowledges an Eval
+  observation batch on its own durable boundary, and the client never waits
+  for run creation. After that acknowledgement the server places one run
+  request per committed record in its in-process outbox. A background flusher
+  writes queued requests to Postgres in one multi-row insert per tenant,
+  creating one `verifier_runs` row per matching active `observations_ready`
+  binding. Rows are keyed by tenant, binding, and record identity, so a
+  repeated request inserts nothing new. Each row MUST freeze `input_record_id`
+  and `input_event_time`, where `input_event_time` is the exact server-managed
+  `wyrd_event_time` assigned to the committed observation, not the
+  client-authored `created_at`.
+  - The outbox has no count limit and never drops a request because Postgres
+    is slow or unavailable. A failed flush keeps its batch and retries with
+    backoff.
+  - Graceful shutdown flushes the outbox before the process exits.
+  - A hard process kill loses only the requests not yet flushed. The user
+    accepted that loss, as for audit. Every loss the process can observe is
+    counted and logged.
+  - The fixed 256-entry activation backlog and its drop-on-full behavior are
+    removed.
+  - Scribe does not write `verifier_runs`, and no crate's transaction writes
+    another crate's tables.
 - **REQ-078**: Postgres owns `verification_bindings`, `drift_baselines`,
   `verifier_runs`, `operator_dispatches`, and tenant Operator connections:
   exact identities,
@@ -772,7 +812,13 @@ multi-table transaction design survives as an alternative.
   operations MUST be owned by `wyrd-sql`. Registration uses those operations
   through the caller-owned `TenantConn` so the Card, card-bound principal,
   binding projection, baseline work row, and connection validation share one
-  transaction. Vala consumers use the `vala-sql` re-export rather than import
+  transaction. (revised in revision 67) A Service or Agent principal's first
+  projection also grants it the built-in `wyrd_default` role
+  (`bifrost_table:read`, `bifrost_record:write`, `evals:run`; REQ-213) in that
+  transaction, so a key issued for it through `POST /auth/issue-key` can
+  emit and verify its evidence without a manual grant. Its Card scope still bounds which Cards it may emit for. Re-applying
+  the Card never grants the role again, so an administrator's revocation
+  stands; existing tenants receive the role row by migration. Vala consumers use the `vala-sql` re-export rather than import
   `wyrd-sql` directly. All five tables MUST carry `data_tenant_id`, enable and
   force RLS, use the existing `wyrd.current_tenant()` policy, and be reachable
   by tenant runtime paths only through `TenantConn`; cross-tenant maintenance,
@@ -971,129 +1017,89 @@ table on `(data_tenant_id, result_id)`.
   performance aids, never identity or authorization boundaries. Bifrost's
   existing default `wyrd_event_time DESC` sort applies; this change adds no
   new partition transform, index service, or custom join mechanism.
-- **REQ-086**: The server MUST send the result tables as Arrow batches through
-  `wyrd_client::Bifrost` over its existing authenticated Arrow/gRPC path back
-  through the Wyrd server's Gate to whichever Scribe owns the batch. A runner
-  MUST NOT assume a Scribe is active in its own server process or write
-  directly to local Scribe state. Tenant provisioning and upgrade migration
-  MUST idempotently create exactly one internal `system` principal row named
-  `verification-results-writer` for each tenant in the existing tenant machine
-  principal store. Its server-minted `PrincipalId` MUST be UUIDv7 and remain
-  stable after provisioning. `system` is the sixth `PrincipalKindTag` wire
-  value and a tenant-plane `PrincipalKind`, not a second identity hierarchy.
-  The row has no bound Card or user-managed lifecycle. It is not a Card, API
-  key, refresh token, role grant, workload binding, or user-manageable
-  principal. Public create, list, get, update, suspend/delete, credential,
-  refresh, workload, delegation, and token-exchange operations MUST reject or
-  omit it as appropriate; it remains representable in token and audit wire
-  contracts so internal writes are attributable.
+- **REQ-086**: Verifier results MUST be written as a server-internal write,
+  the same way gateway capture is (REQ-178). The process's one capture writer
+  submits the result batches to Scribe in-process when Scribe runs in the same
+  pod and otherwise over the mutually authenticated peer plane to a live,
+  ready Scribe; the choice follows pod topology (`WYRD_TARGET`). Result writes
+  MUST NOT go through `wyrd_client::Bifrost`, the public ingest listener, or
+  Gate, and no token is minted for them. The peer ingest RPC is widened to
+  carry exactly the three result tables in addition to the two capture tables,
+  each submission naming the tenant, table, run, and frozen Verifier Card UID
+  explicitly; it refuses every other table and every reserved system tenant.
+  Result writes share the capture writer's transport but not its delivery
+  policy: a result batch is never dropped. Retryable refusals are retried for
+  as long as the run's lease remains, and an unwritten result stays stored
+  for the next claimant (REQ-183).
+  Gate MUST refuse every public write to `vala.verification.results`,
+  `vala.drift.result_features`, and `vala.eval.result_items`, from any
+  principal including wildcard administrators.
 
-  Immediately before each result-publication attempt, the runner MUST mint a
-  normal five-minute-or-shorter Wyrd access token through the existing tenant
-  token issuer using that tenant's persisted SYSTEM
-  principal. The token MUST contain the run tenant, `kind=system`, no roles or
-  credential attribution, delegation chain, or bound root Card, and signed Card
-  scope containing exactly one UID-bearing `Verifier` CardRef: the run's exact
-  Verifier version. Verification MUST reject
-  a missing or non-UUIDv7 persisted principal, a mismatched tenant, a bound root
-  Card, any role, an empty or multi-Card scope, a non-Verifier scope member, or
-  a scope member without managed Card UID. Public API-key, refresh, JWT-bearer,
-  delegation, workload-binding, principal-management, and token-exchange paths
-  MUST reject creation, credentialing, impersonation, delegation, or refresh
-  of `system`. Expiry or retry mints a new short-lived token; no credential is
-  persisted.
+  Tenant provisioning and upgrade migration MUST idempotently create exactly
+  one internal `system` principal row named `verification-results-writer` for
+  each tenant in the existing tenant machine principal store. Its
+  server-minted `PrincipalId` MUST be UUIDv7 and remain stable after
+  provisioning. `system` is the sixth `PrincipalKindTag` wire value and a
+  tenant-plane `PrincipalKind`, not a second identity hierarchy. It is an
+  attribution identity only: result rows carry it as `principal_id`, and
+  in-process reads (below) run as it, but it never appears in a token. It is
+  not a Card, API key, refresh token, role grant, workload binding, or
+  user-manageable principal. Public create, list, get, update,
+  suspend/delete, credential, refresh, workload, delegation, and
+  token-exchange operations MUST reject or omit it as appropriate. The token
+  issuer MUST refuse to mint any token for it, and token verification MUST
+  refuse any `kind=system` claim set. The SYSTEM result-write token, the
+  SYSTEM Drift read token, and their issuance and verification paths are
+  removed.
 
-  SYSTEM minting evaluates no end-user permission and emits no authorization
-  audit row. Gate's result-table admission is the one
-  `bifrost_record:write` authorization decision and uses the canonical audit
-  path. No second issuer, token format, credential table, or identity store is
-  introduced.
+  Scribe stamps the submitted tenant as `data_tenant_id`, the tenant's SYSTEM
+  principal as `principal_id`, and the submitted Verifier Card UID as managed
+  `card_uid`; it MUST refuse a row whose `card_ref` names a different Card. The
+  submitted values come from the run's frozen Postgres row, never from a Verifier
+  or an Arrow payload. A result write evaluates no permission and writes no
+  audit decision, like every other worker mechanic under REQ-145.
 
-  A valid SYSTEM result token receives only the existing
-  `bifrost_record:write` permission. Gate MUST reserve exactly
-  `vala.verification.results`, `vala.drift.result_features`, and
-  `vala.eval.result_items` for this principal kind. A write to one of those
-  tables requires `kind=system`, that permission, and the exact signed Verifier
-  scope; every other principal, including wildcard administrators, is denied.
-  SYSTEM is denied every other table. Gate MUST enforce and audit this as its
-  one canonical `bifrost_record:write` decision. Scribe MUST continue to derive
-  tenant and `principal_id` from authenticated authority, authorize every row's
-  Verifier CardRef against signed scope, and stamp the managed Verifier Card
-  UID; neither tenant nor Card UID may be trusted from Arrow payloads.
-  `Verifier` is therefore an eligible scoped Bifrost target only for this
-  internal path. The global `SYSTEM_OWNER` tenant, platform audit principal,
-  and audit-publisher identity MUST NOT be reused.
-
-  Drift observation reads use a second, mutually exclusive SYSTEM token
-  purpose. Immediately before each Drift aggregate query the runner mints,
-  through the same tenant issuer and persisted SYSTEM principal, a
-  five-minute-or-shorter token with no roles, credential attribution,
-  delegation chain, or bound root Card, whose only permission is
-  `bifrost_query:read` scoped to the table object
-  `{ catalog: vala, schema: drift, table_uid }` of the tenant's registered
-  `vala.drift.observations` table. The issuer resolves that existing table UID
-  in the caller's tenant transaction and MUST NOT create or register a table;
-  when the tenant has no such table no token is minted and the run scores an
-  empty window (Custom completes `inconclusive` with no report). The token's
-  Card scope is the run's exact UID-bearing Verifier CardRef and serves
-  attribution only; it does not limit what Oracle reads. No SYSTEM token
-  carries both the result-write and read permission. Verification MUST accept
-  a `kind=system` claim set only when its permissions are exactly
-  `bifrost_record:write` or exactly one table-scoped `bifrost_query:read` on
-  catalog `vala`, schema `drift`, and MUST refuse every other set, scope, or
-  combination as forged.
-
-  The runner verifies the minted read token with the server's ordinary token
-  verifier, derives the query caller from the verified principal, and
-  dispatches through the ordinary server query service: coarse capability
-  admission, Gate, and a local or peer-forwarded Oracle. It MUST NOT assume an
-  Oracle is active in its own process, construct a principal or query context
-  by hand, or add an Oracle endpoint, client query route, or plan
-  serialization. Oracle's table authorization is the enforcement point; each
-  read records the canonical Oracle read decision and each denial the
-  canonical audited denial. Minting records no audit. The token does not
-  enforce subject, series, or window limits: the server-built fixed SQL
-  supplies those filters from the frozen run and fitted baseline, rendering
-  the subject UID, feature name, fitted edges and labels, and window bounds as
-  escaped typed literals. A Verifier contributes no SQL text. Registration
-  authorization is not standing query authorization. A read token is refused
-  by every record-write admission, and a result-write token is refused by
-  query admission.
-
-  Continuous Eval's own Bifrost reads of its inputs—the run's committed
-  `vala.eval.observations` record and its `vala.traces.spans` trace—run
-  in-process through Oracle as this same persisted tenant SYSTEM principal and
-  never as a fabricated user or other identity. Before each run's reads the
-  server resolves the principal's stable ID from tenant-owned state and mints,
-  without a token, a read authority separate from the result-write token:
-  `bifrost_query:read` scoped to exactly those two tables by their registered
-  UIDs, with no roles, credential, delegation, Card, or Verifier write scope.
-  It is not a general Bifrost query grant; every other table is refused.
-  Oracle authorizes and audits each read through its existing object decision
-  and canonical audit path, attributing allowed read decisions and object
-  denials to that principal. A missing or non-UUIDv7 SYSTEM principal, a
+  Every Verifier input read runs in-process as that same tenant SYSTEM
+  principal under a tokenless read authority. The server resolves the
+  principal's stable ID from tenant-owned state and builds an authority whose
+  only permission is `bifrost_query:read` scoped by registered table UID to
+  exactly the tables the run reads: `vala.drift.observations` for Drift, and
+  `vala.eval.observations` plus `vala.traces.spans` for Eval. It carries no
+  roles, credential, delegation, Card, or write scope, and every other table
+  is refused. Drift resolves the existing table UID in the run's tenant and
+  MUST NOT create or register a table; when the tenant has no such table the
+  run scores an empty window (Custom completes `inconclusive` with no report).
+  The read goes through the ordinary server query service to a local or
+  peer-forwarded Oracle, carrying the authority over the peer plane rather
+  than as a token. The server MUST NOT assume an Oracle is active in its own
+  process or add an Oracle endpoint, client query route, or plan
+  serialization. Oracle's table authorization is the enforcement point; it
+  records the canonical read decision for each read and the canonical audited
+  denial for each refusal. A missing or non-UUIDv7 SYSTEM principal, a
   mismatched tenant, or insufficient table scope MUST fail closed before any
-  row is returned. This read use adds no identity store, principal kind, user,
-  public permission, token format, or public surface.
+  row is returned. The server-built fixed Drift SQL supplies subject, feature,
+  fitted-edge, label, and window filters from the frozen run and fitted
+  baseline as escaped typed literals; a Verifier contributes no SQL text.
+  Registration authorization is not standing query authorization. This adds
+  no identity store, principal kind, user, public permission, token format, or
+  public surface.
 
   Every non-empty required detail batch is written before the canonical
   summary batch, and each is separately acknowledged. A result with zero
   details—such as sampled-out Eval or pre-scoring inconclusive Drift—writes no
-  empty detail batch and requires only the summary acknowledgement. Their writes
-  are not atomic across tables. Only after every required batch is
+  empty detail batch and requires only the summary acknowledgement. Only
+  after every required batch of the run's staged result (REQ-183) is
   acknowledged may the runner settle verifier_runs as completed and create
-  Operator dispatches. Partial result rows may be visible after a failed
-  write or crash; this initial change accepts that limitation and does not
-  add a per-table crash-recovery protocol or claim atomic result visibility.
+  Operator dispatches. Detail rows may be visible before their summary, but a
+  run never has more than one result: every write of its result reuses the
+  same staged bytes and batch IDs.
 - **REQ-087**: Scribe acknowledgement means its existing WAL, batch fence,
   and active rows accepted that sealed batch; it does not mean Iceberg
-  publication. A retry of an unacknowledged result batch MUST preserve the
-  same sealed Arrow payload, table, and batch ID so Scribe can deduplicate it.
-  A fresh write_batch call creates a new batch ID and MUST NOT be described
-  as deduplicated replay. If a process crash loses an unacknowledged payload,
-  the run may remain partial and end errored; it MUST NOT dispatch an Operator
-  as though all result tables were acknowledged. No stronger cross-table
-  crash guarantee is claimed.
+  publication. Every write of a run's result, by any replica and after any
+  crash, MUST submit the staged Arrow bytes under the staged batch IDs
+  (REQ-183), so Scribe's batch fence absorbs every repeat and each result
+  table holds exactly one copy of the run's rows. A result is never rebuilt
+  for a new write.
 - **REQ-097**: For a completed binding-created run with failed verdict, the
   generic runner MUST settle the run and insert one operator_dispatches row
   for each distinct configured Operator UID or inline-spec digest in the
@@ -1307,8 +1313,9 @@ table on `(data_tenant_id, result_id)`.
   `spec` or makes a binding a Card.
 - **REQ-135**: The only new Verification HTTP operations in this change MUST
   be `GET /v1/verification/bindings/{binding_id}`,
-  `POST /v1/verification/runs`, and
-  `GET /v1/verification/runs/{run_id}`. Binding GET MUST return exact owner,
+  `POST /v1/verification/runs`,
+  `GET /v1/verification/runs/{run_id}`, and the synchronous
+  `POST /v1/verification/execute` defined by REQ-167. Binding GET MUST return exact owner,
   subject, and Verifier Card identities, the current principal-activity gate,
   readiness and reason, nullable `next_run_at` (null for Eval), nullable
   `last_activated_at`, and nullable `last_run_id`. Run GET MUST return run ID,
@@ -1334,15 +1341,12 @@ table on `(data_tenant_id, result_id)`.
   `Idempotency-Key` contract, not a new activation resource. Invalid target,
   window, unauthorized subject, tenant mismatch, or unready baseline MUST
   fail before enqueue with a structured Wyrd error.
-- **REQ-137**: Rust, Python, and TypeScript MUST project the same typed
-  `get_binding`, `start_run`, and `get_run` operations through the shared
-  `wyrd-client` Verification capability; TypeScript uses `getBinding`,
-  `startRun`, and `getRun`. Python uses its existing synchronous SDK boundary;
-  Rust and TypeScript await these network operations. Baseline status uses
-  the existing Cards read
-  capability, and analytical results use the existing Bifrost query API with
-  `result_id` and the registered result/detail tables. No SDK implements a
-  separate status engine or adds a result/dispatch transport. MCP MUST expose
+- **REQ-137** (revised in revision 64): Binding status, manual run start,
+  and run status are operator control-plane operations. They stay on HTTP and
+  MCP and MUST NOT be exposed by the Rust, Python, or TypeScript SDKs (see
+  REQ-189). Baseline status uses the existing Cards read capability, and
+  analytical results use the existing Bifrost query API with `result_id` and
+  the registered result/detail tables. MCP MUST expose
   `cards.get`, `verification.get_binding`, `verification.start_run`, and
   `verification.get_run` as typed projections of those same server
   operations. `verification.start_run` requires an explicit write scope;
@@ -1351,10 +1355,10 @@ table on `(data_tenant_id, result_id)`.
 - **REQ-101**: The initial change MUST prove the entire registered
   Service/Agent-to-Operator journey for PSI, SPC, Custom Drift, deterministic
   Eval, and LLM-judge Eval through real SDK, server, Postgres control state,
-  canonical client queue/IPC observation ingest, Bifrost query and Arrow/gRPC
-  result writes, scheduling or post-commit enqueue,
+  canonical client queue/IPC observation ingest, Bifrost query, server-internal
+  result writes, scheduling or transactional Eval enqueue,
   result persistence, and status. Cron, manual activation, worker lease,
-  retry, fail-open Eval enqueue, partial result write, Operator fanout,
+  retry, the Eval run-request outbox, single-copy result writes, Operator fanout,
   notification delivery, restart, authorization, and tenant isolation are
   required evidence. Offline dataset/scenario evaluation is excluded from
   this initial journey.
@@ -1368,14 +1372,16 @@ table on `(data_tenant_id, result_id)`.
   Oracle reads, `vala-drift` fitting/scoring, and `vala-eval` planning/executor
   and result types. Only the missing binding projection, generic scheduling,
   run/dispatch control state, Drift baseline fitting orchestration, Eval
-  post-commit enqueue, media binding through the existing judge path,
+  run-request outbox, media binding through the existing judge path,
   result-table writers, and public status/manual surfaces are added. No new
   downstream projector, observation envelope, Eval engine, generic
   broker, or Alert persistence path is permitted.
 - **REQ-115**: `wyrd-server` MUST supervise one generic
   `VerificationRuntime` containing Scheduler, Verifier runner, and Operator
-  worker capabilities. All worker concurrency, queue claiming, engine calls,
-  external delivery, and shutdown drain MUST be bounded. A process restart
+  worker capabilities. Operator concurrency, queue reads, engine execution time,
+  external delivery, and shutdown drain MUST remain bounded. Verifier runs and
+  baseline fitting MUST NOT use global or per-tenant execution-count permits.
+  A process restart
   MUST reclaim expired Postgres leases and expose pending, retrying, and
   terminal failures through status and structured telemetry; it MUST NOT rely
   on process-local-only run or dispatch state. No new network-serving role or
@@ -1401,10 +1407,12 @@ table on `(data_tenant_id, result_id)`.
   executes that frozen dispatch without reevaluating an end-user permission.
   Scheduler ticks, claims, leases, retries, Scribe commits, and worker mechanics
   evaluate no principal permission and MUST NOT emit authorization audit rows.
-- **REQ-146**: The initial VerificationRuntime MUST use one scheduler task, a
-  shared Verifier/baseline execution ceiling of 16 globally and 4 per tenant,
-  and an external Operator execution ceiling of 16 globally and 4 per tenant.
-  A worker MUST acquire both applicable permits before claiming durable work.
+- **REQ-146**: The initial VerificationRuntime MUST use one scheduler task.
+  Verifier runs and baseline fitting have no global or per-tenant execution-count
+  permits; their durable PostgreSQL claims, leases, deadlines and shutdown
+  behavior remain authoritative across replicas. External Operator execution
+  retains a ceiling of 16 per process and 4 per tenant within that process;
+  the Operator worker acquires both permits before claiming a dispatch.
   An external Operator dispatch has three total attempts, a 30-second timeout
   per attempt, a five-minute deadline from dispatch creation, and retry delays
   of 30 seconds then two minutes; `Retry-After` is honored only when clipped to
@@ -1416,6 +1424,445 @@ table on `(data_tenant_id, result_id)`.
   absent. Existing tracing and metrics MUST expose queue depth, active work,
   attempts, failures, and latency; this change adds no new telemetry service or
   process-local work registry.
+- **REQ-181**: Every claim round MUST consider every tenant with a claimable
+  run, with no limit on the number of tenants, and claim at most one run per
+  tenant. A round claims each tenant in order of its oldest claimable run.
+  Execution has no count limit and nothing is reserved in advance (revision
+  50). The pod's real limits come from the shared resources that already
+  admit work: the Postgres pool, Oracle query admission and memory, and the
+  Bifrost memory budget. When one of them refuses a run for lack of capacity,
+  the run returns to the queue without consuming an attempt, and the process
+  claims nothing new until one of its running runs finishes.
+- **REQ-182**: Each process MUST cache parsed Verifier Cards by tenant and
+  Verifier Card UID. A Card's spec never changes under its UID, so a cached
+  entry needs no content invalidation. The claim transaction returns the
+  claimed run's Verifier Card status from `wyrd.cards`; a deleted Verifier
+  terminates the run `errored` exactly as an unloadable Card does today. On a
+  miss the claim transaction also returns the Card spec, so loading a Verifier
+  never opens its own connection. The cache is bounded by total bytes with
+  least-recently-used eviction, fixed at 64 MiB per process, because every
+  Wyrd-owned buffer is bounded (`architecture/bifrost-design.md`, Resource and
+  failure invariants). It has no configuration and is never shared across
+  tenants.
+- **REQ-183**: A run's result MUST be decided once. When execution finishes,
+  the runner stores the complete result in one lease-fenced Postgres
+  transaction before any of it is written to Bifrost: the `result_id`, the
+  result event time, one batch ID per result table, and each table's Arrow IPC
+  bytes. A transaction whose lease token no longer matches stores nothing, and
+  its work is discarded. A run with a stored result is never executed again:
+  any later claimant, whether a retry, a reclaim after lease expiry, or a
+  restart, writes that stored result instead. The settle transaction that
+  completes the run deletes the stored result. The staging table is owned by
+  `wyrd-sql`, carries `data_tenant_id`, enables and forces RLS, and is
+  reachable only through `TenantConn`. A failed write of a stored result
+  retries the write, not the execution.
+- **REQ-184**: While a run executes or writes its result, the runner MUST
+  renew its lease on the PostgreSQL clock once a third of the lease duration
+  has passed. It renews all of one tenant's in-flight leases in one statement.
+  A renewal that finds a run's token gone cancels that run's work at once. A
+  run that has not stored its result stores nothing; one that has stored it
+  leaves it for the new claimant. Renewal evaluates no permission and writes
+  no audit.
+- **REQ-185**: A run MUST hold a Postgres connection only inside these short
+  transactions, never across engine execution, Oracle reads, LLM or media
+  calls, or Bifrost writes: the claim (which also returns the Verifier), the
+  result store, the settle, and the shared per-tenant lease renewal. No phase
+  mints a token. A connection that cannot be acquired never consumes an
+  attempt. The result store and the settle retry with backoff for as long as
+  the run's lease remains, and a settle that still cannot run leaves the
+  stored result for the next claimant.
+- **REQ-186**: A scheduled occurrence whose window ends at `T` MUST NOT be
+  claimed before PostgreSQL's `statement_timestamp()` reaches `T + 30
+  seconds`. The window stays `[start, T)`. The 30-second wait lets
+  observations stamped before `T` finish ingest before the window is read.
+  It is a fixed value, not configuration.
+- **REQ-187**: Every observation row a first-class SDK emits MUST carry a
+  `wyrd_event_time` set once in `wyrd-client`, from the client clock, at the
+  moment the emit is called. A caller-supplied `wyrd_event_time` is kept, never
+  overwritten. Batching, linger, retry, and flush delay MUST NOT change it.
+  Scribe still stamps receipt time only for rows from other producers that omit
+  the column, and still refuses values outside its acceptance window. An
+  observation that reaches the server more than 30 seconds after its scheduled
+  window ended is stored, but that window has already been read and does not
+  count it.
+- **REQ-188**: A Run view MUST expose real-time verification as
+  `observe.verify(verifier, input)` in all three SDKs (Rust
+  `run.observe().verify(...)`, Python and TypeScript `run.observe.verify(...)`).
+  - `verifier` is the `metadata.name` of a Verifier Card bound in
+    `verified_by` to the view's subject Card in the hydrated graph. The client
+    resolves it to the exact Verifier locally. A name that is not bound to the
+    view's subject fails locally with `WYRD_SDK_404_UNKNOWN_VERIFIER` before
+    any network call. The hydrated graph MUST carry what this resolution needs.
+  - The subject is always the view's subject Card. The caller never passes a
+    Card UID.
+  - An Eval Verifier takes one context in the forms `observe.eval` accepts,
+    with the same optional media. A Drift Verifier takes a non-empty sequence
+    of feature rows in the forms `observe.drift` accepts; the client turns the
+    rows into REQ-167 columns. Input of the wrong shape for the Verifier's kind
+    fails locally with `WYRD_SDK_400_INVALID_OBSERVATION`. A Drift Verifier
+    whose baseline is not yet ready is refused with
+    `WYRD_VERIFICATION_409_BASELINE_NOT_READY`; baselines are fitted
+    asynchronously, so a caller that needs one waits on the Card's status.
+  - It judges only. It records no observation, creates no run, dispatches no
+    Operator, and writes nothing to Bifrost. It calls REQ-167 and keeps
+    REQ-168's authorization, audit, bounds, errors, and no-retry rule. It does
+    not require Bifrost to be started.
+  - It returns a typed `Judgment`: `verdict` (`passed | failed |
+    inconclusive`), `passed` (true only for `passed`), `summary`, `counts`, the
+    exact `verifier` and `subject` references, `execution_id`, and a typed
+    Drift or Eval report. A `failed` verdict is a normal return, never an
+    error. Python is synchronous; Rust and TypeScript await it.
+  - `architecture/wyrd-design.md` documents `observe.verify` beside `drift`,
+    `eval`, and `record`.
+  - Opening a run on one Card is a single step: Python `state.run("agent")`
+    takes the Card alias as its first positional argument (today it is the
+    keyword-only `card=`), matching TypeScript `state.run("agent")` and Rust
+    `state.run_for_card("agent")`. The canonical example is:
+
+    ```python
+    with state.run("agent") as agent:
+        judgment = agent.observe.verify("answer-is-yes", {"answer": "yes"})
+    assert judgment.passed
+    ```
+- **REQ-189**: The `Verification` client handle (`get_binding`, `start_run`,
+  `get_run`, `execute`) and the Python `wyrd.verification` module MUST be
+  removed from the Rust, Python, and TypeScript SDKs, their exports, and their
+  generated stubs and declarations. No alias or compatibility shim remains.
+  `wyrd-client` keeps only the transport `observe.verify` needs. Rust's
+  `WyrdError`, today reachable only as `wyrd_sdk::verification::WyrdError`,
+  is exported at the SDK root as `wyrd_sdk::WyrdError`, matching
+  `from wyrd import WyrdError` and the TypeScript root export. The Python
+  error shape and catalog completeness are owned by the approved
+  `py-error-refactor` change, not by this revision.
+- **REQ-190**: An `http` Operator action whose `auth` names an `http`
+  connection MAY give `url` as a path template beginning with `/`. The
+  request then goes to the connection's stored origin, read at each attempt.
+  A path-only `url` without a named connection MUST be refused at
+  registration with the existing invalid-Operator error. Absolute URLs keep
+  today's rules, including that their origin equal the named connection's
+  origin. This lets one Card run unchanged against different environments.
+- **REQ-191**: An authored artifact entry MAY omit `sha256` and `size_bytes`.
+  The client computes both from the local file before any registration call.
+  Values that are present are still checked and refused on mismatch with
+  `RegistryManifestHashMismatch`. Served and downloaded Cards always carry
+  both.
+- **REQ-192**: Every client-facing test in the Rust, Python, and TypeScript
+  SDKs MUST follow one standard, recorded in `TESTING.md` and used as the
+  review checklist. Tests are the product's public examples: they are written
+  for the user who copies them and the maintainer who will own them, so how a
+  test is written is held to the same bar as what it proves.
+  - **One story per file, one outcome per test.** A file covers one user
+    story; each test name states the outcome the user gets (for example
+    `test_agent_answer_passes_its_verifier`). A story has the same file name,
+    test names, and fixtures in all three SDKs, so the languages can be read
+    side by side.
+  - **Checked-in YAML only.** Cards come from fixture directories under a
+    repository-root `fixtures/cards/<story>/`, shared by the three SDKs. Test
+    code never builds or edits YAML, JSON, digests, or URLs.
+  - **Deployment-shaped server.** (revised in revision 66) A session
+    `WyrdTestServer` exports its address and key the way a deployment's
+    environment does, and SDK and CLI calls made as that deployment's default
+    principal resolve them without arguments. A test that acts as any other
+    principal passes a `WyrdClient` built for that principal's key through
+    the call's optional `client` argument, the way a multi-tenant program
+    would, and never changes the process environment to switch principal.
+    (revised in revision 67) A `WyrdState` acting as a Service is created
+    with that Service's client (REQ-209). A second test server a story
+    starts does not export its address; its calls pass an explicit client.
+    Ambient resolution itself is proved once per SDK by one test about
+    configuration; in Rust, where changing the environment of a running test
+    process is unsound, only that test may run in a child process.
+  - **Public surfaces only.** A test uses the public SDK modules, the
+    test-only CLI functions (REQ-196), the three test controls, and the
+    credential fixtures (REQ-195). It uses no
+    private or extension import, subprocess, raw HTTP, SQL against server
+    tables, digest computation, YAML or JSON parsing of results, sleep, or
+    polling loop.
+  - **Setup is fixtures that return domain objects** (a `WyrdState`, a
+    registered Card), never helper functions in the test file. A test body
+    acts on the SDK and asserts on typed results, short enough to copy as an
+    example.
+  - **Errors assert one exact catalog code** on the raised `WyrdError`;
+    message matching and accepting any of several codes are prohibited.
+  - **Fixed, meaningful names**, never uuid or time suffixes; registering a
+    fixture again is idempotent.
+  - **Value tables use `parametrize` / `it.each` / a table loop with one
+    assertion shape**, never branching inside a loop.
+  - **Engine mathematics and internals stay in Rust tests**: PSI bins, SPC
+    limits, judge scoring, cache and fence counters, and audit staging.
+  - **Written to be owned.** Fixtures, fixture YAML, `conftest` and
+    `tests/support` modules are production-quality code: minimal, realistic,
+    typed, named for the domain, documented by intent, and free of dead
+    options, magic values, and clever indirection. Fixture YAML reads as the
+    Card a user would author. A fixture that hides an ugly flow behind a name
+    does not satisfy this requirement.
+- **REQ-193**: `cards.get(ref)` MUST return the same typed Card in all
+  three SDKs (parity), for the implemented and tested kinds only: `Data`,
+  `Model`, `Prompt`, `Agent`, `Verifier`, `Service`, `Trigger`, and
+  `Operator`. It returns the envelope, a `spec` typed by `kind` (for example
+  `VerifierSpec`, `ServiceSpec`), and the typed server-managed `status`,
+  including a Drift Verifier's baseline state. No SDK exposes a typed spec
+  for `Experiment`, `Workflow`, `Policy`, `Mcp`, `Audit`, `Artifact`, or
+  `Source` until that kind is implemented and tested.
+  Rust already returns `wyrd_spec::envelope::Card`. Python gains the method,
+  and TypeScript's `spec`, today `Record<string, unknown>`, becomes a union
+  discriminated by `kind`. The Python and TypeScript types are generated
+  from the `wyrd-spec` JSON schemas, so that `codegen:check` fails when a
+  language drifts. The kind-specific `cards.data`, `cards.model`, and
+  `cards.prompt` loaders are unchanged. (revised in revision 67) The Python
+  type is read by attribute, not by key: `cards.get(ref)` returns generated
+  frozen dataclasses (`card.spec.…`, `card.status.verification.binding_ids`)
+  discriminated by `kind`, built from the same schemas by the existing Card
+  type generator. No runtime dependency is added.
+- **REQ-194**: A Run view identifies itself by the alias it was opened with.
+  The view property is `alias` (Rust `alias()`, Python and TypeScript
+  `alias`), replacing the string `card_ref` / `cardRef`, whose value and
+  documentation disagreed. The exact Card reference for an alias stays
+  available from the state as a typed `CardRef` (`state.card_ref(alias)`).
+- **REQ-195**: `WyrdTestServer` in all three SDKs documents exactly three
+  test controls, each test-only and backed by the production code path:
+  - `flush_bifrost()`: publish every accepted row now, so the next query
+    sees it;
+  - `wait_for_baseline(verifier, timeout)`: return once the named Drift
+    Verifier's baseline is ready, or fail at the deadline with the last
+    observed baseline state; and
+  - `make_binding_due(...)`: make a schedule due.
+
+  (revised in revision 65) It also provides credential fixtures that return an
+  API key holding named Roles: a machine principal in the session tenant or a
+  named other tenant, and the principal projected by a registered Service
+  Card. They stand in for the operator who grants Roles in a deployment;
+  no public surface grants a Role. A Card-scoped key without added Roles is
+  still issued through the CLI (REQ-199). (revised in revision 67) Roles are
+  now granted with the public `grant-role` command (REQ-212), and a Service's
+  own key holds `wyrd_default` (REQ-213), so story journeys obtain a
+  Service's key with the `issue_key` CLI function and grant any further
+  Role with `grant_role`. The credential fixtures remain only for machine
+  principals that a story needs but no public command creates: a principal
+  holding named Roles in the session tenant, and another tenant's
+  administrator.
+
+  (revised in revision 66) The saved-user-login story additionally uses the
+  test server's saved-login fixtures: enable human single sign-on on the
+  test server, save a human login for a tenant into a configuration home,
+  expire it, revoke its refresh chain, and report whether it is stale. They
+  stand in for the identity provider and the passage of time, exist only on
+  `WyrdTestServer`, and are used by no other story.
+- **REQ-196**: (revised in revision 66) The `wyrd` executable ships with the
+  Python and TypeScript packages and is the product surface for CLI
+  commands. The in-process command functions are a test surface only and are
+  absent from production builds: Python `wyrd.testing.cli.<command>(...)`,
+  present only when the extension is built with its `testing` feature;
+  TypeScript `cli.<command>(...)` from `@wyrd/testing`; and Rust
+  `wyrd_sdk::cli::<command>` behind the `testing` feature, which replaces the
+  `cli` feature. Production `wyrd.cli` keeps only the executable entry point,
+  `@wyrd/sdk` exports no in-process command, and no compatibility alias is
+  kept. Each function runs the same Rust command implementation as the
+  `wyrd` executable, takes the command's options as typed arguments, returns
+  the typed result the command prints with `--format json`, and raises
+  `WyrdError` instead of returning an exit code. A networked command takes
+  an optional `client` (`WyrdClient`); omitted, it resolves the server and
+  credential from the ambient chain exactly as the executable does. The
+  `client` argument replaces the `server` argument. At minimum `plan`,
+  `apply`, `get`, and `load` are exposed; any further command a journey
+  needs is exposed the same way.
+- **REQ-197**: An observation emit never blocks the caller. A full queue
+  refuses with `WYRD_CLIENT_429_QUEUE_FULL`; this is the documented contract,
+  and no SDK adds a blocking or retrying emit.
+- **REQ-198**: Every SDK client exposes `access_token()`, returning a current
+  bearer token for its credential, for handing to third-party clients such as
+  an OpenAI SDK pointed at the Gateway. No principal-id accessor is added.
+- **REQ-199**: Card-scoped key issuance and Gateway provider credential
+  writes are performed through the CLI functions (REQ-196). No separate SDK
+  method is added. (revised in revision 67) Role grants (REQ-212) follow the
+  same rule.
+- **REQ-200**: The Bifrost query API in all three SDKs accepts bind
+  parameters (`sql(query, params)`), and Oracle binds them server-side.
+  Examples and tests read their own rows through the Bifrost client with
+  parameters, never by interpolating values into SQL text.
+- **REQ-201**: A tenant's built-in Bifrost tables are created when the tenant
+  is created, so a query against a built-in table that has never been written
+  returns zero rows instead of `TABLE_NOT_FOUND`. Existing tenants receive any
+  built-in table they lack when the server starts, so a built-in added in a
+  later release needs no per-tenant step. Lazy creation on first write or
+  describe is removed.
+- **REQ-202**: The SDKs expose typed values where the tests found raw wire
+  objects: typed constructors for Operator-connection requests and
+  `CardRef`; an options object for TypeScript `TableConfig.fromJsonSchema`;
+  a catalog code on every local refusal; and no public TypeScript
+  constructor that takes a native binding type. A trusted artifact hash is
+  read from the registered Card's `artifact_hash`, not recomputed.
+- **REQ-203**: Python Card and runtime authoring is typed end to end, and
+  each capability exists in Rust and TypeScript wherever that SDK exposes the
+  same Card kind:
+  - `DataCard.from_path` and `ModelCard.from_path` load a saved Card
+    directory or a Card YAML file in one call, as `PromptCard.from_path`
+    does;
+  - `DataCard` accepts typed `splits` and `target_columns`, and interface
+    options read back as typed values;
+  - `agent.to_card()` returns a typed `AgentCard`; callback context, prompt
+    response schema (`prompt.response_schema`), `WyrdConfig` values, model
+    signature dimensions, and query terminals are typed objects, not dicts
+    or `repr` text;
+  - a documented offline mock provider, with caller-set canned responses,
+    is available from public modules for tests and examples.
+- **REQ-204**: The client-facing test suites are brought to REQ-192 using the
+  per-file verdicts in `review/sdk-test-audit/` as the inventory: tests marked
+  DELETE are removed, MOVE tests are re-homed in the named Rust tier, and
+  REWRITE and TIGHTEN tests are fixed. Type-only assertions move to
+  compile-time type tests (`expectTypeOf`, `ty` fixtures outside pytest
+  collection). Every test file runs in a `mise` lane, and the Python
+  `WyrdTestServer` stub matches its runtime.
+- **REQ-205**: Wyrd's OTLP endpoints accept the caller's API key directly in
+  an `x-wyrd-api-key` header, validated on each request, so a stock
+  OpenTelemetry exporter in any language is configured with standard OTel
+  settings (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`) and
+  keeps working past any access-token lifetime. No SDK exporter helper is
+  added.
+- **REQ-206**: Verification history is read with SQL through the Bifrost
+  client, like any warehouse table; no SDK history API is added. How
+  `vala.verification.results` stores its Drift and Eval summaries is owned by
+  `SPEC-bifrost-variant` in `wyrd-forge`.
+- **REQ-207**: (added in revision 66) Loading an authored Workflow accepts an
+  optional `client` in all three SDKs: Python
+  `Workflow.from_path(path, client=None)`, TypeScript
+  `Workflow.fromPath(path, { client })`, and Rust
+  `Workflow::from_path_with_client(path, client)` beside the unchanged
+  `Workflow::from_path(path)`. Registry Card refs are then read, and the
+  loaded Workflow's Gateway calls are made, as that client's principal;
+  omitted, the ambient chain is used as today. A wholly local Workflow still
+  needs neither a client nor a server.
+- **REQ-208**: (added in revision 67) **One identity parameter.** Every
+  public SDK entry point that calls the server takes exactly one optional
+  identity parameter, a `WyrdClient`: Python `client=None`, TypeScript an
+  options object `{ client }`, and Rust a `with_client(client)` constructor
+  or a `&WyrdClient` argument beside a `from_env()` form. Omitted, the call
+  resolves the client from the ambient chain (environment, then the active
+  profile, then the newest saved login). The server URL, credential, and gRPC
+  URL are arguments of the `WyrdClient` constructor only; no other public
+  surface accepts them. This covers `Cards`, `Bifrost` (connect and table
+  describe), `Gateway`, `OperatorConnections`, `Workflow` loading, and
+  `WyrdState` (REQ-209), and Rust `Platform`. Rust `Cards::new(server_url,
+  credential)` is removed and `Gateway` gains `with_client` and `from_env`
+  like the other handles. The removed arguments get no compatibility alias.
+  The `WyrdClient` constructor documents `credential` once, in every SDK: an
+  API key (`wyrd_sk_…`), which is exchanged for an access token, or an
+  access token, which is presented as-is.
+- **REQ-209**: (added in revision 67) **A state's identity is fixed when it
+  is created.** `WyrdState` takes its client at creation: Python
+  `WyrdState.from_path(path, client=None, …)`, TypeScript
+  `WyrdState.fromPath(path, { client })`, and Rust
+  `WyrdState::from_path_with_client(path, client)` beside `from_path(path)`.
+  `start_bifrost` / `startBifrost` takes no identity argument, and every
+  server call the state makes, including Bifrost startup and
+  `observe.verify`, runs as that client. A state created without a client
+  resolves the ambient chain once, at its first server call, and keeps that
+  client; later environment changes do not change its principal.
+- **REQ-210**: (added in revision 67) **One public surface across SDKs.**
+  The Rust, Python, and TypeScript SDKs expose the same public operations,
+  with the same argument names (in each language's casing), argument kinds,
+  defaults, and typed results. In particular:
+  - `cards.hydrate(ref, destination, metadata_only=False)` downloads a
+    registered Card's reachable graph as a bundle in all three SDKs (Rust
+    `Cards::hydrate(selector, destination, mode)`); Python gains it, and a
+    bundle no longer requires the CLI.
+  - `Cards` exposes root `get`, `list`, `delete`, and `resolve_latest` in
+    all three SDKs.
+  - Bifrost `stream(query, params, deadline)` has one shape in all three
+    SDKs; Rust keeps one table-describe name (`describe_table(namespace,
+    name)`); TypeScript exposes `dropped`.
+  - `state.run(alias)` names its argument `alias` everywhere, and the typed
+    state accessors exist for every kind the state hydrates.
+  - `Workflow.run` accepts the same input kinds, and `Workflow.from_yaml`
+    exists wherever `Workflow.from_path` does.
+  - (revised in revision 68) The same concept has the same name everywhere:
+    a state exposes `root_ref` (the root `CardRef`) and `service` (the typed
+    root Card), and a Workflow exposes its step ids as `steps`.
+  - (revised in revision 68) Workflows are authored as YAML and loaded with
+    `from_path` or `from_yaml`; no SDK exposes programmatic Workflow
+    builders.
+
+  Allowed differences are named idiom exceptions only:
+  - Python's Data and Model holders and per-kind registries;
+  - programmatic `register` in Rust and Python (revised in revision 68);
+  - a synchronous twin where the language has blocking IO: Rust's blocking
+    Bifrost and Python's `Bifrost` beside `AsyncBifrost` (added in revision
+    68);
+  - row-model typing (`model=` / `sql_as::<T>` / a row type);
+  - row serialization on `insert`;
+  - Rust's `run()` / `run_for_card(alias)` and `verify` / `verify_with_media`
+    pairs, where Rust has no optional arguments;
+  - Python's synchronous `record`;
+  - TypeScript string paths;
+  - Python's agent runtime (`Agent.run`);
+  - the operator-only Rust `Principals`, `Platform`, and storage handles;
+  - (added in revision 69) language-native ecosystem adapters that wrap a
+    shared surface without adding server behavior: Python's
+    `QueryResult.to_pandas` / `to_polars` and
+    `wyrd.otel.install_run_correlation`, and (added in revision 70)
+    Python's and TypeScript's `QueryResult.to_arrow` / `toArrow`, which
+    wrap the shared `batches` in the language's Arrow table type that Rust's
+    arrow-rs does not have;
+  - (added in revision 69) Rust's `ClientConfig`, `Environment`, and
+    `GlobalConfig` as the Rust spelling of the `WyrdClient` constructor
+    options that Python and TypeScript take as keyword or object arguments;
+  - (added in revision 69) test-harness CLI helpers that only load fixtures,
+    such as Rust's `cli::load` taking `Option<&Path>`.
+
+  An SDK that exposes a surface no other SDK has, outside this list, either
+  gains the surface everywhere or loses it.
+
+  (added in revision 68) Parity is measured on the SDK packages
+  (`wyrd_sdk`, Python `wyrd`, `@wyrd/sdk`), not on `wyrd-client`, which is
+  also the shared implementation behind the CLI, MCP, the test harness, and
+  the language bindings. `wyrd_sdk` re-exports only parity types; remote
+  `Workflows` and `PublicWyrdGatewayCaller` are not re-exported. Low-level
+  methods on re-exported types (raw requests, `from_parts`, Bifrost query
+  and writer internals, bundle introspection, `Run::subject`, and the
+  `Cards` response and download plumbing) are compiled only under a
+  `wyrd-client` `internal` feature. `wyrd-cli`, `wyrd-mcp`, `wyrd-testing`,
+  and the Python and TypeScript binding crates enable it; `wyrd-sdk-rust`
+  never does, and `check:deps` fails if it does.
+- **REQ-211**: (added in revision 67) **References and paths.** Every
+  selector, loader, and delete accepts a `CardRef` as well as its
+  identity or uid pieces, and every path parameter accepts the language's
+  path type: Python `str | os.PathLike[str]`, Rust `impl AsRef<Path>`, and
+  TypeScript `string`. Docstrings describe what the path names (a Card
+  file or a bundle directory) accurately.
+- **REQ-212**: (added in revision 67) **Role grants.** A tenant
+  administrator grants a built-in or tenant Role to a Card-bound Service or
+  Agent principal with `wyrd auth grant-role --kind --name --version --space
+  --role`, backed by `POST /v1/auth/grant-role` taking `{ card_ref, role }`
+  and returning the principal's roles. The route requires the tenant
+  administrator permission (`*`), not `service_accounts:write`. It is
+  idempotent, tenant-isolated, answers an unknown or foreign Card with the
+  existing non-enumerating not-found code and an unknown role with
+  `WYRD_SPEC_400_VALIDATION`, and stages the `auth.principal.role.grant`
+  authorization decision on the audit outbox. A grant takes effect at the
+  principal's next key exchange. Human users are not grant targets, because
+  federated login replaces their roles. The command is also a test-only CLI
+  function (REQ-196) in every SDK. No revoke command is added.
+- **REQ-213**: (added in revision 67) **A usable default Role.** A Service
+  or Agent principal's first projection grants the built-in `wyrd_default`
+  Role (`bifrost_table:read`, `bifrost_record:write`, `evals:run`) instead of
+  `workload`, so the key `wyrd auth issue-key` issues for a Service can
+  start Bifrost, emit its evidence, and verify without any grant. Its Card
+  scope still bounds which Cards it may emit for and verify. Tenant-wide
+  Bifrost query reads are not in the default; they come from an explicit
+  grant of the built-in `workload` Role, which keeps its permissions.
+  Bifrost reads scoped to a principal's own Card are not added; they need an
+  Oracle row filter that does not exist.
+- **REQ-214**: (added in revision 67) **Every public parameter is
+  documented.** Each public callable documents every parameter's name, type,
+  and meaning, its return value, and its errors, in the SDK's native form:
+  - Python: Google-style `Args:`, `Returns:`, and `Raises:` in the stub
+    sources. The stub assembler's existing docstring gate requires an
+    `Args:` entry for every non-`self` parameter, and Ruff's `D417` runs on
+    the stubs.
+  - TypeScript: `@param`, `@returns`, and `@throws` in `index.ts`.
+  - Rust: an `# Arguments` section on public SDK functions that take
+    parameters.
+
 - **REQ-152**: Verification coordination MUST use PostgreSQL as its clock.
   PostgreSQL MUST write and evaluate runtime activity, schedule eligibility,
   run and dispatch availability, claim and lease expiry, retry/backoff
@@ -1454,8 +1901,8 @@ table on `(data_tenant_id, result_id)`.
   process-local-only run state, registration-only relationship, or provisional
   storage path standing in for the documented server workflow. A successfully
   enqueued run MUST reach completed or a visible bounded retry/terminal state.
-  This does not promise an Eval run when its best-effort post-commit enqueue
-  fails, nor atomic visibility across the separate Bifrost result tables.
+  It does not promise atomic visibility across the separate Bifrost result
+  tables.
 
 - **REQ-061**: Drift and Eval MUST produce the same common Verification Result
   shape. Future implementations can project that core result without changing
@@ -1601,6 +2048,238 @@ table on `(data_tenant_id, result_id)`.
   authorization otherwise remain intact. No replacement policy gate is part
   of this change.
 
+### Direct execution, telemetry, and verification capacity (revision 51)
+
+- **REQ-167**: `POST /v1/verification/execute` MUST synchronously execute
+  one exact registered Verifier for one exact subject over supplied input and
+  return the judgment in the response. The request is `{ verifier_uid,
+  subject_card_uid, input }`. `input` is tagged by `kind`:
+  `eval_record { context: object, media?: [MediaRef] }` for assertion-only
+  and LLM-judge Evals, with judges receiving the supplied context; or
+  `drift_samples { columns: { <feature>: [number | string | null] } }`, where
+  PSI and SPC score against the Verifier's `ready` fitted baseline and Custom
+  scores the mean of `profile.metric_name`. Success is `200 { execution_id,
+  verifier, subject, kind, verdict, summary, counts, detail }`. `verdict` is
+  `passed | failed | inconclusive`, and `detail` is `{ drift: DriftReport }`
+  or `{ eval: EvalReport }`. `execution_id` is a UUIDv7 that appears only in
+  the response, audit, and trace. It is never persisted or queryable. A
+  `failed` verdict is a successful response. The operation MUST NOT create a
+  durable run, publish a result, dispatch an Operator, read or write Bifrost,
+  or apply the Eval sampling policy. Registry, baseline, and judge
+  Agent/Prompt resolution and canonical audit still use PostgreSQL.
+- **REQ-168**: Direct execution MUST require `evals:run` with exact Verifier
+  and subject scope, exactly as the direct-target run start does. The
+  permission check blocks; the audit does not. It MUST stage exactly one
+  allowed or denied decision per request on the process audit outbox shared
+  with Oracle, without waiting for its commit; a decision that fails to
+  commit is logged and counted and never refuses the request. Unknown or
+  cross-tenant targets return `404 verification_target_not_found`. Bounds:
+  - a request body of at most 1 MiB;
+  - `drift_samples` of at most 64 columns × 100,000 values;
+  - `eval_record.context` of at most 256 KiB;
+  - one 60-second execution deadline;
+  - no concurrency cap or admission layer.
+
+  Stable errors:
+
+  | Status | Code | Condition |
+  |---|---|---|
+  | 400 | `verification_input_invalid` | Malformed input |
+  | 413 | `verification_input_too_large` | A bound is exceeded |
+  | 403 | existing RBAC code | Permission denied |
+  | 409 | `verification_baseline_not_ready` | No `ready` fitted baseline |
+  | 409 | `verification_baseline_legacy` | Baseline fitted under an earlier format |
+  | 422 | `verification_input_incompatible` | Missing feature or type mismatch |
+  | 422 | `verification_input_unsupported` | An Eval with trace or agent assertions, refused before any task runs |
+  | 502 | `verification_dependency_failed` | Judge provider failure after the task's own `max_retries` |
+  | 504 | `verification_execution_timed_out` | The deadline elapsed |
+
+  The operation is not idempotent, takes no `Idempotency-Key`, and is never
+  retried automatically by an SDK. A client disconnect cancels in-flight work.
+  Provider calls already issued may have incurred cost.
+- **REQ-169** (revised in revision 64): The Rust, Python, and TypeScript SDKs
+  MUST expose REQ-167 only as `observe.verify(...)` (REQ-188), implemented
+  once in `wyrd-client` without duplicating transport or scoring. MCP MUST
+  expose the write tool `verification_execute`,
+  gated on `evals:run`, and the served OpenAPI MUST describe the operation.
+- **REQ-170**: Verifier execution telemetry MUST follow the TASK-008 closeout
+  telemetry contract. Required elements:
+  - one execution owner shared by queued and direct paths;
+  - closed labels: `kind` (`drift_psi`, `drift_spc`, `drift_custom`,
+    `eval_assertion`, `eval_llm_judge`, `eval_other`, `unknown`), `mode`
+    (`queued`, `direct`), `origin`, `phase` (`load`, `input_read`, `prepare`,
+    `engine`, `publication`, `settlement`), and the bounded `outcome` sets;
+  - `wyrd_verification_engine_overhead_seconds`, computed as engine elapsed
+    time minus the union of measured wait intervals;
+  - the shared bucket set
+    `0.0005, 0.001, 0.0025, 0.005, 0.0075, 0.009, 0.01, 0.025, 0.05, 0.1,
+    0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300`;
+  - INFO-level correlated spans and queued task-start delay;
+  - the operator catalog and its PromQL.
+
+  No Grafana deliverable is part of this change.
+- **REQ-171**: `mise run bench:capacity` is Wyrd's one capacity benchmark. It
+  replaces `bench:verification:capacity` and `bench:bifrost:ingest-capacity`;
+  no other server capacity benchmark exists. It follows the Google SRE
+  load-test shape: one production-shaped workload, a ramp to find
+  saturation, sustained steps at load, and the four golden signals judged
+  against stated SLOs. A default run MUST complete within 30 minutes,
+  including setup, against release `wyrd-server` replicas in peer mode over
+  Postgres and the RustFS emulator, each in an 8-CPU/16-GiB scope.
+  - **Workload.** One mix of everything the server does, driven open-loop
+    through the public Rust client and spread evenly over four tenants with
+    identical traffic. The load level `L` is verification executions per
+    second. At level `L` the mix is:
+
+    | Operation | Rate | Shape |
+    |---|---|---|
+    | Verification, direct | `L/2` per second | PSI, SPC, Custom, assertion Eval, LLM-judge Eval in equal shares (AC-040 reference workloads) |
+    | Verification, queued | `L/2` per second | same five kinds and shares |
+    | Scribe ingest | `2.5·L` Drift observations per second | 100 features each, through `WyrdState` with default queue configuration |
+    | Oracle query | `L/2` per second | equal shares of a selective lookup and a small aggregate over the last 5 minutes of the tenant's ingested data |
+
+    Audit, run settlement, Scribe publication, and Forge maintenance run as
+    the server's own side effects of this mix. Nothing else is driven.
+  - **Steps.**
+    1. warmup: 30 seconds at `L = 50` on one replica, not judged;
+    2. ramp: 60-second steps at `L` = 50, 100, 200, 400 on one replica,
+       stopping at the first step that misses an SLO; the highest passing
+       step is the knee `K`;
+    3. sustained: 180 seconds at `K` on one replica;
+    4. sustained: 180 seconds at `K` on two replicas;
+    5. scale-out: 180 seconds at `2K` on two replicas.
+  - **SLOs.** A step passes only when every SLO holds:
+
+    | Golden signal | SLI | SLO |
+    |---|---|---|
+    | Traffic | achieved ÷ offered, per operation | ≥ 95% |
+    | Errors | requests that failed, were refused, were lost, or produced a wrong judgment | 0 (intentionally failing verifier inputs are judgments, not errors) |
+    | Latency | direct verification paired engine overhead, non-judge kinds | p95 < 10 ms (AC-040) |
+    | Latency | Scribe ingest: client queue drain after load stops | ≤ 1 s |
+    | Latency | client p50/p95/p99 per operation | reported |
+    | Saturation | every backlog (run queue, Scribe, audit outbox, Forge demand) after load stops | drained within 60 s |
+    | Saturation | replica CPU cores and peak memory | reported |
+
+  - **Verdict.** The run passes when the sustained one-replica step and both
+    two-replica steps pass. The scale-out step passing is the proof that two
+    replicas carry more than one.
+  - **Report.** One table, one row per step, one column per SLI, each cell
+    marked PASS or FAIL, then one per-operation row per step with the same
+    columns for diagnosis. Nothing else is judged.
+  - Correctness and isolation are proven by tests, not by this benchmark:
+    tenant fairness, exactly-once queued claims across replicas, judgment
+    correctness, and the AC-041 queue properties.
+  - `--profile` captures symbolized per-step, per-replica `perf` profiles of
+    a diagnostic build and fails explicitly on missing evidence.
+
+### Client ingestion throughput and memory (revision 53)
+
+The client queue behind `observe.*` and `Bifrost.insert*` follows the
+established producer model of Kafka and librdkafka: per-destination batching
+lazily created under one shared memory budget, byte- and linger-triggered
+batches, several idempotent sends in flight, and immediate refusal at the
+call site when the budget is exhausted.
+
+- **REQ-172**: One `Bifrost` handle MUST bound every client-owned ingestion
+  byte with one configurable handle-wide budget, `client_byte_limit_bytes`.
+  Every byte counts against it, from admission until the server acknowledges
+  it or a definite refusal settles it as a counted loss:
+  - admitted rows;
+  - sealed batches;
+  - in-flight batches;
+  - retained ambiguous batches.
+
+  This budget is the only memory bound. In particular:
+  - Any number of destination tables may be written, each through one lazily
+    created producer per (scope, table).
+  - There is no producer-count limit, no per-producer share of the budget, and
+    no row-count capacity.
+  - Configured values are honoured without library ceilings. The current 32
+    MiB, 64-entry, 1,024-row, 4,096-row, and 50,000-row clamps are removed.
+  - Sealing keeps one maximum-message headroom that admission cannot consume,
+    so admitted rows can always be sealed.
+  - The default budget is 256 MiB. A user MUST be able to override it when
+    connecting Bifrost or starting a `WyrdState`'s Bifrost in Rust, Python,
+    and TypeScript. An override smaller than one maximum message plus its
+    sealing headroom is refused at connect time.
+- **REQ-173**: The queue MUST NOT preallocate. No buffer, slot array, or
+  channel storage is sized from a configured capacity or budget before rows
+  arrive. Memory grows with admitted rows and is released on settlement. An
+  idle producer reserves no budget bytes beyond its own bounded bookkeeping.
+- **REQ-174**: A producer MUST seal a batch when either of these occurs:
+  - its staged rows reach the configured `max_message_bytes` frame target; or
+  - the configured linger has elapsed since the first staged row and one of
+    its `max_in_flight` send slots is free. The linger default is 5 ms. While
+    every slot is busy, staged rows keep accumulating until a slot frees or
+    the frame target is reached, so batches grow under backpressure.
+
+  An explicit flush or shutdown seals immediately. Row-count triggers and the
+  1-second default interval are removed. Intake MUST continue while sends are
+  in flight as long as the budget has room.
+- **REQ-175**: Each producer MUST allow up to a configurable number of
+  concurrent sends, `max_in_flight`.
+  - Every batch keeps one UUIDv7 for all its retries, and Scribe's batch
+    deduplication absorbs replays.
+  - Retained ambiguous batches retry with backoff without blocking other
+    sends.
+  - Batches of one producer carry no delivery-order guarantee; rows within
+    one batch keep admission order. Consumers order by row timestamps, never
+    by arrival.
+  - The default `max_in_flight` is the smallest value that meets AC-041,
+    recorded with the `bench:capacity` evidence.
+- **REQ-176**: Admission MUST be immediate and all-or-none per logical record.
+  For example, every tall row of one Drift observation is admitted, or none is.
+  - A record that cannot fit in the remaining budget returns
+    `WYRD_CLIENT_429_QUEUE_FULL` and admits no row, so the caller may flush or
+    back off and then resubmit the same record.
+  - A record larger than the whole admission budget returns
+    `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE`.
+  - Admission never waits on the network.
+  - No blocking or awaitable admission API is added.
+- **REQ-177**: A send that ends without a definite ACK or refusal, including
+  an exhausted transport retry budget or deadline, MUST retain its batch and
+  identity until it is reconciled. Only a definite refusal settles a batch as
+  a counted loss.
+
+### Gateway capture writer (revision 54)
+
+Gateway call capture is server-internal evidence, written the way Bifrost's
+own engines reach Scribe. It does not impersonate a client: no token, no
+per-tenant embedded client, and no loopback through the public ingest
+listener. This revision supersedes the capture-authority mechanism in
+`changes/active/wyrd-gateway-port/spec.md` REQ-006 and its capture boundary.
+
+- **REQ-178**: Each `wyrd-server` process MUST own exactly one capture writer.
+  - When Scribe is active in the same pod, the writer submits the projected
+    `vala.gateway.calls` and `vala.traces.spans` batches to it in-process.
+  - Otherwise it submits them over the existing mutually authenticated peer
+    plane to a live, ready Scribe, through a capture-only peer ingest RPC
+    that carries the tenant and destination table explicitly.
+  - The choice follows pod topology (`WYRD_TARGET`), never table ownership.
+  - The peer RPC is served only by pods running Scribe and admits only
+    `wyrd-peer` client certificates. It refuses any table other than the two
+    capture destinations and the three Verifier result tables (REQ-086), and
+    any reserved system tenant. Widening it to other server-internal writers
+    requires a spec revision.
+- **REQ-179**: Capture MUST be a server-internal write. It holds no token,
+  evaluates no permission, and writes no audit decision. Captured rows carry
+  the reserved `GATEWAY_CAPTURE_PRINCIPAL` identity, which, like
+  `PLATFORM_AUDIT_PRINCIPAL`, never appears in a token. The capture token,
+  its issuance and verification paths, the capture role, and Gate's
+  principal exception are removed. Gate MUST refuse every public write to
+  `vala.gateway.calls`.
+- **REQ-180**: A capture is delivered when Scribe acknowledges it before the
+  call's deadline.
+  - Retryable refusals (backpressure or an unavailable peer) are retried with
+    bounded backoff until that deadline.
+  - Any other failure, or the deadline elapsing, drops the capture with a
+    counted, logged reason and never changes the call's result.
+  - Capture holds no per-tenant queue, client, or in-memory backlog beyond
+    the in-flight attempt.
+  - Each capture batch has a deterministic identity derived from the tenant,
+    call, and table, so a retried or redirected submission is absorbed by
+    Scribe's batch-id dedup.
+
 ## Invariants
 
 - **INV-001**: The shipped continuous user model is an existing Service/Agent
@@ -1648,6 +2327,16 @@ table on `(data_tenant_id, result_id)`.
   credential. No separate migrator or catalog role or password is required.
 - **INV-018**: A multi-replica Wyrd deployment shares one authoritative object
   namespace while each Scribe owns its own durable WAL/staging identity.
+- **INV-019**: Client-owned ingestion bytes never exceed one handle's
+  `client_byte_limit_bytes`. A refused record admits no row. A batch is
+  released only by a durable ACK or a definite refusal, and never by
+  ambiguity.
+- **INV-020**: Gateway capture cannot write outside its tenant and the two
+  capture destinations. No public principal, including one claiming the
+  capture identity, can write `vala.gateway.calls` through Gate.
+- **INV-021**: A Verifier run has at most one result. Every write of it, by
+  any replica and after any crash, carries the same stored bytes and batch
+  IDs, and no public principal can write a Verifier result table.
 
 ## Acceptance obligations
 
@@ -1666,8 +2355,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   Verifiers, inspect non-blocking baseline status until ready, and manually
   analyze bounded windows without an Operator dispatch. They prove
   server-side PSI bin counts and SPC aggregation, persisted
-  vala.verification.results and vala.drift.result_features rows joined by
-  (`data_tenant_id`, `result_id`), and queryable results. A Custom metric journey
+  vala.verification.results and vala.drift.result_features rows joined by `result_id` within the caller's
+  tenant-scoped query, and queryable results. A Custom metric journey
   proves ready registration without a fit job and server-side window mean.
   Empty and invalid Custom windows MUST persist `completed/inconclusive` with
   null `details` and zero feature rows; scored Drift MUST persist its existing
@@ -1706,20 +2395,21 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   Verifier with deterministic and LLM-judge tasks, authored pass_gate, and
   observations_ready binding; emits existing EvalRecordObservation through
   observe:eval over wyrd-client/wyrd-queue's canonical IPC path; and proves
-  the new vala.eval.observations row receives a Scribe acknowledgement
-  independent of the later best-effort Postgres verifier_runs insert.
+  the new vala.eval.observations row is acknowledged without waiting for run
+  creation, and its runs appear through the run-request outbox.
   The created run MUST retain the committed row's exact `record_id` and
   server-managed `wyrd_event_time`, and its input read MUST demonstrate UTC-day
   partition pruning with those frozen values even when client `created_at`
   falls on a different day.
   Successful enqueue runs the existing Eval executor and persists
-  vala.verification.results plus vala.eval.result_items joined by
-  (`data_tenant_id`, `result_id`). A workflow that skips a task MUST persist
+  vala.verification.results plus vala.eval.result_items joined by `result_id` within the caller's
+  tenant-scoped query. A workflow that skips a task MUST persist
   its `TaskRunOutcome::Skipped` beside every `Ran` task outcome, while the
   common result's `details` serializes `EvalWorkflowSummary`. A forced
-  post-commit enqueue failure MUST preserve the Bifrost observation, return
-  successful ingest, emit a structured
-  tracing error, and create no Eval run or Operator dispatch. A failing
+  Postgres outage during a flush MUST keep the requests and create exactly one
+  run per matching binding once Postgres returns. A repeated request MUST
+  create no duplicate. Graceful shutdown MUST flush queued requests before
+  exit. A failing
   pass_gate creates one dispatch per configured Operator; a passing gate
   creates none; an absent gate persists `completed/inconclusive` and creates
   none. A sampled-out record persists one zero-count summary, zero item rows,
@@ -1824,10 +2514,15 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   exit. Async evidence MUST cover an `await`, concurrent tasks using the same
   immutable Run, and a task created inside the scope. Focused Python tests MUST
   prove that missing `opentelemetry-api`, an API-only/no-SDK provider,
-  processor registration failure, span enrichment failure, and detach failure
-  do not escape or block explicit observations; a user exception from the
-  block MUST propagate unchanged. Unknown aliases MUST still fail before
-  entry. Provider registration MUST be idempotent, and an explicitly installed
+  processor registration failure, span enrichment failure, and exit
+  context-update failure do not escape or block explicit observations; a user
+  exception from the block MUST propagate unchanged. Unknown aliases MUST
+  still fail before entry. Repeated entry MUST register the processor once on
+  a normal provider by way of the provider marker, and every optional
+  registration failure MUST leave explicit observations working; duplicate
+  registration under a concurrent first entry is permitted. A nested scope
+  MUST NOT overwrite `wyrd.card_ref`
+  on an already-active span that carries one, and an explicitly installed
   private provider MUST receive the same attributes. Context exit MUST NOT be
   treated as a telemetry or Bifrost durability barrier. No test may infer
   automatic log or metric enrichment from this span contract.
@@ -1881,7 +2576,7 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   re-exchange renews activity without resetting an active schedule cursor, and
   an idle client does not
   re-exchange solely on token expiry. Delegation, human refresh, Card-free
-  automation, SYSTEM minting, cached-token requests, and ordinary observations
+  automation, server-internal SYSTEM work, cached-token requests, and ordinary observations
   do not activate or renew an owner. Inactivity, suspension, and deletion
   prevent scheduled work; later reauthentication starts at the next future
   occurrence without backfill. Two A/B versions remain independently
@@ -1891,7 +2586,7 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
 - **AC-020**: Supporting integration tests MUST exercise the real Postgres
   registration/auth/binding/run/dispatch seams, Oracle/Scribe result and
   observation seams, scheduler claim and lease expiry, baseline fitting,
-  Eval post-commit enqueue, and Operator retry/fanout. Unit tests cover
+  the Eval run-request outbox, and Operator retry/fanout. Unit tests cover
   pure Drift/Eval validation, cron-window calculation, verdict mapping,
   sampling and pass-gate branches, and stable public errors. These lower
   tiers support, but do not replace, AC-012–AC-019 user journeys. The
@@ -1942,23 +2637,21 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   MUST observe a Postgres rotation on the next attempt without a Card revision
   or replica rollout.
 - **AC-023**: A multi-server journey MUST run the Verifier worker on a server
-  without local Scribe ownership and prove its Arrow result batches return
-  through `wyrd_client::Bifrost` to Gate/Scribe, are acknowledged, and are
-  queryable. It MUST assert input rows carry the client Service/Agent
-  `principal_id` and subject `card_uid`, while result/detail rows carry the
-  tenant-scoped SYSTEM writer `principal_id`, exact Verifier `card_uid`, and
-  explicit subject/owner/binding IDs. A forged tenant or out-of-scope Verifier
-  `card_ref` MUST be rejected; no global `SYSTEM_OWNER` token may write a
-  customer-tenant result. Provisioning MUST create one stable UUIDv7 SYSTEM
-  principal per tenant without a public credential. Tests MUST reject public
-  create, list, get, update, suspend/delete, credential, refresh, workload,
-  delegation, impersonation, and token-exchange operations for SYSTEM,
-  non-SYSTEM writes to any result table, and SYSTEM writes to every other
-  table. They MUST prove that a SYSTEM read token is refused against another
-  table and another tenant and cannot write results, and that a verification
-  process without a local Oracle completes a Drift run through peer-forwarded
-  Oracle with an audited read decision. They MUST also prove the existing tenant issuer/JWT format and the
-  single canonical Gate authorization audit. Two bindings for one subject MUST
+  without local Scribe or Oracle and prove that its result batches reach a live
+  Scribe through the peer ingest RPC, are acknowledged, and are queryable, and
+  that a Drift run completes through a peer-forwarded Oracle with an audited
+  SYSTEM read decision. It MUST assert input rows carry the client
+  Service/Agent `principal_id` and subject `card_uid`, while result/detail
+  rows carry the tenant-scoped SYSTEM `principal_id`, exact Verifier
+  `card_uid`, and explicit subject/owner/binding IDs. Provisioning MUST create
+  one stable UUIDv7 SYSTEM principal per tenant without a public credential.
+  Tests MUST reject public create, list, get, update, suspend/delete,
+  credential, refresh, workload, delegation, impersonation, and token-exchange
+  operations for SYSTEM; the issuer's refusal to mint a SYSTEM token;
+  verification's refusal of any `kind=system` claim set; every public write to
+  a result table through Gate, including from a wildcard administrator; a
+  result row whose `card_ref` differs from the submitted Verifier; and a SYSTEM
+  read of another table or another tenant. Two bindings for one subject MUST
   remain independently filterable through runs/results while sharing the one
   raw subject observation without Verifier/binding columns or per-binding
   copies.
@@ -1968,8 +2661,8 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   resolved Bloom-column union for `vala.verification.results` and both
   result-detail tables. A real tenant-scoped query MUST retrieve results by
   Verifier `card_uid`, subject
-  Card UID, and binding ID, then retrieve matching details by
-  (`data_tenant_id`, `result_id`) across at least two time partitions.
+  Card UID, and binding ID, then retrieve matching details joined by `result_id` within the caller's
+  tenant-scoped query across at least two time partitions.
   Physical Parquet evidence MUST show the declared Bloom filters are written;
   an Oracle query plan or scan metric MUST demonstrate time-partition pruning
   and `result_id` row-group pruning where the predicate is selective. The
@@ -1983,10 +2676,12 @@ coverage for Drift and Eval plus the production Drift/Eval journeys below.
   scope refusal, reserved-table refusal, and no audit rows for internal claims,
   retries, Scribe commits, or worker mechanics. They MUST also prove
   `operators:read` versus `operators:write` separation for connection
-  management and Gate's closed SYSTEM/result-table matrix. A multi-tenant runtime journey
-  MUST saturate one tenant at four Verifier and four Operator executions while
-  another tenant still progresses, and MUST show neither global pool exceeds
-  16. A slow local Operator endpoint MUST prove the 30-second attempt timeout,
+  management and Gate's refusal of every public result-table write. A multi-tenant runtime journey
+  MUST execute more than sixteen held Verifier runs, including more than four
+  for one tenant, while another tenant also progresses. Baseline fitting MUST
+  proceed while those runs are held. Operator delivery MUST still enforce four
+  executions per tenant and sixteen per process. A slow local Operator endpoint
+  MUST prove the 30-second attempt timeout,
   three-attempt budget, 30-second/two-minute retry schedule, five-minute
   deadline, and terminal status without rerunning the Verifier. Shutdown tests
   MUST prove claims stop immediately, work drains for at most 30 seconds, and
@@ -2060,9 +2755,220 @@ published image pinned by an immutable registry digest before release.
   delegated exchange MUST still work without `PolicyHook`, policy-only audit,
   or unevaluated `invoke` attribution.
 
+- **AC-039**: Real Rust, Python, and TypeScript client journeys MUST prove
+  direct execution for PSI, SPC, Custom, assertion Eval, and LLM-judge Eval.
+  They MUST prove exact version attribution, passed and failed judgments,
+  missing or legacy baselines, permission and cross-tenant refusal,
+  malformed, oversized, incompatible, and unsupported input, and timeout. They
+  MUST also prove that no durable run, result, dispatch, or Bifrost evidence
+  operation occurs. An isolated test MUST prove that an audit-append failure
+  neither refuses nor delays an authorized execution or changes a permission
+  refusal.
+- **AC-040**: The reference workloads are:
+
+  | Case | Workload |
+  |---|---|
+  | Assertion Eval | 4 assertion tasks over a 2 KiB context |
+  | Custom | 1 metric, 1,000 samples |
+  | PSI | 8 numeric features × 1,000 samples, 10 quantile bins, baseline fitted from 10,000 rows |
+  | SPC | 4 features × 1,000 samples, subgroup size 5, baseline from 10,000 rows |
+  | LLM judge | 1 judge plus 1 assertion against a local TLS mock with a 200 ms delay |
+
+  In `bench:capacity` (REQ-171), the four non-judge kinds MUST show
+  direct-mode paired per-request engine overhead below 10 ms at p95 in every
+  judged step, from at least 1,000 samples per kind in the one-replica
+  sustained step. Judge cases report overhead and provider waits separately,
+  with no threshold.
+- **AC-041**: `bench:capacity` (REQ-171) carries 50,000 ingest rows per
+  second (500 Drift observations × 100 features) at `L = 200` with default
+  queue configuration. Every step at or below the knee MUST show zero
+  `QUEUE_FULL` refusals and client queue drain within one second of load
+  stopping. Tests MUST prove, against a real server, that every emitted
+  observation is durable exactly once with 100 rows per `record_id`, and that
+  client-owned bytes stay flat under sustained emission.
+- **AC-042**: Queue and journey tests MUST prove:
+  - all-or-none admission with resubmission and no duplicates;
+  - a record larger than the budget refused as too large;
+  - intake continuing during an in-flight send;
+  - linger and byte sealing;
+  - retention of ambiguous sends, reconciled by the same batch UUID;
+  - no producer-count limit, with at least 1,000 tables written through one
+    handle;
+  - an idle producer reserving no budget bytes.
+
+  Rust, Python, and TypeScript journeys MUST each prove an uninterrupted
+  1,000-observation × 9-feature Drift burst with QUEUE_FULL resubmission
+  after flush, durably reading back exactly 9,000 rows, 1,000 distinct
+  `record_id`s, and 9 rows per id. Each SDK MUST also prove that a
+  byte-budget override is honoured and that an override too small to seal a
+  message is refused at connect time.
+- **AC-043**: Gateway capture journeys MUST prove:
+  - in a single-pod topology, capture rows land in-process in both capture
+    tables, stamped with the capture principal;
+  - in a peer-mode topology, a gateway served by a pod without Scribe lands
+    capture through the peer RPC on a live Scribe;
+  - a Scribe outage longer than the call's deadline drops that call's
+    capture with a counted reason and never fails the call;
+  - a resubmitted capture batch is not written twice.
+
+  Negative tests MUST prove that Gate refuses every public write to
+  `vala.gateway.calls`, and that the peer RPC refuses tables other than the
+  capture and Verifier result tables, reserved tenants, and callers without a
+  peer certificate.
+
+- **AC-044**: Verifier runtime journeys under load MUST prove:
+  - 200 held queued runs released at once on the 8-connection test pool all
+    complete on their first attempt, with no `settlement_failed` outcome and
+    no connection-acquire timeout;
+  - with more than 64 tenants each holding a claimable run, every tenant
+    receives a claim in the first round;
+  - a run whose lease is reclaimed after its result was stored is written
+    from the stored result without re-executing, and each result table holds
+    exactly one copy of that run's rows;
+  - a stale claimant whose lease was taken cannot store a result, and its
+    work never reaches Bifrost;
+  - a run that executes longer than its lease keeps its lease through
+    renewal, and a renewal that finds its token gone cancels the run's work;
+  - a second run of the same Verifier on one process opens no connection to
+    load its Card, and a run whose Verifier was deleted settles `errored`;
+  - a run refused by a full shared resource returns to the queue without
+    consuming an attempt, and claiming resumes when a running run finishes.
+- **AC-045**: In Rust, Python, and TypeScript journeys, `observe.verify`
+  returns a passing and a failing Eval `Judgment` and a Drift `Judgment`
+  through the fixture graph; an unbound Verifier name fails locally with no
+  request sent; a caller without `evals:run` is refused with REQ-168's error;
+  and a public Bifrost read shows no observation row for the verified input.
+- **AC-046**: No SDK exports `Verification`, `wyrd.verification` does not
+  import, and `mise run codegen:check` passes with the handle removed.
+- **AC-047**: A static fixture Service whose `http` Operator names a
+  connection and a path-only `url` delivers to the local origin the test
+  registered on that connection; a path-only `url` without a connection is
+  refused at registration. A fixture artifact without `sha256` and
+  `size_bytes` registers, and a wrong declared digest is refused.
+- **AC-048**: `TESTING.md` records the REQ-192 standard, and every
+  client-facing test in the three SDKs conforms to it, checked by review
+  against each bullet of REQ-192.
+- **AC-049**: `cards.get(ref)` returns each of the eight REQ-193 kinds,
+  typed, in all three SDKs, read back from a shared fixture, with `codegen:check` proving the Python and TypeScript
+  types match the `wyrd-spec` schemas. A Python journey reads a Drift Verifier
+  through `cards.get(ref)` and sees its baseline state; `observe.verify` before the
+  baseline is ready is refused with `WYRD_VERIFICATION_409_BASELINE_NOT_READY`,
+  and succeeds after `wait_for_baseline`.
+- **AC-050**: Run views expose `alias` and no `card_ref` / `cardRef` in all
+  three SDKs, and `codegen:check` passes.
+- **AC-051**: (revised in revision 66) In each SDK a journey runs `apply`
+  and `get` through the test-only CLI functions against the test server, in
+  the test's own process, with an explicit `client`; a refused command raises
+  `WyrdError` with its catalog code; and the installed `wyrd` executable runs
+  from Python and TypeScript packages. The production Python wheel and the
+  published `@wyrd/sdk` package expose no in-process command function, and
+  no Rust journey other than the one ambient-configuration test runs in a
+  child process.
+- **AC-052**: Rust callers import `wyrd_sdk::WyrdError`, and no journey reads
+  a refusal code out of `UpstreamFailure` details.
+- **AC-053**: A journey calls the Gateway through the stock OpenAI SDK with
+  a token from `access_token()` (REQ-198), and the CLI functions issue a Card-scoped key and write a
+  provider credential (REQ-199).
+- **AC-054**: In each SDK a parameterised `sql` returns the caller's rows,
+  and a bound value containing SQL text is treated as data (REQ-200).
+- **AC-055**: A new tenant's built-in tables are queryable and empty before
+  any write; an existing tenant missing a built-in has it after restart
+  (REQ-201).
+- **AC-056**: Each REQ-202 and REQ-203 capability has a test in every SDK
+  that exposes it, and `codegen:check` passes.
+- **AC-057**: Every DELETE, MOVE, REWRITE, and TIGHTEN row in
+  `review/sdk-test-audit/` is resolved, and every client-facing test file is
+  selected by a `mise` lane (REQ-204).
+- **AC-058**: In each SDK, a stock OTel exporter configured only with the
+  standard `OTEL_EXPORTER_OTLP_*` settings and an `x-wyrd-api-key` header
+  exports a span that is then read back through the Bifrost client
+  (REQ-205).
+- **AC-059**: (added in revision 66) In each SDK a journey loads a Workflow
+  whose Agent and Prompt refs are registry Cards with an explicit `client`
+  holding read access while the ambient credential has none, and the
+  Workflow loads and runs as that client (REQ-207).
+- **AC-060**: (added in revision 67) No public SDK surface outside the
+  `WyrdClient` constructor accepts a server URL, credential, or gRPC URL, in
+  any of the three SDKs; each REQ-208 surface takes an optional client, and a
+  journey in each SDK uses every one of them with an explicit client
+  (REQ-208).
+- **AC-061**: (added in revision 67) In each SDK a journey creates a
+  `WyrdState` with a Service's client, starts Bifrost without identity
+  arguments, and verifies as that Service; a state created with a client
+  lacking `evals:run` is refused with `WYRD_PERMISSION_403_DENIED_RBAC`
+  (REQ-209).
+- **AC-062**: (added in revision 67) A parity table under the change packet
+  lists every public operation of the three SDKs with its arguments and
+  result type; every row matches or names its REQ-210 idiom exception, and
+  each SDK has a journey that hydrates a bundle with `cards.hydrate`
+  (REQ-210).
+- **AC-063**: (added in revision 67) Selectors, loaders, and deletes accept
+  a `CardRef`, Python path parameters accept `pathlib.Path`, and Python
+  `cards.get` results are read by attribute with `ty` type checking passing
+  over the journeys (REQ-193, REQ-211).
+- **AC-064**: (added in revision 67) A journey in each SDK grants a Role
+  with the `grant_role` CLI function and acts with it after a fresh key
+  exchange, and is refused with `WYRD_PERMISSION_403_DENIED_RBAC` when the
+  caller is not a tenant administrator. A Rust route test proves tenant
+  isolation, the non-enumerating not-found answer, an unknown role refused,
+  idempotency, and the staged audit decision (REQ-212).
+- **AC-065**: (added in revision 67) A Service key issued by `issue_key`,
+  with no grant, starts Bifrost, emits, and verifies in each SDK; the same
+  key is refused a tenant-wide Bifrost query until `workload` is granted
+  (REQ-213).
+- **AC-066**: (added in revision 67) The Python stub gate fails on a public
+  callable with an undocumented parameter, and every public Python,
+  TypeScript, and Rust SDK callable documents its parameters, result, and
+  errors (REQ-214).
+- **AC-067**: (added in revision 68) `wyrd_sdk` built without the
+  `internal` feature exposes no raw-request, writer-internal, or
+  introspection method; `check:deps` fails when `wyrd-sdk-rust` enables
+  `internal`; every SDK names the root accessors `root_ref` and `service`
+  and the Workflow step ids `steps`; no SDK exposes Workflow builders; and
+  the parity table has no unexplained row (REQ-210).
+
 ## Open material decisions
 
-None. Revision 39 records the user's narrow deletion: remove the always-allow
+Revision 70:
+
+- None. The user approved on 2026-10-07 naming Python and TypeScript
+  `QueryResult.to_arrow` as an ecosystem adapter instead of adding a Rust
+  `to_arrow`.
+
+Revision 69:
+
+- None. The user approved on 2026-10-07 three named REQ-210 exceptions:
+  language-native ecosystem adapters, Rust config types as the spelling of
+  constructor options, and fixture-only test-harness CLI helpers.
+
+Revision 68:
+
+- None. The user approved every decision on 2026-10-07: unified names,
+  the synchronous-twin and Rust programmatic-`register` exceptions, Rust-only
+  types left out of `wyrd_sdk`, the `internal` feature for low-level
+  methods, and removing the Python Workflow builders in favour of YAML.
+
+Revision 67:
+
+- None. The user approved every decision on 2026-10-07, including the
+  `wyrd_default` Role name (role names allow only `[a-z0-9_]`), its narrow
+  permission set, and documenting parameters in every SDK.
+- Noted outside this change: `POST /v1/principals` gates on
+  `service_accounts:write`, which `runtime_admin` holds, so that role can
+  create a principal holding `admin`. REQ-212 does not reuse that gate. The
+  existing route needs its own follow-up.
+
+Revision 66:
+
+- None. The user approved the revision, including the saved-login fixtures
+  in REQ-195, on 2026-10-07.
+
+Revision 65:
+
+- None. The Bifrost storage and query decisions moved to
+  `SPEC-bifrost-variant`.
+
+Revision 39 records the user's narrow deletion: remove the always-allow
 hook and its fake `invoke` policy attribution without redesigning delegation.
 
 ## Material authority links
@@ -2095,6 +3001,351 @@ hook and its fake `invoke` policy attribution without redesigning delegation.
 - [PagerDuty Global Integrations and Service Routes](https://support.pagerduty.com/main/docs/event-orchestration)
 
 ## Revision history
+
+- **Revision 70 Arrow table adapter (2026-10-07, approved by the user):**
+  - **Trigger.** The final TASK-017-R2 parity pass left one row: Python and
+    TypeScript `QueryResult.to_arrow` return an Arrow table, and Rust has
+    only `batches()`.
+  - **Decision (REQ-210, AC-067).** arrow-rs has no table type, and a batch
+    slice is its equivalent, so `to_arrow` is an ecosystem adapter under
+    exception (a). Rust gains no copying `to_arrow`.
+- **Revision 69 Named idiom exceptions for adapters, config, and test
+  helpers (2026-10-07, approved by the user):**
+  - **Trigger.** The TASK-017-R2 parity table left three surfaces matching
+    no REQ-210 exception: Python pandas/polars and OpenTelemetry adapters,
+    Rust's config types, and Rust's test-only `cli::load` signature.
+  - **Decision (REQ-210, AC-067).** Each is an idiom, not a divergent
+    contract: adapters wrap a shared result or runtime hook in the
+    language's ecosystem, Rust config types carry the same constructor
+    options, and fixture-loading test helpers are not user surface. All
+    three are named exceptions; no SDK is changed to add or remove them.
+- **Revision 68 Parity measured on the SDK packages (2026-10-07, approved
+  by the user):**
+  - **Trigger.** The TASK-017-R2 parity table found surfaces in one or two
+    SDKs that matched no REQ-210 exception: Rust low-level client, writer,
+    and bundle-inspection methods; Rust remote `Workflows` and the gateway
+    caller; blocking Bifrost in Rust and Python only; Python Workflow
+    builders; and different names for the root accessor and step ids.
+  - **Decision (REQ-210, AC-067).** Nothing has shipped, so parity is
+    enforced on the SDK packages for the long term: names are unified;
+    synchronous twins and Rust/Python programmatic `register` are named
+    exceptions; Rust-only types are not re-exported by `wyrd_sdk`;
+    low-level methods sit behind a `wyrd-client` `internal` feature that
+    `wyrd-sdk-rust` never enables; Workflows are authored as YAML only.
+- **Revision 67 One client, one surface, usable roles (2026-10-07,
+  approved by the user):**
+  - **Trigger.** A user-persona review of the TASK-017-R1 journeys, written
+    from the view of a Python data scientist, found that the story tests
+    cannot be copied into a notebook. A bundle needed the test-only CLI. A
+    verify key needed a harness-only Role grant. Identity arrived through
+    `credential=`, `client=`, or the environment, and `verify` silently ran
+    as whichever client Bifrost had started with. A cross-SDK inventory
+    found three SDKs with different shapes for the same operations, and
+    most public parameters undocumented.
+  - **Identity (REQ-208, REQ-209).** Every server-facing surface now takes
+    one optional `WyrdClient`, and a state's identity is fixed when it is
+    created.
+  - **Parity (REQ-210, REQ-211).** The three SDKs expose one surface, with
+    named idiom exceptions only. Python gains `cards.hydrate`, typed
+    attribute-access Cards (REQ-193), `CardRef` selectors, and path
+    arguments.
+  - **Roles (REQ-212, REQ-213).** A tenant administrator grants Roles with
+    `wyrd auth grant-role`. Service principals default to `wyrd_default`,
+    which can emit and verify but not read the tenant's Bifrost.
+  - **Documentation (REQ-214).** Every public parameter is documented in
+    every SDK.
+  - **Breaking.** The removed identity arguments get no alias.
+- **Revision 66 Test-only CLI functions and explicit clients (2026-10-07,
+  approved):** An independent readability review of the TASK-017 rewrites found
+  that every Rust journey needing a credential re-ran its own test binary as
+  a child process, because the CLI functions and Workflow loading read their
+  credential only from the environment and a Rust test cannot change its own
+  environment soundly. The user decided that the in-process CLI functions
+  are a test surface, not a product surface: they move behind each SDK's
+  existing testing gate, with no new feature, and gain an optional
+  `WyrdClient` that replaces `server` (REQ-196). Tests acting as a non-default
+  principal pass that client instead of changing the environment, and
+  ambient resolution is proved once per SDK (REQ-192). Workflow loading gains
+  the same optional client as product API, because Workflows also run
+  locally (REQ-207). The saved-user-login story's fixtures are sanctioned
+  with the credential fixtures (REQ-195). Removing the in-process CLI from
+  the production Python wheel and `@wyrd/sdk` is a breaking change with no
+  alias.
+- **Revision 65 Credential fixtures (2026-10-07, approved by the user):**
+  Journeys need keys holding Roles (`reader`, `writer`, `agent`, another
+  tenant's `admin`), and no public surface grants a Role. REQ-195 now
+  sanctions the test server's credential fixtures alongside the three
+  controls instead of adding a Role-granting CLI option; Card-scoped keys
+  without added Roles stay on the CLI (REQ-199).
+- **Revision 64 SDK verification ergonomics (2026-10-05, approved by the user
+  directing planning into two tasks independent of the Bifrost work):** The
+  user found the SDK verification surface and its journeys unusable: a
+  separate `Verification` handle driven by raw dicts and UIDs, polling, raw
+  SQL, and Card YAML built from Python strings. Real-time verification moves
+  to `observe.verify(...)` on the Run view, judge-only, returning a typed
+  `Judgment` (REQ-188). The SDK `Verification` handle is removed; binding,
+  run start, and run status stay on HTTP and MCP (REQ-137, REQ-169, REQ-189).
+  HTTP Operators may take their origin from a named connection (REQ-190) and
+  artifact digests may be computed by the client (REQ-191), so fixture Cards
+  are static files. REQ-192 sets the journey test standard, modelled on the
+  opsml client, PromptCard, and agent-service tests. The SDK test audit
+  (`review/sdk-test-audit/`) added what the journeys could not do without
+  workarounds: a refusal for an unready baseline (REQ-188), a root Rust
+  `WyrdError` (REQ-189), a typed `cards.get` for every kind in every SDK (REQ-193), `alias` on the Run
+  view (REQ-194), three documented test-server controls (REQ-195), and the
+  CLI as in-process functions in every SDK (REQ-196). The user approved the
+  test standard (REQ-192), widened to every client-facing test and to how
+  tests and fixtures are written, not only what they assert. Audit follow-ups:
+  non-blocking emit stays (REQ-197), `access_token()` (REQ-198), key and
+  credential setup through the CLI (REQ-199), bind parameters (REQ-200),
+  built-in tables created with the tenant (REQ-201), typed SDK values
+  (REQ-202), typed Python authoring with parity (REQ-203), and the test
+  clean-up (REQ-204). Refusing unimplemented kinds at registration is
+  deferred. OTLP endpoints accept API keys so stock exporters need no helper
+  (REQ-205), and verification history stays SQL (REQ-206). Bifrost storage
+  and query work (Variant, Iceberg v3, shredding, pruning, typed result
+  summaries) moved to its own change, `SPEC-bifrost-variant`.
+- **Revision 63 Observations carry their own event time (2026-10-03, approved
+  on user direction):** SDK observations omitted `wyrd_event_time`, so Scribe
+  stamped the batch's receipt time and a buffered observation landed in the
+  window it arrived in rather than the one it happened in. REQ-187 makes
+  `wyrd-client` stamp the event time when the observation is emitted, for all
+  three SDKs. Scribe's acceptance window (30 days past, 24 hours future) keeps
+  rows held through an outage admissible.
+- **Revision 62 Late observations reach their window (2026-10-03, approved on
+  user direction):** A scheduled Drift occurrence was claimed the instant
+  PostgreSQL reached its window end. An observation stamped just before the end
+  but still being ingested was left out of that window, and the next window
+  starts at the end, so it was never counted. REQ-186 adds a fixed 30-second
+  wait after the window end before the occurrence is claimed. Event time stays
+  producer-owned.
+- **Revision 61 Eval runs follow the writer (2026-10-03, approved on user
+  direction):** The TASK-015 review found that the flusher created runs for
+  every binding on the observation's subject and checked each owner's
+  activity when the request was written, which could backfill another owner
+  that authenticated after the observation. The user directed that an Eval
+  observation written by principal A runs only bindings owned by A, and that
+  the activity gate applies to scheduled and Trigger runs. REQ-108 now says so.
+- **Revision 60 Eval run-request outbox (2026-10-03, approved):** Revision
+  59 had Scribe insert `verifier_runs` in its batch-fence transaction. That
+  breaks the repository rule that no crate's transaction writes another
+  crate's tables (`architecture/v1/00-foundations/sql-foundation.md:75`,
+  enforced by two `vala-sql` checks). The alternative of writing runs before
+  acknowledging would make clients wait. The user chose a batched run-request
+  outbox like audit's instead. The acknowledgement covers receipt only, a
+  flusher writes runs in batches and retries rather than dropping, and
+  graceful shutdown flushes. The user explicitly accepted losing unflushed
+  requests on a hard process kill. REQ-077 and AC-014 change.
+
+- **Revision 59 Verifier runtime under load (2026-10-03, approved):** An
+  independent architecture review (Codex gpt-5.6-sol, medium) found that one
+  run could write more than one result, because each retry built a new result
+  and new batch IDs. It also found that Eval runs were lost when the
+  post-acknowledgement handoff failed, that leases were never renewed, and
+  that claim rounds stopped at 64 tenants. The user also objected to three
+  more things. Internal jobs minted tokens, results looped back through the
+  server's own Gate as if from an outside client, and every run reloaded its
+  Verifier from Postgres. Each run took five to seven connections.
+  - **Changes:**
+    - Results are written by the server-internal capture writer with no
+      token and no Gate (REQ-086). They are stored once before writing, and
+      every write reuses those stored bytes and batch IDs (REQ-183).
+    - Leases are renewed (REQ-184).
+    - The claim round has no tenant limit (REQ-181).
+    - Verifiers are cached per process (REQ-182).
+    - A run holds a connection only for its claim, result store, settle, and
+      shared lease renewal (REQ-185).
+    - Eval run creation is moved off the acknowledgement path (REQ-077,
+      superseded by revision 60).
+    - The SYSTEM tokens are removed.
+    - Revision 58's half-pool bound (the first REQ-178, which also duplicated
+      the capture writer's ID) is withdrawn.
+  - **Decided by the user:**
+    - Verifier execution has no count cap. Shared resources that are full
+      push back instead: the run returns to the queue without using an
+      attempt, and claiming pauses until a run finishes.
+    - Drift only runs its SQL on Bifrost and scores what returns. It makes
+      no completeness or freshness check.
+  - **Proof:** AC-044 and the revised AC-014 and AC-023.
+
+- **Revision 58 runner connection bound (2026-10-03, approved):** A fairness
+  test that released 200 held queued runs at once exhausted the server's
+  Postgres pool. Revision 50 removed the Verifier execution permits, which
+  were the only thing bounding concurrent runner Postgres work. Each run makes
+  three separate connection acquisitions (Verifier load at `runner.rs:314`,
+  token mint at `publisher.rs:197`, and settlement at `runner.rs:456`). The
+  pool defaults to 32 connections with a 5 s acquire timeout. A timed-out mint
+  consumes an attempt; a timed-out settlement strands the run until its
+  10-minute lease expires; and HTTP, MCP, and audit work share the same pool.
+  - **Changes:** REQ-178 bounds runner Postgres phases to half the pool and
+    makes settlement retry connection timeouts. Execution remains
+    permit-free.
+  - **Proof:** the fairness test returns to 200 runs on the 8-connection test
+    pool and fails on any `settlement_failed` outcome or any attempt beyond the
+    first.
+
+- **Revision 57 one capacity benchmark (2026-10-03, approved):** Wyrd had three
+  capacity benchmarks (verification, Bifrost ingest, Bifrost query) and the
+  verification one judged correctness, fairness, and tenant roles alongside
+  capacity. Its tenant shape changed twice with no production basis, and
+  two-replica results were hard to read.
+  - **Direction:** the user chose one benchmark for the whole server that is
+    easy to follow under Google SRE practice.
+  - **Changes:** REQ-171 becomes `bench:capacity`: one mix of verification,
+    Scribe ingest, and Oracle query over four identical tenants; ramp,
+    sustained, and two-replica scale-out steps; golden-signal SLIs with
+    stated SLOs and PASS/FAIL per cell. It replaces
+    `bench:verification:capacity` and `bench:bifrost:ingest-capacity`.
+    AC-040 and AC-041 become SLOs of that run; fairness, exactly-once claims,
+    judgment correctness, and queue durability move to tests.
+    `bench:bifrost:query-capacity` is already deleted by
+    `opitimization-and-benchmarks` REQ-010; its ClickBench and observability
+    benchmarks compare the storage engine externally and are not capacity
+    benchmarks.
+
+- **Revision 56 production-shaped capacity benchmark (2026-10-02, approved):**
+  The REQ-171 defaults expanded to 134 steps of 30 seconds: 2 paths × 6
+  cases × 5 rates on each of two replica counts, plus warmup, combined, and
+  fairness steps. A run took over an hour, and no person could diagnose its
+  report. The 10 and 25 per second steps could never yield AC-040's 1,000
+  samples per case.
+  - **Direction:** the user asked for a simple, human-readable benchmark
+    that tests production behavior the way standard capacity tests do, in
+    30 minutes or less.
+  - **Changes:** REQ-171 now runs one production mix through a warmup, a
+    four-rate ramp, and sustained steps on one and two replicas, with a
+    30-minute ceiling. Per-kind and per-path figures become breakdowns of
+    each step. AC-040 measures overhead in the one-replica sustained step
+    instead of solo and mixed ladders.
+  - **Proof:** AC-040 keeps the reference workloads, the 10 ms p95 bound,
+    and the 1,000-sample floor.
+
+- **Revision 55 linger sealing under backpressure (2026-10-02, approved):**
+  The AC-041 benchmark showed the producer sealing a ~350-row batch on every
+  5 ms linger even with every send slot busy. Sealed batches never merge, so
+  the batch rate was fixed by the linger, the sink's
+  `max_in_flight / ack latency` capacity capped throughput near 33k rows/s,
+  client bytes grew, and drain took seconds.
+  - **Direction:** the user approved sealing an elapsed linger only when a
+    send slot is free.
+  - **Changes:** REQ-174's linger trigger now requires a free send slot; the
+    frame-target trigger, flush, and shutdown seal as before.
+  - **Proof:** AC-041 is unchanged.
+
+- **Revision 54 gateway capture writer (2026-10-02, approved):** Gateway
+  capture minted a tenant token per tenant and wrote through one embedded
+  client per tenant over the server's own public gRPC listener, with a
+  64-tenant ceiling and a preallocated per-tenant budget.
+  - **Direction:** the user directed that capture behave like Bifrost's own
+    engines: in-process when Scribe is in the pod, otherwise over the gRPC
+    peer plane, through one writer.
+  - **Changes:** REQ-178 to REQ-180 and INV-020 define the topology-routed
+    writer, the capture-only peer RPC, server-internal identity, and
+    deadline-bounded delivery. AC-043 makes both paths and the refusals
+    acceptance evidence.
+  - **Decided:** the peer RPC is a new capture-only service, not a general
+    internal-write RPC. Delivery is acknowledged before the call's deadline or
+    a counted drop; no backlog survives the deadline. The user approved these
+    decisions and the requirement text in conversation.
+
+- **Revision 53 client ingestion throughput and memory (2026-10-02,
+  approved):** The capacity benchmark's 1,000-observation Drift seed failed with
+  `WYRD_CLIENT_429_QUEUE_FULL`.
+  - **Causes:**
+    - Intake awaited each network send.
+    - Admission was row by row, so a refusal could split one observation.
+    - The size trigger was unreachable.
+    - A 32 MiB budget was pre-divided across 64 potential producers, leaving
+      about 465 staging rows per table.
+    - Ambiguous gRPC exhaustion was settled as a loss.
+  - **New requirement:** the user requires 500 requests/s × 100 features
+    (50,000 rows/s) and directs that no cap exists without justification and
+    that nothing is preallocated.
+  - **Changes:** REQ-172 to REQ-177 adopt the shared-budget producer model
+    from Kafka and librdkafka.
+  - **Proof:** AC-041 and AC-042 make sustained throughput and memory
+    behaviour acceptance evidence.
+  - **Decided:** the default budget is 256 MiB, overridable in every
+    first-class SDK. Batches carry no delivery-order guarantee. No blocking
+    admission API is added.
+
+- **Revision 52 non-blocking direct-execution audit (2026-10-02):** The user
+  directed that permissions are blocking and audits are non-blocking.
+  - REQ-168 stages the direct-execution decision on the shared audit outbox
+    instead of committing it transactionally; an audit failure no longer
+    refuses the request.
+  - AC-039's isolated audit test proves that non-blocking behavior.
+  - Converting the remaining transactional audit surfaces is a separate
+    change.
+- **Revision 51 direct execution, telemetry, and capacity (2026-10-02):** The
+  user approved the TASK-008 closeout amendments.
+  - REQ-135 gains a fourth operation.
+  - REQ-167 to REQ-169 define synchronous supplied-input execution, its
+    authorization, bounds, errors, and SDK/MCP projections.
+  - REQ-170 carries the caller-aligned telemetry contract.
+  - REQ-171 defines the capacity benchmark.
+  - AC-039 and AC-040 fix direct-execution proof, the reference workloads,
+    and the strict latency proof.
+
+  This revision supersedes the recovery task's fixed traffic profile and its
+  prohibition on synchronous execution.
+
+- **Revision 50 remove Verifier execution caps (2026-10-02):** Explicit caller
+  instruction removes the 16-process/4-tenant permits from Verifier runs and
+  baseline fitting directly, without an experimental candidate or replacement
+  admission layer. Operator delivery permits, durable claim/lease fencing,
+  execution/publication deadlines and shutdown behavior remain unchanged.
+
+- **Revision 49 default workload role (2026-10-02):** A Card-bound Service or
+  Agent principal now receives the new built-in `workload` role at first
+  projection, in the registration transaction. The role holds
+  `bifrost_table:read`, `bifrost_record:write`, and `bifrost_query:read`; table
+  read is the describe every writer performs before admission. Card scope still
+  bounds emission, re-registration never re-grants a revoked role, and a
+  migration seeds the role row for existing tenants. This replaces the
+  direct-SQL role grant benchmarks and journeys used because no public route
+  grants a role to a Card-bound principal. The user explicitly approved
+  revision 49 on 2026-10-02.
+
+- **Revision 48 verification table schema erratum (2026-10-02):** Removed the
+  `wyrd_row_ordinal` and `data_tenant_id` rows from the shared managed columns
+  in `architecture/logic/table_schema.md`; Bifrost writes neither column.
+  Tenant scope for the five verification tables comes from the tenant-bound
+  query and the physical tenant table, not a stored row column. AC-012, AC-014,
+  and AC-024 now join results to details by `result_id` within the caller's
+  tenant-scoped query. No behavior changes. The user explicitly approved
+  revision 48 on 2026-10-02.
+
+- **Revision 47 marker-based Run correlation registration (2026-10-02):**
+  Simplified Python Run OpenTelemetry registration in REQ-151, AC-032, and
+  `architecture/logic/run_api.md` to three guarantees: no processor pile-up
+  (a private marker attribute on the provider object makes later entries skip
+  it; a duplicate from a concurrent first entry is harmless because the
+  processor is stateless and enrichment idempotent), never break the app
+  (every optional-telemetry failure is swallowed), and correct stamping from
+  the context-held scope stack. Removed the at-most-once-per-provider attempt,
+  cached outcomes, the no-enrichment rule for accept-then-raise providers, the
+  strict single-processor guarantee, identity-versus-equality caching, and the
+  registration lock with inert processors. This supersedes
+  `TASK-009-R6-reentrant-provider-registration`. The user explicitly approved
+  revision 47 on 2026-10-02 and waived further review.
+
+- **Revision 46 token-free Python Run correlation (2026-10-01):** Resolved
+  `FIND-TASK-009-8` by keeping the Python Wyrd scope stack inside the
+  OpenTelemetry context value (one private key minted at import, a tuple of
+  `(card_ref, run_id)` pairs, innermost last). Entry pushes and exit pops by a
+  single context attach each; detach tokens and detach calls are removed, and
+  a mismatched or failed exit changes nothing. Replaced "attach/detach
+  failure" with "context-update failure" in REQ-151 and "detach failure" with
+  "exit context-update failure" in AC-032; exiting restores the prior Wyrd
+  correlation in the current context. Registration is attempted at most once
+  per provider with a cached outcome, so a provider that raises after
+  accepting the processor never receives a second one. New behavior: entry
+  stamps the already-active recording span only when it does not already
+  carry `wyrd.card_ref`; spans created inside the scope are still stamped by
+  the processor with the innermost scope's pair. Rationale is recorded in
+  `architecture/logic/run_api.md`. The user explicitly
+  approved revision 46 on 2026-10-01.
 
 - **Revision 45 Operator key source correction (2026-10-01):** Replaced the
   nonexistent shared external-secret resolver requirement with server-owned

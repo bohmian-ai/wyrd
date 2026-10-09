@@ -9,8 +9,8 @@ use arrow::array::{Array, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::Field;
 use arrow::ipc::reader::StreamReader;
 use chrono::{DateTime, Utc};
-use wyrd_runtime::Principal;
 use wyrd_spec::ids::CardUid;
+use wyrd_spec::reference::CardRefScope;
 
 use crate::contracts::ScribeError;
 use crate::scribe::execution_lanes::resolve_card_uids;
@@ -77,8 +77,8 @@ pub struct AcknowledgedObservation {
 impl ObservationsTable {
     /// Derive each acknowledged row's activation key from its admitted frame.
     ///
-    /// Re-derives exactly what Scribe stamped: the subject UID through the same
-    /// signed-scope resolution, and the caller's `wyrd_event_time` when present
+    /// Re-derives exactly what Scribe stamped: the subject UID resolved against
+    /// `card_scope`, the same scope Scribe stamped the row with, and the caller's `wyrd_event_time` when present
     /// or `receipt_micros` otherwise. Rows without a subject activate nothing
     /// and are omitted.
     ///
@@ -88,7 +88,7 @@ impl ObservationsTable {
     /// a subject reference no longer resolves.
     pub fn acknowledged(
         frame: &[u8],
-        principal: &Principal,
+        card_scope: Option<&CardRefScope>,
         receipt_micros: i64,
     ) -> Result<Vec<AcknowledgedObservation>, ScribeError> {
         let reader = StreamReader::try_new(Cursor::new(frame), None)
@@ -96,7 +96,7 @@ impl ObservationsTable {
         let mut keys = Vec::new();
         for rows in reader {
             let rows = rows.map_err(|_| ScribeError::InvalidFrame)?;
-            let card_uids = resolve_card_uids(&rows, principal.card_ref_scope(), rows.num_rows())?;
+            let card_uids = resolve_card_uids(&rows, card_scope, rows.num_rows())?;
             let records = rows
                 .column_by_name("record_id")
                 .and_then(|column| column.as_any().downcast_ref::<StringArray>())
@@ -135,8 +135,6 @@ mod tests {
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use uuid::Uuid;
-    use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
-    use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
@@ -165,7 +163,7 @@ mod tests {
         bytes
     }
 
-    /// Keys mirror Scribe's stamping: the signed subject UID, the caller event
+    /// Keys mirror Scribe's stamping: the subject UID from the stamping scope, the caller event
     /// time when supplied, the receipt otherwise, and no key without a subject.
     ///
     /// # Panics
@@ -177,16 +175,9 @@ mod tests {
             uid: Some(uid.clone()),
             ..CardRef::from_str("test/Service/svc@1.0.0").expect("card")
         };
-        let principal = Principal::new(
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKind::Service {
-                card_ref: Some(card.clone()),
-                card_ref_scope: CardRefScope::own(&card),
-            },
-            crate::test_support::tenant(),
-            Vec::new(),
-            PermissionSet::new(),
-        );
+        // The same scope Scribe stamped with: signed for a Card-bound writer,
+        // Gate's registry attribution for an unbound one.
+        let scope = CardRefScope::own(&card);
         let card_text = card.to_string();
         let refs: ArrayRef = Arc::new(StringArray::from(vec![Some(card_text.as_str()), None]));
         let records: ArrayRef = Arc::new(StringArray::from(vec!["r1", "r2"]));
@@ -197,7 +188,7 @@ mod tests {
                 ("record_id", Arc::clone(&records)),
                 ("card_ref", Arc::clone(&refs)),
             ]),
-            &principal,
+            Some(&scope),
             receipt,
         )
         .expect("frame decodes");
@@ -223,7 +214,7 @@ mod tests {
                 ("card_ref", refs),
                 ("wyrd_event_time", caller),
             ]),
-            &principal,
+            Some(&scope),
             receipt,
         )
         .expect("frame decodes");

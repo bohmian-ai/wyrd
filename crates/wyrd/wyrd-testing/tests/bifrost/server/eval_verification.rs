@@ -2478,9 +2478,23 @@ async fn eval_runs_follow_the_writing_owner() -> Result<(), ServerJourneyError> 
     server.flush_bifrost().await?;
     let from_b = record_id(&server, tenant, "from-b").await?;
     let runs = owned_runs(&server, &superuser, 2).await?;
-    let expected = vec![(owner_a, from_a), ("eval-owner-b".to_owned(), from_b)];
+    let owner_b = "eval-owner-b".to_owned();
+    let expected = vec![(owner_a.clone(), from_a), (owner_b.clone(), from_b)];
     if runs != expected {
         return Err(format!("expected one run per writer's own binding, read {runs:?}").into());
+    }
+
+    // The unbound administrator owns no binding, so its record about M runs
+    // every owner's binding of M.
+    let unbound = connect(&server, server.tenant_admin_key().await?.expose_secret());
+    emit_as(&unbound, &bundle_a, "from-admin").await?;
+    server.flush_bifrost().await?;
+    let from_admin = record_id(&server, tenant, "from-admin").await?;
+    let runs = owned_runs(&server, &superuser, 4).await?;
+    for owner in [owner_a, owner_b] {
+        if !runs.contains(&(owner.clone(), from_admin.clone())) {
+            return Err(format!("the unbound record ran no binding of {owner}: {runs:?}").into());
+        }
     }
     server.shutdown().await?;
     Ok(())

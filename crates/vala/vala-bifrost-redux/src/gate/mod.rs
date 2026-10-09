@@ -314,10 +314,18 @@ impl<T: AuditStage> GateAudit for T {
 pub trait ObservationAck: Send + Sync {
     /// Accepts one acknowledged `vala.eval.observations` frame.
     ///
-    /// `frame` is the exact Arrow IPC payload Scribe admitted and
-    /// `receipt_micros` the receipt instant it stamped on rows without a
+    /// `frame` is the exact Arrow IPC payload Scribe admitted, `card_scope`
+    /// the Card scope Scribe resolved its `card_ref`s against — the Gate's
+    /// registry attribution for an unbound writer, the signed scope otherwise
+    /// — and `receipt_micros` the receipt instant it stamped on rows without a
     /// caller `wyrd_event_time`.
-    fn acknowledged(&self, auth: &AuthContext, frame: bytes::Bytes, receipt_micros: i64);
+    fn acknowledged(
+        &self,
+        auth: &AuthContext,
+        card_scope: Option<&wyrd_spec::reference::CardRefScope>,
+        frame: bytes::Bytes,
+        receipt_micros: i64,
+    );
 }
 
 /// The concrete Bifrost write boundary.
@@ -1060,7 +1068,12 @@ impl<A: GateAudit + 'static> Gate<A> {
                 table.namespace == BifrostNamespace::Eval
                     && table.name == crate::tables::EvalObservationsTable::NAME
             })
-            .map(|hook| (Arc::clone(hook), frame.arrow_ipc.clone()));
+            .map(|hook| {
+                let card_scope = attributed_cards
+                    .clone()
+                    .or_else(|| auth.principal.card_ref_scope().cloned());
+                (Arc::clone(hook), card_scope, frame.arrow_ipc.clone())
+            });
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
             authenticated_tenant: auth.tenant,
@@ -1086,8 +1099,8 @@ impl<A: GateAudit + 'static> Gate<A> {
             .record(resolution_started.elapsed().as_secs_f64());
         // Only the attempt that inserted the batch activates runs: a suppressed
         // replay carries its own receipt instant, not the one stored on the rows.
-        if let Some((hook, frame)) = observed.filter(|_| admission.first_commit) {
-            hook.acknowledged(auth, frame, admission.receipt_micros);
+        if let Some((hook, card_scope, frame)) = observed.filter(|_| admission.first_commit) {
+            hook.acknowledged(auth, card_scope.as_ref(), frame, admission.receipt_micros);
         }
         Ok(admission.rows_accepted)
     }

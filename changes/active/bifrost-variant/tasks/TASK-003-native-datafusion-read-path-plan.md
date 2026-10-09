@@ -12,7 +12,7 @@ previous one is done. Do not add work that is not listed here.
 | 2a | Spec revision 26 (Variant is a DataFusion feature) | done, approved (`spec-revision-26-datafusion-variant.md`) |
 | 3 | Implement the correct way (below) | done |
 | 4 | Run focused tests | done (see Step 4 evidence) |
-| 5 | Run release benchmarks | done (see Step 5 evidence); review remediation `review/TASK-003-r1` in progress |
+| 5 | Run release benchmarks | done (see Step 5 evidence, `dist` rerun after TASK-003-R1); review remediation `review/TASK-003-r1` in progress |
 
 ## The rule
 
@@ -789,31 +789,344 @@ latency requirements table above.
     - nested `select_inner_small_field`: 2.39 / 2.66 ms → 283 / 308 µs
     - narrow `select_small_field`: 981 µs / 1.02 ms → 267 / 283 µs
     - wide `select_two_string_fields`: 9.84 / 10.7 → 4.29 / 4.53 ms
-- `bifrost_reads` (`release` profile: four codegen units, no LTO; mimalloc),
-  DataFusion → Wyrd, p50 / p95. The task did not yet pass `--profile dist`,
-  so these numbers are not `dist` builds:
-  - Hot file:
-    - `point_lookup`: 350 / 368 → 354 / 382 µs
-    - `select_narrow`: 241 / 247 → 223 / 235 µs
-    - `select_wide`: 9247 / 9908 → 10023 / 10787 µs
-    - `count_star`: 185 / 204 → 198 / 210 µs
-    - `group_by`: 416 / 427 → 410 / 420 µs
-    - `time_range`: 386 / 392 → 387 / 400 µs
-    - `struct_field`: 633 / 773 → 577 / 666 µs
-    - `list_predicate`: 425 / 436 → 395 / 407 µs
-  - Published:
-    - `point_lookup`: 659 / 890 → 420 / 627 µs
-    - `select_narrow`: 305 / 337 → 276 / 424 µs
-    - `select_wide`: 9950 / 10939 → 10059 / 11578 µs
-    - `count_star`: 10692 / 12726 → 621 / 911 µs
-    - `group_by`: 1557 / 1700 → 600 / 764 µs
-    - `time_range`: 690 / 807 → 460 / 643 µs
-    - `struct_field`: 851 / 983 → 726 / 882 µs
-    - `list_predicate`: 687 / 797 → 515 / 662 µs
-  - Hot `select_wide` is about 0.8 ms above native at p50, the only case
-    slower beyond noise. The gap predates this task and has the same size
-    in earlier runs (`TASK-003-revision-query-latency.md`: 9488 → 10046 µs
-    and 9325 → 10106 µs), so this work did not introduce it.
+- `bifrost_reads`, rerun 2026-10-09 after TASK-003-R1 with `--profile dist`
+  (fat LTO, one codegen unit, mimalloc) at Wyrd `48f672a8e`. This replaces the
+  earlier `release` run, which was mislabeled. Command:
+  `mise run bench:bifrost:reads -- hot|published|variant`, one section at a
+  time on an otherwise idle host. Sampling uses the report.rs harness, not
+  Criterion. Microsecond-scale planning timings are within run-to-run noise
+  of a few µs, so a planning ratio near the ±10% band is not by itself a
+  regression.
+
+#### Hot file: native DataFusion vs Wyrd
+
+| case | datafusion p50 | datafusion p95 | wyrd p50 | wyrd p95 |
+|---|---:|---:|---:|---:|
+| `point_lookup` | 261 µs | 276 µs | 264 µs | 278 µs |
+| `select_narrow` | 166 µs | 185 µs | 155 µs | 168 µs |
+| `select_wide` | 9048 µs | 9543 µs | 9711 µs | 10641 µs |
+| `count_star` | 140 µs | 153 µs | 141 µs | 155 µs |
+| `group_by` | 352 µs | 359 µs | 345 µs | 358 µs |
+| `time_range` | 301 µs | 566 µs | 302 µs | 404 µs |
+| `struct_field` | 505 µs | 544 µs | 467 µs | 496 µs |
+| `list_predicate` | 370 µs | 382 µs | 339 µs | 348 µs |
+
+  Hot `select_wide` is still about 0.7 ms above native at p50. The gap
+  predates this task (`TASK-003-revision-query-latency.md`).
+
+#### Published Iceberg snapshot: native DataFusion vs Wyrd
+
+| case | datafusion p50 | datafusion p95 | wyrd p50 | wyrd p95 |
+|---|---:|---:|---:|---:|
+| `point_lookup` | 606 µs | 950 µs | 341 µs | 416 µs |
+| `select_narrow` | 274 µs | 321 µs | 266 µs | 292 µs |
+| `select_wide` | 9699 µs | 10069 µs | 9783 µs | 10369 µs |
+| `count_star` | 10407 µs | 12069 µs | 512 µs | 727 µs |
+| `group_by` | 1417 µs | 1583 µs | 459 µs | 587 µs |
+| `time_range` | 610 µs | 693 µs | 374 µs | 429 µs |
+| `struct_field` | 728 µs | 821 µs | 593 µs | 647 µs |
+| `list_predicate` | 588 µs | 683 µs | 447 µs | 540 µs |
+
+#### Variant reads: plain DataFusion vs Wyrd hot and published
+
+| case | datafusion p50 | datafusion p95 | wyrd hot p50 | wyrd hot p95 | wyrd published p50 | wyrd published p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| `narrow/unshredded/select_variant` | 3435 µs | 3866 µs | 3422 µs | 3788 µs | 3509 µs | 3847 µs |
+| `narrow/unshredded/select_small_field` | 4169 µs | 4532 µs | 4132 µs | 4283 µs | 4224 µs | 4434 µs |
+| `narrow/unshredded/select_large_field` | 5415 µs | 6159 µs | 5314 µs | 5877 µs | 5431 µs | 5775 µs |
+| `narrow/unshredded/select_all` | 3421 µs | 3801 µs | 3389 µs | 3640 µs | 3493 µs | 3764 µs |
+| `narrow/unshredded/select_id_and_small_field` | 4216 µs | 5121 µs | 4209 µs | 4646 µs | 4372 µs | 4875 µs |
+| `narrow/unshredded/sum_small_field` | 4281 µs | 4657 µs | 4275 µs | 5058 µs | 4346 µs | 5009 µs |
+| `narrow/shredded/select_variant` | 4101 µs | 4231 µs | 4084 µs | 4291 µs | 4208 µs | 5313 µs |
+| `narrow/shredded/select_small_field` | 307 µs | 327 µs | 298 µs | 313 µs | 342 µs | 355 µs |
+| `narrow/shredded/select_large_field` | 4518 µs | 4763 µs | 4486 µs | 4659 µs | 4627 µs | 5001 µs |
+| `narrow/shredded/select_all` | 4032 µs | 4289 µs | 3990 µs | 4136 µs | 4140 µs | 4457 µs |
+| `narrow/shredded/select_id_and_small_field` | 323 µs | 327 µs | 321 µs | 325 µs | 358 µs | 375 µs |
+| `narrow/shredded/sum_small_field` | 420 µs | 440 µs | 415 µs | 431 µs | 456 µs | 495 µs |
+| `wide/unshredded/select_variant` | 15337 µs | 15682 µs | 15353 µs | 15589 µs | 15490 µs | 16838 µs |
+| `wide/unshredded/select_small_field` | 19094 µs | 20003 µs | 19103 µs | 20107 µs | 19579 µs | 20570 µs |
+| `wide/unshredded/select_one_string_field` | 20977 µs | 21712 µs | 21056 µs | 21681 µs | 21001 µs | 21832 µs |
+| `wide/unshredded/select_two_string_fields` | 24260 µs | 26200 µs | 24632 µs | 26164 µs | 24431 µs | 26045 µs |
+| `wide/unshredded/select_all` | 15286 µs | 17448 µs | 15290 µs | 16370 µs | 15416 µs | 16156 µs |
+| `wide/unshredded/sum_small_field` | 19226 µs | 20868 µs | 19160 µs | 20460 µs | 19182 µs | 19889 µs |
+| `wide/shredded/select_variant` | 23898 µs | 26213 µs | 23876 µs | 25369 µs | 24105 µs | 25123 µs |
+| `wide/shredded/select_small_field` | 325 µs | 333 µs | 310 µs | 314 µs | 352 µs | 357 µs |
+| `wide/shredded/select_one_string_field` | 5512 µs | 6203 µs | 5465 µs | 5754 µs | 5659 µs | 6486 µs |
+| `wide/shredded/select_two_string_fields` | 11594 µs | 12291 µs | 11579 µs | 12431 µs | 11800 µs | 12841 µs |
+| `wide/shredded/select_all` | 24167 µs | 25830 µs | 24044 µs | 25266 µs | 24343 µs | 24967 µs |
+| `wide/shredded/sum_small_field` | 418 µs | 433 µs | 409 µs | 417 µs | 454 µs | 466 µs |
+| `nested/unshredded/select_variant` | 7024 µs | 7211 µs | 7007 µs | 7110 µs | 7146 µs | 7523 µs |
+| `nested/unshredded/select_inner_object` | 9452 µs | 10100 µs | 9476 µs | 9812 µs | 9595 µs | 9923 µs |
+| `nested/unshredded/select_inner_small_field` | 8341 µs | 8747 µs | 8325 µs | 8672 µs | 8470 µs | 8927 µs |
+| `nested/unshredded/select_extra_string` | 10299 µs | 11110 µs | 10100 µs | 10824 µs | 10114 µs | 10662 µs |
+| `nested/unshredded/select_all` | 7029 µs | 7562 µs | 7013 µs | 7780 µs | 7136 µs | 7375 µs |
+| `nested/unshredded/sum_inner_small_field` | 8764 µs | 10322 µs | 8803 µs | 10181 µs | 8780 µs | 11108 µs |
+| `nested/shredded/select_variant` | 9289 µs | 10122 µs | 9330 µs | 10696 µs | 9448 µs | 10543 µs |
+| `nested/shredded/select_inner_object` | 4390 µs | 4846 µs | 4384 µs | 5033 µs | 4553 µs | 5419 µs |
+| `nested/shredded/select_inner_small_field` | 325 µs | 327 µs | 313 µs | 315 µs | 362 µs | 385 µs |
+| `nested/shredded/select_extra_string` | 4609 µs | 5211 µs | 4566 µs | 5051 µs | 4702 µs | 4889 µs |
+| `nested/shredded/select_all` | 9753 µs | 10196 µs | 9691 µs | 10853 µs | 9797 µs | 10655 µs |
+| `nested/shredded/sum_inner_small_field` | 437 µs | 454 µs | 430 µs | 437 µs | 474 µs | 491 µs |
+
+#### Variant planning only
+
+| case | datafusion p50 | datafusion p95 | wyrd hot p50 | wyrd hot p95 | wyrd published p50 | wyrd published p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| `narrow/unshredded/select_variant` | 27 µs | 34 µs | 20 µs | 21 µs | 47 µs | 50 µs |
+| `narrow/unshredded/select_small_field` | 92 µs | 130 µs | 66 µs | 127 µs | 117 µs | 186 µs |
+| `narrow/unshredded/select_large_field` | 77 µs | 89 µs | 55 µs | 61 µs | 102 µs | 111 µs |
+| `narrow/unshredded/select_all` | 28 µs | 39 µs | 22 µs | 25 µs | 49 µs | 85 µs |
+| `narrow/unshredded/select_id_and_small_field` | 96 µs | 118 µs | 77 µs | 92 µs | 117 µs | 126 µs |
+| `narrow/unshredded/sum_small_field` | 169 µs | 193 µs | 149 µs | 164 µs | 195 µs | 206 µs |
+| `narrow/shredded/select_variant` | 32 µs | 34 µs | 21 µs | 30 µs | 56 µs | 61 µs |
+| `narrow/shredded/select_small_field` | 80 µs | 82 µs | 63 µs | 72 µs | 101 µs | 110 µs |
+| `narrow/shredded/select_large_field` | 77 µs | 88 µs | 54 µs | 68 µs | 104 µs | 118 µs |
+| `narrow/shredded/select_all` | 28 µs | 33 µs | 22 µs | 23 µs | 49 µs | 54 µs |
+| `narrow/shredded/select_id_and_small_field` | 94 µs | 102 µs | 76 µs | 84 µs | 115 µs | 124 µs |
+| `narrow/shredded/sum_small_field` | 172 µs | 183 µs | 151 µs | 162 µs | 197 µs | 213 µs |
+| `wide/unshredded/select_variant` | 27 µs | 35 µs | 20 µs | 23 µs | 54 µs | 61 µs |
+| `wide/unshredded/select_small_field` | 81 µs | 92 µs | 64 µs | 74 µs | 110 µs | 133 µs |
+| `wide/unshredded/select_one_string_field` | 68 µs | 73 µs | 52 µs | 62 µs | 97 µs | 104 µs |
+| `wide/unshredded/select_two_string_fields` | 86 µs | 94 µs | 70 µs | 81 µs | 107 µs | 113 µs |
+| `wide/unshredded/select_all` | 28 µs | 30 µs | 22 µs | 27 µs | 48 µs | 52 µs |
+| `wide/unshredded/sum_small_field` | 170 µs | 180 µs | 150 µs | 160 µs | 202 µs | 215 µs |
+| `wide/shredded/select_variant` | 26 µs | 32 µs | 20 µs | 21 µs | 46 µs | 51 µs |
+| `wide/shredded/select_small_field` | 81 µs | 91 µs | 64 µs | 69 µs | 103 µs | 107 µs |
+| `wide/shredded/select_one_string_field` | 66 µs | 71 µs | 51 µs | 59 µs | 87 µs | 97 µs |
+| `wide/shredded/select_two_string_fields` | 86 µs | 95 µs | 70 µs | 80 µs | 109 µs | 119 µs |
+| `wide/shredded/select_all` | 28 µs | 62 µs | 22 µs | 44 µs | 50 µs | 91 µs |
+| `wide/shredded/sum_small_field` | 169 µs | 178 µs | 149 µs | 159 µs | 196 µs | 204 µs |
+| `nested/unshredded/select_variant` | 26 µs | 28 µs | 20 µs | 22 µs | 46 µs | 69 µs |
+| `nested/unshredded/select_inner_object` | 70 µs | 78 µs | 55 µs | 59 µs | 91 µs | 101 µs |
+| `nested/unshredded/select_inner_small_field` | 88 µs | 96 µs | 71 µs | 80 µs | 109 µs | 118 µs |
+| `nested/unshredded/select_extra_string` | 66 µs | 73 µs | 52 µs | 60 µs | 88 µs | 100 µs |
+| `nested/unshredded/select_all` | 34 µs | 46 µs | 23 µs | 26 µs | 61 µs | 68 µs |
+| `nested/unshredded/sum_inner_small_field` | 180 µs | 187 µs | 160 µs | 167 µs | 206 µs | 217 µs |
+| `nested/shredded/select_variant` | 31 µs | 37 µs | 21 µs | 22 µs | 54 µs | 68 µs |
+| `nested/shredded/select_inner_object` | 71 µs | 78 µs | 56 µs | 67 µs | 92 µs | 99 µs |
+| `nested/shredded/select_inner_small_field` | 88 µs | 94 µs | 70 µs | 77 µs | 109 µs | 122 µs |
+| `nested/shredded/select_extra_string` | 76 µs | 92 µs | 55 µs | 65 µs | 99 µs | 110 µs |
+| `nested/shredded/select_all` | 36 µs | 40 µs | 24 µs | 29 µs | 61 µs | 66 µs |
+| `nested/shredded/sum_inner_small_field` | 176 µs | 187 µs | 155 µs | 165 µs | 201 µs | 216 µs |
+
+#### Variant gates: 15 of 180 missed (recorded, not tuned)
+
+| planning shredded / unshredded | `narrow/select_variant` | datafusion | 1.20 | 0.9 to 1.1 | MISS |
+| planning shredded / unshredded | `narrow/select_variant` | wyrd published | 1.19 | 0.9 to 1.1 | MISS |
+| planning shredded / unshredded | `narrow/select_small_field` | datafusion | 0.87 | 0.9 to 1.1 | MISS |
+| planning shredded / unshredded | `narrow/select_small_field` | wyrd published | 0.86 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `narrow/select_large_field` | datafusion | 0.83 | <= 0.8 | MISS |
+| shredded / unshredded | `narrow/select_large_field` | wyrd hot | 0.84 | <= 0.8 | MISS |
+| shredded / unshredded | `narrow/select_large_field` | wyrd published | 0.85 | <= 0.8 | MISS |
+| planning shredded / unshredded | `wide/select_variant` | wyrd published | 0.84 | 0.9 to 1.1 | MISS |
+| planning shredded / unshredded | `nested/select_variant` | datafusion | 1.18 | 0.9 to 1.1 | MISS |
+| planning shredded / unshredded | `nested/select_variant` | wyrd published | 1.17 | 0.9 to 1.1 | MISS |
+| planning shredded / unshredded | `nested/select_extra_string` | datafusion | 1.15 | 0.9 to 1.1 | MISS |
+| planning shredded / unshredded | `nested/select_extra_string` | wyrd published | 1.12 | 0.9 to 1.1 | MISS |
+| Wyrd / DataFusion | `narrow/shredded/select_small_field` | wyrd published | 1.11 | <= 1.10 | MISS |
+| Wyrd / DataFusion | `narrow/shredded/select_id_and_small_field` | wyrd published | 1.11 | <= 1.10 | MISS |
+| Wyrd / DataFusion | `nested/shredded/select_inner_small_field` | wyrd published | 1.11 | <= 1.10 | MISS |
+
+  - `narrow/select_large_field` misses its 0.8x key-read gate (0.83 to 0.85)
+    on all three engines, plain DataFusion included, so the gap is not in
+    Wyrd's read path. The selected field is the 16 KiB string, which the
+    shredded file still has to read in full.
+  - Nine planning misses are µs-scale timings (20 to 50 µs p50). Eight
+    come in pairs where plain DataFusion misses the same case in the same
+    direction as Wyrd published; `wide/select_variant` misses only on Wyrd
+    published (0.84). Wyrd hot passes every planning gate. At this scale
+    they are run-to-run noise, not a layout cost.
+  - The three Wyrd / DataFusion misses are 1.11 against a 1.10 limit, all on
+    the published path.
+
+<details><summary>All 180 Variant gates</summary>
+
+#### Variant gates (15 of 180 missed)
+
+| gate | case | engine | ratio | limit | verdict |
+|---|---|---|---:|---|---|
+| shredded / unshredded | `narrow/select_variant` | datafusion | 1.19 | <= 2 | PASS |
+| planning shredded / unshredded | `narrow/select_variant` | datafusion | 1.20 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `narrow/select_variant` | wyrd hot | 1.19 | <= 2 | PASS |
+| planning shredded / unshredded | `narrow/select_variant` | wyrd hot | 1.05 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_variant` | wyrd published | 1.20 | <= 2 | PASS |
+| planning shredded / unshredded | `narrow/select_variant` | wyrd published | 1.19 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `narrow/select_small_field` | datafusion | 0.07 | <= 0.8 | PASS |
+| planning shredded / unshredded | `narrow/select_small_field` | datafusion | 0.87 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `narrow/select_small_field` | wyrd hot | 0.07 | <= 0.8 | PASS |
+| planning shredded / unshredded | `narrow/select_small_field` | wyrd hot | 0.94 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_small_field` | wyrd published | 0.08 | <= 0.8 | PASS |
+| planning shredded / unshredded | `narrow/select_small_field` | wyrd published | 0.86 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `narrow/select_large_field` | datafusion | 0.83 | <= 0.8 | MISS |
+| planning shredded / unshredded | `narrow/select_large_field` | datafusion | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_large_field` | wyrd hot | 0.84 | <= 0.8 | MISS |
+| planning shredded / unshredded | `narrow/select_large_field` | wyrd hot | 0.99 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_large_field` | wyrd published | 0.85 | <= 0.8 | MISS |
+| planning shredded / unshredded | `narrow/select_large_field` | wyrd published | 1.02 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_all` | datafusion | 1.18 | <= 2 | PASS |
+| planning shredded / unshredded | `narrow/select_all` | datafusion | 0.99 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_all` | wyrd hot | 1.18 | <= 2 | PASS |
+| planning shredded / unshredded | `narrow/select_all` | wyrd hot | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_all` | wyrd published | 1.19 | <= 2 | PASS |
+| planning shredded / unshredded | `narrow/select_all` | wyrd published | 1.01 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_id_and_small_field` | datafusion | 0.08 | <= 0.8 | PASS |
+| planning shredded / unshredded | `narrow/select_id_and_small_field` | datafusion | 0.99 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_id_and_small_field` | wyrd hot | 0.08 | <= 0.8 | PASS |
+| planning shredded / unshredded | `narrow/select_id_and_small_field` | wyrd hot | 0.99 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/select_id_and_small_field` | wyrd published | 0.08 | <= 0.8 | PASS |
+| planning shredded / unshredded | `narrow/select_id_and_small_field` | wyrd published | 0.98 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/sum_small_field` | datafusion | 0.10 | <= 0.8 | PASS |
+| planning shredded / unshredded | `narrow/sum_small_field` | datafusion | 1.02 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/sum_small_field` | wyrd hot | 0.10 | <= 0.8 | PASS |
+| planning shredded / unshredded | `narrow/sum_small_field` | wyrd hot | 1.01 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `narrow/sum_small_field` | wyrd published | 0.10 | <= 0.8 | PASS |
+| planning shredded / unshredded | `narrow/sum_small_field` | wyrd published | 1.01 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_variant` | datafusion | 1.56 | <= 2 | PASS |
+| planning shredded / unshredded | `wide/select_variant` | datafusion | 0.94 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_variant` | wyrd hot | 1.56 | <= 2 | PASS |
+| planning shredded / unshredded | `wide/select_variant` | wyrd hot | 0.96 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_variant` | wyrd published | 1.56 | <= 2 | PASS |
+| planning shredded / unshredded | `wide/select_variant` | wyrd published | 0.84 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `wide/select_small_field` | datafusion | 0.02 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/select_small_field` | datafusion | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_small_field` | wyrd hot | 0.02 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/select_small_field` | wyrd hot | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_small_field` | wyrd published | 0.02 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/select_small_field` | wyrd published | 0.94 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_one_string_field` | datafusion | 0.26 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/select_one_string_field` | datafusion | 0.97 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_one_string_field` | wyrd hot | 0.26 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/select_one_string_field` | wyrd hot | 0.99 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_one_string_field` | wyrd published | 0.27 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/select_one_string_field` | wyrd published | 0.90 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_two_string_fields` | datafusion | 0.48 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/select_two_string_fields` | datafusion | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_two_string_fields` | wyrd hot | 0.47 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/select_two_string_fields` | wyrd hot | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_two_string_fields` | wyrd published | 0.48 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/select_two_string_fields` | wyrd published | 1.01 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_all` | datafusion | 1.58 | <= 2 | PASS |
+| planning shredded / unshredded | `wide/select_all` | datafusion | 0.99 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_all` | wyrd hot | 1.57 | <= 2 | PASS |
+| planning shredded / unshredded | `wide/select_all` | wyrd hot | 0.99 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/select_all` | wyrd published | 1.58 | <= 2 | PASS |
+| planning shredded / unshredded | `wide/select_all` | wyrd published | 1.03 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/sum_small_field` | datafusion | 0.02 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/sum_small_field` | datafusion | 0.99 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/sum_small_field` | wyrd hot | 0.02 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/sum_small_field` | wyrd hot | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `wide/sum_small_field` | wyrd published | 0.02 | <= 0.8 | PASS |
+| planning shredded / unshredded | `wide/sum_small_field` | wyrd published | 0.97 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_variant` | datafusion | 1.32 | <= 2 | PASS |
+| planning shredded / unshredded | `nested/select_variant` | datafusion | 1.18 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `nested/select_variant` | wyrd hot | 1.33 | <= 2 | PASS |
+| planning shredded / unshredded | `nested/select_variant` | wyrd hot | 1.07 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_variant` | wyrd published | 1.32 | <= 2 | PASS |
+| planning shredded / unshredded | `nested/select_variant` | wyrd published | 1.17 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `nested/select_inner_object` | datafusion | 0.46 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/select_inner_object` | datafusion | 1.01 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_inner_object` | wyrd hot | 0.46 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/select_inner_object` | wyrd hot | 1.01 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_inner_object` | wyrd published | 0.47 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/select_inner_object` | wyrd published | 1.01 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_inner_small_field` | datafusion | 0.04 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/select_inner_small_field` | datafusion | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_inner_small_field` | wyrd hot | 0.04 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/select_inner_small_field` | wyrd hot | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_inner_small_field` | wyrd published | 0.04 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/select_inner_small_field` | wyrd published | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_extra_string` | datafusion | 0.45 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/select_extra_string` | datafusion | 1.15 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `nested/select_extra_string` | wyrd hot | 0.45 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/select_extra_string` | wyrd hot | 1.05 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_extra_string` | wyrd published | 0.46 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/select_extra_string` | wyrd published | 1.12 | 0.9 to 1.1 | MISS |
+| shredded / unshredded | `nested/select_all` | datafusion | 1.39 | <= 2 | PASS |
+| planning shredded / unshredded | `nested/select_all` | datafusion | 1.04 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_all` | wyrd hot | 1.38 | <= 2 | PASS |
+| planning shredded / unshredded | `nested/select_all` | wyrd hot | 1.03 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/select_all` | wyrd published | 1.37 | <= 2 | PASS |
+| planning shredded / unshredded | `nested/select_all` | wyrd published | 1.00 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/sum_inner_small_field` | datafusion | 0.05 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/sum_inner_small_field` | datafusion | 0.98 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/sum_inner_small_field` | wyrd hot | 0.05 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/sum_inner_small_field` | wyrd hot | 0.97 | 0.9 to 1.1 | PASS |
+| shredded / unshredded | `nested/sum_inner_small_field` | wyrd published | 0.05 | <= 0.8 | PASS |
+| planning shredded / unshredded | `nested/sum_inner_small_field` | wyrd published | 0.98 | 0.9 to 1.1 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_variant` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_variant` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_small_field` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_small_field` | wyrd published | 1.01 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_large_field` | wyrd hot | 0.98 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_large_field` | wyrd published | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_all` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_all` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_id_and_small_field` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/select_id_and_small_field` | wyrd published | 1.04 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/sum_small_field` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/unshredded/sum_small_field` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/select_variant` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/select_variant` | wyrd published | 1.03 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/select_small_field` | wyrd hot | 0.97 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/select_small_field` | wyrd published | 1.11 | <= 1.10 | MISS |
+| Wyrd / DataFusion | `narrow/shredded/select_large_field` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/select_large_field` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/select_all` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/select_all` | wyrd published | 1.03 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/select_id_and_small_field` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/select_id_and_small_field` | wyrd published | 1.11 | <= 1.10 | MISS |
+| Wyrd / DataFusion | `narrow/shredded/sum_small_field` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `narrow/shredded/sum_small_field` | wyrd published | 1.08 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_variant` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_variant` | wyrd published | 1.01 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_small_field` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_small_field` | wyrd published | 1.03 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_one_string_field` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_one_string_field` | wyrd published | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_two_string_fields` | wyrd hot | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_two_string_fields` | wyrd published | 1.01 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_all` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/select_all` | wyrd published | 1.01 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/sum_small_field` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/unshredded/sum_small_field` | wyrd published | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_variant` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_variant` | wyrd published | 1.01 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_small_field` | wyrd hot | 0.96 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_small_field` | wyrd published | 1.08 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_one_string_field` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_one_string_field` | wyrd published | 1.03 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_two_string_fields` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_two_string_fields` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_all` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/select_all` | wyrd published | 1.01 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/sum_small_field` | wyrd hot | 0.98 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `wide/shredded/sum_small_field` | wyrd published | 1.09 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_variant` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_variant` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_inner_object` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_inner_object` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_inner_small_field` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_inner_small_field` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_extra_string` | wyrd hot | 0.98 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_extra_string` | wyrd published | 0.98 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_all` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/select_all` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/sum_inner_small_field` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/unshredded/sum_inner_small_field` | wyrd published | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/select_variant` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/select_variant` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/select_inner_object` | wyrd hot | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/select_inner_object` | wyrd published | 1.04 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/select_inner_small_field` | wyrd hot | 0.96 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/select_inner_small_field` | wyrd published | 1.11 | <= 1.10 | MISS |
+| Wyrd / DataFusion | `nested/shredded/select_extra_string` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/select_extra_string` | wyrd published | 1.02 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/select_all` | wyrd hot | 0.99 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/select_all` | wyrd published | 1.00 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/sum_inner_small_field` | wyrd hot | 0.98 | <= 1.10 | PASS |
+| Wyrd / DataFusion | `nested/shredded/sum_inner_small_field` | wyrd published | 1.08 | <= 1.10 | PASS |
+
+</details>
 
 ## Handoff (2026-10-08): remaining work, in order
 

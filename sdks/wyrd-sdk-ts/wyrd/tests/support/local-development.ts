@@ -79,7 +79,7 @@ export function exportSpan(run: Run): void {
 }
 
 /** Write the `openai-key` credential and deploy `gpt-4o` on it as `client`. */
-async function configureGateway(client: WyrdClient): Promise<void> {
+export async function configureGateway(client: WyrdClient): Promise<void> {
   await cli.putProviderCredential(
     { name: "openai-key", provider: "openai", source: { managed_secret: { secret: "sk-local-upstream" } } },
     { client },

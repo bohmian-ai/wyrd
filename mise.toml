@@ -447,8 +447,8 @@ description = "Tier-1 journeys: the scoped observation surface over one WyrdStat
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:observe:inner'"
 [tasks."test:bifrost:journey:observe:inner"]
 hide = true
-description = "wyrd-sdk-rust observe_a_run, query_bifrost, otel_export, and local_development stories"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development)::/)'"
+description = "wyrd-sdk-rust observe_a_run, query_bifrost, otel_export, local_development, and support_desk stories"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development|support_desk)::/)'"
 
 [tasks."test:bifrost:journey:drift"]
 description = "Tier-1 journeys: Verifiers judge in real time, and a failed scheduled drift run alerts its Operator"
@@ -597,7 +597,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -608,7 +608,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/local-development.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
+run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/local-development.test.ts tests/integration/support-desk.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
 
 [tasks."verify:bifrost"]
 description = "Complete Bifrost change gate: fmt, Clippy, dependency and tenant-isolation checks, plus every Bifrost test tier and language surface."
@@ -1267,6 +1267,22 @@ description = "Run the split-registry gateway workflow example"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_gateway.py"
+
+[tasks."examples:python:support-desk"]
+description = "Run the support desk example against WYRD_SERVER_URL (Python)"
+dir = "sdks/wyrd-sdk-python"
+depends = ["py:setup"]
+run = "uv run python ../../examples/support-desk/python/support_desk.py"
+
+[tasks."examples:rust:support-desk"]
+description = "Run the support desk example against WYRD_SERVER_URL (Rust)"
+run = "cargo run -p wyrd-rust-examples --bin support_desk"
+
+[tasks."examples:typescript:support-desk"]
+description = "Run the support desk example against WYRD_SERVER_URL (TypeScript)"
+dir = "examples/support-desk/typescript"
+depends = ["ts:build"]
+run = "pnpm start"
 
 [tasks."examples:rust:smoke"]
 hide = true

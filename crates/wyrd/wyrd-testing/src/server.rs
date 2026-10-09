@@ -4440,9 +4440,27 @@ impl WyrdTestServerBuilder {
     /// panic prints the captured spans and metrics. A process whose subscriber
     /// or metrics recorder already has another owner keeps that owner's.
     ///
+    /// The server is composed on the shared Wyrd runtime, so every background
+    /// owner it starts lives on the runtime [`WyrdTestServer`]'s `Drop` drives.
+    /// Composed on a caller's current-thread runtime, those owners would wait
+    /// on a thread the dropping test blocks, and teardown would never settle.
+    ///
+    /// # Errors
+    /// Returns an error when database, storage, auth, or router state cannot be
+    /// created, or when the composing task panics.
+    pub async fn start_in_process(self) -> Result<WyrdTestServer, WyrdTestServerError> {
+        tokio::task::spawn_blocking(|| wyrd_runtime::runtime().block_on(self.compose_in_process()))
+            .await
+            .map_err(|error| WyrdTestServerError::Join(format!("in-process start: {error}")))?
+    }
+
+    /// Composes the in-process server on the calling runtime.
+    ///
+    /// Only [`Self::start_in_process`] calls this, from the shared Wyrd runtime.
+    ///
     /// # Errors
     /// Returns an error when database, storage, auth, or router state cannot be created.
-    pub async fn start_in_process(mut self) -> Result<WyrdTestServer, WyrdTestServerError> {
+    async fn compose_in_process(mut self) -> Result<WyrdTestServer, WyrdTestServerError> {
         if self.telemetry.is_none() {
             self.telemetry = crate::bifrost::shared_process_telemetry_for_test()
                 .ok()

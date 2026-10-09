@@ -169,8 +169,8 @@ fn shape(value: &Value) -> &'static str {
 /// # Errors
 /// Returns `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` locally when the input
 /// exceeds a wire bound, and otherwise the server's refusal: malformed,
-/// incompatible, or unsupported input, a caller without `evals:run` or scope
-/// over the subject, an unknown Card, an unready or legacy baseline, a failing
+/// incompatible, or unsupported input, a caller without `verifier:run` on the
+/// Verifier, an unknown Card, an unready or legacy baseline, a failing
 /// judge provider, the deadline, or a transport failure.
 ///
 /// # Cancellation

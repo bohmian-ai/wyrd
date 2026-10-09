@@ -34,8 +34,8 @@ use wyrd_sql::queries::verification::{
 use wyrd_sql::queries::verifier_runs::{
     ClaimedRun, EnqueueOutcome, EnqueueRefusal, ManualEnqueueOutcome, ObservationRecord,
     QueueCounts, RequestKey, RetryOutcome, RunInput, RunOrigin, RunRequest, ScheduleOutcome,
-    ScheduleSkip, Settlement, StagedBatch, StagedResult, TerminalStatus, TraceWaitOutcome,
-    VerifierRunQueue,
+    ScheduleSkip, Settlement, StagedBatch, StagedResult, TargetCards, TerminalStatus,
+    TraceWaitOutcome, VerifierRunQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -584,9 +584,9 @@ async fn enqueue_refuses_unrunnable_targets_without_writing() {
 
 /// A keyed manual request replays its run for the same digest, refuses a
 /// different digest under the same key, and scopes keys to the requester; a
-/// refused keyed request leaves the key unused. `target_subject` resolves a
-/// binding's subject, echoes a direct subject, and answers `None` for an
-/// unknown binding.
+/// refused keyed request leaves the key unused. `target_cards` resolves a
+/// binding's Verifier and subject, echoes a direct target's, and answers
+/// `None` for an unknown binding.
 ///
 /// # Panics
 /// Panics when any keyed outcome, stored key, run count, or subject differs.
@@ -670,10 +670,13 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
 
     assert_eq!(
         queue
-            .target_subject(&mut conn, &target)
+            .target_cards(&mut conn, &target)
             .await
-            .expect("binding subject reads"),
-        Some(owner.clone())
+            .expect("binding target reads"),
+        Some(TargetCards {
+            verifier: custom.clone(),
+            subject: owner.clone(),
+        })
     );
     let direct = VerificationRunTarget::Verifier {
         verifier_uid: custom.clone(),
@@ -681,17 +684,20 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     };
     assert_eq!(
         queue
-            .target_subject(&mut conn, &direct)
+            .target_cards(&mut conn, &direct)
             .await
-            .expect("direct subject answers"),
-        Some(owner)
+            .expect("direct target answers"),
+        Some(TargetCards {
+            verifier: custom,
+            subject: owner,
+        })
     );
     let unknown = VerificationRunTarget::Binding {
         binding_id: BindingId::new_v7(),
     };
     assert_eq!(
         queue
-            .target_subject(&mut conn, &unknown)
+            .target_cards(&mut conn, &unknown)
             .await
             .expect("unknown binding answers"),
         None

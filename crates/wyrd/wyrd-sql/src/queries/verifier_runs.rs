@@ -199,9 +199,9 @@ const KEYED_RUN_SQL: &str = r"
        AND idempotency_key = $2
 ";
 
-/// Read the subject Card a binding verifies.
-const BINDING_SUBJECT_SQL: &str = r"
-    SELECT subject_card_uid
+/// Read the Verifier and subject Card of one binding.
+const BINDING_TARGET_SQL: &str = r"
+    SELECT verifier_uid, subject_card_uid
       FROM wyrd.verification_bindings
      WHERE binding_id = $1
 ";
@@ -710,6 +710,18 @@ pub struct RequestKey<'a> {
     pub request_sha256: &'a [u8],
 }
 
+/// The exact Cards one manual run target selects.
+///
+/// Read by [`VerifierRunQueue::target_cards`] so authorization can check the
+/// Verifier permission and the caller's subject scope before enqueue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetCards {
+    /// The Verifier the run would execute.
+    pub verifier: CardUid,
+    /// The subject Card the run would verify.
+    pub subject: CardUid,
+}
+
 /// Result of [`VerifierRunQueue::enqueue_manual`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualEnqueueOutcome {
@@ -1103,33 +1115,41 @@ impl VerifierRunQueue {
         })
     }
 
-    /// Return the subject Card a manual target would verify.
+    /// Return the Verifier and subject Card a manual target selects.
     ///
-    /// A direct target names its subject; a binding target verifies its
-    /// projected subject. An unknown or other-tenant binding is `Ok(None)`.
-    /// Authorization reads this before enqueue to check a Card-bound caller's
-    /// scope over the exact subject.
+    /// A direct target names both; a binding target selects its projected
+    /// Verifier and subject. An unknown or other-tenant binding is `Ok(None)`.
+    /// Authorization reads this before enqueue to check `verifier:run` on the
+    /// exact Verifier and a Card-bound caller's scope over the exact subject.
     ///
     /// # Errors
     /// Returns the database error when the binding read fails, or a decode
-    /// error when the stored subject is malformed.
-    pub async fn target_subject(
+    /// error when a stored identity is malformed.
+    pub async fn target_cards(
         &self,
         conn: &mut TenantConn<'_>,
         target: &VerificationRunTarget,
-    ) -> Result<Option<CardUid>, SqlxError> {
+    ) -> Result<Option<TargetCards>, SqlxError> {
         match target {
             VerificationRunTarget::Verifier {
-                subject_card_uid, ..
-            } => Ok(Some(subject_card_uid.clone())),
+                verifier_uid,
+                subject_card_uid,
+            } => Ok(Some(TargetCards {
+                verifier: verifier_uid.clone(),
+                subject: subject_card_uid.clone(),
+            })),
             VerificationRunTarget::Binding { binding_id } => {
-                let subject: Option<Uuid> = sqlx::query_scalar(BINDING_SUBJECT_SQL)
+                let row: Option<(Uuid, Uuid)> = sqlx::query_as(BINDING_TARGET_SQL)
                     .bind(binding_id.as_uuid())
                     .fetch_optional(&mut **conn.transaction())
                     .await?;
-                subject
-                    .map(|uid| stored(CardUid::from_uuid(uid)))
-                    .transpose()
+                row.map(|(verifier, subject)| {
+                    Ok(TargetCards {
+                        verifier: stored(CardUid::from_uuid(verifier))?,
+                        subject: stored(CardUid::from_uuid(subject))?,
+                    })
+                })
+                .transpose()
             }
         }
     }

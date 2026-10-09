@@ -143,6 +143,29 @@ impl Deployment {
         self.key(name, &[name]).await
     }
 
+    /// Seed role `name` granting `verifier:run` on exactly `verifier`,
+    /// bootstrap a Card-bound Service principal of the same name holding only
+    /// it, and return its key.
+    ///
+    /// # Panics
+    /// Panics when `verifier` has no UID or the role or principal cannot be
+    /// seeded.
+    pub async fn verifier_key(&self, name: &str, verifier: &CardRef) -> String {
+        let uid = verifier
+            .uid
+            .as_ref()
+            .expect("registered Verifier has a UID");
+        let grant = serde_json::from_value(serde_json::json!({
+            "resource": "verifier", "action": "run", "scope": { "verifier": uid }
+        }))
+        .expect("the scoped permission parses");
+        self.server
+            .seed_role(name, &[grant])
+            .await
+            .expect("role seeds");
+        self.key(name, &[name]).await
+    }
+
     /// Issue a key for the principal registration projected for the Service
     /// `card`, as the administrator through the `wyrd auth issue-key` CLI
     /// function, and return its plaintext.

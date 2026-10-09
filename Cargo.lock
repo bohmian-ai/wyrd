@@ -11096,6 +11096,7 @@ dependencies = [
  "num-iter",
  "num-rational",
  "num-traits",
+ "object_store",
  "once_cell",
  "opentelemetry",
  "opentelemetry-proto",

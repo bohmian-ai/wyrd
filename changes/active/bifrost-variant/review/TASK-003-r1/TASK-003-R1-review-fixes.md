@@ -530,3 +530,179 @@ distributed queries.**
 - Last, `mise run gate`, since the toolchain and the root patch set changed.
 - Evidence (an acceptance table and any diagnoses) is appended to this file.
   Then route to `$wyrd-task-review` r2.
+
+## Evidence (2026-10-09)
+
+Candidate: Wyrd `wyrd/bifrost-variant/TASK-003`, code at `9edb08cdc` plus
+this evidence commit, from `861a0342f`. Commits end with
+`Claude-Session: https://claude.ai/code/session_01Nsu2AgXJUf5kJ2FHRTJGJM`,
+the session that did the work, not the line in this task's Rules.
+
+Forks, pushed to bohmian-ai and pinned in the root `Cargo.toml`:
+
+| Fork | Branch | Commits | Pin |
+|---|---|---|---|
+| `datafusion-distributed` | `wyrd-arrow60` | `75af8e8` `aggregate_plan_metrics`; `b5cbfe5` query-scoped stream close; `8fac2a9` public-API tests and docs | `8fac2a9` |
+| `arrow-rs` | `wyrd-unshred-presize` | `9f5d743` errors, not panics, for invalid Variant; `e0f604e` tests | `e0f604e` |
+| `datafusion` | `wyrd-arrow60-variant-read-plan` | `fd02579cc` pins arrow-rs, malformed-Variant tests | `fd02579cc` (`ORACLE_DATAFUSION_REVISION`) |
+
+### Acceptance
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| D1 plan-wide metrics in the fork | fork `75af8e8` `aggregate_plan_metrics`; Wyrd `43ad85e78` (`record_distributed_scan_metrics` uses it; `fold_distributed_scan_metrics` and the `Stage::Local` branches deleted) | fork unit tests (two-stage counted once, single-stage); `git grep fold_distributed_scan_metrics` empty | PASS |
+| D2 query-scoped stream close | fork `b5cbfe5`, `8fac2a9` (`StreamCloseState`, coordinator and worker); Wyrd `61e5ab325` pin, `63b6df251` (`AnalyticalGraphExchanges` and its stream/slot/close deleted, telemetry kept through `inspect`, `settle` order and rustdoc updated) | fork tests 1-6 under `wait_closed`; `git grep AnalyticalGraphExchanges` empty; `test:bifrost` | PASS |
+| FIND-003-1 revision bound into peer digests | `oracle/codec.rs` `ORACLE_DATAFUSION_REVISION`, `bind_datafusion_revision`; `oracle/peer.rs` | `oracle::codec::tests::plan_fingerprint_binds_the_pinned_datafusion_revision` (digest and `Cargo.toml` pin); `oracle::peer::tests::stage_body_digest_binds_the_datafusion_revision`; preflight refusal is a case in `oracle::follower::tests::oracle_resolver_builds_fresh_request_local_context` (`assert_complete_preflight_matrix`) | PASS |
+| FIND-003-11 scan stats in one unit | `oracle/exec.rs` counts distinct planned files; bytes and pruning from the D1 aggregate (`536b7a4f9`) | `oracle::exec::tests::distributed_scan_stats_count_each_file_once` | PASS (deviation below) |
+| FIND-003-13 planning bounded by the deadline | `224547af8` `plan_physical` under `timeout_at`, mapped to `QueryTimeout` | journey `published::planning_read_stall_ends_at_query_deadline` | PASS |
+| FIND-003-14 recovery never re-PUTs a published key | `959e3431f` `file_list_writer` lookup (Committed/Absent/Conflict), `recover_publication`, uploader `verify_remote` first | `scribe::file_list_writer::tests::artifact_set_publication_classifies_every_row_state`; `parquet::object_uploader::tests::published_objects_are_verified_and_never_written`; `parquet::object_uploader::tests::unpublished_keys_are_written_only_when_they_differ` (PUT-counting store: every table row's PUT count and verdict at the classifier and uploader seams) | PASS (gap below) |
+| FIND-003-9 real missing-object detection | `cc01cb6cd`: test-only constructor and variants deleted; `is_missing_object` matches object_store `NotFound` in the chain; fault hook reads a real missing document | `catalog::iceberg_storage::tests::missing_object_reads_are_recognized_as_missing`; journey `distributed::tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry` (planner retry fires) | PASS |
+| FIND-003-2 nested-leaf proof | `fc781f5c8` | `oracle::nested_pushdown::tests::list_variant_key_reads_decode_only_their_leaf`; `oracle::exec::tests::projected_leaf_union_outputs_the_requested_closure`; analytical nested journey (bytes below `SELECT events`) in `test:bifrost` | PASS |
+| FIND-003-3 late failure restored on four surfaces | `7f6508545` single-partition ordered fixture; Rust Oracle, Rust SDK, Python, TypeScript assert the error after `delivered == 8192` | `test:bifrost` (all tiers and languages) | PASS |
+| FIND-003-5 proto snapshot and hakari | `6196e0600`; workspace-hack regenerated for the fork pins in `9e7149a2b` | `check:proto-drift`, `check:workspace-hack` | PASS |
+| FIND-003-6 `wyrd-types` family | `6196e0600` `scripts/test-families.sh` | `check:test-coverage` | PASS |
+| FIND-003-8, 10 dead code | `f5bbac499` | `git grep reconciliation_limit_bytes`, `PublishedAssignment` empty | PASS |
+| FIND-003-20 shredded walk and read validation deleted; arrow-rs owns read safety | Wyrd `4849e8275`; arrow-rs `9f5d743`, `e0f604e`; DataFusion `fd02579cc`; design `402d4a3aa` | `git grep ShreddedResiduals` empty; `malformed_stored_variant_is_an_error_not_a_panic`, `renderers_refuse_hostile_stored_variants` and the Oracle/nested journeys in `test:bifrost`/`lints` lanes; fork tests | PASS |
+| FIND-003-4 Interactive reason | `237811c72` | review of the five sites and the plan | PASS |
+| FIND-003-7 docs match code; sync abort | `3c832c9a2`, `a41444bef`, `60a9815bd`, `a9c398a0a` | `git grep bifrost_oracle_file_pruning_total` empty; `docs:check`; `lints` | PASS |
+| FIND-003-15, 16, 18 markers, imports, `# Panics` | `6519c1675`, `60a9815bd`, `e865651ff`, `55d1dd245` | `lints` | PASS |
+| FIND-003-17 one `BackendSigner` method per operation | `ef4ac99b4` | `lints` (all-features) and the default-feature clippy of `wyrd-storage` | PASS |
+| FIND-003-19 bench `dist` profile | `50e2e25b0` | bench run log: ``Finished `dist` profile`` | PASS |
+| Group 7 Variant bench (rewritten by user decision, see Deviations) | `6b3cf5b7c`, trimmed in `2360efce8`; dist results in the plan's Step 5 evidence (`259e574f0`) | `mise run bench:bifrost:reads -- variant`: equal rows across layouts on both Wyrd paths; **0 of 16 gates missed** (key reads 0.05-0.10x, extractions 0.52-0.57x, whole value 1.16-1.43x) | PASS |
+| Removed names | | `git grep` of the six names: only review/plan prose under `changes/` | PASS |
+| Verification lanes | | see Commands | PASS |
+
+Non-goals stayed excluded: no Wyrd Variant SQL, pushdown, pruning, scan
+assignment or cache code returned; no protocol version bump; no ledger for
+the FIND-003-14 Forge-cleanup window; `spec.md` and TASK-004 uncommitted.
+
+### Deviations
+
+- **FIND-003-11.** The task asked to count byte ranges on both sides. The
+  user chose to count distinct files and keep the `files_scanned` name, so
+  the test is `distributed_scan_stats_count_each_file_once` instead of
+  `..._each_range_once`.
+- **Diagnosis owner.** The user directed that no more agents be spawned, so
+  every diagnosis below is my own, not a fresh read-only diagnostician's.
+- **Session line.** Commits end with the session above, not
+  `session_014nCbNQCtTnQdNzP4JwrG3i` from the Rules.
+- **Group 7 scope.** The first version copied DataFusion's
+  `parquet_variant_query` word for word (36 cases, a plain-DataFusion side,
+  planning and Wyrd-vs-DataFusion gates) and missed 15 of 180 gates. That
+  duplicated the fork's bench, which owns engine-level Variant timing. The
+  user directed a small Wyrd bench proving shredding works and speeds up
+  reads through Wyrd; Group 7 above is rewritten to match (`2360efce8`).
+- **Bench sampling.** The bench uses the existing `bifrost_reads` report
+  harness (p50/p95 from repeated samples), not Criterion, matching that
+  bench's other sections.
+
+### Diagnoses
+
+**Iceberg journey `files expected 1, saw 16`.**
+- Symptom: after D1, the Iceberg filtering journey reported 16 files scanned
+  for a one-file table.
+- Evidence: `files_scanned` summed `PartitionedFile` byte ranges, and the
+  repartitioned scan split one file into 16 ranges.
+- Cause: FIND-003-11's range counting counts byte ranges, not files.
+- Fix site: `oracle/exec.rs` scan stats count distinct planned files (user
+  decision); the only caller is the scan stats visitor.
+
+**Startup pool exhaustion (`peer security audit append failed`, `pool timed
+out`).**
+- Symptom: many journeys failed at startup when run with
+  `cargo nextest run -j 12`.
+- Evidence: nextest's `-j` is `--test-threads`; the journey profile caps at
+  6 threads against `WYRD_DB_MAX_CONNECTIONS=8`.
+- Cause: the command, not the code. Twelve concurrent journeys exhausted the
+  Postgres pool.
+- Fix site: none in code. Never pass `-j` to nextest; the same tests pass
+  in isolation and in the normal lane.
+
+**`mise run gate` failed at `check:skills-sync`.**
+- Symptom: `Claude skill tree drift: wyrd-task-review/SKILL.md`.
+- Evidence: `.agents/skills/wyrd-task-review/SKILL.md` carried the
+  spec-revision remediation rules; the `.claude` mirror did not.
+- Cause: `9d0e1f07e` edited the canonical skill without `mise run skills:sync`.
+- Fix site: the generated mirror, regenerated by `mise run skills:sync`;
+  no other skill drifted.
+
+**Intermittent `single_planner_root_selects_path_and_capacity` drain leak
+(about 1 in 8 full Oracle journey runs, never under debug logging).**
+- Symptom: after the grouped distributed query, pod 2's follower graph
+  stayed Draining. Its drain timed out after 5 s with 764 bytes still
+  reserved under the graph envelope, and the accounting was poisoned at
+  drop.
+- Evidence: the drain warning in `oracle/analytical.rs` and the envelope
+  accounting in `resources.rs`.
+- Falsified hypotheses, each tested and reverted:
+  1. A lost wakeup in the fork's end-of-query notify. A fork test passed;
+     tokio's `Notified` receives `notify_waiters` from creation.
+  2. A settled follower graph re-activated by a late `ExecuteTask`. A Wyrd
+     test got `QueryAdmissionRejected`: grant envelopes are single-use.
+- Cause: **not yet established.** The holder is a registered memory consumer
+  that never dropped. Candidates are the fork's server-side `NetworkBoundary`
+  reservation, a `WorkerConnection`, or an operator.
+- Instrumentation (user decision, `ed9f3bf9a`): each query view records its
+  consumers by name, and both drain-timeout warnings log `consumers=` with
+  the held bytes. Pinned by `resources::tests::a_registered_zero_byte_child_keeps_its_query_busy`.
+  The next failure names its owner in the warning the journey prints.
+- Did not recur in five full Oracle journey runs after D2 (54/54 each) or
+  in the final lanes below.
+
+### Known limits
+
+- `SELECT v` of a canonical (unshredded) column returns stored bytes; a
+  malformed cell errors only when it is decoded (`variant_get`,
+  `variant_to_json`, Wyrd's renderers), never with a panic.
+- `datafusion_common::variant::validate` is now redundant with arrow-rs's
+  checks; it is left in the fork.
+- Wyrd `43ad85e78` (D1) does not build without the pin in `61e5ab325`;
+  bisect across that pair.
+- `datafusion-distributed` has no isolated test for a worker closing when
+  its own outputs end; test 6 covers it through the coordinator.
+- FIND-003-3 changed the test fixture's query shape (one ordered partition)
+  rather than DataFusion's planning.
+- FIND-003-14 coverage: the eight table rows are proven where they are
+  decided, the classifier (row state) and the uploader (PUTs, verdict).
+  `recover_publication`'s own dispatch over them (Conflict returns before
+  any upload or cleanup; Committed verifies instead of uploading) has no
+  Postgres-backed test, because no existing harness drives staged
+  publication recovery; the "cleanup runs / no cleanup" column is proven by
+  that dispatch's control flow only.
+- FIND-003-14: after Forge's expired cleanup deletes terminal `file_list`
+  rows, a manifest that survived that long reads as Absent. Follow-up; no
+  ledger added here.
+- The intermittent drain leak above remains open, with instrumentation in
+  place.
+
+### Commands
+
+Focused unit tests (11 passed, 815 skipped):
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::file_list_writer::tests::artifact_set_publication_classifies_every_row_state) | test(=oracle::exec::tests::distributed_scan_stats_count_each_file_once) | test(=oracle::nested_pushdown::tests::list_variant_key_reads_decode_only_their_leaf) | test(=catalog::iceberg_storage::tests::missing_object_reads_are_recognized_as_missing) | test(=oracle::codec::tests::plan_fingerprint_binds_the_pinned_datafusion_revision) | test(=oracle::exec::tests::projected_leaf_union_outputs_the_requested_closure) | test(=parquet::object_uploader::tests::published_objects_are_verified_and_never_written) | test(=oracle::peer::tests::stage_body_digest_binds_the_datafusion_revision) | test(=parquet::object_uploader::tests::unpublished_keys_are_written_only_when_they_differ) | test(=resources::tests::a_registered_zero_byte_child_keeps_its_query_busy) | test(=oracle::follower::tests::oracle_resolver_builds_fresh_request_local_context)'
+```
+
+Focused journeys (2 passed, 52 skipped):
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all -E 'test(=distributed::tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry) | test(=published::planning_read_stall_ends_at_query_deadline)'"
+```
+
+Lanes, in order:
+
+| Command | Result |
+|---|---|
+| `mise run test:bifrost` | PASS: every unit, integration and journey lane (Rust, Python, TypeScript; Oracle journey 54/54; MCP journey) |
+| `mise run bench:bifrost:reads -- hot`, `-- published`, `-- variant` (`dist`) | PASS; Variant 0 of 16 gates missed |
+| `mise run fmt` | PASS |
+| `mise run lints` | PASS |
+| `mise run codegen:check` | PASS |
+| `mise run check:proto-drift` | PASS |
+| `mise run check:workspace-hack` | FAIL on first run (stale after the fork pins), PASS after `cargo hakari generate` / `manage-deps` (`9e7149a2b`) |
+| `mise run check:test-coverage` | PASS |
+| `mise run docs:check` | PASS |
+| `git diff --check` | PASS |
+| `mise run check:skills-sync` (first `gate` attempt) | FAIL, fixed by `mise run skills:sync` (`9edb08cdc`) |
+| `mise run gate` | PASS (exit 0, 2464 s), after the `check:skills-sync` fix in `9edb08cdc` |
+| `git grep` of the six removed names | only review and plan prose under `changes/` |

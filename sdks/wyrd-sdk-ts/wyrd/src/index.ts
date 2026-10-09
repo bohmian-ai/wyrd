@@ -2447,6 +2447,22 @@ export class Run {
   forCard(alias: string): Run {
     return Run.fromOpen(this.#native.forCard(alias));
   }
+
+  /**
+   * Invoke this view's tool-free Agent once through the Wyrd gateway and
+   * return its final text. The call carries this run and the Agent Card as
+   * gateway correlation and runs as the state's client.
+   *
+   * @param variables - The Agent Prompt's string variables.
+   * @returns The Agent's final text.
+   * @throws a {@link WyrdError}: `WYRD_SDK_400_CARD_KIND_MISMATCH` for a view
+   * that is not an Agent and `WYRD_AGENT_422_VALIDATION` for an Agent with
+   * tools or a non-gateway Prompt model, both before any IO; otherwise the
+   * gateway's own refusal, such as `WYRD_PERMISSION_403_DENIED_RBAC`.
+   */
+  async invoke(variables: Readonly<Record<string, string>> = {}): Promise<string> {
+    return lifecycleValue<string>(await this.#native.invoke(strictJson("variables", variables)));
+  }
 }
 
 /**

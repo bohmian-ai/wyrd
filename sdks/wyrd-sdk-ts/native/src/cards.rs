@@ -668,6 +668,39 @@ impl NativeRun {
         )
     }
 
+    /// Invokes this view's tool-free Agent once through the Wyrd gateway with
+    /// the string variables of `variables_json` and returns its final text.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; a
+    /// non-Agent view, an Agent with tools, malformed variables, and the
+    /// gateway's refusals are returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn invoke(&self, variables_json: Option<String>) -> Result<NativeLifecycleResult> {
+        let variables: std::collections::BTreeMap<String, String> = match variables_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+        {
+            Ok(variables) => variables.unwrap_or_default(),
+            Err(error) => {
+                return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
+                    message: format!("variables are invalid: {error}"),
+                    details: serde_json::json!({
+                        "field": "variables",
+                        "reason": error.to_string(),
+                    }),
+                }));
+            }
+        };
+        let pairs: Vec<(&str, &str)> = variables
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        NativeLifecycleResult::outcome(Box::pin(self.run.invoke(&pairs)).await)
+    }
+
     /// Emits one row into a registered `vala.datasets` table.
     ///
     /// Asynchronous because the first call for a table describes it; later calls

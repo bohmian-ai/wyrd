@@ -44,6 +44,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 serde_urlencoded = { workspace = true }
 serde_yaml = { workspace = true }
 skald-agent = { workspace = true }
+skald-prompt = { workspace = true }
 skald-providers = { workspace = true }
 skald-runtime = { workspace = true }
 skald-spec = { workspace = true }

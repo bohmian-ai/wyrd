@@ -215,7 +215,11 @@ pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
 /// collapsing onto `502`. Codes with no matching variant fall back to
 /// [`WyrdError::UpstreamFailure`] with the original code preserved in
 /// `details.original_code` rather than silently dropped.
-fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -> WyrdError {
+pub(crate) fn code_to_wyrd_error(
+    code: &str,
+    message: String,
+    details: serde_json::Value,
+) -> WyrdError {
     if code.starts_with("WYRD_STORAGE_")
         && let Ok(error) = serde_json::from_value::<WyrdStorageError>(details.clone())
     {

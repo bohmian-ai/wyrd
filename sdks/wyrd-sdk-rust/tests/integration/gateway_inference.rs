@@ -25,7 +25,9 @@ use wyrd_sdk::operator_connections::SecretBearer;
 use wyrd_sdk::{Gateway, Workflow, WorkflowRunStatus, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::support::{Deployment, register};
+use wyrd_sdk::state::WyrdState;
+
+use crate::support::{Deployment, hydrate, register};
 
 /// The provider key the operator submits; only the upstream may see it.
 const PROVIDER_KEY: &str = "sk-native-upstream";
@@ -421,6 +423,92 @@ async fn registered_example_runs_through_the_gateway() {
     assert_eq!(
         inference.upstream_authorizations().await,
         vec![Some(format!("Bearer {PROVIDER_KEY}")); 3]
+    );
+    inference.deployment.shutdown().await;
+}
+
+/// A Run over a hydrated Service's tool-free Agent, as the Service's own
+/// key, invokes it once through the Gateway and returns its final text; the upstream sees the provider key and no
+/// Run or Card correlation header. A `viewer` without gateway invoke is
+/// refused with the gateway's own code before upstream IO, and the Service's own
+/// Run, which is not an Agent, is refused before any IO.
+///
+/// # Panics
+/// Panics when a step fails or an answer, refusal, or upstream request
+/// differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn run_invokes_its_agent_through_the_gateway() {
+    let inference = Inference::start().await;
+    let cards = inference.deployment.cards();
+    let service = register(&cards, "cards/gateway_inference/ask-service.yaml").await;
+    let bundle = hydrate(&cards, &service.root).await;
+    let state = |client: WyrdClient| {
+        WyrdState::from_path_with_client(bundle.path().join("bundle"), client)
+            .expect("bundle loads offline")
+    };
+
+    let service_client = inference
+        .deployment
+        .client(&inference.deployment.service_key(&service.root).await);
+    let answer = state(service_client.clone())
+        .run_for_card("agent")
+        .expect("agent view resolves")
+        .invoke(&[("question", "hi")])
+        .await
+        .expect("the Agent answers");
+
+    assert_eq!(answer, "hi");
+    let requests = inference
+        .upstream
+        .received_requests()
+        .await
+        .expect("request recording is on");
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].headers.get("wyrd-run-id").is_none()
+            && requests[0].headers.get("wyrd-card-ref").is_none(),
+        "correlation never reaches the provider"
+    );
+    assert_eq!(
+        inference.upstream_authorizations().await,
+        vec![Some(format!("Bearer {PROVIDER_KEY}"))]
+    );
+
+    let viewer = inference
+        .deployment
+        .client(&inference.deployment.key("agent_viewer", &["viewer"]).await);
+    let refused = state(viewer)
+        .run_for_card("agent")
+        .expect("agent view resolves")
+        .invoke(&[("question", "hi")])
+        .await
+        .expect_err("a caller without gateway invoke is refused");
+    assert_eq!(
+        refused.code(),
+        "WYRD_PERMISSION_403_DENIED_RBAC",
+        "{refused}"
+    );
+
+    let not_agent = state(service_client)
+        .run()
+        .invoke(&[("question", "hi")])
+        .await
+        .expect_err("a non-Agent Run is refused");
+    assert_eq!(
+        not_agent.code(),
+        "WYRD_SDK_400_CARD_KIND_MISMATCH",
+        "{not_agent}"
+    );
+    assert_eq!(
+        inference
+            .upstream
+            .received_requests()
+            .await
+            .expect("request recording is on")
+            .len(),
+        1,
+        "refusals precede upstream IO"
     );
     inference.deployment.shutdown().await;
 }

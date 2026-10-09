@@ -245,6 +245,32 @@ impl PyRun {
         false
     }
 
+    /// Invoke this view's tool-free Agent once through the Wyrd gateway with
+    /// string `variables` and return its final text.
+    ///
+    /// The call carries this run and the Agent Card as gateway correlation;
+    /// the GIL is released while it runs.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SDK_400_CARD_KIND_MISMATCH` when this view is not an
+    /// Agent and `WYRD_AGENT_422_VALIDATION` for an Agent with tools or a
+    /// non-gateway Prompt model, both before any IO; otherwise the gateway's
+    /// own refusal, such as `WYRD_PERMISSION_403_DENIED_RBAC`.
+    #[pyo3(signature = (variables=None))]
+    fn invoke(
+        &self,
+        py: Python<'_>,
+        variables: Option<std::collections::BTreeMap<String, String>>,
+    ) -> WyrdPyResult<String> {
+        let variables = variables.unwrap_or_default();
+        let pairs: Vec<(&str, &str)> = variables
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.invoke(&pairs)))
+            .map_err(WyrdPyError::from)
+    }
+
     /// The emit surface for this view.
     #[getter]
     fn observe(&self) -> PyObserveHandle {

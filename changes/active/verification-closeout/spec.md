@@ -326,7 +326,7 @@ error.
    analytical column or table migration is introduced for this change.
 6. `ExecuteVerificationRequest` gains optional `run_id`; SDK `observe.verify`
    and MCP `verification.execute` project that same field.
-7. Gateway headers `wyrd-run-id` and `wyrd-card-ref` must appear together,
+7. Gateway headers `wyrd-run-id` and `wyrd-card-uid` must appear together,
    validate before upstream IO, and are reserved transport headers for every
    supported gateway dialect.
 8. Every LLM judge call uses `GatewayInvocation::decide` exactly once as the

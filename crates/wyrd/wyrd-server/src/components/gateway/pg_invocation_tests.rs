@@ -3097,16 +3097,15 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     );
 }
 
-/// Proves a call's Run and Card attribution is authorized before dispatch
-/// and recorded on its captured row.
+/// Proves a call's Run and Card UID attribution is authorized before
+/// dispatch and recorded on its captured row.
 ///
-/// A caller bound to no Card attributes a registered Agent: the call row's
-/// `card_ref` names that Agent with its registry UID, its `run_id` is the
-/// Run, and Scribe receives the frame scoped to exactly that Card. An
-/// unregistered Card is refused with `WYRD_VALA_403_CARD_UNRESOLVED`, and a
-/// Card-bound Agent naming a Card outside its signed scope with
-/// `WYRD_VALA_403_BIFROST_CARD_SCOPE`; neither refusal dispatches or
-/// captures.
+/// A caller bound to no Card attributes a registered Agent by UID: the call
+/// row's `card_uid` is that UID, its `run_id` is the Run, and Scribe receives
+/// the frame scoped to exactly that Card. An unregistered UID from an unbound
+/// caller, and a registered UID outside a Card-bound Agent's signed scope,
+/// are both refused with `WYRD_VALA_403_BIFROST_CARD_SCOPE`; neither refusal
+/// dispatches or captures.
 ///
 /// # Panics
 ///
@@ -3115,6 +3114,7 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     use arrow::array::AsArray as _;
+    use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::vala::ids::RunId;
 
@@ -3148,10 +3148,10 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
     .card_uid;
     conn.commit().await.expect("seed commits");
     let run = RunId::new();
-    let call = |card: &CardRef| GatewayCallRequest {
+    let call = |card_uid: &CardUid| GatewayCallRequest {
         subject: Some(super::GatewayCallSubject {
             run_id: run.clone(),
-            card: card.clone(),
+            card_uid: card_uid.clone(),
         }),
         ..request("acme/a", Some((1000, 500)), Duration::from_secs(10))
     };
@@ -3160,7 +3160,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
 
     dispatch.push(Step::Return(completed(100, 50)));
     invocation
-        .invoke(&unbound, call(&agent))
+        .invoke(&unbound, call(&uid))
         .await
         .expect("an attributed call completes");
     drain_gateway(&state).await;
@@ -3204,15 +3204,13 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
         ),
         ..invoker(tenant, 2, [])
     };
-    for (caller, card, code) in [
-        (&unbound, &unregistered, "WYRD_VALA_403_CARD_UNRESOLVED"),
-        (&scoped, &agent, "WYRD_VALA_403_BIFROST_CARD_SCOPE"),
-    ] {
+    let ghost = CardUid::new(Uuid::now_v7().to_string()).expect("a UUID is a Card UID");
+    for (caller, card_uid) in [(&unbound, &ghost), (&scoped, &uid)] {
         let refused = invocation
-            .invoke(caller, call(card))
+            .invoke(caller, call(card_uid))
             .await
             .expect_err("an unauthorized attribution is refused");
-        assert_eq!(refused.code(), code);
+        assert_eq!(refused.code(), "WYRD_VALA_403_BIFROST_CARD_SCOPE");
     }
     drain_gateway(&state).await;
     assert_eq!(

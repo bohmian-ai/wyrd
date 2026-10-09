@@ -36,7 +36,6 @@ use wyrd_spec::gateway::{
     GatewayCallOutcome, GatewayCallPayloadV1, GatewayCaptureMode, GatewayCapturePolicy,
     GatewayOperation, GatewayPayloadField, GatewayPayloadObjectRefV1, ModelRef,
 };
-use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
@@ -303,9 +302,7 @@ impl CallCapture {
         let mut columns = batch.columns().to_vec();
         let user = columns.len() - 2;
         columns.truncate(user);
-        columns.push(Arc::new(StringArray::from(vec![
-            subject.card.uid.as_ref().map(CardUid::as_str),
-        ])));
+        columns.push(Arc::new(StringArray::from(vec![subject.card_uid.as_str()])));
         columns.push(Arc::new(StringArray::from(vec![subject.run_id.as_str()])));
         RecordBatch::try_new(batch.schema(), columns).map_err(|_| CaptureDrop::Projection)
     }

@@ -659,9 +659,7 @@ mod tests {
                 403,
             ),
             (
-                IngestError::CardScopeDenied {
-                    card_ref: "c".to_owned(),
-                },
+                IngestError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
                 403,
             ),

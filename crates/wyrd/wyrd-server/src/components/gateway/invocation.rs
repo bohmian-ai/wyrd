@@ -38,12 +38,11 @@ use wyrd_spec::gateway::{
     GatewayUsageAmount, ModelRef,
 };
 use wyrd_spec::ids::{CardUid, ProviderDeploymentName};
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuditOutcome;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_sql::queries::cards::get_card_by_ref;
+use wyrd_sql::queries::cards::get_card_by_uid;
 
 use super::capture::{
     CallCapture, CallFacts, CaptureDrop, PayloadObjects, error_code, operation_name, record,
@@ -97,16 +96,16 @@ pub struct GatewayCallRequest {
 
 /// Application Run and Card one governed call is attributed to.
 ///
-/// Ingress builds it from the paired `wyrd-run-id` and `wyrd-card-ref`
-/// headers. Admission authorizes the Card against the caller before any
-/// provider sees the call and replaces any caller-supplied UID with the
-/// authorized one, which the captured `vala.gateway.calls` row records.
+/// Ingress builds it from the paired `wyrd-run-id` and `wyrd-card-uid`
+/// headers. Admission authorizes the UID against the caller before any
+/// provider sees the call, and the captured `vala.gateway.calls` row records
+/// the authorized UID.
 #[derive(Debug, Clone)]
 pub struct GatewayCallSubject {
     /// Application Run the call belongs to.
     pub run_id: RunId,
-    /// Card the call is attributed to.
-    pub card: CardRef,
+    /// UID of the Card the call is attributed to.
+    pub card_uid: CardUid,
 }
 
 /// Provider answer of a governed call: a completion, or the refusal that
@@ -687,93 +686,53 @@ impl<'a> GatewayInvocation<'a> {
         verdict
     }
 
-    /// Authorizes the Card `subject` attributes a call to and returns it with
-    /// the authorized Card UID.
+    /// Authorizes the Card UID `subject` attributes a call to.
     ///
-    /// A Card-bound caller attributes only within its signed scope, whose
-    /// member carries the UID the mint resolved; a caller bound to no Card may
-    /// attribute to any registered observation-target Card of its tenant,
-    /// read from the registry. A caller-supplied UID is never trusted. Runs
+    /// A Card-bound caller attributes only to a UID its signed scope carries;
+    /// a caller bound to no Card may attribute to any registered
+    /// observation-target Card of its tenant, read from the registry. Runs
     /// before routing, so a refusal reaches no provider.
     ///
     /// # Errors
-    /// Returns `CardScopeDenied` for a Card outside the signed scope,
-    /// `CardUnresolved` for a Card that is unregistered, not an observation
-    /// target, or signed without a UID, and `ServiceUnavailable` when the
-    /// registry cannot be read.
+    /// Returns `CardScopeDenied` for a UID outside the signed scope or, for an
+    /// unbound caller, one naming no registered observation-target Card, and
+    /// `ServiceUnavailable` when the registry cannot be read.
     async fn attribute(
         &self,
         caller: &Caller,
         subject: GatewayCallSubject,
     ) -> Result<GatewayCallSubject, WyrdError> {
-        let GatewayCallSubject { run_id, card } = subject;
-        let uid = match caller.principal.card_attribution() {
-            CardAttribution::Scoped(scope) => {
-                if !scope.authorizes(&card) {
-                    return Err(BifrostError::CardScopeDenied {
-                        card_ref: card.to_string(),
-                    }
-                    .into());
-                }
-                scope
-                    .as_slice()
-                    .iter()
-                    .find(|member| member.same_identity(&card))
-                    .and_then(|member| member.uid.clone())
-            }
+        let authorized = match caller.principal.card_attribution() {
+            CardAttribution::Scoped(scope) => scope.uids().contains(&subject.card_uid),
             CardAttribution::AnyRegistered => {
-                self.registered_uid(caller.data_tenant_id, &card).await?
+                self.is_observation_target(caller.data_tenant_id, &subject.card_uid)
+                    .await?
             }
         };
-        let Some(uid) = uid else {
-            return Err(BifrostError::CardUnresolved {
-                card_ref: card.to_string(),
-            }
-            .into());
-        };
-        Ok(GatewayCallSubject {
-            run_id,
-            card: CardRef {
-                uid: Some(uid),
-                ..card
-            },
-        })
+        if !authorized {
+            return Err(BifrostError::CardScopeDenied.into());
+        }
+        Ok(subject)
     }
 
-    /// Registry UID of `card` in `tenant` when it is a registered
-    /// observation target, otherwise `None`.
+    /// Whether `uid` names a registered observation-target Card in `tenant`.
     ///
     /// # Errors
     /// Returns `ServiceUnavailable` when the registry cannot be read.
-    async fn registered_uid(
+    async fn is_observation_target(
         &self,
         tenant: DataTenantId,
-        card: &CardRef,
-    ) -> Result<Option<CardUid>, WyrdError> {
-        let Some(space) = card
-            .space
-            .as_ref()
-            .filter(|_| card.kind.is_observation_target())
-        else {
-            return Ok(None);
-        };
+        uid: &CardUid,
+    ) -> Result<bool, WyrdError> {
         let mut conn = self
             .state
             .postgres
             .tenant_conn(tenant)
             .await
             .map_err(unavailable)?;
-        match get_card_by_ref(
-            &mut conn,
-            card.kind.clone(),
-            space,
-            &card.name,
-            &card.version,
-        )
-        .await
-        {
-            Ok(row) => Ok(Some(row.card_uid)),
-            Err(WyrdError::RegistryCardNotFound { .. }) => Ok(None),
+        match get_card_by_uid(&mut conn, uid).await {
+            Ok(row) => Ok(row.kind.is_observation_target()),
+            Err(WyrdError::RegistryCardNotFound { .. }) => Ok(false),
             Err(error) => Err(error),
         }
     }

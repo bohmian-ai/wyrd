@@ -1085,7 +1085,9 @@ async fn gateway_ingress_publishes_typed_contracts() {
 
 /// Every public inference ingress publishes the optional
 /// `wyrd-gateway-fallback` header with its encoding, size limits, and refusal
-/// code, while ingresses that ignore it publish no such parameter.
+/// code, while ingresses that ignore it publish no such parameter. The same
+/// ingresses publish the optional `wyrd-card-uid` correlation header with its
+/// refusal codes and no `wyrd-card-ref` header.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop or a published header
@@ -1096,16 +1098,17 @@ async fn gateway_inference_ingress_publishes_the_fallback_header() {
         .await
         .expect("test server starts");
     let document = served_document(&server).await;
-    let fallback = |path: &str| {
+    let parameter = |path: &str, name: &str| {
         document["paths"][path]["post"]["parameters"]
             .as_array()
             .and_then(|parameters| {
                 parameters
                     .iter()
-                    .find(|parameter| parameter["name"] == "wyrd-gateway-fallback")
+                    .find(|parameter| parameter["name"] == name)
             })
             .cloned()
     };
+    let fallback = |path: &str| parameter(path, "wyrd-gateway-fallback");
 
     for path in [
         "/v1/chat/completions",
@@ -1126,6 +1129,21 @@ async fn gateway_inference_ingress_publishes_the_fallback_header() {
         ] {
             assert!(description.contains(term), "{path} documents {term}");
         }
+        let card_uid = parameter(path, "wyrd-card-uid")
+            .unwrap_or_else(|| panic!("{path} publishes the Card UID header"));
+        assert_ne!(card_uid["required"], true, "{path} Card UID is optional");
+        let description = card_uid["description"].as_str().unwrap_or_default();
+        for term in [
+            "wyrd-run-id",
+            "WYRD_GATEWAY_400_INVALID_REQUEST",
+            "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+        ] {
+            assert!(description.contains(term), "{path} documents {term}");
+        }
+        assert!(
+            parameter(path, "wyrd-card-ref").is_none(),
+            "{path} publishes no Card reference header"
+        );
     }
     assert!(
         fallback("/v1/embeddings").is_none(),

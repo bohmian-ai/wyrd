@@ -42,7 +42,7 @@ use wyrd_storage::StorageError;
 use super::batches::{BatchAnswer, GatewayBatches};
 use super::capture::object_path;
 use super::ingress::{
-    CARD_HEADER_DOC, FALLBACK_HEADER_DOC, RUN_HEADER_DOC, requested_fallback, requested_subject,
+    CARD_UID_HEADER_DOC, FALLBACK_HEADER_DOC, RUN_HEADER_DOC, requested_fallback, requested_subject,
 };
 use super::invocation::{
     GatewayCallRequest, GatewayCallResponse, GatewayInvocation, invalid_request,
@@ -837,7 +837,7 @@ pub(crate) async fn get_capture(
     params(
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-ref" = Option<String>, Header, description = CARD_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
     ),
     request_body(content = GatewayChatCompletionsRequest, description = "OpenAI-compatible chat completion request whose `model` is an exact `<provider>/<model>` projection"),
     responses(
@@ -886,7 +886,7 @@ pub(crate) async fn chat_completions(
     params(
         ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
         ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
-        ("wyrd-card-ref" = Option<String>, Header, description = CARD_HEADER_DOC)
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
     ),
     request_body(content = GatewayResponsesRequest, description = "OpenAI-compatible Responses request whose `model` is an exact `<provider>/<model>` projection"),
     responses(
@@ -1335,7 +1335,7 @@ pub(crate) async fn models(
 /// every response through the `wyrd-request-id` header.
 ///
 /// `headers` are the request headers of a route that accepts the
-/// `wyrd-gateway-fallback` override and the `wyrd-run-id`/`wyrd-card-ref`
+/// `wyrd-gateway-fallback` override and the `wyrd-run-id`/`wyrd-card-uid`
 /// attribution; routes that do not pass `None`, keeping tenant fallback
 /// policy and recording an uncorrelated call.
 async fn openai_call(

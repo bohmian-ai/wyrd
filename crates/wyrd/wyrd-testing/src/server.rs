@@ -974,12 +974,11 @@ impl WyrdTestServer {
         &self,
         builder: WyrdTestServerBuilder,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
-        Box::pin(builder.start_with_resources(
-            Arc::clone(&self.inner.fixture),
-            Arc::clone(&self.inner.state.storage),
-            self.inner.storage_root.clone(),
-        ))
-        .await
+        let fixture = Arc::clone(&self.inner.fixture);
+        let storage = Arc::clone(&self.inner.state.storage);
+        let storage_root = self.inner.storage_root.clone();
+        on_shared_runtime(move || builder.start_with_resources(fixture, storage, storage_root))
+            .await
     }
 
     /// Start `builder` as a second replica like
@@ -995,7 +994,16 @@ impl WyrdTestServer {
         if builder.bind_addrs.is_none() {
             builder.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
-        Box::pin(self.start_replica(builder)).await?.bind().await
+        let fixture = Arc::clone(&self.inner.fixture);
+        let storage = Arc::clone(&self.inner.state.storage);
+        let storage_root = self.inner.storage_root.clone();
+        on_shared_runtime(move || async move {
+            Box::pin(builder.start_with_resources(fixture, storage, storage_root))
+                .await?
+                .bind()
+                .await
+        })
+        .await
     }
 
     /// Cancel the serve task, join it in place, and return its drain outcome.
@@ -4462,9 +4470,7 @@ impl WyrdTestServerBuilder {
     /// Returns an error when database, storage, auth, or router state cannot be
     /// created, or when the composing task panics.
     pub async fn start_in_process(self) -> Result<WyrdTestServer, WyrdTestServerError> {
-        tokio::task::spawn_blocking(|| wyrd_runtime::runtime().block_on(self.compose_in_process()))
-            .await
-            .map_err(|error| WyrdTestServerError::Join(format!("in-process start: {error}")))?
+        on_shared_runtime(move || self.compose_in_process()).await
     }
 
     /// Composes the in-process server on the calling runtime.
@@ -4972,9 +4978,34 @@ impl WyrdTestServerBuilder {
         if self.bind_addrs.is_none() {
             self.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
         }
-        let srv = Box::pin(self.start_in_process()).await?;
-        Box::pin(srv.bind()).await
+        on_shared_runtime(move || async move {
+            let srv = Box::pin(self.compose_in_process()).await?;
+            Box::pin(srv.bind()).await
+        })
+        .await
     }
+}
+
+/// Starts a server on the shared Wyrd runtime and returns it to the caller.
+///
+/// Every start path composes and binds through here, so each listener,
+/// serve task, and background owner the server starts lives on the runtime
+/// [`WyrdTestServer`]'s `Drop` drives. Started on a caller's current-thread
+/// runtime, those owners would wait on a thread the dropping test blocks, and
+/// teardown would never settle. `start` builds the future on the blocking
+/// thread because composition futures are not `Send`.
+///
+/// # Errors
+/// Returns the start failure, or [`WyrdTestServerError::Join`] when the
+/// starting thread panics.
+async fn on_shared_runtime<F, Fut>(start: F) -> Result<WyrdTestServer, WyrdTestServerError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<WyrdTestServer, WyrdTestServerError>>,
+{
+    tokio::task::spawn_blocking(move || wyrd_runtime::runtime().block_on(start()))
+        .await
+        .map_err(|error| WyrdTestServerError::Join(format!("server start: {error}")))?
 }
 
 /// Bound a journey's Scribe flush settles within.

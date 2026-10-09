@@ -806,9 +806,10 @@ latency requirements table above.
     - `time_range`: 690 / 807 → 460 / 643 µs
     - `struct_field`: 851 / 983 → 726 / 882 µs
     - `list_predicate`: 687 / 797 → 515 / 662 µs
-  - Open: hot `select_wide` is about 0.8 ms above native at p50. It is the
-    only case where Wyrd is slower beyond noise, and it is not yet
-    diagnosed.
+  - Hot `select_wide` is about 0.8 ms above native at p50, the only case
+    slower beyond noise. The gap predates this task and has the same size
+    in earlier runs (`TASK-003-revision-query-latency.md`: 9488 → 10046 µs
+    and 9325 → 10106 µs), so this work did not introduce it.
 
 ## Handoff (2026-10-08): remaining work, in order
 

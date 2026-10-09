@@ -3,7 +3,7 @@
 // until `editor` is granted, and each change reaches the key's next token.
 import { expect, vi } from "vitest";
 
-import { Bifrost, Cards, Principals, WyrdClient } from "@wyrd/sdk";
+import { Bifrost, type CardRef, Cards, Principals, WyrdClient } from "@wyrd/sdk";
 import { cli } from "@wyrd/testing";
 
 import { observedServiceTest as test } from "../support/observed-service.js";
@@ -34,6 +34,11 @@ test("granted editor reaches the next token until revoked", async ({ bundle: _ }
   const { principal, key } = await issue();
   const principals = Principals.connect();
 
+  const [found] = (await principals.list({ kind: "service", name: "observed-service" })).principals;
+  const bound: CardRef | null | undefined = found?.card_ref;
+  expect(found?.principal_id).toBe(principal);
+  expect([bound?.kind, bound?.name, bound?.version]).toEqual(["Service", "observed-service", "1.0.0"]);
+  expect(bound?.uid).toEqual(expect.any(String));
   expect((await principals.roles(principal)).roles).toEqual([{ role: "workload", source: "direct" }]);
   const reader = await Bifrost.connect({ client: WyrdClient.connect({ credential: key }) });
   expect((await reader.sql(TENANT_WIDE)).numRows).toBe(1);
@@ -68,6 +73,7 @@ test("direct and idp user assignments coexist", async ({ server }) => {
   const page = await principals.list({ email: "pr-person@test.wyrd" });
   expect(page.principals.map((found) => [found.principal_id, found.kind])).toEqual([[user, "user"]]);
   expect(page.next).toBeNull();
+  expect(page.principals[0]?.card_ref).toBeNull();
 
   const granted = await principals.grantRole(user, "viewer");
   expect(granted.changed).toBe(true);

@@ -38,16 +38,34 @@ class RoleAssignmentChange(TypedDict):
     changed: bool
     roles: list[RoleAssignment]
 
+class _PrincipalCardRefOptional(TypedDict, total=False):
+    """Optional fields of ``PrincipalCardRef``."""
+
+    space: str
+    uid: str
+
+class PrincipalCardRef(_PrincipalCardRefOptional):
+    """The Card a Card-bound Service or Agent principal is bound to.
+
+    The same reference shape Card operations accept; ``space`` and ``uid`` are
+    omitted when the server reports none.
+    """
+
+    kind: str
+    name: str
+    version: str
+
 class PrincipalSummary(TypedDict):
-    """One assignable principal; ``email`` is set for users, ``name`` and
-    ``card_ref`` for Services and Agents."""
+    """One assignable principal; ``email`` is set for users, ``name`` for
+    Services and Agents, and ``card_ref`` for Card-bound Services and Agents.
+    ``card_ref`` is ``None`` for users and unbound Services."""
 
     principal_id: str
     kind: PrincipalKind
     status: Literal["active", "suspended"]
     email: str | None
     name: str | None
-    card_ref: dict[str, str] | None
+    card_ref: PrincipalCardRef | None
 
 class PrincipalPage(TypedDict):
     """One page of principals; ``next`` is the ``after`` of the following

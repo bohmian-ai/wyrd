@@ -1921,14 +1921,18 @@ export type RoleAssignmentChange = PrincipalRoles & {
   readonly changed: boolean;
 };
 
-/** One assignable principal; users carry `email`, Services and Agents `name` and `card_ref`. */
+/**
+ * One assignable principal; users carry `email`, Services and Agents `name`,
+ * and Card-bound Services and Agents `card_ref`. `card_ref` is null for users
+ * and unbound Services.
+ */
 export type PrincipalSummary = {
   readonly principal_id: string;
   readonly kind: PrincipalKind;
   readonly status: "active" | "suspended";
   readonly email: string | null;
   readonly name: string | null;
-  readonly card_ref: Readonly<Record<string, string>> | null;
+  readonly card_ref: CardRef | null;
 };
 
 /** One page of principals; `next` is the following page's `after`, or null on the last page. */

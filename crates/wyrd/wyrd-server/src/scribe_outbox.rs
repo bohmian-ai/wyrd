@@ -1019,7 +1019,7 @@ mod tests {
         settle(&outbox).await;
 
         let mut frames = scribe
-            .received()
+            .audit_frames()
             .into_iter()
             .map(|frame| {
                 assert_eq!(frame.table, "vala.system.audit_log");

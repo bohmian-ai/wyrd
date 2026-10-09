@@ -5868,7 +5868,7 @@ mod tests {
     /// Generated TypeScript declaration of `@wyrd/testing`.
     const TYPESCRIPT_DECLARATION: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../../sdks/wyrd-sdk-ts/testing/index.d.ts"
+        "/../../../sdks/wyrd-sdk-ts/testing/native.d.cts"
     ));
 
     /// The three Python controls REQ-195 sanctions.
@@ -5879,15 +5879,17 @@ mod tests {
 
     /// Python members that start, address, or credential the server and so
     /// neither steer nor inspect its state.
-    const PYTHON_SETUP: [&str; 18] = [
+    const PYTHON_SETUP: [&str; 20] = [
         "__init__",
         "__enter__",
         "__exit__",
         "base_url",
+        "grpc_url",
         "api_key",
         "tenant_id",
         "access_token",
         "bootstrap_service",
+        "bootstrap_user",
         "credential_registered_service",
         "scoped_api_key",
         "revoke_scoped_role",
@@ -5901,13 +5903,15 @@ mod tests {
     ];
 
     /// TypeScript members that start, address, or credential the server.
-    const TYPESCRIPT_SETUP: [&str; 16] = [
+    const TYPESCRIPT_SETUP: [&str; 18] = [
         "baseUrl",
         "grpcUrl",
         "token",
         "tableFqn",
         "apiKey",
         "cardRef",
+        "bootstrapService",
+        "bootstrapUser",
         "scopedApiKey",
         "seedTenant",
         "bootstrapServiceInTenant",

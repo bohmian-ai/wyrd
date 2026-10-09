@@ -356,7 +356,7 @@ export interface NativeIssueKey {
 
 /**
  * Test-only capabilities a story's server starts with; every field is
- * optional and defaults to off, except `auditPublication`.
+ * optional and defaults to off.
  */
 export interface NativeTestServerOptions {
   /**
@@ -365,8 +365,6 @@ export interface NativeTestServerOptions {
    * which calls `<providerBaseUrl>/v1/chat/completions`.
    */
   providerBaseUrl?: string
-  /** `false` keeps staged audit rows for assertions; defaults to `true`. */
-  auditPublication?: boolean
   /** `true` runs Drift baseline fitting and Verifier runs. */
   verificationRuntime?: boolean
   /**
@@ -380,7 +378,7 @@ export interface NativeTestServerOptions {
  * Starts a real bound Wyrd test server and mints an admin access token.
  *
  * `options` selects the test-only capabilities; omitted, the server keeps
- * its default upstreams, publishes audit, and runs no verification runtime.
+ * its default upstreams and runs no verification runtime.
  *
  * # Errors
  *

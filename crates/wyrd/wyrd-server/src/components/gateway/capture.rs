@@ -1206,14 +1206,35 @@ pub(crate) mod recording {
         pub(crate) batch_id: uuid::Uuid,
     }
 
+    impl Received {
+        /// Records `frame`'s attribution with its decoded `rows` and `ipc`.
+        fn new(frame: &ScribeIngressFrame, rows: usize, ipc: Bytes) -> Self {
+            Self {
+                tenant: frame.authenticated_tenant,
+                principal: frame.principal.id,
+                card_scope: frame
+                    .principal
+                    .card_ref_scope()
+                    .map(|scope| scope.as_slice().to_vec())
+                    .unwrap_or_default(),
+                table: frame.table.fqn(),
+                request_id: frame.request_id.clone(),
+                rows,
+                ipc,
+                batch_id: frame.batch_id,
+            }
+        }
+    }
+
     /// Scribe that records every capture or result submission and
     /// acknowledged frame, refusing as scripted, and decodes every audit
     /// frame it acknowledges.
     ///
     /// Audit frames share the process Scribe outbox with capture, so they are
     /// acknowledged outside the refusal script and the capture record: a
-    /// capture assertion counts only what capture submitted, and an audit
-    /// assertion reads [`Self::audit_decisions`].
+    /// capture assertion counts only what capture submitted, an audit content
+    /// assertion reads [`Self::audit_decisions`], and an audit framing
+    /// assertion reads [`Self::audit_frames`].
     #[derive(Default)]
     pub(crate) struct RecordingScribe {
         /// Frames acknowledged, in arrival order.
@@ -1224,6 +1245,8 @@ pub(crate) mod recording {
         submitted: Mutex<Vec<uuid::Uuid>>,
         /// Audit decisions acknowledged, in arrival order.
         audit: Mutex<Vec<AuditDecision>>,
+        /// Audit frames acknowledged, in arrival order.
+        audit_frames: Mutex<Vec<Received>>,
     }
 
     impl RecordingScribe {
@@ -1255,6 +1278,17 @@ pub(crate) mod recording {
         /// Panics when the audit lock is poisoned.
         pub(crate) fn audit_decisions(&self) -> Vec<AuditDecision> {
             self.audit.lock().expect("audit").clone()
+        }
+
+        /// Every acknowledged `vala.system.audit_log` frame, in arrival order.
+        ///
+        /// Settles nothing itself: settle the outbox first.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the audit frame lock is poisoned.
+        pub(crate) fn audit_frames(&self) -> Vec<Received> {
+            self.audit_frames.lock().expect("audit frames").clone()
         }
 
         /// Refuses the next unscripted submission with `error`.
@@ -1349,12 +1383,12 @@ pub(crate) mod recording {
         ///
         /// Panics when the frame is not one Arrow IPC stream of the audit
         /// content columns or the audit lock is poisoned.
-        fn acknowledge_audit(&self, frame: ScribeIngressFrame) -> FrameAdmission {
-            let IngressPayload::ArrowIpc(ipc) = frame.payload else {
+        fn acknowledge_audit(&self, frame: &ScribeIngressFrame) -> FrameAdmission {
+            let IngressPayload::ArrowIpc(ipc) = &frame.payload else {
                 panic!("audit submits Arrow IPC");
             };
             let decisions: Vec<AuditDecision> =
-                StreamReader::try_new(std::io::Cursor::new(ipc), None)
+                StreamReader::try_new(std::io::Cursor::new(ipc.clone()), None)
                     .expect("the audit stream opens")
                     .flat_map(|batch| {
                         decode_audit(
@@ -1363,8 +1397,13 @@ pub(crate) mod recording {
                         )
                     })
                     .collect();
-            let rows = u64::try_from(decisions.len()).unwrap_or(u64::MAX);
+            let rows = decisions.len();
+            self.audit_frames
+                .lock()
+                .expect("audit frames")
+                .push(Received::new(frame, rows, ipc.clone()));
             self.audit.lock().expect("audit").extend(decisions);
+            let rows = u64::try_from(rows).unwrap_or(u64::MAX);
             FrameAdmission {
                 batch_id: frame.batch_id,
                 rows_accepted: rows,
@@ -1392,7 +1431,7 @@ pub(crate) mod recording {
             frame: ScribeIngressFrame,
         ) -> Result<FrameAdmission, ScribeError> {
             if frame.table.fqn() == ScribeTable::AuditLog.fqn() {
-                return Ok(self.acknowledge_audit(frame));
+                return Ok(self.acknowledge_audit(&frame));
             }
             self.submitted
                 .lock()
@@ -1401,27 +1440,18 @@ pub(crate) mod recording {
             if let Some(error) = self.refusals.lock().expect("refusals").pop_front() {
                 return Err(error);
             }
-            let IngressPayload::ArrowIpc(ipc) = frame.payload else {
+            let IngressPayload::ArrowIpc(ipc) = &frame.payload else {
                 panic!("capture submits Arrow IPC");
             };
+            let ipc = ipc.clone();
             let rows = StreamReader::try_new(std::io::Cursor::new(ipc.clone()), None)
                 .expect("the capture stream opens")
                 .map(|batch| batch.expect("the capture batch decodes").num_rows())
                 .sum::<usize>();
-            self.received.lock().expect("received").push(Received {
-                tenant: frame.authenticated_tenant,
-                principal: frame.principal.id,
-                card_scope: frame
-                    .principal
-                    .card_ref_scope()
-                    .map(|scope| scope.as_slice().to_vec())
-                    .unwrap_or_default(),
-                table: frame.table.fqn(),
-                request_id: frame.request_id,
-                rows,
-                ipc,
-                batch_id: frame.batch_id,
-            });
+            self.received
+                .lock()
+                .expect("received")
+                .push(Received::new(&frame, rows, ipc));
             Ok(FrameAdmission {
                 batch_id: frame.batch_id,
                 rows_accepted: u64::try_from(rows).unwrap_or(u64::MAX),

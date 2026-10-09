@@ -3,14 +3,19 @@
 //! correlated Agent Runs, wait for continuous and real-time verdicts, and
 //! explain one passing and one failing request through MCP.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use wyrd_sdk::Bifrost;
+use wyrd_sdk::gateway::{
+    GatewayOperation, ModelId, ModelRef, ProviderAdapter, ProviderAuth, ProviderDeployment,
+    ProviderDeploymentName, ProviderId,
+};
 use wyrd_sdk::state::WyrdState;
+use wyrd_sdk::{Bifrost, Gateway};
 use wyrd_testing::server::WyrdTestServer;
 
 use crate::local_development::configure_gateway;
@@ -48,7 +53,8 @@ async fn answer(upstream: &MockServer, marker: &str, content: &str, priority: u8
         .await;
 }
 
-/// The support desk deploys, refuses a conflicting table and an
+/// The support desk refuses to deploy while only another provider's `gpt-4o`
+/// is deployed, then deploys, refuses a conflicting table and an
 /// under-privileged caller, answers every request, earns 100 `answer-quality`
 /// passes and 90 `no-refund-promise` passes with 10 failures, and explains a
 /// passing and a failing request from joined evidence.
@@ -89,8 +95,35 @@ async fn support_desk_answers_verifies_and_explains_every_request() {
         .await
         .expect("the setup administrator key");
     let admin = deployment.client(secrecy::ExposeSecret::expose_secret(&key));
-    configure_gateway(&admin).await;
     let bundle = tempfile::tempdir().expect("bundle directory creates");
+    Gateway::with_client(admin.clone())
+        .put_deployment(&ProviderDeployment {
+            name: ProviderDeploymentName::new("anthropic-gpt-4o").expect("deployment name"),
+            model: ModelRef {
+                provider: ProviderId::new("anthropic").expect("provider"),
+                model: ModelId::new("gpt-4o").expect("model"),
+            },
+            adapter: ProviderAdapter::Anthropic,
+            auth: ProviderAuth::None,
+            capabilities: BTreeSet::from([GatewayOperation::ChatCompletions]),
+            routing_weight: NonZeroU32::MIN,
+        })
+        .await
+        .expect("the same-name foreign deployment puts");
+    let Err(missing) = deploy(&admin, &bundle.path().join("refused")).await else {
+        panic!("another provider's gpt-4o does not serve the Agent");
+    };
+    let missing = missing
+        .downcast_ref::<wyrd_sdk::WyrdError>()
+        .expect("the refusal is a Wyrd error");
+    assert_eq!(missing.code(), "WYRD_GATEWAY_404_MODEL_UNAVAILABLE");
+    assert!(
+        missing
+            .to_string()
+            .contains("configure a gateway provider deployment for openai/gpt-4o"),
+        "{missing}"
+    );
+    configure_gateway(&admin).await;
     let bundle = bundle.path().join("bundle");
 
     let desk = deploy(&admin, &bundle).await.expect("the desk deploys");

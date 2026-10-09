@@ -31,6 +31,8 @@ from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
 
 REQUESTS = 100
+# The gateway provider the Prompt's ``open_ai_chat_completion`` request routes to.
+PROVIDER = "openai"
 """How many requests ``serve`` answers; every tenth asks for a refund."""
 
 SERVICE = Path(__file__).resolve().parents[1] / "service"
@@ -81,16 +83,21 @@ def deploy(client: WyrdClient, bundle: Path) -> Desk:
         WyrdError: the registration refusal, including
             ``WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`` for an incompatible
             existing ``tickets`` table.
-        LookupError: naming the model when no deployment serves it.
+        LookupError: naming the exact gateway deployment to configure when
+            none serves the Prompt's provider and model.
     """
     cards = Cards(client)
     receipt = cards.register_from_path(SERVICE / "support-desk.yaml")
     state = WyrdState.from_path(cards.hydrate(receipt.root, bundle).destination, client)
     gateway = Gateway(client)
     gateway.put_capture_policy({"mode": "metadata", "payload_fields": []})
-    model = state.card("prompt").spec["model"]
-    if not any(d["model"]["model"] == model for d in gateway.deployments()):
-        raise LookupError(f"the support Agent's model {model!r} is not deployed")
+    model = {"provider": PROVIDER, "model": state.card("prompt").spec["model"]}
+    if not any(d["model"] == model for d in gateway.deployments()):
+        route = f"{model['provider']}/{model['model']}"
+        raise LookupError(
+            f"the support Agent's model {route} is not deployed; configure a gateway "
+            f"provider deployment for {route} (PUT /v1/admin/gateway/provider-deployments/{{name}})"
+        )
     return Desk(receipt, state)
 
 

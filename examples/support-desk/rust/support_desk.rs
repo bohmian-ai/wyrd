@@ -28,6 +28,10 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 /// How many requests [`serve`] answers; every tenth asks for a refund.
 pub const REQUESTS: usize = 100;
 
+/// The gateway provider the Prompt's `open_ai_chat_completion` request routes
+/// to; with the Prompt's model it is the exact deployment `deploy` requires.
+const PROVIDER: &str = "openai";
+
 /// The checked-in Service Cards.
 #[must_use]
 pub fn service_dir() -> PathBuf {
@@ -94,8 +98,9 @@ struct Answer<'a> {
 /// # Errors
 /// Returns the registration refusal, including
 /// `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH` for an incompatible existing
-/// `tickets` table, and `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` naming the
-/// model when no deployment serves it.
+/// `tickets` table, and `WYRD_GATEWAY_404_MODEL_UNAVAILABLE` naming the exact
+/// gateway deployment to configure when none serves the Prompt's provider and
+/// model.
 pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
     let cards = Cards::with_client(client.clone());
     let receipt = cards
@@ -120,15 +125,16 @@ pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
         return Err("the `prompt` component is not a Prompt".into());
     };
     let model = &prompt.prompt.model;
-    if !gateway
-        .deployments()
-        .await?
-        .iter()
-        .any(|deployment| deployment.model.model.as_str() == model)
-    {
+    if !gateway.deployments().await?.iter().any(|deployment| {
+        deployment.model.provider.as_str() == PROVIDER && deployment.model.model.as_str() == model
+    }) {
+        let route = format!("{PROVIDER}/{model}");
         return Err(WyrdError::GatewayModelUnavailable {
-            message: format!("the support Agent's model `{model}` is not deployed"),
-            details: json!({ "model": model }),
+            message: format!(
+                "the support Agent's model {route} is not deployed; configure a gateway provider \
+                 deployment for {route} (PUT /v1/admin/gateway/provider-deployments/{{name}})"
+            ),
+            details: json!({ "provider": PROVIDER, "model": model }),
         }
         .into());
     }

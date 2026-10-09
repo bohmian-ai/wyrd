@@ -20,6 +20,7 @@ from wyrd import WyrdError
 from wyrd.bifrost import TableConfig
 from wyrd.cards import Cards
 from wyrd.client import WyrdClient
+from wyrd.gateway import Gateway
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
@@ -85,6 +86,20 @@ def test_support_desk_answers_verifies_and_explains_every_request(tmp_path: Path
                 credential=server.tenant_admin_key(),
                 grpc_url=server.grpc_url,
             )
+            Gateway(admin).put_deployment(
+                {
+                    "name": "anthropic-gpt-4o",
+                    "model": {"provider": "anthropic", "model": "gpt-4o"},
+                    "adapter": "anthropic",
+                    "auth": "none",
+                    "capabilities": ["chat_completions"],
+                    "routing_weight": 1,
+                }
+            )
+            with pytest.raises(
+                LookupError, match="configure a gateway provider deployment for openai/gpt-4o"
+            ):
+                desk_example.deploy(admin, tmp_path / "refused")
             configure_gateway(admin)
             bundle = tmp_path / "bundle"
 

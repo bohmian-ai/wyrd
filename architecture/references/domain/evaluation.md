@@ -10,7 +10,7 @@ Eval is a `Verifier` implementation (`implementation.kind: eval`), not a Card
 kind. The Verifier is reusable and subject-less and declares a typed DAG of
 checks; a Service component, Service, or standalone Agent binds it through
 versioned `verified_by` with an `observations_ready` Trigger. Runtime
-observation `card_ref` supplies subject identity. Each committed
+observation `card_uid` supplies subject identity. Each committed
 `vala.eval.observations` record activates one run per matching active binding
 of that subject, and the run records the common Verification Result plus Eval
 item details. There is no Eval pull protocol; a future offline dataset route

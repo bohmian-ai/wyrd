@@ -129,8 +129,8 @@ not a passive integration or inventory product.
     an unbound Service — has no bounded scope: it may attribute to any
     registered observation-target Card in its tenant, which ingest resolves
     against the tenant registry.
-    An observation may carry its subject `card_ref`; when present, the
-    server authorizes it against that scope and stamps the mapped `card_uid`.
+    An observation may carry its subject `card_uid`; when present, the
+    server authorizes it against that scope's mapped UIDs and stores it.
     Generic telemetry may omit it and retains the authenticated publisher through
     `principal_id`. A separate emit credential was redundant — see "Observation
     identity — Card → Run → Observation".
@@ -759,7 +759,7 @@ introduce a competing request identity.
 How Card-correlated telemetry ties to a Run and a Card, and how the server
 resolves it. A Run is one client application invocation with one `run_id`;
 each correlated row names its own exact subject Card. A telemetry row may omit
-Card correlation; when supplied, the `(card_ref, run_id)` pair anchors it to
+Card correlation; when supplied, the `(card_uid, run_id)` pair anchors it to
 that subject and invocation. The server owns resolution of that identity.
 
 **A principal is not a card.** A Service or Agent principal is bound to one card
@@ -770,7 +770,7 @@ root Service Card. The first-class SDKs may select an initial hydrated Card
 alias when opening the run, and `for_card(alias)` returns an immutable
 Card-scoped view of that same invocation for multi-component work. Views for
 different components share the `run_id` and the JWT, but each row carries its
-view's exact subject `card_ref`. Switching Cards never requires a distinct Run
+view's exact subject `card_uid`. Switching Cards never requires a distinct Run
 ID, and the principal's root Card cannot say which card a correlated record
 belongs to — the subject Card must be carried on that row. Generic telemetry
 may omit a subject Card.
@@ -877,18 +877,18 @@ Consequences, stated so they stop drifting:
   and the envelope selects one within it.
 - **There is no run registry.** Runs are client-side execution records; the
   server never persists a run table and never resolves `run_id` back to a card
-  — the card is the authorized `card_ref` on the row. `run_id` is an **opaque**
+  — the card is the authorized `card_uid` on the row. `run_id` is an **opaque**
   correlation id, never a composite that encodes the card.
-- **When present, `Card → Run → Observation` is the `(card_ref, run_id)` pair on
+- **When present, `Card → Run → Observation` is the `(card_uid, run_id)` pair on
   the row;** generic telemetry remains attributable to `principal_id`, and the
   request spine is the `wyrd_request_id` label that joins many runs across hops.
 - **The observation owns subject identity.** Under pub/sub (Doctrine #3, #21),
-  the observation's `card_ref` IS its subject — no separate `subject_ref` on
+  the observation's `card_uid` IS its subject — no separate `subject_ref` on
   the envelope and no monitor-emits-about-a-different-card case. For a Service
-  principal, the server validates the subject against the locked Service
-  version and matching component `card_ref`. Verification routing is resolved
-  later from that subject's `verified_by` bindings; authorization still
-  reduces to the one subject `card_ref` on the row.
+  principal, the server validates the subject against the UIDs its signed scope
+  maps from the locked Service version and its component Cards. Verification
+  routing is resolved later from that subject's `verified_by` bindings;
+  authorization still reduces to the one subject `card_uid` on the row.
 
 ### Audit
 Immutable case file. Records the result of an investigation against the
@@ -1289,7 +1289,7 @@ of refs is the mode):
 
 **Directional flow.** A Service component binding or standalone Agent declares
 `verified_by` with an Eval-backed Verifier and the runtime emits observations
-carrying the component's `card_ref` as subject identity. Continuous evaluation
+carrying the component's `card_uid` as subject identity. Continuous evaluation
 loads the committed subject record, executes the typed task workflow, and
 persists the common Verification Result plus Eval item details.
 

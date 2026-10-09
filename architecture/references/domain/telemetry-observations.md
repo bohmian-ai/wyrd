@@ -17,7 +17,7 @@ The public correlation spine is:
 authenticated tenant
   + authenticated principal_id
   + Wyrd-Request-Id
-  + optional authorized card_ref/card_uid
+  + optional authorized card_uid
   + optional opaque run_id
 ```
 

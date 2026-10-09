@@ -24,8 +24,8 @@ Implement with `$wyrd-implement`.
   either belongs in the fork, which follows the fork rules in the plan.
 - No `#[allow]`, no weakened assertions, no new dependencies.
 - Never commit `spec.md` or `TASK-004-forge-parallelism.md`.
-- SPEC-1 (`parquet-variant*` in `vala-bifrost-redux`) is out of scope here
-  and waits on a human spec decision.
+- SPEC-1 is resolved: the write side keeps using the public
+  `parquet-variant*` APIs.
 - Preserve:
   - the native distribution rule;
   - the leader-settle ordering (the fold is taken on success and dropped

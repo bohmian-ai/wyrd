@@ -232,7 +232,11 @@ Replace with:
 ### Material constraints
 
 - Replace "and Variant query kernels in `vala-bifrost-redux`" with "; no
-  `parquet-variant*` dependency in `vala-bifrost-redux`".
+  Variant query logic in `vala-bifrost-redux`. Logic that is not
+  Wyrd-specific and would need to change DataFusion, arrow-rs or
+  `datafusion-distributed` internals belongs in those forks. Wyrd-specific
+  logic, including Bifrost's write path calling the public `parquet-variant*`
+  APIs, stays in Wyrd".
 - Replace the "exact eight `[patch.crates-io]` entries" text with "every
   DataFusion crate the workspace resolves, including
   `datafusion-functions-variant`".

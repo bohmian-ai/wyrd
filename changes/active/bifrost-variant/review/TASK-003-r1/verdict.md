@@ -1,7 +1,9 @@
 # TASK-003 r1 verdict
 
-**Verdict: FIX_REQUIRED.** One item, SPEC-1, needs a human spec decision
-before PASS is reachable.
+**Verdict: FIX_REQUIRED.** SPEC-1 was settled by the user: Wyrd-specific
+logic stays in Wyrd, and only logic that needs DataFusion, arrow-rs or
+`datafusion-distributed` internals goes to the forks. Revision 26 was
+reworded to match, and the write-side `parquet-variant*` use stays.
 
 ## Subject
 
@@ -70,7 +72,7 @@ This is the first TASK-003 review, so no root-cause pass was required.
 | Generated artifacts and workspace checks green | FAIL | FIND-5, FIND-6 |
 | Rustdoc and repository style rules | FAIL | FIND-7, FIND-15..18 |
 | No dead or test-only production surface | FAIL | FIND-8, FIND-9, FIND-10 |
-| No `parquet-variant*` dependency in `vala-bifrost-redux` (rev 26) | SPEC_REVISION_REQUIRED | SPEC-1 |
+| No `parquet-variant*` dependency in `vala-bifrost-redux` (rev 26) | PASS after the revision 26 rewording | SPEC-1 (resolved) |
 | Bench task matches its description | FAIL | FIND-19 |
 | Recorded failure diagnoses are accurate | FAIL (docs only) | FIND-4 |
 
@@ -79,7 +81,7 @@ This is the first TASK-003 review, so no root-cause pass was required.
 The full entries are in `findings-validation.md`:
 
 - FIND-003-1 through FIND-003-20;
-- SPEC-1 (needs a human decision).
+- SPEC-1 (resolved by rewording revision 26).
 
 ## Verification limits
 
@@ -102,5 +104,4 @@ None; this is the first review.
 ## Remediation
 
 `TASK-003-R1-review-fixes.md` in this directory, routed to
-`$wyrd-implement`. SPEC-1 needs a human decision on revision 26's
-`parquet-variant*` wording before PASS.
+`$wyrd-implement`.

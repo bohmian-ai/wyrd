@@ -678,13 +678,13 @@ test('production provider replacement settings', async () => {
   expect(activated.status).toBe(200);
   for (const seen of alice.seen) expect(seen).not.toContain(journey.replacementOwnerKey);
 
-  // The retired connection's session cannot refresh: it keeps its already-issued
-  // access token until that token's expiry, and its first use afterwards ends it
-  // on either replica.
+  // The retired connection's session cannot refresh: each replica keeps its own
+  // already-issued access token until that token's expiry (issued in different
+  // seconds, so they can expire a second apart), and the first use afterwards
+  // ends the session on that replica.
   await expectSessionEnds(alice, 1, tenant);
   alice.cookies.set(sessionCookie(tenant), oldSession);
-  expect((await alice.go(0, `/t/${tenant}`)).headers.get('location')).toBe(`/t/${tenant}/login`);
-  expect(alice.cookies.has(sessionCookie(tenant))).toBe(false);
+  await expectSessionEnds(alice, 0, tenant);
 
   // The second realm's alice — same email — is a new User with none of the old authority.
   const replaced = new Browser();

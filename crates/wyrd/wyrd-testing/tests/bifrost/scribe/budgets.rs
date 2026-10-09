@@ -92,6 +92,12 @@ async fn scribe_shards_obey_global_and_tenant_budgets() {
         }
     }
 
+    // Each append stages an audit decision the outbox inserts through this
+    // Scribe; settle it so no ingress bytes are in flight at the snapshot.
+    server
+        .await_audit_retained()
+        .await
+        .expect("staged audit decisions settle");
     let loaded = server
         .scribe_inspection_snapshot()
         .expect("Scribe ownership is inspectable");
@@ -150,7 +156,7 @@ async fn scribe_shards_obey_global_and_tenant_budgets() {
     );
 
     let mut owned = vec![0_usize; TENANTS];
-    for bucket in &loaded.memory_by_bucket {
+    for bucket in super::support::journey_buckets(&loaded) {
         if let Some(index) = tenants
             .iter()
             .position(|tenant| *tenant == bucket.seal_key.tenant)

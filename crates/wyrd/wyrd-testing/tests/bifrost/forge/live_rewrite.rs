@@ -1500,6 +1500,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let pre_rewrite = live_cut(&cluster, &shared.binding).await;
     let rewrites_before = rewrite_snapshots(&cluster, &shared.binding).await.len();
 
+    uncertainty.target_table(shared.binding.table_ident());
     uncertainty.fail_after_next_commit();
     let errors_before = observer.returned_errors().len();
     release_retries(&cluster, owner).await;

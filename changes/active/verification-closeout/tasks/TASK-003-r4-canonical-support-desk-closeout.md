@@ -64,8 +64,10 @@ The public types and surfaces are fixed by the spec:
 - `VerificationBinding.runs_on` becomes optional and is omitted when absent.
 - `ExecuteVerificationRequest.run_id` is optional and omitted when absent.
 - Gateway correlation uses `wyrd-run-id` (non-empty, at most 128 bytes) and
-  `wyrd-card-ref` (the CardRef text grammar); both or neither.
-- The gateway-call subject carries typed Run and Card identities while existing
+  `wyrd-card-uid` (a Card UID); both or neither. The UID is checked against
+  the caller's signed Card scope, or the tenant registry for an unbound
+  caller, before dispatch; a refusal is the fieldless scope denial.
+- The gateway-call subject carries typed Run and Card UID identities while existing
   Workflow steps continue to pass none.
 - Python, TypeScript, and Rust expose idiomatic `Run.invoke`, telemetry setup,
   and Run scope; `observe.verify` keeps its public shape while sending Run ID.
@@ -213,6 +215,75 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^support_desk::/)'"
 ```
 
+### Scenario 5 — Repair shared Scribe delivery and membership ownership
+
+**Behavior.** The process has one live membership snapshot poller through the
+bounded Scribe outbox drain. Each registered Scribe or Oracle role owns one
+readiness heartbeat through its own final shutdown; setting `ready=false`
+does not stop that heartbeat. The shared outbox selects its local Scribe or
+Scribe peer directly from process dependencies and does not require an Oracle
+runtime to submit to a peer.
+
+**RED.** Prove the Oracle-only pod can start before the Scribe-only pod, stage
+on the shared outbox, discover the late Scribe, and deliver through shutdown.
+Add focused checks for peer routing without an Oracle runtime, one poller on a
+mixed-role pod, continued unready heartbeat after `deactivate`, and bounded
+task cleanup on normal shutdown and abort. Reproduce each remaining Scribe,
+Forge, and Oracle journey failure with tracing before changing its assertion.
+
+**GREEN.** In `cluster/mod.rs`, make readiness heartbeat and snapshot poller
+starters return handles that own their cancellation tokens and tasks. Keep
+`RegisteredRole` as the existing cloneable identity value. Scribe and Oracle
+store their own heartbeat handles; `Bifrost` stores the one process poller.
+Stop heartbeats at final role shutdown/abort and the poller after role drain or
+on Bifrost abort. Rename the engine/process token `role_shutdown` to
+`process_drain`; remove the temporary per-role `membership` tokens and duplicate
+pollers. Keep `deactivate` limited to publishing `ready=false`.
+
+In `boot/mod.rs`, construct the outbox with the existing local Scribe
+implementation when present, otherwise with the existing peer route using
+process `ClusterRegistry` and `BifrostPeerTls`. In `scribe_outbox.rs`, store that
+route directly in `ScribeSink`; remove `RouteSlot`, `ScribeRouteBinding`, and
+Oracle-derived route selection. Remove late binding from `Bifrost::assembled`,
+update `reaches_scribe` and the ownerless test shell, and adjust the direct
+outbox test constructors. Preserve the current peer mTLS identity, channel
+cache, `IngestCapture` RPC, batching, stable retry IDs, and accepted in-memory
+loss window.
+
+For tests that count Scribe rows, Forge membership, queue slots, or telemetry,
+assert the intended table or the actual process-wide aggregate. Bind one-shot
+faults to the intended operation when needed. Keep audit decisions on the
+shared outbox; do not add a general audit opt-out. Fix each independently
+diagnosed live-rewrite or Oracle failure at its own root cause.
+
+**REFACTOR.** Delete duplicate lifetime state and late route binding. Add no
+new TLS pool, peer RPC, route config, or delivery system.
+
+### Scenario 6 — Test Postgres bootstraps with its container client
+
+**Behavior.** The shared Postgres test wrapper runs `roles.sql` with `psql`
+from the Compose container it started. A host `psql` 14 or no host `psql` does
+not prevent role bootstrap or the requested test command. Bootstrap errors
+stop the wrapper before that command and still tear down its Compose project.
+
+**RED.** Extend `scripts/postgres/test-contract.sh` to reject host `psql` for
+bootstrap, assert that the container client receives `roles.sql` and the
+configured role passwords, and prove failure propagation and cleanup. Run a
+repository-managed Postgres lane with host `psql` 14 first on `PATH` or a fake
+host `psql` that refuses bootstrap. Preserve the idempotency proof in
+`scripts/postgres/test-roles.sh`, whose own `roles.sql` rerun currently uses
+host `psql`.
+
+**GREEN.** In `scripts/postgres/with-test-postgres.sh`, feed the local
+`roles.sql` file to `docker compose exec -T postgres psql` through stdin;
+keep the existing role variables, add `ON_ERROR_STOP`, and preserve the
+exported host URLs and isolated Compose lifecycle. Make the roles test's
+rerun use the container client as well. Do not change the deployment contract
+of `roles.sql` or require a host `psql` for wrapper bootstrap.
+
+**REFACTOR.** Remove the host-version `PATH` workaround from closeout
+instructions once the contract and roles tests pass.
+
 ## Acceptance Criteria
 
 - AC-004, AC-005, and AC-006 pass.
@@ -228,6 +299,17 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
   three SDKs and no test-only publication hook.
 - Public contracts regenerate cleanly and documentation matches the proved
   workflow.
+- A late Scribe joins an Oracle-only pod's live membership view and receives
+  its staged outbox writes before the bounded shutdown drain ends; peer
+  routing has no Oracle runtime dependency.
+- A mixed-role pod has one process membership poller and one heartbeat per
+  registered role. `deactivate` preserves the unready heartbeat until final
+  role shutdown. Normal shutdown and abort stop every owned task.
+- Scribe, Forge, and Oracle journey lanes and the final broad gate pass with
+  audit, gateway capture, and Verifier results still using the shared outbox.
+- The Postgres wrapper and role-idempotency test run `roles.sql` with the
+  container client; a host `psql` 14 cannot block bootstrap, and SQL failure
+  prevents the requested command while cleanup still runs.
 
 ## Expected Write Set and Consumer Closure
 
@@ -236,7 +318,13 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
   TypeScript declarations.
 - Server: Card registration, Bifrost table ensure, verification binding/
   observation/result/direct owners, gateway ingress/invocation/capture, judge
-  integration, and server state only where caller authority is retained.
+  integration, and server state only where caller authority is retained; the
+  remediation also touches `boot/mod.rs`, `state.rs`, `scribe_outbox.rs`, and
+  process shutdown.
+- Cluster runtime: `ClusterRegistry` task handles in
+  `vala-bifrost-redux/src/cluster/mod.rs` and their direct tests.
+- Shared test infrastructure: `scripts/postgres/with-test-postgres.sh`, its
+  contract and role tests, and any related mise task description.
 - Shared client and SDKs: Run invocation, verify correlation, telemetry setup
   and scope, plus idiomatic Rust/Python/TypeScript projections.
 - Evidence: existing focused server tests, `fixtures/cards/support_desk`, one
@@ -261,9 +349,13 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
 - `mise run py:typecheck`
 - `mise run docs:check`
 
-The integrated candidate runs the three SDK verification lanes and the broad
-`test:bifrost` aggregate once during change review rather than repeating them
-inside this task.
+Use focused exact selectors and the Scribe, Forge, and Oracle journey leaves
+during repair. Run `mise run test:postgres:contract` and
+`mise run test:postgres:roles` for the wrapper change. This remediation
+crosses shared cluster runtime, server boot, shutdown ownership, and test
+infrastructure, so `mise run gate` is the final aggregate. Do not repeat its
+component lanes as separate final gates unless a required lane is outside
+that aggregate.
 
 ## Material Stop Conditions
 
@@ -284,3 +376,97 @@ inside this task.
   `architecture/bifrost-design.md`;
   `TESTING.md` (definitive Wyrd guide for test ergonomics,
   understandability, structure, ownership, and lane selection)
+
+## Implementation Evidence (r4 closeout)
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Late Scribe receives an Oracle-only pod's staged writes; peer routing has no Oracle dependency | `scribe_outbox.rs` selects `Local`/`Peer` at boot from `ClusterRegistry` + `BifrostPeerTls`; `RouteSlot`/late binding removed | `scribe_outbox::tests::a_peer_route_needs_no_oracle`, `an_unreachable_route_drops`; `query::oracle_only_pod_retains_audit_staged_before_its_drain`; `test:bifrost:journey:server` | PASS |
+| One process membership poller, one heartbeat per role; `deactivate` keeps the unready heartbeat; shutdown/abort stop every task | `cluster/mod.rs` `ClusterTask`; poller owned by `Bifrost`; `state.rs` `process_drain`, `stop_role_task` | `cluster::tests::stop_joins_the_task_once`, `stop_aborts_a_task_past_its_deadline`, `abort_and_drop_end_the_task`; `server::owner_inspection::unready_roles_heartbeat_until_teardown_ends_membership_tasks` | PASS |
+| Gateway Run correlation by Card UID: paired `wyrd-run-id` + `wyrd-card-uid`; UID checked against signed scope or tenant registry before dispatch; authorized UID captured; `wyrd-card-ref` and CardRef lookup removed, no alias | `wyrd-spec` `CARD_UID_HEADER`; `ingress.rs` `requested_subject`; `invocation.rs` `GatewayCallSubject { run_id, card_uid }`, `attribute`; `capture.rs`; client `PublicWyrdGatewayCaller::with_subject(run, card_uid)`, `Run::invoke` | `ingress::tests::subject_headers_decode_only_as_a_valid_pair` (malformed); `pg_invocation_tests::gateway_correlation_is_authorized_before_dispatch_and_captured` (out-of-scope, unregistered, capture); `workflow_transport::public_gateway_call_carries_run_and_card_uid`; `pg_openapi_contract::gateway_inference_ingress_publishes_the_fallback_header`; support-desk journeys (`call_card_uid`) | PASS |
+| Public scope error | `CardScopeDenied` fieldless; `<server-validation>` removed; mappings and contracts regenerated | `codegen:check`; wyrd-client/gate error mapping tests | PASS |
+| Scribe, Forge, Oracle lanes pass with audit, capture, and Verifier results on the shared outbox | Table-scoped Scribe faults/backlog; aggregate-meaning metric assertions; table-scoped Forge commit-uncertainty fault; Forge self-reclaim on supervised restart; follower admit-after-settle guard; cancel-safe cleanup pause; grant-order observation | `test:bifrost:journey:scribe` 28/28; `test:bifrost:journey:forge` 22/22; `test:bifrost:journey:oracle` 50/50 | PASS |
+| Postgres wrapper uses the container client | `with-test-postgres.sh`, `test-contract.sh`, `test-roles.sh` | `test:postgres:contract`; `test:postgres:roles`; `mise run gate` | PASS |
+| Final broad gate | — | `mise run -c gate` exit 0 (2026-10-09), no FAIL lines | PASS |
+
+### Diagnoses
+
+Common origin: `70a6f4a4e` made `vala.system.audit_log` an always-active second
+table on the same Scribe, which every audited call writes.
+
+- **Scribe pod-global faults and probes.** Symptom: one-shot persistence faults
+  and staging backlog fired or counted on `audit_log`. Cause: `PersistenceFaults`
+  and `StagingAssembler::backlog` were process-wide. Fix site:
+  `scribe/persistence.rs` `target_table_for_test`, `assembly.rs` `backlog_of`;
+  all fault callers route through `targets()`.
+- **Scribe pod-wide counters.** Symptom: telemetry/budget equalities off by audit
+  rows. Cause: assertions treated process counters as table counts and read
+  before the outbox settled. Fix site: the tests; settle with
+  `await_audit_retained`, assert aggregate meaning, prove the table count by a
+  strict read.
+- **Forge membership and Shutdown attempt.** Symptom: schedule sizes +1 and a
+  `Shutdown` failure on restart. Cause: `audit_log` joins recovered membership;
+  a stopping node's pre-effect attempt is a shutdown, not a failure. Fix site:
+  `production_closeout.rs` (audit-aware sizes; `failures()` excludes shutdown).
+- **Forge uncertainty fault.** Symptom: rewrite never saw its injected commit
+  uncertainty. Cause: process-global fault consumed by an `audit_log` commit.
+  Fix site: `forge_harness.rs` `CommitUncertaintyCatalog::target_table`.
+- **Forge restart reclaim (production).** Symptom:
+  `failed_worker_restarts_while_the_api_serves` waited out its 2-minute bound.
+  Cause: a supervised restart keeps its owner id but `reclaim_expired_attempts`
+  only took expired claims, so readiness waited for the 15-minute lease. Fix
+  site: `forge_tasks.rs` reclaims `claimed_by = previous_owner`;
+  `worker.rs` `drain_recoverable_work` passes its own owner. Proof:
+  `pg_forge_tasks::previous_owner_reclaims_its_unexpired_attempt`.
+- **Oracle admit-after-settle (production).** Symptom:
+  `selected_peer_failure_is_terminal` leaked a follower graph. Cause:
+  `GraphLease::settle` copied an empty attempt set while a reused lease
+  admitted a late `SetPlan`. Fix site: `analytical.rs` marks and copies under
+  the attempt lock; `admit_attempt` refuses once settled. Proof:
+  `oracle::analytical::tests::a_plan_after_settlement_admits_no_attempt` fails
+  without the guard, passes with it.
+- **Oracle cleanup pause.** Symptom: `transport_drop_retains_running_status_until_cleanup_joins`
+  saw the running entry retired while paused. Cause: the leader's `settle`
+  consumed the one-shot pause, was dropped by the transport, and `reclaim`
+  passed straight through. Fix site: `AnalyticalCleanupPause::hold` re-arms
+  when dropped unreleased; `wait_entered` registers before reading. Independent
+  diagnostician concurred.
+- **Oracle queue order.** Symptom: `queued_tenants_are_granted_fifo_and_rotated`
+  saw `second` before `first-older` in the lane. Cause: the test read
+  completion order; production releases the slot before the terminal frame, so
+  completions race. Fix site: the test now parks each grant on a schema stall
+  holding the only unit and records grant order. Production ordering unchanged
+  (independent diagnostician: correct).
+- **Forge failover inherited state.** Symptom:
+  `one_leader_failover_volatile_state` saw the successor's schedule sizes
+  `(1,1,0)`, not `(0,0,0)`. Cause: the stopped leader's shutdown drained audit
+  rows, so the successor's first pass recorded a real `audit_log` commit; the
+  claim was wrong, not production. Fix site: the test asserts that the rewrite
+  key has no inherited track and that only the audit track is present.
+  Independent diagnostician concurred.
+- **Oracle shutdown memory read (production).** Symptom:
+  `memory_refusal_preserves_oracle_health_and_next_query` panicked "Oracle
+  shutdown retained admission, resource, or peer state". Cause:
+  `OracleAdmission::shutdown` waited only for `active_queries == 0`, then read
+  shared pool bytes once. A query's slot returns before its torn-down child
+  tasks drop their reservations. Fix site: `GovernedMemoryRoot` notifies on
+  every shrink, and `shutdown` waits for both counts to reach zero (both wakeups
+  enabled before each check), still bounded by the deadline. The residual
+  warning now includes memory. Every Oracle shutdown routes through this owner.
+  Independent diagnostician identified it.
+- **Rust SDK journey selected identity-lane tests.** Symptom: `verify:rust-sdk`
+  failed `signed_in_development::saved_login_completes_the_workflow_past_token_expiry`
+  with an OIDC discovery 503. Cause: its `--run-ignored=all` filter excluded
+  only `saved_user_auth::`. The Keycloak-dependent `signed_in_development::`
+  tests then ran after `test:identity:journey` had removed Keycloak. Fix site:
+  `mise.toml` `verify:rust-sdk` excludes both modules, which the identity lane
+  owns. Python (marker) and TypeScript (file exclude) were already excluded.
+  Independent diagnostician identified it.
+- **UI replacement settings replica expiry.** Symptom:
+  `production-auth.integration.test.ts` "production provider replacement
+  settings" got no redirect on replica 0 after replica 1 ended the session.
+  Cause: each BFF replica caches its own access token. JWT `exp` has
+  whole-second resolution, so replica 0's token (issued a second later under
+  load) outlived replica 1's. The test assumed both expire together. Fix site:
+  the test polls replica 0 with `expectSessionEnds` as it already did for
+  replica 1. BFF behavior unchanged. Independent diagnostician identified it.

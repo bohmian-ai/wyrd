@@ -2255,7 +2255,8 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
     }
 
-    /// Report the pod's staged backlog from the Scribe staging owner.
+    /// Report the staged backlog of one logical table, or of the whole pod
+    /// when `table_name` is `None`, from the Scribe staging owner.
     ///
     /// Live members are durable, unpublished members, ready or claimed; the
     /// same snapshot is published as the `bifrost_scribe_staging_*` gauges.
@@ -2266,10 +2267,11 @@ impl WyrdTestServer {
     /// cannot be read.
     pub fn scribe_staging_backlog_for_test(
         &self,
+        table_name: Option<&str>,
     ) -> Result<vala_bifrost_redux::scribe::assembly::StagingBacklog, WyrdTestServerError> {
         self.bifrost_scribe()
             .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))?
-            .staging_backlog_for_test()
+            .staging_backlog_for_test(table_name)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
@@ -5993,7 +5995,7 @@ mod tests {
 
     /// Python members that start, address, or credential the server and so
     /// neither steer nor inspect its state.
-    const PYTHON_SETUP: [&str; 20] = [
+    const PYTHON_SETUP: [&str; 21] = [
         "__init__",
         "__enter__",
         "__exit__",
@@ -6014,10 +6016,11 @@ mod tests {
         "expire_saved_login",
         "saved_login_is_stale",
         "revoke_saved_login",
+        "tenant_admin_key",
     ];
 
     /// TypeScript members that start, address, or credential the server.
-    const TYPESCRIPT_SETUP: [&str; 18] = [
+    const TYPESCRIPT_SETUP: [&str; 19] = [
         "baseUrl",
         "grpcUrl",
         "token",
@@ -6036,6 +6039,7 @@ mod tests {
         "savedLoginIsStale",
         "revokeSavedLogin",
         "shutdown",
+        "tenantAdminKey",
     ];
 
     /// Member names declared in the body of `class` in `source`.

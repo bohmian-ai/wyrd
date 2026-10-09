@@ -40,6 +40,7 @@ async fn scribe_failure_retry_replay_remain_atomic() {
         .expect("the Scribe production harness starts with publication faults");
     let tenant = server.data_tenant_id();
     let name = unique_table("retry_replay");
+    faults.target_table_for_test(&name);
     let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
     let client = tenant_client(&server, tenant).await;
 
@@ -172,7 +173,7 @@ async fn scribe_failure_retry_replay_remain_atomic() {
         expected,
         "reconciliation must leave the public read exactly as the client was acknowledged"
     );
-    assert_no_leaked_scribe_ownership(&server, "ambiguous publication reconciliation");
+    assert_no_leaked_scribe_ownership(&server, "ambiguous publication reconciliation").await;
 
     // Replaying the very first batch after it was published adds nothing. The
     // durable batch fence already owns that identity, so the append is either
@@ -235,19 +236,43 @@ async fn published_generations(server: &WyrdTestServer, tenant: DataTenantId, na
 /// still charged to the generation ledger are a leak that no row-count
 /// assertion can see, because the rows themselves are correct either way.
 ///
+/// The reads just before this check stage audit decisions that the outbox
+/// inserts into `audit_log` through this Scribe. The check settles them, then
+/// requires every active and immutable byte the ledger charges to be held by an
+/// `audit_log` bucket, so any byte the publication left behind still fails it.
+///
 /// # Panics
 ///
-/// Panics when the Scribe cannot be inspected or when any active or immutable
-/// generation byte survives the settled publication.
-fn assert_no_leaked_scribe_ownership(server: &WyrdTestServer, boundary: &str) {
+/// Panics when the outbox does not settle, when the Scribe cannot be
+/// inspected, or when any active or immutable generation byte is not held by an
+/// `audit_log` bucket.
+async fn assert_no_leaked_scribe_ownership(server: &WyrdTestServer, boundary: &str) {
+    server
+        .await_audit_retained()
+        .await
+        .expect("staged audit decisions settle");
     let snapshot = server
         .scribe_inspection_snapshot()
         .expect("the production Scribe exposes its observation snapshot");
+    let audit = snapshot
+        .memory_by_bucket
+        .iter()
+        .filter(|bucket| bucket.seal_key.table.namespace == BifrostNamespace::Audit);
+    let (writable, immutable) = audit.fold((0, 0), |(writable, immutable), bucket| {
+        (
+            writable + bucket.writable_bytes,
+            immutable + bucket.immutable_bytes,
+        )
+    });
     let memory = &snapshot.memory_by_category;
-    for category in [MemoryCategory::Active, MemoryCategory::Immutable] {
+    for (category, audit_bytes) in [
+        (MemoryCategory::Active, writable),
+        (MemoryCategory::Immutable, immutable),
+    ] {
         assert_eq!(
-            memory[category as usize], 0,
-            "{boundary} must retain no {category:?} generation bytes: {memory:?}"
+            memory[category as usize], audit_bytes,
+            "{boundary} must retain no {category:?} generation bytes beyond audit_log: \
+             {memory:?}"
         );
     }
 }

@@ -625,7 +625,7 @@ depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typechec
 description = """Complete Rust SDK gate: fmt, Clippy, the wyrd-sdk-rust unit tests and every story journey on one
 Postgres lifecycle, plus the shared identity journeys (see verify:python-sdk)."""
 depends = ["check", "test:identity:journey"]
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^saved_user_auth::/)'\""
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/)'\""
 
 [tasks."verify:typescript-sdk"]
 description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit

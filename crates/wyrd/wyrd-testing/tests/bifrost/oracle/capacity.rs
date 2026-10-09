@@ -2093,9 +2093,11 @@ async fn queued_tenants_are_granted_fifo_and_rotated() {
 /// The pod is saturated by parked queries, three identified requests are
 /// enqueued in a known order behind them, each enqueue is confirmed through the
 /// node's own inspection, and exactly one parked query is then released. From
-/// there a single free slot unit passes down the queue, so completion order is
-/// grant order: the first tenant's older request precedes the second tenant's,
-/// which precedes the first tenant's newer one.
+/// there a single free slot unit passes down the queue one grant at a time:
+/// each granted waiter parks on its schema stall holding the unit until the
+/// test frees it, so the observed order is the grant order. The first tenant's
+/// older request precedes the second tenant's, which precedes the first
+/// tenant's newer one.
 ///
 /// # Errors
 ///
@@ -2151,43 +2153,62 @@ async fn prove_queue_is_fifo_and_tenant_rotated() -> Result<(), JourneyError> {
         );
     }
 
-    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut waiters = Vec::new();
+    let (granted_tx, mut granted_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut waiters = std::collections::HashMap::new();
     for (label, tenant) in [("first-older", 0), ("second", 1), ("first-newer", 0)] {
         // The ring visits tenants in first-enqueue order, so the first tenant's
         // older request must be enqueued before the second tenant appears.
         let query = wyrd_client::Bifrost::query_only(&clients[tenant]);
-        let sql = scheduling_interactive_sql(&tables[tenant]);
-        let order = Arc::clone(&order);
-        waiters.push(tokio::spawn(async move {
-            let outcome = drain_query(&query, &sql).await;
-            if outcome.is_ok()
-                && let Ok(mut order) = order.lock()
-            {
-                order.push(label);
-            }
-            outcome.map(|_| label)
-        }));
+        let request = BifrostQueryRequest {
+            params: Vec::new(),
+            sql: scheduling_interactive_sql(&tables[tenant]),
+            deadline_ms: Some(QUEUED_QUERY_DEADLINE_MS),
+        };
+        let granted_tx = granted_tx.clone();
+        waiters.insert(
+            label,
+            tokio::spawn(async move {
+                let mut stream = query
+                    .query(&request)
+                    .await
+                    .map_err(|refusal| format!("{label} was never granted: {refusal}"))?;
+                let _ = granted_tx.send(label);
+                let _ = stream.next_batch().await;
+                Ok::<(), String>(())
+            }),
+        );
         wait_for_queued(server, waiters.len()).await?;
     }
 
-    // One released unit is enough: each granted waiter returns it on completion,
-    // so the queue drains one grant at a time and completion order is grant
-    // order.
-    let released = held.pop().ok_or("no held envelope to release")?;
-    released.abort();
-    let _ = released.await;
-
-    for waiter in waiters {
-        waiter
-            .await
-            .map_err(|error| format!("a queued waiter panicked: {error}"))?
-            .map_err(|refusal| format!("a queued waiter was never granted: {refusal}"))?;
+    // Exactly one slot unit is ever free, and each grant parks on its schema
+    // stall holding it until the test frees it for the next waiter. Nothing
+    // else can be granted meanwhile, so observation order is grant order.
+    server.stall_next_query_after_schema();
+    let first = held.pop().ok_or("no held envelope to release")?;
+    first.abort();
+    let _ = first.await;
+    let mut granted = Vec::new();
+    for remaining in (0..waiters.len()).rev() {
+        server.wait_query_schema_stall().await?;
+        let label = granted_rx.recv().await.ok_or("the grant channel closed")?;
+        if let Ok(other) = granted_rx.try_recv() {
+            return Err(format!("{other} was granted while {label} held the only unit").into());
+        }
+        if server.oracle_runtime_inspection()?.queued_queries != u64::try_from(remaining)? {
+            return Err(format!("{label}'s grant left the queue at the wrong depth").into());
+        }
+        granted.push(label);
+        if remaining > 0 {
+            server.stall_next_query_after_schema();
+        }
+        let holder = waiters
+            .remove(label)
+            .ok_or("an unknown waiter was granted")?;
+        holder.abort();
+        if let Ok(Err(refusal)) = holder.await {
+            return Err(refusal.into());
+        }
     }
-    let granted = order
-        .lock()
-        .map_err(|_| "queue order lock poisoned")?
-        .clone();
     if granted != ["first-older", "second", "first-newer"] {
         return Err(format!(
             "the queue granted {granted:?}, which is not per-tenant FIFO with equal tenant weight"

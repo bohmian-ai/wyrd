@@ -185,7 +185,7 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
     );
     assert!(
         server
-            .scribe_staging_backlog_for_test()
+            .scribe_staging_backlog_for_test(None)
             .expect("the pod's staged backlog is inspectable")
             .live_members
             > 0,
@@ -362,7 +362,7 @@ fn batch_values(tenant_ordinal: usize, batch: usize) -> Vec<i64> {
 /// Panics when the totals are not inspectable or any of them does not settle.
 fn assert_terminal_reconciliation(server: &WyrdTestServer) {
     let staging = server
-        .scribe_staging_backlog_for_test()
+        .scribe_staging_backlog_for_test(None)
         .expect("the pod's staged backlog is inspectable");
     assert_eq!(
         staging.outstanding_claims, 0,

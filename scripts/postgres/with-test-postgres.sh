@@ -111,10 +111,13 @@ export WYRD_PLATFORM_DATABASE_URL="postgres://wyrd_platform_admin:${platform_adm
 # platform-admin pools are already 2 and read their own suffixed vars.
 export WYRD_DB_MAX_CONNECTIONS="${WYRD_DB_MAX_CONNECTIONS:-8}"
 
-PGPASSWORD="$admin_password" psql "$admin_dsn" \
+# Bootstrap with the container's own psql so the client always matches the
+# server; `roles.sql` needs psql 15+, which a host PATH does not guarantee.
+"${compose[@]}" exec -T postgres psql --username=wyrd_test_admin --dbname=wyrd \
+  --set=ON_ERROR_STOP=1 \
   --set=app_password="$app_password" \
   --set=platform_admin_password="$platform_admin_password" \
-  --file="$repo_root/crates/wyrd/wyrd-sql/bootstrap/roles.sql"
+  <"$repo_root/crates/wyrd/wyrd-sql/bootstrap/roles.sql"
 
 set +e
 "$@"

@@ -429,7 +429,7 @@ pub(crate) async fn reclaim_stopped_claim(fixture: &ForgeFixture) {
         .expect("expire the exact stopped Forge claim");
         assert_eq!(
             vala_sql::queries::forge_tasks::ForgeTasks::new(fixture.operator_pool.clone())
-                .reclaim_expired_attempts(1)
+                .reclaim_expired_attempts(1, None)
                 .await
                 .expect("production bounded reclaim"),
             vec![(task_id, attempt_id)],

@@ -1257,6 +1257,23 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// `start_telemetry` found a tracer provider Wyrd did not install.
+    ///
+    /// Replacing an application's own provider would silently redirect or
+    /// drop its spans, so Wyrd refuses instead of taking over.
+    #[error("[WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS",
+        status = 409,
+        title = "A tracer provider is already installed",
+        remediation = "Add the Wyrd span exporter to the application's existing provider instead of calling start_telemetry."
+    )]
+    SdkTelemetryProviderExists {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// An observation was attempted before `start_bifrost` connected a writer.
     #[error("[WYRD_SDK_400_BIFROST_NOT_STARTED] {message}")]
     #[wyrd_error(
@@ -4115,6 +4132,7 @@ impl WyrdError {
             | Self::SdkUnknownAlias { message, details }
             | Self::SdkUnknownVerifier { message, details }
             | Self::SdkBifrostAlreadyStarted { message, details }
+            | Self::SdkTelemetryProviderExists { message, details }
             | Self::SdkBifrostNotStarted { message, details }
             | Self::SdkBifrostClosed { message, details }
             | Self::SdkInvalidObservation { message, details }

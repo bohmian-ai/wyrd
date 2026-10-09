@@ -10,6 +10,9 @@ the ``otel`` extra (``pip install 'wyrd[otel]'``).
 ``with state.run(...)`` carry the record-level ``wyrd.card_ref`` and
 ``wyrd.run_id`` attributes Bifrost extracts. Everything in that path is
 optional and fail-open: without ``opentelemetry-api`` it is a no-op.
+
+``WyrdState.start_telemetry`` delegates to ``_start_telemetry``, which installs
+one global SDK tracer provider exporting through ``span_exporter``.
 """
 
 from __future__ import annotations
@@ -45,6 +48,10 @@ _SCOPE_KEY: Any = _otel_context.create_key("wyrd.run_scope") if _OTEL_AVAILABLE 
 # second processor, which is harmless because the processor is stateless and
 # setting the same two attributes again is idempotent.
 _MARKER = "_wyrd_run_correlation"
+
+# Private marker on the provider ``_start_telemetry`` installed, so a repeated
+# start returns it instead of mistaking it for the application's own provider.
+_INSTALLED = "_wyrd_installed"
 
 
 def _scope_stack(parent_context: Any = None) -> tuple[tuple[str, str], ...]:
@@ -161,7 +168,7 @@ def _exit_run(card_ref: str, run_id: str) -> None:
 
 _EXPORTER_EXTRA = (
     "Wyrd OTLP exporters need the otel extra: pip install 'wyrd[otel]' "
-    "(opentelemetry-exporter-otlp-proto-http)"
+    "(opentelemetry-sdk, opentelemetry-exporter-otlp-proto-http)"
 )
 
 
@@ -184,6 +191,34 @@ def _session(client: WyrdClient) -> Any:
 def _endpoint(client: WyrdClient, signal: str) -> str:
     """The signal-specific OTLP/HTTP URL on ``client``'s server."""
     return f"{client.server_url.rstrip('/')}/v1/{signal}"
+
+
+def _start_telemetry(client: WyrdClient) -> Any:
+    """Install the global tracer provider exporting spans as ``client``.
+
+    Returns the installed provider, or the one an earlier call installed, so a
+    repeated call is idempotent. Returns ``None`` when the application already
+    installed its own provider; the caller refuses with the catalog error.
+
+    Raises:
+        ImportError: naming the ``otel`` extra when the SDK or exporter is absent.
+    """
+    try:
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    except ImportError as missing:
+        raise ImportError(_EXPORTER_EXTRA) from missing
+    current = _otel_trace.get_tracer_provider()
+    if getattr(current, _INSTALLED, False):
+        return current
+    if not isinstance(current, _otel_trace.ProxyTracerProvider):
+        return None
+    provider = TracerProvider()
+    provider.add_span_processor(BatchSpanProcessor(span_exporter(client)))
+    install_run_correlation(provider)
+    setattr(provider, _INSTALLED, True)
+    _otel_trace.set_tracer_provider(provider)
+    return provider
 
 
 def span_exporter(client: WyrdClient) -> OTLPSpanExporter:

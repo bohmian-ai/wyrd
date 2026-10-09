@@ -585,7 +585,7 @@ impl WyrdState {
     /// # Errors
     /// Returns the client configuration error when the global config file
     /// cannot be read or parsed, or the credential resolution error.
-    pub(crate) fn client(&self) -> Result<&WyrdClient, WyrdError> {
+    pub fn client(&self) -> Result<&WyrdClient, WyrdError> {
         if let Some(client) = self.client.get() {
             return Ok(client);
         }

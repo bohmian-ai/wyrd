@@ -1,7 +1,7 @@
 """A person signs in once with the CLI and completes the local workflow from the saved login.
 
-On the Keycloak identity lane, the stock exporter and Gateway client built from
-that login keep working after its first access token expires.
+On the Keycloak identity lane, the telemetry exporter and Gateway client built
+from that login keep working after its first access token expires.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from opentelemetry import trace
 from wyrd.bifrost import Bifrost
 from wyrd.client import WyrdClient
 from wyrd.testing import WyrdTestServer
@@ -36,6 +37,7 @@ def server() -> Iterator[WyrdTestServer]:
 
 
 @pytest.mark.identity
+@pytest.mark.usefixtures("fresh_tracer_provider")
 def test_saved_login_completes_the_workflow_past_token_expiry(
     server: WyrdTestServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -56,11 +58,12 @@ def test_saved_login_completes_the_workflow_past_token_expiry(
     )
     assert lapsed.status_code == 401
     assert invoke(client) == "hi"
-    export(worked.traces, worked.agent, "after-expiry")
+    run = worked.state.run("agent")
+    export(run)
+    assert trace.get_tracer_provider().force_flush()
     rows = Bifrost(client=client).sql(
         "SELECT card_uid FROM vala.traces.spans WHERE run_id = $1",
-        ["after-expiry"],
+        [run.run_id],
         model=Attributed,
     )
     assert rows == [Attributed(card_uid=worked.agent_uid)]
-    worked.traces.shutdown()

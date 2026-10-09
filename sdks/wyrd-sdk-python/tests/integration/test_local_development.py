@@ -1,8 +1,8 @@
 """A developer runs Wyrd locally with only the administrator key ``wyrd setup`` printed.
 
 They register and hydrate an assistant, invoke a model through the Gateway with
-the stock OpenAI client, observe and verify a Run, export its spans with the
-stock OpenTelemetry exporter, and query the evidence back. No key is issued and
+the stock OpenAI client, observe and verify a Run, export its spans through
+``state.start_telemetry``, and query the evidence back. No key is issued and
 nothing is flushed on the server's behalf. ``work`` is that whole workflow for
 one client, so the signed-in story proves the same steps for a saved login.
 """
@@ -17,14 +17,15 @@ from pathlib import Path
 
 import openai
 import pytest
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry import trace
 from pydantic import BaseModel
-from wyrd import otel
 from wyrd.bifrost import Bifrost
-from wyrd.cards import CardRef, Cards
+from wyrd.cards import Cards
 from wyrd.client import WyrdClient
+from wyrd.errors import WyrdError
 from wyrd.gateway import Gateway, GatewayAuth
+from wyrd.observe import Run
+from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer, cli
 
 from .gateway.support import Upstream
@@ -43,8 +44,7 @@ class Attributed(BaseModel):
 class Worked:
     """What ``work`` leaves running for a caller to keep using."""
 
-    traces: TracerProvider
-    agent: str
+    state: WyrdState
     agent_uid: str
 
 
@@ -86,11 +86,10 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
     judgment = run.for_card("agent").observe.verify("answer-is-yes", {"answer": "yes"})
     assert (judgment.passed, judgment.kind) == (True, "eval_assertion")
 
-    agent_ref = state.card_ref("agent")
-    agent = str(CardRef(agent_ref.kind, agent_ref.name, agent_ref.version, space=agent_ref.space))
-    traces = TracerProvider()
-    traces.add_span_processor(BatchSpanProcessor(otel.span_exporter(client)))
-    export(traces, agent, run.run_id)
+    state.start_telemetry()
+    state.start_telemetry()
+    export(run.for_card("agent"))
+    # Shutdown flushes the exported span.
     state.shutdown()
 
     bifrost = Bifrost(client=client)
@@ -99,15 +98,13 @@ def work(client: WyrdClient, bundle_home: Path) -> Worked:
             f"SELECT card_uid FROM {table} WHERE run_id = $1", [run.run_id], model=Attributed
         )
         assert rows == [Attributed(card_uid=str(state.card_ref(alias).uid))], table
-    return Worked(traces, agent, str(agent_ref.uid))
+    return Worked(state, str(state.card_ref("agent").uid))
 
 
-def export(traces: TracerProvider, agent: str, run_id: str) -> None:
-    """Export one ``answer`` span attributed to ``agent`` and ``run_id`` and flush it."""
-    with traces.get_tracer("wyrd.tests.local").start_as_current_span("answer") as span:
-        span.set_attribute("wyrd.card_ref", agent)
-        span.set_attribute("wyrd.run_id", run_id)
-    assert traces.force_flush()
+def export(run: Run) -> None:
+    """Start one ``answer`` span inside ``run``'s scope, which attributes it to that Run and Card."""
+    with run, trace.get_tracer("wyrd.tests.local").start_as_current_span("answer"):
+        pass
 
 
 def configure_gateway(client: WyrdClient) -> None:
@@ -152,9 +149,34 @@ def server() -> Iterator[WyrdTestServer]:
     yield from local_server()
 
 
+@pytest.mark.usefixtures("fresh_tracer_provider")
 def test_admin_key_completes_the_local_workflow(server: WyrdTestServer, tmp_path: Path) -> None:
     client = WyrdClient(
         server_url=server.base_url, credential=server.tenant_admin_key(), grpc_url=server.grpc_url
     )
 
-    work(client, tmp_path).traces.shutdown()
+    work(client, tmp_path)
+
+
+@pytest.mark.usefixtures("fresh_tracer_provider")
+def test_start_telemetry_refuses_the_applications_own_provider(
+    server: WyrdTestServer, tmp_path: Path
+) -> None:
+    from opentelemetry.sdk.trace import TracerProvider
+
+    client = WyrdClient(
+        server_url=server.base_url, credential=server.tenant_admin_key(), grpc_url=server.grpc_url
+    )
+    cards = Cards(client)
+    register(cards, "cards/latency_baseline/latency-baseline.yaml")
+    register(cards, "cards/verify_in_real_time/latency-model.yaml")
+    register(cards, "cards/verify_in_real_time/assistant.yaml")
+    state = hydrated(download(cards, "assistant", tmp_path), client)
+    own = TracerProvider()
+    trace.set_tracer_provider(own)
+
+    with pytest.raises(WyrdError) as refused:
+        state.start_telemetry()
+
+    assert refused.value.code == "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS"
+    assert trace.get_tracer_provider() is own

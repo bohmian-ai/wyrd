@@ -56,6 +56,20 @@ JUDGE_VERDICT = {
 """The local LLM judge's answer: the graded answer passes."""
 
 
+@pytest.fixture
+def fresh_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset OpenTelemetry's once-only global tracer provider for one test.
+
+    The API lets a process install its global provider once; restoring the two
+    module globals afterwards keeps each telemetry test's install its own.
+    """
+    from opentelemetry import trace
+    from opentelemetry.util._once import Once
+
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
+
+
 @pytest.fixture(scope="session")
 def receiver() -> Iterator[Receiver]:
     """Serve the session's judge provider and Operator hook endpoint."""

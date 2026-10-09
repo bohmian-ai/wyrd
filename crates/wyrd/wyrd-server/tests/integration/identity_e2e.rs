@@ -2381,6 +2381,42 @@ async fn retained_decisions(srv: &WyrdTestServer, tenant: DataTenantId, predicat
         .len()
 }
 
+/// `tenant`'s retained candidate-activation decisions as
+/// `(principal, credential, permission, outcome)`, read once every decision
+/// `srv` staged so far is retained.
+///
+/// A replica reads its own live Scribe; a stopped replica's persisted rows
+/// reach other replicas only through Forge publication, so callers read each
+/// replica before it stops.
+///
+/// # Panics
+/// Panics when audit retention does not settle or the read fails.
+async fn activation_decisions(
+    srv: &WyrdTestServer,
+    tenant: DataTenantId,
+) -> Vec<(String, Option<String>, String, String)> {
+    srv.await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    srv.retained_audit_records(
+        tenant,
+        "audit_principal_id, credential_id, permission, outcome",
+        "operation = 'identity.oidc.candidate.activate'",
+    )
+    .await
+    .expect("retained activation decisions read")
+    .into_iter()
+    .map(|row| {
+        (
+            row[0].clone().unwrap_or_default(),
+            row[1].clone(),
+            row[2].clone().unwrap_or_default(),
+            row[3].clone().unwrap_or_default(),
+        )
+    })
+    .collect()
+}
+
 // ─── Tenant human connection administration ─────────────────────────────────
 
 /// Assert a refusal's status and stable code.
@@ -3062,6 +3098,7 @@ async fn tenant_connection_rotation_journey() {
         k2_only.open(&late_under_k1).is_err(),
         "A sealed the late write under K1"
     );
+    let mut recovery_decisions = activation_decisions(&replica_a, tenant).await;
     replica_a
         .shutdown()
         .await
@@ -3164,29 +3201,8 @@ async fn tenant_connection_rotation_journey() {
     // 8. Each recovery decision is retained on the canonical audit path,
     //    attributed to the recovery principal and its verified credential;
     //    the malformed key left none. The rows are compared per principal in
-    //    decision order.
-    replica_b
-        .await_audit_retained()
-        .await
-        .expect("audit retention settles");
-    let recovery_decisions: Vec<(String, Option<String>, String, String)> = replica_b
-        .retained_audit_records(
-            tenant,
-            "audit_principal_id, credential_id, permission, outcome",
-            "operation = 'identity.oidc.candidate.activate'",
-        )
-        .await
-        .expect("retained activation decisions read")
-        .into_iter()
-        .map(|row| {
-            (
-                row[0].clone().unwrap_or_default(),
-                row[1].clone(),
-                row[2].clone().unwrap_or_default(),
-                row[3].clone().unwrap_or_default(),
-            )
-        })
-        .collect();
+    //    decision order: A's, read before it stopped, then B's.
+    recovery_decisions.extend(activation_decisions(&replica_b, tenant).await);
     let admin_id = principal_id_of(token);
     let runtime_id = non_admin.id().as_uuid().to_string();
     let recovery_id = recovery_admin.id().as_uuid().to_string();

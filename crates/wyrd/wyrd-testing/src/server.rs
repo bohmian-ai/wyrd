@@ -849,7 +849,9 @@ impl WyrdTestServer {
     /// and state tokens, waits up to `budget` for a retained serve task, and
     /// aborts and joins that task when the budget expires so it is never
     /// detached. Unless a bound production serve task already returned its
-    /// drain report, it then runs the existing [`Bifrost::shutdown`] against a
+    /// drain report, it then runs the existing [`Bifrost::shutdown`] (an
+    /// in-process server first writes its Scribe outbox and records that no
+    /// supervised Forge task exists, as the bound serve task would) against a
     /// `budget` deadline, whose failure path aborts every selected role, and
     /// falls back to [`Bifrost::abort`] when that shutdown does not finish in
     /// time. A zero `budget` skips the graceful Bifrost drain and aborts
@@ -900,6 +902,17 @@ impl WyrdTestServer {
         if !self.bifrost_settled {
             let bifrost = &self.inner.state.bifrost;
             let deadline = tokio::time::Instant::now() + budget;
+            if matches!(self.mode, Mode::InProcess) && !budget.is_zero() {
+                // No serve task runs this drain, so follow its order here:
+                // write the Scribe outbox while Scribe still accepts, then
+                // drain Bifrost with no supervised Forge task to join.
+                self.inner
+                    .state
+                    .scribe_outbox
+                    .shutdown(deadline.into_std())
+                    .await;
+                bifrost.mark_unsupervised_for_test();
+            }
             let drained = !budget.is_zero()
                 && matches!(
                     tokio::time::timeout_at(deadline, bifrost.shutdown(deadline.into_std())).await,

@@ -1819,6 +1819,20 @@ impl Bifrost {
         self.test_resources.as_ref()
     }
 
+    /// Records that no production supervisor runs this graph's Forge tasks.
+    ///
+    /// An in-process test server composes Bifrost without `BoundServer::run`,
+    /// so nothing spawns a supervised Forge task and nothing records the join
+    /// that [`Self::shutdown`] requires; without this, every graceful drain
+    /// refuses at that check and falls back to an abort that discards work
+    /// Scribe already accepted. A no-op when Forge is not selected.
+    #[cfg(feature = "test-support")]
+    pub fn mark_unsupervised_for_test(&self) {
+        if let Some(forge) = &self.forge {
+            forge.mark_supervision_drained(true);
+        }
+    }
+
     /// Borrows the selected Forge runtime.
     #[must_use]
     pub(crate) fn forge(&self) -> Option<&Forge> {

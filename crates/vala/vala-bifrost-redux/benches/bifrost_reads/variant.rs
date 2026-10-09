@@ -18,7 +18,7 @@
 //! aborts naming the case. Then each case is timed end to end and planning
 //! alone: [`WARM_UP`] of untimed runs, then [`SAMPLES`] timed runs per engine,
 //! the engines alternating every run. The section prints both tables and every
-//! gate the plan sets that the run misses.
+//! gate the plan sets with its ratio and verdict.
 
 use std::fs::File;
 use std::ops::Range;
@@ -416,7 +416,7 @@ pub async fn run(tables: &OracleBenchTables, root: &Path) -> VariantReport {
 }
 
 impl VariantReport {
-    /// Prints the end-to-end table, the planning table, and every missed gate.
+    /// Prints the end-to-end table, the planning table, and every gate.
     pub fn print(&self) {
         Self::table(
             "Variant reads: plain DataFusion vs Wyrd hot and published",
@@ -424,16 +424,13 @@ impl VariantReport {
             &self.timed,
         );
         Self::table("Variant planning only", |t| &t.plan, &self.timed);
-        let misses = self.misses();
-        println!("\n## Variant gates\n");
-        if misses.is_empty() {
-            println!("Every gate passes.");
-        } else {
-            println!("| gate | case | engine | ratio | limit |");
-            println!("|---|---|---|---:|---|");
-            for miss in &misses {
-                println!("{miss}");
-            }
+        let gates = self.gates();
+        let missed = gates.iter().filter(|gate| gate.ends_with("MISS |")).count();
+        println!("\n## Variant gates ({missed} of {} missed)\n", gates.len());
+        println!("| gate | case | engine | ratio | limit | verdict |");
+        println!("|---|---|---|---:|---|---|");
+        for gate in &gates {
+            println!("{gate}");
         }
     }
 
@@ -454,14 +451,16 @@ impl VariantReport {
         }
     }
 
-    /// Every gate this run misses, each as one Markdown table row.
+    /// Every gate with its ratio and `PASS` or `MISS`, each as one Markdown
+    /// table row.
     ///
     /// Shredded over unshredded p50: at most 0.8x for key reads and 2.0x for
     /// whole-Variant reads, per engine; planning within ±10%, per engine. Wyrd
     /// over plain `DataFusion` p50: at most 1.10x, per layout and Wyrd path.
-    fn misses(&self) -> Vec<String> {
+    fn gates(&self) -> Vec<String> {
         let ratio = |a: &Latency, b: &Latency| a.p50.as_secs_f64() / b.p50.as_secs_f64();
-        let mut misses = Vec::new();
+        let verdict = |pass: bool| if pass { "PASS" } else { "MISS" };
+        let mut gates = Vec::new();
         for shredded in self.timed.iter().filter(|t| t.layout == "shredded") {
             let id = format!("{}/{}", shredded.shape, shredded.case);
             let unshredded = self
@@ -478,28 +477,29 @@ impl VariantReport {
             };
             for (engine, index) in ENGINES.iter().zip(0..) {
                 let run = ratio(&shredded.run[index], &unshredded.run[index]);
-                if run > limit {
-                    misses.push(format!(
-                        "| shredded / unshredded | `{id}` | {engine} | {run:.2} | <= {limit} |"
-                    ));
-                }
+                gates.push(format!(
+                    "| shredded / unshredded | `{id}` | {engine} | {run:.2} | <= {limit} | {} |",
+                    verdict(run <= limit)
+                ));
                 let plan = ratio(&shredded.plan[index], &unshredded.plan[index]);
-                if !(0.9..=1.1).contains(&plan) {
-                    misses.push(format!("| planning shredded / unshredded | `{id}` | {engine} | {plan:.2} | 0.9 to 1.1 |"));
-                }
+                gates.push(format!(
+                    "| planning shredded / unshredded | `{id}` | {engine} | {plan:.2} | 0.9 to 1.1 | {} |",
+                    verdict((0.9..=1.1).contains(&plan))
+                ));
             }
         }
         for t in &self.timed {
             for (engine, index) in ENGINES.iter().zip(0..).skip(1) {
                 let wyrd = ratio(&t.run[index], &t.run[0]);
-                if wyrd > 1.10 {
-                    misses.push(format!(
-                        "| Wyrd / DataFusion | `{}/{}/{}` | {engine} | {wyrd:.2} | <= 1.10 |",
-                        t.shape, t.layout, t.case
-                    ));
-                }
+                gates.push(format!(
+                    "| Wyrd / DataFusion | `{}/{}/{}` | {engine} | {wyrd:.2} | <= 1.10 | {} |",
+                    t.shape,
+                    t.layout,
+                    t.case,
+                    verdict(wyrd <= 1.10)
+                ));
             }
         }
-        misses
+        gates
     }
 }

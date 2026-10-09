@@ -1147,7 +1147,7 @@ pub async fn build_state(
     .await?;
     #[cfg(feature = "test-support")]
     if overrides.fail_after_scribe_activation {
-        bifrost.abort().await;
+        bifrost.abort();
         return Err(ServerBootError::Scribe(
             "test-injected failure after Scribe activation".to_owned(),
         ));
@@ -1193,7 +1193,7 @@ async fn rollback_state_roles(state: &AppState) {
     let deadline = std::time::Instant::now();
     state.bifrost.begin_shutdown();
     if state.bifrost.shutdown(deadline).await.is_err() {
-        state.bifrost.abort().await;
+        state.bifrost.abort();
     }
 }
 

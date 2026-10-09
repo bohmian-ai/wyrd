@@ -17,7 +17,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 
-use crate::client::NativeWyrdClient;
+use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
 use crate::workflow::{NativeWorkflowLoad, parse_workflow_selector};
 use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
 
@@ -237,8 +237,32 @@ pub fn open_wyrd_state(path: String) -> NativeWyrdState {
     }
 }
 
+/// The catalog refusal `WyrdState.startTelemetry` throws when a global tracer
+/// provider is already registered, so its title and remediation come from the
+/// one Rust catalog.
+#[napi]
+pub fn telemetry_provider_exists() -> NativeWyrdError {
+    NativeWyrdError::from_wyrd(&WyrdError::SdkTelemetryProviderExists {
+        message: "an OpenTelemetry tracer provider is already installed".to_owned(),
+        details: serde_json::json!({}),
+    })
+}
+
 #[napi]
 impl NativeWyrdState {
+    /// The client this state's server calls run as, resolving the ambient one
+    /// once on first use, so a telemetry exporter authenticates as the state.
+    #[napi]
+    pub fn client(&self) -> NativeWyrdClientResult {
+        match &self.state {
+            Ok(state) => NativeWyrdClientResult::from_outcome(state.client().cloned()),
+            Err(error) => NativeWyrdClientResult {
+                client: None,
+                error: Some(NativeWyrdError::from_wyrd(error)),
+            },
+        }
+    }
+
     /// Returns the exact root Card reference.
     ///
     /// # Errors
@@ -569,6 +593,13 @@ impl NativeRun {
     #[napi(getter)]
     pub fn alias(&self) -> String {
         self.run.alias().to_owned()
+    }
+
+    /// The exact `CardRef` text of this view's subject, which `Run.scope`
+    /// stamps on spans as `wyrd.card_ref`.
+    #[napi(getter)]
+    pub fn subject(&self) -> String {
+        self.run.subject().to_string()
     }
 
     /// An immutable sibling view scoped to a registered alias.

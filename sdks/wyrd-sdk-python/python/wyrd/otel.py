@@ -49,10 +49,6 @@ _SCOPE_KEY: Any = _otel_context.create_key("wyrd.run_scope") if _OTEL_AVAILABLE 
 # setting the same two attributes again is idempotent.
 _MARKER = "_wyrd_run_correlation"
 
-# Private marker on the provider ``_start_telemetry`` installed, so a repeated
-# start returns it instead of mistaking it for the application's own provider.
-_INSTALLED = "_wyrd_installed"
-
 
 def _scope_stack(parent_context: Any = None) -> tuple[tuple[str, str], ...]:
     """Return the Run scope stack stored in ``parent_context``, or ``()``.
@@ -196,9 +192,10 @@ def _endpoint(client: WyrdClient, signal: str) -> str:
 def _start_telemetry(client: WyrdClient) -> Any:
     """Install the global tracer provider exporting spans as ``client``.
 
-    Returns the installed provider, or the one an earlier call installed, so a
-    repeated call is idempotent. Returns ``None`` when the application already
-    installed its own provider; the caller refuses with the catalog error.
+    Returns the installed provider, which the calling state keeps so a repeated
+    start is idempotent and its shutdown flushes it. Returns ``None`` when a
+    global provider is already installed; the caller refuses with the catalog
+    error.
 
     Raises:
         ImportError: naming the ``otel`` extra when the SDK or exporter is absent.
@@ -208,15 +205,11 @@ def _start_telemetry(client: WyrdClient) -> Any:
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
-    current = _otel_trace.get_tracer_provider()
-    if getattr(current, _INSTALLED, False):
-        return current
-    if not isinstance(current, _otel_trace.ProxyTracerProvider):
+    if not isinstance(_otel_trace.get_tracer_provider(), _otel_trace.ProxyTracerProvider):
         return None
     provider = TracerProvider()
     provider.add_span_processor(BatchSpanProcessor(span_exporter(client)))
     install_run_correlation(provider)
-    setattr(provider, _INSTALLED, True)
     _otel_trace.set_tracer_provider(provider)
     return provider
 

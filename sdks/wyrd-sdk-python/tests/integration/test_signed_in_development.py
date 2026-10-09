@@ -12,7 +12,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from opentelemetry import trace
 from wyrd.bifrost import Bifrost
 from wyrd.client import WyrdClient
 from wyrd.testing import WyrdTestServer
@@ -60,7 +59,7 @@ def test_saved_login_completes_the_workflow_past_token_expiry(
     assert invoke(client) == "hi"
     run = worked.state.run("agent")
     export(run)
-    assert trace.get_tracer_provider().force_flush()
+    worked.state.shutdown()
     rows = Bifrost(client=client).sql(
         "SELECT card_uid FROM vala.traces.spans WHERE run_id = $1",
         [run.run_id],

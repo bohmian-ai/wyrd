@@ -181,9 +181,8 @@ impl PyWyrdState {
         if self.telemetry.get().is_some() {
             return Ok(());
         }
-        let client = PyWyrdClient::from_native(
-            self.inner.client().map_err(WyrdPyError::from)?.clone(),
-        );
+        let client =
+            PyWyrdClient::from_native(self.inner.client().map_err(WyrdPyError::from)?.clone());
         let provider = py
             .import("wyrd.otel")?
             .call_method1("_start_telemetry", (client,))?;

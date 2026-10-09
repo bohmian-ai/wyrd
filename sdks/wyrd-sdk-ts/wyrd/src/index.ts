@@ -24,6 +24,7 @@ const {
   openWyrdState,
   tableConfigFromArrowIpc,
   tableConfigFromJsonSchema,
+  telemetryProviderExists,
   workflowFromYaml,
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
@@ -1268,6 +1269,11 @@ export class WyrdClient {
     this.#native = native;
   }
 
+  /** @internal Wrap a native client another handle resolved, such as a state's. */
+  static fromNative(native: NativeWyrdClient): WyrdClient {
+    return new WyrdClient(native);
+  }
+
   /**
    * Build a client without performing IO.
    *
@@ -2246,6 +2252,16 @@ let otelApi: typeof import("@opentelemetry/api") | null | undefined;
  * no installed API, no active span, or an invalid context supplies nothing.
  */
 function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string } {
+  const api = otel();
+  const spanContext = api?.trace.getActiveSpan()?.spanContext();
+  if (spanContext === undefined || !api?.isSpanContextValid(spanContext)) {
+    return {};
+  }
+  return { traceId: spanContext.traceId, spanId: spanContext.spanId };
+}
+
+/** The application's `@opentelemetry/api`, or `null` when it is not installed. */
+function otel(): typeof import("@opentelemetry/api") | null {
   if (otelApi === undefined) {
     try {
       otelApi = require("@opentelemetry/api") as typeof import("@opentelemetry/api");
@@ -2253,11 +2269,7 @@ function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string 
       otelApi = null;
     }
   }
-  const spanContext = otelApi?.trace.getActiveSpan()?.spanContext();
-  if (spanContext === undefined || !otelApi?.isSpanContextValid(spanContext)) {
-    return {};
-  }
-  return { traceId: spanContext.traceId, spanId: spanContext.spanId };
+  return otelApi;
 }
 
 /** The closed own-key set of one {@link EvalMediaRef}. */
@@ -2463,6 +2475,25 @@ export class Run {
   async invoke(variables: Readonly<Record<string, string>> = {}): Promise<string> {
     return lifecycleValue<string>(await this.#native.invoke(strictJson("variables", variables)));
   }
+
+  /**
+   * Run `fn` inside this view's scope: spans started in it, across awaits,
+   * carry this run and Card once {@link WyrdState.startTelemetry} installed
+   * telemetry. Without `@opentelemetry/api` it only calls `fn`.
+   *
+   * @param fn - The work to scope.
+   * @returns What `fn` returns.
+   */
+  scope<T>(fn: () => T): T {
+    const api = otel();
+    if (api === null) {
+      return fn();
+    }
+    const scoped = api.context
+      .active()
+      .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subject, this.#native.runId]);
+    return api.context.with(scoped, fn);
+  }
 }
 
 /**
@@ -2474,6 +2505,8 @@ export class Run {
  */
 export class WyrdState {
   readonly #native: NativeWyrdState;
+  /** The tracer provider {@link WyrdState.startTelemetry} installed. */
+  #telemetry: { forceFlush(): Promise<void> } | undefined;
 
   private constructor(native: NativeWyrdState) {
     this.#native = native;
@@ -2636,6 +2669,37 @@ export class WyrdState {
   }
 
   /**
+   * Install the global OpenTelemetry tracer provider exporting spans to this
+   * state's server as the state's client.
+   *
+   * Spans export through the stock OTLP/HTTP exporter `spanExporter` builds, which
+   * asks the client for a fresh access token on every export; spans started
+   * inside {@link Run.scope} carry that run and Card. Node's `AsyncLocalStorage`
+   * context manager is registered unless the application registered one. A
+   * second call is idempotent, and {@link WyrdState.shutdown} flushes only
+   * this provider. Needs the optional `@opentelemetry/api`,
+   * `@opentelemetry/context-async-hooks`, `@opentelemetry/sdk-trace-base`, and
+   * `@opentelemetry/exporter-trace-otlp-proto` peers.
+   *
+   * @throws a {@link WyrdError}: `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when
+   * a global tracer provider is already registered (add `spanExporter` to it
+   * instead), or the credential error when the state's client cannot resolve.
+   */
+  async startTelemetry(): Promise<void> {
+    if (this.#telemetry !== undefined) {
+      return;
+    }
+    const native = this.#native.client();
+    const client = WyrdClient.fromNative(nativeHandle(native.client, native.error));
+    const { startTelemetry } = await import("./otel.js");
+    const provider = startTelemetry(client);
+    if (provider === undefined) {
+      throw projectedError(telemetryProviderExists());
+    }
+    this.#telemetry = provider;
+  }
+
+  /**
    * Open one invocation over this state, targeting `alias` or the root Service.
    *
    * Local only: no network IO and no server-side Run resource. `alias`
@@ -2669,11 +2733,13 @@ export class WyrdState {
    * admission is not a durable acknowledgement, so an abrupt exit before it
    * resolves can lose pending rows. After an ambiguous failure, retry
    * `shutdown()` on the same state rather than replacing the writer; a
-   * successfully closed state stays closed.
+   * successfully closed state stays closed. A tracer provider
+   * {@link WyrdState.startTelemetry} installed is flushed first.
    *
    * @throws a {@link WyrdError} for the first producer or sink failure.
    */
   async shutdown(): Promise<void> {
+    await this.#telemetry?.forceFlush();
     lifecycleValue<null>(await this.#native.shutdown());
   }
 }

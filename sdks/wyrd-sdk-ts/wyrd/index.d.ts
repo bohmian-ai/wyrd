@@ -613,6 +613,11 @@ export declare class NativeRun {
   get runId(): string
   /** The alias this view was opened with. */
   get alias(): string
+  /**
+   * The exact `CardRef` text of this view's subject, which `Run.scope`
+   * stamps on spans as `wyrd.card_ref`.
+   */
+  get subject(): string
   /** An immutable sibling view scoped to a registered alias. */
   forCard(alias: string): NativeRunOpen
   /**
@@ -832,6 +837,11 @@ export declare class NativeWyrdClient {
  * on the first read instead of as an untyped constructor failure.
  */
 export declare class NativeWyrdState {
+  /**
+   * The client this state's server calls run as, resolving the ambient one
+   * once on first use, so a telemetry exporter authenticates as the state.
+   */
+  client(): NativeWyrdClientResult
   /**
    * Returns the exact root Card reference.
    *
@@ -1228,6 +1238,13 @@ export declare function tableConfigFromArrowIpc(table: string, schemaIpc: Buffer
  * hyphenated wire spelling is returned as catalog metadata.
  */
 export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfigResult
+
+/**
+ * The catalog refusal `WyrdState.startTelemetry` throws when a global tracer
+ * provider is already registered, so its title and remediation come from the
+ * one Rust catalog.
+ */
+export declare function telemetryProviderExists(): NativeWyrdError
 
 /**
  * Parse a Workflow from its Card envelope YAML text, resolving inline

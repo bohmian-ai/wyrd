@@ -2,13 +2,12 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { BasicTracerProvider, BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { trace } from "@opentelemetry/api";
 import OpenAI from "openai";
 import { expect } from "vitest";
 import { z } from "zod";
 
-import { Bifrost, Cards, Gateway, type WyrdClient, WyrdState, gatewayFetch } from "@wyrd/sdk";
-import { spanExporter } from "@wyrd/sdk/otel";
+import { Bifrost, Cards, Gateway, type Run, type WyrdClient, WyrdState, gatewayFetch } from "@wyrd/sdk";
 import { cli } from "@wyrd/testing";
 
 import { fixture } from "./server.js";
@@ -28,14 +27,15 @@ export const Attributed = z.object({ card_uid: z.string().nullable() });
 
 /** What {@link work} leaves running for a caller to keep using. */
 export interface Worked {
-  readonly traces: BasicTracerProvider;
-  readonly agent: string;
+  readonly state: WyrdState;
+  readonly bundle: string;
   readonly agentUid: string;
 }
 
 /**
  * Run the whole local workflow as `client`: register and hydrate the
- * assistant, invoke the Gateway, observe and verify a Run, export a span, and
+ * assistant, invoke the Gateway, observe and verify a Run, export a span
+ * through `state.startTelemetry`, and
  * read the evidence back. No key is issued and nothing is flushed.
  */
 export async function work(client: WyrdClient): Promise<Worked> {
@@ -56,10 +56,10 @@ export async function work(client: WyrdClient): Promise<Worked> {
   const judgment = await run.forCard("agent").observe.verify("answer-is-yes", { answer: "yes" });
   expect(judgment).toMatchObject({ passed: true, kind: "eval_assertion" });
 
-  const agentRef = state.cardRef("agent");
-  const agent = `${agentRef.space}/${agentRef.kind}/${agentRef.name}@${agentRef.version}`;
-  const traces = new BasicTracerProvider({ spanProcessors: [new BatchSpanProcessor(spanExporter(client))] });
-  await exportSpan(traces, agent, run.runId);
+  await state.startTelemetry();
+  await state.startTelemetry();
+  exportSpan(run.forCard("agent"));
+  // Shutdown flushes the exported span.
   await state.shutdown();
 
   const bifrost = await Bifrost.connect({ client });
@@ -70,16 +70,12 @@ export async function work(client: WyrdClient): Promise<Worked> {
     const rows = await bifrost.sql(`SELECT card_uid FROM ${table} WHERE run_id = $1`, [run.runId], Attributed);
     expect(rows, table).toEqual([{ card_uid: state.cardRef(alias).uid }]);
   }
-  return { traces, agent, agentUid: agentRef.uid ?? "" };
+  return { state, bundle, agentUid: state.cardRef("agent").uid ?? "" };
 }
 
-/** Export one `answer` span attributed to `agent` and `runId` and flush it. */
-export async function exportSpan(traces: BasicTracerProvider, agent: string, runId: string): Promise<void> {
-  traces
-    .getTracer("wyrd.tests.local")
-    .startSpan("answer", { attributes: { "wyrd.card_ref": agent, "wyrd.run_id": runId } })
-    .end();
-  await traces.forceFlush();
+/** Start one `answer` span inside `run`'s scope, which attributes it to that run and Card. */
+export function exportSpan(run: Run): void {
+  run.scope(() => trace.getTracer("wyrd.tests.local").startSpan("answer").end());
 }
 
 /** Write the `openai-key` credential and deploy `gpt-4o` on it as `client`. */

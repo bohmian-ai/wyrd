@@ -41,12 +41,13 @@ test("saved login completes the workflow past token expiry", async ({ server }) 
   const lapsed = await fetch(`${server.baseUrl}/v1/cards`, { headers: { authorization: `Bearer ${original}` } });
   expect(lapsed.status).toBe(401);
   expect(await invoke(client)).toBe("hi");
-  await exportSpan(worked.traces, worked.agent, "after-expiry");
+  const run = worked.state.run("agent");
+  exportSpan(run);
+  await worked.state.shutdown();
   const rows = await (await Bifrost.connect({ client })).sql(
     "SELECT card_uid FROM vala.traces.spans WHERE run_id = $1",
-    ["after-expiry"],
+    [run.runId],
     Attributed,
   );
   expect(rows).toEqual([{ card_uid: worked.agentUid }]);
-  await worked.traces.shutdown();
 });

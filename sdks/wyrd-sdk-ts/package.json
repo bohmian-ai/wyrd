@@ -8,6 +8,7 @@
     "@napi-rs/cli": "3.4.1",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/api-logs": "^0.222.0",
+    "@opentelemetry/context-async-hooks": "^2.11.0",
     "@opentelemetry/exporter-logs-otlp-grpc": "^0.222.0",
     "@opentelemetry/exporter-logs-otlp-proto": "^0.222.0",
     "@opentelemetry/exporter-metrics-otlp-grpc": "^0.222.0",

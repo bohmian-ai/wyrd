@@ -7,8 +7,17 @@
 use crate::error::StorageError;
 use crate::local::LocalSigner;
 use crate::tenant_path::ValidatedPath;
+use std::future::{Future, ready};
+use std::pin::Pin;
 use std::time::Duration;
 use wyrd_spec::storage::{S3CompletedPart, StorageBackendKind, UploadPlan, WireProtocol};
+
+/// The future every [`BackendSigner`] signing operation returns.
+///
+/// One boxed type lets each operation keep a single definition whatever
+/// backends a build compiles in: the local signer resolves immediately and a
+/// cloud signer awaits its SDK, and both arms coerce to this one type.
+pub type SignerFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StorageError>> + Send + 'a>>;
 
 /// Active signer for one configured backend.
 #[derive(Debug, Clone)]
@@ -33,136 +42,84 @@ impl BackendSigner {
 
     /// Presign or describe a single PUT upload.
     ///
+    /// Local signing does no IO and resolves immediately; cloud signing awaits
+    /// the backend SDK.
+    ///
     /// # Errors
-    /// Returns a backend error when signing fails or the operation is not yet
-    /// implemented for the active backend.
-    #[cfg(feature = "cloud")]
-    pub async fn presign_single_put(
-        &self,
-        path: &ValidatedPath,
+    /// Returns an invalid URI error when a local path cannot be rendered as a
+    /// file URL, or a backend error when cloud signing fails.
+    pub fn presign_single_put<'a>(
+        &'a self,
+        path: &'a ValidatedPath,
         size_bytes: u64,
         ttl: Duration,
-    ) -> Result<UploadPlan, StorageError> {
+    ) -> SignerFuture<'a, UploadPlan> {
         match self {
-            Self::Local(signer) => signer.presign_single_put(path, size_bytes, ttl),
+            Self::Local(signer) => {
+                Box::pin(ready(signer.presign_single_put(path, size_bytes, ttl)))
+            }
             #[cfg(feature = "cloud")]
-            Self::Cloud(cloud) => cloud.presign_single_put(path, size_bytes, ttl).await,
+            Self::Cloud(cloud) => Box::pin(cloud.presign_single_put(path, size_bytes, ttl)),
         }
-    }
-
-    /// Describe a single PUT upload in a build without cloud support.
-    ///
-    /// Local signing does no IO, so the plan is returned through an
-    /// immediately-ready future while preserving the awaitable signer API.
-    ///
-    /// # Errors
-    /// Returns an invalid URI error when the local path cannot be rendered as
-    /// a file URL.
-    #[cfg(not(feature = "cloud"))]
-    pub fn presign_single_put(
-        &self,
-        path: &ValidatedPath,
-        size_bytes: u64,
-        ttl: Duration,
-    ) -> std::future::Ready<Result<UploadPlan, StorageError>> {
-        let Self::Local(signer) = self;
-        std::future::ready(signer.presign_single_put(path, size_bytes, ttl))
     }
 
     /// Initiate a multipart upload.
     ///
+    /// A local upload is one file write, so the local signer resolves
+    /// immediately with its single-PUT plan; cloud backends await the SDK.
+    ///
     /// # Errors
-    /// Returns a backend error when initialization fails or is not implemented
-    /// for the active backend.
-    #[cfg(feature = "cloud")]
-    pub async fn init_multipart(
-        &self,
-        path: &ValidatedPath,
+    /// Returns an invalid URI error when a local path cannot be rendered as a
+    /// file URL, or a backend error when cloud initialization fails.
+    pub fn init_multipart<'a>(
+        &'a self,
+        path: &'a ValidatedPath,
         part_count: u32,
         part_size_bytes: u64,
         ttl: Duration,
-    ) -> Result<MultipartInit, StorageError> {
+    ) -> SignerFuture<'a, MultipartInit> {
         match self {
-            Self::Local(signer) => signer.init_multipart(path, part_count, part_size_bytes, ttl),
+            Self::Local(signer) => Box::pin(ready(signer.init_multipart(
+                path,
+                part_count,
+                part_size_bytes,
+                ttl,
+            ))),
             #[cfg(feature = "cloud")]
             Self::Cloud(cloud) => {
-                cloud
-                    .init_multipart(path, part_count, part_size_bytes, ttl)
-                    .await
+                Box::pin(cloud.init_multipart(path, part_count, part_size_bytes, ttl))
             }
         }
     }
 
-    /// Initiate a multipart upload in a build without cloud support.
-    ///
-    /// A local upload is one file write, so this returns its single-PUT plan
-    /// through an immediately-ready future while preserving the awaitable
-    /// signer API.
-    ///
-    /// # Errors
-    /// Returns an invalid URI error when the local path cannot be rendered as
-    /// a file URL.
-    #[cfg(not(feature = "cloud"))]
-    pub fn init_multipart(
-        &self,
-        path: &ValidatedPath,
-        part_count: u32,
-        part_size_bytes: u64,
-        ttl: Duration,
-    ) -> std::future::Ready<Result<MultipartInit, StorageError>> {
-        let Self::Local(signer) = self;
-        std::future::ready(signer.init_multipart(path, part_count, part_size_bytes, ttl))
-    }
-
-    /// Presign one multipart part URL in a cloud-enabled build.
+    /// Presign one multipart part URL.
     ///
     /// # Errors
     /// Returns [`StorageError::BackendCapabilityMismatch`] for backends that do
-    /// not use per-part presigning, or a backend error when cloud signing fails.
-    #[cfg(feature = "cloud")]
-    pub async fn presign_part(
-        &self,
-        path: &ValidatedPath,
-        backend_upload_id: &str,
+    /// not use per-part presigning, including the local backend, or a backend
+    /// error when cloud signing fails.
+    pub fn presign_part<'a>(
+        &'a self,
+        path: &'a ValidatedPath,
+        backend_upload_id: &'a str,
         part_number: u32,
         ttl: Duration,
-    ) -> Result<String, StorageError> {
-        #[cfg(not(feature = "cloud"))]
-        std::future::ready(()).await;
+    ) -> SignerFuture<'a, String> {
         match self {
             #[cfg(feature = "cloud")]
             Self::Cloud(cloud) => {
-                cloud
-                    .presign_part(path, backend_upload_id, part_number, ttl)
-                    .await
+                Box::pin(cloud.presign_part(path, backend_upload_id, part_number, ttl))
             }
-            Self::Local(_) => Err(StorageError::BackendCapabilityMismatch {
-                signer: self.kind(),
-                op: "presign_part",
-            }),
+            Self::Local(_) => {
+                // The local backend signs no parts, so the request is refused
+                // whatever it names.
+                let _ = (path, backend_upload_id, part_number, ttl);
+                Box::pin(ready(Err(StorageError::BackendCapabilityMismatch {
+                    signer: self.kind(),
+                    op: "presign_part",
+                })))
+            }
         }
-    }
-
-    /// Presign one multipart part URL in a build without cloud support.
-    ///
-    /// No local backend uses per-part presigning, so this returns the typed
-    /// capability error in an immediately-ready future while preserving the
-    /// awaitable signer API.
-    ///
-    /// # Errors
-    /// Always returns [`StorageError::BackendCapabilityMismatch`].
-    #[cfg(not(feature = "cloud"))]
-    pub fn presign_part(
-        &self,
-        _path: &ValidatedPath,
-        _backend_upload_id: &str,
-        _part_number: u32,
-        _ttl: Duration,
-    ) -> std::future::Ready<Result<String, StorageError>> {
-        std::future::ready(Err(StorageError::BackendCapabilityMismatch {
-            signer: self.kind(),
-            op: "presign_part",
-        }))
     }
 
     /// Complete a server-side finalization step.
@@ -201,76 +158,49 @@ impl BackendSigner {
         }
     }
 
-    /// Abort a multipart upload in a cloud-enabled build.
+    /// Abort a multipart upload.
+    ///
+    /// Local uploads create no remote multipart session, so a local abort is a
+    /// no-op that resolves immediately.
     ///
     /// # Errors
-    /// Returns a backend error when abort fails. GCS returns a capability
-    /// mismatch because its resumable session URI is bearer-equivalent and is
-    /// not persisted server-side.
-    #[cfg(feature = "cloud")]
-    pub async fn abort_multipart(
-        &self,
-        path: &ValidatedPath,
-        backend_upload_id: &str,
-    ) -> Result<(), StorageError> {
-        #[cfg(not(feature = "cloud"))]
-        std::future::ready(()).await;
+    /// Returns a backend error when a cloud abort fails. GCS returns a
+    /// capability mismatch because its resumable session URI is
+    /// bearer-equivalent and is not persisted server-side.
+    pub fn abort_multipart<'a>(
+        &'a self,
+        path: &'a ValidatedPath,
+        backend_upload_id: &'a str,
+    ) -> SignerFuture<'a, ()> {
         match self {
-            Self::Local(_) => Ok(()),
+            Self::Local(_) => {
+                // No remote session exists to name.
+                let _ = (path, backend_upload_id);
+                Box::pin(ready(Ok(())))
+            }
             #[cfg(feature = "cloud")]
-            Self::Cloud(cloud) => cloud.abort_multipart(path, backend_upload_id).await,
+            Self::Cloud(cloud) => Box::pin(cloud.abort_multipart(path, backend_upload_id)),
         }
-    }
-
-    /// Abort a multipart upload in a build without cloud support.
-    ///
-    /// Local uploads do not create remote multipart sessions, so abort is a
-    /// deterministic no-op returned through an immediately-ready future.
-    ///
-    /// # Errors
-    /// This operation does not fail for the local backend.
-    #[cfg(not(feature = "cloud"))]
-    pub fn abort_multipart(
-        &self,
-        _path: &ValidatedPath,
-        _backend_upload_id: &str,
-    ) -> std::future::Ready<Result<(), StorageError>> {
-        std::future::ready(Ok(()))
     }
 
     /// Presign a GET URL.
     ///
+    /// Local signing does no IO and resolves immediately; cloud signing awaits
+    /// the backend SDK.
+    ///
     /// # Errors
-    /// Returns a backend error when signing fails.
-    #[cfg(feature = "cloud")]
-    pub async fn presign_get(
-        &self,
-        path: &ValidatedPath,
+    /// Returns an invalid URI error when a local path cannot be rendered as a
+    /// file URL, or a backend error when cloud signing fails.
+    pub fn presign_get<'a>(
+        &'a self,
+        path: &'a ValidatedPath,
         ttl: Duration,
-    ) -> Result<String, StorageError> {
+    ) -> SignerFuture<'a, String> {
         match self {
-            Self::Local(signer) => signer.presign_get(path, ttl),
+            Self::Local(signer) => Box::pin(ready(signer.presign_get(path, ttl))),
             #[cfg(feature = "cloud")]
-            Self::Cloud(cloud) => cloud.presign_get(path, ttl).await,
+            Self::Cloud(cloud) => Box::pin(cloud.presign_get(path, ttl)),
         }
-    }
-
-    /// Describe a GET URL in a build without cloud support.
-    ///
-    /// Local signing does no IO, so the URL is returned through an
-    /// immediately-ready future while preserving the awaitable signer API.
-    ///
-    /// # Errors
-    /// Returns an invalid URI error when the local path cannot be rendered as
-    /// a file URL.
-    #[cfg(not(feature = "cloud"))]
-    pub fn presign_get(
-        &self,
-        path: &ValidatedPath,
-        ttl: Duration,
-    ) -> std::future::Ready<Result<String, StorageError>> {
-        let Self::Local(signer) = self;
-        std::future::ready(signer.presign_get(path, ttl))
     }
 
     /// Fetch object metadata for completion verification.
@@ -290,40 +220,24 @@ impl BackendSigner {
 
     /// Re-mint an upload plan from non-bearer replay input.
     ///
+    /// Local signing does no IO and resolves immediately; cloud signing awaits
+    /// the backend SDK.
+    ///
     /// # Errors
-    /// Returns a backend error when the replay input does not match the active
-    /// backend or signing fails.
-    #[cfg(feature = "cloud")]
-    pub async fn remint_plan(
-        &self,
-        path: &ValidatedPath,
-        input: &UploadPlanReplayInput,
+    /// Returns a capability mismatch when the replay input does not match the
+    /// active backend, an invalid URI error when a local path cannot be
+    /// rendered as a file URL, or a backend error when cloud signing fails.
+    pub fn remint_plan<'a>(
+        &'a self,
+        path: &'a ValidatedPath,
+        input: &'a UploadPlanReplayInput,
         ttl: Duration,
-    ) -> Result<UploadPlan, StorageError> {
+    ) -> SignerFuture<'a, UploadPlan> {
         match self {
-            Self::Local(signer) => signer.remint_plan(path, input, ttl),
+            Self::Local(signer) => Box::pin(ready(signer.remint_plan(path, input, ttl))),
             #[cfg(feature = "cloud")]
-            Self::Cloud(cloud) => cloud.remint_plan(path, input, ttl).await,
+            Self::Cloud(cloud) => Box::pin(cloud.remint_plan(path, input, ttl)),
         }
-    }
-
-    /// Re-mint an upload plan in a build without cloud support.
-    ///
-    /// Local signing does no IO, so the plan is returned through an
-    /// immediately-ready future while preserving the awaitable signer API.
-    ///
-    /// # Errors
-    /// Returns a capability mismatch when the replay protocol is not local,
-    /// or an invalid URI error when the path cannot be rendered as a file URL.
-    #[cfg(not(feature = "cloud"))]
-    pub fn remint_plan(
-        &self,
-        path: &ValidatedPath,
-        input: &UploadPlanReplayInput,
-        ttl: Duration,
-    ) -> std::future::Ready<Result<UploadPlan, StorageError>> {
-        let Self::Local(signer) = self;
-        std::future::ready(signer.remint_plan(path, input, ttl))
     }
 }
 

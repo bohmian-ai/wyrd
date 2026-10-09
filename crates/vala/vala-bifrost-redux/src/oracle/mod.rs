@@ -2852,8 +2852,10 @@ impl Oracle {
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryAdmissionRejected`] when this pod's CPU
-    /// shape cannot be read, or the mapped planning failure, which is terminal
-    /// for this query: there is no second build and no fallback path.
+    /// shape cannot be read, [`BifrostError::QueryTimeout`] when the deadline
+    /// passes during physical planning, or the mapped planning failure, which
+    /// is terminal for this query: there is no second build and no fallback
+    /// path.
     async fn build_physical_root(
         &self,
         context: &AuthorizedQueryContext,
@@ -2893,9 +2895,15 @@ impl Oracle {
             return Err(BifrostError::QueryExecutionFailed);
         }
         let planning_started = Instant::now();
-        let root = Self::plan_physical(&planning, context, sql)
-            .await
-            .map_err(|OracleExecutionError::Public(error)| error)?;
+        // Planning reads manifests and Parquet footers, so it runs under the
+        // query deadline like every other read.
+        let root = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            Self::plan_physical(&planning, context, sql),
+        )
+        .await
+        .map_err(|_| BifrostError::QueryTimeout)?
+        .map_err(|OracleExecutionError::Public(error)| error)?;
         QueryPhase::PhysicalPlanning.record(planning_started);
         Ok(RetainedPhysicalPlan {
             config: planning.copied_config(),

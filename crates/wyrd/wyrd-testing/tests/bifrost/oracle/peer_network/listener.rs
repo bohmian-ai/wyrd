@@ -34,7 +34,7 @@ const IDENTITY_FILE_NAME: &str = "node-identity.json";
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn peer_listener_is_isolated_mtls_and_role_complete() {
-    prove_peer_listener_isolation()
+    Box::pin(prove_peer_listener_isolation())
         .await
         .expect("peer listener isolation journey");
 }

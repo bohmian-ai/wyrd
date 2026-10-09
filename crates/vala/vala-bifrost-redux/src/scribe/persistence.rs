@@ -97,12 +97,16 @@ fn record_persist_stage(stage: &'static str, started: std::time::Instant) {
         .record(started.elapsed().as_secs_f64());
 }
 
-/// Counts one generation's Parquet-encoded bytes after a durable encode.
+/// Counts one staged member's raw and Parquet-encoded bytes after a durable encode.
 ///
-/// Increments `bifrost_scribe_persistence_encoded_bytes_total` by `file_size`.
-fn record_encoded_bytes(file_size: usize) {
+/// Increments `bifrost_scribe_persistence_raw_bytes_total` by the frozen
+/// bucket's uncompressed Arrow bytes and
+/// `bifrost_scribe_persistence_encoded_bytes_total` by the staged runs' encoded
+/// bytes, so `rate(raw) / rate(encoded)` is the staging compression ratio.
+fn record_staged_bytes(staged: &crate::scribe::member_stager::StagedRuns) {
+    metrics::counter!("bifrost_scribe_persistence_raw_bytes_total").increment(staged.raw_bytes());
     metrics::counter!("bifrost_scribe_persistence_encoded_bytes_total")
-        .increment(u64::try_from(file_size).unwrap_or(u64::MAX));
+        .increment(staged.staged_bytes());
 }
 
 /// Test-tier one-shot failures for the concrete persistence seams.
@@ -2174,7 +2178,7 @@ impl PersistenceWorker {
             }
         };
         record_persist_stage("stage_member", staged_started);
-        record_encoded_bytes(usize::try_from(staged.staged_bytes()).unwrap_or(usize::MAX));
+        record_staged_bytes(&staged);
         let member = staged.member();
         staging.register_member(staged, chrono::Utc::now()).await?;
         Ok(member)
@@ -3224,12 +3228,13 @@ mod tests {
         );
     }
 
-    /// Per-generation encoded bytes are counted after a durable persist.
+    /// Per-member raw and encoded bytes are counted after a durable persist.
     ///
     /// Drives one complete `persist_once` through the real persistence runtime
     /// using the [`IdlePersistenceFixture`] and asserts that
-    /// `bifrost_scribe_persistence_encoded_bytes_total` is incremented by a
-    /// positive amount (the Parquet-encoded size).
+    /// `bifrost_scribe_persistence_raw_bytes_total` and
+    /// `bifrost_scribe_persistence_encoded_bytes_total` are each incremented by
+    /// a positive amount (the Arrow and Parquet-encoded sizes).
     #[tokio::test(flavor = "current_thread")]
     #[cfg(feature = "test-support")]
     async fn persist_once_counts_encoded_bytes() {
@@ -3246,6 +3251,15 @@ mod tests {
         assert!(
             encoded_bytes.is_some_and(|bytes| bytes > 0),
             "encoded bytes must be counted after persist_once"
+        );
+        let raw_bytes = recorder
+            .snapshot()
+            .counters
+            .get("bifrost_scribe_persistence_raw_bytes_total")
+            .copied();
+        assert!(
+            raw_bytes.is_some_and(|bytes| bytes > 0),
+            "raw bytes must be counted after persist_once"
         );
     }
 

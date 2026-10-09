@@ -114,6 +114,14 @@ impl StagedRuns {
         self.staged_bytes
     }
 
+    /// Returns the uncompressed Arrow bytes the frozen bucket held.
+    ///
+    /// This is the size the assembler's target counts and the numerator of
+    /// the staging compression ratio.
+    pub const fn raw_bytes(&self) -> u64 {
+        self.raw_bytes
+    }
+
     /// Returns the inclusive WAL bounds the member's rows cover.
     ///
     /// A live-tail reader needs these to decide whether a pinned cut already

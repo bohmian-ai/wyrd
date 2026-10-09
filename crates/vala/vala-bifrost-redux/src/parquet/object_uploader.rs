@@ -108,6 +108,8 @@ struct UploadFaults {
     fail_after_close: Arc<AtomicBool>,
     /// Largest backend-owned write or read payload observed by the real backend.
     max_backend_payload_bytes: Arc<AtomicUsize>,
+    /// PUT attempts begun, so a test can prove a key was never rewritten.
+    puts: Arc<AtomicUsize>,
 }
 
 impl BifrostParquetUploader {
@@ -141,6 +143,12 @@ impl BifrostParquetUploader {
             .load(Ordering::Acquire)
     }
 
+    /// Returns the PUT attempts begun since construction.
+    #[cfg(test)]
+    fn puts(&self) -> usize {
+        self.faults.puts.load(Ordering::Acquire)
+    }
+
     /// Records one unavoidable backend-owned payload after bounding its length.
     #[cfg(test)]
     fn record_backend_payload(&self, bytes: usize) {
@@ -151,10 +159,11 @@ impl BifrostParquetUploader {
 
     /// Streams a local file through a caller-governed chunk and verifies remote bytes.
     ///
-    /// A failed or ambiguous PUT is resolved by read-back. Absence is retried once;
-    /// contradictory content fails closed. The key is unpublished until the
-    /// catalog commits it, so a PUT overwrites whatever an earlier attempt left
-    /// there (spec REQ-034). `object_store` takes one owned payload for each
+    /// A key that already holds the expected bytes is accepted without a PUT.
+    /// Otherwise a failed or ambiguous PUT is resolved by read-back. Absence is
+    /// retried once; contradictory content fails closed. The key is unpublished
+    /// until the catalog commits it, so a PUT overwrites whatever an earlier
+    /// attempt left there. `object_store` takes one owned payload for each
     /// write or range read; every such payload is bounded by `chunk.len()`,
     /// and the caller charges its retained chunk. This owner never deletes
     /// remote bytes.
@@ -203,7 +212,45 @@ impl BifrostParquetUploader {
         result
     }
 
+    /// Verifies an object a committed publication already names, never
+    /// writing it.
+    ///
+    /// A published key is never uploaded again, so recovery of a committed
+    /// publication only reads the object back against its manifest-fixed
+    /// identity. There is no repair path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParquetUploadError::EmptyChunk`] for an empty chunk,
+    /// [`ParquetUploadError::ContentContradiction`] when the object is missing
+    /// or its length or content differs, and the object-store error when a
+    /// read fails otherwise.
+    pub async fn verify_published(
+        &self,
+        identity: &ParquetObjectIdentity,
+        expected_sha256: [u8; 32],
+        expected_len: u64,
+        chunk: &mut [u8],
+    ) -> Result<VerifiedParquetObject, ParquetUploadError> {
+        if chunk.is_empty() {
+            return Err(ParquetUploadError::EmptyChunk);
+        }
+        match self
+            .verify_remote(identity, expected_sha256, expected_len, chunk)
+            .await
+        {
+            Err(ParquetUploadError::ObjectStore(object_store::Error::NotFound { .. })) => {
+                Err(ParquetUploadError::ContentContradiction)
+            }
+            verified => verified,
+        }
+    }
+
     /// Writes the manifest-fixed object and resolves outcomes by read-back.
+    ///
+    /// The key is read back first: when it already holds the expected bytes
+    /// no PUT is issued. A missing or contradicting object is written, since
+    /// an unpublished key may be overwritten.
     ///
     /// # Errors
     ///
@@ -216,6 +263,11 @@ impl BifrostParquetUploader {
     /// Cancellation may leave the deterministic remote key absent, an aborted
     /// multipart upload, or complete. A retry is safe because it rewrites the
     /// same bytes and verifies the same fixed length and digest.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: both convergence attempts record an error before
+    /// the loop can end without returning.
     async fn converge(
         &self,
         identity: &ParquetObjectIdentity,
@@ -224,6 +276,17 @@ impl BifrostParquetUploader {
         expected_len: u64,
         chunk: &mut [u8],
     ) -> Result<VerifiedParquetObject, ParquetUploadError> {
+        match self
+            .verify_remote(identity, expected_sha256, expected_len, chunk)
+            .await
+        {
+            Ok(verified) => return Ok(verified),
+            Err(
+                ParquetUploadError::ContentContradiction
+                | ParquetUploadError::ObjectStore(object_store::Error::NotFound { .. }),
+            ) => {}
+            Err(error) => return Err(error),
+        }
         let mut last_error = None;
         for attempt in 0..2 {
             if let Err(error) = self.put_file(identity, source, chunk).await {
@@ -270,6 +333,8 @@ impl BifrostParquetUploader {
         source: &Path,
         chunk: &mut [u8],
     ) -> Result<(), ParquetUploadError> {
+        #[cfg(test)]
+        self.faults.puts.fetch_add(1, Ordering::AcqRel);
         #[cfg(test)]
         if self.faults.fail_before_put.swap(false, Ordering::AcqRel) {
             return Err(object_store::Error::Generic {
@@ -508,9 +573,11 @@ mod tests {
         tokio::fs::write(&source, b"different")
             .await
             .expect("replace stage");
+        let contradicted =
+            ParquetObjectIdentity::new("forge/tenant/contradicted.parquet").expect("identity");
         let error = uploader
             .upload_file_verified(
-                &identity,
+                &contradicted,
                 &source,
                 expected_sha256,
                 content.len() as u64,
@@ -520,6 +587,113 @@ mod tests {
             .await
             .expect_err("local bytes that contradict the manifest fail closed");
         assert!(matches!(error, ParquetUploadError::ContentContradiction));
+    }
+
+    /// Writes one staged file and returns its path, expected digest, and length.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stage cannot be written.
+    async fn staged(directory: &Path, content: &[u8]) -> (std::path::PathBuf, [u8; 32], u64) {
+        let source = directory.join("stage.parquet");
+        tokio::fs::write(&source, content)
+            .await
+            .expect("stage write");
+        (source, Sha256::digest(content).into(), content.len() as u64)
+    }
+
+    /// Seeds `identity` with `bytes`, standing for what an earlier attempt or
+    /// a committed publication left at the key.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the seed write fails.
+    async fn seed(store: &Arc<dyn ObjectStore>, identity: &ParquetObjectIdentity, bytes: &[u8]) {
+        store
+            .put(
+                &ObjectPath::from(identity.as_str()),
+                Bytes::copy_from_slice(bytes).into(),
+            )
+            .await
+            .expect("seed remote object");
+    }
+
+    /// A committed publication's object is only read back: a matching one is
+    /// accepted, and a missing or contradicting one fails closed, all with no
+    /// PUT.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any remote state issues a PUT or classifies otherwise.
+    #[tokio::test]
+    async fn published_objects_are_verified_and_never_written() {
+        let content = b"published Parquet bytes";
+        let directory = tempfile::tempdir().expect("temporary stage");
+        let (_, sha256, length) = staged(directory.path(), content).await;
+        let mut chunk = [0_u8; 6];
+        for (remote, accepted) in [
+            (Some(&content[..]), true),
+            (None, false),
+            (Some(&b"other"[..]), false),
+        ] {
+            let store = memory_store();
+            let uploader = BifrostParquetUploader::new(Arc::clone(&store));
+            let identity =
+                ParquetObjectIdentity::new("scribe/tenant/published.parquet").expect("identity");
+            if let Some(remote) = remote {
+                seed(&store, &identity, remote).await;
+            }
+            let verified = uploader
+                .verify_published(&identity, sha256, length, &mut chunk)
+                .await;
+            if accepted {
+                assert_eq!(verified.expect("matching object").sha256, sha256);
+            } else {
+                assert!(matches!(
+                    verified,
+                    Err(ParquetUploadError::ContentContradiction)
+                ));
+            }
+            assert_eq!(uploader.puts(), 0, "a published key is never written");
+        }
+    }
+
+    /// An unpublished key that already holds the expected bytes is accepted
+    /// with no PUT; a missing or contradicting one is written once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a remote state issues the wrong number of PUTs or does not
+    /// converge on the staged bytes.
+    #[tokio::test]
+    async fn unpublished_keys_are_written_only_when_they_differ() {
+        let content = b"unpublished Parquet bytes";
+        let directory = tempfile::tempdir().expect("temporary stage");
+        let (source, sha256, length) = staged(directory.path(), content).await;
+        let mut chunk = [0_u8; 6];
+        for (remote, puts) in [(Some(&content[..]), 0), (None, 1), (Some(&b"other"[..]), 1)] {
+            let store = memory_store();
+            let uploader = BifrostParquetUploader::new(Arc::clone(&store));
+            let identity =
+                ParquetObjectIdentity::new("scribe/tenant/unpublished.parquet").expect("identity");
+            if let Some(remote) = remote {
+                seed(&store, &identity, remote).await;
+            }
+            let verified = uploader
+                .upload_file_verified(
+                    &identity,
+                    &source,
+                    sha256,
+                    length,
+                    &mut chunk,
+                    BifrostUploadRole::Scribe,
+                )
+                .await
+                .expect("the key converges");
+            assert_eq!(verified.sha256, sha256);
+            assert_eq!(uploader.puts(), puts);
+            assert_eq!(remote_bytes(&store, &identity).await.as_ref(), content);
+        }
     }
 
     /// Proves concurrent uploads of the same manifest-fixed bytes both verify.

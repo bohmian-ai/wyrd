@@ -1117,12 +1117,12 @@ pub(super) fn hot_parquet_scan(
 /// Returns the mapped Iceberg error when file planning fails (a vanished
 /// manifest is marked stale), [`BifrostError::QueryTenantInvariant`] for a
 /// file with key metadata, and a not-implemented error for a file with deletes.
-pub(super) async fn published_files(scan: &IcebergTableScan) -> DataFusionResult<Vec<HotFileSource>> {
+pub(super) async fn published_files(
+    scan: &IcebergTableScan,
+) -> DataFusionResult<Vec<HotFileSource>> {
     // A scan of a table with no snapshot plans no file; skip building
     // Iceberg's scan, which probes the host's parallelism each time.
-    if scan.snapshot_id().is_none()
-        && scan.table().metadata().current_snapshot().is_none()
-    {
+    if scan.snapshot_id().is_none() && scan.table().metadata().current_snapshot().is_none() {
         return Ok(Vec::new());
     }
     let mut builder = scan.table().scan();

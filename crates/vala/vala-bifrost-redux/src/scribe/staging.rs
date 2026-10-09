@@ -1111,14 +1111,14 @@ fn stage_io(operation: &'static str) -> impl FnOnce(std::io::Error) -> ScribeErr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 
     /// Builds one publication record standing for a fixture object.
     ///
     /// The manifest round-trip only needs a record that encodes and compares
     /// exactly, so the metrics are the empty projection of a one-row object
     /// rather than a footer-derived one.
-    fn fixture_promotion_record(
+    pub(crate) fn fixture_promotion_record(
         tenant: DataTenantId,
         object_key: &str,
         checksum: &str,

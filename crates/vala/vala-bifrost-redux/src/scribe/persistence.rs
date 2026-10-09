@@ -1576,11 +1576,22 @@ impl ScribeStageMover {
 
     /// Replays one validated durable publication in upload/catalog/cleanup order.
     ///
+    /// `vala.file_list` is read first, because a published key is never
+    /// uploaded again:
+    ///
+    /// - a committed set only has its objects read back, then the publication
+    ///   replays and cleans up;
+    /// - an absent set uploads each object, which writes only a missing or
+    ///   contradicting key, then publishes and cleans up;
+    /// - a partial or contradicting set fails closed with no upload and no
+    ///   cleanup, leaving the manifest for an operator.
+    ///
     /// # Errors
     ///
-    /// Returns an internal error when object identity or verified upload fails,
-    /// when fenced SQL publication is not known committed, or when exact
-    /// post-commit cleanup cannot complete.
+    /// Returns an internal error when the publication state cannot be read or
+    /// conflicts, object identity or verification fails, fenced SQL
+    /// publication is not known committed, or exact post-commit cleanup
+    /// cannot complete.
     ///
     /// # Cancellation
     ///
@@ -1599,6 +1610,12 @@ impl ScribeStageMover {
             publication = %publication.logical_identity,
             "reconciling staged publication under the active replacement fence"
         );
+        let state = reconciler.publication_state(&publication.rows).await?;
+        if state == file_list_writer::ArtifactSetPublication::Conflict {
+            return Err(ScribeError::Internal {
+                detail: "recovered Scribe publication contradicts the file list".to_owned(),
+            });
+        }
         for claim in &publication.claims {
             let identity =
                 ParquetObjectIdentity::new(claim.object_key.clone()).map_err(|error| {
@@ -1606,19 +1623,25 @@ impl ScribeStageMover {
                         detail: format!("invalid recovered Scribe object identity: {error}"),
                     }
                 })?;
-            self.uploader
-                .upload_file_verified(
-                    &identity,
-                    &claim.staged_path,
-                    claim.sha256,
-                    claim.length,
-                    chunk,
-                    BifrostUploadRole::Scribe,
-                )
-                .await
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!("recovered staged upload failed: {error}"),
-                })?;
+            let verified = if state == file_list_writer::ArtifactSetPublication::Committed {
+                self.uploader
+                    .verify_published(&identity, claim.sha256, claim.length, chunk)
+                    .await
+            } else {
+                self.uploader
+                    .upload_file_verified(
+                        &identity,
+                        &claim.staged_path,
+                        claim.sha256,
+                        claim.length,
+                        chunk,
+                        BifrostUploadRole::Scribe,
+                    )
+                    .await
+            };
+            verified.map_err(|error| ScribeError::Internal {
+                detail: format!("recovered staged upload failed: {error}"),
+            })?;
         }
         match reconciler.publish(&publication.rows).await {
             ScribePublicationOutcome::Committed(_) => {
@@ -1762,6 +1785,21 @@ impl ScribePublicationReconciler {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn fail_claim_retirement(&self) -> bool {
         self.faults.take_claim_retirement()
+    }
+
+    /// Reads what `vala.file_list` already records for one full set,
+    /// without writing or fencing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when the set is malformed or the read fails.
+    pub(crate) async fn publication_state(
+        &self,
+        rows: &[file_list_writer::FileListArtifactInsert],
+    ) -> Result<file_list_writer::ArtifactSetPublication, ScribeError> {
+        file_list_writer::artifact_set_publication(&self.operator_pool, rows)
+            .await
+            .map_err(ScribeError::from)
     }
 
     /// Attempts or reconciles one exact full-set publication.

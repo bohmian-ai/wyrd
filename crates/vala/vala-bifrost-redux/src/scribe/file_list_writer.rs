@@ -546,6 +546,71 @@ pub async fn insert_artifact_set_fenced(
     artifact_set_outcome(first, rows, inserted)
 }
 
+/// What `vala.file_list` already records for one writer-v2 artifact set.
+///
+/// The set's ordered identity `(data_tenant_id, node_id, writer_epoch,
+/// wal_lsn_min, wal_lsn_max, file_ordinal)` is its publication record, exactly
+/// as [`insert_artifact_set_fenced`] treats it. Recovery reads this before any
+/// upload, because a published object key is never written again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactSetPublication {
+    /// Every row is present and matches the set exactly.
+    Committed,
+    /// No row of the set is present.
+    Absent,
+    /// Some rows are present, or present rows contradict the set.
+    Conflict,
+}
+
+impl ArtifactSetPublication {
+    /// Classifies the rows selected for one set's identity against the set.
+    fn classify(existing: &[ExistingArtifactRow], rows: &[FileListArtifactInsert]) -> Self {
+        if existing.is_empty() {
+            Self::Absent
+        } else if artifact_replay_matches(existing, rows) {
+            Self::Committed
+        } else {
+            Self::Conflict
+        }
+    }
+}
+
+/// Reads, without locking, what `vala.file_list` records for one artifact set.
+///
+/// Runs the same ordered identity `SELECT` as [`insert_artifact_set_fenced`]
+/// and classifies the result with the same exact-replay comparison. It writes
+/// nothing and takes no fence.
+///
+/// # Errors
+///
+/// Returns a SQL invariant error for an empty or noncontiguous set, and the
+/// SQL error when the read fails.
+pub async fn artifact_set_publication(
+    operator_pool: &OperatorPool,
+    rows: &[FileListArtifactInsert],
+) -> Result<ArtifactSetPublication, SqlError> {
+    let first = validate_artifact_set(
+        rows,
+        None,
+        "writer-v2 publication set is empty",
+        "writer-v2 publication set is noncontiguous or crosses generations",
+    )?;
+    let existing: Vec<ExistingArtifactRow> = sqlx::query_as(
+        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,file_checksum FROM vala.file_list \
+         WHERE data_tenant_id=$1 AND node_id=$2 AND writer_epoch=$3 AND wal_lsn_min=$4 AND wal_lsn_max=$5 \
+         ORDER BY file_ordinal",
+    )
+    .bind(first.data_tenant_id.as_uuid())
+    .bind(first.node_id)
+    .bind(first.writer_epoch)
+    .bind(first.wal_lsn_min)
+    .bind(first.wal_lsn_max)
+    .fetch_all(operator_pool.pool())
+    .await
+    .map_err(SqlError::from)?;
+    Ok(ArtifactSetPublication::classify(&existing, rows))
+}
+
 /// Deterministic test barrier spanning the two sides of durable publication.
 ///
 /// The first phase pauses after Scribe has persisted its local publication
@@ -656,7 +721,108 @@ fn valid_artifact_identity(row: &FileListArtifactInsert) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::artifact_row_id;
+    use uuid::Uuid;
+    use wyrd_spec::DataTenantId;
+
+    use super::{
+        ArtifactSetPublication, ExistingArtifactRow, FileListArtifactInsert, artifact_row_id,
+    };
+    use crate::catalog::TimeGranularity;
+    use crate::scribe::staging::tests::fixture_promotion_record;
+
+    /// Builds a contiguous two-artifact set of one generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture instant does not bucket.
+    fn artifact_set() -> Vec<FileListArtifactInsert> {
+        let tenant = DataTenantId::new_v7();
+        let node_id = Uuid::now_v7();
+        let now = chrono::Utc::now();
+        let partition = TimeGranularity::Hour
+            .bucket(now)
+            .expect("fixture instant buckets");
+        (0..2_i16)
+            .map(|ordinal| {
+                let id = Uuid::now_v7();
+                let file_path = format!("tenant/spans/member-{ordinal}.parquet");
+                let file_checksum = format!("{ordinal:064}");
+                FileListArtifactInsert {
+                    id,
+                    data_tenant_id: tenant,
+                    namespace: "vala.traces".to_owned(),
+                    table_name: "spans".to_owned(),
+                    promotion_record: fixture_promotion_record(
+                        tenant,
+                        &file_path,
+                        &file_checksum,
+                        4,
+                        partition,
+                        id,
+                    ),
+                    file_path,
+                    file_size: 4,
+                    row_count: 1,
+                    min_event_time: now,
+                    max_event_time: now,
+                    partition,
+                    node_id,
+                    writer_epoch: 3,
+                    wal_lsn_min: 1,
+                    wal_lsn_max: 2,
+                    file_ordinal: ordinal,
+                    file_checksum,
+                }
+            })
+            .collect()
+    }
+
+    /// Projects `row` as the ordered identity `SELECT` returns it.
+    fn existing(row: &FileListArtifactInsert) -> ExistingArtifactRow {
+        (
+            row.file_ordinal,
+            row.namespace.clone(),
+            row.table_name.clone(),
+            row.file_path.clone(),
+            row.file_size,
+            row.row_count,
+            row.min_event_time,
+            row.max_event_time,
+            row.partition.granularity_str().to_owned(),
+            row.partition.start_utc(),
+            Some(row.file_checksum.clone()),
+        )
+    }
+
+    /// A set is committed only when every row is present and matches, absent
+    /// only when no row is, and a conflict for a partial or contradicting set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of the four row states classifies otherwise.
+    #[test]
+    fn artifact_set_publication_classifies_every_row_state() {
+        let rows = artifact_set();
+        let all = rows.iter().map(existing).collect::<Vec<_>>();
+        assert_eq!(
+            ArtifactSetPublication::classify(&all, &rows),
+            ArtifactSetPublication::Committed
+        );
+        assert_eq!(
+            ArtifactSetPublication::classify(&[], &rows),
+            ArtifactSetPublication::Absent
+        );
+        assert_eq!(
+            ArtifactSetPublication::classify(&all[..1], &rows),
+            ArtifactSetPublication::Conflict
+        );
+        let mut mismatched = all;
+        mismatched[1].10 = Some("f".repeat(64));
+        assert_eq!(
+            ArtifactSetPublication::classify(&mismatched, &rows),
+            ArtifactSetPublication::Conflict
+        );
+    }
 
     /// Proves retries reuse one row identity while distinct artifacts remain distinct.
     #[test]

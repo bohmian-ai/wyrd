@@ -366,11 +366,15 @@ discovery proposed no findings, return an explicitly validated empty ledger.
 
 The orchestrator may include only independently confirmed or revised findings.
 A rejected finding is omitted, not softened into optional advice. If validation
-shows that the correction needs a new product, public API,
-architecture, security, compatibility, cross-service, concurrency, resource-
-ownership, or persistent-data decision, do not prescribe it as remediation;
-return `SPEC_REVISION_REQUIRED` when the approved task truly requires that
-decision, otherwise reject the finding as out of scope.
+shows that the correction needs a new product, public API, architecture,
+security, compatibility, cross-service, concurrency, resource-ownership, or
+persistent-data decision, return `SPEC_REVISION_REQUIRED` when the approved
+task truly requires that decision, otherwise reject the finding as out of
+scope. `SPEC_REVISION_REQUIRED` is an approval gate, not permission to omit the
+remedy: retain the finding and provide a decision-complete recommended spec
+revision together with the implementation correction and proof that follow if
+the user approves it. Do not defer discovery of the fix to `$wyrd-spec` or the
+implementation agent.
 
 Missing source, incomplete caller tracing, an unavailable independent
 `ponytail-rev`, or disagreement that cannot be resolved from approved authority
@@ -394,13 +398,17 @@ prior-finding closure, and one verdict:
   change entered the diff. A rejected proposal does not force failure merely
   because its discovery reviewer reported `FAIL`;
 - `FIX_REQUIRED` — one or more bounded implementation findings remain;
-- `SPEC_REVISION_REQUIRED` — correction requires changing approved behavior or
-  an expensive-to-reverse decision; or
+- `SPEC_REVISION_REQUIRED` — one or more retained findings require explicit
+  approval of a recommended spec change before their implementation correction
+  may proceed; or
 - `BLOCKED` — the immutable subject, authority, diff, or required independent
   review cannot be obtained.
 
-For `FIX_REQUIRED`, also write one self-contained remediation task named
-`<task-id>-R<n>-<name>.md` in the same review directory. It must contain:
+For `FIX_REQUIRED` and `SPEC_REVISION_REQUIRED`, also write one self-contained
+remediation task named `<task-id>-R<n>-<name>.md` in the same review directory.
+Include every retained finding; do not drop findings that remain implementable
+under the current spec merely because another finding requires a revision. It
+must contain:
 
 1. the approved spec path, original task path, and candidate identities;
 2. an issue diagnosis for each material finding: the violated obligation,
@@ -409,28 +417,57 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
    one diagnosis at the root that lists every symptom it closes, including
    symptoms patched in earlier rounds;
 3. the intended correction outcome;
-4. a decision-complete recommendation within the approved behavior: select the
-   minimal correction approach, name the existing owner or mechanism to reuse,
-   identify the source of the invalid state and affected consumers, resolve
-   alternatives that would change scope or proof, and explain why that approach
-   closes the diagnosed gap without relying on repeated downstream guards;
+4. a decision-complete recommendation: for findings already authorized by the
+   approved spec, select the minimal correction approach, name the existing
+   owner or mechanism to reuse, identify the source of the invalid state and
+   affected consumers, resolve alternatives that would change scope or proof,
+   and explain why that approach closes the diagnosed gap without relying on
+   repeated downstream guards; for spec-revision findings, provide the same
+   implementation detail contingent on the draft revision below;
 5. constraints, preserved behavior, and explicit non-goals;
 6. acceptance criteria mapped to every finding; and
 7. focused proof that directly exercises the gap plus broader verification.
+
+For each finding that requires a spec revision, the remediation task must also
+contain:
+
+1. the exact approved clauses that conflict with or fail to authorize the
+   correction;
+2. the recommended replacement, addition, or deletion as concrete draft spec
+   text, including the next revision number and a revision-history entry;
+3. the material decision and rationale the user must approve, with rejected
+   alternatives when they affect observable behavior or an expensive-to-reverse
+   boundary;
+4. the implementation correction that becomes authorized by that draft text,
+   including its owner, affected consumers, and preserved behavior; and
+5. sequencing that requires explicit human approval of the spec revision before
+   changing code, followed by the same focused and broader proof required for
+   any other remediation.
+
+Do not revise the spec merely to waive a failed obligation or make the current
+candidate pass. Removing or weakening an obligation is a valid recommendation
+only when higher authority and the user's stated intent establish that the
+obligation itself is wrong; state that evidence and still identify any code,
+tests, or generated artifacts that the approved revision would require.
 
 Do not write an outcome checklist or merely restate the acceptance matrix. The
 diagnosis and recommendation are the substance of the remediation task;
 acceptance criteria only prove that correction. An implementer must not need to
 rediscover the defect or choose the correction boundary. If that recommendation
 requires a new product, public API, architecture, security, compatibility,
-cross-service, concurrency-semantics, or persistent-data decision, return
-`SPEC_REVISION_REQUIRED` instead.
+cross-service, concurrency-semantics, or persistent-data decision, use
+`SPEC_REVISION_REQUIRED` and include the draft spec change and contingent
+implementation correction above; never substitute the verdict for the
+remediation packet.
 
 The remediation task packages validated findings for a fresh implementation
 agent; it is not another design plan. Do not specify helpers, private methods,
-local control flow, fixture structure, or optional improvements. Route it
-directly to `$wyrd-implement`. A later review reassesses the complete cumulative
-candidate against the original task.
+local control flow, fixture structure, or optional improvements. Route a
+`FIX_REQUIRED` packet directly to `$wyrd-implement`. Route a
+`SPEC_REVISION_REQUIRED` packet first to `$wyrd-spec` for the named approval;
+after approval, route that same packet to `$wyrd-implement` without making the
+implementer reconstruct the omitted fix. A later review reassesses the complete
+cumulative candidate against the original task and approved revision.
 
 Return only the verdict, verdict path, remediation task path when present, and
 finding IDs. `PASS` is the task's completion gate. Review does not implement,

@@ -22,7 +22,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
@@ -436,7 +436,7 @@ impl ScribeBatch {
 ///
 /// The roster is read from cluster membership on every attempt, so a Scribe
 /// that joins, leaves, or stops being ready is followed without restart.
-struct ScribePeers {
+pub(crate) struct ScribePeers {
     /// Authoritative cluster membership.
     cluster: Arc<ClusterRegistry>,
     /// Cluster mTLS identity presented to every peer Scribe.
@@ -517,7 +517,7 @@ impl ScribePeers {
 }
 
 /// Where the sink submits.
-enum ScribeRoute {
+pub(crate) enum ScribeRoute {
     /// Scribe runs in this pod and acknowledges in-process.
     Local(Arc<dyn Scribe>),
     /// This pod runs no Scribe and submits over the peer plane.
@@ -525,23 +525,23 @@ enum ScribeRoute {
 }
 
 impl ScribeRoute {
-    /// Selects the route for this process's Bifrost roles.
+    /// Selects the route from this process's own dependencies.
     ///
-    /// A local Scribe wins; an Oracle-only pod uses its peer-plane identity
-    /// and cluster membership; a process with neither reaches no Scribe.
-    fn select(
-        scribe: Option<&Arc<crate::state::Scribe>>,
-        oracle: Option<&Arc<crate::state::Oracle>>,
+    /// A local Scribe wins. Otherwise a pod with a peer-plane identity
+    /// submits to the ready Scribes in `cluster` membership, whatever other
+    /// roles it runs. A process with neither reaches no Scribe.
+    pub(crate) fn select(
+        local: Option<&Arc<vala_bifrost_redux::scribe::ScribeImpl>>,
+        cluster: &Arc<ClusterRegistry>,
+        tls: Option<&BifrostPeerTls>,
     ) -> Option<Self> {
-        match (scribe, oracle) {
-            (Some(scribe), _) => Some(Self::Local(Arc::clone(scribe.scribe()) as Arc<dyn Scribe>)),
-            (None, Some(oracle)) => oracle.lifecycle_transport().peer_tls().map(|tls| {
-                Self::Peer(ScribePeers {
-                    cluster: oracle.cluster(),
-                    tls: tls.clone(),
-                    channels: Mutex::new(HashMap::new()),
-                })
-            }),
+        match (local, tls) {
+            (Some(scribe), _) => Some(Self::Local(Arc::clone(scribe) as Arc<dyn Scribe>)),
+            (None, Some(tls)) => Some(Self::Peer(ScribePeers {
+                cluster: Arc::clone(cluster),
+                tls: tls.clone(),
+                channels: Mutex::new(HashMap::new()),
+            })),
             (None, None) => None,
         }
     }
@@ -563,61 +563,26 @@ impl ScribeRoute {
     }
 }
 
-/// The route slot a [`ScribeSink`] reads, bound once Bifrost is assembled.
-///
-/// Gate, Oracle, and the peer security audit need the outbox before the
-/// Scribe and Oracle runtimes exist, so the outbox starts unbound and the
-/// assembled composition binds its route. `None` once bound means this
-/// process reaches no Scribe.
-type RouteSlot = Arc<OnceLock<Option<ScribeRoute>>>;
-
-/// Binds the route of the process's [`ScribeOutbox`] once Bifrost's roles
-/// exist.
-pub struct ScribeRouteBinding(RouteSlot);
-
-impl ScribeRouteBinding {
-    /// Binds the route this process's roles select; a second bind is ignored.
-    pub(crate) fn bind(
-        self,
-        scribe: Option<&Arc<crate::state::Scribe>>,
-        oracle: Option<&Arc<crate::state::Oracle>>,
-    ) {
-        let _ = self.0.set(ScribeRoute::select(scribe, oracle));
-    }
-}
-
-/// Whether a process composing `scribe` and `oracle` reaches any Scribe,
-/// in-process or over the peer plane.
-pub(crate) fn reaches_scribe(
-    scribe: Option<&Arc<crate::state::Scribe>>,
-    oracle: Option<&Arc<crate::state::Oracle>>,
-) -> bool {
-    scribe.is_some()
-        || oracle.is_some_and(|oracle| oracle.lifecycle_transport().peer_tls().is_some())
-}
-
 /// Groups, encodes, identifies, and submits one tenant's logical writes.
 pub struct ScribeSink {
-    /// Submission route, bound after Bifrost assembly.
-    route: RouteSlot,
+    /// Submission route selected at boot; `None` reaches no Scribe.
+    route: Option<ScribeRoute>,
     /// Submissions so far; rotates peer Scribes across retries.
     attempts: AtomicUsize,
 }
 
 impl ScribeSink {
-    /// Starts the process outbox with an unbound route, returning it with the
-    /// binding Bifrost assembly completes.
+    /// Starts an outbox submitting along `route`, or dropping every write
+    /// when `route` is `None`.
     #[must_use]
-    pub fn outbox() -> (Arc<ScribeOutbox>, ScribeRouteBinding) {
-        let route = RouteSlot::default();
-        let outbox = Outbox::new(
+    pub(crate) fn outbox(route: Option<ScribeRoute>) -> Arc<ScribeOutbox> {
+        Outbox::new(
             Self {
-                route: Arc::clone(&route),
+                route,
                 attempts: AtomicUsize::new(0),
             },
             SCRIBE_WRITERS,
-        );
-        (outbox, ScribeRouteBinding(route))
+        )
     }
 
     /// Starts an outbox submitting in-process to `scribe`, standing in for a
@@ -625,13 +590,13 @@ impl ScribeSink {
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn local_outbox(scribe: Arc<dyn Scribe>) -> Arc<ScribeOutbox> {
-        Outbox::new(
-            Self {
-                route: Arc::new(OnceLock::from(Some(ScribeRoute::Local(scribe)))),
-                attempts: AtomicUsize::new(0),
-            },
-            SCRIBE_WRITERS,
-        )
+        Self::outbox(Some(ScribeRoute::Local(scribe)))
+    }
+
+    /// Whether this sink reaches any Scribe, in-process or over the peer plane.
+    #[must_use]
+    pub const fn reaches_scribe(&self) -> bool {
+        self.route.is_some()
     }
 }
 
@@ -784,8 +749,7 @@ impl OutboxSink for ScribeSink {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeRefusal::Unavailable`] while the route is unbound, and
-    /// the retryable refusal of the first frame Scribe could not take.
+    /// Returns the retryable refusal of the first frame Scribe could not take.
     ///
     /// # Panics
     ///
@@ -796,10 +760,7 @@ impl OutboxSink for ScribeSink {
         tenant: DataTenantId,
         items: &[ScribeWrite],
     ) -> Result<(), ScribeRefusal> {
-        let Some(route) = self.route.get() else {
-            return Err(ScribeRefusal::Unavailable);
-        };
-        let Some(route) = route else {
+        let Some(route) = &self.route else {
             count_lost::<Self>(items.len());
             tracing::warn!(outbox = Self::NAME, %tenant, lost = items.len(), "this process reaches no Scribe; writes are dropped");
             return Ok(());
@@ -853,7 +814,15 @@ mod tests {
     use wyrd_sql::queries::verifier_runs::RunInput;
     use wyrd_tonic::tonic::Code;
 
-    use super::{ScribeOutbox, ScribeRefusal, ScribeSink, ScribeWrite, VerifierAttribution};
+    use uuid::Uuid;
+    use vala_bifrost_redux::cluster::ClusterRegistry;
+    use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
+    use vala_sql::ValaPostgres;
+    use wyrd_spec::vala::api::NodeId;
+
+    use super::{
+        ScribeOutbox, ScribeRefusal, ScribeRoute, ScribeSink, ScribeWrite, VerifierAttribution,
+    };
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
     use crate::components::gateway::recording::RecordingScribe;
@@ -1106,21 +1075,55 @@ mod tests {
         assert_eq!(scribe.attempts(), 4, "the rejected frame is never retried");
     }
 
-    /// Proves an unbound route keeps writes pending for retry, and binding it
-    /// for a process that reaches no Scribe consumes them.
+    /// Proves a process that reaches no Scribe consumes its writes.
     ///
     /// # Panics
     ///
-    /// Panics when the unbound outbox settles or the bound one does not.
+    /// Panics when the outbox claims a route or does not settle.
     #[tokio::test]
-    async fn an_unbound_route_waits_and_an_unreachable_one_drops() {
-        let (outbox, route) = ScribeSink::outbox();
+    async fn an_unreachable_route_drops() {
+        let outbox = ScribeSink::outbox(None);
+        assert!(!outbox.sink().reaches_scribe());
+        let tenant = DataTenantId::new_v7();
+        outbox.stage(tenant, capture(tenant));
+        settle(&outbox).await;
+    }
+
+    /// Proves a pod without a local Scribe routes over the peer plane from
+    /// membership and its peer identity alone, with no Oracle runtime, and
+    /// keeps writes pending while membership names no ready Scribe.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no peer route is selected or a write settles without a
+    /// Scribe to take it.
+    #[tokio::test]
+    async fn a_peer_route_needs_no_oracle() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused.invalid/none")
+            .expect("lazy pool builds without connecting");
+        let cluster = Arc::new(ClusterRegistry::new(
+            ValaPostgres::from_pool(pool),
+            NodeId::new(Uuid::now_v7()),
+        ));
+        let tls = BifrostPeerTls::new(
+            Vec::new(),
+            "bifrost-peer".to_owned(),
+            Vec::new(),
+            secrecy::SecretString::from(String::new()),
+        );
+        let route = ScribeRoute::select(None, &cluster, Some(&tls));
+        assert!(matches!(route, Some(ScribeRoute::Peer(_))));
+        let outbox = ScribeSink::outbox(route);
+        assert!(outbox.sink().reaches_scribe());
         let tenant = DataTenantId::new_v7();
         outbox.stage(tenant, capture(tenant));
         let soon = Instant::now() + Duration::from_millis(200);
-        assert_eq!(outbox.settle(soon).await, 1, "an unbound write waits");
-        route.bind(None, None);
-        settle(&outbox).await;
+        assert_eq!(
+            outbox.settle(soon).await,
+            1,
+            "a write waits for a ready Scribe"
+        );
     }
 
     /// Proves in-process refusals and peer status codes classify into the

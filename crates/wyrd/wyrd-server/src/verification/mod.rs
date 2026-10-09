@@ -426,10 +426,7 @@ impl VerificationRuntimeBuilder<'_> {
             (Some(fault), Some(scribe)) => fault.outbox(Arc::clone(scribe.scribe()) as _),
             _ => outbox,
         };
-        if crate::scribe_outbox::reaches_scribe(
-            self.state.bifrost.scribe(),
-            self.state.bifrost.oracle(),
-        ) {
+        if outbox.sink().reaches_scribe() {
             let runner = VerifierRunner::new(
                 postgres.clone(),
                 operator,

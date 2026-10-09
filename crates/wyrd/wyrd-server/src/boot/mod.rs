@@ -1054,10 +1054,18 @@ pub async fn compose_bifrost(
         None
     };
 
+    // The one process membership poller: every role, the forwarder, and the
+    // Scribe outbox read this registry, and it outlives their drain.
+    let membership_poller = Arc::clone(&cluster_registry).start_snapshot_poller();
     // The one process Scribe outbox: Gate, Oracle, peer security, every
     // request-path decision, gateway capture, and Verifier results stage on
-    // it; its route is bound once the roles exist.
-    let (scribe_outbox, scribe_route) = crate::scribe_outbox::ScribeSink::outbox();
+    // it. It submits to the local Scribe, else to a peer Scribe.
+    let scribe_outbox =
+        crate::scribe_outbox::ScribeSink::outbox(crate::scribe_outbox::ScribeRoute::select(
+            scribe.as_ref().map(|parts| &parts.scribe),
+            &cluster_registry,
+            peer_tls.as_ref(),
+        ));
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
             crate::oracle::PostgresPeerSecurityAudit::try_new(
@@ -1082,7 +1090,7 @@ pub async fn compose_bifrost(
             registered_role: parts.scribe_role,
             fragment_verifier: fragment_authority,
             fragment_security_audit,
-            role_shutdown: shutdown.clone(),
+            process_drain: shutdown.clone(),
             activated: peer_tls.is_none(),
         })))
     } else {
@@ -1177,7 +1185,7 @@ pub async fn compose_bifrost(
             query_controls: Some(query_controls),
             observation_runs,
             scribe_outbox,
-            scribe_route,
+            membership_poller,
             #[cfg(feature = "test-support")]
             resources: Some(bifrost_resources.clone()),
         }),
@@ -2073,7 +2081,7 @@ impl BuiltOracleRole {
             lifecycle_transport,
             resources,
             peer,
-            role_shutdown: shutdown,
+            process_drain: shutdown,
             activated: activate,
         }) {
             Ok(runtime) => Arc::new(runtime),

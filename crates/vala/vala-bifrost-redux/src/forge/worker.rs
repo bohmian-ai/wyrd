@@ -2159,8 +2159,11 @@ impl ForgeWorker {
 
     /// Resolves every durable attempt left unsettled before this worker starts.
     ///
-    /// Reclaims lapsed claims and reconciles Prepared attempts until the durable
-    /// predicate reports nothing recoverable. Ready and retryable demand is not
+    /// Reclaims lapsed claims, and every claim this owner's previous
+    /// incarnation still holds, then reconciles Prepared attempts until the
+    /// durable predicate reports nothing recoverable. A supervised restart
+    /// keeps the owner identity, and the stopped loop joined its attempts, so
+    /// waiting for their leases to lapse would only hold readiness down. Ready and retryable demand is not
     /// recovery — the slots claim it once they start — so this terminates.
     ///
     /// # Errors
@@ -2185,7 +2188,7 @@ impl ForgeWorker {
                     return Ok(());
                 }
                 let reclaimed = self
-                    .reclaim_expired_attempts(claim_limits.max_active_per_tenant)
+                    .reclaim_attempts(claim_limits.max_active_per_tenant, Some(self.owner))
                     .await?;
                 if reclaimed.len() < claim_limits.max_active_per_tenant as usize {
                     break;
@@ -2325,6 +2328,15 @@ impl ForgeWorker {
 
     /// Reclaims expired durable attempts.
     ///
+    /// # Errors
+    /// Returns the failures of [`Self::reclaim_attempts`].
+    async fn reclaim_expired_attempts(&self, cap: u32) -> Result<Vec<(Uuid, Uuid)>, ForgeError> {
+        self.reclaim_attempts(cap, None).await
+    }
+
+    /// Reclaims expired durable attempts, plus every attempt `previous_owner`
+    /// still holds when a starting worker names its own identity.
+    ///
     /// A reclaimed leader-dispatched attempt closes as cancelled, and is
     /// reported Failed so the leader reschedules its table at once, as
     /// `RisingWave` cancels an expired compactor's tasks; a lost report is
@@ -2333,10 +2345,14 @@ impl ForgeWorker {
     /// # Errors
     /// Returns SQL errors from the bounded operator reclaim or the dispatch
     /// read.
-    async fn reclaim_expired_attempts(&self, cap: u32) -> Result<Vec<(Uuid, Uuid)>, ForgeError> {
+    async fn reclaim_attempts(
+        &self,
+        cap: u32,
+        previous_owner: Option<Uuid>,
+    ) -> Result<Vec<(Uuid, Uuid)>, ForgeError> {
         let reclaimed = self
             .tasks
-            .reclaim_expired_attempts(cap)
+            .reclaim_expired_attempts(cap, previous_owner)
             .await
             .map_err(ForgeError::Sql)?;
         if reclaimed.is_empty() {

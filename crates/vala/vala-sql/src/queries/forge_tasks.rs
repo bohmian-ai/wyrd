@@ -880,11 +880,21 @@ impl ForgeTasks {
     /// remain excluded. The returned identities were captured
     /// under the same row locks that cleared durable ownership.
     ///
+    /// `previous_owner` also selects the unexpired attempts that owner still
+    /// holds. Only a starting worker passes its own identity: its previous
+    /// incarnation's attempts have stopped, so their leases protect no live
+    /// execution, and clearing the attempt id fences any stale holder.
+    ///
     /// # Errors
     /// Returns SQL errors from the bounded reclaim transaction.
-    pub async fn reclaim_expired_attempts(&self, cap: u32) -> Result<Vec<(Uuid, Uuid)>, SqlError> {
-        sqlx::query_as("WITH victims AS (SELECT task_id,attempt_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() AND attempt_id IS NOT NULL ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1), updated AS (UPDATE vala.forge_tasks t SET state=CASE WHEN t.plan->'parameters'->>'dispatch' IS NULL THEN 'retryable' ELSE 'cancelled' END,attempt_count=attempt_count+1,next_eligible_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id RETURNING v.task_id,v.attempt_id) SELECT task_id,attempt_id FROM updated ORDER BY task_id")
+    pub async fn reclaim_expired_attempts(
+        &self,
+        cap: u32,
+        previous_owner: Option<Uuid>,
+    ) -> Result<Vec<(Uuid, Uuid)>, SqlError> {
+        sqlx::query_as("WITH victims AS (SELECT task_id,attempt_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND (claim_expires_at<statement_timestamp() OR claimed_by=$2) AND attempt_id IS NOT NULL ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1), updated AS (UPDATE vala.forge_tasks t SET state=CASE WHEN t.plan->'parameters'->>'dispatch' IS NULL THEN 'retryable' ELSE 'cancelled' END,attempt_count=attempt_count+1,next_eligible_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id RETURNING v.task_id,v.attempt_id) SELECT task_id,attempt_id FROM updated ORDER BY task_id")
             .bind(i64::from(cap))
+            .bind(previous_owner)
             .fetch_all(self.operator_pool.pool())
             .await
             .map_err(SqlError::from)

@@ -1022,13 +1022,32 @@ impl StagingAssembler {
     /// second ledger. Called after each ownership transition, never per scrape.
     #[must_use]
     pub fn backlog(&self) -> StagingBacklog {
-        let ready = self.ready.values().flat_map(|index| index.members.iter());
-        let claimed = self
+        self.backlog_of(None)
+    }
+
+    /// Returns the staged backlog of one logical table, or of the whole pod
+    /// when `table_name` is `None`.
+    ///
+    /// Selects ready keys and outstanding claims whose table name matches, so
+    /// a test can observe its own table while other writers, such as the
+    /// pod's `audit_log`, stage members beside it.
+    #[must_use]
+    pub fn backlog_of(&self, table_name: Option<&str>) -> StagingBacklog {
+        let selected =
+            |key: &ScribeAssemblyKey| table_name.is_none_or(|name| key.table().name == name);
+        let ready = self
+            .ready
+            .iter()
+            .filter(|(key, _)| selected(key))
+            .flat_map(|(_, index)| index.members.iter());
+        let claims: Vec<&StagingClaim> = self
             .outstanding
             .values()
-            .flat_map(|claim| claim.members.iter());
+            .filter(|claim| selected(claim.key()))
+            .collect();
+        let claimed = claims.iter().flat_map(|claim| claim.members.iter());
         let mut backlog = StagingBacklog {
-            outstanding_claims: self.outstanding.len(),
+            outstanding_claims: claims.len(),
             ..StagingBacklog::default()
         };
         for member in ready.chain(claimed) {

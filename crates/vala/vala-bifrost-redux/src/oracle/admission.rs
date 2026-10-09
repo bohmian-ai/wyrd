@@ -729,19 +729,36 @@ impl OracleAdmission {
     }
 
     /// Closes admission, cancels queued work, and reports residual local state by a deadline.
+    ///
+    /// Waits until no query is active and the shared pool holds no bytes, or
+    /// the deadline passes. Memory is awaited separately because a query's
+    /// slot returns before its torn-down child tasks drop their reservations.
+    /// Both wakeups are enabled before each check so neither is lost.
     pub(crate) async fn shutdown(&self, deadline: Instant) -> OracleShutdownReport {
         self.close();
         loop {
-            let done = self
+            let admitted = self.shared.notify.notified();
+            let released = self.shared.resources.shared_memory_released();
+            tokio::pin!(admitted, released);
+            admitted.as_mut().enable();
+            released.as_mut().enable();
+            let idle = self
                 .shared
                 .state
                 .lock()
                 .map_or(true, |state| state.active_queries == 0);
+            let done = idle && self.shared.resources.shared_memory_reserved() == 0;
             if done || Instant::now() >= deadline {
                 break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let _ = tokio::time::timeout(remaining, self.shared.notify.notified()).await;
+            let _ = tokio::time::timeout(remaining, async {
+                tokio::select! {
+                    () = admitted => {}
+                    () = released => {}
+                }
+            })
+            .await;
         }
         let state = self
             .shared

@@ -296,13 +296,14 @@ impl ScribeStagingRuntime {
             .map_err(|_| poisoned("staged ready index"))
     }
 
-    /// Returns the staged backlog the assembler currently owns.
+    /// Returns the staged backlog the assembler currently owns for one
+    /// logical table, or for the whole pod when `table_name` is `None`.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the ready index is poisoned.
-    pub fn backlog(&self) -> Result<StagingBacklog, ScribeError> {
-        Ok(self.lock_assembly()?.backlog())
+    pub fn backlog(&self, table_name: Option<&str>) -> Result<StagingBacklog, ScribeError> {
+        Ok(self.lock_assembly()?.backlog_of(table_name))
     }
 
     /// Encodes one frozen bucket into durable, preflighted local runs.
@@ -1525,7 +1526,7 @@ mod tests {
             .await
             .expect("member becomes durable and ready");
 
-        let staged_backlog = runtime.backlog().expect("staged backlog");
+        let staged_backlog = runtime.backlog(None).expect("staged backlog");
         assert_eq!(
             staged_backlog.live_members, 1,
             "one durable member is staged and none has been published"
@@ -1537,7 +1538,7 @@ mod tests {
             .take_residue(&key, ClaimCause::Drain)
             .expect("the ready key releases a residue claim")
             .expect("a residue claim is due");
-        let claimed = runtime.backlog().expect("claimed backlog");
+        let claimed = runtime.backlog(None).expect("claimed backlog");
         assert_eq!(
             claimed.live_members, 1,
             "taking a claim does not publish its member"
@@ -1679,7 +1680,10 @@ mod tests {
             !runtime.owns_any(&snapshot).expect("settled snapshot"),
             "members staged after the snapshot never hold it"
         );
-        assert_eq!(runtime.backlog().expect("backlog").outstanding_claims, 1);
+        assert_eq!(
+            runtime.backlog(None).expect("backlog").outstanding_claims,
+            1
+        );
         drop(newer_claim);
     }
 
@@ -1764,7 +1768,7 @@ mod tests {
         let settled = settled + settle_due(&runtime);
         assert_eq!(settled, WORKERS * ROUNDS, "every staged member settled");
 
-        let backlog = runtime.backlog().expect("final backlog");
+        let backlog = runtime.backlog(None).expect("final backlog");
         assert_eq!(backlog, StagingBacklog::default());
         let gauges = recorder.snapshot().gauges;
         for family in [
@@ -2313,7 +2317,7 @@ mod tests {
         drop(claim);
         assert!(runtime.resumable_claims().expect("claim index").is_empty());
         assert_eq!(
-            runtime.backlog().expect("backlog").outstanding_claims,
+            runtime.backlog(None).expect("backlog").outstanding_claims,
             0,
             "the finished claim returns its slot to the budget"
         );

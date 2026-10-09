@@ -1023,12 +1023,21 @@ impl GraphLease {
 
     /// Admits one attempt of this graph and retains its guard.
     ///
+    /// Settlement marks the lease settled and copies its live attempts under
+    /// this same lock, so an attempt is either in that copy and finished by
+    /// settlement, or refused here; none is admitted after settlement has
+    /// looked.
+    ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] on a poisoned lock, and the
+    /// Returns [`BifrostError::Internal`] on a poisoned lock,
+    /// [`BifrostError::QueryExecutionFailed`] once settlement has begun, and the
     /// supervisor's refusal when the slot is occupied or the graph is unknown.
     fn admit_attempt(&self, key: AnalyticalAttemptKey) -> Result<(), BifrostError> {
         let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+        if self.settled.load(Ordering::Acquire) {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
         if attempts.contains_key(&key) {
             return Ok(());
         }
@@ -1078,9 +1087,15 @@ impl GraphLease {
         &self,
         outcome: AnalyticalAttemptOutcome,
     ) -> Result<(), BifrostError> {
-        if self.settled.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
+        // Marked and copied under the attempt lock, so no attempt is admitted
+        // between the two; see `admit_attempt`.
+        let live = {
+            let attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+            if self.settled.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            attempts.keys().copied().collect::<Vec<_>>()
+        };
         tracing::debug!(
             public_query_id = %self.graph.public_query_id,
             reservation_id = %self.binding.reservation_id.as_uuid(),
@@ -1090,10 +1105,6 @@ impl GraphLease {
         if outcome != AnalyticalAttemptOutcome::Success {
             self.cancel.cancel();
         }
-        let live = {
-            let attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
-            attempts.keys().copied().collect::<Vec<_>>()
-        };
         for key in live {
             self.finish_attempt(key, outcome).await?;
         }
@@ -2968,9 +2979,18 @@ impl AnalyticalCleanupPause {
     }
 
     /// Waits until a graph is stopped on its release step.
+    ///
+    /// The waiter registers before it reads `entered`, so a graph that arrives
+    /// between the read and the await still wakes it.
     pub async fn wait_entered(&self) {
-        while !self.entered.load(std::sync::atomic::Ordering::Acquire) {
-            self.entered_notify.notified().await;
+        loop {
+            let entered = self.entered_notify.notified();
+            tokio::pin!(entered);
+            entered.as_mut().enable();
+            if self.entered.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            entered.await;
         }
     }
 
@@ -2984,17 +3004,40 @@ impl AnalyticalCleanupPause {
     /// Stops one armed graph here, consuming the arming exactly once.
     ///
     /// Unarmed graphs pass straight through, so production release behavior is
-    /// unchanged when nothing is testing it.
+    /// unchanged when nothing is testing it. A hold dropped before the test
+    /// releases it re-arms the pause: a cancelled `settle` hands its graph to
+    /// `reclaim`, which must stop on the same release step instead of passing.
     async fn hold(&self) {
+        /// Re-arms the pause when a hold is dropped before its release.
+        struct Rearm<'a> {
+            /// The pause's arming flag this hold consumed.
+            armed: &'a std::sync::atomic::AtomicBool,
+            /// Whether the test released this hold, which keeps it consumed.
+            released: bool,
+        }
+        impl Drop for Rearm<'_> {
+            /// Restores the consumed arming unless the hold was released.
+            fn drop(&mut self) {
+                if !self.released {
+                    self.armed.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
         if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
+        let mut rearm = Rearm {
+            armed: &self.armed,
+            released: false,
+        };
         let released = self.release_notify.notified();
         tokio::pin!(released);
+        released.as_mut().enable();
         self.entered
             .store(true, std::sync::atomic::Ordering::Release);
         self.entered_notify.notify_waiters();
         released.await;
+        rearm.released = true;
     }
 }
 
@@ -5150,6 +5193,50 @@ mod tests {
             fixture.resolutions.load(Ordering::SeqCst),
             0,
             "no refusal reached a provider"
+        );
+    }
+
+    /// A plan that reaches a graph after its settlement began admits no attempt.
+    ///
+    /// The ingress can reuse a lease it read as active while the leader's
+    /// revocation is settling it. Settlement copies the live attempts once, so
+    /// an attempt admitted afterwards would hold the graph's envelope, egress,
+    /// and reservation until process shutdown. The test holds the lease in the
+    /// state settlement leaves between copying its attempts and releasing the
+    /// supervisor guard, where the supervisor alone would still admit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the late plan is accepted or leaves an attempt live.
+    #[tokio::test]
+    async fn a_plan_after_settlement_admits_no_attempt() {
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        fixture
+            .send(&fixture.leader_message(StageOperationV1::ExecuteTask), now)
+            .await
+            .expect("the first authorized message activates the graph");
+        let lease = fixture
+            .ingress
+            .published(fixture.graph)
+            .expect("activation published the graph owner");
+        lease.settled.store(true, Ordering::Release);
+        assert!(
+            matches!(
+                fixture
+                    .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
+                    .await,
+                Err(BifrostError::QueryExecutionFailed)
+            ),
+            "a plan for a settling graph is refused"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_attempts()
+                .expect("attempts are readable"),
+            0,
+            "the refused plan left no attempt behind"
         );
     }
 

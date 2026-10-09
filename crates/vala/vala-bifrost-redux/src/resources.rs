@@ -1749,6 +1749,14 @@ impl OracleResources {
         self.memory_root.reserved()
     }
 
+    /// Returns a future that resolves on the next byte return to the shared pool.
+    ///
+    /// Callers enable it before reading [`Self::shared_memory_reserved`] so a
+    /// release between the read and the await is not lost.
+    pub(crate) fn shared_memory_released(&self) -> tokio::sync::futures::Notified<'_> {
+        self.memory_root.released.notified()
+    }
+
     /// Returns the cooperative maximum the shared memory pool arbitrates.
     #[must_use]
     pub fn shared_memory_limit(&self) -> usize {
@@ -3362,6 +3370,12 @@ pub(crate) struct GovernedMemoryRoot {
     /// pool's own locks are taken and released inside it, never together, so no
     /// lock order exists to invert.
     operation: Mutex<()>,
+    /// Wakes shutdown waiters after any consumer returns bytes to the pool.
+    ///
+    /// A query's terminal frame can reach its caller before its child tasks
+    /// finish dropping their reservations, so draining owners wait on this
+    /// rather than reading [`Self::reserved`] once.
+    released: Notify,
 }
 
 impl GovernedMemoryRoot {
@@ -3373,6 +3387,7 @@ impl GovernedMemoryRoot {
             governor,
             limit_bytes,
             operation: Mutex::new(()),
+            released: Notify::new(),
         }
     }
 
@@ -3514,6 +3529,8 @@ impl GovernedMemoryRoot {
             tracing::error!(%error, "Oracle memory release could not be reconciled");
         }
         ledger.total = ledger.total.saturating_sub(shrink);
+        drop(ledger);
+        self.released.notify_waiters();
     }
 }
 

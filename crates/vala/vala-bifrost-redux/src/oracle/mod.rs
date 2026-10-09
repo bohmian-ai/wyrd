@@ -2966,7 +2966,11 @@ impl Oracle {
             tracing::debug!(closed, "Oracle shutdown ended held peer grants");
         }
         let report = self.admission.shutdown(deadline).await;
-        if report.active_queries != 0 || report.queued_queries != 0 || report.peer_running != 0 {
+        if report.active_queries != 0
+            || report.queued_queries != 0
+            || report.reserved_memory_bytes != 0
+            || report.peer_running != 0
+        {
             tracing::warn!(
                 active_queries = report.active_queries,
                 queued_queries = report.queued_queries,

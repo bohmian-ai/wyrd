@@ -310,7 +310,7 @@ mod pg_tests {
             .expect("expire attempt");
         assert_eq!(
             tasks
-                .reclaim_expired_attempts(1)
+                .reclaim_expired_attempts(1, None)
                 .await
                 .expect("bounded reclaim"),
             vec![(capacity_id, reclaimed_attempt)]
@@ -325,6 +325,54 @@ mod pg_tests {
         assert_eq!(reclaimed.0, "retryable");
         assert_eq!(reclaimed.1, 1);
         assert!(reclaimed.2);
+    }
+
+    /// A starting worker reclaims its previous incarnation's unexpired claim.
+    ///
+    /// Steady-state reclaim and another owner's identity leave the live lease
+    /// alone; only the holder's own identity takes it, so a supervised restart
+    /// does not stay unready until its own lease lapses.
+    #[tokio::test]
+    async fn previous_owner_reclaims_its_unexpired_attempt() {
+        let (fixture, _admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let owner = Uuid::now_v7();
+        let task_id = tasks
+            .enqueue(&task(fixture.data_tenant_id(), "owned-restart", 205))
+            .await
+            .expect("enqueue owned task");
+        let attempt = tasks
+            .claim_fair(owner, limits(1), None)
+            .await
+            .expect("owned claim")
+            .expect("owned task")
+            .attempt_id
+            .expect("owned attempt");
+
+        assert!(
+            tasks
+                .reclaim_expired_attempts(1, None)
+                .await
+                .expect("steady-state reclaim")
+                .is_empty(),
+            "steady-state reclaim leaves an unexpired lease"
+        );
+        assert!(
+            tasks
+                .reclaim_expired_attempts(1, Some(Uuid::now_v7()))
+                .await
+                .expect("foreign-owner reclaim")
+                .is_empty(),
+            "another owner cannot take an unexpired lease"
+        );
+        assert_eq!(
+            tasks
+                .reclaim_expired_attempts(1, Some(owner))
+                .await
+                .expect("previous-owner reclaim"),
+            vec![(task_id, attempt)],
+            "the holder's own identity reclaims its unexpired attempt"
+        );
     }
 
     /// Proves worker admission is independent of scheduler leadership and only

@@ -187,7 +187,7 @@ mod tests {
             .await
             .expect("remove sentinel");
         assert!(
-            PostgresPeerSecurityAudit::try_new(&postgres, ScribeSink::outbox().0)
+            PostgresPeerSecurityAudit::try_new(&postgres, ScribeSink::outbox(None))
                 .await
                 .is_err(),
             "missing sentinel must prevent peer runtime construction"
@@ -203,7 +203,7 @@ mod tests {
         .await
         .expect("stage incompatible sentinel");
         assert!(
-            PostgresPeerSecurityAudit::try_new(&postgres, ScribeSink::outbox().0)
+            PostgresPeerSecurityAudit::try_new(&postgres, ScribeSink::outbox(None))
                 .await
                 .is_err(),
             "incompatible sentinel must prevent peer runtime construction"

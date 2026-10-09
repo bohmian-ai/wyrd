@@ -143,6 +143,9 @@ pub struct PersistenceFaults {
         Arc<Mutex<Option<crate::scribe::file_list_writer::PublicationFenceBarrier>>>,
     /// Claim-publication progress a test can await instead of polling.
     claim_probe: Arc<watch::Sender<ClaimPublicationProbe>>,
+    /// Logical table the claim faults and the published-claim probe select;
+    /// `None` selects every table.
+    target_table: Arc<Mutex<Option<String>>>,
 }
 
 /// Claim-publication progress observed through [`PersistenceFaults`].
@@ -166,6 +169,25 @@ struct ClaimPublicationProbe {
 
 #[cfg(any(test, feature = "test-support"))]
 impl PersistenceFaults {
+    /// Scopes the claim faults and the published-claim probe to one table.
+    ///
+    /// Every audited call stages an `audit_log` row on the same pod, so its
+    /// claim can become due on the tick that publishes the test's table. A
+    /// scoped one-shot fault then fires only on the named table's claim, and
+    /// [`Self::wait_for_published_claims_for_test`] counts only its claims.
+    pub fn target_table_for_test(&self, table_name: impl Into<String>) {
+        if let Ok(mut target) = self.target_table.lock() {
+            *target = Some(table_name.into());
+        }
+    }
+
+    /// Returns whether a claim for `table_name` is selected by the fault scope.
+    fn targets(&self, table_name: &str) -> bool {
+        self.target_table.lock().map_or(true, |target| {
+            target.as_deref().is_none_or(|target| target == table_name)
+        })
+    }
+
     /// Stops every claim publication at its object write until
     /// [`Self::release_object_writes_for_test`].
     ///
@@ -222,8 +244,11 @@ impl PersistenceFaults {
             .send_modify(|probe| probe.claim_slot_waits += 1);
     }
 
-    /// Records one committed and settled claim publication.
-    fn note_claim_published(&self) {
+    /// Records one committed and settled claim publication for a selected table.
+    fn note_claim_published(&self, table_name: &str) {
+        if !self.targets(table_name) {
+            return;
+        }
         self.claim_probe
             .send_modify(|probe| probe.published_claims += 1);
     }
@@ -384,7 +409,11 @@ impl PersistenceFaults {
         }
     }
 
-    fn take_object_write(&self) -> bool {
+    /// Consumes an armed object-write failure for a claim of a selected table.
+    fn take_object_write(&self, table_name: &str) -> bool {
+        if !self.targets(table_name) {
+            return false;
+        }
         if self.object_write.swap(false, Ordering::AcqRel) {
             return true;
         }
@@ -403,17 +432,18 @@ impl PersistenceFaults {
         self.sql_commit.swap(false, Ordering::AcqRel)
     }
 
-    fn take_post_commit_client_error(&self) -> bool {
-        self.post_commit_client_error.swap(false, Ordering::AcqRel)
+    /// Consumes an armed post-COMMIT response failure for a selected table.
+    fn take_post_commit_client_error(&self, table_name: &str) -> bool {
+        self.targets(table_name) && self.post_commit_client_error.swap(false, Ordering::AcqRel)
     }
 
     fn take_manifest_publication(&self) -> bool {
         self.manifest_publication.swap(false, Ordering::AcqRel)
     }
 
-    /// Consumes the armed claim-retirement failure.
-    fn take_claim_retirement(&self) -> bool {
-        self.claim_retirement.swap(false, Ordering::AcqRel)
+    /// Consumes the armed claim-retirement failure for a selected table.
+    fn take_claim_retirement(&self, table_name: &str) -> bool {
+        self.targets(table_name) && self.claim_retirement.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -1128,7 +1158,8 @@ impl PersistenceRuntime {
             .unwrap_or_default()
     }
 
-    /// Returns this pod's staged backlog read from the staging owner.
+    /// Returns this pod's staged backlog read from the staging owner, for one
+    /// logical table or, when `table_name` is `None`, for the whole pod.
     ///
     /// Default when the pod has no persistence worker or no staging volume.
     ///
@@ -1137,11 +1168,16 @@ impl PersistenceRuntime {
     /// Returns [`ScribeError::Internal`] when the staging assembler lock is
     /// poisoned.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn staging_backlog_for_test(&self) -> Result<StagingBacklog, ScribeError> {
+    pub fn staging_backlog_for_test(
+        &self,
+        table_name: Option<&str>,
+    ) -> Result<StagingBacklog, ScribeError> {
         self.worker
             .as_ref()
             .and_then(|worker| worker.staging.as_ref())
-            .map_or(Ok(StagingBacklog::default()), |staging| staging.backlog())
+            .map_or(Ok(StagingBacklog::default()), |staging| {
+                staging.backlog(table_name)
+            })
     }
 
     /// Aborts every retained persistence worker without touching the async join registry.
@@ -1766,8 +1802,8 @@ impl ScribePublicationReconciler {
     ///
     /// Compiled only for tests and `test-support`; production has no injector.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn fail_claim_retirement(&self) -> bool {
-        self.faults.take_claim_retirement()
+    pub(crate) fn fail_claim_retirement(&self, table_name: &str) -> bool {
+        self.faults.take_claim_retirement(table_name)
     }
 
     /// Attempts or reconciles one exact full-set publication.
@@ -1797,7 +1833,10 @@ impl ScribePublicationReconciler {
                     barrier.pause_after_publication().await;
                 }
                 #[cfg(any(test, feature = "test-support"))]
-                if self.faults.take_post_commit_client_error() {
+                if self
+                    .faults
+                    .take_post_commit_client_error(rows.first().map_or("", |row| &row.table_name))
+                {
                     return ScribePublicationOutcome::UnknownCommitOutcome(ScribeError::Internal {
                         detail: "test client lost the committed publication response".to_owned(),
                     });
@@ -2433,7 +2472,7 @@ impl PersistenceWorker {
             "Scribe finished retiring a claim whose publication had already committed"
         );
         #[cfg(any(test, feature = "test-support"))]
-        self.faults.note_claim_published();
+        self.faults.note_claim_published(&claim.key().table().name);
         self.publish_staging_hint(claim.key());
         Ok(())
     }
@@ -2513,7 +2552,7 @@ impl PersistenceWorker {
         assembled.artifacts.cleanup().await?;
         let published = published?;
         #[cfg(any(test, feature = "test-support"))]
-        self.faults.note_claim_published();
+        self.faults.note_claim_published(&claim.key().table().name);
         self.publish_staging_hint(claim.key());
         if let Some(detail) = published.unacknowledged {
             let error = ScribeError::Internal { detail };
@@ -2551,7 +2590,7 @@ impl PersistenceWorker {
             });
         }
         #[cfg(any(test, feature = "test-support"))]
-        if self.faults.take_object_write() {
+        if self.faults.take_object_write(&claim.key().table().name) {
             return Err(ScribeError::Internal {
                 detail: "test object-store write failure".to_owned(),
             });
@@ -3369,7 +3408,7 @@ mod tests {
         assert_eq!(
             fixture
                 .runtime
-                .staging_backlog_for_test()
+                .staging_backlog_for_test(None)
                 .expect("staging backlog")
                 .live_members,
             0,
@@ -3439,7 +3478,7 @@ mod tests {
         );
         let backlog = fixture
             .runtime
-            .staging_backlog_for_test()
+            .staging_backlog_for_test(None)
             .expect("staging backlog");
         assert_eq!(
             (backlog.live_members, backlog.outstanding_claims),

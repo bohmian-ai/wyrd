@@ -46,7 +46,7 @@ impl BifrostWriter {
     /// a journey reads back through the same credential it wrote with.
     ///
     /// `card_ref` is the Card the credential was minted against; every row this
-    /// writer enqueues is correlated to it, which is what the ingest route
+    /// writer enqueues is correlated to its UID, which is what the ingest route
     /// admits.
     ///
     /// # Errors
@@ -95,7 +95,7 @@ impl BifrostWriter {
             .insert(
                 row,
                 Correlation {
-                    card_ref: Some(self.card_ref.clone()),
+                    card_uid: self.card_ref.uid.clone(),
                     run_id: None,
                 },
             )

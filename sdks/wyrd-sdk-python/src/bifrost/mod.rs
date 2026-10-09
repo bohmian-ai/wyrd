@@ -2,7 +2,7 @@
 //!
 //! Every method converts its Python inputs to native contract types at the edge
 //! — a JSON-Schema document or Arrow IPC schema to [`TableConfig`], a
-//! card-ref string to [`wyrd_spec::reference::CardRef`] — and then calls the
+//! Card UID string to [`wyrd_spec::ids::CardUid`] — and then calls the
 //! Rust-native client. No queue, schema-mapping, registration, or query logic
 //! is re-implemented here; the pool key and [`wyrd_client::bifrost::ClientScope`] stay opaque,
 //! and Python never names them.
@@ -30,7 +30,7 @@ use wyrd_client::bifrost::Bifrost as NativeBifrost;
 use wyrd_client::bifrost::QueryResult;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, CompactionTypeWire, PhysicalLayoutWire, QueryParam, QueryTerminalFrame,
@@ -549,17 +549,17 @@ impl Bifrost {
     /// # Errors
     ///
     /// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` for an invalid
-    /// card reference, `WYRD_VALA_412_NO_ACTIVE_TABLE` when no table is bound,
+    /// Card UID, `WYRD_VALA_412_NO_ACTIVE_TABLE` when no table is bound,
     /// or `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
-    #[pyo3(signature = (row, card_ref=None, run_id=None))]
+    #[pyo3(signature = (row, card_uid=None, run_id=None))]
     fn insert(
         &self,
         row: &str,
-        card_ref: Option<&str>,
+        card_uid: Option<&str>,
         run_id: Option<String>,
     ) -> WyrdPyResult<()> {
         self.handle
-            .insert(row.as_bytes().to_vec(), correlation(card_ref, run_id)?)
+            .insert(row.as_bytes().to_vec(), correlation(card_uid, run_id)?)
             .map_err(client_error)?;
         Ok(())
     }
@@ -798,15 +798,15 @@ fn apply_compaction_type(config: TableConfig, raw: Option<&str>) -> WyrdPyResult
 ///
 /// # Errors
 ///
-/// Returns the stable Wyrd validation error when `card_ref` is not one
-/// parsable Card reference.
-fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> WyrdPyResult<Correlation> {
-    let card_ref = card_ref
-        .map(str::parse::<CardRef>)
+/// Returns the stable Wyrd validation error when `card_uid` is not one
+/// parsable Card UID.
+fn correlation(card_uid: Option<&str>, run_id: Option<String>) -> WyrdPyResult<Correlation> {
+    let card_uid = card_uid
+        .map(str::parse::<CardUid>)
         .transpose()
-        .map_err(|error| invalid_argument("card_ref", error))?;
+        .map_err(|error| invalid_argument("card_uid", error))?;
     Ok(Correlation {
-        card_ref,
+        card_uid,
         run_id: run_id.map(RunId::from_string),
     })
 }
@@ -1140,23 +1140,23 @@ impl PyBifrostQueryStream {
 /// * `table` - The destination `<namespace>.<name>` table.
 /// * `schema` - The table's JSON Schema as JSON text.
 /// * `row` - One row as JSON object text.
-/// * `card_ref` - The optional `space/Kind/name@version` stamped on the row.
+/// * `card_uid` - The optional UID of the Card the row correlates to.
 /// * `run_id` - The optional run identifier stamped on the row.
 ///
 /// # Errors
 ///
 /// Raises `WyrdError` carrying `WYRD_SPEC_400_VALIDATION` for schema text that
-/// is not JSON or an invalid card reference, and the shared mapper's
+/// is not JSON or an invalid Card UID, and the shared mapper's
 /// `WYRD_VALA_400_SCHEMA_PARSE` for a schema with no mappable columns, the
 /// same code `TableConfig.from_json_schema` raises.
 #[pyfunction]
-#[pyo3(signature = (bifrost, table, schema, row, card_ref=None, run_id=None))]
+#[pyo3(signature = (bifrost, table, schema, row, card_uid=None, run_id=None))]
 fn record(
     bifrost: &Bound<'_, Bifrost>,
     table: &str,
     schema: &str,
     row: &str,
-    card_ref: Option<&str>,
+    card_uid: Option<&str>,
     run_id: Option<String>,
 ) -> WyrdPyResult<()> {
     let schema_value: Value =
@@ -1168,7 +1168,7 @@ fn record(
         table,
         &std::sync::Arc::new(schema),
         row.as_bytes().to_vec(),
-        correlation(card_ref, run_id)?,
+        correlation(card_uid, run_id)?,
     );
     Ok(())
 }

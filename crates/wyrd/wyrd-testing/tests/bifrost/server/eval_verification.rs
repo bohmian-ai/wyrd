@@ -1043,7 +1043,7 @@ fn answered_observation(
                 "created_at": at.to_rfc3339(),
             })
             .to_string(),
-            Some(subject),
+            subject.uid.as_ref(),
             None,
             Some(at.timestamp_micros()),
         )
@@ -1609,7 +1609,7 @@ fn stamped_observation(
                 "created_at": at.to_rfc3339(),
             })
             .to_string(),
-            Some(subject),
+            subject.uid.as_ref(),
             None,
             Some(at.timestamp_micros()),
         )

@@ -26,7 +26,6 @@ use wyrd_runtime::outbox::{Outbox, OutboxSink};
 use wyrd_runtime::principal::Principal;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::reference::CardRefScope;
 use wyrd_sql::queries::verifier_runs::{ObservationRecord, VerifierRunQueue};
 use wyrd_sql::{SqlError, WyrdPostgres};
 
@@ -118,8 +117,8 @@ impl ObservationEnqueue {
 }
 
 impl ObservationAck for ObservationEnqueue {
-    /// Decodes the acknowledged frame's records against `card_scope`, the
-    /// scope Scribe stamped them with, and stages one run request per record,
+    /// Decodes the acknowledged frame's records, keyed by the `card_uid`
+    /// Scribe authorized and stored, and stages one run request per record,
     /// tagged with the Card `auth`'s principal is bound to as its writer,
     /// without waiting.
     ///
@@ -127,15 +126,9 @@ impl ObservationAck for ObservationEnqueue {
     /// activate every matching binding of their subject. A frame that does
     /// not decode is logged and counted as lost; the acknowledged
     /// observation is never affected.
-    fn acknowledged(
-        &self,
-        auth: &AuthContext,
-        card_scope: Option<&CardRefScope>,
-        frame: Bytes,
-        receipt_micros: i64,
-    ) {
+    fn acknowledged(&self, auth: &AuthContext, frame: Bytes, receipt_micros: i64) {
         let writer = bound_card(&auth.principal);
-        match EvalObservationsTable::acknowledged(&frame, card_scope, receipt_micros) {
+        match EvalObservationsTable::acknowledged(&frame, receipt_micros) {
             Ok(keys) => {
                 for key in keys {
                     self.runs.stage(

@@ -34,7 +34,7 @@ use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeError, ScribeIngressFrame};
-use vala_bifrost_redux::gate::attribution::native_card_refs;
+use vala_bifrost_redux::gate::attribution::native_card_uids;
 use vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
@@ -250,7 +250,7 @@ impl ScribeTable {
 ///
 /// The frame principal built from it is the tenant SYSTEM principal scoped to
 /// exactly this Verifier, so Scribe stamps that principal as `principal_id`
-/// and the Verifier UID as `card_uid`, and refuses a row whose `card_ref`
+/// and the Verifier UID as `card_uid`, and refuses a row whose `card_uid`
 /// names another Card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifierAttribution {
@@ -414,12 +414,7 @@ impl ScribeBatch {
             ),
         };
         let attributed_cards = match self.verifier {
-            None => {
-                let cards = native_card_refs(&self.ipc);
-                cards.split_first().map(|(root, rest)| {
-                    CardRefScope::from_root_and_members(root, rest.iter().cloned())
-                })
-            }
+            None => Some(native_card_uids(&self.ipc)).filter(|uids| !uids.is_empty()),
             Some(_) => None,
         };
         ScribeIngressFrame {
@@ -914,7 +909,11 @@ mod tests {
                 trigger: None,
                 input: &input,
             },
-            VERIFIER,
+            attribution
+                .verifier
+                .uid
+                .as_ref()
+                .expect("the fixture Verifier carries its UID"),
             VerificationResultId::new_v7(),
             now,
             now,
@@ -983,10 +982,7 @@ mod tests {
             assert!(frame.card_scope.is_empty());
         }
         assert_eq!(received[2].principal, attribution.principal);
-        assert_eq!(
-            received[2].card_scope,
-            std::slice::from_ref(&attribution.verifier)
-        );
+        assert_eq!(received[2].card_scope, attribution.verifier.uid.as_slice());
         assert!(received.iter().all(|frame| frame.tenant == tenant));
         assert!(
             received

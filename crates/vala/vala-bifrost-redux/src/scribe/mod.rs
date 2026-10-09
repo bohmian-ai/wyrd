@@ -1856,7 +1856,6 @@ impl Scribe for ScribeImpl {
                     | ScribeError::FingerprintMismatch { .. }
                     | ScribeError::TableNotFound { .. }
                     | ScribeError::CardScopeDenied
-                    | ScribeError::CardUnresolved
                     | ScribeError::StreamMismatch { .. } => Some("invalid"),
                     ScribeError::IngressClosed
                     | ScribeError::IngestBusy { .. }

@@ -16,8 +16,7 @@ use vala_bifrost_redux::tables::{DomainTable, DriftObservationsTable, EvalObserv
 use wyrd_queue::{ClientByteGuard, MockSink, QueueConfig};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    BifrostTableDescription, BifrostTableEntry, FieldSpec, INPUT_CLASS_GATE_CORRELATION,
-    INPUT_CLASS_KEY, PARQUET_FIELD_ID_KEY,
+    BifrostTableDescription, BifrostTableEntry, FieldSpec, PARQUET_FIELD_ID_KEY,
 };
 use wyrd_spec::vala::eval::media::{MediaKind, MediaRef};
 use wyrd_spec::vala::ids::{SessionId, SpanId, TraceId};
@@ -176,14 +175,10 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
         user_fields: wyrd_queue::arrow_schema_to_fieldspec(&schema),
         correlation_fields: vec![
             FieldSpec {
-                name: "card_ref".to_owned(),
+                name: "card_uid".to_owned(),
                 data_type: wyrd_spec::vala::api::DataTypeSpec::Utf8,
                 nullable: true,
-                metadata: [(
-                    INPUT_CLASS_KEY.to_owned(),
-                    INPUT_CLASS_GATE_CORRELATION.to_owned(),
-                )]
-                .into(),
+                metadata: [(PARQUET_FIELD_ID_KEY.to_owned(), "1001".to_owned())].into(),
             },
             FieldSpec {
                 name: "run_id".to_owned(),
@@ -766,7 +761,7 @@ fn judgment_body() -> Value {
 }
 
 /// `observe.verify` resolves a bound Verifier locally, sends one request in
-/// the shape its kind takes, and returns the typed judgment; an unbound name
+/// the shape its kind takes carrying the view's `run_id`, and returns the typed judgment; an unbound name
 /// and a wrong input shape are refused before any request is sent.
 ///
 /// # Panics
@@ -851,6 +846,7 @@ async fn verify_resolves_bound_verifiers_and_refuses_invalid_inputs_locally() {
         .clone()
         .expect("drift uid")
         .to_string();
+    let run_id = service.run_id().as_str();
     assert_eq!(
         *bodies.lock().expect("body lock"),
         vec![
@@ -858,6 +854,7 @@ async fn verify_resolves_bound_verifiers_and_refuses_invalid_inputs_locally() {
                 "verifier_uid": quality,
                 "subject_card_uid": root,
                 "input": { "kind": "eval_record", "context": { "answer": "yes" } },
+                "run_id": run_id,
             }),
             json!({
                 "verifier_uid": drift,
@@ -866,6 +863,7 @@ async fn verify_resolves_bound_verifiers_and_refuses_invalid_inputs_locally() {
                     "score": [0.4, 0.6],
                     "tier": [null, "gold"],
                 } },
+                "run_id": run_id,
             }),
         ]
     );
@@ -997,7 +995,7 @@ fn drift_projects_one_tall_row_per_feature() {
             "a row carries exactly the fixed user columns"
         );
         assert!(
-            row.get("run_id").is_none() && row.get("card_ref").is_none(),
+            row.get("run_id").is_none() && row.get("card_uid").is_none(),
             "correlation is not a row field"
         );
     }

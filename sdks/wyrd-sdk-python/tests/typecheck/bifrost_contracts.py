@@ -71,11 +71,11 @@ def client_value_types_are_declared_without_any() -> None:
     server does.
     """
 
-    correlation: Correlation = {"card_ref": "test/Service/writer@1.0.0"}
+    correlation: Correlation = {"card_uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"}
     resolved: ResolvedTable = {"table_uid": "01J0", "fingerprint": "fp"}
     key: SortKey = {"column": "wyrd_event_time", "direction": "desc", "null_order": "last"}
 
-    assert correlation["card_ref"].endswith("@1.0.0")
+    assert correlation["card_uid"].endswith("1b01")
     assert "run_id" not in correlation
     assert resolved["table_uid"] == "01J0"
     assert key["column"] == "wyrd_event_time"

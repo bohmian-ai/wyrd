@@ -10,8 +10,8 @@ use super::support::{start_scribe_server, unique_table};
 ///
 /// For a canonical signal table the description's projected Arrow schema is
 /// the registry's physical schema — every name, type shape, and nullability —
-/// plus the one Gate input (`card_ref`) the write path resolves rather than
-/// stores, and the exact canonical physical fingerprint. Types compare through
+/// including the `card_uid` correlation input a writer supplies, and the
+/// exact canonical physical fingerprint. Types compare through
 /// the storage layer's own round-trip equivalence, which is what "the stored
 /// schema" means once Iceberg has widened a byte or string column. For a
 /// dynamic table, a batch built straight from the description is accepted by
@@ -112,19 +112,17 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
             "`{name}` sends no field identity; ingress compares by shape"
         );
     }
-    assert_eq!(
+    assert!(
         canonical
             .correlation_fields
             .iter()
-            .find(|field| field.name == "card_ref")
-            .expect("the Gate correlation input is described")
+            .find(|field| field.name == "card_uid")
+            .expect("the Card correlation input is described")
             .metadata
-            .get(wyrd_spec::vala::api::INPUT_CLASS_KEY)
-            .map(String::as_str),
-        Some(wyrd_spec::vala::api::INPUT_CLASS_GATE_CORRELATION),
-        "card_ref is a resolved Gate input, not a stored column"
+            .contains_key(wyrd_spec::vala::api::PARQUET_FIELD_ID_KEY),
+        "card_uid is the stored column the writer supplies"
     );
-    for name in ["card_ref", "run_id", "wyrd_event_time"] {
+    for name in ["card_uid", "run_id", "wyrd_event_time"] {
         assert_eq!(
             described_schema
                 .fields()
@@ -148,8 +146,8 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     assert!(
         wyrd_queue::schema::writable_schema(&dynamic, false)
             .expect("the dynamic description projects an Arrow schema")
-            .field_with_name("card_ref")
-            .expect("the Gate correlation input is described")
+            .field_with_name("card_uid")
+            .expect("the Card correlation input is described")
             .is_nullable(),
         "Card correlation is optional, so describe must not demand it"
     );
@@ -158,7 +156,7 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
     builder
         .append_json_row(
             r#"{"id": 1, "value": "described"}"#,
-            Some(&writer_card),
+            writer_card.uid.as_ref(),
             None,
             None,
         )

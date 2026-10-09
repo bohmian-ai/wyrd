@@ -5,7 +5,7 @@
 //! `vala.eval.result_items`, taken from the tables' own declarations so the
 //! payload can never drift from the registered contract. Every batch also
 //! carries the three correlation columns Scribe admits from a native payload:
-//! `card_ref` (the Verifier, resolved against the frame principal's Verifier scope),
+//! `card_uid` (the Verifier, authorized against the frame principal's Verifier scope),
 //! `run_id` (the application Run judged, null when none, as for scheduled
 //! Drift), and
 //! `wyrd_event_time` (the one server-chosen
@@ -31,7 +31,7 @@ use vala_drift::{DriftReport, DriftVerdict};
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
+use wyrd_spec::vala::managed_columns::{CARD_UID, RUN_ID, WYRD_EVENT_TIME};
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput};
 
@@ -175,8 +175,8 @@ impl<'a> ResultRun<'a> {
 pub struct ResultPayloadBuilder<'a> {
     /// The run whose frozen identities and input the rows record.
     run: ResultRun<'a>,
-    /// Verifier `CardRef` text without a UID, authorized by Scribe against scope.
-    verifier_ref: &'a str,
+    /// The Verifier's UID, authorized by Scribe against the frame's Card scope.
+    verifier_uid: &'a CardUid,
     /// The new result's identity.
     result_id: VerificationResultId,
     /// The one event time shared by every row of this result.
@@ -196,7 +196,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     #[must_use]
     pub fn new(
         run: ResultRun<'a>,
-        verifier_ref: &'a str,
+        verifier_uid: &'a CardUid,
         result_id: VerificationResultId,
         event_time: DateTime<Utc>,
         started_at: DateTime<Utc>,
@@ -204,7 +204,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     ) -> Self {
         Self {
             run,
-            verifier_ref,
+            verifier_uid,
             result_id,
             event_time,
             started_at,
@@ -514,7 +514,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Every authored column must fill exactly one of `fields` by name; the
     /// arrays are placed in the order of `fields`, never in authoring order,
     /// so a reordered declaration keeps each value under its own name. The
-    /// schema is `fields` followed by `card_ref`, `run_id`, and
+    /// schema is `fields` followed by `card_uid`, `run_id`, and
     /// `wyrd_event_time`, each repeated for the authored row count.
     ///
     /// # Errors
@@ -554,7 +554,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             });
         }
         fields.extend([
-            Field::new(CARD_REF, DataType::Utf8, true),
+            Field::new(CARD_UID, DataType::Utf8, true),
             Field::new(RUN_ID, DataType::Utf8, true),
             Field::new(
                 WYRD_EVENT_TIME,
@@ -562,7 +562,10 @@ impl<'a> ResultPayloadBuilder<'a> {
                 false,
             ),
         ]);
-        arrays.push(text(std::iter::repeat_n(Some(self.verifier_ref), rows)));
+        arrays.push(text(std::iter::repeat_n(
+            Some(self.verifier_uid.as_str()),
+            rows,
+        )));
         arrays.push(text(std::iter::repeat_n(
             self.run.run_id.map(RunId::as_str),
             rows,
@@ -733,6 +736,8 @@ mod tests {
         subject: CardUid,
         /// Binding owner Card.
         owner: CardUid,
+        /// The Verifier the result is written under.
+        verifier: CardUid,
         /// Binding identity.
         binding: BindingId,
         /// Frozen inline Trigger.
@@ -775,6 +780,7 @@ mod tests {
             run_id: RunId::new(),
             subject: uid(),
             owner: uid(),
+            verifier: uid(),
             binding: BindingId::new_v7(),
             trigger: FrozenTarget::Digest("sha256:t".to_owned()),
             input,
@@ -801,7 +807,7 @@ mod tests {
     fn builder(run: &TestRun) -> ResultPayloadBuilder<'_> {
         ResultPayloadBuilder::new(
             run.view(),
-            "prod/Verifier/check@1.2.0",
+            &run.verifier,
             VerificationResultId::new_v7(),
             at(30),
             at(10),
@@ -909,8 +915,8 @@ mod tests {
                     Some(run.run_id.as_str())
                 );
                 assert_eq!(
-                    cell(batch, CARD_REF, row).as_deref(),
-                    Some("prod/Verifier/check@1.2.0")
+                    cell(batch, CARD_UID, row).as_deref(),
+                    Some(run.verifier.as_str())
                 );
             }
         }
@@ -1055,6 +1061,7 @@ mod tests {
     #[test]
     fn direct_task_writes_one_summary_row() {
         let subject = uid();
+        let verifier = uid();
         let application = RunId::new();
         let input = RunInput::EvalRecord {
             record_id: application.as_str().to_owned(),
@@ -1081,7 +1088,7 @@ mod tests {
                 trigger: None,
                 input: &input,
             },
-            "prod/Verifier/no-refund-promise@1.0.0",
+            &verifier,
             VerificationResultId::new_v7(),
             at(20),
             at(10),
@@ -1108,10 +1115,7 @@ mod tests {
             ("trigger_identity", None),
             ("source_record_id", Some(application.as_str().to_owned())),
             (RUN_ID, Some(application.as_str().to_owned())),
-            (
-                CARD_REF,
-                Some("prod/Verifier/no-refund-promise@1.0.0".to_owned()),
-            ),
+            (CARD_UID, Some(verifier.to_string())),
         ] {
             assert_eq!(cell(row, column, 0), expected, "{column}");
         }
@@ -1138,7 +1142,7 @@ mod tests {
         let run = eval_run();
         let error = ResultPayloadBuilder::new(
             run.view(),
-            "prod/Verifier/check@1.2.0",
+            &run.verifier,
             VerificationResultId::new_v7(),
             at(30),
             at(10),
@@ -1179,7 +1183,7 @@ mod tests {
         let expected: Vec<_> = reversed
             .iter()
             .map(|field| field.name().clone())
-            .chain([CARD_REF, RUN_ID, WYRD_EVENT_TIME].map(str::to_owned))
+            .chain([CARD_UID, RUN_ID, WYRD_EVENT_TIME].map(str::to_owned))
             .collect();
         assert_eq!(order, expected);
         for field in ResultsTable::arrow_fields() {

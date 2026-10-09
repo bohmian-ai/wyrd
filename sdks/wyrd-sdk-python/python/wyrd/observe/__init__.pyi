@@ -78,8 +78,8 @@ class Run:
         """Enter this view's ambient OpenTelemetry span correlation.
 
         Best-effort and execution-local: attaches this view's exact Card
-        reference and
-        ``run_id`` as ``wyrd.card_ref`` / ``wyrd.run_id`` to the active
+        UID and
+        ``run_id`` as ``wyrd.card_uid`` / ``wyrd.run_id`` to the active
         recording span and to every span started inside the block on a
         provider holding the Wyrd processor (the global provider is installed
         automatically; see ``wyrd.otel.install_run_correlation``). Never raises
@@ -307,7 +307,7 @@ def record(
         schema: the table's JSON Schema mapping, or a Pydantic model class
             whose ``model_json_schema()`` is used.
         row: the row as a mapping or a Pydantic model instance.
-        correlation: optional ``card_ref`` (``space/Kind/name@version``) and
+        correlation: optional ``card_uid`` (a registered Card UID) and
             ``run_id`` stamped on the row. Omitted, the row is uncorrelated.
 
     Returns:
@@ -316,7 +316,7 @@ def record(
     Raises:
         WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` for a schema with no
             mappable columns, as ``TableConfig.from_json_schema`` raises;
-            ``WYRD_SPEC_400_VALIDATION`` for an invalid ``card_ref``.
+            ``WYRD_SPEC_400_VALIDATION`` for an invalid ``card_uid``.
     """
     ...
 

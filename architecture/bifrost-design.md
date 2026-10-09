@@ -67,10 +67,10 @@ Required, non-null `principal_id` identifies the authenticated publisher. None
 participates in row identity.
 
 For OTLP records, table-owned projection reads correlation only from the final
-record-level `wyrd.card_ref` and `wyrd.run_id` attributes, retaining all source
-attributes losslessly. The values use the existing `CardRef` and `RunId` text
-grammars. Any client Card UID is ignored; Scribe stamps only the UID from the
-verified principal scope.
+record-level `wyrd.card_uid` and `wyrd.run_id` attributes, retaining all source
+attributes losslessly. The values use the `CardUid` and `RunId` text grammars.
+Scribe stores a client Card UID only when the verified principal scope, or for
+a principal bound to no Card the tenant registry, confirms it.
 
 Identity is batch-level. The batch identity is the client-generated UUIDv7
 `wyrd_batch_id` request field; it is not stored on rows. Within a

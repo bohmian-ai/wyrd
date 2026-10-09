@@ -197,10 +197,10 @@ impl PyRun {
 
     /// Enter this view's ambient OpenTelemetry span correlation.
     ///
-    /// Delegates to `wyrd.otel`, which pushes this view's exact `CardRef` and
+    /// Delegates to `wyrd.otel`, which pushes this view's exact Card UID and
     /// `run_id` onto the scope stack held in Python's execution-local
     /// OpenTelemetry context value, stamps an already-active recording span
-    /// that does not yet carry `wyrd.card_ref`, and ensures the global provider
+    /// that does not yet carry `wyrd.card_uid`, and ensures the global provider
     /// has the Wyrd span processor. No scope state is stored on this immutable
     /// view, so one run may be entered by nested or concurrent scopes.
     /// Telemetry is optional: any failure, including a missing `opentelemetry`
@@ -211,7 +211,10 @@ impl PyRun {
         let _ = slf.py().import("wyrd.otel").and_then(|otel| {
             otel.call_method1(
                 "_enter_run",
-                (run.inner.subject().to_string(), run.inner.run_id().as_str()),
+                (
+                    run.inner.subject_uid().as_str(),
+                    run.inner.run_id().as_str(),
+                ),
             )
         });
         slf
@@ -219,7 +222,7 @@ impl PyRun {
 
     /// Restore the correlation that was ambient before the matching entry.
     ///
-    /// Passes this view's `CardRef` and `run_id` to `wyrd.otel`, which pops the
+    /// Passes this view's subject Card UID and `run_id` to `wyrd.otel`, which pops the
     /// current execution context's innermost scope only when it equals that
     /// pair; a mismatched or failing exit changes nothing. Failures are
     /// swallowed, and the method always returns `False` so an exception raised
@@ -239,7 +242,10 @@ impl PyRun {
         let _ = slf.py().import("wyrd.otel").and_then(|otel| {
             otel.call_method1(
                 "_exit_run",
-                (run.inner.subject().to_string(), run.inner.run_id().as_str()),
+                (
+                    run.inner.subject_uid().as_str(),
+                    run.inner.run_id().as_str(),
+                ),
             )
         });
         false

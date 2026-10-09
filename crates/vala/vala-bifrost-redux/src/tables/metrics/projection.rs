@@ -38,7 +38,7 @@ use crate::tables::signal::{
     struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
     validate_canonical_user_batch,
 };
-use wyrd_spec::reference::CardRefScope;
+use wyrd_spec::ids::CardUid;
 
 /// Largest accepted metric name, in bytes.
 const MAX_METRIC_NAME_BYTES: usize = 256;
@@ -157,7 +157,7 @@ const KIND_SPECIFIC_COLUMNS: [&str; 20] = [
 /// assembled into the canonical Arrow batch.
 pub fn project_resource_metrics(
     resource_metrics: &[ResourceMetrics],
-    card_scope: Option<&CardRefScope>,
+    card_scope: Option<&[CardUid]>,
     output_limit_bytes: usize,
 ) -> Result<(RecordBatch, MetricsOutcome), TableError> {
     let mut columns = PointColumns::default();
@@ -398,7 +398,7 @@ impl MetricDescriptor {
 /// Validate every data point of one metric, in request order.
 fn point_rows(
     metric: &Metric,
-    card_scope: Option<&CardRefScope>,
+    card_scope: Option<&[CardUid]>,
 ) -> Vec<Result<PointRow, &'static str>> {
     match &metric.data {
         Some(metric::Data::Gauge(gauge)) => gauge
@@ -511,11 +511,11 @@ impl PointRow {
     /// # Errors
     ///
     /// Returns a stable reason when the numeric oneof is absent, a
-    /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
+    /// `wyrd.card_uid` or `wyrd.run_id` attribute is wrongly typed or
     /// malformed, or an exemplar is invalid.
     fn number(
         point: &NumberDataPoint,
-        card_scope: Option<&CardRefScope>,
+        card_scope: Option<&[CardUid]>,
     ) -> Result<Self, &'static str> {
         let (int_value, double_value) = match point.value {
             Some(number_data_point::Value::AsInt(value)) => (Some(value), None),
@@ -542,11 +542,11 @@ impl PointRow {
     /// Returns a stable reason when the bucket and bound counts disagree, the
     /// bucket counts do not sum to the declared count, a bound is not finite or
     /// not strictly increasing, the collection exceeds its accepted size, a
-    /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
+    /// `wyrd.card_uid` or `wyrd.run_id` attribute is wrongly typed or
     /// malformed, or an exemplar is invalid.
     fn histogram(
         point: &HistogramDataPoint,
-        card_scope: Option<&CardRefScope>,
+        card_scope: Option<&[CardUid]>,
     ) -> Result<Self, &'static str> {
         if point.bucket_counts.len() > MAX_BUCKETS {
             return Err("histogram bucket collection exceeds the accepted size");
@@ -599,12 +599,12 @@ impl PointRow {
     /// # Errors
     ///
     /// Returns a stable reason when a bucket collection exceeds its accepted
-    /// size, the zero threshold is negative, a `wyrd.card_ref` or
+    /// size, the zero threshold is negative, a `wyrd.card_uid` or
     /// `wyrd.run_id` attribute is wrongly typed or malformed, or an exemplar
     /// is invalid.
     fn exponential_histogram(
         point: &ExponentialHistogramDataPoint,
-        card_scope: Option<&CardRefScope>,
+        card_scope: Option<&[CardUid]>,
     ) -> Result<Self, &'static str> {
         if point.zero_threshold < 0.0 {
             return Err("exponential histogram zero threshold is negative");
@@ -637,11 +637,11 @@ impl PointRow {
     ///
     /// Returns a stable reason when the quantile collection exceeds its
     /// accepted size, a quantile lies outside the closed unit interval, or a
-    /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
+    /// `wyrd.card_uid` or `wyrd.run_id` attribute is wrongly typed or
     /// malformed.
     fn summary(
         point: &SummaryDataPoint,
-        card_scope: Option<&CardRefScope>,
+        card_scope: Option<&[CardUid]>,
     ) -> Result<Self, &'static str> {
         if point.quantile_values.len() > MAX_QUANTILES {
             return Err("summary quantile collection exceeds the accepted size");
@@ -789,7 +789,7 @@ struct PointColumns {
     scope_attributes: Vec<Vec<u8>>,
     scope_dropped_attributes_count: Vec<u32>,
     scope_schema_url: Vec<String>,
-    card_ref: Vec<Option<String>>,
+    card_uid: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
 
@@ -817,7 +817,7 @@ fn point_payload_bytes(descriptor: &MetricDescriptor, row: &PointRow) -> usize {
         + descriptor.metadata.len()
         + descriptor.kind.len()
         + row.attributes.len()
-        + row.correlation.card_ref.as_ref().map_or(0, String::len)
+        + row.correlation.card_uid.as_ref().map_or(0, String::len)
         + row.correlation.run_id.as_ref().map_or(0, String::len)
         + numeric_elements * size_of::<i64>()
         + row
@@ -858,7 +858,7 @@ impl PointColumns {
         self.start_time_unix_nano.push(row.start_time_unix_nano);
         self.flags.push(row.flags);
         self.attributes.push(row.attributes);
-        self.card_ref.push(row.correlation.card_ref);
+        self.card_uid.push(row.correlation.card_uid);
         self.run_id.push(row.correlation.run_id);
         self.int_value.push(row.int_value);
         self.double_value.push(row.double_value);
@@ -1066,7 +1066,7 @@ impl PointColumns {
             binary_column(&self.scope_attributes),
             u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(self.scope_schema_url),
-            utf8_opt_column(self.card_ref),
+            utf8_opt_column(self.card_uid),
             utf8_opt_column(self.run_id),
         ];
         RecordBatch::try_new(projected_signal_schema(METRIC_FIELDS), columns)

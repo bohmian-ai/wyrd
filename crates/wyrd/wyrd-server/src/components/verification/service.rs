@@ -527,8 +527,9 @@ impl<'a> VerificationControl<'a> {
             tracing::warn!(%execution_id, "the tenant has no SYSTEM principal; the direct result is not recorded");
             return;
         };
-        let (Some(subject), Ok(result_id)) = (
+        let (Some(subject), Some(verifier), Ok(result_id)) = (
             target.subject.uid.as_ref(),
+            target.verifier.uid.as_ref(),
             VerificationResultId::new(execution_id.as_uuid()),
         ) else {
             return;
@@ -549,11 +550,6 @@ impl<'a> VerificationControl<'a> {
                 }
             }
         };
-        let verifier_ref = CardRef {
-            uid: None,
-            ..target.verifier.clone()
-        }
-        .to_string();
         let verifier_version = target.verifier.version.to_string();
         let built = ResultPayloadBuilder::new(
             ResultRun {
@@ -565,7 +561,7 @@ impl<'a> VerificationControl<'a> {
                 trigger: None,
                 input: &input,
             },
-            &verifier_ref,
+            verifier,
             result_id,
             ended_at,
             started_at,

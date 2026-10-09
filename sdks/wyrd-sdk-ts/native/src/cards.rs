@@ -595,11 +595,11 @@ impl NativeRun {
         self.run.alias().to_owned()
     }
 
-    /// The exact `CardRef` text of this view's subject, which `Run.scope`
-    /// stamps on spans as `wyrd.card_ref`.
+    /// The UID of this view's subject Card, which `Run.scope` stamps on
+    /// spans as `wyrd.card_uid`.
     #[napi(getter)]
-    pub fn subject(&self) -> String {
-        self.run.subject().to_string()
+    pub fn subject_uid(&self) -> String {
+        self.run.subject_uid().as_str().to_owned()
     }
 
     /// An immutable sibling view scoped to a registered alias.

@@ -46,10 +46,7 @@ pub(crate) fn projected_source_schema_fingerprint(
         .filter(|field| {
             !matches!(
                 field.name().as_str(),
-                wyrd_spec::vala::CARD_REF
-                    | wyrd_spec::vala::CARD_UID
-                    | wyrd_spec::vala::PRINCIPAL_ID
-                    | "run_id"
+                wyrd_spec::vala::CARD_UID | wyrd_spec::vala::PRINCIPAL_ID | "run_id"
             ) && !field.name().starts_with("wyrd_")
         })
         .map(|field| field.as_ref().clone())
@@ -64,13 +61,15 @@ pub struct ScribeIngressFrame {
     pub principal: Principal,
     /// Authenticated tenant selected by the transport boundary.
     pub authenticated_tenant: wyrd_spec::DataTenantId,
-    /// Registry-resolved Cards an unbound writer attributes this frame to.
+    /// Card UIDs the frame's rows may correlate to, when the principal's
+    /// signed scope does not govern.
     ///
-    /// Gate resolves the frame's distinct `card_ref` values against the
-    /// tenant registry when the principal may attribute to any registered
-    /// observation-target Card; each member carries its registry UID. `None`
-    /// for a Card-bound writer, whose signed scope governs instead.
-    pub attributed_cards: Option<wyrd_spec::reference::CardRefScope>,
+    /// Gate fills it for an unbound writer with the frame's distinct
+    /// `card_uid` values that name registered observation-target Cards in the
+    /// tenant; the Scribe outbox fills it for a gateway capture with the
+    /// subjects the gateway already authorized. `None` leaves the principal's
+    /// signed scope in force.
+    pub attributed_cards: Option<Vec<wyrd_spec::ids::CardUid>>,
     /// Requested logical table, unchanged by physical resolution.
     pub table: TableRef,
     /// Fingerprint asserted by an engine-internal producer with no catalog.
@@ -309,9 +308,6 @@ pub enum ScribeError {
     #[error("ingest card scope validation failed")]
     CardScopeDenied,
 
-    #[error("ingest card identity could not be resolved")]
-    CardUnresolved,
-
     #[error("ingress dispatcher is closed")]
     IngressClosed,
 
@@ -366,7 +362,6 @@ impl ScribeError {
                 future_bound_micros: *future_bound_micros,
             },
             Self::CardScopeDenied => Self::CardScopeDenied,
-            Self::CardUnresolved => Self::CardUnresolved,
             Self::IngressClosed => Self::IngressClosed,
             Self::ObjectStorePutFailed(error) => Self::Internal {
                 detail: format!("object store PUT failed: {error}"),

@@ -776,9 +776,9 @@ belongs to — the subject Card must be carried on that row. Generic telemetry
 may omit a subject Card.
 
 Python `Run` values are synchronous context managers for optional ambient span
-correlation. Entering a scope best-effort attaches the selected CardRef and
+correlation. Entering a scope best-effort attaches the selected Card UID and
 run ID to Python OpenTelemetry context, annotates an active recording span,
-and lets an idempotently installed span processor copy `wyrd.card_ref` and
+and lets an idempotently installed span processor copy `wyrd.card_uid` and
 `wyrd.run_id` onto spans created inside the scope. Exiting restores the prior
 context. Missing or incompatible Python OpenTelemetry support and enrichment
 failures are no-ops; they never fail application execution or explicit Wyrd
@@ -808,33 +808,32 @@ and Run correlation are optional per-row values:
 
 | Value | Source | Grain | Means |
 |---|---|---|---|
-| `card_ref` | optional client assertion of the row's exact subject Card (the run view's selected Card); server authorizes it when present | per row | the optional Card-version anchor — *which* Card |
+| `card_uid` | optional client assertion of the row's exact subject Card UID (the run view's selected Card); server authorizes it when present | per row | the optional Card-version anchor — *which* Card |
 | `run_id` | optional client-generated value per `.run()`, shared by every Card-scoped view of that invocation; passed through opaquely | per row | the optional Run anchor — *which* execution |
 | `principal_id` | server-stamped from the verified JWT | per request | the authenticated publisher — *who* emitted it |
 | `tenant_id` | server-stamped from the verified JWT | per request | the tenancy boundary |
 | `wyrd_request_id` | the propagated `Wyrd-Request-Id` (minted at first sighting) | per request | the request spine — one request spans **many** runs and hops |
 
 Resolution rule: **tenant and `principal_id` come from the token; a present
-`card_ref` is client-asserted, server-authorized, and resolved from its trusted
-signed scope mapping, or, for a principal bound to no Card, from the tenant
-registry; absent Card correlation produces null `card_uid`;
+`card_uid` is client-asserted and server-authorized against the trusted signed
+scope, or, for a principal bound to no Card, against the tenant registry;
+absent Card correlation produces null `card_uid`;
 `run_id` and `wyrd_request_id` pass through untouched.**
 
 On OTLP input, canonical table projection reads these optional values from the
-record-level attributes named exactly `wyrd.card_ref` and `wyrd.run_id`. The
+record-level attributes named exactly `wyrd.card_uid` and `wyrd.run_id`. The
 final duplicate key wins, matching Wyrd's existing OTLP attribute lookup rule,
 while every original attribute entry remains in the lossless payload.
-`wyrd.card_ref` uses the compact `CardRef` text grammar; a client `#uid` suffix
-is syntactically valid but untrusted and ignored when the server selects the UID
-from signed scope. `wyrd.run_id` uses the existing `RunId` text grammar.
+`wyrd.card_uid` uses the `CardUid` text grammar and `wyrd.run_id` the existing
+`RunId` text grammar.
 Consequences, stated so they stop drifting:
 
-- **`card_ref` and `run_id` are optional per-row columns on the observation payload, not
+- **`card_uid` and `run_id` are optional per-row columns on the observation payload, not
   request metadata.** A client-side queue batches records from different runs —
   and different cards — before it flushes, so one sealed batch (one
   `wyrd_batch_id`) freely mixes them. The producer is keyed by **table only**; it
   never splits a batch by card or run. The server therefore authorizes every
-  present `card_ref` **per row** (every distinct asserted Card in the batch must
+  present `card_uid` **per row** (every distinct asserted Card in the batch must
   be in the principal's scope),
   validates the client-generated UUIDv7 `wyrd_batch_id` request field (the
   idempotency key; it is not a row column), stamps request-scoped
@@ -845,10 +844,10 @@ Consequences, stated so they stop drifting:
   them). A row without `wyrd_event_time` takes `wyrd_ingested_at`. Row
   identity is batch-level; no per-row position is stamped.
 
-- **`card_ref` is optional and authorized, not trusted.** Its absence is valid
+- **`card_uid` is optional and authorized, not trusted.** Its absence is valid
   generic telemetry and produces null `card_uid`; the authenticated publisher
   remains available through non-null `principal_id`. When present, the server checks the asserted
-  `card_ref` against the principal's **card scope**. For Service and Agent
+  `card_uid` against the principal's **card scope**. For Service and Agent
   principals, the scope is the principal's own `card_ref` plus the
   **observation-target** cards reachable through the transitive card-ref graph
   declared in that card's spec. A card is in scope only if its kind is an
@@ -857,7 +856,7 @@ Consequences, stated so they stop drifting:
   control-plane kinds (`Policy`, `Audit`, `Operator`, `Trigger`) never enter the
   emit scope. Service cards contribute `Service.components`; other reachable
   specs contribute their declared card refs according to the shared card-ref
-  extraction rules. A `card_ref` outside that set is rejected: a principal may
+  extraction rules. A `card_uid` outside that set is rejected: a principal may
   not attribute records to a card outside its declared graph. The scope can be resolved from the
   signed `card_ref_scope` claim minted into the JWT at `/auth/token`. Every
   token mint — a first exchange, a machine's re-exchange, or a human refresh
@@ -866,12 +865,12 @@ Consequences, stated so they stop drifting:
   in-memory mapping and performs no Card-registry Postgres or cache lookup.
   A principal bound to no Card (User, tenant administrator, unbound Service)
   carries no bounded scope; its scope is every registered observation-target
-  Card in its tenant. Gate resolves the distinct `card_ref` values of each
-  frame (at most 32) against the tenant registry before dispatch and hands
-  Scribe the resolved UID-bearing members as that frame's scope, so an
-  unregistered or non-observation Card is refused exactly like a reference
-  outside a signed scope.
-- **This is not the governance token.** `card_ref` is one field in the
+  Card in its tenant. Gate looks the distinct `card_uid` values of each
+  frame (at most 32) up in the tenant registry before dispatch and hands
+  Scribe the registered observation-target UIDs as that frame's scope, so an
+  unregistered or non-observation Card is refused exactly like a UID outside
+  a signed scope.
+- **This is not the governance token.** `card_uid` is one field in the
   observation envelope, authorized by the existing JWT plus the principal's
   declared card-ref graph — not a separate per-card credential (doctrine #18).
   The token still proves the principal; it bounds a *set* of emittable cards,

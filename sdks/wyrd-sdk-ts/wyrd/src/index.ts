@@ -509,7 +509,7 @@ export interface TableLayout {
 
 /** Optional per-row correlation; an omitted field is a null on the wire. */
 export interface Correlation {
-  cardRef?: string;
+  cardUid?: string;
   runId?: string;
 }
 
@@ -901,12 +901,12 @@ export class Bifrost {
    * saturated queue throws the stable refusal rather than dropping the row.
    *
    * @param row - One row object matching the active table's columns.
-   * @param correlation - Optional `cardRef` and `runId` stamped on the row.
+   * @param correlation - Optional `cardUid` and `runId` stamped on the row.
    * @throws {@link WyrdError} with no active table, for a malformed
-   * `cardRef`, or when the queue is full.
+   * `cardUid`, or when the queue is full.
    */
   insert(row: Readonly<Record<string, unknown>>, correlation: Correlation = {}): void {
-    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardRef, correlation.runId));
+    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardUid, correlation.runId));
   }
 
   /**
@@ -1206,11 +1206,11 @@ export type TokenAudience = "wyrd" | "bifrost";
  * @param schema - The table's JSON Schema, or a schema that emits one, mapped
  * to the Arrow schema of the row.
  * @param row - One row object matching `schema`.
- * @param correlation - Optional `cardRef` and `runId` stamped on the row;
+ * @param correlation - Optional `cardUid` and `runId` stamped on the row;
  * omitted, the row is uncorrelated.
  * @throws {@link WyrdError} `WYRD_VALA_400_SCHEMA_PARSE` for a schema that
  * does not map to Arrow, or `WYRD_SPEC_400_VALIDATION` for unparsable schema
- * text or a malformed `cardRef`.
+ * text or a malformed `cardUid`.
  */
 export function record(
   bifrost: Bifrost,
@@ -1224,7 +1224,7 @@ export function record(
       table,
       jsonSchemaText(schema),
       JSON.stringify(row),
-      correlation.cardRef,
+      correlation.cardUid,
       correlation.runId,
     ),
   );
@@ -2491,7 +2491,7 @@ export class Run {
     }
     const scoped = api.context
       .active()
-      .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subject, this.#native.runId]);
+      .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subjectUid, this.#native.runId]);
     return api.context.with(scoped, fn);
   }
 }

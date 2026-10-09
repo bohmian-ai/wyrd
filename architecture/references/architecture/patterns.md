@@ -232,7 +232,7 @@ Observability code is explicit about:
 - Ingestion vs query responsibilities
 
 Every observation row carries server-stamped `principal_id`. Optional per-row
-`card_ref` is server-authorized when present; `run_id` remains opaque.
+`card_uid` is server-authorized when present; `run_id` remains opaque.
 
 Evaluation code keeps deterministic assertions deterministic.
 Model-based judging is isolated from assertion logic and tested with mock

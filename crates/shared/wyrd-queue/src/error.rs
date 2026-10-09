@@ -55,7 +55,7 @@ pub enum WyrdQueueError {
     #[error("schema parse: {0}")]
     SchemaParse(String),
 
-    /// A reserved column name (`wyrd_*`, or `card_ref`/`run_id` presented as a
+    /// A reserved column name (`wyrd_*`, or `card_uid`/`run_id` presented as a
     /// payload key rather than via its argument) appeared where user fields are
     /// expected. Serialization-domain `WYRD_VALA_400_BIFROST_RESERVED_COLUMN`.
     #[error("reserved column: {0}")]

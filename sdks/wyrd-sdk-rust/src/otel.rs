@@ -118,12 +118,12 @@ pub fn start_telemetry(state: &WyrdState) -> Result<Telemetry, WyrdError> {
 struct RunCorrelation;
 
 impl SpanProcessor for RunCorrelation {
-    /// Copy the current task's Run scope onto `span` as `wyrd.card_ref` and
+    /// Copy the current task's Run scope onto `span` as `wyrd.card_uid` and
     /// `wyrd.run_id`; a span started outside every scope is unchanged.
     fn on_start(&self, span: &mut Span, _cx: &Context) {
         use opentelemetry::trace::Span as _;
-        if let Some((card_ref, run_id)) = current_run_scope() {
-            span.set_attribute(KeyValue::new("wyrd.card_ref", card_ref));
+        if let Some((card_uid, run_id)) = current_run_scope() {
+            span.set_attribute(KeyValue::new("wyrd.card_uid", card_uid));
             span.set_attribute(KeyValue::new("wyrd.run_id", run_id));
         }
     }

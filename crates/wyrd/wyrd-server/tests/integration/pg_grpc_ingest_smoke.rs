@@ -780,15 +780,15 @@ async fn scribe_tail_listing_trusts_the_peer_and_scopes_to_the_table() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Encodes one complete `vala.verification.results` row with `card_ref`.
+/// Encodes one complete `vala.verification.results` row with `card_uid`.
 ///
 /// Carries every authored column of the built-in result table, with
-/// `card_ref` in the correlation column.
+/// `card_uid` in the correlation column.
 ///
 /// # Panics
 ///
 /// Panics when the fixed Arrow batch or IPC stream cannot be constructed.
-fn verification_result_ipc(card_ref: &str) -> Vec<u8> {
+fn verification_result_ipc(card_uid: &str) -> Vec<u8> {
     let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
     let text = |name: &str, nullable: bool| Field::new(name, DataType::Utf8, nullable);
     let fields = vec![
@@ -807,7 +807,7 @@ fn verification_result_ipc(card_ref: &str) -> Vec<u8> {
         Field::new("started_at", utc(), false),
         Field::new("ended_at", utc(), false),
         text("details", true),
-        text("card_ref", true),
+        text("card_uid", true),
     ];
     let schema = Arc::new(Schema::new(fields));
     let now = Utc::now().timestamp_micros();
@@ -832,7 +832,7 @@ fn verification_result_ipc(card_ref: &str) -> Vec<u8> {
         at(Some(now)),
         at(Some(now)),
         null(),
-        value(card_ref),
+        value(card_uid),
     ];
     let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
         .expect("valid verification result batch");
@@ -1106,7 +1106,7 @@ async fn public_result_writes_are_refused_over_grpc() {
                 harness.bind,
                 jwt,
                 table,
-                verification_result_ipc("prod/Verifier/drift@1.0.0"),
+                verification_result_ipc(&Uuid::now_v7().to_string()),
             )
             .await
             .expect_err("a public result write is refused");
@@ -1316,7 +1316,7 @@ async fn forged_tenant_result_writes_are_refused() {
             harness.bind,
             &jwt,
             "vala.verification.results",
-            verification_result_ipc("prod/Verifier/drift@1.0.0"),
+            verification_result_ipc(&Uuid::now_v7().to_string()),
         )
         .await
         .expect_err("a forged tenant is refused");

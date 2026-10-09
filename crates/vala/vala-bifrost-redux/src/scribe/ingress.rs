@@ -15,6 +15,7 @@ use std::time::Instant;
 use iceberg::spec::Schema;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::reference::CardRefScope;
 
 /// Validates that one decoded request fits the persistence bucket that must own it.
 ///
@@ -94,8 +95,8 @@ fn take_transport_decode_owner(
 struct AdmittedRowContext {
     /// Authenticated principal moved into the retained source.
     principal: wyrd_runtime::Principal,
-    /// Card scope every `card_ref` is authorized and stamped against.
-    card_scope: Option<wyrd_spec::reference::CardRefScope>,
+    /// Card UIDs every row's `card_uid` is authorized against.
+    card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
     /// Catalog fingerprint required of the projected source schema.
     expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
     /// Stable request identity moved into managed-column stamping.
@@ -554,7 +555,7 @@ impl ScribeImpl {
                 AdmittedRowContext {
                     card_scope: frame
                         .attributed_cards
-                        .or_else(|| frame.principal.card_ref_scope().cloned()),
+                        .or_else(|| frame.principal.card_ref_scope().map(CardRefScope::uids)),
                     principal: frame.principal,
                     expected_schema_fingerprint,
                     request_id: frame.request_id,

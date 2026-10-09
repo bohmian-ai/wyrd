@@ -93,7 +93,7 @@ def otlp_tracer(otlp_environment: None, observed_key: str) -> Iterator[TracerPro
 
     The provider is private, as an agent framework's often is, so Wyrd's
     correlation processor is registered through the explicit hook. Spans
-    asserting a ``wyrd.card_ref`` are admitted only within the exporting key's
+    asserting a ``wyrd.card_uid`` are admitted only within the exporting key's
     Card scope, so the exporter authenticates with the Service's own key.
     """
     provider = TracerProvider()

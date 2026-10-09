@@ -36,6 +36,7 @@ use wyrd_spec::gateway::{
     GatewayCallOutcome, GatewayCallPayloadV1, GatewayCaptureMode, GatewayCapturePolicy,
     GatewayOperation, GatewayPayloadField, GatewayPayloadObjectRefV1, ModelRef,
 };
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_storage::StorageError;
 use wyrd_storage::tenant_path::{self, ValidatedPath};
@@ -273,11 +274,11 @@ impl CallCapture {
     }
 
     /// Builds the one-row `vala.gateway.calls` batch over the table's user
-    /// fields followed by its `card_ref` and `run_id` correlation inputs.
+    /// fields followed by its `card_uid` and `run_id` correlation inputs.
     ///
-    /// The correlation inputs carry the authorized subject, whose `card_ref`
-    /// text includes the Card UID Scribe stamps as `card_uid`, or are null for
-    /// an uncorrelated call.
+    /// The correlation inputs carry the authorized subject's Card UID, which
+    /// Scribe confirms against the frame's attributed UIDs, or are null for an
+    /// uncorrelated call.
     ///
     /// # Errors
     ///
@@ -302,7 +303,9 @@ impl CallCapture {
         let mut columns = batch.columns().to_vec();
         let user = columns.len() - 2;
         columns.truncate(user);
-        columns.push(Arc::new(StringArray::from(vec![subject.card.to_string()])));
+        columns.push(Arc::new(StringArray::from(vec![
+            subject.card.uid.as_ref().map(CardUid::as_str),
+        ])));
         columns.push(Arc::new(StringArray::from(vec![subject.run_id.as_str()])));
         RecordBatch::try_new(batch.schema(), columns).map_err(|_| CaptureDrop::Projection)
     }
@@ -965,7 +968,7 @@ pub(crate) mod tests {
 
         let calls = capture.calls_batch().expect("calls batch");
         assert_eq!(calls.num_rows(), 1);
-        for column in ["card_ref", "run_id", "request_payload_json"] {
+        for column in ["card_uid", "run_id", "request_payload_json"] {
             let array = calls.column_by_name(column).expect(column);
             assert_eq!(array.null_count(), 1, "{column} is null");
         }
@@ -1173,7 +1176,8 @@ pub(crate) mod recording {
     };
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::ids::CardUid;
+    use wyrd_spec::reference::CardRefScope;
     use wyrd_spec::request_id::RequestId;
 
     use crate::scribe_outbox::{ScribeSink, ScribeTable};
@@ -1212,9 +1216,10 @@ pub(crate) mod recording {
         pub(crate) tenant: DataTenantId,
         /// Principal the frame was submitted under.
         pub(crate) principal: PrincipalId,
-        /// Card scope Scribe stamps `card_uid` from: the frame's attributed
-        /// Cards when it carries them, otherwise its principal's scope.
-        pub(crate) card_scope: Vec<CardRef>,
+        /// Card UIDs Scribe authorizes `card_uid` against: the frame's
+        /// attributed UIDs when it carries them, otherwise its principal's
+        /// signed scope.
+        pub(crate) card_scope: Vec<CardUid>,
         /// Fully qualified destination table.
         pub(crate) table: String,
         /// Request the frame was admitted under.
@@ -1235,9 +1240,8 @@ pub(crate) mod recording {
                 principal: frame.principal.id,
                 card_scope: frame
                     .attributed_cards
-                    .as_ref()
-                    .or_else(|| frame.principal.card_ref_scope())
-                    .map(|scope| scope.as_slice().to_vec())
+                    .clone()
+                    .or_else(|| frame.principal.card_ref_scope().map(CardRefScope::uids))
                     .unwrap_or_default(),
                 table: frame.table.fqn(),
                 request_id: frame.request_id.clone(),

@@ -477,7 +477,7 @@ impl Bifrost {
                 table.fqn(),
                 table.user_schema(),
                 row,
-                correlation.card_ref,
+                correlation.card_uid,
                 correlation.run_id,
             )
             .map_err(Into::into)
@@ -516,7 +516,7 @@ impl Bifrost {
                 table.fqn(),
                 table.user_schema(),
                 rows,
-                correlation.card_ref,
+                correlation.card_uid,
                 correlation.run_id,
                 None,
             )
@@ -546,7 +546,7 @@ impl Bifrost {
                 table.fqn(),
                 table.user_schema(),
                 rows,
-                correlation.card_ref,
+                correlation.card_uid,
                 correlation.run_id,
                 Some(chrono::Utc::now().timestamp_micros()),
             )
@@ -598,7 +598,7 @@ impl Bifrost {
                 &table,
                 &schema,
                 row,
-                correlation.card_ref,
+                correlation.card_uid,
                 correlation.run_id,
             )
             .map_err(Into::into)

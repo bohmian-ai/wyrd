@@ -98,10 +98,10 @@ type Refusal = readonly [string, (bifrost: Bifrost) => void, string];
 test.for<Refusal>([
   ["no active table", (bifrost) => bifrost.insert({ value: 81 }), "WYRD_VALA_412_NO_ACTIVE_TABLE"],
   [
-    "malformed card reference",
+    "malformed Card UID",
     (bifrost) => {
       bifrost.useTable(TableConfig.fromJsonSchema("vala.datasets.refused", Value));
-      bifrost.insert({ value: 82 }, { cardRef: "not-a-ref" });
+      bifrost.insert({ value: 82 }, { cardUid: "not-a-uid" });
     },
     "WYRD_SPEC_400_VALIDATION",
   ],

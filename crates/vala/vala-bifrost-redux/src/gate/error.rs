@@ -40,7 +40,7 @@ pub enum IngestError {
         /// Fully-qualified table name the caller attempted to write.
         table: String,
     },
-    /// A per-row `card_ref` outside the principal's card scope (or null/absent).
+    /// A per-row `card_uid` outside the principal's card scope.
     #[error("card_ref {card_ref} outside principal card scope")]
     CardScopeDenied {
         /// Canonical string form of the refused card reference.
@@ -312,9 +312,6 @@ impl IngestError {
                 future_bound_micros,
             },
             crate::contracts::ScribeError::CardScopeDenied => Self::CardScopeDenied {
-                card_ref: "<server-validation>".to_owned(),
-            },
-            crate::contracts::ScribeError::CardUnresolved => Self::CardUnresolved {
                 card_ref: "<server-validation>".to_owned(),
             },
             crate::contracts::ScribeError::IngressClosed => Self::IngressClosed,
@@ -697,11 +694,6 @@ mod tests {
             (
                 ScribeError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
-                "vala.traces.spans",
-            ),
-            (
-                ScribeError::CardUnresolved,
-                "WYRD_VALA_403_CARD_UNRESOLVED",
                 "vala.traces.spans",
             ),
             (

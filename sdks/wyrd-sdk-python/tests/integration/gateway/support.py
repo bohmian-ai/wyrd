@@ -32,7 +32,7 @@ BINDINGS = {
 
 OPENAI_USAGE = {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15}
 
-OPENAI_COMPLETION = {
+OPENAI_COMPLETION: dict[str, Any] = {
     "id": "chatcmpl-1",
     "object": "chat.completion",
     "created": 1,

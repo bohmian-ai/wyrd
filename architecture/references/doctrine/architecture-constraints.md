@@ -158,7 +158,7 @@ replicas remain one logical surface behind one gateway.
 
 - One JWT can carry multiple component cards (nested service).
 - Each observation row carries server-stamped `principal_id`; optional per-row
-  `card_ref` is server-authorized when present, and `run_id` remains opaque.
+  `card_uid` is server-authorized when present, and `run_id` remains opaque.
 - Run IDs are opaque client-side execution records, not server-persisted.
 - See `architecture/wyrd-design.md` §Observation identity.
 

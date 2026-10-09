@@ -831,28 +831,21 @@ async fn scribe_optional_and_scoped_card_correlation_journey() {
     })
     .expect("the writer's SDK client");
 
-    let identity = |card: &wyrd_spec::reference::CardRef| {
-        wyrd_spec::reference::CardRef {
-            uid: None,
-            ..card.clone()
-        }
-        .to_string()
-    };
+    let root_uid = registry_card_uid(&server, &root).await;
+    let secondary_uid = registry_card_uid(&server, &secondary).await;
     append_correlated(
         &client,
         &table,
         &[
             (1, None),
-            (2, Some(identity(&root))),
-            (3, Some(identity(&secondary))),
+            (2, Some(root_uid.clone())),
+            (3, Some(secondary_uid.clone())),
         ],
     )
     .await
     .expect("optional and scoped correlations are admitted");
 
     let stamped = read_correlation(&client, &table).await;
-    let root_uid = registry_card_uid(&server, &root).await;
-    let secondary_uid = registry_card_uid(&server, &secondary).await;
     assert_eq!(
         stamped,
         vec![
@@ -866,7 +859,7 @@ async fn scribe_optional_and_scoped_card_correlation_journey() {
     let refusal = append_correlated(
         &client,
         &table,
-        &[(4, Some("prod/Service/other@1.0.0".to_owned()))],
+        &[(4, Some(uuid::Uuid::now_v7().to_string()))],
     )
     .await
     .expect_err("an out-of-scope Card is refused");
@@ -949,18 +942,11 @@ async fn scribe_unbound_writer_card_attribution_journey() {
         ))
         .await
         .expect("the Trigger registers");
-    let identity = |card: &wyrd_spec::reference::CardRef| {
-        wyrd_spec::reference::CardRef {
-            uid: None,
-            ..card.clone()
-        }
-        .to_string()
-    };
-
+    let observed_uid = registry_card_uid(&server, &observed).await;
     append_correlated(
         &client,
         &table,
-        &[(1, None), (2, Some(identity(&observed)))],
+        &[(1, None), (2, Some(observed_uid.clone()))],
     )
     .await
     .expect("a registered observation target is attributable");
@@ -971,16 +957,13 @@ async fn scribe_unbound_writer_card_attribution_journey() {
         .collect::<Vec<_>>();
     assert_eq!(
         stamped,
-        vec![
-            (1, None),
-            (2, Some(registry_card_uid(&server, &observed).await))
-        ],
+        vec![(1, None), (2, Some(observed_uid))],
         "the registered Card is stamped with its registry UID"
     );
 
     for refused in [
-        "default/Service/never-registered@1.0.0".to_owned(),
-        identity(&trigger.root),
+        uuid::Uuid::now_v7().to_string(),
+        registry_card_uid(&server, &trigger.root).await,
     ] {
         let refusal = append_correlated(&client, &table, &[(3, Some(refused.clone()))])
             .await
@@ -1167,7 +1150,7 @@ async fn append_correlated(
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new(
-            wyrd_spec::vala::managed_columns::CARD_REF,
+            wyrd_spec::vala::managed_columns::CARD_UID,
             DataType::Utf8,
             true,
         ),

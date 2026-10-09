@@ -43,7 +43,7 @@ export function metricExporter(client: WyrdClient): OTLPMetricExporter {
 }
 
 /**
- * The context key `Run.scope` sets to `[cardRef, runId]`. `createContextKey`
+ * The context key `Run.scope` sets to `[cardUid, runId]`. `createContextKey`
  * is `Symbol.for`, so the key `Run.scope` creates without importing this
  * module is the same one.
  */
@@ -54,7 +54,7 @@ const runCorrelation: SpanProcessor = {
   onStart(span: Span, parentContext: Context): void {
     const scope = parentContext.getValue(RUN_SCOPE) as readonly [string, string] | undefined;
     if (scope !== undefined) {
-      span.setAttributes({ "wyrd.card_ref": scope[0], "wyrd.run_id": scope[1] });
+      span.setAttributes({ "wyrd.card_uid": scope[0], "wyrd.run_id": scope[1] });
     }
   },
   onEnd(): void {},

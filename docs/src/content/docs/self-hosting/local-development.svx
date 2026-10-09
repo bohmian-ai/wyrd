@@ -174,7 +174,7 @@ run.observe.verify("answer-is-yes", {"answer": "yes"})
 traces = TracerProvider()
 traces.add_span_processor(BatchSpanProcessor(otel.span_exporter(client)))
 with traces.get_tracer("assistant").start_as_current_span("answer") as span:
-    span.set_attribute("wyrd.card_ref", "default/Agent/assistant-agent@1.0.0")
+    span.set_attribute("wyrd.card_uid", str(state.card_ref("agent").uid))
     span.set_attribute("wyrd.run_id", run.run_id)
 traces.force_flush()
 state.shutdown()

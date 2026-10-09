@@ -742,14 +742,9 @@ fn result(
             failure(RESULT_INVALID, "the verification result cannot be encoded"),
         )
     };
-    let verifier_ref = CardRef {
-        uid: None,
-        ..verifier.clone()
-    }
-    .to_string();
     let payload = match ResultPayloadBuilder::new(
         ResultRun::claimed(run, report.run_id()),
-        &verifier_ref,
+        &run.verifier_uid,
         result_id,
         event_time,
         started_at,

@@ -415,7 +415,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when a missing value is not null, a final duplicate does not win,
-    /// a wrongly typed, malformed, out-of-scope, or UID-less value rejects more
+    /// a wrongly typed, malformed, out-of-scope, or reference-text value rejects more
     /// than its own point, an original attribute entry changes, or the outcome
     /// counts and first reason are not exact.
     #[test]
@@ -428,35 +428,35 @@ mod tests {
         let missing = base();
         let mut valid = base();
         valid.push(attribute(
-            "wyrd.card_ref",
+            "wyrd.card_uid",
             Value::StringValue(CARD.to_owned()),
         ));
         valid.push(attribute("wyrd.run_id", Value::StringValue(RUN.to_owned())));
         let mut duplicate = base();
         duplicate.push(attribute(
-            "wyrd.card_ref",
-            Value::StringValue("prod/Service/superseded@9.9.9".to_owned()),
+            "wyrd.card_uid",
+            Value::StringValue("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b99".to_owned()),
         ));
         duplicate.push(attribute(
-            "wyrd.card_ref",
+            "wyrd.card_uid",
             Value::StringValue(CARD.to_owned()),
         ));
         let mut wrong_typed = base();
         wrong_typed.push(attribute("wyrd.run_id", Value::IntValue(7)));
         let mut malformed = base();
         malformed.push(attribute(
-            "wyrd.card_ref",
-            Value::StringValue("not-a-card-ref".to_owned()),
+            "wyrd.card_uid",
+            Value::StringValue("not-a-card-uid".to_owned()),
         ));
         let mut out_of_scope = base();
         out_of_scope.push(attribute(
-            "wyrd.card_ref",
+            "wyrd.card_uid",
             Value::StringValue(correlation_fixture::OUT_OF_SCOPE.to_owned()),
         ));
-        let mut without_uid = base();
-        without_uid.push(attribute(
-            "wyrd.card_ref",
-            Value::StringValue(correlation_fixture::WITHOUT_UID.to_owned()),
+        let mut reference_text = base();
+        reference_text.push(attribute(
+            "wyrd.card_uid",
+            Value::StringValue(correlation_fixture::REFERENCE_TEXT.to_owned()),
         ));
 
         let sets = vec![
@@ -466,7 +466,7 @@ mod tests {
             wrong_typed,
             malformed,
             out_of_scope,
-            without_uid,
+            reference_text,
         ];
         let requested = request(vec![metric(
             "gauge.correlated",
@@ -480,14 +480,17 @@ mod tests {
                     .collect(),
             }),
         )]);
-        let (batch, outcome) =
-            project_resource_metrics(&requested, Some(&correlation_fixture::scope()), usize::MAX)
-                .expect("projection completes");
+        let (batch, outcome) = project_resource_metrics(
+            &requested,
+            Some(correlation_fixture::scope().as_slice()),
+            usize::MAX,
+        )
+        .expect("projection completes");
 
         assert_eq!(outcome.accepted_points, 3);
         assert_eq!(
             outcome.rejected_points, 4,
-            "an out-of-scope and a UID-less reference each reject only their own point"
+            "an out-of-scope UID and a Card reference each reject only their own point"
         );
         assert_eq!(
             outcome.rejection_message.as_deref(),
@@ -500,14 +503,14 @@ mod tests {
             "only the two defective points are lost"
         );
 
-        let card_refs = typed::<StringArray>(&batch, "card_ref");
+        let card_uids = typed::<StringArray>(&batch, "card_uid");
         assert!(
-            card_refs.is_null(0),
-            "a missing wyrd.card_ref projects null"
+            card_uids.is_null(0),
+            "a missing wyrd.card_uid projects null"
         );
-        assert_eq!(card_refs.value(1), CARD);
+        assert_eq!(card_uids.value(1), CARD);
         assert_eq!(
-            card_refs.value(2),
+            card_uids.value(2),
             CARD,
             "the final duplicate is authoritative"
         );

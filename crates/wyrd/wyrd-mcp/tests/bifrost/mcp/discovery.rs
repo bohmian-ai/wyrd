@@ -199,7 +199,7 @@ mod pg_tests {
             .filter_map(|field| field["name"].as_str())
             .collect();
         assert!(
-            correlation_names.contains(&"card_ref") && correlation_names.contains(&"run_id"),
+            correlation_names.contains(&"card_uid") && correlation_names.contains(&"run_id"),
             "the server-resolved correlation columns are their own class: {correlation_names:?}"
         );
         assert!(

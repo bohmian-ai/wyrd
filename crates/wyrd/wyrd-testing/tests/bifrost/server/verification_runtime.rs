@@ -41,7 +41,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
+    CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
 };
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::RunInput;
@@ -362,15 +362,11 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         Some(api_key.expose_secret()),
         scribe.grpc_url().as_deref(),
     )?;
-    let uidless = CardRef {
-        uid: None,
-        ..subject_ref.clone()
-    };
     Bifrost::connect(&writer)
         .await?
         .write_batch(
             "vala.drift.observations",
-            &observation_batch(&record, &uidless.to_string())?,
+            &observation_batch(&record, &subject)?,
         )
         .await?;
     seed.activate(client).await?;
@@ -478,14 +474,14 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     Ok(())
 }
 
-/// One Drift observation `record` of `card_ref`: a drifting `score` and a
+/// One Drift observation `record` of the Card `card_uid`: a drifting `score` and a
 /// `latency` feature, as the SDK's tall projection writes them, with a
 /// client-owned `wyrd_event_time` [`EVENT_TIME_LEAD`] before the client's
 /// clock.
 ///
 /// # Errors
 /// Returns an Arrow error when the batch cannot be assembled.
-fn observation_batch(record: &str, card_ref: &str) -> Result<RecordBatch, ServerJourneyError> {
+fn observation_batch(record: &str, card_uid: &CardUid) -> Result<RecordBatch, ServerJourneyError> {
     let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
     let schema = Arc::new(Schema::new(vec![
         Field::new("record_id", DataType::Utf8, false),
@@ -494,7 +490,7 @@ fn observation_batch(record: &str, card_ref: &str) -> Result<RecordBatch, Server
         Field::new("str_value", DataType::Utf8, true),
         Field::new("session_id", DataType::Utf8, true),
         Field::new("created_at", utc(), false),
-        Field::new(CARD_REF, DataType::Utf8, true),
+        Field::new(CARD_UID, DataType::Utf8, true),
         Field::new(WYRD_EVENT_TIME, utc(), false),
     ]));
     let now = Utc::now().timestamp_micros();
@@ -508,7 +504,10 @@ fn observation_batch(record: &str, card_ref: &str) -> Result<RecordBatch, Server
             Arc::new(StringArray::from(vec![None::<&str>, None])),
             Arc::new(StringArray::from(vec![None::<&str>, None])),
             Arc::new(TimestampMicrosecondArray::from(vec![now, now]).with_timezone("UTC")),
-            Arc::new(StringArray::from(vec![card_ref, card_ref])),
+            Arc::new(StringArray::from(vec![
+                card_uid.as_str(),
+                card_uid.as_str(),
+            ])),
             Arc::new(
                 TimestampMicrosecondArray::from(vec![event_time, event_time]).with_timezone("UTC"),
             ),
@@ -772,11 +771,11 @@ impl<'a> ResultLayoutJourney<'a> {
             ),
         };
         let result = VerificationResultId::new_v7();
-        let verifier_ref = CardRef {
-            uid: None,
-            ..self.verifier.clone()
-        }
-        .to_string();
+        let verifier_uid = self
+            .verifier
+            .uid
+            .as_ref()
+            .ok_or("the Verifier has no UID")?;
         let payload = ResultPayloadBuilder::new(
             ResultRun {
                 run_id: None,
@@ -787,7 +786,7 @@ impl<'a> ResultLayoutJourney<'a> {
                 trigger: None,
                 input: &input,
             },
-            &verifier_ref,
+            verifier_uid,
             result,
             event_time,
             event_time,

@@ -3169,13 +3169,9 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
         .iter()
         .find(|frame| frame.table == "vala.gateway.calls")
         .expect("the call row delivers");
-    let attributed = CardRef {
-        uid: Some(uid),
-        ..agent.clone()
-    };
     assert_eq!(
         calls.card_scope,
-        CardRefScope::own(&attributed).as_slice(),
+        std::slice::from_ref(&uid),
         "Scribe stamps card_uid from exactly the attributed Agent"
     );
     let row =
@@ -3191,7 +3187,7 @@ async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
             .value(0)
             .to_owned()
     };
-    assert_eq!(text("card_ref"), attributed.to_string());
+    assert_eq!(text("card_uid"), uid.as_str());
     assert_eq!(text("run_id"), run.as_str());
 
     let unregistered: CardRef = "prod/Agent/ghost@1.0.0".parse().expect("ghost ref");

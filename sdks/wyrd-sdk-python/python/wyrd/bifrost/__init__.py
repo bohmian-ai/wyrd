@@ -176,7 +176,7 @@ class ResolvedTable(TypedDict):
 class Correlation(TypedDict, total=False):
     """Optional per-row correlation; an omitted key is a null on the wire."""
 
-    card_ref: str
+    card_uid: str
     run_id: str
 
 
@@ -209,7 +209,7 @@ class TableConfig:
         Args:
             model: a Pydantic model class, not an instance. Its
                 ``model_json_schema()`` becomes the declared user columns.
-                ``card_ref``, ``run_id``, and ``wyrd_*`` names are reserved.
+                ``card_uid``, ``run_id``, and ``wyrd_*`` names are reserved.
             table: the ``"<namespace>.<name>"`` name SQL uses.
             partition_granularity: ``"hour"`` or ``"day"`` partitions on
                 ``wyrd_event_time``. Omitted while another layout argument is
@@ -568,12 +568,12 @@ class _BifrostBase:
         Args:
             row: a Pydantic model instance, a mapping, or a JSON object string
                 holding the table's declared columns.
-            correlation: optional ``card_ref`` and ``run_id`` for this row.
+            correlation: optional ``card_uid`` and ``run_id`` for this row.
                 Omitted keys are stored as null.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unparsable
-                ``card_ref``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
+                ``card_uid``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
                 is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
                 queue is full.
 
@@ -582,7 +582,7 @@ class _BifrostBase:
         correlation = correlation or {}
         self._native.insert(
             _row_json(row),
-            correlation.get("card_ref"),
+            correlation.get("card_uid"),
             correlation.get("run_id"),
         )
 
@@ -913,8 +913,8 @@ DataTypeSpec = str | DataTypeSpecVariants
 class _FieldSpecOptional(TypedDict, total=False):
     """The described-column keys the server omits when they carry nothing.
 
-    `metadata` holds the stable field id under `PARQUET:field_id` and, for a
-    write-time correlation input, `wyrd:input_class`; an empty map is omitted.
+    `metadata` holds the stable field id under `PARQUET:field_id`; an empty
+    map is omitted.
     """
 
     metadata: dict[str, str]
@@ -978,7 +978,7 @@ class TableDescription(_TableDescriptionOptional):
     """Server projection of one registered table's stored physical schema.
 
     ``user_fields`` are the declared columns, ``correlation_fields`` the
-    write-time ``card_ref``/``run_id`` inputs, and ``managed_candidates`` the
+    write-time ``card_uid``/``run_id`` inputs, and ``managed_candidates`` the
     managed columns a writer may supply itself.
     """
 

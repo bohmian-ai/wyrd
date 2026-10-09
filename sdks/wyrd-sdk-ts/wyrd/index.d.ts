@@ -58,10 +58,10 @@ export declare class NativeBifrost {
    * # Errors
    *
    * Returns a napi error only when the outcome cannot be encoded; an invalid
-   * card reference, no-active-table, and queue-full refusals are returned in
+   * Card UID, no-active-table, and queue-full refusals are returned in
    * [`NativeLifecycleResult`].
    */
-  insert(row: string, cardRef?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
+  insert(row: string, cardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Writes one already-built Arrow batch to `table` and awaits durability.
    *
@@ -116,10 +116,10 @@ export declare class NativeBifrost {
    * # Errors
    *
    * Returns a napi error only when the outcome cannot be encoded; an
-   * unparsable or unmappable schema and an invalid card reference are
+   * unparsable or unmappable schema and an invalid Card UID are
    * returned in [`NativeLifecycleResult`].
    */
-  record(table: string, schemaJson: string, row: string, cardRef?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
+  record(table: string, schemaJson: string, row: string, cardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Starts one terminal-safe query through the Rust SDK owner.
    *
@@ -614,10 +614,10 @@ export declare class NativeRun {
   /** The alias this view was opened with. */
   get alias(): string
   /**
-   * The exact `CardRef` text of this view's subject, which `Run.scope`
-   * stamps on spans as `wyrd.card_ref`.
+   * The UID of this view's subject Card, which `Run.scope` stamps on
+   * spans as `wyrd.card_uid`.
    */
-  get subject(): string
+  get subjectUid(): string
   /** An immutable sibling view scoped to a registered alias. */
   forCard(alias: string): NativeRunOpen
   /**

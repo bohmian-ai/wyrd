@@ -24,6 +24,7 @@ use arrow_schema::DataType;
 use serde::Serialize;
 use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::media::MediaRef;
 use wyrd_spec::vala::ids::{RunId, SessionId};
@@ -44,16 +45,16 @@ pub use lifecycle::{DRIFT_OBSERVATIONS_TABLE, EVAL_OBSERVATIONS_TABLE};
 const DATASETS_PREFIX: &str = "vala.datasets.";
 
 tokio::task_local! {
-    /// The `(card_ref, run_id)` text of the innermost [`Run::scope`] the
+    /// The `(card_uid, run_id)` text of the innermost [`Run::scope`] the
     /// current task runs in, which a telemetry span processor stamps on spans.
     static RUN_SCOPE: (String, String);
 }
 
-/// The `(card_ref, run_id)` text of the innermost [`Run::scope`] the current
+/// The `(card_uid, run_id)` text of the innermost [`Run::scope`] the current
 /// task runs in, or `None` outside every scope.
 ///
 /// A telemetry span processor reads this when a span starts so the span
-/// carries the record-level `wyrd.card_ref` and `wyrd.run_id` attributes
+/// carries the record-level `wyrd.card_uid` and `wyrd.run_id` attributes
 /// Bifrost extracts.
 #[must_use]
 pub fn current_run_scope() -> Option<(String, String)> {
@@ -91,7 +92,10 @@ impl Run {
     /// it completes. No IO happens here.
     pub fn scope<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
         RUN_SCOPE.scope(
-            (self.subject.to_string(), self.run_id.as_str().to_owned()),
+            (
+                self.subject_uid().as_str().to_owned(),
+                self.run_id.as_str().to_owned(),
+            ),
             future,
         )
     }
@@ -161,12 +165,26 @@ impl Run {
         Observe { run: self }
     }
 
-    /// This view's row correlation: subject Card plus invocation.
+    /// This view's row correlation: the subject Card's UID plus invocation.
     fn correlation(&self) -> Correlation {
         Correlation {
-            card_ref: Some(self.subject.clone()),
+            card_uid: Some(self.subject_uid().clone()),
             run_id: Some(self.run_id.clone()),
         }
+    }
+
+    /// The UID of the Card this view observes: every observation's
+    /// `card_uid` correlation and the `wyrd.card_uid` its spans carry.
+    ///
+    /// # Panics
+    /// Never for a loaded [`WyrdState`]: a hydrated bundle refuses any Card
+    /// without a UID at load, and every subject is resolved from that bundle.
+    #[must_use]
+    pub fn subject_uid(&self) -> &CardUid {
+        self.subject
+            .uid
+            .as_ref()
+            .expect("every hydrated Card carries its UID")
     }
 }
 

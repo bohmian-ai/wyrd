@@ -199,11 +199,6 @@ struct AnalyticalGraphState {
     running_query: Option<super::query_stream::RunningQueryTerminalOwner>,
     /// The query-owned runtime every follower of this graph installs.
     runtime: OracleExecution,
-    /// Every outbound exchange stream this graph opened, owned by the graph.
-    ///
-    /// Shared by the leader session that opens them and the lease that settles
-    /// the graph, so one graph has exactly one place its exchanges live.
-    exchanges: Arc<super::analytical_transport::AnalyticalGraphExchanges>,
     /// Cancellation child covering every descendant of this graph.
     ///
     /// Owned by the graph rather than by each attempt because a graph's
@@ -480,7 +475,6 @@ impl AnalyticalSupervisor {
                 retained_admission: None,
                 running_query: None,
                 runtime,
-                exchanges: Arc::default(),
                 cancel: self.root_cancel.child_token(),
                 metric_fold: None,
             }),
@@ -496,25 +490,6 @@ impl AnalyticalSupervisor {
             graph,
             released: false,
         })
-    }
-
-    /// Returns one registered graph's own exchange registry.
-    ///
-    /// `None` when the graph is not registered here, which is the correct
-    /// answer: an unregistered graph opens no exchange.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
-    pub fn graph_exchanges(
-        &self,
-        graph: AnalyticalGraphKey,
-    ) -> Result<Option<Arc<super::analytical_transport::AnalyticalGraphExchanges>>, BifrostError>
-    {
-        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        Ok(graphs
-            .get(&graph)
-            .map(|entry| Arc::clone(&entry.state().exchanges)))
     }
 
     /// Returns one registered graph's own cancellation child.

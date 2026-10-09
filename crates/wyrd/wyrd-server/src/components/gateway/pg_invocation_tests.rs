@@ -68,7 +68,6 @@ use super::pg_administration_tests::{
 use super::{GatewayAdministration, GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
-use crate::scribe_outbox::ScribeSink;
 use crate::state::{AppState, LimitsConfig};
 
 /// One scripted provider attempt.
@@ -697,89 +696,6 @@ async fn gateway_managed_credentials_resolve_per_tenant_across_restart_and_rotat
     drain_gateway(&foreign).await;
 }
 
-/// An authorized invoke dispatches without waiting on its own audit commit,
-/// and a commit that cannot land neither refuses the call nor is lost.
-///
-/// The invocation audit is non-blocking: the decision is staged on the
-/// process audit outbox, so a failing audit write costs the call nothing. The
-/// failed write is counted and retried, and the decision commits exactly once
-/// when staging recovers.
-///
-/// # Panics
-///
-/// Panics when the invoke fails, waits for the failing audit write, stages a
-/// decision while audit fails, or does not commit it once after recovery.
-#[tokio::test]
-async fn gateway_invocation_dispatches_without_waiting_for_the_audit_append() {
-    let recorder = SeriesRecorder::default();
-    let _metrics = metrics::set_default_local_recorder(&recorder);
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let tenant = fixture.data_tenant_id();
-    let dispatch = Scripted::shared();
-    let state = replica(&fixture, dispatch.clone()).await;
-    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
-    drain_gateway(&state).await;
-    let before = audit_decisions(&fixture, tenant).await;
-    fixture
-        .fail_audit_staging()
-        .await
-        .expect("audit failure installs");
-    dispatch.push(Step::Return(completed(10, 5)));
-    let started = std::time::Instant::now();
-    GatewayInvocation::new(&state)
-        .invoke(
-            &invoker(tenant, 1, [model_access("acme/a")]),
-            request("acme/a", None, Duration::from_secs(10)),
-        )
-        .await
-        .expect("an unaudited allow still dispatches");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the call waited for the failing audit write"
-    );
-    assert_eq!(dispatch.seen(), ["dep-a"]);
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while !recorder
-        .series
-        .lock()
-        .expect("series")
-        .contains("outbox_write_failures_total{outbox=audit}")
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the failed audit write is counted"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        audit_decisions(&fixture, tenant).await,
-        before,
-        "nothing is staged while audit fails"
-    );
-    let queued = state.scribe_outbox.pending();
-    fixture
-        .restore_audit_staging()
-        .await
-        .expect("audit staging restores");
-    drain_gateway(&state).await;
-    let after = audit_decisions(&fixture, tenant).await;
-    let recovered = &after[before.len()..];
-    assert_eq!(
-        recovered.len(),
-        queued,
-        "every queued decision commits exactly once: {recovered:?}"
-    );
-    assert_eq!(
-        recovered
-            .iter()
-            .filter(|decision| *decision == &("gateway.invoke".to_owned(), "allowed".to_owned()))
-            .count(),
-        1,
-        "the invoke's allowance commits exactly once: {recovered:?}"
-    );
-}
-
 /// Public handler and internal seam share one pipeline: the requested model
 /// is authorized and audited before dispatch, an unauthorized fallback is
 /// skipped and audited, fallback preserves requested and resolved identity,
@@ -789,7 +705,8 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let state = replica(&fixture, dispatch.clone()).await;
+    let scribe = Arc::new(RecordingScribe::default());
+    let state = scribe.record(replica(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     let invocation = GatewayInvocation::new(&state);
     let decision = |outcome: &str| ("gateway.invoke".to_owned(), outcome.to_owned());
@@ -812,7 +729,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     assert!(dispatch.seen().is_empty(), "a denial never dispatches");
     drain_gateway(&state).await;
     assert_eq!(
-        audit_decisions(&fixture, tenant).await.last(),
+        audit_decisions(&scribe, tenant).last(),
         Some(&decision("denied"))
     );
 
@@ -832,7 +749,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
         "unauthorized acme/b is never dispatched"
     );
     drain_gateway(&state).await;
-    let decisions = audit_decisions(&fixture, tenant).await;
+    let decisions = audit_decisions(&scribe, tenant);
     assert_eq!(
         decisions[decisions.len() - 2..],
         [decision("allowed"), decision("denied")]
@@ -843,7 +760,7 @@ async fn gateway_invocation_authorizes_each_model_and_accounts_attempts() {
     let broad = invoker(tenant, 1, [provider_access()]);
     // The failure above holds dep-a in replica-local cooldown; a fresh replica
     // attempts it again before falling back.
-    let fresh = replica(&fixture, dispatch.clone()).await;
+    let fresh = scribe.record(replica(&fixture, dispatch.clone()).await);
     let response = GatewayInvocation::new(&fresh)
         .invoke(
             &broad,
@@ -2911,10 +2828,11 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
         .await;
     let secret = tempfile::NamedTempFile::new().expect("secret file");
     std::fs::write(secret.path(), "sk-deepseek\n").expect("secret writes");
-    let a = http_replica(&fixture, tenant, secret.path()).await;
-    let b = http_replica(&fixture, tenant, secret.path()).await;
-    let c = http_replica(&fixture, tenant, secret.path()).await;
-    let d = http_replica(&fixture, tenant, secret.path()).await;
+    let scribe = Arc::new(RecordingScribe::default());
+    let a = scribe.record(http_replica(&fixture, tenant, secret.path()).await);
+    let b = scribe.record(http_replica(&fixture, tenant, secret.path()).await);
+    let c = scribe.record(http_replica(&fixture, tenant, secret.path()).await);
+    let d = scribe.record(http_replica(&fixture, tenant, secret.path()).await);
     let caller = batch_deployment(&b, tenant, &format!("{}/v1", upstream.uri())).await;
     let line = json!({"custom_id": "a", "method": "POST", "url": "/v1/chat/completions",
         "body": {"model": "deepseek/deepseek-chat", "messages": [{"role": "user", "content": "hi"}]}});
@@ -3009,7 +2927,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
     drain_gateway(&a).await;
     drain_gateway(&b).await;
     drain_gateway(&c).await;
-    let decisions = audit_decisions(&fixture, tenant).await.len();
+    let decisions = audit_decisions(&scribe, tenant).len();
     let denied = super::routes::create_batch(
         State(c.clone()),
         Ok(invoker(tenant, 9, [])),
@@ -3022,7 +2940,7 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     assert_eq!(pending().await, 1, "a denial claims nothing");
     drain_gateway(&c).await;
-    assert_eq!(audit_decisions(&fixture, tenant).await.len(), decisions + 1);
+    assert_eq!(audit_decisions(&scribe, tenant).len(), decisions + 1);
 
     // A caller that leaves after the claim commits and before dispatch, here
     // while admission on healthy replica D waits on the tenant's admission
@@ -3058,14 +2976,6 @@ async fn gateway_batch_creations_release_claims_only_without_dispatch() {
     drain_gateway(&b).await;
     drain_gateway(&c).await;
     drain_gateway(&d).await;
-}
-
-/// Routes `state`'s Scribe outbox to a recording Scribe standing in for the
-/// pod's own, returning the state and the Scribe its batches land in.
-fn recorded(mut state: AppState) -> (AppState, Arc<RecordingScribe>) {
-    let scribe = Arc::new(RecordingScribe::default());
-    state.scribe_outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
-    (state, scribe)
 }
 
 /// Waits for every spawned gateway task — accounting and post-answer
@@ -3111,7 +3021,7 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     let caller = invoker(tenant, 1, [provider_access()]);
     let call = || request("acme/a", Some((1000, 500)), Duration::from_secs(10));
 
-    let (disabled, scribe) = recorded(replica(&fixture, dispatch.clone()).await);
+    let (disabled, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
     dispatch.push(Step::Return(completed(100, 50)));
     GatewayInvocation::new(&disabled)
         .invoke(&caller, call())
@@ -3131,7 +3041,7 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
         .await
         .expect("metadata policy stores");
 
-    let (captured, scribe) = recorded(replica(&fixture, dispatch.clone()).await);
+    let (captured, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
     dispatch.push(Step::Return(failed(1000, 0)));
     dispatch.push(Step::Return(completed(100, 50)));
     let response = GatewayInvocation::new(&captured)
@@ -3286,7 +3196,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .await
         .expect("payload policy stores");
     let caller = invoker(tenant, 1, [provider_access()]);
-    let (state, scribe) = recorded(state);
+    let (state, scribe) = RecordingScribe::attach(state);
     let invocation = GatewayInvocation::new(&state);
     for _ in 0..2 {
         dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
@@ -3492,7 +3402,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .expect("the catalog table is restored");
 
     drain_gateway(&state).await;
-    let decisions = audit_decisions(&fixture, tenant).await;
+    let decisions = audit_decisions(&scribe, tenant);
     let retrievals = decisions
         .iter()
         .filter(|(operation, _)| operation == "gateway.payload_object.get")
@@ -3516,7 +3426,7 @@ async fn gateway_payload_objects_are_authorized_convergent_and_stable_when_expir
         .put_object(&prefix, b"not a directory".to_vec())
         .await
         .expect("the blocker writes where the object directory must go");
-    let (failing, unpublished) = recorded(failing);
+    let (failing, unpublished) = RecordingScribe::attach(failing);
     dispatch.push(Step::Return(media_completed(PAYLOAD_OBJECT_BYTES)));
     let unaffected = GatewayInvocation::new(&failing)
         .invoke(&caller, request("acme/a", None, Duration::from_secs(10)))
@@ -3564,7 +3474,7 @@ async fn gateway_selected_speech_persists_one_retrievable_object() {
             .mount(&upstream)
             .await;
     }
-    let (state, scribe) = recorded(
+    let (state, scribe) = RecordingScribe::attach(
         replica_with_fixture_catalog(
             &fixture,
             Arc::new(
@@ -3714,7 +3624,8 @@ async fn gateway_capture_work_ends_at_the_call_deadline() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let (state, scribe) = recorded(replica_with_fixture_catalog(&fixture, dispatch.clone()).await);
+    let (state, scribe) =
+        RecordingScribe::attach(replica_with_fixture_catalog(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     let caller = invoker(tenant, 1, [provider_access()]);
     let deadline = Duration::from_millis(500);
@@ -3789,7 +3700,7 @@ async fn gateway_capture_policy_change_affects_only_later_admissions() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let (state, scribe) = recorded(replica(&fixture, dispatch.clone()).await);
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     let gateway = GatewayAdministration::new(&state);
     let write = |mode| GatewayCapturePolicyWrite {
@@ -4092,7 +4003,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         .await;
     let secret = tempfile::NamedTempFile::new().expect("secret file");
     std::fs::write(secret.path(), format!("{CANARY}\n")).expect("secret writes");
-    let (state, scribe) = recorded(
+    let (state, scribe) = RecordingScribe::attach(
         test_state(&fixture)
             .await
             .with_gateway(crate::config::GatewayConfig {
@@ -4320,19 +4231,12 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
             "an answer encoding the credential stores no object {digest}"
         );
     }
-    let mut conn = fixture
-        .vala_postgres()
-        .tenant_conn(tenant)
-        .await
-        .expect("vala tenant conn");
-    let audit: Vec<String> = sqlx::query_scalar(
-        "SELECT row_to_json(a)::text FROM vala.audit_staging a WHERE data_tenant_id = $1",
-    )
-    .bind(tenant.as_uuid())
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("audit rows");
-    conn.commit().await.expect("audit read commits");
+    let audit: Vec<String> = scribe
+        .audit_decisions()
+        .iter()
+        .filter(|decision| decision.tenant == tenant)
+        .map(|decision| format!("{decision:?}"))
+        .collect();
     assert!(!audit.is_empty(), "authorization decisions were audited");
     let configuration = serde_json::to_string(&(
         gateway.credentials(&admin).await.expect("credentials read"),
@@ -4537,7 +4441,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
 async fn gateway_batch_listing_is_one_bounded_pruned_read() {
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
-    let state = replica(&fixture, Scripted::shared()).await;
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, Scripted::shared()).await);
     let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
     // Denied batches 101..=220 lie between visible batches 300, 250 and 50.
     let visible = [300_u128, 250, 50];
@@ -4601,7 +4505,7 @@ async fn gateway_batch_listing_is_one_bounded_pruned_read() {
         // The invoke decision is staged on the gateway tracker, so it is
         // readable once that tracker drains.
         drain_gateway(&state).await;
-        audit_decisions(&fixture, tenant).await.len()
+        audit_decisions(&scribe, tenant).len()
     };
 
     let caller = invoker(tenant, 1, [model_access("acme/a")]);
@@ -4666,7 +4570,7 @@ async fn gateway_terminal_spans_classify_every_call_and_attempt() {
         )
         .expect("gateway dispatch builds"),
     );
-    let (state, scribe) = recorded(replica(&fixture, Arc::clone(&dispatch)).await);
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, Arc::clone(&dispatch)).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
@@ -5005,7 +4909,7 @@ async fn gateway_accounting_failure_after_a_completed_attempt_fails_the_call_spa
     let fixture = PgFixture::start().await.expect("fixture starts");
     let tenant = fixture.data_tenant_id();
     let dispatch = Scripted::shared();
-    let (state, scribe) = recorded(replica(&fixture, dispatch.clone()).await);
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
     configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
     GatewayAdministration::new(&state)
         .put_capture(

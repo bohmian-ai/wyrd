@@ -680,9 +680,9 @@ mod pg_tests {
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::components::auth::AuthenticatedPrincipal;
+    use crate::components::gateway::recording::RecordingScribe;
     use crate::state::AppState;
     use axum::Extension;
-    use sqlx::Row;
     use wyrd_spec::request_id::RequestId;
     use wyrd_sql::TenantConn;
 
@@ -890,7 +890,7 @@ mod pg_tests {
         let sa_id = insert_test_service_account(&mut conn, tenant, creator, &card_ref).await;
         conn.commit().await.expect("seed commits");
 
-        let state = fixture_state(&fixture).await;
+        let (state, scribe) = RecordingScribe::attach(fixture_state(&fixture).await);
         let caller = caller_with(
             creator,
             tenant,
@@ -935,36 +935,37 @@ mod pg_tests {
             response.0.key_id, stored_key_id,
             "the response names the issued credential's UUID"
         );
-        let row = sqlx::query(
-            "SELECT principal_id, detail, request_id, data_tenant_id
-             FROM vala.audit_staging
-             WHERE data_tenant_id = $1
-               AND operation = 'auth.api_key.issue'
-               AND detail LIKE '%credential_issuance%'",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_one(&mut **verify_conn.transaction())
-        .await
-        .expect("credential issuance audit event was staged");
-
-        let audit_actor: Uuid = row.get("principal_id");
-        let detail: serde_json::Value =
-            serde_json::from_str(row.get("detail")).expect("audit detail is json");
+        let issuances: Vec<_> = scribe
+            .audit_decisions()
+            .into_iter()
+            .filter(|decision| {
+                decision.operation == "auth.api_key.issue"
+                    && decision
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.to_string().contains("credential_issuance"))
+            })
+            .collect();
+        let [row] = issuances.as_slice() else {
+            panic!("one credential issuance audit event was recorded: {issuances:?}");
+        };
+        let detail = row.detail.as_ref().expect("issuance detail is recorded");
         let audit_target: Uuid = detail["target_principal_id"]
             .as_str()
             .expect("target principal id is present")
             .parse()
             .expect("target principal id is a uuid");
-        let audit_request_id: String = row.get("request_id");
-        let audit_tenant: Uuid = row.get("data_tenant_id");
-        assert_eq!(audit_actor, creator, "audit records the issuing actor");
+        assert_eq!(
+            row.audit_principal_id, creator,
+            "audit records the issuing actor"
+        );
         assert_eq!(
             audit_target, sa_id,
             "audit records the target service account"
         );
-        assert_eq!(audit_tenant, tenant.as_uuid(), "audit is tenant-scoped");
+        assert_eq!(row.tenant, tenant, "audit is tenant-scoped");
         assert_eq!(
-            audit_request_id, expected_request_id,
+            row.request_id, expected_request_id,
             "audit records the request id"
         );
     }
@@ -989,7 +990,7 @@ mod pg_tests {
         let creator = insert_test_user(&mut conn, tenant).await;
         conn.commit().await.expect("seed commits");
 
-        let state = fixture_state(&fixture).await;
+        let (state, scribe) = RecordingScribe::attach(fixture_state(&fixture).await);
         let caller = caller_with(
             creator,
             tenant,
@@ -1016,19 +1017,18 @@ mod pg_tests {
             0,
             "audit settles"
         );
+        let allowed = scribe
+            .audit_decisions()
+            .into_iter()
+            .filter(|decision| {
+                decision.tenant == tenant
+                    && decision.operation == "auth.api_key.issue"
+                    && decision.outcome == "allowed"
+            })
+            .count();
         let mut verify_conn = fixture.tenant_conn().await.expect("verify conn opens");
-        let staged: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging
-              WHERE data_tenant_id = $1
-                AND operation = 'auth.api_key.issue'
-                AND outcome = 'allowed'",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_one(&mut **verify_conn.transaction())
-        .await
-        .expect("allowance count reads");
         assert_eq!(
-            staged, 1,
+            allowed, 1,
             "the failed issue records the decision it evaluated"
         );
 

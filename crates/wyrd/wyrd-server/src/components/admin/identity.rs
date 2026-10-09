@@ -410,6 +410,7 @@ mod pg_tests {
 
     use super::*;
     use crate::components::auth::{ServerAuth, ServerAuthz};
+    use crate::components::gateway::recording::RecordingScribe;
     use crate::postgres::ServerPostgres;
     use crate::test_support::{test_app_state, test_catalog};
 
@@ -479,8 +480,13 @@ mod pg_tests {
     }
 
     /// Build handler state whose connection owner holds a sealing keyring,
-    /// may reach loopback providers, and whose permission check is `check`.
-    async fn test_state(fixture: &PgFixture, check: Arc<AllowFirst>) -> AppState {
+    /// may reach loopback providers, whose permission check is `check`, and
+    /// whose audit decisions land in `scribe`.
+    async fn test_state(
+        fixture: &PgFixture,
+        check: Arc<AllowFirst>,
+        scribe: &Arc<RecordingScribe>,
+    ) -> AppState {
         let postgres = Arc::new(ServerPostgres::from_parts(
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
@@ -492,11 +498,11 @@ mod pg_tests {
         std::fs::create_dir_all(&root).expect("storage root creates");
         let signer = LocalSigner::new(root).expect("local signer creates");
         let origin = Url::parse(PUBLIC_ORIGIN).expect("origin parses");
-        let state = test_app_state(
+        let state = scribe.record(test_app_state(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             test_catalog().await,
-        );
+        ));
         let audit = Arc::clone(&state.scribe_outbox);
         state
             .with_auth(ServerAuth {
@@ -567,14 +573,14 @@ mod pg_tests {
             .expect("candidate is staged");
     }
 
-    /// Count staged `(outcome)` decisions for `operation` once everything
-    /// `state` staged on its audit outbox is committed.
+    /// Count recorded `(outcome)` decisions for `operation`, ordered by
+    /// outcome, once everything `state` staged has reached `scribe`.
     ///
     /// # Panics
-    /// Panics when the outbox does not settle or the staging read fails.
+    /// Panics when the outbox does not settle.
     async fn decisions(
         state: &AppState,
-        fixture: &PgFixture,
+        scribe: &RecordingScribe,
         operation: &str,
     ) -> Vec<(String, i64)> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -583,17 +589,13 @@ mod pg_tests {
             0,
             "audit settles"
         );
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let rows = sqlx::query_as(
-            "SELECT outcome, count(*) FROM vala.audit_staging \
-             WHERE operation = $1 GROUP BY outcome ORDER BY outcome",
-        )
-        .bind(operation)
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("audit staging reads");
-        conn.commit().await.expect("commit");
-        rows
+        let mut counts = std::collections::BTreeMap::<String, i64>::new();
+        for decision in scribe.audit_decisions() {
+            if decision.operation == operation {
+                *counts.entry(decision.outcome).or_default() += 1;
+            }
+        }
+        counts.into_iter().collect()
     }
 
     /// The candidate's `(tested_revision, tested_until is set)` stamp.
@@ -628,7 +630,8 @@ mod pg_tests {
             allowed: AtomicUsize::new(usize::MAX),
             evaluations: AtomicUsize::new(0),
         });
-        let state = test_state(&fixture, Arc::clone(&check)).await;
+        let scribe = Arc::new(RecordingScribe::default());
+        let state = test_state(&fixture, Arc::clone(&check), &scribe).await;
         stage_candidate(&state, tenant, &provider).await;
 
         let Json(begun) = test_candidate(
@@ -671,7 +674,7 @@ mod pg_tests {
         );
         assert_eq!(check.evaluations.load(Ordering::SeqCst), 1);
         assert_eq!(
-            decisions(&state, &fixture, "identity.oidc.candidate.test").await,
+            decisions(&state, &scribe, "identity.oidc.candidate.test").await,
             vec![("allowed".to_owned(), 1)]
         );
         assert_eq!(stamp(&fixture).await, (None, false));
@@ -689,12 +692,14 @@ mod pg_tests {
     async fn put_candidate_authorizes_before_decoding_its_body() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
+        let scribe = Arc::new(RecordingScribe::default());
         let denied = test_state(
             &fixture,
             Arc::new(AllowFirst {
                 allowed: AtomicUsize::new(0),
                 evaluations: AtomicUsize::new(0),
             }),
+            &scribe,
         )
         .await;
         let refused = put_candidate(
@@ -706,7 +711,7 @@ mod pg_tests {
         .expect_err("an unauthorized caller is refused");
         assert_eq!(refused.0.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
         assert_eq!(
-            decisions(&denied, &fixture, "identity.oidc.candidate.put").await,
+            decisions(&denied, &scribe, "identity.oidc.candidate.put").await,
             vec![("denied".to_owned(), 1)]
         );
 
@@ -716,6 +721,7 @@ mod pg_tests {
                 allowed: AtomicUsize::new(usize::MAX),
                 evaluations: AtomicUsize::new(0),
             }),
+            &scribe,
         )
         .await;
         let malformed = put_candidate(
@@ -748,7 +754,7 @@ mod pg_tests {
         .expect("a valid body stages");
         assert_eq!(staged.revision, 1);
         assert_eq!(
-            decisions(&state, &fixture, "identity.oidc.candidate.put").await,
+            decisions(&state, &scribe, "identity.oidc.candidate.put").await,
             vec![("allowed".to_owned(), 3), ("denied".to_owned(), 1)]
         );
     }

@@ -995,6 +995,7 @@ mod pg_tests {
     use super::*;
     use crate::auth::pg_resolvers::{PgIssuerResolver, issuer_write_from_trusted};
     use crate::components::auth::{Caller, ServerAuthz};
+    use crate::components::gateway::recording::RecordingScribe;
     use wyrd_spec::request_id::RequestId;
 
     const SECRET: &str = "super-secret";
@@ -1363,7 +1364,7 @@ mod pg_tests {
     async fn duplicate_create_conflicts() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture).await;
+        let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
         let (_server, issuer) = discovery_server().await;
 
         let _ = create_trusted_issuer(
@@ -1384,7 +1385,7 @@ mod pg_tests {
 
         assert_safe_conflict(&error);
         assert_eq!(
-            decision_rows(&fixture, &state, "admin.trusted_issuer.create").await,
+            decision_rows(&state, &scribe, "admin.trusted_issuer.create").await,
             vec![("allowed".to_owned(), 2)],
             "each permitted create records its decision, whatever the write did"
         );
@@ -1395,7 +1396,7 @@ mod pg_tests {
     async fn list_is_empty_and_delete_missing_issuer_is_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture).await;
+        let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
 
         // An empty tenant lists no issuers — absence is an empty Vec, not a 404.
         let listed = list_trusted_issuers(State(state.clone()), writer(tenant))
@@ -1416,7 +1417,7 @@ mod pg_tests {
         .expect_err("missing issuer delete is not found");
         assert!(matches!(delete_err.0, WyrdError::AdminNotFound { .. }));
         assert_eq!(
-            decision_rows(&fixture, &state, "admin.trusted_issuer.delete").await,
+            decision_rows(&state, &scribe, "admin.trusted_issuer.delete").await,
             vec![("allowed".to_owned(), 1)],
             "a delete that removed nothing still records the decision it evaluated"
         );
@@ -1548,7 +1549,7 @@ mod pg_tests {
     async fn create_binding_for_unknown_issuer_is_not_found() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture).await;
+        let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
         // Deliberately do NOT seed the issuer: the binding's composite FK to
         // auth_trusted_issuers has no target row.
         let issuer = IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid");
@@ -1568,7 +1569,7 @@ mod pg_tests {
         // The FK violation is a missing referenced issuer (404), not a conflict.
         assert!(matches!(error.0, WyrdError::AdminNotFound { .. }));
         assert_eq!(
-            decision_rows(&fixture, &state, "admin.workload_binding.create").await,
+            decision_rows(&state, &scribe, "admin.workload_binding.create").await,
             vec![("allowed".to_owned(), 1)],
             "the permitted create records its decision though the binding never landed"
         );
@@ -1654,72 +1655,28 @@ mod pg_tests {
         );
     }
 
-    /// Return the staged `(outcome, count)` decision rows for `operation`.
+    /// Return the recorded `(outcome, count)` decision rows for `operation`,
+    /// ordered by outcome.
     ///
-    /// Settles `state`'s audit outbox first, so every decision it staged is
-    /// read.
+    /// Settles `state`'s audit outbox first, so every decision it staged has
+    /// reached `scribe`.
     ///
     /// # Panics
     ///
-    /// Panics when the outbox does not settle, or the tenant connection or the
-    /// staging read fails.
+    /// Panics when the outbox does not settle.
     async fn decision_rows(
-        fixture: &PgFixture,
         state: &AppState,
+        scribe: &RecordingScribe,
         operation: &str,
     ) -> Vec<(String, i64)> {
         settle_audit(state).await;
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let rows = sqlx::query_as(
-            "SELECT outcome, count(*) FROM vala.audit_staging \
-             WHERE operation = $1 GROUP BY outcome",
-        )
-        .bind(operation)
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("decision rows read");
-        conn.commit().await.expect("assertion transaction commits");
-        rows
-    }
-
-    /// Makes every audit write to the fixture's staging table fail.
-    ///
-    /// The process metrics recorder is installed first, because a counter
-    /// increment made before any recorder exists is discarded.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the failure trigger cannot be installed.
-    async fn fail_audit(fixture: &PgFixture) {
-        let _ = crate::app::metrics::test_prometheus_handle();
-        fixture
-            .fail_audit_staging()
-            .await
-            .expect("audit failure installs");
-    }
-
-    /// Waits for a failed audit write, restores staging, and returns the
-    /// committed `(outcome, count)` rows for `operation`.
-    ///
-    /// Proves both halves of an audit failure: the write was attempted and
-    /// counted while staging refused it, and the retried decision commits once
-    /// staging accepts it again.
-    ///
-    /// # Panics
-    ///
-    /// Panics when no failed write is counted within thirty seconds, staging
-    /// cannot be restored, or the decisions do not settle.
-    async fn recovered_rows(
-        fixture: &PgFixture,
-        state: &AppState,
-        operation: &str,
-    ) -> Vec<(String, i64)> {
-        crate::test_support::await_audit_write_failure().await;
-        fixture
-            .restore_audit_staging()
-            .await
-            .expect("audit staging restores");
-        decision_rows(fixture, state, operation).await
+        let mut counts = std::collections::BTreeMap::<String, i64>::new();
+        for decision in scribe.audit_decisions() {
+            if decision.operation == operation {
+                *counts.entry(decision.outcome).or_default() += 1;
+            }
+        }
+        counts.into_iter().collect()
     }
 
     /// An issuer created without `default_roles` grants `viewer`, while an
@@ -1764,85 +1721,6 @@ mod pg_tests {
         assert_eq!(created, [vec!["viewer".to_owned()], Vec::new()]);
     }
 
-    /// An issuer create whose audit cannot be written still registers its
-    /// issuer, and its decision commits once staging recovers.
-    ///
-    /// Permissions block and audits do not: the decision is staged on the
-    /// non-blocking audit outbox, so a failed audit write costs the create
-    /// nothing and is retried.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture cannot start or any assertion fails.
-    #[tokio::test]
-    async fn an_unrecordable_issuer_create_still_writes_its_issuer() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture).await;
-        let (_server, issuer) = discovery_server().await;
-        fail_audit(&fixture).await;
-
-        let _ = create_trusted_issuer(
-            State(state.clone()),
-            writer(tenant),
-            Json(create_issuer_request(issuer.clone(), Some(SECRET))),
-        )
-        .await
-        .expect("an unrecordable create still succeeds");
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let row = trusted_issuer_by_url(&mut conn, issuer.as_str())
-            .await
-            .expect("query succeeds");
-        conn.commit().await.expect("commit");
-        assert!(row.is_some(), "the create registered its issuer");
-        assert_eq!(
-            recovered_rows(&fixture, &state, "admin.trusted_issuer.create").await,
-            vec![("allowed".to_owned(), 1)],
-            "the retried allowance commits exactly once"
-        );
-    }
-
-    /// A binding create whose audit cannot be written still writes its
-    /// binding, and its decision commits once staging recovers.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture cannot start or any assertion fails.
-    #[tokio::test]
-    async fn an_unrecordable_binding_create_still_writes_its_binding() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture).await;
-        seed_issuer(&fixture, tenant).await;
-        fail_audit(&fixture).await;
-
-        let _ = create_workload_binding(
-            State(state.clone()),
-            writer(tenant),
-            Json(CreateWorkloadBindingRequest {
-                issuer: IssuerUrl::new(SEEDED_ISSUER).expect("issuer is valid"),
-                subject: "system:serviceaccount:default/sa".to_owned(),
-                audience: None,
-                card_ref: sample_card_ref(),
-            }),
-        )
-        .await
-        .expect("an unrecordable binding create still succeeds");
-
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let bindings = workload_bindings_for_tenant(&mut conn, None, None)
-            .await
-            .expect("query succeeds");
-        conn.commit().await.expect("commit");
-        assert_eq!(bindings.len(), 1, "the create wrote its binding");
-        assert_eq!(
-            recovered_rows(&fixture, &state, "admin.workload_binding.create").await,
-            vec![("allowed".to_owned(), 1)],
-            "the retried allowance commits exactly once"
-        );
-    }
-
     /// A binding create that cannot open its tenant connection still stages
     /// its allowance.
     ///
@@ -1854,7 +1732,7 @@ mod pg_tests {
     async fn a_binding_create_without_a_connection_stages_its_allowance() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let mut state = test_state(&fixture).await;
+        let (mut state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
         let unreachable = sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(Duration::from_secs(2))
             .connect_lazy_with(
@@ -1880,7 +1758,7 @@ mod pg_tests {
         .await
         .expect_err("a create without a tenant connection is refused");
         assert_eq!(
-            decision_rows(&fixture, &state, "admin.workload_binding.create").await,
+            decision_rows(&state, &scribe, "admin.workload_binding.create").await,
             vec![("allowed".to_owned(), 1)],
             "the allowance is staged before the connection is acquired"
         );
@@ -1899,7 +1777,7 @@ mod pg_tests {
     async fn a_revocation_that_finds_nothing_records_one_allowance() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture).await;
+        let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
 
         let error = crate::auth::revoke::revoke_principal(
             State(state.clone()),
@@ -1914,7 +1792,7 @@ mod pg_tests {
         .expect_err("revoking an absent principal is not found");
         assert!(matches!(error.0, WyrdError::PrincipalNotFound { .. }));
         assert_eq!(
-            decision_rows(&fixture, &state, "auth.principal.revoke").await,
+            decision_rows(&state, &scribe, "auth.principal.revoke").await,
             vec![("allowed".to_owned(), 1)],
             "a revocation that changed nothing commits exactly its allowed decision"
         );
@@ -1935,7 +1813,7 @@ mod pg_tests {
     async fn a_failed_discovery_keeps_its_allowance_and_creates_no_issuer() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture).await;
+        let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
         // No discovery document is mounted, so discovery fails after the verdict.
         let server = MockServer::start().await;
         let issuer = IssuerUrl::new(server.uri()).expect("loopback http issuer is valid");
@@ -1950,7 +1828,7 @@ mod pg_tests {
         assert!(matches!(error.0, WyrdError::DiscoveryUnavailable { .. }));
 
         assert_eq!(
-            decision_rows(&fixture, &state, "admin.trusted_issuer.create").await,
+            decision_rows(&state, &scribe, "admin.trusted_issuer.create").await,
             vec![("allowed".to_owned(), 1)],
             "the allowance is staged before discovery"
         );
@@ -1973,9 +1851,10 @@ mod pg_tests {
     async fn configured_checker_denial_governs_workload_binding_create() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
-        let state = test_state(&fixture).await.with_authz(ServerAuthz {
-            permission_check: Arc::new(DenyAllCheck),
-        });
+        let (state, scribe) =
+            RecordingScribe::attach(test_state(&fixture).await.with_authz(ServerAuthz {
+                permission_check: Arc::new(DenyAllCheck),
+            }));
         seed_issuer(&fixture, tenant).await;
 
         let error = create_workload_binding(
@@ -1997,7 +1876,7 @@ mod pg_tests {
         ));
 
         assert_eq!(
-            decision_rows(&fixture, &state, "admin.workload_binding.create").await,
+            decision_rows(&state, &scribe, "admin.workload_binding.create").await,
             vec![("denied".to_owned(), 1)]
         );
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");

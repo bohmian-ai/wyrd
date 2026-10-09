@@ -104,14 +104,15 @@ impl PeerSecurityAudit for PostgresPeerSecurityAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vala_sql::scribe_outbox::AuditSink;
+    use crate::components::gateway::recording::RecordingScribe;
+    use crate::scribe_outbox::ScribeSink;
     use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 
     /// Production peer audit stages exact system and verified-tenant identities.
     ///
     /// # Panics
     /// Panics when the fixture cannot start, the sentinel is rejected, the
-    /// staged rejections do not commit, or a committed row is misattributed.
+    /// staged rejections are not written, or a written row is misattributed.
     #[tokio::test]
     async fn oracle_peer_postgres_audit_routes_security_identity_and_detail() {
         let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
@@ -121,7 +122,8 @@ mod tests {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         );
-        let outbox = AuditSink::outbox(fixture.vala_postgres().clone());
+        let scribe = Arc::new(RecordingScribe::default());
+        let outbox = ScribeSink::local_outbox(Arc::clone(&scribe) as _);
         let writer = PostgresPeerSecurityAudit::try_new(&postgres, Arc::clone(&outbox))
             .await
             .expect("exact sentinel enables peer audit");
@@ -133,35 +135,36 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(outbox.shutdown(deadline).await, 0, "both rejections commit");
 
-        let pool = fixture.superuser_pool().expect("assertion pool");
-        let rows: Vec<(uuid::Uuid, uuid::Uuid, String, String, String, String)> = sqlx::query_as(
-            "SELECT data_tenant_id, principal_id, principal_kind, permission, \
-                        outcome, detail \
-                   FROM vala.audit_staging \
-                  WHERE operation = 'bifrost.query.security_violation' \
-                  ORDER BY data_tenant_id",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("audit rows");
+        let rows: Vec<_> = scribe
+            .audit_decisions()
+            .into_iter()
+            .filter(|row| row.operation == "bifrost.query.security_violation")
+            .collect();
 
         assert_eq!(rows.len(), 2);
         for row in &rows {
-            assert_eq!(row.1, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
-            assert_eq!(row.2, "service");
-            assert_eq!(row.3, "bifrost:query:peer_execute");
-            assert_eq!(row.4, "denied");
+            assert_eq!(row.audit_principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
+            assert_eq!(row.principal_kind, "service");
+            assert_eq!(row.permission, "bifrost:query:peer_execute");
+            assert_eq!(row.outcome, "denied");
         }
-        let system = rows
-            .iter()
-            .find(|row| row.0 == DataTenantId::SYSTEM_OWNER.as_uuid())
-            .expect("system audit row");
-        assert!(system.5.contains("\"violation\":\"peer_unknown_key\""));
-        let tenant = rows
-            .iter()
-            .find(|row| row.0 == fixture.data_tenant_id().as_uuid())
-            .expect("verified tenant audit row");
-        assert!(tenant.5.contains("\"violation\":\"peer_audience\""));
+        let violation = |tenant: DataTenantId| {
+            rows.iter()
+                .find(|row| row.tenant == tenant)
+                .and_then(|row| row.detail.as_ref())
+                .and_then(|detail| detail["violation"].as_str())
+                .map(ToOwned::to_owned)
+        };
+        assert_eq!(
+            violation(DataTenantId::SYSTEM_OWNER).as_deref(),
+            Some("peer_unknown_key"),
+            "system audit row"
+        );
+        assert_eq!(
+            violation(fixture.data_tenant_id()).as_deref(),
+            Some("peer_audience"),
+            "verified tenant audit row"
+        );
     }
 
     /// Missing or incompatible system state prevents peer audit readiness.
@@ -184,12 +187,9 @@ mod tests {
             .await
             .expect("remove sentinel");
         assert!(
-            PostgresPeerSecurityAudit::try_new(
-                &postgres,
-                AuditSink::outbox(fixture.vala_postgres().clone())
-            )
-            .await
-            .is_err(),
+            PostgresPeerSecurityAudit::try_new(&postgres, ScribeSink::outbox().0)
+                .await
+                .is_err(),
             "missing sentinel must prevent peer runtime construction"
         );
 
@@ -203,12 +203,9 @@ mod tests {
         .await
         .expect("stage incompatible sentinel");
         assert!(
-            PostgresPeerSecurityAudit::try_new(
-                &postgres,
-                AuditSink::outbox(fixture.vala_postgres().clone())
-            )
-            .await
-            .is_err(),
+            PostgresPeerSecurityAudit::try_new(&postgres, ScribeSink::outbox().0)
+                .await
+                .is_err(),
             "incompatible sentinel must prevent peer runtime construction"
         );
     }

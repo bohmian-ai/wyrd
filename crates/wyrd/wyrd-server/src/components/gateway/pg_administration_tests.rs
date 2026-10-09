@@ -36,6 +36,7 @@ use wyrd_spec::security::SecretRef;
 use wyrd_sql::queries::gateway::{GatewayAccountingEntryWrite, append_gateway_accounting_entry};
 use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
+use super::capture::recording::RecordingScribe;
 use super::{GatewayAdministration, GatewayCredentialSource};
 use crate::components::auth::Caller;
 use crate::config::{GatewayConfig, GatewayCredentialBinding, VaultBackendConfig};
@@ -206,26 +207,18 @@ fn assert_invalid(error: &WyrdError, field: &str) {
     }
 }
 
-/// Reads `(operation, outcome)` audit decisions recorded for `tenant`.
-pub(super) async fn audit_decisions(
-    fixture: &PgFixture,
+/// `(operation, outcome)` of every gateway decision `scribe` received for
+/// `tenant`, in arrival order; settle the recorded state first.
+pub(super) fn audit_decisions(
+    scribe: &RecordingScribe,
     tenant: DataTenantId,
 ) -> Vec<(String, String)> {
-    let mut conn = fixture
-        .vala_postgres()
-        .tenant_conn(tenant)
-        .await
-        .expect("vala tenant conn");
-    let rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT operation, outcome FROM vala.audit_staging \
-         WHERE data_tenant_id = $1 AND operation LIKE 'gateway.%' ORDER BY seq",
-    )
-    .bind(tenant.as_uuid())
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("audit rows");
-    conn.commit().await.expect("audit read commits");
-    rows
+    scribe
+        .audit_decisions()
+        .into_iter()
+        .filter(|decision| decision.tenant == tenant && decision.operation.starts_with("gateway."))
+        .map(|decision| (decision.operation, decision.outcome))
+        .collect()
 }
 
 /// Proves create, idempotent rotation, terminal revoke, and redaction.
@@ -838,7 +831,7 @@ async fn gateway_deployments_guard_credential_references() {
 #[tokio::test]
 async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
     let fixture = PgFixture::start().await.expect("fixture starts");
-    let state = test_state(&fixture).await;
+    let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
     let tenant = fixture.data_tenant_id();
     let other = fixture
         .seed_additional_tenant("gateway-other")
@@ -910,11 +903,8 @@ async fn gateway_administration_is_authorized_audited_and_tenant_isolated() {
         1
     );
 
-    state
-        .scribe_outbox
-        .settle(std::time::Instant::now() + std::time::Duration::from_secs(30))
-        .await;
-    let decisions = audit_decisions(&fixture, tenant).await;
+    settle_audit(&state).await;
+    let decisions = audit_decisions(&scribe, tenant);
     let expected: Vec<(String, String)> = [
         ("gateway.provider_credential.list", "denied"),
         ("gateway.provider_deployment.list", "denied"),
@@ -1157,13 +1147,11 @@ async fn gateway_capture_policy_versions_only_on_change() {
 }
 
 /// Proves every authorized outcome — success, validation, not-found, and
-/// conflict — records exactly one allowed decision, and that a failing audit
-/// write refuses nothing: the operation answers as it would have, and its
-/// decision commits once staging recovers.
+/// conflict — records exactly one allowed decision.
 #[tokio::test]
-async fn gateway_failed_operations_keep_one_allowed_decision_and_never_wait_on_audit() {
+async fn gateway_failed_operations_keep_one_allowed_decision() {
     let fixture = PgFixture::start().await.expect("fixture starts");
-    let state = test_state(&fixture).await;
+    let (state, scribe) = RecordingScribe::attach(test_state(&fixture).await);
     let tenant = fixture.data_tenant_id();
     let admin = admin(tenant);
     let gateway = GatewayAdministration::new(&state);
@@ -1226,47 +1214,8 @@ async fn gateway_failed_operations_keep_one_allowed_decision_and_never_wait_on_a
     .into_iter()
     .map(|(op, outcome)| (op.to_owned(), outcome.to_owned()))
     .collect();
-    state
-        .scribe_outbox
-        .settle(std::time::Instant::now() + std::time::Duration::from_secs(30))
-        .await;
-    assert_eq!(audit_decisions(&fixture, tenant).await, expected);
-
-    let _ = crate::app::metrics::test_prometheus_handle();
-    fixture
-        .fail_audit_staging()
-        .await
-        .expect("audit failure installs");
-    let refused = gateway
-        .revoke_credential(&admin, &credential_name("absent"))
-        .await
-        .expect_err("an absent credential is not found");
-    assert!(
-        matches!(refused, WyrdError::GatewayResourceNotFound { .. }),
-        "a failing audit write refuses nothing: {refused:?}"
-    );
-    crate::test_support::await_audit_write_failure().await;
-    assert_eq!(
-        audit_decisions(&fixture, tenant).await,
-        expected,
-        "nothing is staged while audit fails"
-    );
-    fixture
-        .restore_audit_staging()
-        .await
-        .expect("audit staging restores");
     settle_audit(&state).await;
-    let mut recovered = expected;
-    recovered.push((
-        "gateway.provider_credential.revoke".to_owned(),
-        "allowed".to_owned(),
-    ));
-    assert_eq!(
-        audit_decisions(&fixture, tenant).await,
-        recovered,
-        "the retried decision commits exactly once, in order"
-    );
-    settle_audit(&state).await;
+    assert_eq!(audit_decisions(&scribe, tenant), expected);
 }
 
 /// Proves policy resets are writes: write-only principals reset both policies

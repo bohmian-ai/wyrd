@@ -1142,8 +1142,9 @@ pub(crate) mod tests {
 #[cfg(test)]
 pub(crate) mod recording {
     use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
+    use arrow::array::{Array as _, AsArray as _, RecordBatch};
     use arrow::ipc::reader::StreamReader;
     use bytes::Bytes;
     use vala_bifrost_redux::catalog::{TableRef, TableUid};
@@ -1154,6 +1155,35 @@ pub(crate) mod recording {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
+
+    use crate::scribe_outbox::{ScribeSink, ScribeTable};
+    use crate::state::AppState;
+
+    /// One authorization decision the recording Scribe acknowledged on
+    /// `vala.system.audit_log`, decoded from its frame for content checks.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct AuditDecision {
+        /// Tenant whose audit history the decision was written to.
+        pub(crate) tenant: DataTenantId,
+        /// Request the decision was taken in.
+        pub(crate) request_id: String,
+        /// Audited operation.
+        pub(crate) operation: String,
+        /// Resource the decision was taken on.
+        pub(crate) resource: String,
+        /// Principal the decision was taken for; nil when none resolved.
+        pub(crate) audit_principal_id: uuid::Uuid,
+        /// Stable snake-case principal kind tag.
+        pub(crate) principal_kind: String,
+        /// Permission the decision evaluated.
+        pub(crate) permission: String,
+        /// `allowed` or `denied`.
+        pub(crate) outcome: String,
+        /// Credential the principal authenticated with, when recorded.
+        pub(crate) credential_id: Option<uuid::Uuid>,
+        /// Canonical JSON detail, when recorded.
+        pub(crate) detail: Option<serde_json::Value>,
+    }
 
     /// One frame the recording Scribe acknowledged.
     #[derive(Debug, Clone)]
@@ -1176,8 +1206,14 @@ pub(crate) mod recording {
         pub(crate) batch_id: uuid::Uuid,
     }
 
-    /// Scribe that records every submission and acknowledged frame, and
-    /// refuses as scripted.
+    /// Scribe that records every capture or result submission and
+    /// acknowledged frame, refusing as scripted, and decodes every audit
+    /// frame it acknowledges.
+    ///
+    /// Audit frames share the process Scribe outbox with capture, so they are
+    /// acknowledged outside the refusal script and the capture record: a
+    /// capture assertion counts only what capture submitted, and an audit
+    /// assertion reads [`Self::audit_decisions`].
     #[derive(Default)]
     pub(crate) struct RecordingScribe {
         /// Frames acknowledged, in arrival order.
@@ -1186,9 +1222,41 @@ pub(crate) mod recording {
         refusals: Mutex<VecDeque<ScribeError>>,
         /// Batch id of every submission seen, acknowledged or not, in order.
         submitted: Mutex<Vec<uuid::Uuid>>,
+        /// Audit decisions acknowledged, in arrival order.
+        audit: Mutex<Vec<AuditDecision>>,
     }
 
     impl RecordingScribe {
+        /// Routes `state`'s Scribe outbox to a recording Scribe standing in
+        /// for the pod's own, returning the state and the Scribe its batches
+        /// land in.
+        pub(crate) fn attach(state: AppState) -> (AppState, Arc<Self>) {
+            let scribe = Arc::new(Self::default());
+            (scribe.record(state), scribe)
+        }
+
+        /// Routes `state`'s Scribe outbox to this Scribe, so several states
+        /// of one test — replicas of one tenant — land in one record.
+        ///
+        /// Owners built from `state` before this call keep the replaced
+        /// outbox, so record before deriving any.
+        pub(crate) fn record(self: &Arc<Self>, mut state: AppState) -> AppState {
+            state.scribe_outbox = ScribeSink::local_outbox(Arc::clone(self) as _);
+            state
+        }
+
+        /// Every acknowledged `vala.system.audit_log` row, in arrival order.
+        ///
+        /// Settles nothing itself: settle the outbox first, after which every
+        /// staged decision is here.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the audit lock is poisoned.
+        pub(crate) fn audit_decisions(&self) -> Vec<AuditDecision> {
+            self.audit.lock().expect("audit").clone()
+        }
+
         /// Refuses the next unscripted submission with `error`.
         ///
         /// # Panics
@@ -1239,6 +1307,73 @@ pub(crate) mod recording {
         }
     }
 
+    /// Decodes every row of one `vala.system.audit_log` batch for `tenant`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a content column is missing, not text, or not parseable.
+    fn decode_audit(tenant: DataTenantId, batch: &RecordBatch) -> Vec<AuditDecision> {
+        let text = |name: &str, row: usize| {
+            let values = batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("audit column {name}"))
+                .as_string::<i32>();
+            values.is_valid(row).then(|| values.value(row).to_owned())
+        };
+        let uuid = |value: String| uuid::Uuid::parse_str(&value).expect("audit id is a uuid");
+        (0..batch.num_rows())
+            .map(|row| {
+                let required = |name: &str| text(name, row).unwrap_or_else(|| panic!("{name}"));
+                AuditDecision {
+                    tenant,
+                    request_id: required("request_id"),
+                    operation: required("operation"),
+                    resource: required("resource"),
+                    audit_principal_id: uuid(required("audit_principal_id")),
+                    principal_kind: required("principal_kind"),
+                    permission: required("permission"),
+                    outcome: required("outcome"),
+                    credential_id: text("credential_id", row).map(uuid),
+                    detail: text("detail", row)
+                        .map(|detail| serde_json::from_str(&detail).expect("detail is json")),
+                }
+            })
+            .collect()
+    }
+
+    impl RecordingScribe {
+        /// Decodes and records every decision of one audit `frame`, then
+        /// acknowledges it.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the frame is not one Arrow IPC stream of the audit
+        /// content columns or the audit lock is poisoned.
+        fn acknowledge_audit(&self, frame: ScribeIngressFrame) -> FrameAdmission {
+            let IngressPayload::ArrowIpc(ipc) = frame.payload else {
+                panic!("audit submits Arrow IPC");
+            };
+            let decisions: Vec<AuditDecision> =
+                StreamReader::try_new(std::io::Cursor::new(ipc), None)
+                    .expect("the audit stream opens")
+                    .flat_map(|batch| {
+                        decode_audit(
+                            frame.authenticated_tenant,
+                            &batch.expect("the audit batch decodes"),
+                        )
+                    })
+                    .collect();
+            let rows = u64::try_from(decisions.len()).unwrap_or(u64::MAX);
+            self.audit.lock().expect("audit").extend(decisions);
+            FrameAdmission {
+                batch_id: frame.batch_id,
+                rows_accepted: rows,
+                receipt_micros: 0,
+                first_commit: true,
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl Scribe for RecordingScribe {
         /// Records the submission, then refuses as scripted or records
@@ -1256,6 +1391,9 @@ pub(crate) mod recording {
             &self,
             frame: ScribeIngressFrame,
         ) -> Result<FrameAdmission, ScribeError> {
+            if frame.table.fqn() == ScribeTable::AuditLog.fqn() {
+                return Ok(self.acknowledge_audit(frame));
+            }
             self.submitted
                 .lock()
                 .expect("submitted")

@@ -1,4 +1,4 @@
-//! `mise run bench:bifrost:reads`: how fast Bifrost answers a read, as two
+//! `mise run bench:bifrost:reads`: how fast Bifrost answers a read, as three
 //! like-for-like comparisons. Each section stores one set of data, runs the
 //! same SQL on both sides, asserts both sides return identical rows, and only
 //! then times them (see `report` for how).
@@ -10,19 +10,22 @@
 //!    Native is iceberg-datafusion's `IcebergStaticTableProvider`; Wyrd is the
 //!    production Oracle provider reading the snapshot through the published
 //!    path. Measures the speed of published data.
-//!
-//! Unshredded against shredded Variant reads are `DataFusion`'s own behavior and
-//! are measured by `DataFusion`'s `parquet_variant_query` benchmark.
+//! 3. `variant`: the same Variant objects written unshredded and shredded by
+//!    Bifrost's own writer, each read by plain `DataFusion`, the Wyrd hot read
+//!    and the Wyrd published read, end to end and planning only, with the
+//!    cases of `DataFusion`'s `parquet_variant_query` benchmark (see
+//!    `variant`).
 //!
 //! Both sides of every pair use the Oracle session configuration
 //! (`OracleSessionShape`): same target partitions, same Parquet options. The
 //! only difference is the table provider and Wyrd's installed rules and
-//! functions. `-- hot` or `-- published` runs one section.
+//! functions. `-- hot`, `-- published` or `-- variant` runs one section.
 //!
 //! [`GLOBAL`] installs the server's allocator.
 
 mod events;
 mod report;
+mod variant;
 
 use std::fmt::Write as _;
 
@@ -55,8 +58,12 @@ fn main() {
             reports.push(runtime.block_on(events.published(&tables)));
         }
     }
+    let variant = wants("variant").then(|| runtime.block_on(variant::run(&tables, dir.path())));
     for report in &reports {
         report.print();
+    }
+    if let Some(variant) = variant {
+        variant.print();
     }
 }
 

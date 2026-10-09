@@ -6,10 +6,14 @@
 //! every run so machine drift lands on both equally. One timed run is one query
 //! end to end: plan, execute, and collect every batch.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow::array::ArrayRef;
 use arrow::util::display::array_value_to_string;
 use datafusion::prelude::SessionContext;
+use parquet_variant_compute::variant_to_json;
+use wyrd_types::variant::is_variant;
 
 /// Untimed runs of each side before timing.
 const WARM_UP: usize = 3;
@@ -25,11 +29,11 @@ pub struct Side<'a> {
 }
 
 /// The p50 and p95 of one side's timed runs.
-struct Latency {
+pub struct Latency {
     /// Median run.
-    p50: Duration,
+    pub p50: Duration,
     /// 95th percentile run.
-    p95: Duration,
+    pub p95: Duration,
 }
 
 /// One section's results: a titled table with a left and a right side.
@@ -104,7 +108,7 @@ impl Report {
 
 impl Latency {
     /// The p50 and p95 of `runs`, by nearest rank.
-    fn of(mut runs: Vec<Duration>) -> Self {
+    pub fn of(mut runs: Vec<Duration>) -> Self {
         runs.sort_unstable();
         let rank = |percent: usize| runs[(runs.len() * percent).div_ceil(100).max(1) - 1];
         Self {
@@ -115,7 +119,7 @@ impl Latency {
 }
 
 /// Renders `duration` in whole microseconds.
-fn micros(duration: Duration) -> String {
+pub fn micros(duration: Duration) -> String {
     format!("{} µs", duration.as_micros())
 }
 
@@ -124,7 +128,7 @@ fn micros(duration: Duration) -> String {
 /// # Panics
 ///
 /// Panics when the query fails to plan or execute.
-async fn run(side: &Side<'_>) -> Duration {
+pub async fn run(side: &Side<'_>) -> Duration {
     let start = Instant::now();
     side.context
         .sql(side.sql)
@@ -138,10 +142,13 @@ async fn run(side: &Side<'_>) -> Duration {
 
 /// Every row `sql` returns, each rendered as its comma-joined columns, sorted.
 ///
+/// A Variant column renders as JSON, so the same values compare equal
+/// whether a file stored them shredded or unshredded.
+///
 /// # Panics
 ///
 /// Panics when the query fails to plan, execute, or render.
-async fn rows(context: &SessionContext, sql: &str) -> Vec<String> {
+pub async fn rows(context: &SessionContext, sql: &str) -> Vec<String> {
     let batches = context
         .sql(sql)
         .await
@@ -151,9 +158,21 @@ async fn rows(context: &SessionContext, sql: &str) -> Vec<String> {
         .unwrap_or_else(|error| panic!("{sql}: executes: {error}"));
     let mut rows = Vec::new();
     for batch in &batches {
+        let columns: Vec<ArrayRef> = batch
+            .schema()
+            .fields()
+            .iter()
+            .zip(batch.columns())
+            .map(|(field, column)| {
+                if is_variant(field) {
+                    Arc::new(variant_to_json(column).expect("Variant renders as JSON"))
+                } else {
+                    Arc::clone(column)
+                }
+            })
+            .collect();
         for row in 0..batch.num_rows() {
-            let values = batch
-                .columns()
+            let values = columns
                 .iter()
                 .map(|column| array_value_to_string(column, row).expect("renders"));
             rows.push(values.collect::<Vec<_>>().join(","));

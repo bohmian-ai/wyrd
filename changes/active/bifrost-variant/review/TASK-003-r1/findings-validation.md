@@ -203,17 +203,24 @@ otherwise.
     counts, with each range counted once.
 - Closure: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/oracle::exec::tests::distributed_scan_stats_count_each_range_once/)'`.
 
-**FIND-003-12 — MISSING: no pre-execution tenant-prefix refusal**
+**FIND-003-12: spec wording (revised by user decision, 2026-10-09)**
 - Sources: INV-4, FUP-1, SEC-2.
-- Location: `oracle/exec.rs:897-990`.
-- Correction:
-  - In `bind`, check every `PartitionedFile` location against
-    `tenants/{tenant}/`, using one prefix helper placed beside
-    `catalog/tenant_table.rs:176-181`.
-  - Reuse the footer-proof error.
-  - Change the test at `exec.rs:2606-2655` to expect a refusal, and add CSV
-    and non-local-URL cases.
-- Closure: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(/oracle::exec::tests::/)'`.
+- Original claim: `TenantWarehouseReads::bind` (`oracle/exec.rs:897-990`)
+  has no pre-execution path-prefix refusal, which the spec text
+  (`spec.md:338-340`) asked for.
+- Decision: no code change.
+  - Every worker scan already goes through `TenantParquetReaderFactory`,
+    which refuses a file whose footer is missing or names another tenant
+    before any row is decoded.
+  - `decoded_stage_scans_read_only_as_the_bound_tenant` and
+    `hot_parquet_refuses_foreign_or_missing_footer_tenant_before_any_row`
+    prove this.
+  - The footer proof checks the file's contents, which is stronger than
+    checking its path.
+- Correction: revision 26 now names the footer proof as the tenant
+  boundary and drops the prefix wording.
+- Closure: those two tests pass unchanged, and the wording is present in
+  `spec-revision-26-datafusion-variant.md`.
 
 **FIND-003-13 — REGRESSION: planning footer IO escapes the deadline**
 - Sources: SYS-2, RES-1.

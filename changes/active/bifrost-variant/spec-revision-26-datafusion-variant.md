@@ -139,7 +139,15 @@ Replace the first paragraph with:
 
 In the paragraph listing what crosses the wire, delete the Variant file
 adapter bullet (the adapter-factory codec hook and the `FileRead` UDF). Only
-the tenant footer proof (`WorkerPlanRewriteHandler`) remains.
+the tenant footer proof remains. Replace its bullet with:
+
+> - the tenant footer proof, reattached by a `datafusion-distributed`
+>   `WorkerPlanRewriteHandler`. The proof refuses any file whose footer does
+>   not name the authenticated tenant before a row is decoded.
+
+The footer proof is the tenant boundary. It checks the file's own contents,
+which is a stronger check than the path, so no separate path-prefix check is
+required.
 
 ### Safe pruning and hidden row lineage
 

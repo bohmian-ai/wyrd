@@ -58,7 +58,7 @@ This is the first TASK-003 review, so no root-cause pass was required.
 |---|---|---|
 | Analytical rebuilt on native `datafusion-distributed`; no Wyrd-invented DataFusion logic; deleted code not reintroduced | PASS except FIND-10, FIND-20 | behavior, invariants, reuse |
 | Workers read only through the tenant footer proof | PASS | security, storage |
-| Pre-execution tenant-prefix refusal (`spec.md:338-340`) | FAIL | FIND-12 |
+| Tenant boundary on worker reads | PASS (spec reworded: the footer proof is the boundary) | FIND-12 |
 | Peer contract binds the fork revision (rev 26, plan:165) | FAIL | FIND-1 |
 | Live fragments carry pushed predicates under the signed digest | PASS | security; `leaf_predicates_round_trip_and_execute` |
 | Live route event-time pruning | PASS | `event_time_predicate_selects_only_overlapping_routes`, journeys |
@@ -102,6 +102,11 @@ The full entries are in `findings-validation.md`:
 None; this is the first review.
 
 ## Remediation
+
+The user added two items: D1 (plan-wide distributed metrics) and D2
+(releasing worker partition streams at query end). Both move into
+`datafusion-distributed`.
+
 
 `TASK-003-R1-review-fixes.md` in this directory, routed to
 `$wyrd-implement`.

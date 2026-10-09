@@ -53,8 +53,8 @@ use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion_datasource::compute_all_files_statistics;
 use datafusion_distributed::{
-    DistributedLeafExec, NetworkBoundaryExt as _, Stage, WorkerPlanRewriteEvent,
-    WorkerPlanRewriteEventResponse, WorkerPlanRewriteHandler,
+    DistributedLeafExec, WorkerPlanRewriteEvent, WorkerPlanRewriteEventResponse,
+    WorkerPlanRewriteHandler,
 };
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, TryFutureExt};
@@ -272,8 +272,8 @@ impl RemoteScanMetrics {
 pub(crate) struct OracleQueryScanStats {
     /// Physical bytes reported by `DataFusion`'s Parquet scan metric.
     pub(crate) physical_bytes_scanned: Option<u64>,
-    /// Number of files executed file scan nodes opened: the files they were
-    /// planned to read, less those `DataFusion`'s `FilePruner` skipped.
+    /// Number of file ranges executed file scan nodes opened: the ranges they
+    /// were planned to read, less those `DataFusion`'s `FilePruner` skipped.
     pub(crate) files_scanned: u64,
     /// Number of file partitions represented by executed scan nodes.
     pub(crate) partitions_scanned: u64,
@@ -289,10 +289,15 @@ pub(crate) struct OracleQueryScanStats {
 
 impl OracleQueryScanStats {
     /// Walks one final physical plan and snapshots scan metrics and file counts.
+    ///
+    /// A `DistributedExec` root's leaves execute on followers, so their file
+    /// sources' local metric sets are not retained: that query's bytes and
+    /// pruning arrive only through [`record_distributed_scan_metrics`].
     #[must_use]
     pub(crate) fn from_plan(plan: &dyn ExecutionPlan) -> Self {
         let mut stats = Self::default();
-        Self::visit(plan, &mut stats);
+        let local_metrics = query_class_for_root(plan) == QueryClass::Interactive;
+        Self::visit(plan, local_metrics, &mut stats);
         stats
     }
 
@@ -340,12 +345,13 @@ impl OracleQueryScanStats {
 
     /// Visits each physical node exactly once, accumulating leaf scan evidence.
     ///
-    /// A distributed plan's stages hang off their network boundaries rather
-    /// than off children, and a split leaf holds one scan per task, so both
-    /// are descended to count the files and partitions every task was planned
-    /// to read. Those scans execute on followers; their bytes and pruning
-    /// arrive through [`record_distributed_scan_metrics`] instead.
-    fn visit(plan: &dyn ExecutionPlan, stats: &mut Self) {
+    /// A network boundary returns its stage plan as a child, and a split leaf
+    /// holds one scan per task that `children()` does not return, so its
+    /// variants are descended to count the file ranges and partitions every
+    /// task was planned to read. `local_metrics` retains each file source's
+    /// metric set for [`Self::finalize`]; it is false for a distributed root,
+    /// whose scans report through [`record_distributed_scan_metrics`].
+    fn visit(plan: &dyn ExecutionPlan, local_metrics: bool, stats: &mut Self) {
         if let Some(source) = plan.downcast_ref::<DataSourceExec>()
             && let Some(config) = source.data_source().downcast_ref::<FileScanConfig>()
         {
@@ -354,26 +360,23 @@ impl OracleQueryScanStats {
                 .saturating_add(config.file_groups.len() as u64);
             stats.files_scanned = stats
                 .files_scanned
-                .saturating_add(distinct_files(config) as u64);
-            stats
-                .physical_metrics
-                .push(config.file_source.metrics().clone());
+                .saturating_add(file_ranges(config) as u64);
+            if local_metrics {
+                stats
+                    .physical_metrics
+                    .push(config.file_source.metrics().clone());
+            }
         }
         if let Some(source) = plan.downcast_ref::<LiveScribeExec>() {
             stats.remote_handles.push(Arc::clone(source.scan_metrics()));
         }
         if let Some(leaf) = plan.downcast_ref::<DistributedLeafExec>() {
             for variant in leaf.variants() {
-                Self::visit(variant.as_ref(), stats);
+                Self::visit(variant.as_ref(), local_metrics, stats);
             }
         }
-        if let Some(boundary) = plan.as_network_boundary()
-            && let Stage::Local(stage) = boundary.input_stage()
-        {
-            Self::visit(stage.plan.as_ref(), stats);
-        }
         for child in plan.children() {
-            Self::visit(child.as_ref(), stats);
+            Self::visit(child.as_ref(), local_metrics, stats);
         }
     }
 }
@@ -418,7 +421,9 @@ pub(crate) fn query_class_for_root(plan: &dyn ExecutionPlan) -> QueryClass {
 /// Upstream ships each task's metrics back to the coordinator over its own
 /// coordinator channel once that task finishes, and
 /// `rewrite_distributed_plan_with_metrics` waits for all of them before
-/// attaching them to the coordinator's plan tree. Reading them here is what
+/// attaching them to the coordinator's plan tree;
+/// `aggregate_plan_metrics` then totals every node once by name. Reading them
+/// here is what
 /// lets the leader stay the single emitter of a leader-owned physical-scan
 /// metric while the reads themselves happened elsewhere.
 ///
@@ -441,11 +446,10 @@ pub(crate) async fn record_distributed_scan_metrics(
         datafusion_distributed::DistributedMetricsFormat::Aggregated,
     )
     .await?;
-    let mut bytes_scanned = None;
-    let mut pruning = PruningEvidence::default();
-    fold_distributed_scan_metrics(&with_metrics, &mut bytes_scanned, &mut pruning);
+    let metrics = datafusion_distributed::aggregate_plan_metrics(&with_metrics);
+    let pruning = parquet_pruning(&metrics);
     sink.record_footer(WorkerScanStats {
-        bytes_scanned,
+        bytes_scanned: sum_named_count(&metrics, "bytes_scanned"),
         row_groups_scanned: pruning.row_groups_scanned,
         row_groups_pruned: pruning.row_groups_pruned,
         row_groups_pruned_bloom: pruning.row_groups_pruned_bloom,
@@ -454,35 +458,6 @@ pub(crate) async fn record_distributed_scan_metrics(
     });
     sink.record_pruned_files(pruning.files_pruned);
     Ok(with_metrics)
-}
-
-/// Accumulates one rewritten plan node's scan metrics, then its whole subtree.
-///
-/// A distributed plan is not one tree. Each stage below a network boundary
-/// hangs off that boundary's input stage rather than off its children, so a
-/// plain child walk sees only the coordinator's own stage and reports a query
-/// that scanned nothing. Descending both edges is what reaches the follower
-/// leaves where the reads actually happened.
-fn fold_distributed_scan_metrics(
-    node: &Arc<dyn ExecutionPlan>,
-    bytes_scanned: &mut Option<u64>,
-    pruning: &mut PruningEvidence,
-) {
-    if let Some(metrics) = node.metrics() {
-        let metrics = metrics.aggregate_by_name();
-        if let Some(bytes) = sum_named_count(&metrics, "bytes_scanned") {
-            *bytes_scanned = Some(bytes_scanned.unwrap_or(0).saturating_add(bytes));
-        }
-        pruning.add(parquet_pruning(&metrics));
-    }
-    if let Some(boundary) = node.as_network_boundary()
-        && let Stage::Local(stage) = boundary.input_stage()
-    {
-        fold_distributed_scan_metrics(&stage.plan, bytes_scanned, pruning);
-    }
-    for child in node.children() {
-        fold_distributed_scan_metrics(child, bytes_scanned, pruning);
-    }
 }
 
 /// Reads the completed plan's own physical shape and retained spill evidence.
@@ -533,12 +508,11 @@ struct OutputSortNode {
     spilled_rows: u64,
 }
 
-/// Accumulates one plan's physical shape across ordinary and distributed edges.
+/// Accumulates one plan's physical shape over a plain `children()` walk.
 ///
-/// A distributed plan hides its remote stages behind network boundaries, so a
-/// walk over `children()` alone would see only the coordinator's fragment.
-/// Crossing `Stage::Local` reaches the stages this process itself owns, which
-/// is where the output sort and its retained metrics live.
+/// A network boundary returns its stage plan as a child, so the walk reaches
+/// the stages this process owns, where the output sort and its retained
+/// metrics live, and visits every node once.
 #[derive(Debug, Default)]
 struct PhysicalEvidenceWalk {
     /// Every sort carrying the root's output schema.
@@ -547,20 +521,11 @@ struct PhysicalEvidenceWalk {
     aggregate_group_types: std::collections::BTreeSet<String>,
     /// Field names of each equi-join's left-input child, in visit order.
     join_build_schemas: Vec<Vec<String>>,
-    /// Nodes already recorded, identified by address.
-    ///
-    /// A `Stage::Local` boundary and its ordinary child are the same node in a
-    /// distributed plan, so a walk that follows both edges would count one sort
-    /// or join twice and then report the plan as ambiguous.
-    seen: std::collections::HashSet<*const ()>,
 }
 
 impl PhysicalEvidenceWalk {
-    /// Records `node`'s own contribution, then descends into everything it owns.
+    /// Records `node`'s own contribution, then descends into its children.
     fn visit(&mut self, node: &Arc<dyn ExecutionPlan>, schema: &Schema) {
-        if !self.seen.insert(Arc::as_ptr(node).cast::<()>()) {
-            return;
-        }
         if let Some(sort) = node.downcast_ref::<SortExec>()
             && sort.schema().fields() == schema.fields()
         {
@@ -613,11 +578,6 @@ impl PhysicalEvidenceWalk {
         if let Some(join) = node.downcast_ref::<SortMergeJoinExec>() {
             self.join_build_schemas
                 .push(field_names(join.left().schema().as_ref()));
-        }
-        if let Some(boundary) = node.as_network_boundary()
-            && let datafusion_distributed::Stage::Local(stage) = boundary.input_stage()
-        {
-            self.visit(&stage.plan, schema);
         }
         for child in node.children() {
             self.visit(child, schema);
@@ -1528,18 +1488,13 @@ impl TableProvider for OracleTableProvider {
     }
 }
 
-/// Counts the distinct files one file scan reads.
+/// Counts the file ranges one file scan reads.
 ///
-/// `DataFusion`'s byte-range repartitioning lists one file in several groups,
-/// so the count deduplicates by object location.
-fn distinct_files(config: &FileScanConfig) -> usize {
-    config
-        .file_groups
-        .iter()
-        .flat_map(FileGroup::iter)
-        .map(|file| &file.object_meta.location)
-        .collect::<std::collections::HashSet<_>>()
-        .len()
+/// `DataFusion`'s byte-range repartitioning lists one file as several ranges,
+/// and its `FilePruner` reports skipped ranges, so files scanned and files
+/// pruned are both counted in ranges.
+fn file_ranges(config: &FileScanConfig) -> usize {
+    config.file_groups.iter().map(FileGroup::len).sum()
 }
 
 /// Resolves `DataFusion`'s requested scan output to public column names.
@@ -3617,6 +3572,111 @@ pub(super) mod tests {
             query_class_for_root(wrapped.as_ref()),
             QueryClass::Interactive
         );
+    }
+
+    /// Scan stats count each planned file range once, distributed or not.
+    ///
+    /// Two Parquet files are planned as a plain scan by `DataFusion`'s own
+    /// planner, one range per file, and as a GROUP BY by the pinned
+    /// distributed planner, which byte-splits them into per-task ranges. Each
+    /// count must equal the ranges its plan holds: a network boundary returns
+    /// its stage plan as a child, so a walk that also followed the boundary's
+    /// input stage would count every distributed range twice. The distributed
+    /// root retains no local metric set: its bytes and pruning come only from
+    /// the followers' aggregate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture file cannot be written, either statement cannot
+    /// be planned, or the pinned planner returns no `DistributedExec` root.
+    #[tokio::test]
+    async fn distributed_scan_stats_count_each_range_once() {
+        let directory = tempfile::tempdir().expect("range fixture directory");
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
+        write_split_fixture(&directory.path().join("a.parquet"), &schema, &[1, 2]);
+        write_split_fixture(&directory.path().join("b.parquet"), &schema, &[2, 3]);
+        let location = directory.path().to_str().expect("utf-8 fixture path");
+        // One range per file on both planners, so their counts are comparable.
+        let mut config = crate::resources::OracleSessionShape::for_test().session_config();
+        config.options_mut().optimizer.repartition_file_scans = false;
+
+        let ordinary = datafusion::prelude::SessionContext::new_with_config(config.clone());
+        ordinary
+            .register_parquet(
+                "rows",
+                location,
+                datafusion::prelude::ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register ordinary fixture");
+        let plain = ordinary
+            .sql("SELECT key FROM rows")
+            .await
+            .expect("lower plain scan")
+            .create_physical_plan()
+            .await
+            .expect("build plain scan");
+
+        datafusion_distributed::DistributedExt::set_distributed_worker_resolver(
+            &mut config,
+            RootClassWorkers,
+        );
+        datafusion_distributed::DistributedExt::set_distributed_desired_task_count_handler(
+            &mut config,
+            RootClassTaskCount,
+        );
+        let state = <datafusion::execution::session_state::SessionStateBuilder as datafusion_distributed::SessionStateBuilderExt>::with_distributed_planner(
+            datafusion::execution::session_state::SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(config),
+        )
+        .build();
+        let distributed = datafusion::prelude::SessionContext::new_with_state(state);
+        distributed
+            .register_parquet(
+                "rows",
+                location,
+                datafusion::prelude::ParquetReadOptions::default(),
+            )
+            .await
+            .expect("register distributed fixture");
+        let grouped = distributed
+            .sql("SELECT key, count(*) FROM rows GROUP BY key")
+            .await
+            .expect("lower grouped scan")
+            .create_physical_plan()
+            .await
+            .expect("build grouped scan");
+        assert_eq!(
+            query_class_for_root(grouped.as_ref()),
+            QueryClass::Analytical
+        );
+
+        let plain = OracleQueryScanStats::from_plan(plain.as_ref());
+        let mut leaf_ranges = 0_u64;
+        grouped
+            .apply(|node| {
+                if let Some(leaf) = node.downcast_ref::<DistributedLeafExec>() {
+                    for variant in leaf.variants() {
+                        let config = variant
+                            .downcast_ref::<DataSourceExec>()
+                            .and_then(|source| {
+                                source.data_source().downcast_ref::<FileScanConfig>()
+                            })
+                            .expect("each task variant is a file scan");
+                        leaf_ranges += file_ranges(config) as u64;
+                    }
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            })
+            .expect("walk grouped plan");
+        let grouped = OracleQueryScanStats::from_plan(grouped.as_ref());
+        assert_eq!(plain.files_scanned, 2);
+        assert!(leaf_ranges >= 2, "every file is planned on some task");
+        assert_eq!(grouped.files_scanned, leaf_ranges);
+        assert_eq!(plain.physical_metrics.len(), 1);
+        assert!(grouped.physical_metrics.is_empty());
     }
 
     /// Forces every leaf stage of the root-class fixture onto two tasks.

@@ -853,6 +853,119 @@ pub(super) mod tests {
         }
     }
 
+    /// Returns the Parquet leaves `published` decodes for `sql` as the hot
+    /// scan plans it: the projection and predicate `DataFusion` pushed into
+    /// the scan's `ParquetSource`, planned through [`FileReadPlan`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the query does not plan to exactly one Parquet scan or the
+    /// pushed expressions do not plan over the file.
+    async fn scan_leaves(published: &Bytes, sql: &str) -> Vec<String> {
+        use datafusion::datasource::physical_plan::{
+            FileScanConfig, FileSource as _, ParquetSource,
+        };
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::physical_plan::ExecutionPlanVisitor;
+
+        /// Collects the one `ParquetSource` of a plan.
+        struct Scans(Vec<ParquetSource>);
+        impl ExecutionPlanVisitor for Scans {
+            type Error = std::convert::Infallible;
+
+            /// Records `plan`'s `ParquetSource` when it is a Parquet scan.
+            ///
+            /// # Errors
+            ///
+            /// Never fails.
+            fn pre_visit(&mut self, plan: &dyn ExecutionPlan) -> Result<bool, Self::Error> {
+                if let Some(source) = plan
+                    .downcast_ref::<DataSourceExec>()
+                    .and_then(|exec| exec.data_source().downcast_ref::<FileScanConfig>())
+                    .and_then(|config| config.file_source().downcast_ref::<ParquetSource>())
+                {
+                    self.0.push(source.clone());
+                }
+                Ok(true)
+            }
+        }
+
+        let schema = logical_schema();
+        let plan = HotTable::new(published, Arc::clone(&schema))
+            .plan(sql)
+            .await;
+        let mut scans = Scans(Vec::new());
+        let Ok(()) = datafusion::physical_plan::accept(plan.as_ref(), &mut scans);
+        let [source] = scans.0.as_slice() else {
+            panic!("{sql} plans one Parquet scan, found {}", scans.0.len());
+        };
+        let projection = source.projection().cloned().unwrap_or_else(|| {
+            ProjectionExprs::from_indices(&(0..schema.fields().len()).collect::<Vec<_>>(), &schema)
+        });
+        let reader =
+            ArrowReaderMetadata::load(published, ArrowReaderOptions::new()).expect("valid footer");
+        let file_plan = FileReadPlan::new(&reader, &schema, projection, source.filter(), 20)
+            .expect("per-file plan");
+        decoded_leaves(published, &file_plan)
+    }
+
+    /// A Variant key under a list element decodes only that key's leaves,
+    /// both through a list index (`events[1]['attributes'] ->> 'k'`) and
+    /// through `unnest`: on a shredded file the scan reads the attributes'
+    /// `metadata` and the shredded `k` subtree, never the event `name`, the
+    /// sibling shredded `x`, or the residual `value`, and on an unshredded file
+    /// only the attributes Variant. Both return each event's `k`, identically
+    /// from either file.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a read decodes other leaves or the two files' values
+    /// differ.
+    #[tokio::test]
+    async fn list_variant_key_reads_decode_only_their_leaf() {
+        let shredded = write_file(true);
+        let unshredded = write_file(false);
+        let attributes = "events.list.element.attributes";
+        for (sql, expected) in [
+            (
+                "SELECT events[1]['attributes'] ->> 'k' AS k FROM t",
+                vec![Some("v1"), None, None, None],
+            ),
+            (
+                "SELECT unnest(events)['attributes'] ->> 'k' AS k FROM t",
+                vec![Some("v1"), Some("v2"), None, None],
+            ),
+        ] {
+            assert_eq!(
+                scan_leaves(&shredded, sql).await,
+                [
+                    format!("{attributes}.metadata"),
+                    format!("{attributes}.typed_value.k.value"),
+                    format!("{attributes}.typed_value.k.typed_value"),
+                ],
+                "{sql}"
+            );
+            assert_eq!(
+                scan_leaves(&unshredded, sql).await,
+                [
+                    format!("{attributes}.metadata"),
+                    format!("{attributes}.value"),
+                ],
+                "{sql}"
+            );
+            let read = |published| async move {
+                HotTable::new(published, logical_schema()).sql(sql).await
+            };
+            let shredded_rows = read(&shredded).await;
+            assert_eq!(
+                shredded_rows.column(0).as_string::<i32>(),
+                &StringArray::from(expected),
+                "{sql}"
+            );
+            assert_eq!(shredded_rows, read(&unshredded).await, "{sql}");
+        }
+    }
+
     /// A key the file did not shred reads as null even when every row's
     /// residual `value` is null: Arrow then reports the key missing, and the
     /// leaf must still be a Variant, so a predicate pushed into the hot scan

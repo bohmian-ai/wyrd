@@ -232,3 +232,64 @@ architecture text; do not preserve unused compatibility paths.
   `architecture/wyrd-design.md`; `architecture/bifrost-design.md`;
   `TESTING.md` (definitive Wyrd guide for test ergonomics,
   understandability, structure, ownership, and lane selection)
+
+## Implementation Evidence
+
+Commits `ce56636ba`..`7d3eb319a` on `wyrd-verification-closeout-outbox`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-003 for all four producer families and both Scribe routes | `crates/wyrd/wyrd-server/src/scribe_outbox.rs` (`ScribeWrite::{Audit,Capture,Result}`, `ScribeSink` local/peer routes); audit via `AuditStage for Outbox<S>`; capture in `components/gateway/capture.rs`; queued and direct results in `verification/runner.rs` | `wyrd-server` lib `scribe_outbox::tests::{writes_group_by_destination_under_their_attribution, audit_decisions_frame_under_the_platform_audit_principal, an_unbound_route_waits_and_an_unreachable_one_drops, scribe_refusals_and_peer_codes_classify_alike}`; `wyrd-testing` `audit_retention::{retained_history_carries_both_credential_shapes, system_owner_security_rejections_retain_once}`; `test:bifrost:integration:server` 87/87 | PASS |
+| Multiple logical writes for one destination become one Arrow batch | `ScribeSink::write` groups a tenant slice by destination and encodes one frame each | `scribe_outbox::tests::writes_group_by_destination_under_their_attribution` | PASS |
+| Retrying an unchanged write keeps its batch id; a terminal rejection never blocks the tenant | `crates/shared/wyrd-runtime/src/outbox.rs` identical-slice retry; content-derived v7 batch ids | `wyrd-runtime` `outbox::tests::{a_retry_writes_the_identical_failed_slice_without_later_items, a_failed_write_is_retried_once_in_order_ahead_of_later_items, a_failing_tenant_does_not_delay_another_tenant}` (9/9); `scribe_outbox::tests::{a_retry_resubmits_identical_frames, a_terminal_rejection_never_blocks_later_writes}`; `pg_verification_runtime::lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplicates` | PASS |
+| No pre-ingress Scribe memory reservation or duplicate admission | The sink submits frames to the existing local/peer Scribe ingress unchanged | Source review of `scribe_outbox.rs`; `test:bifrost:integration:redux` 904/904 | PASS |
+| `vala.audit_staging`, chain/publication state, `AuditPublisher`, `wyrd.verifier_run_results` have no runtime owner | Additive drops `vala-sql/migrations/20261008000000_drop_audit_staging.sql`, `wyrd-sql/migrations/20261008000000_drop_verifier_run_results.sql`; publisher and staging modules deleted | `git grep` finds no runtime reference outside migrations and the migration test; `vala-sql` `pg_migration` asserts the relations are gone; `test:sql` | PASS |
+| Retained audit carries decision content without chain-only fields; retained rows not rewritten | `vala.system.audit_log` built-in contract without `seq`/hash fields; no history rewrite | `audit_retention::retained_history_carries_both_credential_shapes` (reading `seq` fails) | PASS |
+| Queued runs settle with their result; observation enqueue/claim unchanged | `runner.rs` builds the result, settles under the lease fence, then stages | `pg_verification_runtime` and `pg_verification_routes` 40/40, including `expired_lease_is_reclaimed_and_the_stale_holder_is_fenced` and `every_tenant_is_claimed_in_the_first_round` | PASS |
+| Abrupt-process loss documented; rejection and shutdown-deadline loss logged and counted | `AGENTS.md` §2, `architecture/wyrd-design.md`, `architecture/bifrost-design.md`; `Outbox::shutdown` counts `outbox_events_lost_total` | `outbox::tests::shutdown_flushes_items_that_recover_before_the_deadline`; `scribe_outbox::tests::a_terminal_rejection_never_blocks_later_writes` | PASS |
+
+Lanes: `fmt`, `lints`, `codegen:check`, `check:deps`, `check:tenant-isolation`,
+`git diff --check`, `test:bifrost:integration:server` (87/87),
+`test:bifrost:integration:redux` (904/904), `test:sql`,
+`test:identity:journey` (all green), and the wyrd family suite (2397/2397).
+
+Exact selectors: `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/outbox::tests::/)'`;
+`mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(/scribe_outbox::tests::/)'`;
+`mise exec -- cargo nextest run --locked -p wyrd-testing --test server --run-ignored all -E 'test(/audit_retention::/)'`
+(Postgres wrapper); `mise exec -- cargo nextest run --locked -p wyrd-server --test integration -E 'test(/pg_verification_(runtime|routes)::/)'` (Postgres wrapper).
+
+### Deviations and material limits
+
+- The queued result is staged after its lease-fenced settlement reports
+  `completed`, not before. Staging first let an expired-lease holder publish a
+  second, orphaned result (`expired_lease_is_reclaimed_and_the_stale_holder_is_fenced`).
+- Each gateway request stages its own capture frame; `Phase::Publication` is
+  removed; a direct result's `result_id` is its `execution_id`.
+- The audit decision time is the process clock at staging.
+- The built-in audit schema changed without a history upgrade path (precedent
+  `b7185d0ee`); retained rows are not rewritten.
+- Decisions staged by an Oracle drain after the outbox shutdown fence are lost
+  and counted.
+- Tests that injected audit-write failures were deleted: staging cannot fail,
+  and the `Outbox` unit tests own loss accounting.
+- System-owner audit is not readable through Oracle; it is proved through
+  `vala.scribe_batch_commits`. Three `platform_admin_e2e` journeys now assert
+  only that system-owner batches increased (tenant-slug resource and the
+  absence of credential material are not re-asserted).
+- The `audit_publication` harness option was removed from the Rust, Python,
+  and TypeScript test servers.
+- Test harness: every start path composes and binds on the shared Wyrd
+  runtime its `Drop` drives, and in-process teardown drains the Scribe outbox
+  and Bifrost like the serve task (`Bifrost::mark_unsupervised_for_test`).
+  The fault-injection result outbox (`PublicationFault::outbox`) also starts
+  on the shared runtime; started on a test's current-thread runtime, its
+  in-flight Scribe write held Bifrost's teardown abort forever under load.
+  `tenant_connection_rotation_journey` reads each replica's audit before that
+  replica stops, because a stopped replica's rows reach others only through
+  Forge publication.
+- The stub-scanning test reads the generated `native.d.cts` and lists
+  `grpc_url`/`bootstrap_user` and `bootstrapService`/`bootstrapUser` as setup.
+- Host: psql 14 lacks `\getenv`, so Postgres lanes ran with
+  `/opt/homebrew/opt/libpq/bin` first on PATH. macOS bash 3.2 lacks `mapfile`,
+  so the wyrd family suite ran as the same `cargo nextest` command
+  `scripts/run-family-tests.sh` builds, not through the script.

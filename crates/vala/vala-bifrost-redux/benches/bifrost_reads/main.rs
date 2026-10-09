@@ -18,8 +18,8 @@
 //!
 //! Both sides of every pair use the Oracle session configuration
 //! (`OracleSessionShape`): same target partitions, same Parquet options. The
-//! only difference is the table provider and Wyrd's installed rules and
-//! functions. `-- hot`, `-- published` or `-- variant` runs one section.
+//! only difference is the table provider. `-- hot`, `-- published` or
+//! `-- variant` runs one section.
 //!
 //! [`GLOBAL`] installs the server's allocator.
 
@@ -38,6 +38,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Builds every fixture and runs each requested section, printing one table
 /// per section.
+///
+/// # Panics
+///
+/// Panics when the Tokio runtime or the fixture directory cannot be created,
+/// or when a section's fixture or comparison fails.
 fn main() {
     // Cargo passes `--bench`; a bare word names a section.
     let sections: Vec<String> = std::env::args()
@@ -69,6 +74,10 @@ fn main() {
 
 /// `bytes` of xorshift hex seeded by `seed` and `row`, so every value differs
 /// and nothing collapses to a dictionary.
+///
+/// # Panics
+///
+/// Never in practice: writing to a `String` cannot fail.
 fn text(seed: &str, row: usize, bytes: usize) -> String {
     let mut state = seed
         .bytes()

@@ -332,8 +332,32 @@ distributed queries.**
   - **Proof:** an Oracle read of a shredded published file still renders
     correctly through `variant_cell_to_json` and `WyrdJsonEncoderFactory`.
     The existing nested-pushdown and Oracle journeys cover this; run them.
-  - **Out of scope:** the top-level `EncodedVariant::validate` in
-    `mask_placeholders` and the placeholder masking stay as they are.
+  - **Also delete the read-side Bifrost validation (user decision,
+    2026-10-09).**
+    - Spec revision 26 applies Bifrost's Variant limits when writing.
+      Reads use DataFusion and arrow-rs validation as they are.
+    - So `mask_placeholders` no longer calls `EncodedVariant::validate` on
+      the top-level `value`. Remove that call and the error it raises.
+    - Keep the placeholder masking: a cell with empty metadata and an empty
+      or absent value becomes null. That is null semantics, not a Bifrost
+      limit.
+    - Write-side validation stays exactly as it is: `EncodedVariant::from_json`,
+      `from_json_text`, `from_bytes` and `VariantColumnBuilder`.
+  - **Safety still required: no panics and no stack overflow.** Rendering a
+    malformed or hostile-depth cell must return an error. Wyrd no longer
+    checks for this; arrow-rs does.
+    - Keep `malformed_stored_variant_is_an_error_not_a_panic`. Drop only its
+      `mask_placeholders(..).is_err()` line, because `mask_placeholders` no
+      longer validates. The two renderer assertions stay.
+    - Rewrite `renderers_refuse_hostile_stored_variants` so that
+      `variant_cell_to_json` and `WyrdJsonEncoderFactory` return an error on
+      the 20,000-level cell without overflowing. Drop its assertion on
+      `VariantViolation::TooDeep { depth: 65 }`, because that is Bifrost's
+      write-side code.
+    - If either test fails once Wyrd's check is gone, arrow-rs's decoding is
+      the gap. Fix it in the arrow-rs fork (fallible decoding with its own
+      nesting limit), push, and bump the pin. Do not put a check back in
+      Wyrd.
 
 ### Group 6: docs and style
 

@@ -160,6 +160,18 @@ Do this group first: it changes code that findings 11 and 7 also touch.
     3. the root dropped before preparation finishes;
     4. a connection that resolves after close;
     5. two concurrent queries, where closing one leaves the other running.
+  - **Worker stages:** a remote worker builds its own `TaskContext`
+    (`impl_coordinator_channel.rs`, `impl_execute_task.rs`) and its stage can
+    hold its own network pools.
+    - The worker creates one close state per executed task and puts it in
+      that `TaskContext`, using the same type and the same invariants.
+    - It closes when the task's output stream ends, errors, or is dropped.
+      The coordinator cancelling the gRPC call drops it.
+    - Fork test 6: a three-stage plan (coordinator, then worker stage with
+      its own network boundary, then leaf stage) whose root is dropped
+      mid-query. After `wait_closed` on the coordinator and on each worker
+      task, every memory pool reports 0 reserved, no reader task remains, and
+      a sibling query on the same workers still completes.
 - **Wyrd change:**
   - Delete `AnalyticalGraphExchanges`, `AnalyticalExchangeStream`,
     `ExchangeSlot`, `close_exchanges` and every `exchanges.close()` call (in
@@ -222,28 +234,50 @@ Do this group first: it changes code that findings 11 and 7 also touch.
     but a published key is never uploaded again.
   - Recovery can replay a manifest whose catalog commit already succeeded,
     when it was interrupted before cleanup.
-- **Fix:** before any upload, `recover_publication` asks the
-  `ScribePublicationReconciler` whether this publication is already
-  committed, using the same fenced SQL check it runs after the upload.
-  - **Already committed:** verify each object only and never PUT. A matching
-    object is accepted. A missing or contradicting object fails closed with
-    the uploader's existing contradiction error (internal). There is no
-    repair path.
-  - **Not committed:** use the uploader. It calls `verify_remote` first and
-    returns with no PUT on a match. On missing or contradicting content it
-    falls through to the existing put-and-verify loop, since overwriting an
-    unpublished key is allowed.
+- **Authority:** `vala.file_list`. `file_list_writer::insert_artifact_set_fenced`
+  already treats the artifact set's ordered identity
+  `(data_tenant_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max,
+  file_ordinal)` as the publication record: a replay matches exactly, and a
+  partial or contradicting set is an invariant error.
+- **Fix:** add a read-only lookup beside `insert_artifact_set_fenced` in
+  `scribe/file_list_writer.rs` that selects the existing rows for the set's
+  identity (the same `SELECT … ORDER BY file_ordinal` the insert already
+  runs, without `FOR UPDATE`) and classifies them with the existing
+  `artifact_replay_matches`:
+  - **Committed:** every row present and matching.
+  - **Absent:** no row present.
+  - **Conflict:** some rows present, or rows that do not match.
+
+  `ScribePublicationReconciler` exposes it, and `recover_publication` calls
+  it before any upload:
+  - **Committed:** verify each object only, never PUT. A matching object is
+    accepted, then the existing `publish` replay and `cleanup_published`
+    run. A missing or contradicting object fails closed with the uploader's
+    existing contradiction error (internal). There is no repair path.
+  - **Conflict:** fail closed (internal error), 0 PUTs, no cleanup. The
+    manifest stays for an operator.
+  - **Absent:** the current path. The uploader calls `verify_remote` first
+    and returns with no PUT on a match; on missing or contradicting content
+    it falls through to put-and-verify, since overwriting an unpublished key
+    is allowed.
+- **Known limit, not in this task:** after Forge's expired cleanup deletes
+  terminal `file_list` rows (`vala-sql/src/queries/forge_tasks.rs`), a
+  manifest that survived that long reads as Absent. That window comes from
+  the recovery and retirement protocols, which TASK-003 did not change.
+  Record it in the evidence as a follow-up; do not add a ledger here.
 - **Tests:** use a PUT-counting object store; reuse an existing test store
   wrapper if there is one.
 
-  | Publication | Remote object | PUTs | Result |
+  | `file_list` state | Remote object | PUTs | Result |
   |---|---|---|---|
-  | committed | matching | 0 | succeeds |
+  | committed | matching | 0 | succeeds, cleanup runs |
   | committed | missing | 0 | fails closed |
   | committed | contradicting | 0 | fails closed |
-  | not committed | matching | 0 | succeeds |
-  | not committed | missing | 1 | succeeds |
-  | not committed | contradicting | 1 | succeeds |
+  | partial rows | any | 0 | fails closed |
+  | mismatched rows | any | 0 | fails closed |
+  | absent | matching | 0 | succeeds |
+  | absent | missing | 1 | succeeds |
+  | absent | contradicting | 1 | succeeds |
 
 **FIND-003-9. Dead error variants hide a broken missing-file check.**
 - **Problem:** in `storage/error.rs`, `from_object_store`,
@@ -358,6 +392,30 @@ distributed queries.**
       the gap. Fix it in the arrow-rs fork (fallible decoding with its own
       nesting limit), push, and bump the pin. Do not put a check back in
       Wyrd.
+  - **Read validation owner: arrow-rs, for every layout.** DataFusion's
+    adapter validates only when file and table types differ. A canonical
+    file whose type equals the table's skips it
+    (`datafusion/common/src/nested_struct.rs`), and
+    `VariantArray::try_value` can panic on malformed bytes
+    (`parquet-variant-compute/src/variant_array.rs`).
+    - **arrow-rs fork:** `VariantArray::try_value`, `unshred_variant` and
+      `variant_get` return an `ArrowError`, never panic, for malformed
+      metadata, a malformed value, or nesting past a fixed depth limit.
+      Decoding is iterative or depth-checked so no input overflows the
+      stack. Add a constant for the limit if none exists; name it without
+      Wyrd terms. Unit-test each of the three cases on canonical and on
+      shredded arrays.
+    - **DataFusion fork:** in `datafusion/core/tests/parquet/variant.rs`,
+      write a canonical Parquet column and a shredded one, each holding a
+      malformed-metadata, a malformed-value and an over-depth cell. Prove
+      `SELECT v`, `variant_get` and `variant_to_json` each return an error
+      and do not panic, for both layouts.
+    - Push both forks and bump the pins in the root `Cargo.toml`.
+    - **Design doc:** rewrite `architecture/bifrost-design.md` ~173-177.
+      Bifrost enforces size, encoding, numeric range and depth when writing.
+      Reads rely on arrow-rs, which refuses malformed or over-deep stored
+      Variant with an error rather than a panic or unbounded work. The
+      fixed failure order there applies to writes.
 
 ### Group 6: docs and style
 
@@ -436,15 +494,23 @@ distributed queries.**
   - Both tables declare the canonical, unshredded Variant.
 - **Cases:** each `{shape}/{layout}/{case}` is timed two ways:
   - read by plain DataFusion over the same files;
-  - read through Wyrd.
+  - read through Wyrd, on both the hot path and the published path, as the
+    existing `bifrost_reads` groups do.
 
   Each also gets a planning-only timing, as the DataFusion bench does.
-- **Gates,** checked from the report, p50 and p95:
-  - shredded single-key reads are faster than unshredded;
-  - shredded whole-Variant reads (`select_variant`, `select_all`) are at
-    most 2x unshredded;
-  - planning is equal across layouts;
-  - Wyrd is within noise of plain DataFusion on the same files.
+- **Equivalence first:** before any timing, each case's rows (sorted, Variant
+  rendered to JSON) must be equal across both layouts, both engines and both
+  Wyrd paths. A mismatch aborts the bench with the case name.
+- **Sampling:** Criterion with 3 s warm-up and at least 20 samples per case;
+  report p50 and p95 from the samples.
+- **Gates** (any miss fails the task; record it, do not tune the bench):
+  - shredded single-key and two-key reads: p50 at most 0.8x unshredded;
+  - shredded whole-Variant reads (`select_variant`, `select_all`): p50 at
+    most 2.0x unshredded;
+  - planning: p50 within ±10% across layouts;
+  - Wyrd vs plain DataFusion on the same files and case: p50 at most 1.10x.
+- **Baselines:** keep the existing no-Variant and Struct groups and their
+  evidence; the new group adds to them.
 - **Run:** `mise run bench:bifrost:reads`, with the `dist` profile from
   FIND-003-19. Record the table in the plan's Step 5 evidence, replacing
   the mislabeled run.

@@ -1285,7 +1285,7 @@ impl ScribeResources {
             MemoryHolder::Oracle,
             ceiling_bytes,
             &Arc::new(AtomicUsize::new(0)),
-            &Arc::new(AtomicUsize::new(0)),
+            &LiveConsumers::default(),
         );
         OracleExecution::issue(None, memory_pool, ceiling_bytes, target_partitions, 0)
     }
@@ -1897,7 +1897,7 @@ impl ForgeResources {
             MemoryHolder::Forge,
             self.memory_root.limit_bytes(),
             &Arc::new(AtomicUsize::new(0)),
-            &Arc::new(AtomicUsize::new(0)),
+            &LiveConsumers::default(),
         )
     }
 
@@ -2469,7 +2469,7 @@ impl BifrostResourceGovernor {
         let target_partitions = oracle_target_partitions(plan.effective_cpu, request.local_ratio)?;
         let spill_limit_bytes = oracle_query_spill_limit(plan.scratch_limit_bytes);
         let memory_peak_bytes = Arc::new(AtomicUsize::new(0));
-        let memory_consumers = Arc::new(AtomicUsize::new(0));
+        let memory_consumers = LiveConsumers::default();
         let memory_pool = memory_root.query_view(
             MemoryHolder::Oracle,
             granted_memory_bytes,
@@ -3384,14 +3384,14 @@ impl GovernedMemoryRoot {
     /// The view owns only a ceiling, the holder its charges are attributed to,
     /// and its own consumer ledger; it allocates nothing of its own, so two
     /// views can never sum above the pool. It records its peak into
-    /// `peak_bytes` and its registered consumer count into `live_consumers`,
-    /// both shared with the owner that issued it.
+    /// `peak_bytes` and the names of its registered consumers into
+    /// `live_consumers`, both shared with the owner that issued it.
     fn query_view(
         self: &Arc<Self>,
         holder: MemoryHolder,
         ceiling_bytes: usize,
         peak_bytes: &Arc<AtomicUsize>,
-        live_consumers: &Arc<AtomicUsize>,
+        live_consumers: &LiveConsumers,
     ) -> Arc<dyn MemoryPool> {
         Arc::new(GovernedMemoryView {
             root: Arc::clone(self),
@@ -3514,6 +3514,16 @@ impl GovernedMemoryRoot {
     }
 }
 
+/// Names of the consumers registered on one query view, keyed by
+/// `MemoryConsumer::id()`.
+///
+/// Shared between the view, which inserts on `register` and removes on
+/// `unregister`, and the query owner, which reads it to tell a child that is
+/// alive but holds no bytes from one that is gone, and to name the child a
+/// drain timeout is still waiting on. Holding no invariant a panic could break,
+/// it is read through a poisoned lock rather than refused.
+type LiveConsumers = Arc<Mutex<BTreeMap<usize, String>>>;
+
 /// Per-consumer and aggregate bytes one query view currently holds.
 #[derive(Debug, Default)]
 struct GovernedMemoryLedger {
@@ -3575,13 +3585,13 @@ struct GovernedMemoryView {
     ledger: Mutex<GovernedMemoryLedger>,
     /// Query-local observed peak, read by capacity journeys.
     peak_bytes: Arc<AtomicUsize>,
-    /// Consumers currently registered through this view.
+    /// Consumers currently registered through this view, by name.
     ///
     /// `DataFusion` registers an operator's reservation when the operator is
-    /// built, before it holds any byte, and unregisters it on drop. The count
-    /// is what lets a query owner tell a zero-byte child that may still grow
-    /// from a child that is gone.
-    live_consumers: Arc<AtomicUsize>,
+    /// built, before it holds any byte, and unregisters it on drop. The entries
+    /// are what let a query owner tell a zero-byte child that may still grow
+    /// from a child that is gone, and name a child that outlived its drain.
+    live_consumers: LiveConsumers,
 }
 
 impl GovernedMemoryView {
@@ -3614,24 +3624,23 @@ impl MemoryPool for GovernedMemoryView {
         "oracle_shared_root"
     }
 
-    /// Registers this query's consumer with the shared root and counts it live.
+    /// Registers this query's consumer with the shared root and records it live.
     fn register(&self, consumer: &MemoryConsumer) {
         self.root.pool.register(consumer);
         self.live_consumers
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(consumer.id(), consumer.name().to_owned());
     }
 
-    /// Forwards removal and stops counting the consumer; sibling consumers
+    /// Forwards removal and stops recording the consumer; sibling consumers
     /// may still hold bytes.
     fn unregister(&self, consumer: &MemoryConsumer) {
         self.root.pool.unregister(consumer);
-        // `DataFusion` unregisters only what it registered, so the count
-        // cannot underflow; saturating keeps a foreign caller from wrapping it.
-        let _ = self.live_consumers.fetch_update(
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-            |live| Some(live.saturating_sub(1)),
-        );
+        self.live_consumers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&consumer.id());
         if let Ok(mut ledger) = self.lock_ledger()
             && ledger
                 .consumers
@@ -3752,12 +3761,13 @@ pub struct OracleQueryResources {
     /// was admitted under. Only the observing pool wrapper writes it, so it
     /// stays zero on a build without `test-support`.
     memory_peak_bytes: Arc<AtomicUsize>,
-    /// Consumers currently registered on this query's memory view.
+    /// Consumers currently registered on this query's memory view, by name.
     ///
-    /// Shared with the view, which counts each `DataFusion` registration
+    /// Shared with the view, which records each `DataFusion` registration
     /// until it drops, so [`OracleQueryResources::nested_idle`] can see a
-    /// child that is alive but holds no bytes yet.
-    memory_consumers: Arc<AtomicUsize>,
+    /// child that is alive but holds no bytes yet, and a drain timeout can
+    /// name it.
+    memory_consumers: LiveConsumers,
     governor: BifrostResourceGovernor,
     released: bool,
     /// Leader-local admission charge returned with this owner's slots.
@@ -3817,8 +3827,27 @@ impl OracleQueryResources {
         self.nested_memory_bytes() == 0
             && self
                 .memory_consumers
-                .load(std::sync::atomic::Ordering::Acquire)
-                == 0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+    }
+
+    /// Names every nested memory child still registered on this query's pool.
+    ///
+    /// The byte count says that a drain is stuck; this says on what. Names are
+    /// the `MemoryConsumer` names `DataFusion` and the distributed executor
+    /// register, sorted so a report is stable across runs.
+    #[must_use]
+    pub fn nested_memory_consumers(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .memory_consumers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        names.sort_unstable();
+        names
     }
 
     /// Returns the query-pool memory a child still holds, in bytes.
@@ -5738,11 +5767,13 @@ mod tests {
     /// can hold zero bytes, then grow on its in-flight poll. A drain that
     /// treats zero bytes as idle releases the query owner in that window and
     /// poisons the process governor. The query is idle only once the
-    /// registration itself drops.
+    /// registration itself drops, and until then the child is named, so a
+    /// drain timeout can report what it is waiting on.
     ///
     /// # Panics
-    /// Panics when the plan, role composition, or query grant fails, or when
-    /// idleness ignores a live zero-byte registration.
+    /// Panics when the plan, role composition, or query grant fails, when
+    /// idleness ignores a live zero-byte registration, or when the live child
+    /// is not named exactly while registered.
     #[test]
     fn a_registered_zero_byte_child_keeps_its_query_busy() {
         let roles = BifrostRuntimeResources::from_snapshot(
@@ -5765,6 +5796,7 @@ mod tests {
             !query.nested_idle(),
             "a registered zero-byte child is still alive"
         );
+        assert_eq!(query.nested_memory_consumers(), ["registered-sorter"]);
         child.try_grow(1).expect("the child grows within its grant");
         child.shrink(1);
         assert!(
@@ -5774,6 +5806,7 @@ mod tests {
 
         drop(child);
         assert!(query.nested_idle(), "the child is gone once it unregisters");
+        assert!(query.nested_memory_consumers().is_empty());
         drop(query);
         assert!(!roles.snapshot().expect("snapshot").oracle_query_active);
     }

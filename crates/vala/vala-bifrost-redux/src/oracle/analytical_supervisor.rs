@@ -537,6 +537,22 @@ impl AnalyticalSupervisor {
             .map_or(0, |entry| entry.state().resources.nested_memory_bytes()))
     }
 
+    /// Names the nested children one registered graph's envelope still holds.
+    ///
+    /// Paired with [`Self::graph_children_debt`] in a drain timeout, so the
+    /// warning says what stayed and not only how much. An unregistered graph
+    /// holds nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub fn graph_children(&self, graph: AnalyticalGraphKey) -> Result<Vec<String>, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        Ok(graphs.get(&graph).map_or_else(Vec::new, |entry| {
+            entry.state().resources.nested_memory_consumers()
+        }))
+    }
+
     /// Returns the number of registered graphs, for terminal-cleanup evidence.
     ///
     /// # Errors

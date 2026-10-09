@@ -1162,10 +1162,12 @@ impl GraphLease {
             tokio::time::sleep(GRAPH_DRAIN_INTERVAL).await;
         }
         let memory_bytes = self.supervisor.graph_children_debt(self.graph)?;
+        let consumers = self.supervisor.graph_children(self.graph)?;
         tracing::warn!(
             public_query_id = %self.graph.public_query_id,
             datafusion_query_id = %self.graph.datafusion_query_id,
             memory_bytes,
+            ?consumers,
             "Oracle analytical graph did not drain before its follower release"
         );
         Err(BifrostError::Internal {
@@ -2867,10 +2869,12 @@ impl AnalyticalGraphRelease {
             tokio::time::sleep_until(self.deadline.min(now + GRAPH_DRAIN_INTERVAL)).await;
         }
         let memory_bytes = self.supervisor.graph_children_debt(self.graph)?;
+        let consumers = self.supervisor.graph_children(self.graph)?;
         tracing::warn!(
             public_query_id = %self.graph.public_query_id,
             datafusion_query_id = %self.graph.datafusion_query_id,
             memory_bytes,
+            ?consumers,
             "Oracle analytical leader graph was not confirmed drained within its deadline"
         );
         Err(BifrostError::Internal {

@@ -712,9 +712,29 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
         }
     }
 
+    // Abrupt termination leaves the victim's membership row live until its
+    // heartbeat ages past the liveness cutoff, and the audit count below is
+    // itself an Analytical read that would plan a stage on it until then.
+    let leader = cluster.server(0).ok_or("missing leader node")?;
+    let membership = leader
+        .state()
+        .oracle_cluster()
+        .ok_or("the leader composed no Oracle membership")?;
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(200));
+        loop {
+            poll.tick().await;
+            membership.refresh_snapshot().await?;
+            if membership.snapshot().live_oracle(victim).is_none() {
+                return Ok::<_, ServerJourneyError>(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| "the terminated follower never left the leader's membership")??;
+
     // One accepted logical read, exactly as the successful phase proves: a
     // failed execution neither skips its audited decision nor writes a second.
-    let leader = cluster.server(0).ok_or("missing leader node")?;
     if audit_rows(leader, tenant, "bifrost.query.read_decision").await? != reads_before + 1 {
         return Err("the failed scheduled query did not relay exactly one logical read".into());
     }
@@ -723,6 +743,71 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
     }
 
     await_clean_analytical(&cluster).await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// An Oracle-only pod drained soon after boot still retains its audit decisions.
+///
+/// The first Oracle of a role-separated cluster boots before the Scribe-only
+/// pod registers, so its boot-time membership names no Scribe. Its read
+/// decision is staged on the process Scribe outbox, which routes over the peer
+/// plane from that membership; the pod is then drained gracefully. Membership
+/// must keep refreshing through the drain, so the outbox finds the Scribe and
+/// the decision lands in retained history, read back through the other Oracle.
+///
+/// # Errors
+/// Returns cluster setup, catalog, query, shutdown, or retained-history errors,
+/// including the timeout naming the observed count when the decision was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn oracle_only_pod_retains_audit_staged_before_its_drain() -> Result<(), ServerJourneyError> {
+    let mut cluster = wyrd_testing::bifrost::WyrdTestCluster::start_spec(
+        wyrd_testing::bifrost::BifrostClusterSpec::role_separated(),
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let oracles = cluster
+        .servers()
+        .filter(|server| server.bifrost_scribe().is_none())
+        .map(WyrdTestServer::node_id)
+        .collect::<Vec<_>>();
+    let [drained, reader] = oracles[..] else {
+        return Err("the role-separated cluster runs two Oracle-only pods".into());
+    };
+    let table = format!("drained_audit_{}", uuid::Uuid::now_v7().simple());
+    let oracle = cluster
+        .server_by_node(drained)
+        .ok_or("missing the drained Oracle")?;
+    oracle
+        .state()
+        .bifrost_catalog()
+        .ok_or("missing catalog")?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table),
+            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            tenant,
+            physical_layout: None,
+        })
+        .await?;
+    let mut stream = oracle
+        .state()
+        .bifrost
+        .query_sql(
+            scheduled_context(tenant)?,
+            request(&format!("SELECT value FROM vala.bifrost.{table}")),
+        )
+        .await?;
+    while let Some(frame) = stream.frames.next().await {
+        frame?;
+    }
+    cluster.stop_node(drained).await?;
+
+    cluster
+        .server_by_node(reader)
+        .ok_or("missing the reading Oracle")?
+        .await_retained_audit_count(tenant, "operation = 'bifrost.query.read_decision'", 1)
+        .await?;
     cluster.shutdown().await?;
     Ok(())
 }

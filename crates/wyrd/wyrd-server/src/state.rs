@@ -419,8 +419,14 @@ pub struct Scribe {
     fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Durable security audit for rejected Scribe fragment authority.
     fragment_security_audit: Arc<dyn PeerSecurityAudit>,
-    /// Cancels the recurring heartbeat and snapshot tasks before role removal.
+    /// Process shutdown signal; cancelled when the supervised drain begins.
     role_shutdown: CancellationToken,
+    /// Role-owned signal ending the heartbeat and snapshot poller.
+    ///
+    /// Unlike `role_shutdown`, it is cancelled only when this role itself
+    /// shuts down, after the process drain, so membership stays current and
+    /// this role stays advertised while peers and the Scribe outbox drain.
+    membership: CancellationToken,
     /// Retains the heartbeat task so teardown can prove it stopped before unregister.
     heartbeat: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Synchronously aborts the heartbeat without acquiring its async owner lock.
@@ -458,8 +464,14 @@ pub struct Oracle {
     lifecycle: RoleLifecycle,
     /// Shared tenant-qualified catalog retained by the selected data subsystem.
     catalog: Arc<BifrostCatalog>,
-    /// Cancels the Oracle heartbeat and membership snapshot tasks.
+    /// Process shutdown signal; cancelled when the supervised drain begins.
     role_shutdown: CancellationToken,
+    /// Role-owned signal ending the heartbeat and membership snapshot poller.
+    ///
+    /// Unlike `role_shutdown`, it is cancelled only when this role itself
+    /// shuts down, after the process drain, so the Scribe outbox, forwarding,
+    /// and query planning read current membership while the process drains.
+    membership: CancellationToken,
     /// Retains the heartbeat task until ordered shutdown stops it.
     heartbeat: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Synchronously aborts the heartbeat without acquiring its async owner lock.
@@ -497,6 +509,7 @@ impl Oracle {
     pub(crate) fn abort_shutdown(&self) {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
+        self.membership.cancel();
         self.heartbeat_abort.abort();
         self.snapshot_poller_abort.abort();
         self.engine.begin_shutdown();
@@ -526,12 +539,13 @@ impl Oracle {
         } = inputs;
         let advertise_ready = Arc::new(AtomicBool::new(activated));
         let lifecycle = RoleLifecycle::serving();
+        let membership = CancellationToken::new();
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
             Arc::clone(&advertise_ready),
-            role_shutdown.clone(),
+            membership.clone(),
         );
-        let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(role_shutdown.clone());
+        let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(membership.clone());
         let heartbeat_abort = heartbeat.abort_handle();
         let snapshot_poller_abort = snapshot_poller.abort_handle();
         let running_queries = Arc::clone(engine.running_queries());
@@ -553,6 +567,7 @@ impl Oracle {
             registered_role,
             cluster,
             role_shutdown,
+            membership,
             heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
             heartbeat_abort,
             snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
@@ -706,6 +721,7 @@ impl Oracle {
     ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
+        self.membership.cancel();
         let report = self.engine.shutdown(deadline).await;
         await_role_task(&self.heartbeat, deadline, "oracle heartbeat").await?;
         await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await?;
@@ -822,6 +838,7 @@ impl Scribe {
     pub(crate) fn abort_shutdown(&self) {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
+        self.membership.cancel();
         self.heartbeat_abort.abort();
         self.snapshot_poller_abort.abort();
         self.wal_fault_monitor_abort.abort();
@@ -861,12 +878,13 @@ impl Scribe {
         let advertise_ready = Arc::new(AtomicBool::new(
             activated && !ingest.wal_fault().is_cancelled(),
         ));
+        let membership = CancellationToken::new();
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
             Arc::clone(&advertise_ready),
-            role_shutdown.clone(),
+            membership.clone(),
         );
-        let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(role_shutdown.clone());
+        let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(membership.clone());
         let heartbeat_abort = heartbeat.abort_handle();
         let snapshot_poller_abort = snapshot_poller.abort_handle();
         let lifecycle = RoleLifecycle::serving();
@@ -896,6 +914,7 @@ impl Scribe {
             fragment_verifier,
             fragment_security_audit,
             role_shutdown,
+            membership,
             heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
             heartbeat_abort,
             snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
@@ -1065,6 +1084,7 @@ impl Scribe {
     ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
+        self.membership.cancel();
         if !self.ingest.shutdown(deadline).await {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {
                 detail: "Scribe shutdown did not flush every retained owner".to_owned(),

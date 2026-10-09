@@ -346,8 +346,8 @@ pub fn reset_active_cut_acquisitions_for_test() -> usize {
     TEST_ACTIVE_CUT_ACQUISITIONS.swap(0, std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Makes the next `count` acquired metadata reads report object-store
-/// `NotFound`.
+/// Makes the next `count` acquired metadata reads fail the way a removed
+/// document does: by reading a location that does not exist.
 ///
 /// Stands in for a catalog move whose superseded document was deleted between
 /// acquisition and the metadata read, which a test cannot place at that exact
@@ -481,6 +481,8 @@ impl BifrostCatalog {
         }
         let table_uid = TableUid::from_bytes(acquired.identity.table_uid);
         let identifier = binding.table_ident();
+        // A fault reads a document that does not exist, through the same
+        // `FileIO`, so the reacquisition sees the production error shape.
         #[cfg(any(test, feature = "test-support"))]
         if TEST_METADATA_NOT_FOUND_FAULTS
             .fetch_update(
@@ -490,15 +492,8 @@ impl BifrostCatalog {
             )
             .is_ok()
         {
-            return Err(BifrostCatalogError::Iceberg(
-                IcebergError::new(
-                    iceberg::ErrorKind::DataInvalid,
-                    "injected missing metadata document",
-                )
-                .with_source(crate::storage::BifrostStorageError::NotFound {
-                    detail: "injected missing metadata document".to_owned(),
-                }),
-            ));
+            let missing = format!("{}.removed", acquired.metadata_location);
+            TableMetadata::read_from(&self.file_io, &missing).await?;
         }
         let metadata =
             Arc::new(TableMetadata::read_from(&self.file_io, &acquired.metadata_location).await?);

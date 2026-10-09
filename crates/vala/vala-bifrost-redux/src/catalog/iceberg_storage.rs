@@ -487,6 +487,26 @@ mod tests {
         )
     }
 
+    /// Reading a missing object fails with the error a removed metadata
+    /// document produces, and the catalog error recognizes it as missing, so
+    /// Oracle's one reacquisition fires on it.
+    ///
+    /// # Panics
+    /// Panics when the read succeeds, the error is not recognized as a
+    /// missing object, or an outage is.
+    #[tokio::test]
+    async fn missing_object_reads_are_recognized_as_missing() {
+        let root = tempfile::tempdir().expect("warehouse root");
+        let (storage, warehouse) = adapter(root.path());
+        let missing = storage
+            .read(&format!("{warehouse}/metadata/removed.metadata.json"))
+            .await
+            .expect_err("the object does not exist");
+        assert!(crate::catalog::BifrostCatalogError::Iceberg(missing).is_missing_object());
+        let outage = IcebergError::new(IcebergErrorKind::Unexpected, "backend unavailable");
+        assert!(!crate::catalog::BifrostCatalogError::Iceberg(outage).is_missing_object());
+    }
+
     /// A streamed write becomes one object, listing reports it under its
     /// absolute location (and its directory when not recursive), and a prefix
     /// delete removes everything beneath it.

@@ -22,12 +22,41 @@ pub const ORACLE_PHYSICAL_CODEC_VERSION: u32 = 1;
 /// Only extension type accepted by the Oracle follower.
 pub const ORACLE_REMOTE_SCAN_TAG: &str = "wyrd.oracle.remote_scan";
 
+/// The pinned `DataFusion` fork revision every Oracle peer must be built from.
+///
+/// Physical plans and stage bodies are `DataFusion`'s own protobuf encodings,
+/// whose meaning changes with the engine build. Both peer digests commit to
+/// this revision, so a worker built from another revision refuses the plan at
+/// preflight instead of decoding it differently. It must equal the
+/// `datafusion` revision in the workspace `[patch.crates-io]`.
+pub const ORACLE_DATAFUSION_REVISION: &str = "a4ff145509b00df9eaaf79b29984cf68387ea65d";
+
+/// Commits `revision`, length-prefixed, to a peer digest.
+///
+/// The one place both peer digests ([`physical_plan_fingerprint`] and
+/// [`super::peer::stage_body_digest`]) bind the engine build they were
+/// produced by.
+pub(super) fn bind_datafusion_revision(digest: &mut Sha256, revision: &str) {
+    digest.update((revision.len() as u64).to_be_bytes());
+    digest.update(revision.as_bytes());
+}
+
 /// Fingerprints the exact versioned physical-plan bytes shared by all followers.
 #[must_use]
 pub fn physical_plan_fingerprint(bytes: &[u8]) -> String {
+    physical_plan_fingerprint_at(ORACLE_DATAFUSION_REVISION, bytes)
+}
+
+/// Fingerprints physical-plan bytes as a peer built from the `DataFusion`
+/// `revision` would.
+///
+/// [`physical_plan_fingerprint`] is this at [`ORACLE_DATAFUSION_REVISION`];
+/// tests use another revision to prove a mismatched build is refused.
+pub(super) fn physical_plan_fingerprint_at(revision: &str, bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(b"wyrd.oracle.physical-plan.v1\0");
     digest.update(ORACLE_PHYSICAL_CODEC_VERSION.to_be_bytes());
+    bind_datafusion_revision(&mut digest, revision);
     digest.update(bytes);
     format!("sha256:{:x}", digest.finalize())
 }
@@ -378,6 +407,29 @@ mod tests {
         physical_plan_node::PhysicalPlanType,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The plan fingerprint commits to the `DataFusion` revision, and that
+    /// revision is the one the workspace pins.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another revision fingerprints the same bytes identically,
+    /// or the constant drifts from the root manifest's `datafusion` pin.
+    #[test]
+    fn plan_fingerprint_binds_the_pinned_datafusion_revision() {
+        assert_ne!(
+            physical_plan_fingerprint(b"plan"),
+            physical_plan_fingerprint_at("another-revision", b"plan")
+        );
+        let manifest = include_str!("../../../../../Cargo.toml");
+        let pin = format!(
+            "datafusion = {{ git = \"https://github.com/bohmian-ai/datafusion\", rev = \"{ORACLE_DATAFUSION_REVISION}\" }}"
+        );
+        assert!(
+            manifest.lines().any(|line| line == pin),
+            "ORACLE_DATAFUSION_REVISION must equal the root Cargo.toml datafusion rev"
+        );
+    }
 
     /// Provider wrapper whose destruction proves failed decode releases acquired state.
     #[derive(Debug)]

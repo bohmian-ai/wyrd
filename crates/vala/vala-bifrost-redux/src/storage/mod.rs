@@ -369,9 +369,5 @@ mod tests {
             .await
             .expect_err("absent");
         assert!(error_chain_contains_not_found(&missing));
-        assert!(matches!(
-            BifrostStorageError::from_object_store(&missing),
-            BifrostStorageError::NotFound { .. }
-        ));
     }
 }

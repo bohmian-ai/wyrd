@@ -1509,7 +1509,8 @@ pub(crate) mod tests {
     /// Builds every request mutation a follower decode must refuse.
     ///
     /// The cases cover each independent authority the decode checks: a physical
-    /// plan whose join loses a child, a reservation the leader never issued, an
+    /// plan whose join loses a child, a plan fingerprinted by a peer built from
+    /// another `DataFusion` revision, a reservation the leader never issued, an
     /// assignment whose namespace, table, or tenant does not match the
     /// authenticated binding, a fence naming the wrong role or a stale token, an
     /// missing Scribe provider cut, an unknown scan id, a wrong schema
@@ -1536,6 +1537,12 @@ pub(crate) mod tests {
         }
         .encode_to_vec();
         case.plan_fingerprint = physical_plan_fingerprint(&case.physical_plan_bytes);
+        malformed.push(case);
+        let mut case = request.clone();
+        case.plan_fingerprint = super::super::codec::physical_plan_fingerprint_at(
+            "another-revision",
+            &case.physical_plan_bytes,
+        );
         malformed.push(case);
         let mut case = request.clone();
         case.reservation_id = ReservationId::new(uuid::Uuid::now_v7());

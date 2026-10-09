@@ -310,11 +310,27 @@ pub const MAX_STAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Returns [`PeerSecurityError::Body`] when the body is empty or exceeds
 /// [`MAX_STAGE_BODY_BYTES`], before any hashing occurs.
 pub fn stage_body_digest(body: &[u8]) -> Result<String, PeerSecurityError> {
+    stage_body_digest_at(super::codec::ORACLE_DATAFUSION_REVISION, body)
+}
+
+/// Computes a stage body digest as a peer built from the `DataFusion`
+/// `revision` would.
+///
+/// [`stage_body_digest`] is this at
+/// [`super::codec::ORACLE_DATAFUSION_REVISION`]; tests use another revision
+/// to prove a mismatched build is refused.
+///
+/// # Errors
+///
+/// Returns [`PeerSecurityError::Body`] when the body is empty or exceeds
+/// [`MAX_STAGE_BODY_BYTES`], before any hashing occurs.
+fn stage_body_digest_at(revision: &str, body: &[u8]) -> Result<String, PeerSecurityError> {
     if body.is_empty() || body.len() > MAX_STAGE_BODY_BYTES {
         return Err(PeerSecurityError::Body);
     }
     let mut hash = Sha256::new();
     hash.update(b"wyrd.oracle.stage.body.v1\0");
+    super::codec::bind_datafusion_revision(&mut hash, revision);
     hash.update((body.len() as u64).to_be_bytes());
     hash.update(body);
     Ok(hex::encode(hash.finalize()))
@@ -1050,6 +1066,20 @@ mod tests {
         assert_eq!(
             claims.to_context(StageOperationV1::ExecuteTask),
             Err(PeerSecurityError::Operation)
+        );
+    }
+
+    /// A stage body digest commits to the `DataFusion` revision: the same body
+    /// digests differently under another engine build.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the two revisions produce the same digest.
+    #[test]
+    fn stage_body_digest_binds_the_datafusion_revision() {
+        assert_ne!(
+            stage_body_digest(b"plan").expect("a bounded body digests"),
+            stage_body_digest_at("another-revision", b"plan").expect("a bounded body digests")
         );
     }
 

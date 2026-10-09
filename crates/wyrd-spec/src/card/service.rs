@@ -68,7 +68,8 @@ pub struct ServiceSpec {
 pub struct ServiceTable {
     /// Dataset table name inside `vala.datasets`.
     pub name: String,
-    /// JSON Schema object describing the table's user fields.
+    /// JSON Schema object describing the table's user fields, whose
+    /// `properties` order is the table's column order.
     pub schema: serde_json::Value,
 }
 

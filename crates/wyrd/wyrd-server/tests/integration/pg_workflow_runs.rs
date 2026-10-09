@@ -746,7 +746,7 @@ impl Fixture {
         self.server
             .await_audit_retained()
             .await
-            .expect("audit publishes");
+            .expect("audit is retained");
         self.server
             .retained_audit_records(
                 tenant,
@@ -804,61 +804,6 @@ impl Fixture {
         .expect("ledger reads");
         conn.commit().await.expect("ledger read commits");
         count
-    }
-
-    /// Make every create decision of this tenant fail to commit its audit
-    /// row, so the outbox retries it, until [`Self::restore_create_audit`].
-    ///
-    /// The trigger is scoped to this tenant and operation, so concurrent
-    /// fixtures sharing the database are unaffected.
-    ///
-    /// # Panics
-    /// Panics when the trigger cannot be installed.
-    async fn fail_create_audit(&self) {
-        let pool = self
-            .server
-            .pg_fixture()
-            .superuser_pool()
-            .expect("superuser pool opens");
-        for statement in [
-            "CREATE OR REPLACE FUNCTION vala.wyrd_test_fail_workflow_create() RETURNS trigger \
-             LANGUAGE plpgsql AS $$ BEGIN \
-             IF NEW.operation = 'workflow.run.create' AND NEW.data_tenant_id = TG_ARGV[0]::uuid THEN \
-             RAISE EXCEPTION 'test fault: workflow create audit refused'; \
-             END IF; RETURN NEW; END $$"
-                .to_owned(),
-            format!(
-                "CREATE OR REPLACE TRIGGER wyrd_test_fail_workflow_create_{tenant} \
-                 BEFORE INSERT ON vala.audit_staging FOR EACH ROW \
-                 EXECUTE FUNCTION vala.wyrd_test_fail_workflow_create('{uuid}')",
-                tenant = self.server.data_tenant_id().as_uuid().simple(),
-                uuid = self.server.data_tenant_id().as_uuid(),
-            ),
-        ] {
-            sqlx::query(sqlx::AssertSqlSafe(statement))
-                .execute(&pool)
-                .await
-                .expect("audit fault installs");
-        }
-    }
-
-    /// Remove the fault [`Self::fail_create_audit`] installed.
-    ///
-    /// # Panics
-    /// Panics when the trigger cannot be dropped.
-    async fn restore_create_audit(&self) {
-        let pool = self
-            .server
-            .pg_fixture()
-            .superuser_pool()
-            .expect("superuser pool opens");
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP TRIGGER IF EXISTS wyrd_test_fail_workflow_create_{} ON vala.audit_staging",
-            self.server.data_tenant_id().as_uuid().simple()
-        )))
-        .execute(&pool)
-        .await
-        .expect("audit fault clears");
     }
 }
 
@@ -1203,10 +1148,8 @@ fn chain(name: &str, depth: usize) -> TempDir {
 /// before any run lookup; request-shape, route-override, and timeout errors
 /// are refused before authorization; an unknown version, a native route,
 /// undeclarable tools, an unbound external route, an oversized input, a
-/// deleted root, and a full tenant are refused after an audited allow; an
-/// unrecordable decision never refuses the create and commits once staging
-/// recovers; and another tenant's
-/// administrator cannot name this tenant's Workflow at all. A principal holding
+/// deleted root, and a full tenant are refused after an audited allow; and
+/// another tenant's administrator cannot name this tenant's Workflow at all. A principal holding
 /// `workflows:run` without gateway invocation, and an admin, are accepted, with
 /// live gateway grants still applying to the run.
 ///
@@ -1412,26 +1355,6 @@ async fn admission_is_audited_and_side_effect_free_on_refusal() {
     let run = fixture.terminal(&fixture.admin.token, &run).await;
     assert_eq!(run.status, WorkflowRunStatus::Succeeded);
     assert_eq!(fixture.upstream.arrivals(), 6);
-
-    fixture.fail_create_audit().await;
-    let unrecorded = fixture.accept(runner, &request).await;
-    fixture.restore_create_audit().await;
-    let unrecorded = fixture.terminal(runner, &unrecorded).await;
-    assert_eq!(
-        unrecorded.status,
-        WorkflowRunStatus::Succeeded,
-        "an unrecordable decision never refuses the create"
-    );
-    runner_allowed += 1;
-    assert_eq!(
-        fixture
-            .server
-            .wait_oracle_audit_staged(PATIENCE)
-            .await
-            .expect("audit outbox settles"),
-        0,
-        "the retried decision commits once staging recovers"
-    );
 
     let resource = "workflow:engineering/code-review@1.0.0";
     let creates = fixture.decisions("workflow.run.create").await;

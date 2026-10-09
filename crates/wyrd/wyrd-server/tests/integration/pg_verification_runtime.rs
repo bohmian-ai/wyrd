@@ -8,8 +8,8 @@
 //! places the row itself in the past through the fixture. Results are staged
 //! on a Scribe outbox writing to the server's own Scribe, wrapped in a
 //! [`PublicationFault`] that records every submitted batch; run state is
-//! read back from `wyrd.verifier_runs` and audit from `vala.audit_staging`,
-//! whose publisher is disabled so staged rows stay observable.
+//! read back from `wyrd.verifier_runs` and audit from the tenant's retained
+//! `vala.system.audit_log` history.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -40,7 +40,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::DriftMethod;
 use wyrd_spec::card::verifier::DriftBaselineState;
 use wyrd_spec::ids::{BindingId, CardUid, FeatureName, VerificationRunId};
-use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationError};
+use wyrd_spec::verification::{DriftWindow, VerificationError};
 use wyrd_sql::queries::drift_baselines::DriftBaselineQueue;
 use wyrd_sql::queries::storage::artifact_metadata::{self, NewArtifactMetadata};
 use wyrd_sql::queries::verifier_runs::{ObservationRecord, TerminalStatus};
@@ -70,12 +70,12 @@ struct Harness {
     subject: CardUid,
     /// Active Custom Drift Verifier Card the runs execute.
     verifier: CardUid,
-    /// Superuser pool for audit staging assertions.
+    /// Superuser pool for run-state assertions and fault injection.
     assertion: PgPool,
     /// Faults and the submitted-batch record every runtime writes through.
     fault: PublicationFault,
-    /// Highest staged audit sequence before the test acted.
-    audit_floor: i64,
+    /// Number of retained audit decisions before the test acted.
+    audit_floor: usize,
 }
 
 impl Harness {
@@ -104,7 +104,7 @@ impl Harness {
             fault: PublicationFault::default(),
             audit_floor: 0,
         };
-        harness.audit_floor = harness.max_audit_seq().await;
+        harness.audit_floor = harness.retained_audit_operations().await.len();
         harness
     }
 
@@ -210,24 +210,15 @@ impl Harness {
             .collect()
     }
 
-    /// Every staged audit operation for the tenant since the floor.
+    /// Every retained audit operation for the tenant since the floor, in
+    /// decision order.
     ///
     /// # Panics
-    /// Panics when the staging read fails.
+    /// Panics when the retained audit read fails.
     async fn audit_operations(&self) -> Vec<String> {
-        self.server
-            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        self.retained_audit_operations()
             .await
-            .expect("audit outbox settles");
-        sqlx::query_scalar(
-            "SELECT operation FROM vala.audit_staging \
-             WHERE data_tenant_id = $1 AND seq > $2 ORDER BY seq",
-        )
-        .bind(self.seed.tenant().as_uuid())
-        .bind(self.audit_floor)
-        .fetch_all(&self.assertion)
-        .await
-        .expect("staged audit operations")
+            .split_off(self.audit_floor)
     }
 
     /// Flush the server's Scribe and count the tenant's durable rows per
@@ -394,54 +385,24 @@ impl Harness {
         .expect("run lease reads")
     }
 
-    /// Operator dispatches durably created for `run`.
+    /// Every retained audit operation of the tenant in decision order, once
+    /// the Scribe outbox has settled.
     ///
     /// # Panics
-    /// Panics when the dispatch table cannot be read.
-    async fn dispatches(&self, run: VerificationRunId) -> i64 {
-        sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.operator_dispatches WHERE run_id = $1")
-            .bind(run.as_uuid())
-            .fetch_one(&self.assertion)
-            .await
-            .expect("dispatches read")
-    }
-
-    /// Poll until the tenant has exactly one run and return it.
-    ///
-    /// # Panics
-    /// Panics when no run exists within [`WAIT`] or more than one does.
-    async fn wait_single_run(&self) -> VerificationRunId {
-        let deadline = tokio::time::Instant::now() + WAIT;
-        loop {
-            let runs = self.seed.runs().await.expect("runs read");
-            assert!(runs.len() <= 1, "one occurrence yields one run: {runs:?}");
-            if let Some(run) = runs.first() {
-                return *run;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the occurrence was never scheduled"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    /// Highest staged audit sequence of the tenant.
-    ///
-    /// # Panics
-    /// Panics when the staging read fails.
-    async fn max_audit_seq(&self) -> i64 {
+    /// Panics when the outbox does not settle or the retained read fails.
+    async fn retained_audit_operations(&self) -> Vec<String> {
         self.server
-            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await_audit_retained()
             .await
-            .expect("audit outbox settles");
-        sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging WHERE data_tenant_id = $1",
-        )
-        .bind(self.seed.tenant().as_uuid())
-        .fetch_one(&self.assertion)
-        .await
-        .expect("audit floor reads")
+            .expect("audit is retained");
+        self.server
+            .retained_audit_records(self.seed.tenant(), "operation", "true")
+            .await
+            .expect("retained audit operations")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect()
     }
 }
 
@@ -953,13 +914,14 @@ async fn unscorable_verifier_errors_without_publishing() {
 }
 
 /// A result batch Scribe durably accepted but whose acknowledgement was lost
-/// is resent by the outbox as the identical batch — same table, batch ID, and
-/// Arrow bytes — and Scribe acknowledges the replay without a second row. The
-/// run completes on its first attempt once its result is staged.
+/// makes the outbox resend the identical slice: the detail and summary frames
+/// are resubmitted with the same table, batch ID, and Arrow bytes, and Scribe
+/// acknowledges each replay without a second row. The run completes on its
+/// first attempt once its result is staged.
 ///
 /// # Panics
-/// Panics when the run retries or fails, the replay differs from the original
-/// batch, or Scribe keeps a duplicate summary row.
+/// Panics when the run retries or fails, a replay differs from its original
+/// batch, or Scribe keeps a duplicate summary or detail row.
 #[tokio::test]
 async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplicates() {
     let harness = Harness::start().await;
@@ -988,12 +950,22 @@ async fn lost_result_ack_replays_the_identical_sealed_batch_and_scribe_deduplica
         "the replay carries the identical table, batch ID, and sealed bytes"
     );
     let details = sent_to(fault, FEATURES).await;
-    assert_eq!(details.len(), 1);
+    assert_eq!(
+        details.len(),
+        2,
+        "the retried slice resends its acknowledged detail frame"
+    );
+    assert_eq!(details[0], details[1], "the detail replay is identical");
     assert_ne!(details[0].batch_id, summaries[0].batch_id);
     assert_eq!(
         harness.writes().await,
-        vec![FEATURES.to_owned(), RESULTS.to_owned(), RESULTS.to_owned()],
-        "each submission, replay included, is recorded"
+        vec![
+            FEATURES.to_owned(),
+            RESULTS.to_owned(),
+            FEATURES.to_owned(),
+            RESULTS.to_owned()
+        ],
+        "each submission, replay included, is recorded in slice order"
     );
     runtime.stop().await;
     let rows = harness.durable_rows().await;

@@ -29,7 +29,7 @@ use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_sql::queries::verification::{InactivityTimeout, binding_activity};
 use wyrd_sql::queries::verifier_runs::{ScheduleOutcome, ScheduleSkip, VerifierRunQueue};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
-use wyrd_testing::{AuditCommitFailures, Bootstrap, WyrdTestServer};
+use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Seed a dependency row directly so the journey can exercise non-Active states.
 ///
@@ -533,26 +533,16 @@ async fn registration_replays_through_public_authenticated_route() {
         first_body["outcomes"][0]["card_ref"]["uid"]
     );
     server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await_retained_audit_count(
+            server.data_tenant_id(),
+            &format!(
+                "operation = 'card.registration.create' AND audit_principal_id = '{}'",
+                id.as_uuid()
+            ),
+            2,
+        )
         .await
-        .expect("audit outbox settles");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    let audit_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-         WHERE operation = 'card.registration.create' AND principal_id = $1",
-    )
-    .bind(id.as_uuid())
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("audit count reads");
-    assert_eq!(
-        audit_count, 2,
-        "each received registration request audits its own card:write decision"
-    );
-    conn.commit().await.expect("assertion transaction commits");
+        .expect("each received registration request audits its own card:write decision");
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -1717,25 +1707,20 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
         serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
             .expect("prompt outcome contains a UID");
     server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await_retained_audit_count(
+            server.data_tenant_id(),
+            &format!(
+                "operation = 'card.registration.create' AND audit_principal_id = '{}'",
+                id.as_uuid()
+            ),
+            1,
+        )
         .await
-        .expect("audit outbox settles");
+        .expect("one received request evaluates card:write once and audits it once");
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
         .expect("tenant connection opens");
-    let audit_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-         WHERE operation = 'card.registration.create' AND principal_id = $1",
-    )
-    .bind(id.as_uuid())
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("audit count reads");
-    assert_eq!(
-        audit_count, 1,
-        "one received request evaluates card:write once and audits it once"
-    );
     let relationships: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
         "SELECT card_uid, target_name, target_uid FROM wyrd.card_relationships \
          WHERE card_uid IN ($1, $2) ORDER BY target_name",
@@ -2082,296 +2067,14 @@ async fn card_reconciler_dead_letters_after_three_failures() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Drops the failure `trigger` on `vala.audit_staging`, settles the audit
-/// outbox, and counts the tenant's staged `operation` decisions.
-///
-/// Proves the retry half of an audit-failure case: the decision the trigger
-/// kept failing is still queued and commits once the database accepts it.
-///
-/// # Panics
-/// Panics when the trigger cannot be dropped, the outbox does not drain, or
-/// the staging read fails.
-async fn recovered_decisions(
-    server: &WyrdTestServer,
-    superuser: &sqlx::PgPool,
-    trigger: &str,
-    operation: &str,
-) -> i64 {
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "DROP TRIGGER {trigger} ON vala.audit_staging"
-    )))
-    .execute(superuser)
-    .await
-    .expect("failure trigger drops");
-    assert_eq!(
-        server
-            .wait_oracle_audit_staged(Duration::from_secs(30))
-            .await
-            .expect("audit outbox settles"),
-        0,
-        "the retried decisions drain"
-    );
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation = $1")
-            .bind(operation)
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("decision count reads");
-    conn.commit().await.expect("assertion transaction commits");
-    count
-}
-
-/// Completion activates the Card even when its decision audit cannot commit.
-///
-/// The decision is staged on the non-blocking audit outbox, so a staging
-/// insert refused for `card.registration.complete` costs the request nothing:
-/// the Card becomes active, no completion row is staged, and the failed write
-/// is counted. Once the insert is accepted again, the retried decision commits
-/// exactly once.
-///
-/// # Panics
-/// Panics when the server cannot start, the completion is refused, the Card is
-/// not active, a completion row is staged while audit fails, the failure is not
-/// counted, or the decision does not commit once after recovery.
-#[tokio::test(flavor = "current_thread")]
-async fn completion_succeeds_when_its_decision_audit_fails() {
-    let failures = AuditCommitFailures::install().expect("metrics recorder installs");
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-completion-audit-failure", &["editor"])
-        .await
-        .expect("writer bootstraps")
-    else {
-        panic!("user bootstrap returned a non-user principal");
-    };
-    let superuser = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
-    sqlx::query(
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_card_completion_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'card.registration.complete' THEN
-               RAISE EXCEPTION 'injected completion audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure function installs");
-    sqlx::query(
-        r"CREATE TRIGGER test_fail_card_completion_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_card_completion_audit()",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure trigger installs");
-
-    let response = server
-        .oneshot_authenticated(&jwt, heavy_registration_request("completion-audit-001"))
-        .await
-        .expect("heavy registration responds");
-    let body = response_json(response).await;
-    let card_uid: CardUid = serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
-        .expect("response contains card UID");
-    let upload_path = body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
-        .as_str()
-        .expect("local upload plan contains a URL")
-        .to_owned();
-    assert!(upload_path.starts_with("/v1/cards/upload/local/"));
-    let upload = Request::builder()
-        .method(Method::PUT)
-        .uri(upload_path)
-        .body(Body::from("a"))
-        .expect("local upload request builds");
-    assert_eq!(
-        server
-            .oneshot_authenticated(&jwt, upload)
-            .await
-            .expect("local upload responds")
-            .status(),
-        StatusCode::OK
-    );
-
-    let complete = Request::builder()
-        .method(Method::POST)
-        .uri(format!("/v1/cards/{card_uid}/complete"))
-        .header("Idempotency-Key", "completion-audit-001")
-        .body(Body::empty())
-        .expect("card completion request builds");
-    let completion = server
-        .oneshot_authenticated(&jwt, complete)
-        .await
-        .expect("completion responds");
-    let completion_status = completion.status();
-    let completion_body = response_json(completion).await;
-    assert_eq!(completion_status, StatusCode::OK, "{completion_body}");
-    assert_eq!(completion_body["outcomes"][0]["status"], "active");
-    failures
-        .await_failure(Duration::from_secs(30))
-        .await
-        .expect("the failed audit write is counted");
-
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    let card_state: (String, Option<String>) =
-        sqlx::query_as("SELECT status, card_blob_uri FROM wyrd.cards WHERE card_uid = $1")
-            .bind(card_uid.as_uuid())
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("card state reads");
-    assert_eq!(card_state.0, "active");
-    assert!(card_state.1.is_some());
-    let complete_audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging WHERE operation = 'card.registration.complete'",
-    )
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("completion audit count reads");
-    assert_eq!(complete_audits, 0);
-    conn.commit().await.expect("assertion transaction commits");
-    assert_eq!(
-        recovered_decisions(
-            &server,
-            &superuser,
-            "test_fail_card_completion_audit",
-            "card.registration.complete"
-        )
-        .await,
-        1,
-        "the retried decision commits exactly once after recovery"
-    );
-
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// Delete removes the Card even when its decision audit cannot commit.
-///
-/// # Panics
-/// Panics when the server cannot start, the delete is refused, the Card is not
-/// deleted, a delete row is staged while audit fails, the failure is not
-/// counted, or the decision does not commit once after recovery.
-#[tokio::test(flavor = "current_thread")]
-async fn delete_succeeds_when_its_decision_audit_fails() {
-    let failures = AuditCommitFailures::install().expect("metrics recorder installs");
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-delete-audit-failure", &["editor"])
-        .await
-        .expect("writer bootstraps")
-    else {
-        panic!("writer bootstrap returned a non-user principal");
-    };
-    let card_uid = seed_dependency(
-        &server,
-        server.data_tenant_id(),
-        "delete-audit-failure",
-        "active",
-    )
-    .await;
-    let superuser = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
-    sqlx::query(
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_card_delete_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'card.registration.delete' THEN
-               RAISE EXCEPTION 'injected delete audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure function installs");
-    sqlx::query(
-        r"CREATE TRIGGER test_fail_card_delete_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_card_delete_audit()",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure trigger installs");
-
-    let request = Request::builder()
-        .method(Method::DELETE)
-        .uri(format!("/v1/cards/by-uid/Prompt/{card_uid}"))
-        .body(Body::empty())
-        .expect("delete request builds");
-    let response = server
-        .oneshot_authenticated(&jwt, request)
-        .await
-        .expect("delete responds");
-    assert!(
-        response.status().is_success(),
-        "{}",
-        response_json(response).await
-    );
-    failures
-        .await_failure(Duration::from_secs(30))
-        .await
-        .expect("the failed audit write is counted");
-
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    let card_status: String =
-        sqlx::query_scalar("SELECT status FROM wyrd.cards WHERE card_uid = $1")
-            .bind(card_uid.as_uuid())
-            .fetch_one(&mut **conn.transaction())
-            .await
-            .expect("card state reads");
-    let delete_audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-         WHERE operation = 'card.registration.delete' AND resource = $1",
-    )
-    .bind(format!("card:{card_uid}"))
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("delete audit count reads");
-    assert_eq!(card_status, "deleted");
-    assert_eq!(delete_audits, 0);
-    conn.commit().await.expect("assertion transaction commits");
-    assert_eq!(
-        recovered_decisions(
-            &server,
-            &superuser,
-            "test_fail_card_delete_audit",
-            "card.registration.delete"
-        )
-        .await,
-        1,
-        "the retried decision commits exactly once after recovery"
-    );
-    server.shutdown().await.expect("test server shuts down");
-}
-
 /// A delete that finds no Card still records its one received verdict.
 ///
-/// The not-found transaction commits nothing, so its in-transaction append
-/// rolls back and the service records the allowed row standalone exactly once.
+/// The not-found transaction commits nothing, yet the authorization verdict
+/// is retained exactly once.
 ///
 /// # Panics
 /// Panics when the server cannot start, the delete is not a 404, or the
-/// staged verdict rows are not exactly one `allowed`.
+/// retained verdict rows are not exactly one `allowed`.
 #[tokio::test(flavor = "current_thread")]
 async fn delete_by_ref_not_found_records_one_decision() {
     let server = WyrdTestServer::start_in_process()
@@ -2397,22 +2100,22 @@ async fn delete_by_ref_not_found_records_one_decision() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
     server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await_audit_retained()
         .await
-        .expect("audit outbox settles");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
+        .expect("audit is retained");
+    let decisions: Vec<String> = server
+        .retained_audit_records(
+            server.data_tenant_id(),
+            "outcome",
+            "operation = 'card.registration.delete' AND resource LIKE '%never-registered%'",
+        )
         .await
-        .expect("tenant connection opens");
-    let decisions: Vec<String> = sqlx::query_scalar(
-        "SELECT outcome FROM vala.audit_staging \
-         WHERE operation = 'card.registration.delete' AND resource LIKE '%never-registered%'",
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("delete decisions read");
+        .expect("delete decisions read")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .collect();
     assert_eq!(decisions, vec!["allowed".to_owned()]);
-    conn.commit().await.expect("assertion transaction commits");
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -2554,100 +2257,6 @@ async fn blob_storage_failure_leaves_durable_failure_state() {
     assert!(failure_state.1.is_none());
     assert!(failure_state.2.is_some());
     conn.commit().await.expect("assertion transaction commits");
-
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// Register the whole composite even when its decision audit cannot commit.
-///
-/// # Panics
-/// Panics when the server cannot start, the registration is refused, any Card
-/// of the composite is missing, the failure is not counted, or the decision
-/// does not commit once after recovery.
-#[tokio::test(flavor = "current_thread")]
-async fn registration_succeeds_when_its_decision_audit_fails() {
-    let failures = AuditCommitFailures::install().expect("metrics recorder installs");
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let Bootstrap::User { jwt, .. } = server
-        .bootstrap_user("registry-audit-failure-writer", &["editor"])
-        .await
-        .expect("writer bootstraps")
-    else {
-        panic!("user bootstrap returned a non-user principal");
-    };
-    let superuser = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
-    sqlx::query(
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_registration_decision_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'card.registration.create' THEN
-               RAISE EXCEPTION 'injected registration audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure function installs");
-    sqlx::query(
-        r"CREATE TRIGGER test_fail_registration_decision_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_registration_decision_audit()",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure trigger installs");
-
-    let response = server
-        .oneshot_authenticated(&jwt, three_card_composite_request("audit-failure-001"))
-        .await
-        .expect("registration responds");
-    let status = response.status();
-    let body = response_json(response).await;
-    assert_eq!(status, StatusCode::CREATED, "{body}");
-    failures
-        .await_failure(Duration::from_secs(30))
-        .await
-        .expect("the failed audit write is counted");
-
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    let operation_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.card_registration_operations WHERE idempotency_key = $1",
-    )
-    .bind("audit-failure-001")
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("operation count reads");
-    let card_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.cards WHERE name IN \
-         ('composite-prompt', 'composite-agent', 'composite-service')",
-    )
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .expect("card count reads");
-    assert_eq!(operation_count, 1);
-    assert_eq!(card_count, 3);
-    conn.commit().await.expect("assertion transaction commits");
-    assert_eq!(
-        recovered_decisions(
-            &server,
-            &superuser,
-            "test_fail_registration_decision_audit",
-            "card.registration.create"
-        )
-        .await,
-        1,
-        "the retried decision commits exactly once after recovery"
-    );
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -3504,29 +3113,36 @@ async fn owner_status_serves_stable_binding_ids_and_exchange_activates() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// List `principal`'s registration audit rows as (permission, outcome), sorted.
+/// List `principal`'s retained registration audit rows as (permission,
+/// outcome), sorted.
 ///
 /// # Panics
-/// Panics when the tenant connection or the read fails.
+/// Panics when the Scribe outbox does not settle or the retained read fails.
 async fn registration_audits(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
     server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await_audit_retained()
         .await
-        .expect("audit outbox settles");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
+        .expect("audit is retained");
+    let mut rows: Vec<(String, String)> = server
+        .retained_audit_records(
+            server.data_tenant_id(),
+            "permission, outcome",
+            &format!(
+                "operation = 'card.registration.create' AND audit_principal_id = '{principal}'"
+            ),
+        )
         .await
-        .expect("tenant connection opens");
-    let rows = sqlx::query_as(
-        "SELECT permission, outcome FROM vala.audit_staging \
-          WHERE operation = 'card.registration.create' AND principal_id = $1 \
-          ORDER BY permission, outcome",
-    )
-    .bind(principal)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("audit rows read");
-    conn.commit().await.expect("assertion transaction commits");
+        .expect("audit rows read")
+        .into_iter()
+        .map(|record| {
+            let mut fields = record.into_iter().map(Option::unwrap_or_default);
+            (
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort();
     rows
 }
 

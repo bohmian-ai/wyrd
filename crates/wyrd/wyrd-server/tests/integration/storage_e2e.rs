@@ -306,12 +306,12 @@ async fn local_client_server_round_trip() {
 /// Upload and download planning are receiving authorization boundaries, so the
 /// verdict is recorded before anything about the Card or its objects is
 /// disclosed. The journey drives both routes through the real client against a
-/// bound server, requires the stable RBAC code on each, and reads staging to
+/// bound server, requires the stable RBAC code on each, and reads retained audit to
 /// prove exactly one `denied` row per route.
 ///
 /// # Panics
 /// Panics when the server or client cannot start, either route is not refused
-/// with the RBAC code, or staging lacks exactly one `denied` row per route.
+/// with the RBAC code, or retained audit lacks exactly one `denied` row per route.
 #[tokio::test(flavor = "current_thread")]
 async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
     // Both routes refuse before any storage IO, so the default bound server
@@ -361,22 +361,25 @@ async fn storage_routes_refuse_and_audit_an_unprivileged_caller() {
         .expect_err("a principal without card:read cannot plan a download");
     assert_eq!(error.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
 
-    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+    srv.await_audit_retained().await.expect("audit is retained");
+    let mut denials: Vec<(String, String)> = srv
+        .retained_audit_records(
+            srv.data_tenant_id(),
+            "operation, outcome",
+            "operation IN ('storage.upload.init', 'storage.download.init')",
+        )
         .await
-        .expect("audit outbox settles");
-    let mut conn = srv
-        .tenant_conn_for(srv.data_tenant_id())
-        .await
-        .expect("tenant connection opens");
-    let denials: Vec<(String, String)> = sqlx::query_as(
-        "SELECT operation, outcome FROM vala.audit_staging \
-         WHERE operation IN ('storage.upload.init', 'storage.download.init') \
-         ORDER BY operation",
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("storage decision rows read");
-    conn.commit().await.expect("assertion transaction commits");
+        .expect("storage decision rows read")
+        .into_iter()
+        .map(|record| {
+            let mut fields = record.into_iter().map(Option::unwrap_or_default);
+            (
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+            )
+        })
+        .collect();
+    denials.sort();
     assert_eq!(
         denials,
         vec![

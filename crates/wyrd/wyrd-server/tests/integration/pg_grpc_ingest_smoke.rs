@@ -880,9 +880,9 @@ async fn insert_as(
 /// Result-table tests share this real path: an in-process server with a
 /// seeded tenant, its provisioned SYSTEM principal, the reserved result table
 /// provisioned, and a public gRPC listener. Its fields let each test write
-/// over gRPC and read the staged audit decisions and replayed WAL.
+/// over gRPC and read the retained audit decisions and replayed WAL.
 struct ResultTableHarness {
-    /// Composed server whose Scribe, WAL, and audit staging are under test.
+    /// Composed server whose Scribe, WAL, and retained audit are under test.
     server: WyrdTestServer,
     /// Tenant every write belongs to.
     tenant: DataTenantId,
@@ -892,10 +892,8 @@ struct ResultTableHarness {
     bind: SocketAddr,
     /// Cancels the gRPC listener on shutdown.
     shutdown: CancellationToken,
-    /// Migrator pool used only for assertions over audit staging.
+    /// Migrator pool used only for assertions over the Bifrost catalog.
     assertion_pool: PgPool,
-    /// Highest staged audit sequence for the tenant before any write.
-    seq_before: i64,
 }
 
 impl ResultTableHarness {
@@ -931,17 +929,6 @@ impl ResultTableHarness {
             .pg_fixture()
             .superuser_pool()
             .expect("fixture exposes a migrator assertion pool");
-        server
-            .wait_oracle_audit_staged(Duration::from_secs(30))
-            .await
-            .expect("audit outbox settles");
-        let seq_before: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging WHERE data_tenant_id = $1",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_one(&assertion_pool)
-        .await
-        .expect("audit chain observation");
 
         let (_, health_service) = health_reporter();
         let router = build_app_grpc(
@@ -964,49 +951,49 @@ impl ResultTableHarness {
             bind,
             shutdown,
             assertion_pool,
-            seq_before,
         }
     }
 
-    /// Staged `bifrost.record.write` decisions since start, in order.
+    /// Retained `bifrost.record.write` decisions of the fresh tenant, in
+    /// decision order.
     ///
-    /// Each row is `(principal kind, resource, outcome)`.
+    /// Each row is `(principal kind, resource, outcome)`. The tenant is created
+    /// by [`Self::start`], so every retained write decision belongs to the test.
     ///
     /// # Panics
     ///
-    /// Panics when audit staging cannot be read or a decision names a
+    /// Panics when retained audit cannot be read or a decision names a
     /// permission other than `bifrost:record:write`.
     async fn write_decisions(&self) -> Vec<(String, String, String)> {
         self.server
-            .wait_oracle_audit_staged(Duration::from_secs(30))
+            .await_audit_retained()
             .await
-            .expect("audit outbox settles");
-        let decisions: Vec<(String, String, String, String)> = sqlx::query_as(
-            "SELECT principal_kind, resource, permission, outcome \
-             FROM vala.audit_staging \
-             WHERE data_tenant_id = $1 AND operation = 'bifrost.record.write' AND seq > $2 \
-             ORDER BY seq",
-        )
-        .bind(self.tenant.as_uuid())
-        .bind(self.seq_before)
-        .fetch_all(&self.assertion_pool)
-        .await
-        .expect("staged write decisions");
-        decisions
+            .expect("audit is retained");
+        self.server
+            .retained_audit_records(
+                self.tenant,
+                "principal_kind, resource, permission, outcome",
+                "operation = 'bifrost.record.write'",
+            )
+            .await
+            .expect("retained write decisions")
             .into_iter()
-            .map(|(kind, resource, permission, outcome)| {
+            .map(|record| {
+                let mut fields = record.into_iter().map(Option::unwrap_or_default);
+                let mut next = || fields.next().unwrap_or_default();
+                let (kind, resource, permission, outcome) = (next(), next(), next(), next());
                 assert_eq!(permission, "bifrost:record:write");
                 (kind, resource, outcome)
             })
             .collect()
     }
 
-    /// Asserts the staged write decisions equal `expected` and the
+    /// Asserts the retained write decisions equal `expected` and the
     /// acknowledged WAL holds no verification result record.
     ///
     /// # Panics
     ///
-    /// Panics when the staged decisions differ from `expected` or the
+    /// Panics when the retained decisions differ from `expected` or the
     /// acknowledged WAL replays any `results`, `result_features`, or
     /// `result_items` record.
     async fn assert_only_denials_and_no_durable_result(
@@ -1088,7 +1075,7 @@ fn mint_record_writer_jwt(state: &AppState, principal: TokenPrincipalRef) -> Str
 /// # Panics
 ///
 /// Panics when any write is admitted or answered with another code or
-/// message, when the staged decisions differ from one denial per write in
+/// message, when the retained decisions differ from one denial per write in
 /// order, or when a result row becomes durable.
 #[tokio::test]
 async fn public_result_writes_are_refused_over_grpc() {
@@ -1156,7 +1143,7 @@ async fn public_result_writes_are_refused_over_grpc() {
 /// # Panics
 ///
 /// Panics when resolution succeeds without a principal, the authority carries
-/// other authority, or either query or its staged audit decision differs from
+/// other authority, or either query or its retained audit decision differs from
 /// the expected one.
 #[tokio::test]
 async fn system_read_authority_reads_only_the_named_table() {
@@ -1243,25 +1230,31 @@ async fn system_read_authority_reads_only_the_named_table() {
         "{denied:?}"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let decisions = loop {
-        let decisions: Vec<(String, String)> = sqlx::query_as(
-            "SELECT operation, outcome FROM vala.audit_staging \
-             WHERE data_tenant_id = $1 AND principal_id = $2 AND seq > $3 \
-               AND operation IN ('bifrost.query.read_decision', 'vala.query.sync') \
-             ORDER BY operation",
-        )
-        .bind(harness.tenant.as_uuid())
-        .bind(harness.system)
-        .bind(harness.seq_before)
-        .fetch_all(&harness.assertion_pool)
+    let predicate = format!(
+        "audit_principal_id = '{}' \
+         AND operation IN ('bifrost.query.read_decision', 'vala.query.sync')",
+        harness.system
+    );
+    harness
+        .server
+        .await_retained_audit_count(harness.tenant, &predicate, 2)
         .await
-        .expect("staged read decisions");
-        if decisions.len() >= 2 || Instant::now() > deadline {
-            break decisions;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    };
+        .expect("both read decisions are retained");
+    let mut decisions: Vec<(String, String)> = harness
+        .server
+        .retained_audit_records(harness.tenant, "operation, outcome", &predicate)
+        .await
+        .expect("retained read decisions")
+        .into_iter()
+        .map(|record| {
+            let mut fields = record.into_iter().map(Option::unwrap_or_default);
+            (
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+            )
+        })
+        .collect();
+    decisions.sort();
     assert_eq!(
         decisions,
         vec![

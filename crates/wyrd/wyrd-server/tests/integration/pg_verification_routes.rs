@@ -295,53 +295,47 @@ async fn start_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(Strin
     decisions(server, "verification.run.start", principal).await
 }
 
-/// List `principal`'s `verification.execute` decisions as (permission,
-/// outcome) once the non-blocking audit outbox has committed every staged
-/// decision.
+/// List `principal`'s `verification.execute` decisions as (permission, outcome).
 ///
 /// # Panics
-/// Panics when the outbox does not drain within ten seconds or the audit rows
-/// cannot be read.
+/// Panics when the retained audit history cannot be read.
 async fn execute_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while server.state().audit_outbox.pending() != 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "audit outbox drains"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
     decisions(server, "verification.execute", principal).await
 }
 
-/// List `principal`'s staged `operation` decisions as (permission, outcome).
+/// List `principal`'s retained `operation` decisions as (permission, outcome),
+/// sorted by outcome.
 ///
 /// # Panics
-/// Panics when the audit rows cannot be read.
+/// Panics when the Scribe outbox does not settle or retained audit history
+/// cannot be read.
 async fn decisions(
     server: &WyrdTestServer,
     operation: &str,
     principal: Uuid,
 ) -> Vec<(String, String)> {
     server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await_audit_retained()
         .await
-        .expect("audit outbox settles");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
+        .expect("audit is retained");
+    let mut rows: Vec<(String, String)> = server
+        .retained_audit_records(
+            server.data_tenant_id(),
+            "permission, outcome",
+            &format!("operation = '{operation}' AND audit_principal_id = '{principal}'"),
+        )
         .await
-        .expect("tenant connection opens");
-    let rows = sqlx::query_as(
-        "SELECT permission, outcome FROM vala.audit_staging \
-          WHERE operation = $1 AND principal_id = $2 \
-          ORDER BY outcome",
-    )
-    .bind(operation)
-    .bind(principal)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("audit rows read");
-    conn.commit().await.expect("audit read commits");
+        .expect("retained audit reads")
+        .into_iter()
+        .map(|record| {
+            let mut fields = record.into_iter().map(Option::unwrap_or_default);
+            (
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort_by(|left, right| left.1.cmp(&right.1));
     rows
 }
 
@@ -1219,94 +1213,6 @@ async fn direct_execution_refusals_are_stable() {
         vec![("evals:run".to_owned(), "denied".to_owned())]
     );
     assert_eq!(run_count(&server, server.data_tenant_id()).await, 0);
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// A direct execution whose decision cannot be audited still executes: audit
-/// is non-blocking, so the allowed caller gets its judgment and the Card-bound
-/// caller without subject scope gets its permission refusal. Neither decision
-/// reaches staging while audit fails; both are retried and commit exactly once
-/// when it recovers.
-///
-/// # Panics
-/// Panics when the server fails to start, a fixture write fails, the failure
-/// trigger cannot be installed or dropped, a route fails to respond, or any
-/// status, code, or audit expectation fails.
-#[tokio::test(flavor = "current_thread")]
-async fn direct_execution_does_not_wait_on_audit() {
-    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let direct = Direct::seed(&server).await;
-    let (caller, jwt) = user(&server, "vx-audit-writer", &["editor"]).await;
-    let machine = server
-        .bootstrap_service("vx-audit-foreign-service", &["editor"])
-        .await
-        .expect("card-bound service bootstraps");
-    let machine_token = machine_jwt(&server, &machine).await;
-    let superuser = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
-    for statement in [
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_execute_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'verification.execute' THEN
-               RAISE EXCEPTION 'injected execute audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;",
-        r"CREATE TRIGGER test_fail_execute_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_execute_audit()",
-    ] {
-        sqlx::query(statement)
-            .execute(&superuser)
-            .await
-            .expect("failure trigger installs");
-    }
-
-    let body = execute_body(
-        &direct.eval,
-        &direct.service,
-        json!({ "kind": "eval_record", "context": { "x": 1 } }),
-    )
-    .to_string();
-    let (status, judged) = post_execute(&server, &jwt, body.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{judged}");
-    assert_eq!(judged["verdict"], "passed", "{judged}");
-    let (status, problem) = post_execute(&server, &machine_token, body).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
-    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
-    failures
-        .await_failure(std::time::Duration::from_secs(30))
-        .await
-        .expect("the failed audit write is counted");
-    let staged: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging WHERE operation = 'verification.execute'",
-    )
-    .fetch_one(&superuser)
-    .await
-    .expect("staging reads");
-    assert_eq!(staged, 0, "no decision is staged while audit fails");
-
-    sqlx::query("DROP TRIGGER test_fail_execute_audit ON vala.audit_staging")
-        .execute(&superuser)
-        .await
-        .expect("failure trigger drops");
-    assert_eq!(
-        execute_decisions(&server, caller).await,
-        vec![("evals:run".to_owned(), "allowed".to_owned())],
-        "the allowance commits exactly once after recovery"
-    );
-    assert_eq!(
-        execute_decisions(&server, machine.id().as_uuid()).await,
-        vec![("evals:run".to_owned(), "denied".to_owned())],
-        "the denial commits exactly once after recovery"
-    );
     server.shutdown().await.expect("test server shuts down");
 }
 

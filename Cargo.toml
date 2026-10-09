@@ -251,7 +251,7 @@ iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compact
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.
 # The Wyrd fork carries the Arrow 60 port; upstream is still on Arrow 59.
-datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distributed", rev = "0b81b127164a35fca491bd7500f9fd0189f941ca" }
+datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distributed", rev = "8fac2a978bdcf8e06457238ebfe9c7f35023c123" }
 
 # One tested revision of the Wyrd DataFusion fork (v55.1.0 rebased onto apache
 # main with Arrow 60, plus nested-field

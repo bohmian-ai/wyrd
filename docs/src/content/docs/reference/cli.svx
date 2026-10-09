@@ -110,7 +110,8 @@ WYRD_REFRESH_TOKEN="$TOKEN" wyrd auth refresh --server https://acme.wyrd.cloud
 ### auth issue-key
 
 Issue an API key bound to a card ref (`POST /auth/issue-key`). Requires an admin
-credential in the ambient chain.
+credential in the ambient chain. Prints the key once, with the `principal_id`
+that [`wyrd principal role`](#wyrd-principal-role) takes.
 
 ```bash
 wyrd auth issue-key \
@@ -132,37 +133,6 @@ wyrd auth issue-key \
     ['--space', 'yes', '—', 'Card space.'],
     ['--label', 'no', '—', 'Label stored with the key row.'],
     ['--expires-in-seconds', 'no', '—', 'TTL override in seconds.'],
-    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
-  ]}
-/>
-
-### auth grant-role
-
-Grant a built-in or tenant Role to the principal bound to a Service or Agent
-Card (`POST /v1/auth/grant-role`). Requires a tenant administrator (`*`)
-credential in the ambient chain. Granting a Role the principal already holds
-succeeds with `granted: false`. The Role reaches the principal's tokens at its
-next key exchange. See [Authorization](/concepts/authorization/).
-
-```bash
-wyrd auth grant-role \
-  --kind Service --name checkout --version 1.0.0 --space prod \
-  --role workload --server https://acme.wyrd.cloud
-```
-
-<DataTable
-  columns={[
-    { header: 'Flag', role: 'name' },
-    { header: 'Required' },
-    { header: 'Env' },
-    { header: 'Meaning' }
-  ]}
-  rows={[
-    ['--kind', 'yes', '—', 'Card kind of the target principal: Service or Agent.'],
-    ['--name', 'yes', '—', 'Card name.'],
-    ['--version', 'yes', '—', 'Card version (e.g. 1.0.0).'],
-    ['--space', 'yes', '—', 'Card space.'],
-    ['--role', 'yes', '—', 'Built-in or tenant Role to grant (e.g. workload).'],
     ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
   ]}
 />
@@ -218,6 +188,63 @@ wyrd principal revoke 3f9a...uuid --kind service --reason "key leaked" \
     ['<id>', 'yes', '—', 'Principal ID (UUID) to revoke.'],
     ['--kind', 'yes', '—', 'Principal kind: user, service, or agent.'],
     ['--reason', 'yes', '—', 'Audit reason for the revocation.'],
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
+  ]}
+/>
+
+## wyrd principal list
+
+Page through the tenant's assignable users and Service and Agent principals
+(`GET /v1/principals`), printing each id, kind, and name, then `next: <id>`
+when another page follows. Filters are exact. Requires an admin credential in
+the ambient chain.
+
+```bash
+wyrd principal list --kind service --name checkout --server https://acme.wyrd.cloud
+```
+
+<DataTable
+  columns={[
+    { header: 'Flag', role: 'name' },
+    { header: 'Required' },
+    { header: 'Env' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['--kind', 'no', '—', 'Only principals of this kind: user, service, or agent.'],
+    ['--email', 'no', '—', 'Only the user with this exact email.'],
+    ['--name', 'no', '—', 'Only the service or agent with this exact name.'],
+    ['--limit', 'no', '—', 'Page size, 1 to 200 (default 100).'],
+    ['--after', 'no', '—', 'Continue after this principal id, the previous page\'s next.'],
+    ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
+  ]}
+/>
+
+## wyrd principal role
+
+List a principal's Roles with their source (`list`), or grant (`grant`) or
+revoke (`revoke`) a direct Role (`PUT` and `DELETE
+/v1/principals/{id}/roles/{role}`). Grant and revoke are idempotent and print
+whether anything changed and the resulting assignments; they require a tenant
+administrator (`*`) credential in the ambient chain. Revoking leaves a user's
+`idp` assignment of the same Role to the identity provider. A change reaches
+the principal's next token. See [Authorization](/concepts/authorization/).
+
+```bash
+wyrd principal role grant --principal 3f9a...uuid --role editor \
+  --server https://acme.wyrd.cloud
+```
+
+<DataTable
+  columns={[
+    { header: 'Flag', role: 'name' },
+    { header: 'Required' },
+    { header: 'Env' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['--principal', 'yes', '—', 'Principal ID (UUID) to act on.'],
+    ['--role', 'grant, revoke', '—', 'Built-in or tenant Role (e.g. editor).'],
     ['--server', 'yes', 'WYRD_SERVER_URL', 'Wyrd server base URL.']
   ]}
 />

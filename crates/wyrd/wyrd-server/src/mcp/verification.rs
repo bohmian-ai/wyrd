@@ -13,7 +13,7 @@ use rmcp::model::{CallToolResult, Tool};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
-use wyrd_runtime::Permission;
+use wyrd_runtime::permission::{Action, Resource};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{BindingId, CardUid, IdempotencyKey, VerificationRunId};
@@ -117,10 +117,11 @@ pub(super) fn descriptors_unscoped() -> Vec<Tool> {
     ]
 }
 
-/// The write tools shown only to a caller holding `evals:run`.
+/// The write tools shown only to a caller holding any `verifier:run` grant.
 ///
 /// A planning convenience, not the boundary: [`VerificationControl`]
-/// authorizes and audits the same permission when the tool is named directly.
+/// authorizes `verifier:run` on the exact selected Verifier and audits that
+/// decision when the tool is named directly.
 #[must_use]
 pub(super) fn write_descriptors() -> Vec<Tool> {
     vec![
@@ -129,30 +130,33 @@ pub(super) fn write_descriptors() -> Vec<Tool> {
             "Start a manual verification run",
             "Durably enqueue one manual Drift run over a bounded UTC window [start, end) for a \
              binding or a direct Verifier/subject pair, and return its run_id without waiting \
-             for scoring. Poll verification.get_run. Requires evals:run and, for a Card-bound \
-             caller, Card scope over the subject.",
+             for scoring. Poll verification.get_run. Requires verifier:run on the selected \
+             Verifier and, for a Card-bound caller, Card scope over the subject.",
             false,
         ),
         tool::<ExecuteVerificationRequest, Judgment>(
             EXECUTE,
             "Execute a Verifier on supplied input",
-            "Judge supplied drift_samples or one eval_record with one exact Verifier about one \
-             subject Card and return the verdict, counts, and detail in this response, within a \
+            "Judge supplied drift_samples, one eval_record, or one task_context with one exact \
+             Verifier about one subject Card and return the verdict and detail (plus counts for \
+             Drift and Eval) in this response, within a \
              60-second deadline. Nothing is enqueued, published, or dispatched; a failed verdict \
              is a successful result. PSI/SPC Verifiers need a ready fitted baseline; Eval trace \
-             and agent assertions are unsupported. Requires evals:run and, for a Card-bound \
-             caller, Card scope over the subject.",
+             and agent assertions are unsupported. Requires verifier:run on the Verifier.",
             false,
         ),
     ]
 }
 
-/// Whether this caller's token carries `evals:run`.
+/// Whether this caller's token carries any `verifier:run` grant.
+///
+/// Coarse admission only: a grant of one Verifier UID shows the tools, and
+/// the service still authorizes the exact Verifier each call selects.
 pub(super) fn may_start_runs(caller: &Caller) -> bool {
     caller
         .principal
         .effective_permissions
-        .contains(&Permission::eval_run())
+        .covers_operation(&Resource::Verifier, &Action::Run)
 }
 
 impl WyrdMcpHandler {

@@ -212,7 +212,9 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Drift writes one `result_features` row per scored feature and records
     /// the report (or null when unscored) as `details`; Eval writes one
     /// `result_items` row per task outcome and records the workflow summary
-    /// as `details`. A report with no detail rows writes only the summary.
+    /// as `details`; a task writes only the summary, sourced from the
+    /// synthetic record, with its one `AssertionResult` as `details`. A report
+    /// with no detail rows writes only the summary.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::InputMismatch`] when the report's
@@ -242,6 +244,11 @@ impl<'a> ResultPayloadBuilder<'a> {
                 let details = canonical_json(&report.workflow_summary())?;
                 (None, Some(record_id.as_str()), Some(details))
             }
+            (VerifierReport::Task(result), RunInput::EvalRecord { record_id, .. }) => (
+                None,
+                Some(record_id.as_str()),
+                Some(canonical_json(result)?),
+            ),
             _ => return Err(ResultPayloadError::InputMismatch { implementation }),
         };
         let summary = self.summary(implementation, verdict, window, record_id, details)?;

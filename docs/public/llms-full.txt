@@ -5033,12 +5033,15 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "type": "array"
         },
         "runs_on": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/InlineableRef_for_TriggerSpec"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card."
+          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card.\n\nAbsent means explicit-only: the binding attaches the Verifier to its subject for direct invocation and nothing activates it."
         },
         "verifier": {
           "allOf": [
@@ -5050,7 +5053,6 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
         }
       },
       "required": [
-        "runs_on",
         "verifier"
       ],
       "type": "object"
@@ -15235,12 +15237,15 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
           "type": "array"
         },
         "runs_on": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/InlineableRef_for_TriggerSpec"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card."
+          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card.\n\nAbsent means explicit-only: the binding attaches the Verifier to its subject for direct invocation and nothing activates it."
         },
         "verifier": {
           "allOf": [
@@ -15252,7 +15257,6 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
         }
       },
       "required": [
-        "runs_on",
         "verifier"
       ],
       "type": "object"
@@ -21946,6 +21950,171 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
       "pattern": "^[a-zA-Z_][a-zA-Z0-9_-]*$",
       "type": "string"
     },
+    "TaskVerifierSpec": {
+      "description": "The body of a `task` Verifier: exactly one check, judged directly.\n\nA real-time assertion or LLM judge is not an Eval workflow, so it carries no task map, dataset, sampling, pass gate, or task graph. Its one `kind`-tagged definition sits directly under `implementation.spec` and reuses the existing assertion and LLM-judge payloads. Deserialization refuses `depends_on` and `condition`, which have no meaning for one check, and any unknown field such as a nested `task:` wrapper.",
+      "oneOf": [
+        {
+          "description": "Programmatic assertion against the supplied context.",
+          "properties": {
+            "condition": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional gate evaluated before the task runs."
+            },
+            "context_path": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Path to the single value to assert against."
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              },
+              "type": "array"
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ],
+              "description": "Unique identifier within the enclosing eval task map."
+            },
+            "item_context_path": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Path to an array the runtime iterates and asserts per item."
+            },
+            "kind": {
+              "enum": [
+                "assertion"
+              ],
+              "type": "string"
+            },
+            "operator": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ],
+              "description": "Comparison applied to the observed value and expected value."
+            }
+          },
+          "required": [
+            "expected",
+            "id",
+            "kind",
+            "operator"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "LLM-as-judge evaluation of the supplied context.",
+          "properties": {
+            "condition": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/EvalCondition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional gate evaluated before the task runs."
+            },
+            "context_path": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/JsonPath"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional JSONPath selecting the context passed to the judge."
+            },
+            "depends_on": {
+              "description": "IDs of upstream tasks that must complete before this task runs.",
+              "items": {
+                "$ref": "#/definitions/TaskId"
+              },
+              "type": "array"
+            },
+            "expected": {
+              "description": "Right-hand side of the comparison."
+            },
+            "id": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TaskId"
+                }
+              ],
+              "description": "Unique identifier within the enclosing eval task map."
+            },
+            "judge_ref": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/InlineableRef_for_AgentSpec"
+                }
+              ],
+              "description": "Reference to or inline definition of an Agent card."
+            },
+            "kind": {
+              "enum": [
+                "llm_judge"
+              ],
+              "type": "string"
+            },
+            "max_retries": {
+              "default": 2,
+              "description": "Maximum retries on transient runtime failures.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "operator": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ComparisonOperator"
+                }
+              ],
+              "description": "Comparison applied to the judge response and expected value."
+            }
+          },
+          "required": [
+            "expected",
+            "id",
+            "judge_ref",
+            "kind",
+            "operator"
+          ],
+          "type": "object"
+        }
+      ],
+      "type": "object"
+    },
     "TriggerSpec": {
       "description": "Declarative activation for a bound Verifier.",
       "oneOf": [
@@ -22017,12 +22186,15 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
           "type": "array"
         },
         "runs_on": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/InlineableRef_for_TriggerSpec"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card."
+          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card.\n\nAbsent means explicit-only: the binding attaches the Verifier to its subject for direct invocation and nothing activates it."
         },
         "verifier": {
           "allOf": [
@@ -22034,7 +22206,6 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
         }
       },
       "required": [
-        "runs_on",
         "verifier"
       ],
       "type": "object"
@@ -22074,6 +22245,26 @@ Schema source: crates/wyrd-spec/schemas/verifier_spec.json
             },
             "spec": {
               "$ref": "#/definitions/EvalSpec"
+            }
+          },
+          "required": [
+            "kind",
+            "spec"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One direct assertion or LLM judge over supplied JSON context.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "task"
+              ],
+              "type": "string"
+            },
+            "spec": {
+              "$ref": "#/definitions/TaskVerifierSpec"
             }
           },
           "required": [
@@ -27707,12 +27898,15 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "type": "array"
         },
         "runs_on": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/InlineableRef_for_TriggerSpec"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card."
+          "description": "When the bound Verifier runs, inline or as a referenced Trigger Card.\n\nAbsent means explicit-only: the binding attaches the Verifier to its subject for direct invocation and nothing activates it."
         },
         "verifier": {
           "allOf": [
@@ -27724,7 +27918,6 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         }
       },
       "required": [
-        "runs_on",
         "verifier"
       ],
       "type": "object"

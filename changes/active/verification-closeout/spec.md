@@ -1,6 +1,6 @@
 ---
 id: SPEC-verification-closeout
-revision: 2
+revision: 3
 status: approved
 approved: 2026-10-08
 ---
@@ -53,6 +53,39 @@ fresh access token for each request through the stock client's supported auth
 hook. Local development works with the setup admin key; the enterprise flow
 works with a saved user login. User journeys do not call the test-only Bifrost
 publication flush hook.
+
+### REQ-003A — Direct Verifier tasks and invocation authority
+
+A Verifier Card may be registered independently and may be bound to a standalone
+Agent, a Service, or a Service component. One owner may bind both an automatically
+activated Eval Verifier and an explicit-only task Verifier. A direct request
+selects one registered Verifier and a subject Card in the caller's tenant; the
+binding does not grant permission to invoke it.
+
+`VerifierImplementation` gains `Task(TaskVerifierSpec)`, selected by
+`implementation.kind: task`. `TaskVerifierSpec` is the only new struct for this
+implementation. It contains one flattened `VerifierTask` definition directly
+under `implementation.spec`, with no nested `task` or `tasks` field and no
+`EvalSpec` deserialization. `VerifierTask` is an enum whose `Assertion` and
+`LlmJudge` variants reuse the existing `AssertionTask` and `LlmJudgeTask`
+types; do not create replacement payload structs. Eval-only task dependencies
+and conditions are invalid in this single-task shape. A task Verifier produces
+one judgment over supplied JSON context; it does not introduce a new Card kind
+or a second task engine.
+
+Explicit invocation, including HTTP, MCP, and public SDK calls, requires
+`verifier:run` on the exact selected Verifier Card UID, or an all-Verifiers
+grant. `PermissionScope::Verifier(CardUid)` names one Verifier; `All` covers
+every Verifier in the tenant. The server resolves the Verifier inside the
+caller's tenant, checks that permission before execution, and audits allowed
+and denied decisions. `evals:run` alone does not authorize this generic
+endpoint. Binding and subject identity do not substitute for invocation
+permission. The subject
+must resolve to an available Card in the same tenant; direct invocation does
+not additionally require the caller's observation-attribution Card scope.
+The built-in `workload` role retains its current ability to invoke Verifiers
+through an all-Verifiers `verifier:run` grant; custom roles may grant one
+Verifier UID.
 
 ### REQ-004 — One non-blocking Scribe outbox
 
@@ -191,7 +224,7 @@ reopen or silently simplify them.
     | Role | Permissions |
     |---|---|
     | `viewer` | all Card, artifact, audit, Operator, gateway, gateway-payload, Bifrost-table, and Bifrost-query reads |
-    | `workload` | `viewer` plus Bifrost table/record writes, evaluation, Workflow execution, Trigger writes, Operator invocation, and gateway invocation |
+    | `workload` | `viewer` plus Bifrost table/record writes, evaluation, all-Verifiers `verifier:run`, Workflow execution, Trigger writes, Operator invocation, and gateway invocation |
     | `editor` | `workload` plus Card/artifact authoring, policy lock, and Service installation |
     | `admin` | `*` |
 
@@ -411,12 +444,20 @@ Excluded:
   through public MCP/SDK surfaces.
 - **AC-006.** Generated contracts, dependency boundaries, tenant-isolation
   checks, docs, examples, formatting, and lints remain clean.
+- **AC-007.** Checked-in YAML deserializes a single-task Verifier; standalone
+  Agent and Service bindings resolve it; a client invokes it through the
+  real-time endpoint when granted `verifier:run` for that UID and is refused
+  when granted only another Verifier UID or `evals:run`.
 
 ## Open decisions
 
 None.
 
 ## Revision history
+
+- **Revision 3 — 2026-10-08.** Approved a separate single-task Verifier spec
+  and scoped `verifier:run` authority for explicit invocation, with YAML,
+  binding, and public-client proof added to the TASK-001 remediation.
 
 - **Revision 2 — 2026-10-08.** Approved the in-memory best-effort Scribe path:
   `ScribeSink` batches logical writes and pushes them through existing local or

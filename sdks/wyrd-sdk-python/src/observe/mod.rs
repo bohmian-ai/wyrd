@@ -454,7 +454,8 @@ impl PyJudgment {
         &self.inner.summary
     }
 
-    /// Count-only rollup of the judgment as its wire mapping.
+    /// Count-only rollup of a Drift or Eval judgment as its wire mapping;
+    /// `None` for a task Verifier.
     ///
     /// # Errors
     /// Raises an internal error when the rollup cannot be converted.
@@ -466,7 +467,8 @@ impl PyJudgment {
         )?)
     }
 
-    /// The engine report as its wire mapping: `{"drift": ...}` or `{"eval": ...}`.
+    /// The engine report as its wire mapping: `{"drift": ...}`, `{"eval": ...}`,
+    /// or `{"task": {"result": ...}}`.
     ///
     /// # Errors
     /// Raises an internal error when the report cannot be converted.

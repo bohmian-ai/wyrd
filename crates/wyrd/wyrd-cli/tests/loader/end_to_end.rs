@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use wyrd_loader::{build_submissions, load};
 use wyrd_spec::card::trigger::TriggerActivation;
+use wyrd_spec::card::verifier::{VerifierImplementation, VerifierTask};
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::reference::{InlineableRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
@@ -14,14 +15,16 @@ fn fixture(name: &str) -> PathBuf {
 
 /// Load the canonical Service tree and prove all references resolve before submission.
 ///
-/// The tree binds sibling Drift and Eval Verifiers through `verified_by`,
-/// covering a referenced Trigger Card, an inline activation, and a referenced
-/// failure Operator, so every binding slot must leave the loader resolved.
+/// The tree binds sibling Drift, Eval, and task Verifiers through
+/// `verified_by`, covering a referenced Trigger Card, an inline activation, a
+/// referenced failure Operator, and explicit-only task bindings without
+/// `runs_on` on a standalone Agent, the Service, and a Service component, so
+/// every binding slot must leave the loader resolved.
 #[test]
 fn load_end_to_end_reference_tree() {
     let tree = load(&fixture("end_to_end")).expect("canonical loader fixture must load");
 
-    assert_eq!(tree.cards.len(), 11);
+    assert_eq!(tree.cards.len(), 12);
     assert!(tree.diagnostics.is_empty());
     assert_eq!(
         tree.cards.last().map(|card| &card.submission.kind),
@@ -37,6 +40,7 @@ fn load_end_to_end_reference_tree() {
     assert!(position("churn-classifier-drift") < service_position);
     assert!(position("churn-classifier") < service_position);
     assert!(position("churn-triage-eval") < service_position);
+    assert!(position("cohort-check") < position("churn-triage"));
     assert!(position("churn-triage") < service_position);
     assert!(position("retention-runbook") < service_position);
     assert!(position("slack-ops-alerts") < service_position);
@@ -102,26 +106,34 @@ fn load_end_to_end_reference_tree() {
             assert!(matches!(model_binding.verifier, Ref::Sibling { .. }));
             assert!(matches!(
                 model_binding.runs_on,
-                InlineableRef::Sibling { .. }
+                Some(InlineableRef::Sibling { .. })
             ));
             assert!(matches!(
                 model_binding.on_failure.as_slice(),
                 [InlineableRef::Sibling { .. }]
             ));
-            let [agent_binding] = service.components[1].verified_by.as_slice() else {
-                panic!("agent1 component must carry exactly one verification binding");
+            let [agent_binding, component_task] = service.components[1].verified_by.as_slice()
+            else {
+                panic!("agent1 component must carry its Eval and task bindings");
             };
             assert!(matches!(
                 &agent_binding.runs_on,
-                InlineableRef::Inline(trigger)
+                Some(InlineableRef::Inline(trigger))
                     if matches!(trigger.activation, TriggerActivation::ObservationsReady { .. })
             ));
+            assert!(matches!(component_task.verifier, Ref::Sibling { .. }));
+            assert!(component_task.runs_on.is_none());
 
-            let [service_binding] = service.verified_by.as_slice() else {
-                panic!("the Service must carry exactly one Service-level binding");
+            let [service_binding, service_task] = service.verified_by.as_slice() else {
+                panic!("the Service must carry its guardrail and task bindings");
             };
             assert!(matches!(service_binding.verifier, Ref::Ref(_)));
-            assert!(matches!(service_binding.runs_on, InlineableRef::Ref(_)));
+            assert!(matches!(
+                service_binding.runs_on,
+                Some(InlineableRef::Ref(_))
+            ));
+            assert!(matches!(service_task.verifier, Ref::Sibling { .. }));
+            assert!(service_task.runs_on.is_none());
             assert!(matches!(
                 service_binding.on_failure.as_slice(),
                 [InlineableRef::Inline(_)]
@@ -135,10 +147,33 @@ fn load_end_to_end_reference_tree() {
                 panic!("the standalone Agent must carry exactly one binding");
             };
             assert!(matches!(standalone_binding.verifier, Ref::Ref(_)));
-            assert!(matches!(standalone_binding.runs_on, InlineableRef::Ref(_)));
+            assert!(matches!(
+                standalone_binding.runs_on,
+                Some(InlineableRef::Ref(_))
+            ));
             assert!(matches!(
                 standalone_binding.on_failure.as_slice(),
                 [InlineableRef::Ref(_)]
+            ));
+        }
+        if loaded.submission.metadata.name.as_str() == "churn-triage" {
+            let Spec::Agent(agent) = &spec else {
+                panic!("churn-triage must remain an Agent spec");
+            };
+            let [task_binding] = agent.verified_by.as_slice() else {
+                panic!("the standalone Agent must carry its task binding");
+            };
+            assert!(matches!(task_binding.verifier, Ref::Sibling { .. }));
+            assert!(task_binding.runs_on.is_none());
+        }
+        if loaded.submission.metadata.name.as_str() == "cohort-check" {
+            let Spec::Verifier(verifier) = &spec else {
+                panic!("cohort-check must remain a Verifier spec");
+            };
+            assert!(matches!(
+                &verifier.implementation,
+                VerifierImplementation::Task(task)
+                    if matches!(task.definition, VerifierTask::Assertion(_))
             ));
         }
         if loaded.submission.metadata.name.as_str() == "churn-triage-eval-ready" {
@@ -151,7 +186,7 @@ fn load_end_to_end_reference_tree() {
     assert!(saw_materialized_file);
 
     let submissions = build_submissions(tree).expect("loaded tree is wire-ready");
-    assert_eq!(submissions.len(), 11);
+    assert_eq!(submissions.len(), 12);
 }
 
 #[test]

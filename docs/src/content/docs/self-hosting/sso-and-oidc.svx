@@ -101,7 +101,7 @@ PUT /v1/identity/oidc/candidate
   "client_auth": "SecretPost",
   "client_secret": "<secret>",
   "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
-  "group_role_map": { "wyrd-admins": ["admin"], "wyrd-writers": ["writer"] },
+  "group_role_map": { "wyrd-admins": ["admin"], "wyrd-editors": ["editor"] },
   "expected_revision": null
 }
 ```

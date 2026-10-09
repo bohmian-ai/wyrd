@@ -8,6 +8,7 @@ pub use wyrd_spec::auth::{
     BifrostPermissionScope, BifrostSchemaScope, BifrostTableScope, GatewayAccess, PermissionScope,
     PermissionScopeError,
 };
+use wyrd_spec::ids::CardUid;
 
 /// One operation/object authorization triple.
 ///
@@ -78,6 +79,8 @@ pub enum Resource {
     Operators,
     /// Eval-backed Verifier Cards and eval runs.
     Evals,
+    /// Explicit invocation of a Verifier Card, optionally scoped to one UID.
+    Verifier,
     /// Drift-backed Verifier Cards and drift observations.
     Drift,
     /// Artifact bytes and metadata.
@@ -226,6 +229,7 @@ impl Resource {
             Self::Services => "services",
             Self::Operators => "operators",
             Self::Evals => "evals",
+            Self::Verifier => "verifier",
             Self::Drift => "drift",
             Self::Artifacts => "artifacts",
             Self::Audit => "audit",
@@ -304,7 +308,8 @@ impl Permission {
     /// Rejects a permission whose object scope cannot apply to its operation.
     ///
     /// Bifrost object scope is meaningful only for Bifrost query reads and
-    /// record writes, and gateway object scope only for gateway invocation. A wildcard or
+    /// record writes, gateway object scope only for gateway invocation, and
+    /// Verifier object scope only for `verifier:run`. A wildcard or
     /// multi-resource grant on either axis keeps object-wide reach only with
     /// [`PermissionScope::All`], which is what stops a wildcard from inheriting
     /// one object's narrow authority.
@@ -315,8 +320,9 @@ impl Permission {
     /// [`PermissionScopeError::InvalidIdentifier`] with field `resource` when an
     /// object scope is attached to a resource that does not own that object, or
     /// with field `action` when a Bifrost scope is attached to an action other
-    /// than [`Action::Read`] for query or [`Action::Write`] for record, or a
-    /// gateway scope to any action other than [`Action::Invoke`].
+    /// than [`Action::Read`] for query or [`Action::Write`] for record, a
+    /// gateway scope to any action other than [`Action::Invoke`], or a Verifier
+    /// scope to any action other than [`Action::Run`].
     pub fn validate(&self) -> Result<(), PermissionScopeError> {
         self.scope.validate()?;
         let (resource_accepts, required_action) = match &self.scope {
@@ -330,6 +336,7 @@ impl Permission {
                 },
             ),
             PermissionScope::Gateway(_) => (self.resource == Resource::Gateway, Action::Invoke),
+            PermissionScope::Verifier(_) => (self.resource == Resource::Verifier, Action::Run),
         };
         if !resource_accepts {
             return Err(PermissionScopeError::InvalidIdentifier {
@@ -461,6 +468,32 @@ impl Permission {
     pub const fn eval_run() -> Self {
         Self {
             resource: Resource::Evals,
+            action: Action::Run,
+            scope: PermissionScope::All,
+        }
+    }
+
+    /// Invoke the one Verifier Card `verifier`, directly or as a manual run.
+    ///
+    /// The permission an explicit invocation requires: only a grant of this
+    /// exact UID or [`Self::verifier_run_any`] covers it.
+    #[must_use]
+    pub const fn verifier_run(verifier: CardUid) -> Self {
+        Self {
+            resource: Resource::Verifier,
+            action: Action::Run,
+            scope: PermissionScope::Verifier(verifier),
+        }
+    }
+
+    /// Invoke every Verifier Card in the tenant.
+    ///
+    /// The unscoped grant the built-in `workload` and `editor` Roles carry; a
+    /// narrower custom Role grants [`Self::verifier_run`] for one UID.
+    #[must_use]
+    pub const fn verifier_run_any() -> Self {
+        Self {
+            resource: Resource::Verifier,
             action: Action::Run,
             scope: PermissionScope::All,
         }
@@ -797,6 +830,7 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "services" => Resource::Services,
         "operators" => Resource::Operators,
         "evals" => Resource::Evals,
+        "verifier" => Resource::Verifier,
         "drift" => Resource::Drift,
         "artifacts" => Resource::Artifacts,
         "audit" => Resource::Audit,
@@ -979,6 +1013,7 @@ mod tests {
             Resource::Services,
             Resource::Operators,
             Resource::Evals,
+            Resource::Verifier,
             Resource::Drift,
             Resource::Artifacts,
             Resource::Audit,
@@ -1212,6 +1247,50 @@ mod tests {
                     "resource": resource,
                     "action": action,
                     "scope": {"gateway": {"provider": {"provider": "openai"}}}
+                }))
+                .is_err(),
+                "{resource}:{action}"
+            );
+        }
+    }
+
+    /// Proves `verifier:run` parses, covers only its exact Verifier UID or the
+    /// unscoped grant, is never implied by `evals:run`, and refuses a Verifier
+    /// scope on any other operation.
+    #[test]
+    fn verifier_run_is_uid_scoped_and_distinct_from_eval_run() {
+        use wyrd_spec::ids::CardUid;
+        let uid = |value: &str| CardUid::new(value).expect("valid uuid7");
+        let bound = uid("01927b4c-0000-7000-8000-000000000001");
+        let other = uid("01927b4c-0000-7000-8000-000000000002");
+
+        assert_eq!(
+            "verifier:run".parse::<Permission>().expect("parses"),
+            Permission::verifier_run_any()
+        );
+        assert!(Permission::verifier_run_any().covers(&Permission::verifier_run(bound.clone())));
+        assert!(
+            Permission::verifier_run(bound.clone())
+                .covers(&Permission::verifier_run(bound.clone()))
+        );
+        assert!(
+            !Permission::verifier_run(other).covers(&Permission::verifier_run(bound.clone())),
+            "an unrelated UID grant does not cover"
+        );
+        assert!(
+            !Permission::eval_run().covers(&Permission::verifier_run(bound.clone())),
+            "evals:run alone does not cover"
+        );
+        assert_eq!(
+            serde_json::to_value(Permission::verifier_run(bound.clone())).expect("serializes"),
+            json!({"resource": "verifier", "action": "run", "scope": {"verifier": bound.as_str()}})
+        );
+        for (resource, action) in [("verifier", "read"), ("evals", "run")] {
+            assert!(
+                serde_json::from_value::<Permission>(json!({
+                    "resource": resource,
+                    "action": action,
+                    "scope": {"verifier": bound.as_str()}
                 }))
                 .is_err(),
                 "{resource}:{action}"

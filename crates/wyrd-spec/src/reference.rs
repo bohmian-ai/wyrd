@@ -842,7 +842,9 @@ mod tests {
     fn path_binding(dir: &str) -> crate::card::verifier::VerificationBinding {
         crate::card::verifier::VerificationBinding {
             verifier: Ref::Path(PathBuf::from(format!("{dir}/verifier.yaml"))),
-            runs_on: InlineableRef::Path(PathBuf::from(format!("{dir}/trigger.yaml"))),
+            runs_on: Some(InlineableRef::Path(PathBuf::from(format!(
+                "{dir}/trigger.yaml"
+            )))),
             on_failure: vec![InlineableRef::Path(PathBuf::from(format!(
                 "{dir}/operator.yaml"
             )))],

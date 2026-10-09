@@ -208,3 +208,66 @@ collector. Broad lanes above do not replace those focused Red/Green commands.
   `architecture/wyrd-security-posture.md`; `architecture/wyrd-design.md`;
   `TESTING.md` (definitive Wyrd guide for test ergonomics,
   understandability, structure, ownership, and lane selection)
+
+## Implementation Evidence
+
+Commits: `035be3105`, `a6257f909`, `472617b9e`, `2cca3a65a`, `540b16663`,
+`d4da18bee`, `b5ab2dd5d`, `8f65cb716`, `729174f44`, `24be8c7ff`, `a2e20233a`,
+`0abd5b8fb`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Principal discovery and idempotent direct grant/revoke with source provenance, audit, and tenant isolation (Scenario 1, AC-001) | `crates/wyrd/wyrd-server/src/components/principals/routes.rs` (`GET /v1/principals`, `PUT`/`DELETE /v1/principals/{id}/roles/{role}`, audit `auth.principal.list`, `auth.principal.role.{list,grant,revoke}`); `wyrd-sql` `role_assignments.rs` (`source` in key); `wyrd_client::principals::Principals::{list,roles,grant_role,revoke_role}`; CLI `wyrd principal list` / `principal role list\|grant\|revoke`; `IssueKeyResponse.principal_id` | `mise run test:principals:integration` (all summaries pass); `mise run check:tenant-isolation`; `mise run codegen:check` | PASS |
+| Direct user assignments survive login; revoke removes only `direct` (AC-001) | IdP login replaces only `idp` rows; token issuance reads distinct roles across sources | `principal_roles::direct_and_idp_user_assignments_coexist` in Rust (`cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^principal_roles::/)'`), Python `tests/integration/test_principal_roles.py::test_direct_and_idp_user_assignments_coexist`, TypeScript `tests/integration/principal-roles.test.ts` "direct and idp user assignments coexist" | PASS |
+| Four built-in roles replace retired names without aliases; Card principals get `workload`; omitted trusted-issuer roles default to `viewer` | `crates/shared/wyrd-runtime/src/builtin_roles.rs` (`BUILTIN_ROLES`, `DEFAULT_CARD_ROLE`, `DEFAULT_ISSUER_ROLE`) | `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/^builtin_roles::tests::/)'` (`exactly_four_roles_are_built_in`, `roles_are_strictly_nested`); `principal_roles::granted_editor_reaches_the_next_token_until_revoked`, `only_a_tenant_admin_assigns_roles` in all three SDKs | PASS |
+| One unbound-principal attribution rule across Bifrost, OTLP, and verification (Scenario 2) | `Principal::card_attribution()` → `CardAttribution::{Scoped,AnyRegistered}`; Gate `attribution::CardRegistry` resolves unbound `card_refs` (cap `MAX_ATTRIBUTED_CARDS = 32`); verification `service.rs` `resolve_direct` / `subject_in_scope` use the same rule | `mise run test:bifrost:journey:otlp` incl. `wyrd-testing::otlp negative::pg_tests::unbound_writer_attributes_spans_to_registered_cards_only` (registered → attributed; unregistered → rejected `wyrd.card_ref is outside the principal's Card scope`; none → unattributed); `mise run test:bifrost:journey:observe` | PASS |
+| Stock-client adapters resolve the token per request (Rust OTLP/HTTP behind `otel`; Python OTLP/HTTP + `GatewayAuth`; TS exporters + `gatewayFetch`); missing optional packages name what to install | `sdks/wyrd-sdk-rust/src/otel.rs`; `sdks/wyrd-sdk-python/python/wyrd/otel.py` (`span_exporter`, `log_exporter`, `metric_exporter`, `otel` extra), `python/wyrd/gateway/_auth.py` (`gateway` extra); `sdks/wyrd-sdk-ts/wyrd/src/otel.ts` (`@wyrd/sdk/otel`, optional peers), `gatewayFetch` in `src/index.ts` | `uv run python -m pytest -q tests/unit/gateway/test_gateway_auth.py` (3 passed: httpx, httpx2, async); `pnpm exec vitest run tests/unit/gateway.test.ts` ("gatewayFetch sends a fresh access token on every request"); `mise run ts:pack:check` | PASS |
+| `local_development`: setup admin key registers, hydrates, invokes, observes, verifies, exports, and queries with no key issued and no flush (AC-002) | `sdks/wyrd-sdk-rust/tests/integration/local_development.rs`, `sdks/wyrd-sdk-python/tests/integration/test_local_development.py`, `sdks/wyrd-sdk-ts/wyrd/tests/integration/local-development.test.ts` + `tests/support/local-development.ts`; harness `tenant_admin_key` / `tenantAdminKey` | Rust `-E 'test(=local_development::admin_key_completes_the_local_workflow)'` via `mise run test:bifrost:journey:observe`; Python `uv run python -m pytest -q -m integration tests/integration/test_local_development.py` via `mise run test:bifrost:journey:python` (68 passed); TS via `mise run test:bifrost:journey:typescript` (64 passed) | PASS |
+| `signed_in_development`: saved-login user completes the workflow; stock clients keep working after the original token expires (AC-002) | `signed_in_development.rs`, `test_signed_in_development.py`, `signed-in-development.test.ts`; harness `access_ttl_seconds` / `accessTtlSeconds` (zero skew) | `WYRD_IDENTITY_TARGET=rust mise run test:identity:journey` (7 passed), `WYRD_IDENTITY_TARGET=python …` (7 passed), `WYRD_IDENTITY_TARGET=typescript …` (7 passed); each asserts the lapsed original token gets 401, then Gateway invoke and OTLP export still succeed | PASS |
+| Local-development guide matches the proved workflow; docs describe principal roles | `docs/src/content/docs/self-hosting/local-development.svx` §6, `concepts/authorization.svx`, `reference/cli.svx`, `self-hosting/sso-and-oidc.svx`; `architecture/wyrd-security-posture.md`, `architecture/wyrd-design.md`; `fixtures/README.md` | `mise run docs:check` | PASS |
+| Format, lints, boundaries, generated contracts | — | `mise run fmt`, `mise run lints`, `mise run py:lints`, `mise run py:format:check`, `mise run py:typecheck`, `mise run py:test:unit` (593 passed), `mise run ts:lints`/`ts:format:check`/`ts:typecheck`, `mise run ts:test:unit` (63 passed), `mise run codegen:check`, `mise run check:deps`, `mise run check:py-wheel-no-testing`, `mise run test:gateway:journey`, `git diff --check` | PASS |
+
+### Decisions
+
+- `GatewayAuth` subclasses both `httpx.Auth` and `httpx2.Auth`. The current
+  OpenAI (3.x) and Anthropic Python SDKs build on `httpx2` and google-genai on
+  `httpx`; one instance serves either. Its flow overrides keep the bases'
+  signatures because each base types them with its own `Request`.
+- Omitted `default_roles` default to `viewer` for trusted issuers; human OIDC
+  connections keep roles only from `group_role_map`.
+- Unbound attribution resolves at most 32 Cards per request
+  (`MAX_ATTRIBUTED_CARDS`). Unbound Services share the rule with users and the
+  tenant administrator.
+- Only the new local and signed-in journeys are flush-free here. Removing
+  `flush_bifrost` from the remaining journeys is REQ-009/010 (TASK-003).
+- The Python harness's `cleanup` argument was removed. It was never
+  implemented, no caller passed it, and adding `access_ttl_seconds` would
+  otherwise push `__new__` over Clippy's argument limit.
+
+### Diagnoses
+
+- **Signed-in Rust journey 503 "gateway credential protection is unavailable".**
+  The test gateway's managed-secret keyring covers only the fixture tenant
+  (`test_gateway_config(fixture.data_tenant_id(), …)`), and alice was signed
+  in to a seeded tenant. Fix: sign alice in to `FIXTURE_TENANT_SLUG`.
+- **Signed-in Rust journey `ClientTransportDown` on Bifrost start.**
+  `ClientConfig::from_environment` derives the default gRPC port. Fix: set
+  `config.grpc.endpoint = server.grpc_url()`.
+- **`test_workflow_parameter_injection.py::test_explicit_workflow_bindings`
+  `KeyError: 'editor'`.** The role rename in `035be3105` also renamed a
+  workflow step lookup (`steps["writer"]`). Fix: restore the step name.
+- **TS signed-in journey "this credential already names its tenant".** The
+  `@wyrd/testing` CLI shim forwards the client's access token as an explicit
+  credential, and `WYRD_TENANT` beside it is correctly refused. The fresh
+  config home holds one saved login, so the test sets no `WYRD_TENANT`, like
+  the Rust journey.
+
+### Non-goals and scope
+
+No role aliases, direct permissions on principals, MCP principal surface,
+compatibility routes, or second refresh path were added. Rust provides no
+Gateway adapter. All changed files are within the expected write set, plus the
+identity, Bifrost, and TS integration lane selectors in `mise.toml` and the
+pack inventory in `scripts/check_ts_package.mjs`.
+
+Result: **IMPLEMENTED**.

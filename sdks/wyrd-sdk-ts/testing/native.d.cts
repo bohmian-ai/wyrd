@@ -73,16 +73,19 @@ export declare class NativeWyrdTestServer {
   /**
    * Mint an API key for a principal holding exactly `permissions`.
    *
-   * `permissions` are `resource:action` strings. This is the door a journey
-   * uses to prove an access gate from the caller's side: it seeds one role
-   * carrying only those grants and bootstraps a service onto it.
+   * Each permission is either a `resource:action` string, which grants every
+   * object of that operation, or an object in the persisted typed
+   * permission projection (`resource`, `action`, `scope`), which expresses
+   * object scope such as one Verifier. This is the door a journey uses to
+   * prove an access gate from the caller's side: it seeds one role carrying
+   * only those grants and bootstraps a service onto it.
    *
    * # Errors
    *
    * Returns a napi error for an unparsable permission, or when the harness
    * is closed or role seeding or bootstrapping fails.
    */
-  scopedApiKey(role: string, permissions: Array<string>): string
+  scopedApiKey(role: string, permissions: Array<any>): string
   /**
    * Provision a second active tenant so a journey can prove cross-tenant
    * isolation, returning its tenant ID.
@@ -143,6 +146,15 @@ export declare class NativeWyrdTestServer {
    * is closed, or bootstrapping fails.
    */
   bootstrapServiceInTenant(tenantId: string, roles: Array<string>, name: string): string
+  /**
+   * Issue a key for the fixture tenant's unbound administrator: the key
+   * `wyrd setup` prints, bound to no Card.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or issuing fails.
+   */
+  tenantAdminKey(): string
   /**
    * Activate the identity lane's Keycloak sign-in for one tenant and
    * return its id: the fixture tenant when `tenantSlug` is absent, else a
@@ -372,6 +384,12 @@ export interface NativeTestServerOptions {
    * register, for saved user login journeys.
    */
   humanSso?: boolean
+  /**
+   * Access-token lifetime in seconds, verified with no clock-skew
+   * allowance, so a journey can outlive one token; omitted keeps the
+   * production lifetime.
+   */
+  accessTtlSeconds?: number
 }
 
 /**

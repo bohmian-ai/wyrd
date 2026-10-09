@@ -138,9 +138,24 @@ and realtime result rows carry the application Run, Verifier Card, subject,
 and stable result identity. Direct execution returns independently and records
 through `ScribeOutbox` without creating a verification run or dispatch.
 
+A direct task Verifier judgment records exactly one `vala.verification.results`
+row and no detail-table row: `implementation = task`, `execution_status =
+completed`, its `passed`/`failed` verdict, exact `verifier_version` and
+`subject_card_uid`, null `owner_card_uid`/`binding_id`/`trigger_identity`/
+`window_*`, `source_record_id` set to the application Run record identity (the
+`execution_id` when none is supplied), the execution interval as
+`started_at`/`ended_at`, and the canonical JSON of its one `AssertionResult` in
+the sensitive `details` column. No new table or record type is added. The
+task3 merge already builds this row in `ResultPayloadBuilder::build`; this
+scenario proves it and carries the application Run identity into it.
+
 **RED.** Extend existing gateway-capture, result-projection, and direct-route
 tests with correlated continuous and direct cases plus malformed, partial, and
-unauthorized correlation refusals.
+unauthorized correlation refusals. Add a `verification::results` unit test that
+builds a task result and asserts its single `vala.verification.results` batch
+and row values, and extend the direct-route test to read the task row back by
+`result_id = execution_id` and to refuse `details` without the payload
+permission.
 
 **GREEN.** Carry the existing typed identities through gateway facts and result
 projection, and use Task 2's shared outbox for completed direct judgments.
@@ -205,6 +220,10 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
   provider duplicates Task 1 or Task 2 ownership.
 - Direct execution stages exactly one result through `ScribeOutbox` and creates
   no durable verification run, observation, or Operator dispatch.
+- A direct task Verifier judgment is recorded as one `vala.verification.results`
+  row (`implementation = task`) whose `AssertionResult` is in `details`, read
+  back by `result_id = execution_id` and refused without the payload
+  permission; no detail table or new record type exists for it.
 - The support-desk journeys use the same story and observable outcomes in all
   three SDKs and no test-only publication hook.
 - Public contracts regenerate cleanly and documentation matches the proved

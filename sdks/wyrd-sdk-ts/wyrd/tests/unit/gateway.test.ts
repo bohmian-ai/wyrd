@@ -1,6 +1,6 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
-import { Gateway, WyrdClient } from "@wyrd/sdk";
+import { Gateway, WyrdClient, gatewayFetch } from "@wyrd/sdk";
 
 /** Sits where a number is required, so a serde message would quote it verbatim. */
 const SENTINEL = "sk-live-typescript-surface-sentinel";
@@ -41,4 +41,23 @@ test("rejects a malformed body without echoing it", async () => {
   });
   const error = await refusal.catch((reason: unknown) => reason);
   expect(JSON.stringify(error) + String(error)).not.toContain(SENTINEL);
+});
+
+test("gatewayFetch sends a fresh access token on every request", async () => {
+  let minted = 0;
+  const client = { accessToken: async () => `token-${++minted}` } as unknown as WyrdClient;
+  const sent: (string | null)[] = [];
+  vi.stubGlobal("fetch", async (_input: string | URL | Request, init?: RequestInit) => {
+    sent.push(new Headers(init?.headers).get("authorization"));
+    return new Response("{}");
+  });
+  try {
+    const gateway = gatewayFetch(client);
+    await gateway("http://gateway/v1/models", { headers: { accept: "application/json" } });
+    await gateway("http://gateway/v1/models");
+  } finally {
+    vi.unstubAllGlobals();
+  }
+
+  expect(sent).toEqual(["Bearer token-1", "Bearer token-2"]);
 });

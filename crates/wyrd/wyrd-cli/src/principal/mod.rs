@@ -1,3 +1,4 @@
+/// `wyrd principal list`, `roles`, `grant-role`, and `revoke-role`.
 pub mod assignment;
 pub mod credential;
 pub mod revoke;

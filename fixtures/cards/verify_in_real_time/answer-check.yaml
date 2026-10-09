@@ -1,0 +1,16 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: answer-check
+  version: 1.0.0
+  space: default
+spec:
+  description: One task check that the agent answers "yes".
+  implementation:
+    kind: task
+    spec:
+      kind: assertion
+      id: answer
+      context_path: $.answer
+      operator: equals
+      expected: "yes"

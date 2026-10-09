@@ -82,20 +82,21 @@ it.
 
 Card-bound identities are provisioned idempotently by tenant, principal kind,
 Card kind, and Card UID. Re-applying a Card preserves the principal identity.
-The first projection grants the built-in `wyrd_default` role
-(`bifrost_table:read`, `bifrost_record:write`, `evals:run`) in the registration
-transaction, so the workload can emit and verify its evidence; its Card scope
-still bounds which Cards it may emit for and verify. A principal bound to no
+The first projection grants the built-in `workload` role in the registration
+transaction, so the workload can emit, query, and verify its evidence; its Card
+scope still bounds which Cards it may emit for and verify. A principal bound to no
 Card (User, tenant administrator, unbound Service) may attribute evidence to
 any registered observation-target Card in its own tenant; ingest resolves those
-references against the tenant registry, never across tenants. Tenant-wide Bifrost query
-reads come only from an explicit grant of the built-in `workload` role.
+references against the tenant registry, never across tenants.
 Re-applying a Card never grants the role again, so an administrator's
-revocation stands. A tenant administrator (`*`, not `service_accounts:write`)
-grants further roles to a Card-bound principal with `POST /v1/auth/grant-role`
-(`wyrd auth grant-role`); the decision is staged on the Scribe outbox as
-`auth.principal.role.grant`, and the role reaches tokens at the next key
-exchange.
+revocation stands. Roles are assigned to principals, not Cards. A tenant
+administrator (`*`, not `service_accounts:write`) grants and revokes direct
+roles with `PUT` and `DELETE /v1/principals/{id}/roles/{role}`
+(`wyrd principal role grant|revoke`); each decision is staged on the Scribe
+outbox as `auth.principal.role.grant` or `auth.principal.role.revoke`, and the
+change reaches the principal's next token. A user's assignments record their
+source: login replaces only `idp` assignments, so a direct grant survives the
+next login, and tokens carry the union of both sources.
 Credential issuance is a separate privileged operation and is policy-gated.
 The verification runtime also provisions one UUIDv7 `system` principal per
 tenant, the server's own identity for continuous verification work that has no

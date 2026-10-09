@@ -123,6 +123,7 @@ pub async fn list_assignable_principals(
         .await
 }
 
+/// SQL-shape checks of the assignable-principal directory statements.
 #[cfg(test)]
 mod tests {
     use super::{ASSIGNABLE_PRINCIPAL_BY_ID_SQL, LIST_ASSIGNABLE_PRINCIPALS_SQL};

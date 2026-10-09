@@ -32,7 +32,8 @@ const VIEWER: &[Permission] = &[
 ];
 
 /// [`VIEWER`] plus every runtime write a running Service or Agent performs:
-/// Bifrost table and record writes, evaluation, Workflow execution, Trigger
+/// Bifrost table and record writes, evaluation, explicit invocation of every
+/// Verifier, Workflow execution, Trigger
 /// writes, Operator invocation, and gateway invocation on every model.
 const WORKLOAD: &[Permission] = &[
     Permission::card_read(),
@@ -46,6 +47,7 @@ const WORKLOAD: &[Permission] = &[
     Permission::bifrost_table_write(),
     Permission::bifrost_record_write(),
     Permission::eval_run(),
+    Permission::verifier_run_any(),
     Permission::workflow_run(),
     Permission::trigger_write(),
     Permission::operator_invoke(),
@@ -67,6 +69,7 @@ const EDITOR: &[Permission] = &[
     Permission::bifrost_table_write(),
     Permission::bifrost_record_write(),
     Permission::eval_run(),
+    Permission::verifier_run_any(),
     Permission::workflow_run(),
     Permission::trigger_write(),
     Permission::operator_invoke(),
@@ -235,6 +238,7 @@ mod tests {
             Permission::bifrost_table_write(),
             Permission::bifrost_record_write(),
             Permission::eval_run(),
+            Permission::verifier_run_any(),
             Permission::workflow_run(),
             Permission::trigger_write(),
             Permission::operator_invoke(),

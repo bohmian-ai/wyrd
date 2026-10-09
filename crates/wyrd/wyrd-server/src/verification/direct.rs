@@ -14,16 +14,21 @@ use arrow::array::{ArrayRef, Float64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use chrono::Utc;
 use serde_json::{Value, json};
+use tracing::Instrument;
 use vala_drift::{DriftReport, FittedBaseline, score_drift};
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
-use vala_eval::{EvalExecError, InMemoryTraceSource};
+use vala_eval::tasks::{AssertionTaskExecutor, JudgeTaskExecutor};
+use vala_eval::{
+    ContextSnapshot, EvalExecError, InMemoryTraceSource, MediaBindings, RecordIdentity,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::drift::{DriftProfile, DriftSpec};
 use wyrd_spec::card::eval::EvalSpec;
-use wyrd_spec::card::verifier::VerifierImplementation;
+use wyrd_spec::card::verifier::{TaskVerifierSpec, VerifierImplementation, VerifierTask};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardUid, VerificationExecutionId};
 use wyrd_spec::vala::eval::EvalTask;
+use wyrd_spec::vala::eval::media::MediaRef;
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::ids::{RecordId, RunId};
 use wyrd_spec::verification::{
@@ -67,7 +72,8 @@ impl DirectExecutor {
     /// Judge `input` with `implementation` of `verifier_uid` for `tenant`.
     ///
     /// Drift scores the supplied columns with the shared `vala-drift` scorer;
-    /// Eval scores one synthetic record through the queued Eval path.
+    /// Eval scores one synthetic record through the queued Eval path; a task
+    /// runs its one assertion or LLM judge directly on the supplied context.
     /// Preparation — baseline load, input conversion, plan construction —
     /// is the `prepare` phase on `telemetry`.
     ///
@@ -112,11 +118,28 @@ impl DirectExecutor {
                 self.eval(tenant, execution_id, spec, &record, telemetry)
                     .await
             }
+            (
+                VerifierImplementation::Task(spec),
+                DirectVerificationInput::TaskContext { context, media },
+            ) => {
+                self.task(
+                    tenant,
+                    execution_id,
+                    spec,
+                    context,
+                    media.as_deref(),
+                    telemetry,
+                )
+                .await
+            }
             (VerifierImplementation::Drift(_), _) => {
                 Err(incompatible("a Drift Verifier judges drift_samples input"))
             }
             (VerifierImplementation::Eval(_), _) => {
                 Err(incompatible("an Eval Verifier judges eval_record input"))
+            }
+            (VerifierImplementation::Task(_), _) => {
+                Err(incompatible("a task Verifier judges task_context input"))
             }
         }
     }
@@ -193,6 +216,67 @@ impl DirectExecutor {
             }
         };
         Ok(VerifierReport::Drift(Some(report)))
+    }
+
+    /// Run a task Verifier's one check on `context`.
+    ///
+    /// An assertion runs through the shared assertion executor; an LLM judge
+    /// runs through the shared judge executor over the tenant's production
+    /// judge invoker. The check sees the context exactly as supplied, with
+    /// `media` bound for a judge Prompt.
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::VerificationDependencyFailed`] when a judge fails
+    /// after its own retries and [`WyrdError::VerificationInputIncompatible`]
+    /// when the check cannot evaluate the context.
+    async fn task(
+        &self,
+        tenant: DataTenantId,
+        execution_id: VerificationExecutionId,
+        spec: &TaskVerifierSpec,
+        context: &serde_json::Map<String, Value>,
+        media: Option<&[MediaRef]>,
+        telemetry: &ExecutionTelemetry,
+    ) -> Result<VerifierReport, WyrdError> {
+        let snapshot = ContextSnapshot::new(
+            Arc::new(Value::Object(context.clone())),
+            RecordIdentity {
+                run_id: RunId::from_string(execution_id.to_string()),
+                record_id: RecordId(execution_id.as_uuid()),
+                scenario_id: None,
+            },
+        )
+        .with_media(
+            MediaBindings::from_refs(media.into_iter().flatten().cloned()),
+            Vec::new(),
+        );
+        let checked = match &spec.definition {
+            VerifierTask::Assertion(task) => {
+                let _score = tracing::info_span!("verification.score").entered();
+                AssertionTaskExecutor::new().assert(task, &snapshot, 0)
+            }
+            VerifierTask::LlmJudge(task) => {
+                JudgeTaskExecutor::new(self.eval.judge_invoker(tenant, telemetry))
+                    .judge(task, &snapshot, 0)
+                    .instrument(tracing::info_span!("verification.score"))
+                    .await
+                    .map(|(result, _)| result)
+            }
+        };
+        checked
+            .map(|result| VerifierReport::Task(Box::new(result)))
+            .map_err(|error| match error {
+                EvalExecError::JudgeUnavailable { .. }
+                | EvalExecError::JudgeRetriesExhausted { .. }
+                | EvalExecError::JudgeInvalidOutput { .. } => {
+                    tracing::warn!(%execution_id, cause = %error, "direct task judge failed");
+                    WyrdError::VerificationDependencyFailed {
+                        message: "the judge provider failed after the task's retries".to_owned(),
+                        details: json!({}),
+                    }
+                }
+                error => incompatible(&error.to_string()),
+            })
     }
 
     /// Load the ready fitted baseline of `verifier_uid`.
@@ -377,7 +461,8 @@ fn samples_batch(
 /// Drift is the Vala report in its serialized spelling, read back into the
 /// typed wire report; a non-finite score or threshold of an inconclusive
 /// feature serializes as an absent value. Eval lists the ran assertion
-/// results and the skipped tasks with their reasons.
+/// results and the skipped tasks with their reasons. A task carries its one
+/// check result.
 ///
 /// # Errors
 /// Returns [`WyrdError::Internal`] when the Drift report does not encode into
@@ -395,6 +480,9 @@ pub fn detail(report: &VerifierReport) -> Result<VerificationExecutionDetail, Wy
         VerifierReport::Eval { report, .. } => {
             VerificationExecutionDetail::Eval(eval_detail(report))
         }
+        VerifierReport::Task(result) => VerificationExecutionDetail::Task {
+            result: result.clone(),
+        },
     })
 }
 

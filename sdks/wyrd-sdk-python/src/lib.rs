@@ -17,6 +17,7 @@ mod observe;
 #[cfg(feature = "python")]
 mod operators;
 #[cfg(feature = "python")]
+/// `wyrd.principals`: the Python projection of the tenant principal handle.
 mod principals;
 #[cfg(feature = "python")]
 mod state;

@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -4711,8 +4711,13 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+gateway = [
+    { name = "httpx" },
+    { name = "httpx2" },
+]
 otel = [
     { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
 ]
 
 [package.dev-dependencies]
@@ -4751,10 +4756,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", marker = "extra == 'gateway'", specifier = ">=0.27" },
+    { name = "httpx2", marker = "extra == 'gateway'", specifier = ">=2.7" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.27" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.27" },
     { name = "pyarrow", specifier = ">=18.0.0" },
 ]
-provides-extras = ["otel"]
+provides-extras = ["otel", "gateway"]
 
 [package.metadata.requires-dev]
 dev = [

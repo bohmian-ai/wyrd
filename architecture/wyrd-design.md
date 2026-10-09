@@ -245,7 +245,7 @@ not a passive integration or inventory product.
 21. **`verified_by` is the versioned verification subscription contract.**
     A Service component, Service, or standalone Agent declares typed
     `VerificationBinding` values. Each binding resolves one exact Verifier,
-    one Trigger activation, and zero or more failure Operators. The binding is
+    optional Trigger activation, and zero or more failure Operators. The binding is
     static declaration and never a per-request routing table; changing it
     changes the containing Card spec. There is no separate publication or
     monitor-routing field, and clients never select a Verifier per
@@ -791,13 +791,15 @@ Service view is `root`); the state returns the exact typed `CardRef` for an
 alias. `run.observe.verify(verifier, input)` judges the view's subject in real
 time: the client resolves the named Verifier among those bound in
 `verified_by` to that subject in the hydrated graph, shapes the input for the
-Verifier's kind (one Eval context, or Drift feature rows), and calls
+Verifier's implementation (one JSON context for Eval or Task, or Drift feature
+rows), and calls
 `POST /v1/verification/execute` once, without replay, returning the typed
 `Judgment`. An unbound name (`WYRD_SDK_404_UNKNOWN_VERIFIER`) or a wrongly
 shaped input (`WYRD_SDK_400_INVALID_OBSERVATION`) fails locally before any
 network IO, and a `failed` verdict is an ordinary return. Judging records no
-observation, run, dispatch, or Bifrost row and does not require Bifrost
-startup. SDKs carry no separate verification handle; binding and run
+observation, durable verification run, or dispatch and does not require Bifrost
+startup. Its completed result is staged through the Scribe outbox. SDKs carry
+no separate verification handle; binding and run
 operations remain server HTTP and MCP surfaces, and verification history is
 read with parameterized SQL through the Bifrost client.
 
@@ -1130,24 +1132,32 @@ Multi-party attestations are not part of the v1 Audit wire contract. Values in
 ### Verifier
 
 A subject-less verification declaration with exactly one typed implementation.
-`Verifier` is the only registrable verification kind: the initial closed
-`implementation.kind` variants are `drift` and `eval`, and `kind: Drift` /
+`Verifier` is the only registrable verification kind: the closed
+`implementation.kind` variants are `drift`, `eval`, and `task`, and `kind: Drift` /
 `kind: Eval` registrations are rejected. Scheduling and failure reaction
 remain on the binding's Trigger and Operators.
 ```yaml
 spec:
   description?: string
   implementation:
-    kind: drift | eval           # closed; variant fields below
-    spec: DriftSpec | EvalSpec    # implementation body below
+    kind: drift | eval | task                 # closed; variant fields below
+    spec: DriftSpec | EvalSpec | TaskVerifierSpec
 ```
+
+`task` deserializes into `TaskVerifierSpec`, not `EvalSpec`. This is the only new
+struct for the task implementation. Its `spec` is one flattened, `kind`-tagged
+`VerifierTask` enum value that reuses the existing `AssertionTask` or
+`LlmJudgeTask` payload; there is no nested `task` field, Eval task map, or
+replacement payload struct. The task uses the existing check behavior over
+direct JSON input, without Eval-only dependencies or conditions. It produces one
+judgment. Registration and binding do not grant invocation authority.
 
 A Verifier runs only through a `verified_by` binding on a Service component,
 Service, or standalone Agent, or through an analysis-only direct invocation:
 ```yaml
 verified_by:
   - verifier: Ref                            # → Verifier (exact version)
-    runs_on: InlineableRef<TriggerSpec>      # activation
+    runs_on?: InlineableRef<TriggerSpec>     # absent means explicit-only
     on_failure: [InlineableRef<OperatorSpec>] # zero or more reactions
 ```
 
@@ -1168,6 +1178,14 @@ Trigger decides when; the Verifier decides the verdict; the generic runner,
 not the Drift or Eval implementation, creates dispatches; each Operator owns
 its own delivery. A Verifier run never creates another Trigger. Direct
 Verifier invocation is analysis-only and dispatches nothing.
+
+Public direct and manual invocation checks `verifier:run` against the selected
+Verifier's exact Card UID. `PermissionScope::Verifier(CardUid)` names one UID;
+`All` covers every Verifier in the tenant. `evals:run` alone does not authorize
+the generic verification endpoint. Permission is checked before execution and
+the allowed or denied decision is audited. The subject Card is resolved in the
+same tenant; direct invocation does not use observation-attribution Card scope.
+A binding does not replace the invocation permission.
 
 The runner drains `wyrd.verifier_runs` in claim rounds. Each round considers
 every tenant with a claimable run, oldest first, with no tenant limit, and

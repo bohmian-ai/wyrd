@@ -328,13 +328,13 @@ mod tests {
     fn binding(verifier: &CardRef) -> VerificationBinding {
         VerificationBinding {
             verifier: Ref::Ref(verifier.clone()),
-            runs_on: InlineableRef::Inline(Box::new(TriggerSpec {
+            runs_on: Some(InlineableRef::Inline(Box::new(TriggerSpec {
                 description: None,
                 activation: TriggerActivation::Schedule {
                     cron: "0 * * * *".to_owned(),
                     tz: None,
                 },
-            })),
+            }))),
             on_failure: Vec::new(),
         }
     }

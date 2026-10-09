@@ -7,14 +7,19 @@
 
 mod gateway_admin;
 mod gateway_inference;
+/// The admin-key local workflow, start to finish, without a publication flush.
+mod local_development;
 mod observe_a_run;
 mod operator_connections;
 mod otel_export;
+/// Principal discovery and Role assignment through `Principals`.
 mod principal_roles;
 mod query_bifrost;
 mod register_and_hydrate;
 mod saved_user_auth;
 mod scheduled_drift_alerts_operator;
+/// The same workflow from a saved login, past access-token expiry.
+mod signed_in_development;
 mod support;
 mod verify_in_real_time;
 mod workflow_loading;

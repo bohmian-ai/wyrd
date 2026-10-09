@@ -1701,10 +1701,13 @@ export interface Judgment {
     | "eval_assertion"
     | "eval_llm_judge"
     | "eval_other"
+    | "task_assertion"
+    | "task_llm_judge"
     | "unknown";
   readonly verdict: "passed" | "failed" | "inconclusive";
   readonly summary: string;
-  readonly counts:
+  /** Count-only rollup of a Drift or Eval judgment; absent for a task Verifier. */
+  readonly counts?:
     | { readonly implementation: "drift"; readonly drifted_features: number; readonly total_features: number }
     | {
         readonly implementation: "eval";
@@ -1713,8 +1716,8 @@ export interface Judgment {
         readonly total_tasks: number;
         readonly pass_rate_percent: number;
       };
-  /** `{ drift: DriftReport }` or `{ eval: { results, skipped } }`. */
-  readonly detail: { readonly drift: unknown } | { readonly eval: unknown };
+  /** `{ drift: DriftReport }`, `{ eval: { results, skipped } }`, or `{ task: { result } }`. */
+  readonly detail: { readonly drift: unknown } | { readonly eval: unknown } | { readonly task: unknown };
 }
 
 /** The provider an Operator connection authenticates to. */
@@ -1921,14 +1924,18 @@ export type RoleAssignmentChange = PrincipalRoles & {
   readonly changed: boolean;
 };
 
-/** One assignable principal; users carry `email`, Services and Agents `name` and `card_ref`. */
+/**
+ * One assignable principal; users carry `email`, Services and Agents `name`,
+ * and Card-bound Services and Agents `card_ref`. `card_ref` is null for users
+ * and unbound Services.
+ */
 export type PrincipalSummary = {
   readonly principal_id: string;
   readonly kind: PrincipalKind;
   readonly status: "active" | "suspended";
   readonly email: string | null;
   readonly name: string | null;
-  readonly card_ref: Readonly<Record<string, string>> | null;
+  readonly card_ref: CardRef | null;
 };
 
 /** One page of principals; `next` is the following page's `after`, or null on the last page. */
@@ -2811,6 +2818,26 @@ export interface GatewayCapturePolicyWrite {
 /** Versioned capture policy as stored by the server. */
 export interface GatewayCapturePolicy extends GatewayCapturePolicyWrite {
   readonly version: number;
+}
+
+/**
+ * A `fetch` that authenticates every request to the Wyrd Gateway as `client`.
+ *
+ * Hand it to a stock client, such as
+ * `new OpenAI({ baseURL: \`${client.serverUrl}/v1\`, apiKey: "wyrd", fetch: gatewayFetch(client) })`.
+ * Each request asks `client` for its current access token and sends it as
+ * `Authorization: Bearer <token>`, so a long-lived client keeps working after
+ * any one access token expires.
+ *
+ * @param client - The client whose access token every request carries.
+ * @returns The authenticating `fetch`.
+ */
+export function gatewayFetch(client: WyrdClient): typeof fetch {
+  return async (input, init) => {
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    headers.set("authorization", `Bearer ${await client.accessToken()}`);
+    return fetch(input, { ...init, headers });
+  };
 }
 
 /**

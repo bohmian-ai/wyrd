@@ -66,6 +66,12 @@ def test_granted_editor_reaches_the_next_token_until_revoked(
     principal, key = issue(server, service)
     principals = Principals(client_of(server))
 
+    (found,) = principals.list(kind="service", name=service.name)["principals"]
+    bound = found["card_ref"]
+    assert found["principal_id"] == principal
+    assert bound is not None
+    assert (bound["kind"], bound["name"], bound["version"]) == ("Service", service.name, "1.0.0")
+    assert bound.get("uid") == str(service.uid)
     assert principals.roles(principal)["roles"] == [{"role": "workload", "source": "direct"}]
     assert len(Bifrost(client=client_of(server, key)).sql(TENANT_WIDE, model=Count)) == 1
     with pytest.raises(WyrdError) as refused:
@@ -109,6 +115,7 @@ def test_direct_and_idp_user_assignments_coexist(server: WyrdTestServer) -> None
     assert [(found["principal_id"], found["kind"]) for found in page["principals"]] == [
         (user, "user")
     ]
+    assert page["principals"][0]["card_ref"] is None
     assert page["next"] is None
 
     granted = principals.grant_role(user, "viewer")

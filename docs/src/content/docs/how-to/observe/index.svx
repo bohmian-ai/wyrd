@@ -32,8 +32,8 @@ separate card kind.
 - `GET /v1/verification/bindings/{binding_id}` reads a binding's schedule,
   readiness, and last activation (`cards:read`).
 - `POST /v1/verification/runs` enqueues a manual Drift run over an explicit
-  window, against a binding or a Verifier directly (`evals:run` plus scope over
-  the target); `GET /v1/verification/runs/{run_id}` reads its
+  window, against a binding or a Verifier directly (`verifier:run` on the
+  Verifier plus scope over the subject); `GET /v1/verification/runs/{run_id}` reads its
   status, result pointer, and Operator dispatches (`cards:read`).
 - Query `vala.verification.results` and `vala.drift.result_features` through
   Bifrost for verdicts and per-feature scores (`bifrost_query:read`).

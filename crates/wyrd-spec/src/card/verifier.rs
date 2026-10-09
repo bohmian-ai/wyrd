@@ -1,7 +1,7 @@
 //! Verifier Card spec and the inline verification binding that attaches one.
 //!
 //! A Verifier is the single registrable verification Card kind. It declares
-//! exactly one typed implementation — currently Drift or Eval — and carries no
+//! exactly one typed implementation — Drift, Eval, or one direct Task — and carries no
 //! secret material and no mutable runtime health. Subjects attach a Verifier
 //! through a [`VerificationBinding`] in their own `verified_by` list; the
 //! binding is part of the containing Card version and is never itself a Card.
@@ -9,7 +9,7 @@
 #[cfg(feature = "server")]
 use std::borrow::Cow;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(feature = "server")]
 use utoipa::openapi::RefOr;
 #[cfg(feature = "server")]
@@ -23,6 +23,7 @@ use crate::card::operator::OperatorSpec;
 use crate::card::trigger::TriggerSpec;
 use crate::ids::BindingId;
 use crate::reference::{CardRef, InlineableRef, Ref};
+use crate::vala::eval::{AssertionTask, LlmJudgeTask};
 use crate::verification::VerificationError;
 
 /// Verifier Card spec body.
@@ -63,6 +64,57 @@ pub enum VerifierImplementation {
     Drift(DriftSpec),
     /// Task-based evaluation over committed observations.
     Eval(EvalSpec),
+    /// One direct assertion or LLM judge over supplied JSON context.
+    Task(TaskVerifierSpec),
+}
+
+/// The body of a `task` Verifier: exactly one check, judged directly.
+///
+/// A real-time assertion or LLM judge is not an Eval workflow, so it carries
+/// no task map, dataset, sampling, pass gate, or task graph. Its one
+/// `kind`-tagged definition sits directly under `implementation.spec` and
+/// reuses the existing assertion and LLM-judge payloads. Deserialization
+/// refuses `depends_on` and `condition`, which have no meaning for one check,
+/// and any unknown field such as a nested `task:` wrapper.
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct TaskVerifierSpec {
+    /// The one check this Verifier runs.
+    #[serde(flatten)]
+    pub definition: VerifierTask,
+}
+
+/// The closed set of checks a `task` Verifier may run.
+///
+/// Internally tagged by `kind`; each variant reuses the existing
+/// [`AssertionTask`] or [`LlmJudgeTask`] payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VerifierTask {
+    /// Programmatic assertion against the supplied context.
+    Assertion(AssertionTask),
+    /// LLM-as-judge evaluation of the supplied context.
+    LlmJudge(LlmJudgeTask),
+}
+
+impl<'de> Deserialize<'de> for TaskVerifierSpec {
+    /// Decode the one flattened check and refuse graph-only fields.
+    ///
+    /// # Errors
+    /// Fails for an unknown or missing `kind`, an unknown field, or a
+    /// non-empty `depends_on` or present `condition`.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let definition = VerifierTask::deserialize(deserializer)?;
+        let (depends_on, condition) = match &definition {
+            VerifierTask::Assertion(task) => (&task.depends_on, task.condition.is_some()),
+            VerifierTask::LlmJudge(task) => (&task.depends_on, task.condition.is_some()),
+        };
+        if !depends_on.is_empty() || condition {
+            return Err(serde::de::Error::custom(
+                "a task Verifier runs one check; depends_on and condition do not apply",
+            ));
+        }
+        Ok(Self { definition })
+    }
 }
 
 /// Build the opaque OpenAPI object used for `EvalSpec`.
@@ -83,6 +135,32 @@ fn eval_spec_openapi_schema() -> RefOr<Schema> {
             .property("pass_gate", opaque_object.clone())
             .property("context_capture", opaque_object)
             .required("tasks")
+            .schema_type(Type::Object)
+            .build(),
+    ))
+}
+
+/// Build the opaque OpenAPI object used for `TaskVerifierSpec`.
+///
+/// The assertion and LLM-judge payloads carry no
+/// `utoipa::ToSchema`, so the branch names only the `kind` discriminator.
+#[cfg(feature = "server")]
+fn task_spec_openapi_schema() -> RefOr<Schema> {
+    RefOr::T(Schema::Object(
+        ObjectBuilder::new()
+            .description(Some(
+                "Task Verifier implementation spec: one assertion or llm_judge check.",
+            ))
+            .property(
+                "kind",
+                Schema::Object(
+                    ObjectBuilder::new()
+                        .schema_type(Type::String)
+                        .enum_values(Some(["assertion", "llm_judge"]))
+                        .build(),
+                ),
+            )
+            .required("kind")
             .schema_type(Type::Object)
             .build(),
     ))
@@ -124,6 +202,7 @@ impl PartialSchema for VerifierImplementation {
                 <DriftSpec as PartialSchema>::schema(),
             ))
             .item(implementation_branch("eval", eval_spec_openapi_schema()))
+            .item(implementation_branch("task", task_spec_openapi_schema()))
             .title(Some("VerifierImplementation"))
             .description(Some("One typed Verifier implementation."))
             .into()
@@ -162,6 +241,7 @@ impl VerifierImplementation {
         match self {
             Self::Drift(_) => "drift",
             Self::Eval(_) => "eval",
+            Self::Task(_) => "task",
         }
     }
 }
@@ -175,12 +255,13 @@ impl VerifierSpec {
     ///
     /// # Errors
     /// Returns the first [`DriftValidationError`] a Drift implementation
-    /// reports. The Eval implementation has no spec-local validator and always
-    /// succeeds here.
+    /// reports. The Eval and Task implementations have no spec-local
+    /// validator here and always succeed; a Task's shape is enforced when it
+    /// deserializes.
     pub fn validate(&self) -> Result<(), DriftValidationError> {
         match &self.implementation {
             VerifierImplementation::Drift(drift) => drift.validate(),
-            VerifierImplementation::Eval(_) => Ok(()),
+            VerifierImplementation::Eval(_) | VerifierImplementation::Task(_) => Ok(()),
         }
     }
 }
@@ -304,7 +385,11 @@ pub struct VerificationBinding {
     /// The exact Verifier Card this subject is verified by.
     pub verifier: Ref,
     /// When the bound Verifier runs, inline or as a referenced Trigger Card.
-    pub runs_on: InlineableRef<TriggerSpec>,
+    ///
+    /// Absent means explicit-only: the binding attaches the Verifier to its
+    /// subject for direct invocation and nothing activates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_on: Option<InlineableRef<TriggerSpec>>,
     /// Operators dispatched independently after a `failed` verdict.
     ///
     /// Empty means a failed result stays durable with no reaction.

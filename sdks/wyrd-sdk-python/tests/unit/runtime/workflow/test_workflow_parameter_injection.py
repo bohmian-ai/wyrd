@@ -91,7 +91,7 @@ def test_explicit_workflow_bindings() -> None:
     }
     assert run.steps["planner"]["structured_output"] == {"foo": "A", "bar": "B"}
     assert run.steps["planner"]["attempts"] == 1
-    assert run.steps["editor"]["text"] == "pick A for rust"
+    assert run.steps["writer"]["text"] == "pick A for rust"
     snapshot: WorkflowRunDict = run.to_dict()
     planner: WorkflowStepResult = snapshot["steps"]["planner"]
     assert snapshot["outputs"] == run.outputs

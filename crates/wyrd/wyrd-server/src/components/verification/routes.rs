@@ -82,8 +82,8 @@ async fn get_binding(
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the body, window, or Idempotency-Key is
-/// malformed, the caller lacks `evals:run` or subject scope, the target is
-/// unknown, unrunnable, or not ready, the key was used for a different
+/// malformed, the caller lacks `verifier:run` on the selected Verifier or
+/// subject scope, the target is unknown, unrunnable, or not ready, the key was used for a different
 /// request, or the enqueue fails.
 #[utoipa::path(
     post,
@@ -99,8 +99,9 @@ async fn get_binding(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks evals:run or Card scope over the \
-          subject (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:run on the selected \
+          Verifier or Card scope over the subject (WYRD_PERMISSION_403_DENIED_RBAC)",
+          body = WyrdProblem),
         (status = 404, description = "No such binding in the caller's tenant \
           (WYRD_VERIFICATION_404_BINDING_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The Verifier's baseline is not ready, or the \
@@ -188,7 +189,7 @@ async fn get_run(
 ///
 /// # Errors
 /// Returns a stable Wyrd error when the body is too large or malformed, the
-/// caller lacks `evals:run` or subject scope, the target is unknown, the
+/// caller lacks `verifier:run` on the Verifier, the target is unknown, the
 /// baseline is not ready or legacy, the input does not fit the Verifier, a
 /// judge fails, or the deadline elapses.
 #[utoipa::path(
@@ -203,8 +204,8 @@ async fn get_run(
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
           WYRD_AUTH_401_TOKEN_EXPIRED)", body = WyrdProblem),
-        (status = 403, description = "The principal lacks evals:run or Card scope over the \
-          subject (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
+        (status = 403, description = "The principal lacks verifier:run on the Verifier \
+          (WYRD_PERMISSION_403_DENIED_RBAC)", body = WyrdProblem),
         (status = 404, description = "No active Verifier and subject with these UIDs in the \
           caller's tenant (WYRD_VERIFICATION_404_TARGET_NOT_FOUND)", body = WyrdProblem),
         (status = 409, description = "The fitted baseline is not ready or legacy \

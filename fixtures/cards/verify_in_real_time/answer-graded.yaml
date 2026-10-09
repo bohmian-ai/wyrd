@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: answer-graded
+  version: 1.0.0
+  space: default
+spec:
+  description: One task check where an LLM judge grades the agent's answer.
+  implementation:
+    kind: task
+    spec:
+      kind: llm_judge
+      id: judge
+      judge_ref:
+        prompt: ./judge-prompt.yaml
+        tool_names: []
+        run_config: {max_iterations: 1}
+      context_path: $.answer
+      operator: equals
+      expected: {passed: true}
+      max_retries: 0

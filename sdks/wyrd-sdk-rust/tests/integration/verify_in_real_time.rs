@@ -1,5 +1,7 @@
 //! An assistant judges its own behavior while it runs: `observe().verify`
-//! returns a `Judgment` from the Verifier bound to the observed Card.
+//! returns a `Judgment` from the Verifier bound to the observed Card, whether
+//! that Verifier is an Eval, a Drift, or a single task check. Only
+//! `verifier:run` on the named Verifier authorizes the call.
 
 use std::time::Duration;
 
@@ -47,6 +49,10 @@ struct Assistant {
     service: CardRef,
     /// The registered `latency-drift` Verifier.
     latency_drift: CardRef,
+    /// The registered `answer-is-yes` Eval Verifier.
+    answer_is_yes: CardRef,
+    /// The registered `answer-check` task Verifier.
+    answer_check: CardRef,
 }
 
 impl Assistant {
@@ -92,6 +98,8 @@ impl Assistant {
             bundle,
             service: assistant.root.clone(),
             latency_drift: registered(&assistant, "latency-drift"),
+            answer_is_yes: registered(&assistant, "answer-is-yes"),
+            answer_check: registered(&assistant, "answer-check"),
         }
     }
 
@@ -191,6 +199,77 @@ async fn agent_answer_fails_its_verifier() {
     assistant.deployment.shutdown().await;
 }
 
+/// A task Verifier's one assertion passes the expected answer and fails any
+/// other, with no counts: a single check has nothing to count.
+///
+/// # Panics
+/// Panics when a verify fails or a judgment differs.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn agent_answer_is_judged_by_its_task_check() {
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+    let run = state.run_for_card("agent").expect("agent run opens");
+
+    for (answer, verdict) in [
+        ("yes", VerificationVerdict::Passed),
+        ("no", VerificationVerdict::Failed),
+    ] {
+        let judgment = run
+            .observe()
+            .verify("answer-check", &Answer { answer })
+            .await
+            .expect("the answer is judged");
+        assert_eq!(
+            (judgment.verdict, judgment.kind, judgment.counts),
+            (verdict, VerifierKind::TaskAssertion, None)
+        );
+        assert_eq!(judgment.verifier.name.as_str(), "answer-check");
+    }
+    assistant.deployment.shutdown().await;
+}
+
+/// A task Verifier's LLM judge grades the answer through the server's
+/// provider upstream, here the local mock judge.
+///
+/// # Panics
+/// Panics when the verify fails, the judgment differs, or the judge did not
+/// receive the graded answer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn graded_answer_passes_the_task_llm_judge() {
+    let assistant = Assistant::start().await;
+    let state = assistant.state().await;
+
+    let judgment = state
+        .run_for_card("agent")
+        .expect("agent run opens")
+        .observe()
+        .verify("answer-graded", &Answer { answer: "yes" })
+        .await
+        .expect("the answer is judged");
+
+    assert_eq!(
+        (judgment.verdict, judgment.kind, judgment.counts),
+        (
+            VerificationVerdict::Passed,
+            VerifierKind::TaskLlmJudge,
+            None
+        )
+    );
+    let graded = assistant
+        .judge
+        .received_requests()
+        .await
+        .expect("the judge records requests");
+    assert_eq!(graded.len(), 1);
+    assert!(
+        String::from_utf8_lossy(&graded[0].body).contains("Grade the answer yes."),
+        "the judge received the answer"
+    );
+    assistant.deployment.shutdown().await;
+}
+
 /// The LLM judge grades the answer through the server's provider upstream.
 ///
 /// # Panics
@@ -286,10 +365,10 @@ async fn model_latency_drift_is_judged_failed() {
         (
             VerificationVerdict::Failed,
             VerifierKind::DriftPsi,
-            VerifierCounts::Drift {
+            Some(VerifierCounts::Drift {
                 drifted_features: 1,
                 total_features: 1
-            }
+            })
         )
     );
     assistant.deployment.shutdown().await;
@@ -373,34 +452,72 @@ async fn input_of_the_wrong_shape_fails_locally() {
     assistant.deployment.shutdown().await;
 }
 
-/// A state created with a machine principal holding only the `workload`
-/// Role, which grants no `evals:run`, cannot verify.
+/// A principal holding only `evals:run`, or `verifier:run` on another
+/// Verifier, cannot verify with `answer-check`: neither grant names it, and
+/// the binding is no grant.
 ///
 /// # Panics
-/// Panics when the verify succeeds or is refused with another code.
+/// Panics when a verify succeeds or is refused with another code.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn caller_without_evals_run_is_refused() {
+async fn caller_without_the_verifier_grant_is_refused() {
     let assistant = Assistant::start().await;
-    let workload = assistant
+    let evals_only = assistant
         .deployment
-        .key("workload_only", &["workload"])
+        .scoped_key("evals_only", &["evals:run"])
         .await;
-    let state = assistant.state_as(assistant.deployment.client(&workload));
+    let other_verifier = assistant
+        .deployment
+        .verifier_key("other_verifier", &assistant.answer_is_yes)
+        .await;
 
-    let refused = state
-        .run_for_card("agent")
-        .expect("agent run opens")
+    for key in [evals_only, other_verifier] {
+        let refused = assistant
+            .state_as(assistant.deployment.client(&key))
+            .run_for_card("agent")
+            .expect("agent run opens")
+            .observe()
+            .verify("answer-check", &Answer { answer: "yes" })
+            .await
+            .expect_err("no grant names answer-check");
+        assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+    }
+    assistant.deployment.shutdown().await;
+}
+
+/// A Card-bound principal granted `verifier:run` on exactly `answer-check`
+/// verifies with it, whatever Card it is bound to, and with nothing else.
+///
+/// # Panics
+/// Panics when the granted verify is refused or the other one is not.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn exact_verifier_grant_verifies_only_that_verifier() {
+    let assistant = Assistant::start().await;
+    let key = assistant
+        .deployment
+        .verifier_key("exact_verifier", &assistant.answer_check)
+        .await;
+    let state = assistant.state_as(assistant.deployment.client(&key));
+    let run = state.run_for_card("agent").expect("agent run opens");
+
+    let judgment = run
+        .observe()
+        .verify("answer-check", &Answer { answer: "yes" })
+        .await
+        .expect("the granted Verifier judges");
+    assert!(judgment.passed());
+    let refused = run
         .observe()
         .verify("answer-is-yes", &Answer { answer: "yes" })
         .await
-        .expect_err("the workload role cannot verify");
-
+        .expect_err("the grant names one Verifier");
     assert_eq!(refused.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
     assistant.deployment.shutdown().await;
 }
 
-/// Another tenant's administrator cannot verify this tenant's assistant.
+/// Another tenant's administrator cannot verify this tenant's assistant with
+/// either its Eval or its task Verifier.
 ///
 /// # Panics
 /// Panics when the verify succeeds or is refused with another code.
@@ -414,16 +531,20 @@ async fn another_tenant_cannot_verify_the_assistant() {
         .await;
     let state = assistant.state_as(assistant.deployment.client(&foreign));
     state.start_bifrost().await.expect("Bifrost starts");
+    let run = state.run_for_card("agent").expect("agent run opens");
 
-    let refused = state
-        .run_for_card("agent")
-        .expect("agent run opens")
-        .observe()
-        .verify("answer-is-yes", &Answer { answer: "yes" })
-        .await
-        .expect_err("another tenant cannot verify");
-
-    assert_eq!(refused.code(), "WYRD_VERIFICATION_404_TARGET_NOT_FOUND");
+    for verifier in ["answer-is-yes", "answer-check"] {
+        let refused = run
+            .observe()
+            .verify(verifier, &Answer { answer: "yes" })
+            .await
+            .expect_err("another tenant cannot verify");
+        assert_eq!(
+            refused.code(),
+            "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+            "{verifier}"
+        );
+    }
     assistant.deployment.shutdown().await;
 }
 

@@ -1221,7 +1221,10 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
     /// already pinned to exact UIDs. A referenced Trigger is read back by UID
     /// inside this transaction (a sibling Trigger was persisted earlier in it)
     /// so its schedule is frozen with the binding; an inline Trigger or
-    /// Operator is frozen as its canonical spec digest.
+    /// Operator is frozen as its canonical spec digest. A binding without
+    /// `runs_on` is explicit-only and has no activation to project, so it is
+    /// not frozen; a client selects its Verifier through the Card's
+    /// `verified_by` instead.
     ///
     /// # Errors
     /// Returns `WYRD_INTERNAL` when a bound ref lacks its pinned UID or a
@@ -1246,7 +1249,10 @@ impl<'a, 'c> BindingProjector<'a, 'c> {
         let mut bindings = Vec::new();
         for (occurrence, subject, site) in sites {
             for binding in site {
-                let (trigger, activation) = match &binding.runs_on {
+                let Some(runs_on) = &binding.runs_on else {
+                    continue;
+                };
+                let (trigger, activation) = match runs_on {
                     InlineableRef::Inline(trigger) => {
                         let body = Spec::Trigger((**trigger).clone());
                         (inline_digest(&body)?, trigger.activation.clone())

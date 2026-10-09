@@ -1,0 +1,17 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  space: wyrd-team
+  name: cohort-check
+  version: "1.0.0"
+spec:
+  # One task, not a graph: no `tasks` map, `depends_on`, or `condition`.
+  # Bound without `runs_on`, it runs only when a caller invokes it explicitly.
+  implementation:
+    kind: task
+    spec:
+      kind: assertion
+      id: cohort_valid
+      context_path: $.cohort
+      operator: in
+      expected: [loyal_win_back, price_sensitive, service_frustrated, unreachable]

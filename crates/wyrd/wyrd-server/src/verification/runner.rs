@@ -173,6 +173,8 @@ impl VerifierEngines {
             VerifierImplementation::Eval(spec) => {
                 Box::pin(self.eval.execute(tenant, run, spec, telemetry)).await
             }
+            // A task Verifier is invoked directly, never through a queued run.
+            VerifierImplementation::Task(_) => EngineOutcome::implementation_unavailable("task"),
         }
     }
 }
@@ -720,8 +722,8 @@ impl VerifierRunner {
 /// returned rather than staged: only a settlement that still holds the lease
 /// may stage it, so a holder that lost its lease writes no result.
 ///
-/// A missing SYSTEM principal or an unbuildable report terminates `errored`
-/// with no write.
+/// A missing SYSTEM principal, an unbuildable report, or a report with no
+/// counts (a task, which is never queued) terminates `errored` with no write.
 fn result(
     run: &ClaimedRun,
     verifier: &CardRef,
@@ -734,6 +736,12 @@ fn result(
     };
     let result_id = VerificationResultId::new_v7();
     let event_time = Utc::now();
+    let invalid = || {
+        Transition::Terminate(
+            TerminalStatus::Errored,
+            failure(RESULT_INVALID, "the verification result cannot be encoded"),
+        )
+    };
     let verifier_ref = CardRef {
         uid: None,
         ..verifier.clone()
@@ -752,14 +760,11 @@ fn result(
         Ok(payload) => payload,
         Err(error) => {
             tracing::warn!(run_id = %run.lease.run_id, %error, "verification result encoding failed");
-            return (
-                Transition::Terminate(
-                    TerminalStatus::Errored,
-                    failure(RESULT_INVALID, "the verification result cannot be encoded"),
-                ),
-                None,
-            );
+            return (invalid(), None);
         }
+    };
+    let Some(counts) = report.counts() else {
+        return (invalid(), None);
     };
     let verdict = payload.verdict();
     (
@@ -767,7 +772,7 @@ fn result(
             result_id,
             verdict,
             summary: report.summary(),
-            counts: report.counts(),
+            counts,
         },
         Some(ScribeWrite::Result {
             payload,

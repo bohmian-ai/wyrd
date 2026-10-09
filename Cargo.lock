@@ -11616,6 +11616,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "url",
+ "wyrd-auth-verify",
  "wyrd-cards",
  "wyrd-cli",
  "wyrd-client",
@@ -11635,7 +11636,10 @@ name = "wyrd-sdk-rust"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "async-trait",
+ "chrono",
  "opentelemetry",
+ "opentelemetry-http",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "reqwest 0.13.4",
@@ -11646,6 +11650,7 @@ dependencies = [
  "tokio",
  "wiremock",
  "workspace-hack",
+ "wyrd-auth-verify",
  "wyrd-cli",
  "wyrd-client",
  "wyrd-sdk-rust",
@@ -11678,6 +11683,7 @@ name = "wyrd-sdk-ts-testing"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "chrono",
  "napi",
  "napi-build",
  "napi-derive",
@@ -11686,6 +11692,7 @@ dependencies = [
  "serde_json",
  "url",
  "vala-bifrost-redux",
+ "wyrd-auth-verify",
  "wyrd-cli",
  "wyrd-client",
  "wyrd-runtime",

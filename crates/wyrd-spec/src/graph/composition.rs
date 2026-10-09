@@ -6,7 +6,10 @@ use super::{GraphError, RootPick, identity_key, submission_card_ref};
 use crate::card::agent::AgentSpec;
 use crate::card::operator::{OperatorAction, OperatorSpec};
 use crate::card::trigger::TriggerSpec;
-use crate::card::verifier::{OWNER_OCCURRENCE_KEY, VerificationBinding, VerifierImplementation};
+use crate::card::verifier::{
+    OWNER_OCCURRENCE_KEY, TaskVerifierSpec, VerificationBinding, VerifierImplementation,
+    VerifierTask,
+};
 use crate::card::workflow::WorkflowAction;
 use crate::envelope::{CardKind, Spec};
 use crate::error::WyrdError;
@@ -161,7 +164,9 @@ pub fn binding_validation_errors(bindings: &[VerificationBinding], field: &str) 
                 });
             }
         }
-        check_runs_on(&binding.runs_on, &binding_field, &mut errors);
+        if let Some(runs_on) = &binding.runs_on {
+            check_runs_on(runs_on, &binding_field, &mut errors);
+        }
         check_on_failure(&binding.on_failure, &binding_field, &mut errors);
     }
     errors
@@ -324,11 +329,19 @@ impl Spec {
                     }
                 }
             }
-            Self::Verifier(verifier) => {
-                if let VerifierImplementation::Eval(eval) = &verifier.implementation {
+            Self::Verifier(verifier) => match &verifier.implementation {
+                VerifierImplementation::Eval(eval) => {
                     push_nested_judges(eval, "spec.implementation.spec", &mut sites);
                 }
-            }
+                VerifierImplementation::Task(TaskVerifierSpec {
+                    definition: VerifierTask::LlmJudge(judge),
+                }) => {
+                    if let InlineableRef::Inline(agent) = &judge.judge_ref {
+                        push_nested_agent(agent, "spec.implementation.spec.judge_ref", &mut sites);
+                    }
+                }
+                VerifierImplementation::Drift(_) | VerifierImplementation::Task(_) => {}
+            },
             Self::Data(_)
             | Self::Model(_)
             | Self::Prompt(_)

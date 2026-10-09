@@ -28,26 +28,28 @@ impl JudgeTaskExecutor {
     pub fn new(invoker: Arc<dyn JudgeInvoker>) -> Self {
         Self { invoker }
     }
-}
 
-#[async_trait]
-impl TaskExecutor for JudgeTaskExecutor {
-    async fn execute(
+    /// Judge one `task` against `snapshot` at `stage` through the injected invoker.
+    ///
+    /// The typed entry point shared by Eval graph dispatch and a standalone
+    /// task Verifier: it checks required media, narrows the scoped view to
+    /// the task's path, invokes the judge Agent with the task's retries, and
+    /// compares the parsed output with the task's operator.
+    ///
+    /// # Errors
+    /// Returns [`EvalExecError::MediaBindingMissingForTask`] for unbound
+    /// media, [`EvalExecError::ExtractPathMissing`] or
+    /// [`EvalExecError::JsonPathFailure`] for an unresolved path,
+    /// [`EvalExecError::JudgeInvalidOutput`] or
+    /// [`EvalExecError::JudgeRetriesExhausted`] when the judge fails, and
+    /// [`EvalExecError::OperatorTypeMismatch`] when the operator cannot
+    /// compare the parsed and expected values.
+    pub async fn judge(
         &self,
-        task: &EvalTask,
+        judge: &LlmJudgeTask,
         snapshot: &ContextSnapshot,
         stage: u32,
-    ) -> Result<TaskOutput, EvalExecError> {
-        let EvalTask::LlmJudge(judge) = task else {
-            return Err(EvalExecError::DagInvalid {
-                reason: format!(
-                    "stage {stage} dispatched {} task {:?} to judge executor",
-                    task.discriminator(),
-                    task.id().as_str()
-                ),
-            });
-        };
-
+    ) -> Result<(AssertionResult, JudgeOutcome), EvalExecError> {
         for media_id in snapshot.required_media.iter() {
             if snapshot.media.get(media_id).is_none() {
                 return Err(EvalExecError::MediaBindingMissingForTask {
@@ -94,6 +96,29 @@ impl TaskExecutor for JudgeTaskExecutor {
             parsed,
             judge_ref: judge.judge_ref.as_card_ref().cloned(),
         };
+        Ok((result, outcome))
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for JudgeTaskExecutor {
+    async fn execute(
+        &self,
+        task: &EvalTask,
+        snapshot: &ContextSnapshot,
+        stage: u32,
+    ) -> Result<TaskOutput, EvalExecError> {
+        let EvalTask::LlmJudge(judge) = task else {
+            return Err(EvalExecError::DagInvalid {
+                reason: format!(
+                    "stage {stage} dispatched {} task {:?} to judge executor",
+                    task.discriminator(),
+                    task.id().as_str()
+                ),
+            });
+        };
+
+        let (result, outcome) = self.judge(judge, snapshot, stage).await?;
         Ok(TaskOutput::Judge {
             result,
             outcome: Box::new(outcome),

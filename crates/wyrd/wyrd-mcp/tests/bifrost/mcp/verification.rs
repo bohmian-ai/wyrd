@@ -28,6 +28,7 @@ mod pg_tests {
     use wyrd_client::cards::{CardGraphHydrator, CardSelector, Cards, HydrationMode};
     use wyrd_client::state::WyrdState;
     use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_runtime::Permission;
     use wyrd_spec::reference::CardRef;
     use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -37,13 +38,13 @@ mod pg_tests {
     /// The binding status read tool.
     const GET_BINDING: &str = "verification.get_binding";
 
-    /// The manual run write tool, offered only with `evals:run`.
+    /// The manual run write tool, offered only with `verifier:run`.
     const START_RUN: &str = "verification.start_run";
 
     /// The run status read tool.
     const GET_RUN: &str = "verification.get_run";
 
-    /// The direct execution write tool, offered only with `evals:run`.
+    /// The direct execution write tool, offered only with `verifier:run`.
     const EXECUTE: &str = "verification.execute";
 
     /// The existing Bifrost read tool verdicts are read through.
@@ -249,7 +250,7 @@ mod pg_tests {
         );
         assert!(
             !reader_names.contains(&START_RUN),
-            "an agent without evals:run is not offered the write tool: {reader_names:?}"
+            "an agent without verifier:run is not offered the write tool: {reader_names:?}"
         );
         let refused = reader_client.call_tool(call(START_RUN, start)?).await;
         let rendered = match refused {
@@ -550,7 +551,7 @@ mod pg_tests {
         )?;
         assert!(
             denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
-            "a caller without evals:run is refused: {denied}"
+            "a caller without verifier:run is refused: {denied}"
         );
         reader_client.cancel().await?;
 
@@ -594,8 +595,9 @@ mod pg_tests {
     ///
     /// The tool result carries the exact Verifier and subject, the `passed`
     /// or `failed` verdict, and the Drift detail; nothing is enqueued. A
-    /// reader is refused with the RBAC code, and another tenant's
-    /// administrator cannot resolve this tenant's Cards.
+    /// reader and a caller holding only `evals:run` are neither offered the
+    /// tool nor allowed it, and another tenant's administrator cannot resolve
+    /// this tenant's Cards.
     ///
     /// # Errors
     ///
@@ -641,18 +643,32 @@ mod pg_tests {
         }
         agent_client.cancel().await?;
 
-        let reader = server
-            .bootstrap_service("mcp-execute-reader", &["viewer"])
+        server
+            .seed_role(
+                "mcp_evals_only",
+                &[Permission::card_read(), Permission::eval_run()],
+            )
             .await?;
-        let reader_client =
-            ().serve_with_lifecycle(transport(&server, api_key(&reader)?, None)?, discover())
-                .await?;
-        let denied = refusal(reader_client.call_tool(call(EXECUTE, request(1.0))?).await)?;
-        assert!(
-            denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
-            "a caller without evals:run is refused: {denied}"
-        );
-        reader_client.cancel().await?;
+        for (name, role) in [
+            ("mcp-execute-reader", "viewer"),
+            ("mcp-execute-evals-only", "mcp_evals_only"),
+        ] {
+            let caller = server.bootstrap_service(name, &[role]).await?;
+            let caller_client =
+                ().serve_with_lifecycle(transport(&server, api_key(&caller)?, None)?, discover())
+                    .await?;
+            let tools = caller_client.list_all_tools().await?;
+            assert!(
+                !tools.iter().any(|tool| tool.name == EXECUTE),
+                "{role} is not offered the execute tool"
+            );
+            let denied = refusal(caller_client.call_tool(call(EXECUTE, request(1.0))?).await)?;
+            assert!(
+                denied.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+                "a caller without verifier:run is refused: {role}: {denied}"
+            );
+            caller_client.cancel().await?;
+        }
 
         let other_tenant = server.seed_tenant("mcp-execute-other").await?;
         let foreign = server

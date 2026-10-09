@@ -176,6 +176,7 @@ ulid = "1"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry-http = { version = "0.31", default-features = false }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "trace", "metrics", "logs", "with-serde"] }
 arrow = "59.2"
 arrow-array = "59.2"

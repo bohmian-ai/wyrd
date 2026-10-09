@@ -303,16 +303,37 @@ distributed queries.**
 - **FIND-003-10:** delete `PublishedAssignment` from `oracle/exec.rs`, with
   its `assigned` parameter and the `Some` branch. Its only caller passes
   `None`.
-- **FIND-003-20: dropped. Keep `ShreddedResiduals`.**
-  - The review called it a copy of `parquet_variant_compute::unshred_variant`,
-    but it is not one.
-  - It enforces Bifrost's bounded validation (size, encoding, numeric
-    ranges, depth) on every shredded residual before anything decodes it,
-    as `architecture/bifrost-design.md` ~165-175 requires.
-  - `unshred_variant` builds output immediately and enforces none of those
-    bounds.
-  - These bounds are Bifrost's rules, so the walk is Wyrd-specific and stays.
-    Do not change `variant.rs`.
+- **FIND-003-20: delete Wyrd's shredded-layout walk. The forks already do
+  this work.**
+  - **The fork already handles it.** In the DataFusion fork, the default
+    `PhysicalExprAdapter` converts every file's Variant to the table's
+    canonical, unshredded Variant on read. It first runs arrow-rs's full
+    validation, then calls arrow-rs `unshred_variant` (spec revision 26,
+    "Reading").
+  - **So the walk never sees real data.** Every query result that reaches
+    Wyrd's JSON renderers has already been validated and unshredded:
+    - the client facade;
+    - the CLI;
+    - MCP;
+    - server verification.
+
+    The `typed_value` branch of `mask_placeholders` in
+    `crates/shared/wyrd-queue/src/variant.rs` is therefore never reached by
+    production data. Only the synthetic unit test
+    `shredded_residuals_pass_the_read_gate` feeds it a shredded column.
+  - **Fix:**
+    - Delete `ShreddedResiduals`, `present_owners`, the `typed_value` branch
+      in `mask_placeholders`, and the test
+      `shredded_residuals_pass_the_read_gate`.
+    - Update the `mask_placeholders` rustdoc so it no longer mentions
+      shredded residuals.
+    - Do not call `unshred_variant` from Wyrd. Wyrd neither unshreds nor
+      walks the shredded layout.
+  - **Proof:** an Oracle read of a shredded published file still renders
+    correctly through `variant_cell_to_json` and `WyrdJsonEncoderFactory`.
+    The existing nested-pushdown and Oracle journeys cover this; run them.
+  - **Out of scope:** the top-level `EncodedVariant::validate` in
+    `mask_placeholders` and the placeholder masking stay as they are.
 
 ### Group 6: docs and style
 
@@ -382,6 +403,7 @@ distributed queries.**
   - `reconciliation_limit_bytes`
   - `PublishedAssignment`
   - `bifrost_oracle_file_pruning_total`
+  - `ShreddedResiduals`
 - These pass:
   - `mise run test:bifrost`, including the Oracle journeys, the
     analytical lifecycle and the MCP leak journey;

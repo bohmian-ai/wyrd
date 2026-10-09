@@ -341,6 +341,7 @@ mod tests {
             TimestampMicrosecondArray::from_iter_values((0..rows).map(|row| row * 2 + offset));
         let record = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(times)])
             .expect("fixture member batch");
+        let arrow_bytes = crate::scribe::memory::retained_arrow_bytes(&record);
         FrozenMemtable {
             seal_id: u64::from(batch),
             seal_key: SealKey::new(
@@ -354,7 +355,7 @@ mod tests {
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
-            arrow_bytes: 0,
+            arrow_bytes,
         }
     }
 

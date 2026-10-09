@@ -323,6 +323,9 @@ pub struct StagedHotSourceRecordV1 {
     wal_range: StagedLsnRange,
     /// Fsynced sorted runs holding the rows, in sort order.
     runs: Vec<StagedRunFile>,
+    /// Uncompressed Arrow bytes the member's rows held in the memtable, which
+    /// the assembler's size target counts.
+    raw_bytes: u64,
     /// Instant the member became durable and queryable.
     ready_at: DateTime<Utc>,
     /// Current lifecycle position.
@@ -340,6 +343,7 @@ impl StagedHotSourceRecordV1 {
         member: StagedMemberId,
         wal_range: StagedLsnRange,
         runs: Vec<StagedRunFile>,
+        raw_bytes: u64,
         ready_at: DateTime<Utc>,
     ) -> Self {
         Self {
@@ -355,6 +359,7 @@ impl StagedHotSourceRecordV1 {
             generation: member.generation(),
             wal_range,
             runs,
+            raw_bytes,
             ready_at,
             state: StagedMemberState::Ready,
         }
@@ -452,11 +457,12 @@ impl StagedHotSourceRecordV1 {
     ///
     /// # Errors
     ///
-    /// Returns [`HotStageError::Invalid`] when the member carries no bytes or
-    /// no rows, which cannot describe a frozen nonempty bucket.
+    /// Returns [`HotStageError::Invalid`] when the member carries no raw
+    /// bytes, no encoded bytes, or no rows, which cannot describe a frozen nonempty bucket.
     pub fn ready_member(&self, name: &str) -> Result<ReadyMember, HotStageError> {
         ReadyMember::new(
             self.member(),
+            self.raw_bytes,
             self.encoded_bytes(),
             self.rows(),
             self.ready_at,
@@ -1243,6 +1249,7 @@ mod tests {
             member,
             StagedLsnRange { min: 10, max: 42 },
             vec![run],
+            64,
             ready_at(),
         );
         stage
@@ -1274,6 +1281,7 @@ mod tests {
             .ready_member("member.staged.json")
             .expect("the member projects into the ready index");
         assert_eq!(ready.id(), member);
+        assert_eq!(ready.raw_bytes(), 64);
         assert_eq!(ready.encoded_bytes(), 16);
         assert_eq!(ready.ready_at(), ready_at());
     }
@@ -1295,6 +1303,7 @@ mod tests {
             StagedMemberId::new(4, 1),
             StagedLsnRange { min: 1, max: 2 },
             Vec::new(),
+            64,
             ready_at(),
         );
         record.tenant = DataTenantId::SYSTEM_OWNER;
@@ -1371,6 +1380,7 @@ mod tests {
             member,
             StagedLsnRange { min: 1, max: 2 },
             vec![run],
+            64,
             ready_at(),
         );
         let mut encoded: serde_json::Value =
@@ -1421,6 +1431,7 @@ mod tests {
             member,
             StagedLsnRange { min: 3, max: 9 },
             vec![run],
+            64,
             ready_at(),
         );
         stage
@@ -1501,6 +1512,7 @@ mod tests {
                 member,
                 StagedLsnRange { min: 1, max: 1 },
                 vec![run],
+                64,
                 ready_at(),
             );
             let before = syncs();
@@ -1563,6 +1575,7 @@ mod tests {
                 *member,
                 StagedLsnRange { min: 1, max: 1 },
                 vec![run],
+                64,
                 ready_at(),
             );
             stage
@@ -1625,6 +1638,7 @@ mod tests {
             member,
             StagedLsnRange { min: 4, max: 4 },
             vec![run],
+            64,
             ready_at(),
         );
         stage
@@ -1701,6 +1715,7 @@ mod tests {
             member,
             StagedLsnRange { min: 4, max: 4 },
             vec![run],
+            64,
             ready_at(),
         );
         stage
@@ -1812,6 +1827,7 @@ mod tests {
             member,
             StagedLsnRange { min: 8, max: 8 },
             vec![run],
+            64,
             ready_at(),
         );
         stage
@@ -1918,6 +1934,7 @@ mod tests {
             member,
             StagedLsnRange { min: 2, max: 2 },
             vec![run],
+            64,
             ready_at(),
         );
         stage

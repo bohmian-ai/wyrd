@@ -396,7 +396,7 @@ The principal size boundaries are independent:
 | Ingest request | one `scribe.ingest_request_bytes` wire ceiling, 16 MiB default |
 | Ingest expanded data | derived 4x the wire ceiling (64 MiB default), enforced before WAL; no row cap |
 | Parquet row group | soft 128 MiB encoded target; a single large accepted row fits a group of its own |
-| Scribe hot object | `min(WYRD_MAX_FILE_SIZE_ON_DISK, Forge target)` encoded whole-file target, drained by size or dwell, with bounded residue |
+| Scribe hot object | `min(WYRD_MAX_FILE_SIZE_ON_DISK, Forge target)`: a key's ready members drain once their summed raw (uncompressed Arrow) bytes reach it, or at dwell, with bounded residue; output objects roll at the same value in encoded bytes |
 | Forge rewrite output | the table's optional registered compaction target, else the deployment default of approximately 1 GiB (`WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES`) |
 
 Ingest has exactly one size setting. The wire ceiling bounds encoded request
@@ -475,7 +475,11 @@ be split across claims and a later member cannot join an existing claim.
 `PhysicalLayout` order; rows that tie on every layout key keep claim-member
 order, then their position within the staged run, so the merged order is
 deterministic without a per-row tie-breaker column. It writes Parquet row groups toward a soft 128 MiB target and
-closes immutable hot objects around the 512 MiB whole-file target. A completed row group is
+closes immutable hot objects around the 512 MiB whole-file target. The claim
+trigger counts raw bytes: each staged member records the uncompressed Arrow
+bytes its frozen bucket held, and a key is claimed once those sum to the target,
+matching how memtable rotation measures size. Counting encoded bytes instead
+would hold a well-compressing table until dwell. A completed row group is
 indivisible, and a smaller object is valid for dwell, partition close,
 pressure, drain, or final residue. The 512 MiB target is independent of WAL,
 active-memory, row-group, and Forge output geometry.

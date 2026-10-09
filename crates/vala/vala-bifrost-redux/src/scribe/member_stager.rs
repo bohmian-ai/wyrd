@@ -84,6 +84,9 @@ pub struct StagedRuns {
     runs: Vec<StagedRunFile>,
     /// Durable staged bytes committed to the staging volume for these runs.
     staged_bytes: u64,
+    /// Uncompressed Arrow bytes the frozen bucket held, recorded so the
+    /// assembler's size target counts raw data rather than encoded bytes.
+    raw_bytes: u64,
 }
 
 impl StagedRuns {
@@ -233,6 +236,11 @@ impl ScribeMemberStager {
             wal: request.origin.wal,
             runs,
             staged_bytes,
+            raw_bytes: u64::try_from(request.frozen.arrow_bytes).map_err(|_| {
+                ScribeError::Internal {
+                    detail: "staged member raw size exceeds u64".to_owned(),
+                }
+            })?,
         })
     }
 
@@ -255,6 +263,7 @@ impl ScribeMemberStager {
             staged.member,
             staged.wal,
             staged.runs,
+            staged.raw_bytes,
             ready_at,
         );
         self.stage
@@ -416,6 +425,7 @@ mod tests {
             ))],
         )
         .expect("frozen member fixture");
+        let arrow_bytes = crate::scribe::memory::retained_arrow_bytes(&batch);
         FrozenMemtable {
             seal_id: 11,
             seal_key: SealKey::new(
@@ -429,7 +439,7 @@ mod tests {
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
-            arrow_bytes: 0,
+            arrow_bytes,
         }
     }
 
@@ -503,6 +513,11 @@ mod tests {
             .expect("staged member publishes ready");
         assert_eq!(ready.id(), StagedMemberId::new(5, 9));
         assert_eq!(ready.rows(), 512);
+        assert_eq!(
+            ready.raw_bytes(),
+            u64::try_from(frozen.arrow_bytes).expect("fixture size fits u64"),
+            "the size target counts the frozen bucket's raw Arrow bytes"
+        );
 
         let recovered = stage.recover().await.expect("scan after publication");
         let members = recovered

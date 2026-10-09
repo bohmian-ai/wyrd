@@ -285,6 +285,11 @@ impl StagedMemberId {
 pub struct ReadyMember {
     /// Immutable identity of the member within its key.
     id: StagedMemberId,
+    /// Uncompressed Arrow bytes the member's rows held in the memtable.
+    ///
+    /// The size target counts these, so publication tracks how much data
+    /// arrived rather than how well it compressed.
+    raw_bytes: u64,
     /// Encoded bytes the member's runs occupy on the staging volume.
     encoded_bytes: u64,
     /// Exact rows the member carries.
@@ -299,16 +304,17 @@ impl ReadyMember {
     /// # Errors
     ///
     /// Returns [`AssemblyError::EmptyMember`] when the member reports zero
-    /// encoded bytes or zero rows. Such a member cannot exist — a bucket is
-    /// frozen only when it is nonempty — and admitting it would let a claim
-    /// grow without ever approaching its target.
+    /// raw bytes, zero encoded bytes, or zero rows. Such a member cannot
+    /// exist — a bucket is frozen only when it is nonempty — and admitting it
+    /// would let a claim grow without ever approaching its target.
     pub fn new(
         id: StagedMemberId,
+        raw_bytes: u64,
         encoded_bytes: u64,
         rows: u64,
         ready_at: DateTime<Utc>,
     ) -> Result<Self, AssemblyError> {
-        if encoded_bytes == 0 || rows == 0 {
+        if raw_bytes == 0 || encoded_bytes == 0 || rows == 0 {
             return Err(AssemblyError::EmptyMember {
                 shard: id.shard(),
                 generation: id.generation(),
@@ -316,6 +322,7 @@ impl ReadyMember {
         }
         Ok(Self {
             id,
+            raw_bytes,
             encoded_bytes,
             rows,
             ready_at,
@@ -326,6 +333,12 @@ impl ReadyMember {
     #[must_use]
     pub const fn id(self) -> StagedMemberId {
         self.id
+    }
+
+    /// Returns the uncompressed Arrow bytes the size target counts.
+    #[must_use]
+    pub const fn raw_bytes(self) -> u64 {
+        self.raw_bytes
     }
 
     /// Returns the encoded staging bytes the member occupies.
@@ -528,9 +541,9 @@ impl StagingClaim {
 /// Why the assembler refused a registration or a claim.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AssemblyError {
-    /// A staged member reported no bytes or no rows.
+    /// A staged member reported no raw bytes, no encoded bytes, or no rows.
     #[error(
-        "Scribe staged member from shard {shard} generation {generation} carries no encoded bytes or rows"
+        "Scribe staged member from shard {shard} generation {generation} carries no raw bytes, encoded bytes, or rows"
     )]
     EmptyMember {
         /// Shard that produced the member.
@@ -579,7 +592,7 @@ pub enum AssemblyError {
 /// Validated controls governing when and how many claims are taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagingAssemblerConfig {
-    /// Encoded bytes a claim must reach to close at target.
+    /// Raw (uncompressed Arrow) bytes a claim must reach to close at target.
     target_file_size_bytes: u64,
     /// Longest a ready member may wait before it is released as residue.
     max_dwell: Duration,
@@ -624,7 +637,7 @@ impl StagingAssemblerConfig {
         })
     }
 
-    /// Returns the encoded bytes a claim must reach to close at target.
+    /// Returns the raw bytes a claim must reach to close at target.
     #[must_use]
     pub const fn target_file_size_bytes(self) -> u64 {
         self.target_file_size_bytes
@@ -659,7 +672,10 @@ impl KeyReadyIndex {
         self.members.insert(position, member);
     }
 
-    /// Returns the smallest complete prefix whose bytes reach `target`.
+    /// Returns the smallest complete prefix whose raw bytes reach `target`.
+    ///
+    /// Raw rather than encoded bytes are summed so a well-compressing table
+    /// publishes on the same data volume as a poorly compressing one.
     ///
     /// Returns `None` while the key is still filling: a shorter prefix would
     /// publish a smaller object than configured, which is the amplification the
@@ -667,7 +683,7 @@ impl KeyReadyIndex {
     fn target_prefix(&self, target: u64) -> Option<usize> {
         let mut summed: u64 = 0;
         for (index, member) in self.members.iter().enumerate() {
-            summed = summed.saturating_add(member.encoded_bytes());
+            summed = summed.saturating_add(member.raw_bytes());
             if summed >= target {
                 return Some(index + 1);
             }
@@ -1233,6 +1249,7 @@ mod tests {
         ReadyMember::new(
             StagedMemberId::new(shard, generation),
             bytes,
+            bytes,
             bytes / 10,
             ready_at,
         )
@@ -1260,6 +1277,7 @@ mod tests {
         ReadyMember::new(
             StagedMemberId::new(shard, generation),
             bytes,
+            bytes,
             rows,
             ready_at,
         )
@@ -1286,6 +1304,35 @@ mod tests {
             StagingAssemblerConfig::new(target, Duration::from_mins(10), budget)
                 .expect("fixture controls validate"),
         )
+    }
+
+    /// The size target counts raw bytes, not the smaller encoded bytes.
+    ///
+    /// A table that compresses 4:1 must publish once 1,000 raw bytes have
+    /// arrived, even though its staged runs hold only 250 encoded bytes;
+    /// counting encoded bytes would hold it until the dwell instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture registration or claim is refused.
+    #[test]
+    fn target_counts_raw_bytes_not_encoded_bytes() {
+        let tenant = DataTenantId::new_v7();
+        let key = key_for(tenant, 0);
+        let compressed = ReadyMember::new(StagedMemberId::new(1, 1), 1_000, 250, 100, at(0))
+            .expect("a nonempty fixture member");
+        let mut staging = assembler(1_000, 4);
+        staging
+            .register_ready(&key, compressed)
+            .expect("a fresh member registers");
+
+        let claim = staging
+            .next_claim(at(1))
+            .expect("claim budget is free")
+            .expect("raw bytes reach target before the dwell");
+
+        assert!(claim.cause().is_target());
+        assert_eq!(claim.encoded_bytes(), 250);
     }
 
     /// A claim's identity is a function of its members, not of how they arrived.
@@ -2030,7 +2077,7 @@ mod tests {
             }
         );
         assert_eq!(
-            ReadyMember::new(StagedMemberId::new(1, 1), 0, 10, at(0))
+            ReadyMember::new(StagedMemberId::new(1, 1), 10, 0, 10, at(0))
                 .expect_err("an empty member is refused"),
             AssemblyError::EmptyMember {
                 shard: 1,

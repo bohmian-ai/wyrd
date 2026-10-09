@@ -971,7 +971,10 @@ mod tests {
             assert!(frame.card_scope.is_empty());
         }
         assert_eq!(received[2].principal, attribution.principal);
-        assert_eq!(received[2].card_scope, [attribution.verifier.clone()]);
+        assert_eq!(
+            received[2].card_scope,
+            std::slice::from_ref(&attribution.verifier)
+        );
         assert!(received.iter().all(|frame| frame.tenant == tenant));
         assert!(
             received

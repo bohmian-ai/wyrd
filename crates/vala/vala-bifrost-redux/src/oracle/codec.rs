@@ -29,7 +29,7 @@ pub const ORACLE_REMOTE_SCAN_TAG: &str = "wyrd.oracle.remote_scan";
 /// this revision, so a worker built from another revision refuses the plan at
 /// preflight instead of decoding it differently. It must equal the
 /// `datafusion` revision in the workspace `[patch.crates-io]`.
-pub const ORACLE_DATAFUSION_REVISION: &str = "a4ff145509b00df9eaaf79b29984cf68387ea65d";
+pub const ORACLE_DATAFUSION_REVISION: &str = "fd02579cc7b4253d477613757b8d2e651f0057e5";
 
 /// Commits `revision`, length-prefixed, to a peer digest.
 ///

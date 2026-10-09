@@ -259,39 +259,39 @@ datafusion-distributed = { git = "https://github.com/bohmian-ai/datafusion-distr
 # Parquet read planner) replaces these crates for every consumer, including the
 # iceberg, compaction, and distributed git dependencies.
 [patch.crates-io]
-datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
-datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "a4ff145509b00df9eaaf79b29984cf68387ea65d" }
+datafusion = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-common = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-datasource = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-datasource-parquet = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-functions = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-functions-variant = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-physical-expr = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-physical-expr-adapter = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-proto = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
+datafusion-pruning = { git = "https://github.com/bohmian-ai/datafusion", rev = "fd02579cc7b4253d477613757b8d2e651f0057e5" }
 # Arrow-rs 60.0.0 with the unshred_variant buffer pre-size fix, the same
 # revision the DataFusion fork pins.
-arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-arith = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-buffer = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-cmp = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-csv = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-data = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-flight = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-ord = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-row = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-select = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-arrow-string = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-parquet = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-parquet-variant = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-parquet-variant-compute = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
-parquet-variant-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "0d0eb247d802de3063e19871754e7ee7f9b381d9" }
+arrow = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-arith = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-buffer = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-cmp = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-csv = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-data = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-flight = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-ord = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-row = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-select = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+arrow-string = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+parquet = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+parquet-variant = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+parquet-variant-compute = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
+parquet-variant-json = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -63,6 +63,10 @@ async fn service_principal() -> (Deployment, PrincipalId, String) {
 
 /// Register [`AUTHORED`] as the principal holding `key`, through a fresh
 /// client so the call carries the principal's next token.
+///
+/// # Errors
+/// Returns the registration error, `WYRD_PERMISSION_403_DENIED_RBAC` when the
+/// principal's Roles do not include Card authoring.
 async fn author(deployment: &Deployment, key: &str) -> Result<(), WyrdError> {
     Cards::with_client(deployment.client(key))
         .register_from_path(&fixture(AUTHORED))

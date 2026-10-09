@@ -53,6 +53,8 @@ pub mod transport {
     pub use wyrd_client::transport::{GrpcConfig, HttpConfig, ResolvedCredential};
 }
 
+/// Stock OpenTelemetry OTLP exporters that authenticate every export with
+/// the client's current token.
 #[cfg(feature = "otel")]
 pub mod otel;
 

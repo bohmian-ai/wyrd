@@ -10,18 +10,24 @@ use wyrd_spec::auth::RoleSource;
 
 use crate::TenantConn;
 
+/// Insert one user Role assignment from one source; an existing identical
+/// assignment is left in place so a repeated grant reports no change.
 const GRANT_ROLE_TO_USER_SQL: &str = r"
         INSERT INTO wyrd.auth_user_roles (data_tenant_id, user_id, role_id, source)
         VALUES ($1, $2, $3, $4)
         ON CONFLICT (data_tenant_id, user_id, role_id, source) DO NOTHING
         ";
 
+/// Delete one user Role assignment from one source, leaving the same Role
+/// held from the other source in place.
 const REVOKE_ROLE_FROM_USER_SQL: &str = "DELETE FROM wyrd.auth_user_roles
            WHERE data_tenant_id = wyrd.current_tenant()
              AND user_id = $1
              AND role_id = $2
              AND source = $3";
 
+/// List a user's effective Role names for token minting.
+///
 /// A Role held from both sources is one effective Role, so names are distinct.
 const LIST_USER_ROLES_SQL: &str = r"
         SELECT DISTINCT r.name
@@ -34,6 +40,8 @@ const LIST_USER_ROLES_SQL: &str = r"
          ORDER BY r.name
         ";
 
+/// List a user's Role assignments with their source, one row per Role and
+/// source, ordered so administrators read a stable assignment set.
 const LIST_USER_ROLE_ASSIGNMENTS_SQL: &str = r"
         SELECT r.name, ur.source
           FROM wyrd.auth_user_roles ur
@@ -67,6 +75,8 @@ const REPLACE_IDP_USER_ROLES_SQL: &str = r"
         SELECT EXISTS (SELECT 1 FROM removed) OR EXISTS (SELECT 1 FROM added)
         ";
 
+/// Insert one direct Role assignment for a Service or Agent principal; an
+/// existing assignment is left in place so a repeated grant reports no change.
 const GRANT_ROLE_TO_SERVICE_ACCOUNT_SQL: &str = r"
         INSERT INTO wyrd.auth_service_account_roles (
             data_tenant_id, service_account_id, role_id
@@ -74,11 +84,13 @@ const GRANT_ROLE_TO_SERVICE_ACCOUNT_SQL: &str = r"
         ON CONFLICT (data_tenant_id, service_account_id, role_id) DO NOTHING
         ";
 
+/// Delete one Role assignment from a Service or Agent principal.
 const REVOKE_ROLE_FROM_SERVICE_ACCOUNT_SQL: &str = "DELETE FROM wyrd.auth_service_account_roles
            WHERE data_tenant_id = wyrd.current_tenant()
              AND service_account_id = $1
              AND role_id = $2";
 
+/// List a Service or Agent principal's Role names; every one is `direct`.
 const LIST_SERVICE_ACCOUNT_ROLES_SQL: &str = r"
         SELECT r.name
           FROM wyrd.auth_service_account_roles sar

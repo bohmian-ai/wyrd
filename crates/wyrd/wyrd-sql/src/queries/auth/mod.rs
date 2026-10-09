@@ -11,6 +11,8 @@ pub mod api_keys;
 pub mod device_authorizations;
 pub mod human_connections;
 pub mod login_state;
+/// Discovery of the users and Service or Agent principals a tenant
+/// administrator can assign Roles to.
 pub mod principal_directory;
 pub mod refresh_tokens;
 pub mod revocation;

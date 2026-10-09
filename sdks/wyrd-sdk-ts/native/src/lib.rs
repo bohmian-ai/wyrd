@@ -10,6 +10,7 @@ pub mod cli;
 pub mod client;
 pub mod gateway;
 pub mod operators;
+/// The napi projection of the tenant principal handle.
 pub mod principals;
 pub mod workflow;
 

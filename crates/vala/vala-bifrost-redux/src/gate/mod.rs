@@ -1,5 +1,7 @@
 //! Bifrost Gate — the server-independent auth, transport-limit, and routing boundary.
 
+/// Registry resolution of the Cards an unbound writer may attribute
+/// evidence to, shared by ingest and OTLP admission.
 pub mod attribution;
 pub mod auth;
 pub mod error;

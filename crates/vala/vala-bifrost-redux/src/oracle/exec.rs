@@ -272,8 +272,8 @@ impl RemoteScanMetrics {
 pub(crate) struct OracleQueryScanStats {
     /// Physical bytes reported by `DataFusion`'s Parquet scan metric.
     pub(crate) physical_bytes_scanned: Option<u64>,
-    /// Number of file ranges executed file scan nodes opened: the ranges they
-    /// were planned to read, less those `DataFusion`'s `FilePruner` skipped.
+    /// Number of distinct files executed file scan nodes were planned to read,
+    /// less what `DataFusion`'s `FilePruner` skipped when opening them.
     pub(crate) files_scanned: u64,
     /// Number of file partitions represented by executed scan nodes.
     pub(crate) partitions_scanned: u64,
@@ -283,6 +283,12 @@ pub(crate) struct OracleQueryScanStats {
     physical_metrics: Vec<ExecutionPlanMetricsSet>,
     /// Participant-reported scan accumulators from every remote scan leaf.
     remote_handles: Vec<Arc<RemoteScanMetrics>>,
+    /// Every file location the plan's scans read, across all tasks.
+    ///
+    /// `DataFusion` lists one file as several byte ranges, and the distributed
+    /// planner spreads one file's ranges over several tasks, so files are
+    /// counted once by location over the whole plan.
+    planned_files: std::collections::HashSet<object_store::path::Path>,
     /// Prevents duplicate terminal aggregation when a stream closes twice.
     finalized: bool,
 }
@@ -298,6 +304,7 @@ impl OracleQueryScanStats {
         let mut stats = Self::default();
         let local_metrics = query_class_for_root(plan) == QueryClass::Interactive;
         Self::visit(plan, local_metrics, &mut stats);
+        stats.files_scanned = stats.planned_files.len() as u64;
         stats
     }
 
@@ -305,8 +312,9 @@ impl OracleQueryScanStats {
     ///
     /// Files are counted from the plan before execution, and `DataFusion`
     /// skips files whose statistics exclude them only as it opens each one,
-    /// so the skipped files are subtracted last. A file split into several
-    /// ranges counts once per range on both sides.
+    /// so the skipped files are subtracted last. `DataFusion` reports skips per
+    /// byte range, not per file, so a file split into several ranges and
+    /// skipped is subtracted once per range; the count saturates at zero.
     pub(crate) fn finalize(&mut self) {
         if self.finalized {
             return;
@@ -347,8 +355,8 @@ impl OracleQueryScanStats {
     ///
     /// A network boundary returns its stage plan as a child, and a split leaf
     /// holds one scan per task that `children()` does not return, so its
-    /// variants are descended to count the file ranges and partitions every
-    /// task was planned to read. `local_metrics` retains each file source's
+    /// variants are descended to collect the files and count the partitions
+    /// every task was planned to read. `local_metrics` retains each file source's
     /// metric set for [`Self::finalize`]; it is false for a distributed root,
     /// whose scans report through [`record_distributed_scan_metrics`].
     fn visit(plan: &dyn ExecutionPlan, local_metrics: bool, stats: &mut Self) {
@@ -358,9 +366,13 @@ impl OracleQueryScanStats {
             stats.partitions_scanned = stats
                 .partitions_scanned
                 .saturating_add(config.file_groups.len() as u64);
-            stats.files_scanned = stats
-                .files_scanned
-                .saturating_add(file_ranges(config) as u64);
+            stats.planned_files.extend(
+                config
+                    .file_groups
+                    .iter()
+                    .flat_map(FileGroup::iter)
+                    .map(|file| file.object_meta.location.clone()),
+            );
             if local_metrics {
                 stats
                     .physical_metrics
@@ -1486,15 +1498,6 @@ impl TableProvider for OracleTableProvider {
         // supplied.
         project_plan_by_name(union, &scan_projection.output_names)
     }
-}
-
-/// Counts the file ranges one file scan reads.
-///
-/// `DataFusion`'s byte-range repartitioning lists one file as several ranges,
-/// and its `FilePruner` reports skipped ranges, so files scanned and files
-/// pruned are both counted in ranges.
-fn file_ranges(config: &FileScanConfig) -> usize {
-    config.file_groups.iter().map(FileGroup::len).sum()
 }
 
 /// Resolves `DataFusion`'s requested scan output to public column names.
@@ -3574,32 +3577,29 @@ pub(super) mod tests {
         );
     }
 
-    /// Scan stats count each planned file range once, distributed or not.
+    /// Scan stats count each planned file once, distributed or not.
     ///
     /// Two Parquet files are planned as a plain scan by `DataFusion`'s own
-    /// planner, one range per file, and as a GROUP BY by the pinned
-    /// distributed planner, which byte-splits them into per-task ranges. Each
-    /// count must equal the ranges its plan holds: a network boundary returns
-    /// its stage plan as a child, so a walk that also followed the boundary's
-    /// input stage would count every distributed range twice. The distributed
-    /// root retains no local metric set: its bytes and pruning come only from
-    /// the followers' aggregate.
+    /// planner and as a GROUP BY by the pinned distributed planner, which
+    /// byte-splits them into per-task ranges. Both counts must equal the two
+    /// files: neither a split nor a network boundary, which returns its stage
+    /// plan as a child, may count one file twice. The distributed root
+    /// retains no local metric set: its bytes and pruning come only from the
+    /// followers' aggregate.
     ///
     /// # Panics
     ///
     /// Panics when a fixture file cannot be written, either statement cannot
     /// be planned, or the pinned planner returns no `DistributedExec` root.
     #[tokio::test]
-    async fn distributed_scan_stats_count_each_range_once() {
+    async fn distributed_scan_stats_count_each_file_once() {
         let directory = tempfile::tempdir().expect("range fixture directory");
         let schema: SchemaRef =
             Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, false)]));
         write_split_fixture(&directory.path().join("a.parquet"), &schema, &[1, 2]);
         write_split_fixture(&directory.path().join("b.parquet"), &schema, &[2, 3]);
         let location = directory.path().to_str().expect("utf-8 fixture path");
-        // One range per file on both planners, so their counts are comparable.
         let mut config = crate::resources::OracleSessionShape::for_test().session_config();
-        config.options_mut().optimizer.repartition_file_scans = false;
 
         let ordinary = datafusion::prelude::SessionContext::new_with_config(config.clone());
         ordinary
@@ -3654,27 +3654,9 @@ pub(super) mod tests {
         );
 
         let plain = OracleQueryScanStats::from_plan(plain.as_ref());
-        let mut leaf_ranges = 0_u64;
-        grouped
-            .apply(|node| {
-                if let Some(leaf) = node.downcast_ref::<DistributedLeafExec>() {
-                    for variant in leaf.variants() {
-                        let config = variant
-                            .downcast_ref::<DataSourceExec>()
-                            .and_then(|source| {
-                                source.data_source().downcast_ref::<FileScanConfig>()
-                            })
-                            .expect("each task variant is a file scan");
-                        leaf_ranges += file_ranges(config) as u64;
-                    }
-                }
-                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
-            })
-            .expect("walk grouped plan");
         let grouped = OracleQueryScanStats::from_plan(grouped.as_ref());
         assert_eq!(plain.files_scanned, 2);
-        assert!(leaf_ranges >= 2, "every file is planned on some task");
-        assert_eq!(grouped.files_scanned, leaf_ranges);
+        assert_eq!(grouped.files_scanned, 2);
         assert_eq!(plain.physical_metrics.len(), 1);
         assert!(grouped.physical_metrics.is_empty());
     }

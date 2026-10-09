@@ -1826,9 +1826,7 @@ pub struct WorkerScanStats {
     /// memory-backed source reads no storage and must not be reported as a
     /// zero-byte scan of one that does.
     pub bytes_scanned: Option<u64>,
-    /// Number of file ranges the follower's executed scan nodes were planned
-    /// to read. A file split into several byte ranges counts once per range,
-    /// the same unit `DataFusion` reports pruned files in.
+    /// Number of files represented by the follower's executed scan nodes.
     pub files_scanned: u64,
     /// Number of file partitions represented by the follower's executed scans.
     pub partitions_scanned: u64,

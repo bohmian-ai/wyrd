@@ -553,7 +553,7 @@ cargo run --locked --release -p wyrd-testing --features wyrd-server/cloud --bin 
 
 [tasks."bench:bifrost:reads"]
 description = "Opt-in read benchmark, two like-for-like sections over the same stored data, each asserting identical rows before timing and printing p50/p95 per side: (1) hot: native DataFusion register_parquet vs the Oracle hot read of the same file; (2) published: native iceberg-datafusion vs the Oracle published read of the same Iceberg snapshot. Built like the shipped server: `dist` profile (fat LTO, one codegen unit) and mimalloc. `-- hot|published` runs one section. Needs no server or Postgres; part of no gate or verify lane."
-run = "cargo bench --locked -p vala-bifrost-redux --features test-support,bench-support --bench bifrost_reads"
+run = "cargo bench --locked -p vala-bifrost-redux --features test-support,bench-support --bench bifrost_reads --profile dist"
 
 [tasks."test:bifrost:journey:otlp"]
 description = "Tier-1 journeys: OTLP trace, log, metric, mixed-batch and negative protocol surfaces"

@@ -10,9 +10,9 @@ previous one is done. Do not add work that is not listed here.
 | 1 | Spec revision 21 (one read path) | done, approved |
 | 2 | Delete unneeded and incorrect code | done; workspace compiles (`cargo check --workspace --all-features --tests`) |
 | 2a | Spec revision 26 (Variant is a DataFusion feature) | done, approved (`spec-revision-26-datafusion-variant.md`) |
-| 3 | Implement the correct way (below) | in progress: order items 1–3, V1, V2 done; V3 F5 done; V3 Lists (F1/F2) under independent review (see V3 status) |
-| 4 | Run focused tests | not started |
-| 5 | Run release benchmarks | Variant bench written and passing on a fast build (`release-nonlto`); final LTO run not started |
+| 3 | Implement the correct way (below) | done |
+| 4 | Run focused tests | done (see Step 4 evidence) |
+| 5 | Run release benchmarks | done (see Step 5 evidence); review remediation `review/TASK-003-r1` in progress |
 
 ## The rule
 
@@ -618,8 +618,10 @@ Each item depends only on items above it.
         - Symptom: an Analytical class was expected, Interactive was seen.
         - Evidence: no `DistributedExec` root for the 12-row,
           one-object tables.
-        - Cause: native `datafusion-distributed` distributes only a scan
-          spanning more than one task. One published object is one task.
+        - Cause: one published object is one file group and a single
+          partition. With an inexact row count and row estimates trusted,
+          no repartition is added, so the plan has no stage boundary. Two
+          objects do distribute.
         - Fix site: the fixtures. Analytical tables are published as two
           objects; Interactive cases read separate one-object tables.
       - Hot and Iceberg filtering, "files expected 1, saw 3":
@@ -787,7 +789,9 @@ latency requirements table above.
     - nested `select_inner_small_field`: 2.39 / 2.66 ms → 283 / 308 µs
     - narrow `select_small_field`: 981 µs / 1.02 ms → 267 / 283 µs
     - wide `select_two_string_fields`: 9.84 / 10.7 → 4.29 / 4.53 ms
-- `mise run bench:bifrost:reads` (`dist`, mimalloc), DataFusion → Wyrd, p50 / p95:
+- `bifrost_reads` (`release` profile: four codegen units, no LTO; mimalloc),
+  DataFusion → Wyrd, p50 / p95. The task did not yet pass `--profile dist`,
+  so these numbers are not `dist` builds:
   - Hot file:
     - `point_lookup`: 350 / 368 → 354 / 382 µs
     - `select_narrow`: 241 / 247 → 223 / 235 µs

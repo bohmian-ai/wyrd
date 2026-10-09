@@ -280,6 +280,36 @@ impl EvalEngine {
         }
     }
 
+    /// The production judge invoker of `tenant`, timed on `telemetry`.
+    ///
+    /// The Skald invoker over the tenant's registry and media, with each
+    /// invocation recorded as one wait. Shared by the Eval path and a direct
+    /// task Verifier's LLM judge so both call judge providers the same way.
+    pub fn judge_invoker(
+        &self,
+        tenant: DataTenantId,
+        telemetry: &ExecutionTelemetry,
+    ) -> Arc<dyn JudgeInvoker> {
+        let registry = Arc::new(TenantRegistry {
+            state: self.state.clone(),
+            tenant,
+        });
+        let media = Arc::new(TenantMedia {
+            storage: Arc::clone(&self.state.storage),
+            tenant,
+        });
+        let inner = SkaldJudgeInvoker::new(
+            Arc::clone(&self.providers),
+            Arc::clone(&registry) as Arc<dyn AgentCardResolver>,
+            registry,
+        )
+        .with_media_resolver(media);
+        Arc::new(TimedJudge {
+            inner,
+            waits: telemetry.waits(),
+        })
+    }
+
     /// Score one `record` of `tenant` under `spec` and map its report.
     ///
     /// The one Eval execution path of queued runs and direct execution: it
@@ -300,29 +330,12 @@ impl EvalEngine {
         traces: InMemoryTraceSource,
         telemetry: &ExecutionTelemetry,
     ) -> Result<VerifierReport, ScoreFailure> {
-        let registry = Arc::new(TenantRegistry {
-            state: self.state.clone(),
-            tenant,
-        });
-        let media = Arc::new(TenantMedia {
-            storage: Arc::clone(&self.state.storage),
-            tenant,
-        });
-        let judge = SkaldJudgeInvoker::new(
-            Arc::clone(&self.providers),
-            Arc::clone(&registry) as Arc<dyn AgentCardResolver>,
-            registry,
-        )
-        .with_media_resolver(media);
-        let judge = TimedJudge {
-            inner: judge,
-            waits: telemetry.waits(),
-        };
+        let judge = self.judge_invoker(tenant, telemetry);
         let scoring = telemetry
             .prepare(async {
                 ScenarioScoring::new(
                     Arc::new(spec.clone()),
-                    Arc::new(judge),
+                    judge,
                     Arc::new(traces),
                     Duration::from_millis(READ_DEADLINE_MS),
                 )

@@ -24,6 +24,26 @@ impl AssertionTaskExecutor {
     pub fn new() -> Self {
         Self
     }
+
+    /// Judge one `task` against `snapshot` at `stage`.
+    ///
+    /// The typed entry point shared by Eval graph dispatch and a standalone
+    /// task Verifier: it resolves the task's path in the scoped view and
+    /// applies its comparison operator, with no knowledge of the caller.
+    ///
+    /// # Errors
+    /// Returns [`EvalExecError::ExtractPathMissing`] or
+    /// [`EvalExecError::JsonPathFailure`] when a path does not resolve, and
+    /// [`EvalExecError::OperatorTypeMismatch`] when the operator cannot
+    /// compare the observed and expected values.
+    pub fn assert(
+        &self,
+        task: &AssertionTask,
+        snapshot: &ContextSnapshot,
+        stage: u32,
+    ) -> Result<AssertionResult, EvalExecError> {
+        execute_assertion(task, snapshot, stage)
+    }
 }
 
 #[async_trait]
@@ -43,8 +63,9 @@ impl TaskExecutor for AssertionTaskExecutor {
                 ),
             });
         };
-        let result = execute_assertion(assertion, snapshot, stage)?;
-        Ok(TaskOutput::Assertion(result))
+        Ok(TaskOutput::Assertion(
+            self.assert(assertion, snapshot, stage)?,
+        ))
     }
 }
 

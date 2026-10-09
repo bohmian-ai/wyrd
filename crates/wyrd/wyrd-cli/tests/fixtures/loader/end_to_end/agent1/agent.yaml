@@ -14,3 +14,7 @@ spec:
   run_config:
     max_iterations: 5
     timeout_ms: 45000
+
+  # Standalone binding without `runs_on`: explicit invocation only.
+  verified_by:
+    - verifier: ./cohort-check.yaml

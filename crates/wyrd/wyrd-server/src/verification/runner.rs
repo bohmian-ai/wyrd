@@ -179,6 +179,8 @@ impl VerifierEngines {
             VerifierImplementation::Eval(spec) => {
                 Box::pin(self.eval.execute(tenant, run, spec, telemetry)).await
             }
+            // A task Verifier is invoked directly, never through a queued run.
+            VerifierImplementation::Task(_) => EngineOutcome::implementation_unavailable("task"),
         }
     }
 }
@@ -898,19 +900,23 @@ fn stage(
         )?;
         Ok((payload.verdict(), batches))
     });
-    let (verdict, batches) = encoded.map_err(|error| {
-        tracing::warn!(run_id = %run.lease.run_id, %error, "verification result encoding failed");
+    let invalid = || {
         Transition::Terminate(
             TerminalStatus::Errored,
             failure(RESULT_INVALID, "the verification result cannot be encoded"),
         )
+    };
+    let (verdict, batches) = encoded.map_err(|error| {
+        tracing::warn!(run_id = %run.lease.run_id, %error, "verification result encoding failed");
+        invalid()
     })?;
+    let counts = report.counts().ok_or_else(invalid)?;
     Ok(StagedResult {
         result_id,
         event_time,
         verdict,
         summary: report.summary(),
-        counts: report.counts(),
+        counts,
         verifier: verifier.clone(),
         batches: batches
             .into_iter()

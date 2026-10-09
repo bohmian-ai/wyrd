@@ -3105,6 +3105,40 @@ TaskId: TypeAlias = "str"
 # Closed Wyrd ML task taxonomy.
 TaskType: TypeAlias = 'Literal["BinaryClassification", "MultiClassClassification", "Regression", "Clustering", "AnomalyDetection", "Forecasting", "Generation", "Other"]'
 
+# The body of a `task` Verifier: exactly one check, judged directly.
+#
+# A real-time assertion or LLM judge is not an Eval workflow, so it carries no task map, dataset, sampling, pass gate, or task graph. Its one `kind`-tagged definition sits directly under `implementation.spec` and reuses the existing assertion and LLM-judge payloads. Deserialization refuses `depends_on` and `condition`, which have no meaning for one check, and any unknown field such as a nested `task:` wrapper.
+TaskVerifierSpec: TypeAlias = "TaskVerifierSpecAssertion | TaskVerifierSpecLlmJudge"
+
+
+@dataclass(frozen=True, kw_only=True)
+class TaskVerifierSpecAssertion:
+    """Programmatic assertion against the supplied context."""
+
+    condition: EvalCondition | None = None
+    context_path: JsonPath | None = None
+    depends_on: list[TaskId] = field(default_factory=list)
+    expected: JsonValue
+    id: TaskId
+    item_context_path: JsonPath | None = None
+    kind: Literal["assertion"]
+    operator: ComparisonOperator
+
+
+@dataclass(frozen=True, kw_only=True)
+class TaskVerifierSpecLlmJudge:
+    """LLM-as-judge evaluation of the supplied context."""
+
+    condition: EvalCondition | None = None
+    context_path: JsonPath | None = None
+    depends_on: list[TaskId] = field(default_factory=list)
+    expected: JsonValue
+    id: TaskId
+    judge_ref: InlineableRef_for_AgentSpec
+    kind: Literal["llm_judge"]
+    max_retries: int | None = None
+    operator: ComparisonOperator
+
 
 @dataclass(frozen=True, kw_only=True)
 class TensorflowMeta:
@@ -3189,7 +3223,7 @@ class VerificationBinding:
     """
 
     on_failure: list[InlineableRef_for_OperatorSpec] = field(default_factory=list)
-    runs_on: InlineableRef_for_TriggerSpec
+    runs_on: InlineableRef_for_TriggerSpec | None = None
     verifier: Ref
 
 
@@ -3215,7 +3249,9 @@ class VerificationStatus:
 # The closed set of Verifier implementations.
 #
 # Adjacently tagged so that `implementation.kind` selects the variant and the variant's own typed body lives under `implementation.spec`. An unknown `kind` fails deserialization before validation or persistence, so a future implementation cannot be authored until its variant ships.
-VerifierImplementation: TypeAlias = "VerifierImplementationDrift | VerifierImplementationEval"
+VerifierImplementation: TypeAlias = (
+    "VerifierImplementationDrift | VerifierImplementationEval | VerifierImplementationTask"
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -3232,6 +3268,14 @@ class VerifierImplementationEval:
 
     kind: Literal["eval"]
     spec: EvalSpec
+
+
+@dataclass(frozen=True, kw_only=True)
+class VerifierImplementationTask:
+    """One direct assertion or LLM judge over supplied JSON context."""
+
+    kind: Literal["task"]
+    spec: TaskVerifierSpec
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -4787,6 +4831,27 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
         ("updated_at", False, ("union", [("prim", "string"), ("prim", "null")])),
         ("verification", False, ("union", [("ref", "VerificationStatus"), ("prim", "null")])),
     ),
+    "TaskVerifierSpecAssertion": (
+        ("condition", False, ("union", [("ref", "EvalCondition"), ("prim", "null")])),
+        ("context_path", False, ("union", [("ref", "JsonPath"), ("prim", "null")])),
+        ("depends_on", False, ("array", ("ref", "TaskId"))),
+        ("expected", True, ("prim", "any")),
+        ("id", True, ("ref", "TaskId")),
+        ("item_context_path", False, ("union", [("ref", "JsonPath"), ("prim", "null")])),
+        ("kind", True, ("union", [("lit", "assertion")])),
+        ("operator", True, ("ref", "ComparisonOperator")),
+    ),
+    "TaskVerifierSpecLlmJudge": (
+        ("condition", False, ("union", [("ref", "EvalCondition"), ("prim", "null")])),
+        ("context_path", False, ("union", [("ref", "JsonPath"), ("prim", "null")])),
+        ("depends_on", False, ("array", ("ref", "TaskId"))),
+        ("expected", True, ("prim", "any")),
+        ("id", True, ("ref", "TaskId")),
+        ("judge_ref", True, ("ref", "InlineableRef_for_AgentSpec")),
+        ("kind", True, ("union", [("lit", "llm_judge")])),
+        ("max_retries", False, ("prim", "integer")),
+        ("operator", True, ("ref", "ComparisonOperator")),
+    ),
     "TensorflowMeta": (
         ("framework_version", True, ("prim", "string")),
         ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),
@@ -4817,7 +4882,7 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
     ),
     "VerificationBinding": (
         ("on_failure", False, ("array", ("ref", "InlineableRef_for_OperatorSpec"))),
-        ("runs_on", True, ("ref", "InlineableRef_for_TriggerSpec")),
+        ("runs_on", False, ("union", [("ref", "InlineableRef_for_TriggerSpec"), ("prim", "null")])),
         ("verifier", True, ("ref", "Ref")),
     ),
     "VerificationError": (
@@ -4835,6 +4900,10 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
     "VerifierImplementationEval": (
         ("kind", True, ("union", [("lit", "eval")])),
         ("spec", True, ("ref", "EvalSpec")),
+    ),
+    "VerifierImplementationTask": (
+        ("kind", True, ("union", [("lit", "task")])),
+        ("spec", True, ("ref", "TaskVerifierSpec")),
     ),
     "VerifierSpec": (
         ("description", False, ("union", [("prim", "string"), ("prim", "null")])),
@@ -5630,6 +5699,10 @@ _ALIASES: dict[str, tuple] = {
             ("union", [("lit", "Other")]),
         ],
     ),
+    "TaskVerifierSpec": (
+        "union",
+        [("ref", "TaskVerifierSpecAssertion"), ("ref", "TaskVerifierSpecLlmJudge")],
+    ),
     "TfSaveFormat": ("union", [("union", [("lit", "Keras")]), ("union", [("lit", "SavedModel")])]),
     "TorchSaveFormat": (
         "union",
@@ -5658,7 +5731,11 @@ _ALIASES: dict[str, tuple] = {
     ),
     "VerifierImplementation": (
         "union",
-        [("ref", "VerifierImplementationDrift"), ("ref", "VerifierImplementationEval")],
+        [
+            ("ref", "VerifierImplementationDrift"),
+            ("ref", "VerifierImplementationEval"),
+            ("ref", "VerifierImplementationTask"),
+        ],
     ),
     "VersionBlock": ("prim", "string"),
     "VersionBump": (

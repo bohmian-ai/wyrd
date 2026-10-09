@@ -1701,10 +1701,13 @@ export interface Judgment {
     | "eval_assertion"
     | "eval_llm_judge"
     | "eval_other"
+    | "task_assertion"
+    | "task_llm_judge"
     | "unknown";
   readonly verdict: "passed" | "failed" | "inconclusive";
   readonly summary: string;
-  readonly counts:
+  /** Count-only rollup of a Drift or Eval judgment; absent for a task Verifier. */
+  readonly counts?:
     | { readonly implementation: "drift"; readonly drifted_features: number; readonly total_features: number }
     | {
         readonly implementation: "eval";
@@ -1713,8 +1716,8 @@ export interface Judgment {
         readonly total_tasks: number;
         readonly pass_rate_percent: number;
       };
-  /** `{ drift: DriftReport }` or `{ eval: { results, skipped } }`. */
-  readonly detail: { readonly drift: unknown } | { readonly eval: unknown };
+  /** `{ drift: DriftReport }`, `{ eval: { results, skipped } }`, or `{ task: { result } }`. */
+  readonly detail: { readonly drift: unknown } | { readonly eval: unknown } | { readonly task: unknown };
 }
 
 /** The provider an Operator connection authenticates to. */

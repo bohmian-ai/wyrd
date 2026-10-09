@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  space: wyrd-team
+  name: runbook-judged
+  version: "1.0.0"
+spec:
+  implementation:
+    kind: task
+    spec:
+      kind: llm_judge
+      id: runbook_grounded
+      judge_ref:
+        kind: Agent
+        space: wyrd-team
+        name: triage-judge
+        version: "1.0.0"
+      context_path: $.score
+      operator: equals
+      expected: { passed: true }
+      max_retries: 3

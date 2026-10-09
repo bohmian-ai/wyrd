@@ -13,6 +13,7 @@ use vala_eval::EvalExecError;
 use vala_eval::executor::EvalReport;
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::card::operator::VerifierCounts;
+use wyrd_spec::vala::eval::AssertionResult;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::TerminalStatus;
 
@@ -35,6 +36,8 @@ pub enum VerifierReport {
         /// The workflow verdict the Eval engine's pass gate decided.
         verdict: VerificationVerdict,
     },
+    /// A task Verifier's one check, judged directly; it passes or fails.
+    Task(AssertionResult),
 }
 
 impl VerifierReport {
@@ -44,6 +47,7 @@ impl VerifierReport {
         match self {
             Self::Drift(_) => "drift",
             Self::Eval { .. } => "eval",
+            Self::Task(_) => "task",
         }
     }
 
@@ -75,7 +79,8 @@ impl VerifierReport {
     ///
     /// Drift maps its own verdict (`no_drift` passes, `drift` fails,
     /// `inconclusive` stays inconclusive) and an unscored execution is
-    /// inconclusive; Eval reports the verdict its pass gate decided.
+    /// inconclusive; Eval reports the verdict its pass gate decided; a task
+    /// passes or fails with its one check.
     #[must_use]
     pub const fn verdict(&self) -> VerificationVerdict {
         match self {
@@ -86,6 +91,8 @@ impl VerifierReport {
                 DriftVerdict::Inconclusive => VerificationVerdict::Inconclusive,
             },
             Self::Eval { verdict, .. } => *verdict,
+            Self::Task(result) if result.passed => VerificationVerdict::Passed,
+            Self::Task(_) => VerificationVerdict::Failed,
         }
     }
 
@@ -119,6 +126,11 @@ impl VerifierReport {
                     rollup.total_tasks
                 )
             }
+            Self::Task(result) => format!(
+                "Task {} {}.",
+                result.task_id.as_str(),
+                if result.passed { "passed" } else { "failed" }
+            ),
         }
     }
 
@@ -127,11 +139,12 @@ impl VerifierReport {
     ///
     /// Drift counts drifted and scored features; Eval counts passed and ran
     /// tasks. An unscored Drift execution (never `failed`) reads zero of zero,
-    /// and a negative rollup count reads zero.
+    /// and a negative rollup count reads zero. A task has none: its one
+    /// check is fully described by its verdict.
     #[must_use]
-    pub fn counts(&self) -> VerifierCounts {
+    pub fn counts(&self) -> Option<VerifierCounts> {
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        match self {
+        Some(match self {
             Self::Drift(None) => VerifierCounts::Drift {
                 drifted_features: 0,
                 total_features: 0,
@@ -153,7 +166,8 @@ impl VerifierReport {
                     u32::try_from(rollup.total_tasks).unwrap_or(0),
                 )
             }
-        }
+            Self::Task(_) => return None,
+        })
     }
 }
 

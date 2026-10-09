@@ -16,7 +16,9 @@ use crate::card::model::ModelSpec;
 use crate::card::operator::{OperatorAction, OperatorSpec};
 use crate::card::service::ServiceSpec;
 use crate::card::trigger::TriggerSpec;
-use crate::card::verifier::{VerificationBinding, VerifierImplementation, VerifierSpec};
+use crate::card::verifier::{
+    VerificationBinding, VerifierImplementation, VerifierSpec, VerifierTask,
+};
 use crate::card::workflow::{WorkflowAction, WorkflowSpec};
 use crate::envelope::Spec;
 use crate::reference::{CardRef, InlineableRef, Ref};
@@ -375,6 +377,18 @@ impl Visit for VerifierSpec {
             VerifierImplementation::Eval(eval) => {
                 eval.visit_at("spec.implementation.spec", f);
             }
+            VerifierImplementation::Task(task) => {
+                if let VerifierTask::LlmJudge(judge) = &mut task.definition {
+                    let path = "spec.implementation.spec.judge_ref".to_owned();
+                    f(SlotEntry {
+                        path: path.clone(),
+                        value: SlotValue::InlineableAgent(&mut judge.judge_ref),
+                    });
+                    if let InlineableRef::Inline(agent) = &mut judge.judge_ref {
+                        visit_agent(agent, &path, f);
+                    }
+                }
+            }
         }
     }
 }
@@ -484,7 +498,8 @@ impl OperatorSpec {
 
 /// Visit one verification-binding list using the exact owning field path.
 ///
-/// Each binding yields its Verifier reference, its `runs_on` Trigger slot, and
+/// Each binding yields its Verifier reference, its `runs_on` Trigger slot when
+/// one is authored, and
 /// every `on_failure` Operator slot, plus the references nested inside any
 /// inline Operator body. Inline Triggers carry no references of their own.
 fn visit_verified_by<F>(bindings: &mut [VerificationBinding], path: &str, f: &mut F)
@@ -496,10 +511,12 @@ where
             path: format!("{path}[{index}].verifier"),
             value: SlotValue::Durable(&mut binding.verifier),
         });
-        f(SlotEntry {
-            path: format!("{path}[{index}].runs_on"),
-            value: SlotValue::InlineableTrigger(&mut binding.runs_on),
-        });
+        if let Some(runs_on) = &mut binding.runs_on {
+            f(SlotEntry {
+                path: format!("{path}[{index}].runs_on"),
+                value: SlotValue::InlineableTrigger(runs_on),
+            });
+        }
         for (operator_index, operator) in binding.on_failure.iter_mut().enumerate() {
             let operator_path = format!("{path}[{index}].on_failure[{operator_index}]");
             if let InlineableRef::Inline(inline) = operator {
@@ -726,7 +743,7 @@ mod completeness_tests {
     fn binding(verifier: &str) -> VerificationBinding {
         VerificationBinding {
             verifier: Ref::Ref(card_ref(CardKind::Verifier, verifier)),
-            runs_on: InlineableRef::Ref(card_ref(CardKind::Trigger, "hourly")),
+            runs_on: Some(InlineableRef::Ref(card_ref(CardKind::Trigger, "hourly"))),
             on_failure: vec![
                 InlineableRef::Ref(card_ref(CardKind::Operator, "page")),
                 InlineableRef::Inline(Box::new(OperatorSpec {

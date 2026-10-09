@@ -1465,7 +1465,7 @@ mod pg_tests {
             String::from_utf8_lossy(&plan.stderr)
         );
         let plan: Value = serde_json::from_slice(&plan.stdout).expect("plan output is JSON");
-        assert_eq!(plan["cards"].as_array().map(Vec::len), Some(11));
+        assert_eq!(plan["cards"].as_array().map(Vec::len), Some(12));
 
         let server = WyrdTestServer::builder()
             .with_verification_runtime_for_test()
@@ -1564,7 +1564,7 @@ mod pg_tests {
         )
         .await
         .expect("canonical authored directory applies");
-        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(11));
+        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(12));
         wait_baseline_ready(
             &public_cards_client(&base_url, &jwt),
             json!({
@@ -1588,7 +1588,7 @@ mod pg_tests {
         .await
         .expect("canonical Service graph hydrates");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 15);
+        assert_eq!(summary["card_count"], 16);
 
         let metadata: Value = serde_yaml::from_slice(
             &std::fs::read(bundle.path().join("metadata.yaml"))
@@ -1600,6 +1600,7 @@ mod pg_tests {
             .expect("bundle metadata lists hydrated cards");
         for (kind, name) in [
             ("Verifier", "churn-triage-eval"),
+            ("Verifier", "cohort-check"),
             ("Verifier", "churn-classifier-drift"),
             ("Verifier", "retention-guardrail"),
             ("Trigger", "retention-observations-ready"),
@@ -1613,9 +1614,9 @@ mod pg_tests {
             );
         }
 
-        for (name, binding_owner) in [
-            ("churn-response-service", "Service"),
-            ("retention-runbook", "Agent"),
+        for (name, binding_owner, binding_count) in [
+            ("churn-response-service", "Service", 2),
+            ("retention-runbook", "Agent", 1),
         ] {
             let card = cards
                 .iter()
@@ -1632,13 +1633,17 @@ mod pg_tests {
             let bindings = document["spec"]["verified_by"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{name} persisted its verified_by list"));
-            assert_eq!(bindings.len(), 1, "{bindings:?}");
+            assert_eq!(bindings.len(), binding_count, "{bindings:?}");
             for leg in ["verifier", "runs_on"] {
                 assert!(
                     bindings[0][leg]["uid"].is_string(),
                     "{name}.{leg} persisted UID-pinned: {:?}",
                     bindings[0][leg]
                 );
+            }
+            if let Some(explicit) = bindings.get(1) {
+                assert!(explicit["verifier"]["uid"].is_string(), "{explicit:?}");
+                assert!(explicit.get("runs_on").is_none(), "{explicit:?}");
             }
 
             let relationships: Value = serde_yaml::from_slice(

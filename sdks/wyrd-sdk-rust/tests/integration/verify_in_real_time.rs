@@ -286,10 +286,10 @@ async fn model_latency_drift_is_judged_failed() {
         (
             VerificationVerdict::Failed,
             VerifierKind::DriftPsi,
-            VerifierCounts::Drift {
+            Some(VerifierCounts::Drift {
                 drifted_features: 1,
                 total_features: 1
-            }
+            })
         )
     );
     assistant.deployment.shutdown().await;

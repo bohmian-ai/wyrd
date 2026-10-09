@@ -1,0 +1,15 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  space: wyrd-team
+  name: cohort-check
+  version: "1.0.0"
+spec:
+  implementation:
+    kind: task
+    spec:
+      kind: assertion
+      id: cohort_valid
+      context_path: $.cohort
+      operator: in
+      expected: [loyal_win_back, price_sensitive]

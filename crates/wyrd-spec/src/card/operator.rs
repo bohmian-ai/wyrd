@@ -528,6 +528,10 @@ fn field_applies(name: &str, implementation: Option<&VerifierImplementation>) ->
         (name.split_once('.').map(|(kind, _)| kind), implementation),
         (Some("drift"), Some(VerifierImplementation::Eval(_)))
             | (Some("eval"), Some(VerifierImplementation::Drift(_)))
+            | (
+                Some("drift" | "eval"),
+                Some(VerifierImplementation::Task(_))
+            )
     )
 }
 

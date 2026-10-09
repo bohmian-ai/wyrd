@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::ids::{ModelId, ProviderId};
+use crate::ids::{CardUid, ModelId, ProviderId};
 
 /// Longest accepted catalog or schema identifier segment.
 const MAX_IDENTIFIER_LEN: usize = 63;
@@ -48,6 +48,8 @@ pub enum PermissionScope {
     Bifrost(BifrostPermissionScope),
     /// One gateway provider or exact provider/model pair.
     Gateway(GatewayAccess),
+    /// One Verifier Card, by its exact UID.
+    Verifier(CardUid),
 }
 
 /// The gateway provider objects one invoke grant reaches.
@@ -140,13 +142,15 @@ impl PermissionScope {
     ///
     /// [`Self::All`] covers everything; a Bifrost scope never covers `All`,
     /// because "all objects" is strictly wider than any single schema or table.
+    /// A Verifier scope covers only the same Verifier UID.
     #[must_use]
     pub fn covers(&self, required: &Self) -> bool {
         match (self, required) {
             (Self::All, _) => true,
             (Self::Bifrost(granted), Self::Bifrost(required)) => granted.covers(required),
             (Self::Gateway(granted), Self::Gateway(required)) => granted.covers(required),
-            (Self::Bifrost(_) | Self::Gateway(_), _) => false,
+            (Self::Verifier(granted), Self::Verifier(required)) => granted == required,
+            (Self::Bifrost(_) | Self::Gateway(_) | Self::Verifier(_), _) => false,
         }
     }
 
@@ -169,10 +173,11 @@ impl PermissionScope {
     /// Returns [`PermissionScopeError::InvalidIdentifier`] when a catalog or
     /// schema segment is empty, longer than 63 characters, or contains anything
     /// other than ASCII alphanumerics, `_`, or `-`. Gateway identities are
-    /// validated when their typed ids decode, so a gateway scope is always valid.
+    /// validated when their typed ids decode, so a gateway or Verifier scope is
+    /// always valid.
     pub fn validate(&self) -> Result<(), PermissionScopeError> {
         match self {
-            Self::All | Self::Gateway(_) => Ok(()),
+            Self::All | Self::Gateway(_) | Self::Verifier(_) => Ok(()),
             Self::Bifrost(scope) => scope.validate(),
         }
     }

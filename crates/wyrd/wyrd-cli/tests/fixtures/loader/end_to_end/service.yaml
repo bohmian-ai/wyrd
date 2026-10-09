@@ -33,6 +33,8 @@ spec:
             connection: ops-slack
             channel_id: C0123456789
             text: retention guardrail failed for the churn response service
+    # Explicit-only: no `runs_on`, so a caller invokes this task Verifier directly.
+    - verifier: agent1/cohort-check.yaml
 
   # Every component uses the unified ref variant: `path` (sibling submission)
   # or `ref` (external, identity by kind+space+name+exact version). Inline is
@@ -64,6 +66,7 @@ spec:
             kind: observations_ready
           on_failure:
             - ./ops/operator-slack.yaml
+        - verifier: agent1/cohort-check.yaml
 
     - alias: agent2
       ref: agent2/agent.yaml

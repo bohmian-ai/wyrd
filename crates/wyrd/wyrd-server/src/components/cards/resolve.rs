@@ -266,6 +266,9 @@ impl EffectiveSpecs {
 
     /// Check one binding's effective Trigger pairing, schedule, and `on_failure` actions.
     ///
+    /// A binding without `runs_on` is explicit-only: it has no Trigger to pair,
+    /// so only its Verifier and `on_failure` actions are checked.
+    ///
     /// A `schedule` Trigger must parse as a five-field cron in a known IANA
     /// zone with a future occurrence, because the projected binding arms its
     /// cursor from that schedule on the owner's first machine exchange.
@@ -283,8 +286,9 @@ impl EffectiveSpecs {
     ) -> Result<(), WyrdError> {
         let verifier = self.load(conn, Some(&binding.verifier)).await?;
         let trigger = match &binding.runs_on {
-            InlineableRef::Inline(trigger) => Some(Spec::Trigger((**trigger).clone())),
-            reference => self.load(conn, reference.to_durable().as_ref()).await?,
+            None => None,
+            Some(InlineableRef::Inline(trigger)) => Some(Spec::Trigger((**trigger).clone())),
+            Some(reference) => self.load(conn, reference.to_durable().as_ref()).await?,
         };
         if let (Some(Spec::Verifier(verifier)), Some(Spec::Trigger(trigger))) =
             (&verifier, &trigger)

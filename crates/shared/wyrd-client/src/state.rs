@@ -2829,10 +2829,10 @@ pub(crate) mod tests {
     ) -> VerificationBinding {
         VerificationBinding {
             verifier: Ref::Ref(verifier),
-            runs_on: InlineableRef::Inline(Box::new(TriggerSpec {
+            runs_on: Some(InlineableRef::Inline(Box::new(TriggerSpec {
                 description: None,
                 activation,
-            })),
+            }))),
             on_failure: Vec::new(),
         }
     }

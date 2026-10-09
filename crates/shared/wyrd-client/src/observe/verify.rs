@@ -33,7 +33,9 @@ type DriftColumns = BTreeMap<String, Vec<Option<DriftSample>>>;
 
 /// Build the wire input a Verifier of `implementation`'s kind judges.
 ///
-/// An Eval Verifier takes one context object with optional media. A Drift
+/// An Eval Verifier takes one context object with optional media, and a task
+/// Verifier takes the context its one check judges, also with optional media.
+/// A Drift
 /// Verifier takes a non-empty sequence of flat feature rows, each validated as
 /// `observe.drift` validates one observation, and receives them as one column
 /// per feature; a feature a row omits is a null sample in that row, which the
@@ -57,6 +59,18 @@ pub(crate) fn direct_input(
                 ));
             };
             Ok(DirectVerificationInput::EvalRecord {
+                context,
+                media: (!media.is_empty()).then_some(media),
+            })
+        }
+        VerifierImplementation::Task(_) => {
+            let Value::Object(context) = input else {
+                return Err(invalid_observation(
+                    "a task Verifier judges one context object",
+                    json!({ "received": shape(&input) }),
+                ));
+            };
+            Ok(DirectVerificationInput::TaskContext {
                 context,
                 media: (!media.is_empty()).then_some(media),
             })

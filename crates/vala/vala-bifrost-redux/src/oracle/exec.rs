@@ -1,8 +1,10 @@
-//! `DataFusion` physical sources and invariant operators owned by Oracle.
+//! `DataFusion` physical sources and scan evidence owned by Oracle.
 //!
-//! Every table enters `DataFusion` through one disjoint source union. Tenant
-//! validation surrounds that union so a foreign row cannot influence a filter,
-//! join, aggregate, or limit.
+//! Every table enters `DataFusion` through one disjoint union of its persisted
+//! Parquet scan and its live Scribe sources. The persisted scan is
+//! `DataFusion`'s own; Wyrd's reader factory proves every footer belongs to
+//! the query's tenant before any row is decoded, so a foreign row never
+//! reaches a filter, join, aggregate, or limit.
 
 use std::error::Error;
 use std::fmt;
@@ -1004,11 +1006,15 @@ pub(crate) enum HotObjects {
 /// The leader's hot files, a follower's hot assignment, and a Scribe
 /// follower's staged runs all use it. `DataFusion` owns the read, the footer
 /// cache, pruning, the row filter, splitting, and memory; Wyrd adds only the
-/// tenant proof of every footer and the Variant expression adapter. Each
-/// file's row count, when the manifest records one, is reported as inexact
-/// statistics so `DataFusion` decides splitting as it does for a listing table.
-/// Inexact, because an exact count lets `DataFusion` answer `count(*)` without
-/// opening the file, which would skip that file's footer tenant proof.
+/// reader factory that proves every footer's tenant. Each file's row count,
+/// when the manifest records one, is reported as inexact statistics so
+/// `DataFusion` decides splitting as it does for a listing table. Inexact,
+/// because an exact count lets `DataFusion` answer `count(*)` without opening
+/// the file, which would skip that file's footer tenant proof.
+///
+/// The scan carries no predicate; `DataFusion`'s `FilterPushdown` places the
+/// query's predicate in it, and the file pruner then skips a file whose
+/// event-time bounds (see [`HotFileSource::statistics`]) exclude it.
 ///
 /// The scan's `ObjectStoreUrl` is the always-registered local one; it is never
 /// resolved to a store, because the reader factory carries the real store.
@@ -1017,10 +1023,6 @@ pub(crate) enum HotObjects {
 ///
 /// Returns the `DataFusion` error raised when a warehouse location is outside
 /// the warehouse or the file statistics cannot be merged.
-///
-/// The scan carries no predicate; `DataFusion`'s `FilterPushdown` places the
-/// query's predicate in it, and the file pruner then skips a file whose
-/// event-time bounds (see [`HotFileSource::statistics`]) exclude it.
 pub(super) fn hot_parquet_scan(
     files: Vec<HotFileSource>,
     objects: HotObjects,
@@ -1175,8 +1177,9 @@ pub(crate) struct HotFileSource {
     /// Exact row count the manifest records, or `None` for a staged run
     /// whose count is not known before its footer is read.
     ///
-    /// Reported as the file's exact statistics, so `DataFusion` decides
-    /// whether to split a hot scan as it does for a listing table.
+    /// Reported as inexact statistics, so `DataFusion` decides whether to
+    /// split a hot scan as it does for a listing table, and `count(*)` still
+    /// opens the file and proves its footer.
     pub(crate) row_count: Option<u64>,
     /// Immutable `wyrd_event_time` interval this object declares, or the exact
     /// reason it declares none.
@@ -1479,8 +1482,9 @@ impl TableProvider for OracleTableProvider {
 
     /// Builds the exact `Iceberg + hot + live` disjoint source.
     ///
-    /// Row IO remains lazy in returned execution plans. Iceberg and hot Parquet
-    /// bytes are first accessed only when `DataFusion` executes the already
+    /// Planning reads Iceberg manifests to list the snapshot's files and loads
+    /// the kept published files' footers into the node's footer cache; row
+    /// bytes are first read only when `DataFusion` executes the already
     /// audited plan.
     ///
     /// # Errors
@@ -2883,6 +2887,11 @@ pub(super) mod tests {
     }
 
     /// Writes `values` as a Parquet file with two-row row groups.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch, file, or Parquet writer cannot be created or
+    /// closed, or when the written size does not fit `usize`.
     fn write_split_fixture(path: &std::path::Path, schema: &SchemaRef, values: &[i64]) -> usize {
         let batch = RecordBatch::try_new(
             Arc::clone(schema),
@@ -2914,6 +2923,10 @@ pub(super) mod tests {
     }
 
     /// Collects every `Int64` value one stream yields.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stream yields an error or a non-`Int64` first column.
     async fn collect_int64(
         mut stream: datafusion::execution::SendableRecordBatchStream,
     ) -> Vec<i64> {
@@ -3023,6 +3036,11 @@ pub(super) mod tests {
 
     /// Writes one Parquet source of [`HOT_BATCH_FIXTURE_ROWS`] rows in a single
     /// row group, so batch counts depend only on the configured batch size.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture directory, file, or Parquet writer cannot be
+    /// created.
     fn build_hot_batch_fixture() -> HotCausalFixture {
         let directory = tempfile::tempdir().expect("hot batch fixture directory");
         let path = directory.path().join("hot-batch.parquet");
@@ -3389,16 +3407,16 @@ pub(super) mod tests {
     ///
     /// This is the production Interactive leader path for
     /// `SELECT duration_ms FROM ... WHERE status_code = 'STATUS_CODE_ERROR'`.
-    /// Pushdown is `Inexact`, so `DataFusion` asks the scan for the output
-    /// column and the predicate column, `[duration_ms, status_code]`, and
-    /// filters above it. `unused_payload` is requested by nobody and must not
-    /// appear in any leaf; the provider returns every row.
+    /// The scan is asked for the output column and the predicate column,
+    /// `[duration_ms, status_code]`; it applies no predicate itself, which
+    /// `DataFusion`'s pushdown places later. `unused_payload` is requested by
+    /// nobody and must not appear in any leaf; the provider returns every row.
     ///
     /// # Panics
     /// Panics if provider construction, scan planning, or execution violates
     /// the closure contract this owner pins.
     #[tokio::test]
-    async fn projected_leaf_union_preserves_predicate_columns() {
+    async fn projected_leaf_union_outputs_the_requested_closure() {
         use datafusion::execution::context::SessionContext;
         use datafusion::logical_expr::{col, lit};
         use datafusion::physical_plan::collect;

@@ -7141,13 +7141,13 @@ impl AnalyticalExecutionHandle {
         );
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
         config.set_distributed_channel_resolver(resolver);
-        // No codec is installed here. `config` is the planning session's own
-        // copied configuration, which already carries this node's Oracle codec
-        // — bound to the execution lock, which this one would not be. Upstream
-        // stores user codecs as an ordered list and encodes the position of the
-        // codec that matched, so a second entry shifts every position past the
-        // one a follower builds from its own single install, and the follower
-        // then refuses the plan with "Can't find required codec in codec list".
+        // No user codec is installed on this path: every node the plan
+        // carries is `DataFusion`'s own. Anyone who adds one must install it
+        // exactly once and in the same position on followers. Upstream stores
+        // user codecs as an ordered list and encodes the position of the codec
+        // that matched, so an extra entry shifts every position past it and
+        // the follower refuses the plan with "Can't find required codec in
+        // codec list".
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)

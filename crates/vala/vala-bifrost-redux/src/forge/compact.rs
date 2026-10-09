@@ -299,7 +299,7 @@ impl ForgeObjects {
     /// order. The last key of a page becomes the next cursor; a short page
     /// ends the stream. Pages are produced lazily, so orphan GC stopping at its
     /// page cap stops the walks.
-    // ponytail: one full walk per page (O(pages × objects)); only the local
+    // One full walk per page (O(pages × objects)); only the local
     // filesystem takes this path.
     fn unordered_pages(
         &self,

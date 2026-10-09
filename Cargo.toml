@@ -227,7 +227,7 @@ lru = "=0.12.5"
 # single native universe (no moving branch, no duplicate Arrow/Parquet package);
 # `[patch.crates-io]` below pins the DataFusion crates to the Wyrd fork.
 datafusion = "=55.1.0"
-# Bifrost's one object store (spec REQ-032); the same release DataFusion 55 uses.
+# Bifrost's one object store; the same release DataFusion 55 uses.
 object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
 datafusion-proto = "=55.1.0"
 datafusion-datasource = "=55.1.0"

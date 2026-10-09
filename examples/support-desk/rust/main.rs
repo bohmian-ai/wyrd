@@ -15,8 +15,7 @@ async fn main() -> Result<(), support_desk::Error> {
     let bundle = tempfile::tempdir()?;
     let desk = support_desk::deploy(&client, &bundle.path().join("bundle")).await?;
     let served = support_desk::serve(&desk).await?;
-    let verdicts =
-        support_desk::wait_for_verdicts(&client, &desk, Duration::from_secs(300)).await?;
+    let verdicts = support_desk::wait_for_verdicts(&client, &desk, Duration::from_mins(5)).await?;
     println!("{verdicts:?}");
     for verdict in [true, false] {
         if let Some(request) = served.iter().find(|request| request.passed == verdict) {

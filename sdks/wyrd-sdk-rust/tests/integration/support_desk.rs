@@ -23,7 +23,7 @@ mod example;
 use example::{REQUESTS, deploy, explain, question, serve, wait_for_verdicts};
 
 /// How long the story waits for every verdict.
-const WAIT: Duration = Duration::from_secs(180);
+const WAIT: Duration = Duration::from_mins(3);
 
 /// Mount one Chat Completions answer `content` for requests whose body
 /// contains `marker`, ranked by `priority` (lower wins).

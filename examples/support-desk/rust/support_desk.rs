@@ -7,7 +7,7 @@
 //! its own Agent Run. [`wait_for_verdicts`] waits for both Verifiers to judge
 //! every answer, and [`explain`] joins one Run's evidence over MCP.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use tracing::Instrument as _;
 use wyrd_sdk::bifrost::QueryParam;
 use wyrd_sdk::cards::{CardSelector, Cards, HydrationMode, RegistrationReceipt};
 use wyrd_sdk::gateway::{GatewayCaptureMode, GatewayCapturePolicyWrite};
+use wyrd_sdk::observe::EvalObservationOptions;
 use wyrd_sdk::otel::start_telemetry;
 use wyrd_sdk::state::WyrdState;
 use wyrd_sdk::{Bifrost, Gateway, Spec, WyrdClient, WyrdError};
@@ -69,7 +70,7 @@ pub struct Served {
 
 /// One `vala.datasets.tickets` row.
 #[derive(Serialize)]
-struct Ticket<'a> {
+struct TicketRow<'a> {
     /// The request's ticket.
     ticket_id: String,
     /// The customer's question.
@@ -112,7 +113,7 @@ pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
     gateway
         .put_capture_policy(&GatewayCapturePolicyWrite {
             mode: GatewayCaptureMode::Metadata,
-            payload_fields: Default::default(),
+            payload_fields: BTreeSet::default(),
         })
         .await?;
     let Spec::Prompt(prompt) = &state.card("prompt")?.spec else {
@@ -137,7 +138,7 @@ pub async fn deploy(client: &WyrdClient, bundle: &Path) -> Result<Desk, Error> {
 /// The customer question of request `index`.
 #[must_use]
 pub fn question(index: usize) -> String {
-    if index % 10 == 0 {
+    if index.is_multiple_of(10) {
         format!("Can I get a refund for order {index}?")
     } else {
         format!("Where is order {index}?")
@@ -165,7 +166,7 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
             observe
                 .record(
                     "vala.datasets.tickets",
-                    &Ticket {
+                    &TicketRow {
                         ticket_id: format!("T-{index}"),
                         question: &question,
                         answer: &answer,
@@ -173,7 +174,10 @@ pub async fn serve(desk: &Desk) -> Result<Vec<Served>, Error> {
                     },
                 )
                 .await?;
-            observe.eval(&Answer { answer: &answer }, Default::default())?;
+            observe.eval(
+                &Answer { answer: &answer },
+                EvalObservationOptions::default(),
+            )?;
             let judgment = observe
                 .verify("no-refund-promise", &Answer { answer: &answer })
                 .await?;

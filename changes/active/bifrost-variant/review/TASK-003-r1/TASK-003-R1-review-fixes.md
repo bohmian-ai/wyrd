@@ -115,21 +115,51 @@ Do this group first: it changes code that findings 11 and 7 also touch.
   - A consumer that stops polling (a finished hash-join build side, an
     early-finished aggregate) holds its stream forever.
   - Its buffered bytes stay charged to the query's memory pool.
-- **Fork change:**
-  - In `src/worker/worker_connection_pool.rs`, the pool hands out proxy
-    streams. Each one is an `Arc<Mutex<Option<inner>>>` slot that the pool
-    also retains.
-  - Add a `close()` that drops every retained inner stream, taken or not.
-    It is idempotent, and holds the lock only for one inner poll.
-  - `DistributedExec`'s output stream calls `close()` on every connection
-    pool in its plan when it reaches end-of-stream or is dropped.
-  - Dropping the inner gRPC partition receivers fires the existing
-    `CancellationToken` path in `src/protocol/grpc/worker_client.rs`. That
-    ends the reader task and cancels the remote work.
-  - Fork test: a join whose build side is held but not polled.
-    - After the root stream ends, the reader tasks have exited and the
-      memory pool's `reserved()` is 0.
-    - The same holds after dropping the root stream mid-query.
+- **Fork change:** add one query-scoped close state. The private shape is
+  yours to choose; the invariants are not.
+  - **Owner:**
+    - `DistributedExec::execute` creates one close state per execution. It
+      holds a monotonic "closed" flag and a `CancellationToken`.
+    - The state reaches every `WorkerConnectionPool` built for the executed
+      head stage through the `TaskContext`, the same way `LocalWorkerContext`
+      is carried.
+    - Pools register with it at creation, so closing never relies on walking
+      `base_plan` or `plan_for_viz`. Note that the head stage is built lazily
+      inside the spawned preparation task.
+  - **Proxy streams:**
+    - Each stream a pool hands out is a proxy whose inner stream the pool
+      can drop.
+    - On close, every inner stream is dropped, taken or not, and a proxy
+      that is still polled ends.
+  - **Invariants:**
+    1. Close covers every pool of the executed head plan.
+    2. One idempotent close runs on every exit: end-of-stream, execution
+       error, preparation error, cancellation, and the root stream being
+       dropped, including before or during preparation.
+    3. Close happens before any coordinator drain that would wait on those
+       streams.
+    4. `closed` is checked both before a connection future is created and
+       after it resolves.
+       - A connection that resolves after close drops its streams at once.
+       - A call to `execute()` after close returns an empty stream and never
+         opens a connection.
+    5. Dropping the inner gRPC receivers fires the existing
+       `CancellationToken` path in `src/protocol/grpc/worker_client.rs`,
+       which ends the reader task and cancels the remote work.
+    6. Sibling queries are unaffected.
+  - **Observable completion:**
+    - The close state exposes `async fn wait_closed(&self)`. It resolves once
+      every reader task registered under it has exited and its buffered
+      batches are dropped.
+    - Tests await it under a `tokio::time::timeout`, then assert. No sleeps.
+  - **Fork tests** (each awaits `wait_closed`, then asserts that the memory
+    pool's `reserved()` is 0 and that no reader task remains):
+    1. a join whose build side is held but not polled, after the root
+       reaches end-of-stream;
+    2. the root dropped mid-query;
+    3. the root dropped before preparation finishes;
+    4. a connection that resolves after close;
+    5. two concurrent queries, where closing one leaves the other running.
 - **Wyrd change:**
   - Delete `AnalyticalGraphExchanges`, `AnalyticalExchangeStream`,
     `ExchangeSlot`, `close_exchanges` and every `exchanges.close()` call (in
@@ -185,16 +215,35 @@ Do this group first: it changes code that findings 11 and 7 also touch.
   `QueryTimeout`.
 
 **FIND-003-14. Recovery re-uploads already-published files.**
-- **Problem:** `parquet/object_uploader.rs` `converge` always PUTs, and is
-  reached from scribe persistence recovery. Spec REQ-034 says a published
-  key is never uploaded again.
-- **Fix:**
-  - Call `verify_remote` first; on a match, return with no PUT.
-  - If the object is missing or its content contradicts, fall through to
-    the existing put-and-verify loop.
-- **Test:** three tests with a PUT-counting object store (reuse an existing
-  test store wrapper if there is one) for a matching, an absent and a
-  contradicting key. They expect 0, 1 and 1 PUTs.
+- **Problem:**
+  - `parquet/object_uploader.rs` `converge` always PUTs. It is reached from
+    `scribe/persistence.rs` `recover_publication`.
+  - Spec REQ-034 (`spec.md` ~1065) allows overwriting an unpublished key,
+    but a published key is never uploaded again.
+  - Recovery can replay a manifest whose catalog commit already succeeded,
+    when it was interrupted before cleanup.
+- **Fix:** before any upload, `recover_publication` asks the
+  `ScribePublicationReconciler` whether this publication is already
+  committed, using the same fenced SQL check it runs after the upload.
+  - **Already committed:** verify each object only and never PUT. A matching
+    object is accepted. A missing or contradicting object fails closed with
+    the uploader's existing contradiction error (internal). There is no
+    repair path.
+  - **Not committed:** use the uploader. It calls `verify_remote` first and
+    returns with no PUT on a match. On missing or contradicting content it
+    falls through to the existing put-and-verify loop, since overwriting an
+    unpublished key is allowed.
+- **Tests:** use a PUT-counting object store; reuse an existing test store
+  wrapper if there is one.
+
+  | Publication | Remote object | PUTs | Result |
+  |---|---|---|---|
+  | committed | matching | 0 | succeeds |
+  | committed | missing | 0 | fails closed |
+  | committed | contradicting | 0 | fails closed |
+  | not committed | matching | 0 | succeeds |
+  | not committed | missing | 1 | succeeds |
+  | not committed | contradicting | 1 | succeeds |
 
 **FIND-003-9. Dead error variants hide a broken missing-file check.**
 - **Problem:** in `storage/error.rs`, `from_object_store`,
@@ -254,16 +303,16 @@ distributed queries.**
 - **FIND-003-10:** delete `PublishedAssignment` from `oracle/exec.rs`, with
   its `assigned` parameter and the `Some` branch. Its only caller passes
   `None`.
-- **FIND-003-20:**
-  - In `crates/shared/wyrd-queue/src/variant.rs` `mask_placeholders`,
-    replace the hand-written `ShreddedResiduals` walk with
-    `parquet_variant_compute::unshred_variant`, followed by the existing
-    `validate`.
-  - Delete `ShreddedResiduals`.
-  - The fixture for `variant::tests::shredded_residuals_pass_the_read_gate`
-    needs field `a` in its metadata to pass after this change.
-  - If a depth limit must run before unshredding, it belongs in the arrow-rs
-    fork, not in Wyrd.
+- **FIND-003-20: dropped. Keep `ShreddedResiduals`.**
+  - The review called it a copy of `parquet_variant_compute::unshred_variant`,
+    but it is not one.
+  - It enforces Bifrost's bounded validation (size, encoding, numeric
+    ranges, depth) on every shredded residual before anything decodes it,
+    as `architecture/bifrost-design.md` ~165-175 requires.
+  - `unshred_variant` builds output immediately and enforces none of those
+    bounds.
+  - These bounds are Bifrost's rules, so the walk is Wyrd-specific and stays.
+    Do not change `variant.rs`.
 
 ### Group 6: docs and style
 
@@ -332,7 +381,6 @@ distributed queries.**
   - `fold_distributed_scan_metrics`
   - `reconciliation_limit_bytes`
   - `PublishedAssignment`
-  - `ShreddedResiduals`
   - `bifrost_oracle_file_pruning_total`
 - These pass:
   - `mise run test:bifrost`, including the Oracle journeys, the

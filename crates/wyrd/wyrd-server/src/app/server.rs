@@ -39,6 +39,19 @@ fn shutdown_deadline_active(deadline: std::time::Instant) -> bool {
     tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline)
 }
 
+/// The Scribe outbox's share of the remaining process shutdown budget.
+///
+/// The outbox retries refused slices until its deadline, so handing it the
+/// whole process deadline lets an unreachable Scribe consume the budget Bifrost
+/// needs to drain its roles. The outbox gets half of what remains on Tokio's
+/// runtime clock; Bifrost keeps the process deadline, so it always starts its
+/// drain with at least the other half. An already-elapsed deadline yields
+/// the current instant, so the outbox abandons its backlog at once.
+fn outbox_shutdown_deadline(deadline: std::time::Instant) -> std::time::Instant {
+    let now = tokio::time::Instant::now();
+    (now + tokio::time::Instant::from_std(deadline).saturating_duration_since(now) / 2).into_std()
+}
+
 /// Resolves supervisor and Bifrost terminal state without discarding lifecycle failures.
 ///
 /// `report` is the drain outcome the caller already computed; it is returned
@@ -831,10 +844,15 @@ impl BoundServer {
         let deadline = deadline.into_std();
         // Every request, gateway call, and Verifier run has finished, so the
         // Scribe outbox holds nearly all it will be given while Scribe still
-        // accepts; write it before Bifrost closes. A decision an Oracle drain
+        // accepts; write it before Bifrost closes, within the outbox's share
+        // of the budget so Bifrost still drains when Scribe is unreachable. A decision an Oracle drain
         // stages after this fence is refused, and every loss is counted and
         // logged by the outbox.
-        let unwritten = self.state.scribe_outbox.shutdown(deadline).await;
+        let unwritten = self
+            .state
+            .scribe_outbox
+            .shutdown(outbox_shutdown_deadline(deadline))
+            .await;
         if unwritten != 0 {
             tracing::warn!(
                 unwritten,
@@ -1084,5 +1102,33 @@ mod pg_tests {
             error.to_string(),
             "Scribe role unavailable; shutdown was triggered by: worker exited"
         );
+    }
+}
+
+/// Shutdown budget arithmetic that needs only Tokio's clock.
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::outbox_shutdown_deadline;
+
+    /// The outbox drains within half the remaining budget, leaving Bifrost the
+    /// rest, and an elapsed deadline is never pushed into the future.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the outbox share is not half the remaining budget or an
+    /// elapsed deadline moves.
+    #[tokio::test(start_paused = true)]
+    async fn outbox_gets_half_of_the_remaining_shutdown_budget() {
+        let now = tokio::time::Instant::now().into_std();
+        let deadline = now + Duration::from_secs(30);
+        assert_eq!(
+            outbox_shutdown_deadline(deadline),
+            now + Duration::from_secs(15)
+        );
+        tokio::time::advance(Duration::from_secs(40)).await;
+        let later = tokio::time::Instant::now().into_std();
+        assert_eq!(outbox_shutdown_deadline(deadline), later);
     }
 }

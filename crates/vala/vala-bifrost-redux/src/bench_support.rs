@@ -13,6 +13,73 @@ use crate::namespaces::BifrostNamespace;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::{PreparedWalAppend, WalConfig, WalWriter};
 
+#[cfg(feature = "test-support")]
+use std::collections::HashMap;
+#[cfg(feature = "test-support")]
+use std::fs::File;
+#[cfg(feature = "test-support")]
+use std::path::PathBuf;
+#[cfg(feature = "test-support")]
+use std::sync::Arc;
+
+#[cfg(feature = "test-support")]
+use arrow::datatypes::{Schema, SchemaRef};
+#[cfg(feature = "test-support")]
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
+#[cfg(feature = "test-support")]
+use datafusion::prelude::SessionContext;
+#[cfg(feature = "test-support")]
+use iceberg::arrow::arrow_schema_to_schema;
+#[cfg(feature = "test-support")]
+use iceberg::io::FileIO;
+#[cfg(feature = "test-support")]
+use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+#[cfg(feature = "test-support")]
+use iceberg::spec::{FormatVersion, SortOrder, TableMetadataBuilder, UnboundPartitionSpec};
+#[cfg(feature = "test-support")]
+use iceberg::table::Table;
+#[cfg(feature = "test-support")]
+use iceberg::transaction::{ApplyTransactionAction as _, Transaction};
+#[cfg(feature = "test-support")]
+use iceberg::writer::file_writer::ParquetWriter;
+#[cfg(feature = "test-support")]
+use iceberg::{
+    Catalog as _, CatalogBuilder as _, NamespaceIdent, Runtime, TableCreation, TableIdent,
+};
+#[cfg(feature = "test-support")]
+use parquet::file::properties::WriterProperties;
+#[cfg(feature = "test-support")]
+use parquet::file::reader::{FileReader as _, SerializedFileReader};
+#[cfg(feature = "test-support")]
+use wyrd_runtime::permission::PermissionSet;
+#[cfg(feature = "test-support")]
+use wyrd_runtime::{Permission, Principal, PrincipalKind};
+#[cfg(feature = "test-support")]
+use wyrd_spec::auth::PrincipalId;
+#[cfg(feature = "test-support")]
+use wyrd_spec::request_id::RequestId;
+#[cfg(feature = "test-support")]
+use wyrd_spec::vala::api::AuthMethod;
+
+#[cfg(feature = "test-support")]
+use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
+#[cfg(feature = "test-support")]
+use crate::catalog::iceberg_storage::{BifrostIcebergStorage, BifrostIcebergStorageFactory};
+#[cfg(feature = "test-support")]
+use crate::oracle::AuthorizedQueryContext;
+#[cfg(feature = "test-support")]
+use crate::oracle::bindings::bench_session_config;
+#[cfg(feature = "test-support")]
+use crate::oracle::exec::{HotFileSource, OracleTableInputs, OracleTableProvider};
+#[cfg(feature = "test-support")]
+use crate::oracle::session::OracleSessionTemplate;
+#[cfg(feature = "test-support")]
+use crate::parquet::footer::tenant_key_value;
+#[cfg(feature = "test-support")]
+use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
+#[cfg(feature = "test-support")]
+use crate::storage::BifrostStorage;
+
 /// Closed Oracle telemetry label domains exported only for benchmark contracts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OracleTelemetryLabelDomains {
@@ -220,25 +287,23 @@ impl WalBenchSupport {
 ///
 /// A hot table ([`Self::session`]) is the production [`OracleTableProvider`]
 /// over a snapshot-free Iceberg table and one hot file, so a query plans and
-/// reads exactly as a leader-local Oracle read of unpublished data does: the
-/// Variant SQL surface, the leaf path rule, and the hot per-file reader. A
-/// published table ([`Self::publish`], [`Self::published_session`]) is the
-/// same provider over a real Iceberg snapshot holding the file and no hot
-/// file, so a query plans through Iceberg and reads through the published
-/// path. Files must be written under the root with [`Self::writer_properties`],
-/// whose footer proves this owner's tenant.
-///
-/// [`OracleTableProvider`]: crate::oracle::exec::OracleTableProvider
+/// reads exactly as a leader-local Oracle read of unpublished data does:
+/// `DataFusion`'s Parquet scan through the hot file reader, which proves each
+/// footer's tenant. A published table ([`Self::publish`],
+/// [`Self::published_session`]) is the same provider over a real Iceberg
+/// snapshot holding the file and no hot file, so a query plans through Iceberg
+/// and reads through the published path. Files must be written under the root
+/// with [`Self::writer_properties`], whose footer proves this owner's tenant.
 #[cfg(feature = "test-support")]
 pub struct OracleBenchTables {
     /// The tenant every footer proves and every query reads as.
     tenant: DataTenantId,
     /// The fixture's storage owner, shared by the hot reader and the catalog.
-    storage: std::sync::Arc<crate::storage::BifrostStorage>,
+    storage: Arc<BifrostStorage>,
     /// The fixture's warehouse store every hot and published file is read through.
-    objects: std::sync::Arc<crate::catalog::iceberg_storage::BifrostIcebergStorage>,
+    objects: Arc<BifrostIcebergStorage>,
     /// The warehouse root every file must live under.
-    root: std::path::PathBuf,
+    root: PathBuf,
     /// The warehouse URI of `root`, which every published location names.
     warehouse: String,
 }
@@ -249,16 +314,11 @@ impl OracleBenchTables {
     /// existing directory `root`.
     #[must_use]
     pub fn new(root: &Path) -> Self {
-        let storage = crate::storage::BifrostStorage::for_test(root, true);
+        let storage = BifrostStorage::for_test(root, true);
         let warehouse = format!("file://{}", root.display());
         Self {
             tenant: DataTenantId::new_v7(),
-            objects: std::sync::Arc::new(
-                crate::catalog::iceberg_storage::BifrostIcebergStorage::new(
-                    std::sync::Arc::clone(&storage),
-                    &warehouse,
-                ),
-            ),
+            objects: Arc::new(BifrostIcebergStorage::new(Arc::clone(&storage), &warehouse)),
             storage,
             root: root.to_path_buf(),
             warehouse,
@@ -268,45 +328,38 @@ impl OracleBenchTables {
     /// The Bifrost writer recipe, with a footer proving this owner's tenant and
     /// `row_group_rows` rows per row group.
     #[must_use]
-    pub fn writer_properties(
-        &self,
-        row_group_rows: usize,
-    ) -> parquet::file::properties::WriterProperties {
-        crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
-            vec![crate::parquet::footer::tenant_key_value(self.tenant)],
-            &[],
-        )
-        .into_builder()
-        .set_max_row_group_row_count(Some(row_group_rows))
-        .build()
+    pub fn writer_properties(&self, row_group_rows: usize) -> WriterProperties {
+        bifrost_writer_properties_with_metadata(vec![tenant_key_value(self.tenant)], &[])
+            .into_builder()
+            .set_max_row_group_row_count(Some(row_group_rows))
+            .build()
     }
 
     /// Returns a plain `DataFusion` session with the same configuration an
     /// Oracle session has (see `bench_session_config`) and none of Wyrd's
-    /// providers, rules or functions: the native side of a like-for-like
-    /// comparison.
+    /// providers: the native side of a like-for-like comparison.
     ///
     /// # Panics
     ///
-    /// Panics when the fixed test composition has no Oracle capability.
+    /// Panics when the host's core count yields no partition count, which a
+    /// real host cannot cause.
     #[must_use]
-    pub fn native_session() -> datafusion::prelude::SessionContext {
-        datafusion::prelude::SessionContext::new_with_config(
-            crate::oracle::bindings::bench_session_config(),
-        )
+    pub fn native_session() -> SessionContext {
+        SessionContext::new_with_config(bench_session_config())
     }
 
     /// Returns a production-configured Oracle session (see
     /// `bench_session_config`) with each `(name, logical schema, file)`
-    /// registered as a hot table, bound with a live Interactive grant over a
-    /// 1 GiB test Oracle composition so its leaves execute without admission.
+    /// registered as a hot table, bound with a live Interactive test grant so
+    /// its leaves execute without admission.
     ///
     /// The logical schema carries every field's Iceberg field id; a file may
     /// shred its Variants, as hot files do.
     ///
     /// # Panics
     ///
-    /// Panics when the fixed test composition has no Oracle capability.
+    /// Panics when the host's core count yields no partition count, which a
+    /// real host cannot cause.
     ///
     /// # Errors
     ///
@@ -315,15 +368,15 @@ impl OracleBenchTables {
     /// built or registered.
     pub async fn session(
         &self,
-        tables: &[(&str, arrow::datatypes::SchemaRef, &Path)],
-    ) -> datafusion::error::Result<datafusion::prelude::SessionContext> {
+        tables: &[(&str, SchemaRef, &Path)],
+    ) -> DataFusionResult<SessionContext> {
         let context = Self::wyrd_session();
         for (name, schema, path) in tables {
             let table = Self::unpublished_table(name, schema, path)?;
             let provider = self
                 .provider(name, table, vec![self.hot_file(path)?])
                 .await?;
-            context.register_table(*name, std::sync::Arc::new(provider))?;
+            context.register_table(*name, Arc::new(provider))?;
         }
         Ok(context)
     }
@@ -346,56 +399,45 @@ impl OracleBenchTables {
     pub async fn publish(
         &self,
         name: &str,
-        schema: &arrow::datatypes::Schema,
+        schema: &Schema,
         path: &Path,
-    ) -> datafusion::error::Result<iceberg::table::Table> {
-        use datafusion::error::DataFusionError;
-        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-        use iceberg::transaction::{ApplyTransactionAction as _, Transaction};
-        use iceberg::{Catalog as _, CatalogBuilder as _, NamespaceIdent, TableCreation};
-
+    ) -> DataFusionResult<Table> {
         let external = |error: iceberg::Error| DataFusionError::External(Box::new(error));
         let catalog = MemoryCatalogBuilder::default()
-            .with_storage_factory(std::sync::Arc::new(
-                crate::catalog::iceberg_storage::BifrostIcebergStorageFactory::new(
-                    std::sync::Arc::clone(&self.storage),
-                    &self.warehouse,
-                ),
-            ))
+            .with_storage_factory(Arc::new(BifrostIcebergStorageFactory::new(
+                Arc::clone(&self.storage),
+                &self.warehouse,
+            )))
             .load(
                 "bench",
-                std::collections::HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_owned(),
-                    self.warehouse.clone(),
-                )]),
+                HashMap::from([(MEMORY_CATALOG_WAREHOUSE.to_owned(), self.warehouse.clone())]),
             )
             .await
             .map_err(external)?;
         let namespace = NamespaceIdent::new("bench".to_owned());
         catalog
-            .create_namespace(&namespace, std::collections::HashMap::new())
+            .create_namespace(&namespace, HashMap::new())
             .await
             .map_err(external)?;
         let creation = TableCreation::builder()
             .name(name.to_owned())
-            .schema(iceberg::arrow::arrow_schema_to_schema(schema).map_err(external)?)
-            .format_version(iceberg::spec::FormatVersion::V3)
+            .schema(arrow_schema_to_schema(schema).map_err(external)?)
+            .format_version(FormatVersion::V3)
             .build();
         let table = catalog
             .create_table(&namespace, creation)
             .await
             .map_err(external)?;
-        let footer = parquet::file::reader::FileReader::metadata(
-            &parquet::file::reader::SerializedFileReader::new(std::fs::File::open(path)?)
-                .map_err(|error| DataFusionError::External(Box::new(error)))?,
-        )
-        .clone();
-        let data_file = iceberg::writer::file_writer::ParquetWriter::parquet_to_data_file_builder(
-            std::sync::Arc::clone(table.metadata().current_schema()),
-            std::sync::Arc::new(footer),
+        let footer = SerializedFileReader::new(File::open(path)?)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?
+            .metadata()
+            .clone();
+        let data_file = ParquetWriter::parquet_to_data_file_builder(
+            Arc::clone(table.metadata().current_schema()),
+            Arc::new(footer),
             usize::try_from(std::fs::metadata(path)?.len()).unwrap_or(usize::MAX),
             format!("{}/{}", self.warehouse, self.relative(path)?),
-            std::collections::HashMap::new(),
+            HashMap::new(),
         )
         .map_err(external)?
         .build()
@@ -417,7 +459,8 @@ impl OracleBenchTables {
     ///
     /// # Panics
     ///
-    /// Panics when the fixed test composition has no Oracle capability.
+    /// Panics when the host's core count yields no partition count, which a
+    /// real host cannot cause.
     ///
     /// # Errors
     ///
@@ -425,12 +468,12 @@ impl OracleBenchTables {
     /// registered.
     pub async fn published_session(
         &self,
-        tables: &[(&str, &iceberg::table::Table)],
-    ) -> datafusion::error::Result<datafusion::prelude::SessionContext> {
+        tables: &[(&str, &Table)],
+    ) -> DataFusionResult<SessionContext> {
         let context = Self::wyrd_session();
         for (name, table) in tables {
             let provider = self.provider(name, (*table).clone(), Vec::new()).await?;
-            context.register_table(*name, std::sync::Arc::new(provider))?;
+            context.register_table(*name, Arc::new(provider))?;
         }
         Ok(context)
     }
@@ -439,11 +482,11 @@ impl OracleBenchTables {
     ///
     /// # Panics
     ///
-    /// Panics when the fixed test composition has no Oracle capability.
-    fn wyrd_session() -> datafusion::prelude::SessionContext {
-        datafusion::prelude::SessionContext::new_with_state(
-            crate::oracle::session::OracleSessionTemplate::shared()
-                .session(crate::oracle::bindings::bench_session_config()),
+    /// Panics when the host's core count yields no partition count, which a
+    /// real host cannot cause.
+    fn wyrd_session() -> SessionContext {
+        SessionContext::new_with_state(
+            OracleSessionTemplate::shared().session(bench_session_config()),
         )
     }
 
@@ -454,31 +497,24 @@ impl OracleBenchTables {
     ///
     /// Returns a `DataFusion` error when the schema has no Iceberg form or the
     /// table cannot be built.
-    fn unpublished_table(
-        name: &str,
-        schema: &arrow::datatypes::Schema,
-        path: &Path,
-    ) -> datafusion::error::Result<iceberg::table::Table> {
-        use iceberg::spec::{FormatVersion, SortOrder, TableMetadataBuilder, UnboundPartitionSpec};
-
-        let external =
-            |error: iceberg::Error| datafusion::error::DataFusionError::External(Box::new(error));
+    fn unpublished_table(name: &str, schema: &Schema, path: &Path) -> DataFusionResult<Table> {
+        let external = |error: iceberg::Error| DataFusionError::External(Box::new(error));
         let metadata = TableMetadataBuilder::new(
-            iceberg::arrow::arrow_schema_to_schema(schema).map_err(external)?,
+            arrow_schema_to_schema(schema).map_err(external)?,
             UnboundPartitionSpec::builder().build(),
             SortOrder::unsorted_order(),
             format!("file://{}", path.parent().unwrap_or(path).display()),
             FormatVersion::V3,
-            std::collections::HashMap::new(),
+            HashMap::new(),
         )
         .and_then(TableMetadataBuilder::build)
         .map_err(external)?
         .metadata;
-        iceberg::table::Table::builder()
-            .file_io(iceberg::io::FileIO::new_with_fs())
+        Table::builder()
+            .file_io(FileIO::new_with_fs())
             .metadata(metadata)
-            .identifier(iceberg::TableIdent::from_strs(["bench", name]).map_err(external)?)
-            .runtime(iceberg::Runtime::current())
+            .identifier(TableIdent::from_strs(["bench", name]).map_err(external)?)
+            .runtime(Runtime::current())
             .build()
             .map_err(external)
     }
@@ -490,26 +526,20 @@ impl OracleBenchTables {
     ///
     /// Returns a `DataFusion` error when the file cannot be read or lies
     /// outside the root.
-    fn hot_file(
-        &self,
-        path: &Path,
-    ) -> datafusion::error::Result<crate::oracle::exec::HotFileSource> {
+    fn hot_file(&self, path: &Path) -> DataFusionResult<HotFileSource> {
         let size = std::fs::metadata(path)?.len();
         // Production reads the row count from the durable manifest row; the
         // bench file has no manifest, so its own footer stands in for it.
-        let rows = parquet::file::reader::FileReader::metadata(
-            &parquet::file::reader::SerializedFileReader::new(std::fs::File::open(path)?)
-                .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?,
-        )
-        .file_metadata()
-        .num_rows();
-        Ok(crate::oracle::exec::HotFileSource {
+        let rows = SerializedFileReader::new(File::open(path)?)
+            .map_err(|error| DataFusionError::External(Box::new(error)))?
+            .metadata()
+            .file_metadata()
+            .num_rows();
+        Ok(HotFileSource {
             location: self.relative(path)?,
             size_bytes: usize::try_from(size).unwrap_or(usize::MAX),
             row_count: u64::try_from(rows).ok(),
-            event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
-                crate::catalog::event_time::EventTimeBoundsDefect::Missing,
-            ),
+            event_time: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing),
         })
     }
 
@@ -518,10 +548,10 @@ impl OracleBenchTables {
     /// # Errors
     ///
     /// Returns a `DataFusion` error when `path` lies outside the root.
-    fn relative(&self, path: &Path) -> datafusion::error::Result<String> {
+    fn relative(&self, path: &Path) -> DataFusionResult<String> {
         Ok(path
             .strip_prefix(&self.root)
-            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
+            .map_err(|error| DataFusionError::External(Box::new(error)))?
             .to_string_lossy()
             .into_owned())
     }
@@ -536,29 +566,29 @@ impl OracleBenchTables {
     async fn provider(
         &self,
         name: &str,
-        table: iceberg::table::Table,
-        hot_files: Vec<crate::oracle::exec::HotFileSource>,
-    ) -> datafusion::error::Result<crate::oracle::exec::OracleTableProvider> {
-        let principal = wyrd_runtime::Principal {
-            id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
-            kind: wyrd_runtime::PrincipalKind::User,
+        table: Table,
+        hot_files: Vec<HotFileSource>,
+    ) -> DataFusionResult<OracleTableProvider> {
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: PrincipalKind::User,
             tenant_id: self.tenant,
             roles: Vec::new(),
-            effective_permissions: wyrd_runtime::permission::PermissionSet::default(),
+            effective_permissions: PermissionSet::default(),
             credential_id: None,
         };
-        let context = crate::oracle::AuthorizedQueryContext::try_new(
+        let context = AuthorizedQueryContext::try_new(
             principal,
             self.tenant,
-            wyrd_spec::request_id::RequestId::now_v7(),
+            RequestId::now_v7(),
             None,
-            wyrd_spec::vala::api::AuthMethod::Internal,
-            wyrd_runtime::Permission::bifrost_query_read(),
+            AuthMethod::Internal,
+            Permission::bifrost_query_read(),
         )
-        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-        crate::oracle::exec::OracleTableProvider::try_new(crate::oracle::exec::OracleTableInputs {
+        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        OracleTableProvider::try_new(OracleTableInputs {
             table,
-            objects: std::sync::Arc::clone(&self.objects),
+            objects: Arc::clone(&self.objects),
             hot_files,
             context,
             table_name: name.to_owned(),

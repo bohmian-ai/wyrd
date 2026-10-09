@@ -33,8 +33,10 @@ use iceberg::{
     Catalog, Error as IcebergError, ErrorKind as IcebergErrorKind, Namespace, NamespaceIdent,
     TableCommit, TableCreation, TableIdent,
 };
-use object_store::ObjectMeta;
+use object_store::path::Path as ObjectPath;
+use object_store::{ObjectMeta, ObjectStoreExt as _};
 use secrecy::ExposeSecret as _;
+use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -43,8 +45,8 @@ use vala_bifrost_redux::catalog::{
 };
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeError,
-    ForgeObjectStore, ForgeObjects, ForgeRoleReadiness, ForgeSchedulerTrigger, ForgeTelemetry,
-    ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    ForgeObjectPages, ForgeObjectStore, ForgeObjects, ForgeRoleReadiness, ForgeSchedulerTrigger,
+    ForgeTelemetry, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -272,11 +274,7 @@ impl ForgeObjectStore for CountingObjectStore {
     /// Recording each cursor is what lets a resume proof assert that earlier
     /// pages are never relisted; re-chunking each production page keeps its
     /// order and cursor semantics while letting the page cap bite.
-    fn list_pages(
-        &self,
-        prefix: &str,
-        start_after: Option<&str>,
-    ) -> vala_bifrost_redux::forge::ForgeObjectPages {
+    fn list_pages(&self, prefix: &str, start_after: Option<&str>) -> ForgeObjectPages {
         self.list_cursors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1880,11 +1878,9 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when the object cannot be read.
     pub(crate) async fn read_object(&self, key: &str) -> Bytes {
-        use object_store::ObjectStoreExt as _;
-
         self.storage
             .objects()
-            .get(&object_store::path::Path::from(key))
+            .get(&ObjectPath::from(key))
             .await
             .expect("fixture object read")
             .bytes()
@@ -1898,11 +1894,9 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when the write fails.
     pub(crate) async fn write_object(&self, key: &str, bytes: impl Into<Bytes>) {
-        use object_store::ObjectStoreExt as _;
-
         self.storage
             .objects()
-            .put(&object_store::path::Path::from(key), bytes.into().into())
+            .put(&ObjectPath::from(key), bytes.into().into())
             .await
             .expect("fixture object write");
     }
@@ -1913,11 +1907,9 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when the delete fails.
     pub(crate) async fn delete_object(&self, key: &str) {
-        use object_store::ObjectStoreExt as _;
-
         self.storage
             .objects()
-            .delete(&object_store::path::Path::from(key))
+            .delete(&ObjectPath::from(key))
             .await
             .expect("fixture object delete");
     }
@@ -1928,14 +1920,7 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when the store fails for a reason other than absence.
     pub(crate) async fn object_exists(&self, key: &str) -> bool {
-        use object_store::ObjectStoreExt as _;
-
-        match self
-            .storage
-            .objects()
-            .head(&object_store::path::Path::from(key))
-            .await
-        {
+        match self.storage.objects().head(&ObjectPath::from(key)).await {
             Ok(_) => true,
             Err(object_store::Error::NotFound { .. }) => false,
             Err(error) => panic!("fixture object stat failed: {error}"),
@@ -1952,10 +1937,8 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when the object store cannot be listed or read.
     pub(crate) async fn object_digests(&self) -> BTreeMap<String, String> {
-        use object_store::ObjectStoreExt as _;
-
         let objects = self.storage.objects();
-        let prefix = object_store::path::Path::from(self.binding.object_prefix.as_str());
+        let prefix = ObjectPath::from(self.binding.object_prefix.as_str());
         let entries = objects
             .list(Some(&prefix))
             .try_collect::<Vec<_>>()
@@ -1971,8 +1954,7 @@ impl PromotionIntegrationFixture {
                 .await
                 .expect("fixture object bytes");
             digests.insert(entry.location.to_string(), {
-                use sha2::Digest as _;
-                hex::encode(sha2::Sha256::digest(&bytes))
+                hex::encode(Sha256::digest(&bytes))
             });
         }
         digests

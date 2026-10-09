@@ -18,7 +18,10 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::memory_pool::{
     FairSpillPool, MemoryConsumer, MemoryPool, MemoryReservation, TrackConsumersPool,
@@ -29,6 +32,7 @@ use rustix::fs::statvfs;
 use tokio::sync::Notify;
 use wyrd_spec::vala::api::QueryClass;
 
+use crate::oracle::session::OracleSessionTemplate;
 use crate::oracle::spill::{OracleSpillRuntime, build_query_runtime};
 
 /// One mebibyte in bytes.
@@ -4071,7 +4075,7 @@ impl OracleSessionShape {
     /// crate test that builds a scan without a session.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn config_options(self) -> datafusion::config::ConfigOptions {
+    pub(crate) fn config_options(self) -> ConfigOptions {
         self.session_config().options().as_ref().clone()
     }
 
@@ -4083,8 +4087,8 @@ impl OracleSessionShape {
 
     /// Applies this shape and Oracle's fixed Parquet read options to `config`.
     ///
-    /// A closed leaf predicate recognized by `OracleTableProvider`'s classifier
-    /// only prunes files, row groups, and pages if the session that opens the
+    /// A predicate `DataFusion` pushes into a Parquet scan only prunes files,
+    /// row groups, and pages if the session that opens the
     /// Parquet files enables pushdown, reorders filters ahead of decoding, and
     /// consults bloom filters and page indexes. Scans report row counts as
     /// inexact (an exact count would let `count(*)` skip the footer tenant
@@ -4247,7 +4251,7 @@ impl OracleExecution {
 
     /// Builds a default-featured session state for `config` under this grant:
     /// the Oracle session for `config` (see
-    /// [`crate::oracle::session::OracleSessionTemplate::session`]) with its
+    /// [`OracleSessionTemplate::session`]) with its
     /// runtime swapped for the grant's, as `SessionContext` swaps a runtime.
     ///
     /// Sessions that need upstream's distributed
@@ -4258,8 +4262,8 @@ impl OracleExecution {
         &self,
         config: datafusion::execution::context::SessionConfig,
     ) -> datafusion::execution::SessionState {
-        datafusion::execution::SessionStateBuilder::new_from_existing(
-            crate::oracle::session::OracleSessionTemplate::shared().session(self.configure(config)),
+        SessionStateBuilder::new_from_existing(
+            OracleSessionTemplate::shared().session(self.configure(config)),
         )
         .with_runtime_env(Arc::clone(&self.runtime))
         .build()

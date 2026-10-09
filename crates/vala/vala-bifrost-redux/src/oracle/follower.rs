@@ -53,8 +53,7 @@ pub enum PhysicalPlanFollowerError {
 ///
 /// The class is decided where the cause is known and carried unchanged to the
 /// role's dispatch mapping, which is the only place it becomes a wire
-/// outcome. A published follower treats every class as eligible source loss;
-/// a Scribe follower degrades only `SourceLoss` and fails `Fault`.
+/// outcome. A Scribe follower degrades only `SourceLoss` and fails `Fault`.
 #[derive(Debug, Error)]
 pub enum FollowerResolutionError {
     /// Schema, projection, predicate, binding, integrity, or local execution
@@ -764,16 +763,16 @@ where
             .decode(request, authenticated, &session, &context)
             .await?;
         self.effects.execution.fetch_add(1, Ordering::SeqCst);
-        // Snapshot the scan metric sets before execution consumes the plan.
-        // The leader's own plan has only remote leaves, so this follower-side
-        // capture is the only place a distributed query can observe physical
-        // read volume at all.
         // A live fragment ships its predicate as a `FilterExec` above the
         // placeholder; `DataFusion`'s own pushdown moves it into the
         // substituted staged scan, where it prunes row groups and pages.
         let plan = FilterPushdown::new()
             .optimize(plan, session.config().options())
             .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
+        // Snapshot the scan metric sets after pushdown and before execution
+        // consumes the plan. They return to the leader in this live
+        // fragment's footer; published scans report through
+        // `record_distributed_scan_metrics` instead.
         let scan_stats = super::exec::OracleQueryScanStats::from_plan(plan.as_ref());
         let stream = execute_stream(plan, context)
             .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
@@ -807,11 +806,6 @@ where
         self.effects.preflight.load(Ordering::SeqCst)
     }
 
-    /// Performs the complete IO-free validation phase.
-    ///
-    /// # Errors
-    /// Returns a preflight error for any malformed request, contradictory
-    /// authenticated binding, unsupported plan node, or inconsistent scan set.
     /// Validates one authenticated assignment beyond its identity and binding.
     ///
     /// Runs the checks that are about the assignment's *content* rather than
@@ -853,6 +847,16 @@ where
         Ok(())
     }
 
+    /// Performs the complete IO-free validation phase.
+    ///
+    /// Checks the request's wire shape and role fences against the
+    /// authenticated context, decodes the plan to collect its extension
+    /// placeholders, and validates every assignment's identity, binding, and
+    /// content before any provider resolution or object I/O.
+    ///
+    /// # Errors
+    /// Returns a preflight error for any malformed request, contradictory
+    /// authenticated binding, unsupported plan node, or inconsistent scan set.
     fn preflight(
         &self,
         request: &ExecuteFragmentRequest,

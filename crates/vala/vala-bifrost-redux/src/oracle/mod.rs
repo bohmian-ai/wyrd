@@ -42,10 +42,12 @@ use wyrd_spec::vala::api::{
     QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
 };
 
+use crate::catalog::iceberg_storage::BifrostIcebergStorage;
 use crate::catalog::{
     BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef, TableUid, TenantTableBinding,
 };
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
+use crate::resources::OracleResources;
 use crate::schema::SchemaFingerprint;
 use crate::scribe::tail_rpc::TailReadError;
 
@@ -234,7 +236,7 @@ pub struct QueryOptions {
 #[derive(Debug, Clone)]
 pub struct OracleMemoryResources {
     /// Narrow Oracle capability issued by the one production composition.
-    pub resources: crate::resources::OracleResources,
+    pub resources: OracleResources,
 }
 
 /// Point-in-time readiness inputs used by role-separated lifecycle journeys.
@@ -1138,7 +1140,7 @@ pub struct Oracle {
     /// This node's Oracle resource capability, read only by test-tier
     /// inspection; admission holds its own clone.
     #[cfg(feature = "test-support")]
-    resources: crate::resources::OracleResources,
+    resources: OracleResources,
     /// Query-scoped live Scribe discovery owner.
     tail_discovery: Option<Arc<dyn TailStreamDiscovery>>,
     /// Test-tier one-shot refusal armed immediately before the distributed build.
@@ -1319,7 +1321,7 @@ struct AnalyticalCompositionInputs {
     /// Immutable peer identity every east-west channel is dialed through.
     peer_tls: dispatcher::BifrostPeerTls,
     /// The node's warehouse store every stage scan on this node reads through.
-    objects: Arc<crate::catalog::iceberg_storage::BifrostIcebergStorage>,
+    objects: Arc<BifrostIcebergStorage>,
     /// Parquet bytes each distributed scan task reads; `None` keeps upstream's.
     file_scan_bytes_per_task: Option<usize>,
 }
@@ -1621,7 +1623,7 @@ impl Oracle {
     /// same arithmetic admission will apply.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub const fn role_resources(&self) -> &crate::resources::OracleResources {
+    pub const fn role_resources(&self) -> &OracleResources {
         &self.resources
     }
 

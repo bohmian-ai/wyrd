@@ -1,8 +1,12 @@
-//! The session template every Oracle query session starts from.
+//! The session template Oracle's planning and execution sessions start from.
 //!
 //! `DataFusion`'s default features, including its Variant functions and the
 //! `->`/`->>` planner, are built once per process; each query clones the
 //! result instead of rebuilding every registry.
+//!
+//! The analytical leader's distributed session is the one exception: it is
+//! built from `DataFusion`'s default features directly, with the attempt's own
+//! runtime and the distributed planner.
 
 use std::sync::{Arc, LazyLock};
 

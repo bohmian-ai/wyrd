@@ -10,16 +10,22 @@
 //! from the same configuration, which is what lets planning observe an unbound
 //! lock and execution observe the admitted one without rebuilding the root.
 
+#[cfg(all(feature = "test-support", feature = "bench-support"))]
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
+#[cfg(all(feature = "test-support", feature = "bench-support"))]
+use datafusion::prelude::SessionConfig;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::vala::api::QueryClass;
 use wyrd_spec::vala::error::BifrostError;
 
 use super::live::LiveDispatch;
 use super::{DegradedSourceAccumulator, QueryCatalogError};
+#[cfg(all(feature = "test-support", feature = "bench-support"))]
+use crate::resources::{OracleSessionShape, oracle_target_partitions};
 
 /// The admitted execution governance every leaf resolves from its task.
 ///
@@ -231,20 +237,20 @@ fn with_test_grant(
 /// leader-local Oracle leaves without admission.
 ///
 /// The shape is the one a production leader derives: one partition per core
-/// for wholly local data ([`crate::resources::oracle_target_partitions`] at
-/// locality 1.0), with Oracle's fixed Parquet read options.
+/// for wholly local data ([`oracle_target_partitions`] at locality 1.0), with
+/// Oracle's fixed Parquet read options.
 ///
 /// # Panics
 ///
 /// Panics when the partition count overflows, which a host's core count
 /// cannot cause.
 #[cfg(all(feature = "test-support", feature = "bench-support"))]
-pub(crate) fn bench_session_config() -> datafusion::prelude::SessionConfig {
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let partitions = crate::resources::oracle_target_partitions(cores, 1.0)
-        .expect("a host's core count yields a partition count");
+pub(crate) fn bench_session_config() -> SessionConfig {
+    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let partitions =
+        oracle_target_partitions(cores, 1.0).expect("a host's core count yields a partition count");
     with_test_grant(
-        crate::resources::OracleSessionShape::new(partitions).session_config(),
+        OracleSessionShape::new(partitions).session_config(),
         OracleExecutionGrant::for_test(QueryClass::Interactive),
     )
 }

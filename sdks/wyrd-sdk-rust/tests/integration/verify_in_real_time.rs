@@ -1,7 +1,8 @@
 //! An assistant judges its own behavior while it runs: `observe().verify`
 //! returns a `Judgment` from the Verifier bound to the observed Card, whether
 //! that Verifier is an Eval, a Drift, or a single task check. Only
-//! `verifier:run` on the named Verifier authorizes the call.
+//! `verifier:run` on the named Verifier authorizes the call; an LLM judge
+//! then calls the gateway as that same caller.
 
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use wyrd_sdk::state::WyrdState;
 use wyrd_sdk::{Bifrost, VerificationVerdict, VerifierCounts, VerifierKind, WyrdClient};
 use wyrd_testing::server::WyrdTestServer;
 
+use crate::local_development::configure_gateway;
 use crate::support::{Deployment, hydrate, register, registered};
 
 /// How long a test waits for the latency baseline to fit.
@@ -36,8 +38,8 @@ struct Latency {
 }
 
 /// The assistant deployment: a server running the verification runtime whose
-/// provider upstream is a local judge that passes every answer, with the
-/// assistant Service registered and hydrated.
+/// gateway deploys `gpt-4o` on a local judge that passes every answer, with
+/// the assistant Service registered and hydrated.
 struct Assistant {
     /// The deployment.
     deployment: Deployment,
@@ -56,8 +58,9 @@ struct Assistant {
 }
 
 impl Assistant {
-    /// Start the judge and the server, then register the latency baseline,
-    /// the latency Model, and the assistant, and hydrate the assistant.
+    /// Start the judge and the server, deploy the judge model on the gateway,
+    /// then register the latency baseline, the latency Model, and the
+    /// assistant, and hydrate the assistant.
     ///
     /// # Panics
     /// Panics when a setup step fails.
@@ -69,7 +72,7 @@ impl Assistant {
                 "id": "chatcmpl-judge",
                 "object": "chat.completion",
                 "created": 1,
-                "model": "gpt-test",
+                "model": "gpt-4o",
                 "choices": [{
                     "index": 0,
                     "finish_reason": "stop",
@@ -87,6 +90,7 @@ impl Assistant {
                 ),
         )
         .await;
+        configure_gateway(&deployment.admin()).await;
         let cards = deployment.cards();
         register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
         register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
@@ -107,8 +111,9 @@ impl Assistant {
     /// started with Bifrost.
     ///
     /// The Service's key comes from the `issue_key` CLI function with no Role
-    /// granted beyond its default, so Bifrost startup and every verify run
-    /// with exactly what a newly registered Service holds.
+    /// granted beyond its default `workload`, so Bifrost startup, every
+    /// verify, and every judge's gateway call run with exactly what a newly
+    /// registered Service holds.
     ///
     /// # Panics
     /// Panics when the key is not issued, the bundle does not load, or

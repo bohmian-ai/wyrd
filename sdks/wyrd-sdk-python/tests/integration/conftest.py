@@ -35,6 +35,7 @@ from .support import (
     register,
     service_key,
 )
+from .test_local_development import configure_gateway
 
 if TYPE_CHECKING:
     from wyrd.operators import OperatorConnectionView
@@ -133,7 +134,11 @@ def viewer_key(wyrd_server: WyrdTestServer) -> str:
 def assistant_bundle(
     wyrd_server: WyrdTestServer, cards: Cards, tmp_path_factory: pytest.TempPathFactory
 ) -> Path:
-    """The ``assistant`` Service, registered with a fitted latency baseline and downloaded."""
+    """The ``assistant`` Service, registered with a fitted latency baseline and downloaded.
+
+    Its LLM judges call the gateway, so the judge model is deployed there first.
+    """
+    configure_gateway(WyrdClient())
     register(cards, "cards/latency_baseline/latency-baseline.yaml")
     register(cards, "cards/verify_in_real_time/latency-model.yaml")
     registered = register(cards, "cards/verify_in_real_time/assistant.yaml")

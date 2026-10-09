@@ -112,15 +112,14 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
             "`{name}` sends no field identity; ingress compares by shape"
         );
     }
+    let card_uid = canonical
+        .correlation_fields
+        .iter()
+        .find(|field| field.name == "card_uid")
+        .expect("the Card correlation input is described");
     assert!(
-        canonical
-            .correlation_fields
-            .iter()
-            .find(|field| field.name == "card_uid")
-            .expect("the Card correlation input is described")
-            .metadata
-            .contains_key(wyrd_spec::vala::api::PARQUET_FIELD_ID_KEY),
-        "card_uid is the stored column the writer supplies"
+        card_uid.nullable && card_uid.data_type == wyrd_spec::vala::api::DataTypeSpec::Utf8,
+        "card_uid is the optional text column the writer supplies"
     );
     for name in ["card_uid", "run_id", "wyrd_event_time"] {
         assert_eq!(

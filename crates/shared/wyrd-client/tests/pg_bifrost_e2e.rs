@@ -2729,14 +2729,14 @@ mod pg_tests {
     /// Variant and whose events are Structs, then reads it through raw `sql`
     /// and typed `sql_as`. The raw result keeps the Variant extension, the
     /// typed result decodes every Variant into native JSON, Struct access
-    /// stays exact, and invalid JSON in `parse_json` is the stable Variant
-    /// error, before the first batch or after a delivered one, while
-    /// `try_parse_json` is null.
+    /// stays exact, invalid JSON in `parse_json` is a query execution failure,
+    /// and `try_parse_json` is null. A failure after a delivered batch refuses
+    /// the whole result.
     ///
     /// # Panics
     ///
     /// Panics when the fixture is refused, a value reads back differently, or
-    /// an early or late failure does not carry its catalog problem.
+    /// a failure does not carry the query execution problem.
     #[tokio::test]
     async fn builtin_variant_and_struct_payloads_are_queryable() {
         let srv = WyrdTestServer::start_bound()
@@ -2828,13 +2828,12 @@ mod pg_tests {
             .sql(&format!("SELECT parse_json('{{bad') AS v {parent}"))
             .await
             .expect_err("invalid JSON in parse_json is a query error");
-        assert_eq!(sdk_code(&invalid), "WYRD_VALA_400_VARIANT_INVALID_JSON");
+        assert_eq!(sdk_code(&invalid), "WYRD_VALA_500_QUERY_EXECUTION_FAILED");
 
-        // A failure after a delivered batch keeps the pre-stream problem: rows
+        // A failure after a delivered batch refuses the whole result: rows
         // from id 8192 fail only in the second 8192-row batch. DataFusion
         // projects batches on several partitions, so that batch may fail
-        // before or after the first one is delivered. An unrelated late cast
-        // failure stays generic, and neither result is returned partially.
+        // before or after the first one is delivered.
         let late_fqn = owned_fqn("variant_late");
         let late_table = Bifrost::connect_with_table(&client, table(&late_fqn))
             .await
@@ -2859,37 +2858,23 @@ mod pg_tests {
         srv.flush_bifrost()
             .await
             .expect("publish the late-failure rows");
-        let BifrostClientError::Transport(early) = invalid else {
-            panic!("invalid JSON in one row is refused before the stream opens");
-        };
-        for (sql, expected) in [
-            (
-                format!(
-                    "SELECT id, parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{{bad' END) AS v \
-                     FROM {late_fqn}"
-                ),
-                early.problem(),
-            ),
-            (
-                format!(
-                    "SELECT id, CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT) AS v \
-                     FROM {late_fqn}"
-                ),
-                wyrd_spec::error::WyrdError::from(
-                    wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
-                )
-                .problem(),
-            ),
-        ] {
-            let late = bifrost
-                .sql(&sql)
-                .await
-                .expect_err("a late failure refuses the whole result");
-            if let Some(terminal) = late.terminal() {
-                assert_eq!(terminal.row_count, 8192, "one valid batch preceded it");
-            }
-            assert_eq!(wyrd_spec::error::WyrdError::from(&late).problem(), expected);
+        let late = bifrost
+            .sql(&format!(
+                "SELECT id, CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT) AS v \
+                 FROM {late_fqn}"
+            ))
+            .await
+            .expect_err("a late failure refuses the whole result");
+        if let Some(terminal) = late.terminal() {
+            assert_eq!(terminal.row_count, 8192, "one valid batch preceded it");
         }
+        assert_eq!(
+            wyrd_spec::error::WyrdError::from(&late).problem(),
+            wyrd_spec::error::WyrdError::from(
+                wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
+            )
+            .problem()
+        );
 
         srv.shutdown().await.expect("server shutdown");
     }

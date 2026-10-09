@@ -69,12 +69,24 @@ fn request(sql: &str) -> BifrostQueryRequest {
     }
 }
 
-/// Writes and publishes one fixture table on the cluster's ingest node.
+/// Writes and publishes one fixture table on the cluster's ingest node as
+/// `objects` published objects.
+///
+/// Ids `0..FIXTURE_ROWS` are split evenly across `objects` writes, each
+/// flushed into its own object, and every object holds every `filter_key`
+/// group, so totals and group counts do not depend on `objects`. The class a
+/// statement settles follows this layout: the distributed planner splits a
+/// scan of two or more objects across tasks at the harness's one byte per
+/// task, and leaves a one-object scan on the leader.
 ///
 /// # Errors
 /// Returns missing-ingest-node, registration, credential, append, flush, or
 /// Oracle membership-refresh failures while preparing the published fixture.
-async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, JourneyError> {
+async fn seed_table(
+    cluster: &WyrdTestCluster,
+    prefix: &str,
+    objects: i64,
+) -> Result<String, JourneyError> {
     let ingest = cluster
         .servers()
         .find(|server| server.bifrost_scribe().is_some())
@@ -83,15 +95,19 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
     let table = unique_table(prefix);
     register_table(ingest, tenant, &table).await?;
     let rows = writer(ingest, &format!("{prefix}-writer")).await?;
-    rows.write(
-        &format!("vala.bifrost.{table}"),
-        &journey_schema(),
-        (0..FIXTURE_ROWS)
-            .map(|id| journey_row(id, &format!("group_{}", id % FIXTURE_GROUPS)))
-            .collect::<Vec<_>>(),
-    )
-    .await?;
-    ingest.flush_bifrost().await?;
+    let per_object = FIXTURE_ROWS / objects;
+    for object in 0..objects {
+        let start = object * per_object;
+        rows.write(
+            &format!("vala.bifrost.{table}"),
+            &journey_schema(),
+            (start..start + per_object)
+                .map(|id| journey_row(id, &format!("group_{}", id % FIXTURE_GROUPS)))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        ingest.flush_bifrost().await?;
+    }
     cluster.refresh_oracle_snapshots().await?;
     Ok(table)
 }
@@ -216,7 +232,10 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
     let cluster =
         WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
     let tenant = cluster.data_tenant_id();
-    let table = seed_table(&cluster, "analytical_cleanup").await?;
+    let table = seed_table(&cluster, "analytical_cleanup", 2).await?;
+    // A one-object table stays on the leader, so its scan is the graphless
+    // Interactive case.
+    let interactive_table = seed_table(&cluster, "analytical_cleanup_ui", 1).await?;
     let query_server = cluster.server(0).ok_or("missing query node")?;
     let engine = Arc::clone(
         query_server
@@ -228,7 +247,8 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
     let public = client(query_server, "analytical-cleanup-reader").await?;
     let query = wyrd_client::Bifrost::query_only(&public);
 
-    let plain = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
+    let plain =
+        format!("SELECT id FROM vala.bifrost.{interactive_table} WHERE filter_key = 'group_0'");
     let grouped = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
     );
@@ -721,10 +741,21 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let api_key = cluster
         .provision_public_api_key("single-planner-caller")
         .await?;
+    // Class follows table layout: the two-object table spans more than one
+    // task and distributes, while the one-object scan table stays on the
+    // leader as the graphless Interactive case.
     let table = format!("single_planner_{}", uuid::Uuid::now_v7().simple());
     cluster.register_table(PEER_SCRIBE, &table).await?;
+    let half = FIXTURE_ROWS / 2;
+    for start_id in [0, half] {
+        cluster
+            .ingest_rows(PEER_SCRIBE, &table, start_id, half, FIXTURE_GROUPS)
+            .await?;
+    }
+    let scan_table = format!("single_planner_scan_{}", uuid::Uuid::now_v7().simple());
+    cluster.register_table(PEER_SCRIBE, &scan_table).await?;
     cluster
-        .ingest_rows(PEER_SCRIBE, &table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
+        .ingest_rows(PEER_SCRIBE, &scan_table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
         .await?;
     for index in [
         COORDINATOR,
@@ -742,7 +773,7 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let remote_before = RemoteWork::observe(&cluster)?;
 
     let client = public_client(cluster.server(COORDINATOR)?, &api_key)?;
-    let scan_sql = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
+    let scan_sql = format!("SELECT id FROM vala.bifrost.{scan_table} WHERE filter_key = 'group_0'");
     let grouped_sql = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
@@ -755,7 +786,8 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         }
     }
 
-    // A normal root is entirely leader-executable and therefore Interactive.
+    // A one-object scan plans as one task, so its root is normal and the
+    // statement is Interactive.
     let scan = run_public(&client, &scan_sql).await?;
     expect_public(
         &scan,
@@ -764,7 +796,7 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         "normal root",
     )?;
 
-    // The grouped statement is the only one whose root is `DistributedExec`.
+    // The two-object table spans two tasks, so its root is `DistributedExec`.
     let grouped = run_public(&client, &grouped_sql).await?;
     expect_public(
         &grouped,
@@ -823,9 +855,10 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     }
 
     // A pinned object that no longer exists is terminal on the ordinary
-    // normal-root scan: the pinned cut still names it, so the leader must
-    // fail its one attempt rather than repin, replan, or rebuild.
-    let object = pinned_parquet(&cluster, &table)?;
+    // normal-root scan: the pinned cut still names the one-object table's only
+    // object, so the leader must fail its one attempt rather than repin,
+    // replan, or rebuild.
+    let object = pinned_parquet(&cluster, &scan_table)?;
     cluster.remove_storage_object(&object)?;
     let stale_cut =
         expect_single_build_failure(&mut cluster, &client, &scan_sql, "missing pinned object")
@@ -1295,7 +1328,7 @@ async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
     let cluster =
         WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
     let tenant = cluster.data_tenant_id();
-    let table = seed_table(&cluster, "under_privileged").await?;
+    let table = seed_table(&cluster, "under_privileged", 2).await?;
     let query_server = cluster.server(0).ok_or("missing query node")?;
     let grouped = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"

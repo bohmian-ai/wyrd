@@ -483,6 +483,12 @@ pub struct OracleRuntimeConfig {
     /// to be approved.
     #[serde(default)]
     pub allow_unapproved_profile: bool,
+    /// Parquet bytes each distributed Analytical scan task reads.
+    ///
+    /// `datafusion-distributed` asks for one scan task per this many bytes,
+    /// capped by the workers the query holds. Unset keeps its own default.
+    #[serde(default)]
+    pub file_scan_bytes_per_task: Option<usize>,
 }
 
 /// Default waiting places per Oracle node across both query classes.
@@ -526,6 +532,7 @@ impl Default for OracleRuntimeConfig {
             max_frame_bytes: default_oracle_max_frame_bytes(),
             calibration_profile: PathBuf::new(),
             allow_unapproved_profile: false,
+            file_scan_bytes_per_task: None,
         }
     }
 }
@@ -3116,6 +3123,11 @@ impl WyrdServerConfig {
             if self.bifrost.oracle.max_workers_per_query > 63 {
                 return Err(ConfigError::Invalid {
                     message: "bifrost.oracle.max_workers_per_query must be at most 63".to_owned(),
+                });
+            }
+            if self.bifrost.oracle.file_scan_bytes_per_task == Some(0) {
+                return Err(ConfigError::Invalid {
+                    message: "bifrost.oracle.file_scan_bytes_per_task must be positive".to_owned(),
                 });
             }
             // Both time limits share the caller `deadline_ms` range, so every

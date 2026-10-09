@@ -1152,7 +1152,7 @@ mod tests {
             },
         )
     }
-    use sha2::{Digest as _, Sha256};
+    use sha2::Sha256;
 
     use super::*;
 

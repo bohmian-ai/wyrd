@@ -76,10 +76,11 @@ enum PruningExpectation {
     /// One node plans and scans locally: file-level or row-group-level
     /// exclusion both count, because the leaf's file set is the leader's.
     FilesOrRowGroups,
-    /// A follower rebuilds its own leaf and `with_assigned_files` pins its file
-    /// set, so row-group exclusion under the signed closure is the only signal
-    /// that can move. This is the assertion that regresses if
-    /// `OracleCatalogResolver::resolve` stops passing `assignment.predicates`.
+    /// A follower runs its task's share of the leader's scan. The predicate
+    /// `DataFusion` pushed into that scan travels inside it, so row-group
+    /// exclusion inside the follower's files is required positively. This is
+    /// the assertion that regresses if the pushed predicate stops reaching the
+    /// worker's Parquet scan.
     RowGroupsOnly,
 }
 
@@ -96,11 +97,10 @@ enum PruningExpectation {
 ///
 /// The two legs prove different halves. The `one_mixed` leg plans and scans on
 /// one node, so either physical granularity may move and the assertion accepts
-/// whichever the fixture's layout produced. The `three_mixed` leg dispatches to
-/// a follower whose leaf file set is pinned by `with_assigned_files`, so file
-/// counts cannot move and row-group exclusion under the signed
-/// `assignment.predicates` closure is the only available signal — that leg
-/// requires it positively.
+/// whichever the fixture's layout produced. The `three_mixed` leg runs the
+/// scan's tasks on followers, carrying the pushed predicate inside the scan
+/// `datafusion-distributed` ships — that leg requires row-group exclusion
+/// there positively.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_selective_predicate_and_projection_prune_distributed_reads() {
@@ -369,14 +369,11 @@ async fn prove_selective_predicate_pruning(
                 .into());
             }
         }
-        // The follower rebuilds its own leaf and `with_assigned_files`
-        // overwrites its file set with the assignment's, so any file-level
-        // pruning `provider.scan` performed is discarded and `files_scanned`
-        // cannot move. What survives the rebuild is the signed
-        // `assignment.predicates` closure reaching `with_filter`, which drives
-        // the shared per-file plan's `select_row_groups` and both row-group counters. On a
-        // distributed leg the leader's plan holds only remote leaves, so the
-        // folded `FollowerScanEvidence` is the sole source of these numbers.
+        // The follower runs its task's share of the leader's scan, with the
+        // predicate `DataFusion` pushed into it, which drives the scan's
+        // row-group pruning and both row-group counters. On a distributed leg
+        // the leader's plan executes no scan itself, so the follower metrics
+        // `datafusion-distributed` returns are the sole source of these numbers.
         // Both halves are required, and `pruned` is required positively rather
         // than inferred: `sum_metric` reports an absent family as 0.0, so a
         // missing series must fail here, not pass.
@@ -596,12 +593,10 @@ const HOT_BATCH_ID_BASE: i64 = 101;
 /// leaves at once — the compacted `:iceberg` leaf and the sealed `:hot` leaf —
 /// and prunes physically on both.
 ///
-/// The two leaves are otherwise untestable together. A table that has never
-/// compacted records an `:iceberg` assignment with an empty file set, which
-/// `OracleCatalogResolver::resolve` short-circuits before it ever calls
-/// `provider.scan`, so a fixture that only writes and flushes exercises the hot
-/// leaf and nothing else. This journey therefore compacts first and writes
-/// second:
+/// The two are otherwise untestable together. A table that has never
+/// compacted has no Iceberg data file, so a fixture that only writes and
+/// flushes exercises hot files and nothing else. This journey therefore
+/// compacts first and writes second:
 ///
 /// 1. write `COMPACTED_BATCH_ROWS` rows, each sealed as its own file;
 /// 2. drive one Forge pass to completion and require the inputs to be marked
@@ -618,8 +613,8 @@ const HOT_BATCH_ID_BASE: i64 = 101;
 /// Pruning is then required to move bytes scanned against an unfiltered
 /// baseline of the same cut, and the fixture is shaped so that only the
 /// compacted leaf can move it: every hot row matches the predicate, so the hot
-/// leaf reads the same bytes either way. Removing `assignment.predicates` from
-/// the follower's `provider.scan` call collapses the difference to zero, which
+/// leaf reads the same bytes either way. A pushed predicate that no longer
+/// reaches the follower's Parquet scan collapses the difference to zero, which
 /// is the regression this leg exists to catch.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
@@ -792,9 +787,9 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     // Attribution still holds: every hot row matches the predicate, so the hot
     // leaf reads identical bytes filtered and unfiltered, and the whole of this
     // difference is the compacted leaf skipping row groups inside its published
-    // data file. Removing `assignment.predicates` from the follower's
-    // `provider.scan` call collapses it to zero, which is what makes this a
-    // real assertion rather than a restatement of the fixture.
+    // data file. A pushed predicate that no longer reaches the follower's
+    // Parquet scan collapses it to zero, which is what makes this a real
+    // assertion rather than a restatement of the fixture.
     //
     // Strict `Less` rather than a negated `<`: an incomparable (NaN) metric
     // must fail this proof, not silently satisfy it.
@@ -803,7 +798,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         Some(std::cmp::Ordering::Less)
     ) {
         return Err(format!(
-            "compacted leaf must scan strictly fewer bytes under the signed predicate: \
+            "compacted leaf must scan strictly fewer bytes under the pushed predicate: \
              selective={selective_bytes} unfiltered={unfiltered_bytes}"
         )
         .into());
@@ -1242,14 +1237,14 @@ async fn grouped_counts(
 }
 
 /// A filtered aggregate over published files and live rows on two Scribes is
-/// one Analytical plan: the published scan runs on the one Oracle worker the
-/// table's cut is frozen to while each Scribe executes exactly one live
-/// fragment, and the result counts both.
+/// one Analytical plan: the published scan runs on the query's frozen Oracle
+/// workers while each Scribe executes exactly one live fragment, and the
+/// result counts both.
 ///
 /// The live leaf caps its stage at one task, so the aggregate above the union
-/// stays on the coordinator and only the published leaf stage is remote. A
-/// published table is bound to one destination, so exactly one worker leases a
-/// graph for it.
+/// stays on the coordinator and only the published leaf stage is remote.
+/// `datafusion-distributed` places that stage's tasks, so which and how many
+/// frozen workers lease a graph is upstream's choice; at least one must.
 ///
 /// Published rows alone, or live rows drained anywhere but the two Scribe
 /// fragments, cannot produce these counts and deltas together.
@@ -1257,8 +1252,8 @@ async fn grouped_counts(
 /// # Errors
 ///
 /// Returns an error when the peer cluster, ingest, publication, or query
-/// fails, when counts or per-node fragment deltas differ, or when other than
-/// exactly one published worker leased a graph for the query.
+/// fails, when counts or per-node fragment deltas differ, or when no frozen
+/// worker leased a graph for the query.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), JourneyError> {
@@ -1341,11 +1336,8 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
             leased.push(index);
         }
     }
-    if leased.len() != 1 {
-        return Err(format!(
-            "the published scan must run on its one frozen worker, saw leases on {leased:?}"
-        )
-        .into());
+    if leased.is_empty() {
+        return Err("the published scan leased a graph on no frozen worker".into());
     }
     if cluster.peer_body_polls() <= polls_before {
         return Err("no published work crossed the private peer plane".into());

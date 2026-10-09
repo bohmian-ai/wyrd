@@ -19,7 +19,7 @@
 [tools]
 node = "26.2.0"
 uv = "0.11.16"
-rust    = "1.97.1"
+rust    = "1.98.1"
 "npm:pnpm" = "11.4.0"
 cmake = "3.26.4"
 protoc = "33.2"

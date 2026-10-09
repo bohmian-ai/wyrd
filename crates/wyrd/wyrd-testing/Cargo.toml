@@ -122,6 +122,8 @@ wiremock = { workspace = true }
 workspace-hack.workspace = true
 # The peer-context journey encodes a Scribe fragment exactly as a leader does.
 datafusion-proto = { workspace = true }
+# The leaf-predicate peer journey plans its filter as a leader's session does.
+datafusion = { workspace = true }
 # The analytical-layout journey maps an Eval report through the production
 # result payload builder, whose Eval input is this crate's report type.
 vala-eval = { workspace = true }

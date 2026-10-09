@@ -287,10 +287,7 @@ async fn run_workload(
                             message: error.to_string(),
                         })?;
                 let elapsed = started.elapsed();
-                let sample: u64 = elapsed
-                    .as_micros()
-                    .try_into()
-                    .map_or(u64::MAX, |value| value);
+                let sample: u64 = elapsed.as_micros().try_into().unwrap_or(u64::MAX);
                 let sample = sample.max(1);
                 samples.push(sample);
                 assert_no_cross_tenant_leak(tenant, &response.rows, &expected_shape);

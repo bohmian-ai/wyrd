@@ -100,9 +100,7 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
-    // justification: signature parity with sibling cloud backends (S3/GCS/Azure); BackendSigner dispatch awaits the returned future uniformly across variants
-    #[allow(clippy::unused_async)]
-    pub async fn presign_single_put(
+    pub fn presign_single_put(
         &self,
         path: &ValidatedPath,
         _size_bytes: u64,
@@ -120,9 +118,7 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
-    // justification: signature parity with sibling cloud backends (S3/GCS/Azure); BackendSigner dispatch awaits the returned future uniformly across variants
-    #[allow(clippy::unused_async)]
-    pub async fn init_multipart(
+    pub fn init_multipart(
         &self,
         path: &ValidatedPath,
         _part_count: u32,
@@ -130,7 +126,7 @@ impl LocalSigner {
         ttl: Duration,
     ) -> Result<MultipartInit, StorageError> {
         Ok(MultipartInit {
-            plan: self.presign_single_put(path, 0, ttl).await?,
+            plan: self.presign_single_put(path, 0, ttl)?,
             backend_upload_id: String::new(),
         })
     }
@@ -156,9 +152,7 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
-    // justification: signature parity with sibling cloud backends (S3/GCS/Azure); BackendSigner dispatch awaits the returned future uniformly across variants
-    #[allow(clippy::unused_async)]
-    pub async fn presign_get(
+    pub fn presign_get(
         &self,
         path: &ValidatedPath,
         _ttl: Duration,
@@ -185,7 +179,7 @@ impl LocalSigner {
     ///
     /// # Errors
     /// Returns a capability mismatch if the replay protocol is not local.
-    pub async fn remint_plan(
+    pub fn remint_plan(
         &self,
         path: &ValidatedPath,
         input: &UploadPlanReplayInput,
@@ -198,7 +192,6 @@ impl LocalSigner {
             });
         }
         self.presign_single_put(path, input.part_size_bytes, ttl)
-            .await
     }
 
     fn object_path(&self, path: &ValidatedPath) -> PathBuf {
@@ -239,7 +232,6 @@ mod integration_tests {
 
         let plan = signer
             .presign_single_put(&path, head.size_bytes, Duration::from_mins(1))
-            .await
             .expect("local upload plan");
         let UploadPlan::SinglePut {
             put_url,
@@ -313,8 +305,10 @@ mod integration_tests {
         }
     }
 
-    #[tokio::test]
-    async fn local_capability_mismatch_is_typed_for_non_local_protocols() {
+    /// Replaying a non-local upload protocol through the local signer is a
+    /// typed capability mismatch naming the local backend and `remint_plan`.
+    #[test]
+    fn local_capability_mismatch_is_typed_for_non_local_protocols() {
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let tenant = DataTenantId::new_v7();
@@ -327,9 +321,7 @@ mod integration_tests {
             part_size_bytes: 10,
             block_count_planned: None,
         };
-        let result = signer
-            .remint_plan(&path, &input, Duration::from_mins(1))
-            .await;
+        let result = signer.remint_plan(&path, &input, Duration::from_mins(1));
         match result {
             Err(StorageError::BackendCapabilityMismatch { signer, op }) => {
                 assert_eq!(signer, StorageBackendKind::Local);

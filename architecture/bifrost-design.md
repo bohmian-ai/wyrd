@@ -543,8 +543,8 @@ spill behavior without claiming exhaustive operator coverage.
 ### Variant SQL
 
 Every Oracle session — leader planning, admission execution, follower,
-analytical leader, analytical planning, and distributed worker — installs one
-Variant SQL owner before it plans, decodes, or executes:
+analytical leader, analytical planning, and distributed worker — is built with
+`DataFusion`'s default features, which include the fork's `variant` feature:
 
 - `v -> 'key'` and `v -> n` return the Variant at an object key or array index,
   or null when absent; chains such as `attributes -> 'http' ->> 'route'` follow
@@ -553,20 +553,18 @@ Variant SQL owner before it plans, decodes, or executes:
   itself, any other non-null value as its JSON text, and SQL null when absent or
   JSON null. Its result casts to numeric, boolean, and timestamp types with
   ordinary SQL cast semantics.
-- `parse_json(text)` returns the Variant for JSON text and fails with
-  `WYRD_VALA_400_VARIANT_INVALID_JSON` on invalid input; `try_parse_json(text)`
-  returns null instead. `to_json(v)` returns a Variant's JSON text.
+- `parse_json(text)` returns the Variant for JSON text and fails the query on
+  invalid input; `try_parse_json(text)` returns null instead. `to_json(v)`
+  returns a Variant's JSON text.
 
 `->` and `->>` apply only to Variant operands; a JSON text column is queried as
-`parse_json(column) ->> 'key'`. Literal paths lower to one semantic
-`variant_get` UDF backed by Arrow-rs `variant_get`, and `->>` adds text
-conversion after it; a non-literal path element is evaluated per row from the
-full root value. Struct access stays DataFusion's exact `s['field']`
+`parse_json(column) ->> 'key'`. `->` plans as `variant_get` and `->>` as
+`variant_get_text`. Struct access stays DataFusion's exact `s['field']`
 `get_field`. Every Variant result keeps the `arrow.parquet.variant` extension
-on the wire. The functions travel in physical plans by name, so the function
-set's version is bound into the plan and stage digests peers verify before
-decoding. Variant failures, like every catalogued query failure, keep their
-stable code and details across interactive and distributed execution.
+on the wire. Wyrd adds no Variant function, planner, or file adapter: queries
+use the fork's Variant feature as-is, so a Variant evaluation failure is the
+generic `WYRD_VALA_500_QUERY_EXECUTION_FAILED`, and peers agree on function
+semantics through the pinned fork revision.
 
 ### Nested-field reads
 

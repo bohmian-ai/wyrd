@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::TaskContext;
 use datafusion::execution::session_state::SessionState;
+use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
@@ -365,8 +367,7 @@ impl<T> ScribeTailResolver<T> {
     /// `DataFusion`'s Parquet scan, so they get the row-group and page pruning
     /// every Oracle hot read gets, with no footer caching because a staged run
     /// is rewritable; the scan's files hold the staged lease until the plan
-    /// drops. A signed predicate
-    /// conjunction becomes one `FilterExec` above both. A read with neither
+    /// drops. A read with neither
     /// rows nor runs is an in-memory source of empty partitions at the
     /// closure schema.
     ///
@@ -767,6 +768,12 @@ where
         // The leader's own plan has only remote leaves, so this follower-side
         // capture is the only place a distributed query can observe physical
         // read volume at all.
+        // A live fragment ships its predicate as a `FilterExec` above the
+        // placeholder; `DataFusion`'s own pushdown moves it into the
+        // substituted staged scan, where it prunes row groups and pages.
+        let plan = FilterPushdown::new()
+            .optimize(plan, session.config().options())
+            .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
         let scan_stats = super::exec::OracleQueryScanStats::from_plan(plan.as_ref());
         let stream = execute_stream(plan, context)
             .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
@@ -2099,7 +2106,9 @@ pub(crate) mod tests {
         .state();
         let leaf = resolve_staged_fixture(&fixture, service, &session).await;
         let predicate = datafusion::physical_expr::expressions::binary(
-            Arc::new(datafusion::physical_expr::expressions::Column::new("value", 0)),
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                "value", 0,
+            )),
             datafusion::logical_expr::Operator::Eq,
             datafusion::physical_expr::expressions::lit(2_i64),
             &leaf.schema(),
@@ -2187,8 +2196,8 @@ pub(crate) mod tests {
 
     /// Returns the partition count each live source under `plan` advertises.
     ///
-    /// Walks past a signed `FilterExec` and a mixed `UnionExec` to the
-    /// memory and staged leaves, in the order the resolver built them.
+    /// Walks past a mixed `UnionExec` to the memory and staged leaves, in the
+    /// order the resolver built them.
     fn live_source_partitions(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
         if plan.children().is_empty() {
             return vec![plan.output_partitioning().partition_count()];
@@ -2223,7 +2232,8 @@ pub(crate) mod tests {
     /// cut (fewer batches than partitions) give the memtable four partitions,
     /// with unused groups left empty, while a small staged run reads as one
     /// partition by `DataFusion`'s scan rules. Draining every partition returns
-    /// each row exactly once, after the signed predicate where one applies.
+    /// each row exactly once; the query predicate is the fragment's own
+    /// `FilterExec`, not the resolver's.
     ///
     /// # Panics
     /// Panics when resolution or execution fails, a source advertises a
@@ -2235,7 +2245,7 @@ pub(crate) mod tests {
         )
         .state();
 
-        // One memtable batch under the signed predicate.
+        // One memtable batch.
         let (tenant_id, schema, stream, resolver) = closure_fixture_resolver();
         let binding = closure_fixture_binding(tenant_id);
         let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
@@ -2255,10 +2265,12 @@ pub(crate) mod tests {
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await
             .expect("the one-batch cut executes");
+        let mut values = first_int64_values(&rows);
+        values.sort_unstable();
         assert_eq!(
-            first_int64_values(&rows),
-            vec![41],
-            "the ERROR row survives exactly once"
+            values,
+            vec![41, 97],
+            "every memtable row is read exactly once"
         );
 
         // An empty snapshot.

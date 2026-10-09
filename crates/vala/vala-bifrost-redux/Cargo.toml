@@ -59,7 +59,6 @@ arrow-schema = { workspace = true }
 parquet = { workspace = true, features = ["async"] }
 parquet-variant = { workspace = true }
 parquet-variant-compute = { workspace = true }
-parquet-variant-json = { workspace = true }
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
@@ -71,7 +70,7 @@ http = { workspace = true }
 http-body = { workspace = true }
 tower = { workspace = true }
 url = { workspace = true }
-datafusion = { workspace = true }
+datafusion = { workspace = true, features = ["variant"] }
 datafusion-datasource = { workspace = true }
 datafusion-proto = { workspace = true }
 object_store = { workspace = true }

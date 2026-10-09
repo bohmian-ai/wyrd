@@ -21,9 +21,10 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::catalog::Session;
-use datafusion::common::Statistics;
 use datafusion::common::config::TableParquetOptions;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::{Transformed, TransformedResult as _, TreeNode as _};
+use datafusion::common::{Statistics, plan_err};
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::parquet::metadata::DFParquetMetadata;
@@ -49,7 +50,10 @@ use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion_datasource::compute_all_files_statistics;
-use datafusion_distributed::NetworkBoundaryExt as _;
+use datafusion_distributed::{
+    DistributedLeafExec, NetworkBoundaryExt as _, Stage, WorkerPlanRewriteEvent,
+    WorkerPlanRewriteEventResponse, WorkerPlanRewriteHandler,
+};
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, TryFutureExt};
 use futures_util::{StreamExt as _, TryStreamExt};
@@ -95,7 +99,9 @@ pub fn remote_partition_attempts_for_test() -> u64 {
 /// `DataFusion` records every row group it considers as either pruned or
 /// matched by statistics, then, of those statistics kept, as pruned or matched
 /// by Bloom filters; with no predicate both stages record every group as
-/// matched. The groups read are therefore the Bloom stage's matches.
+/// matched. The groups read are therefore the Bloom stage's matches. Files
+/// (or file ranges) its `FilePruner` skipped before opening them are counted
+/// separately, so a planned file count can be reduced to the files opened.
 fn parquet_pruning(metrics: &MetricsSet) -> PruningEvidence {
     let pruning = |name: &str| match metrics.sum_by_name(name) {
         Some(MetricValue::PruningMetrics {
@@ -106,10 +112,12 @@ fn parquet_pruning(metrics: &MetricsSet) -> PruningEvidence {
         ),
         _ => (0, 0),
     };
+    let (files_pruned, _) = pruning("files_ranges_pruned_statistics");
     let (statistics_pruned, _) = pruning("row_groups_pruned_statistics");
     let (bloom_pruned, bloom_matched) = pruning("row_groups_pruned_bloom_filter");
     let (page_rows_pruned, _) = pruning("page_index_rows_pruned");
     PruningEvidence {
+        files_pruned,
         row_groups_scanned: bloom_matched,
         row_groups_pruned: statistics_pruned.saturating_add(bloom_pruned),
         row_groups_pruned_bloom: bloom_pruned,
@@ -123,8 +131,12 @@ fn parquet_pruning(metrics: &MetricsSet) -> PruningEvidence {
 /// `row_groups_pruned_bloom` is the subset a Bloom filter excluded after
 /// statistics kept it, so statistics-only exclusion is the difference.
 /// `rows_pruned_page_index` counts rows skipped inside retained row groups.
+/// `files_pruned` counts planned files a scan skipped without opening them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PruningEvidence {
+    /// Planned files (or file ranges) `DataFusion`'s `FilePruner` skipped
+    /// from their statistics before reading any footer.
+    pub(crate) files_pruned: u64,
     /// Row groups read after every row-group pruning mechanism.
     pub(crate) row_groups_scanned: u64,
     /// Row groups excluded by statistics or Bloom filters.
@@ -138,6 +150,7 @@ pub(crate) struct PruningEvidence {
 impl PruningEvidence {
     /// Adds `other` into this total, saturating every counter.
     pub(crate) fn add(&mut self, other: Self) {
+        self.files_pruned = self.files_pruned.saturating_add(other.files_pruned);
         self.row_groups_scanned = self
             .row_groups_scanned
             .saturating_add(other.row_groups_scanned);
@@ -173,6 +186,12 @@ pub(crate) struct RemoteScanMetrics {
     files_scanned: AtomicU64,
     /// Summed file-partition count across every completed participant.
     partitions_scanned: AtomicU64,
+    /// Summed planned files distributed tasks skipped without opening them.
+    ///
+    /// Only a distributed fold records it: those files were counted from the
+    /// leader's plan, so they are subtracted at terminal aggregation. A live
+    /// Scribe footer already reports the files it opened.
+    files_pruned: AtomicU64,
     /// Summed retained row groups across every completed participant.
     row_groups_scanned: AtomicU64,
     /// Summed pruned row groups across every completed participant.
@@ -208,6 +227,11 @@ impl RemoteScanMetrics {
             .fetch_add(stats.rows_pruned_page_index, Ordering::Relaxed);
     }
 
+    /// Records planned files a completed distributed plan's tasks skipped.
+    fn record_pruned_files(&self, files: u64) {
+        self.files_pruned.fetch_add(files, Ordering::Relaxed);
+    }
+
     /// Returns the aggregated totals, preserving absent-versus-zero bytes.
     fn terminal_values(&self) -> (Option<u64>, u64, u64) {
         let bytes = self
@@ -228,6 +252,7 @@ impl RemoteScanMetrics {
     /// with no such participant contributes a true zero, not an absence.
     fn terminal_pruning(&self) -> PruningEvidence {
         PruningEvidence {
+            files_pruned: self.files_pruned.load(Ordering::Acquire),
             row_groups_scanned: self.row_groups_scanned.load(Ordering::Acquire),
             row_groups_pruned: self.row_groups_pruned.load(Ordering::Acquire),
             row_groups_pruned_bloom: self.row_groups_pruned_bloom.load(Ordering::Acquire),
@@ -245,7 +270,8 @@ impl RemoteScanMetrics {
 pub(crate) struct OracleQueryScanStats {
     /// Physical bytes reported by `DataFusion`'s Parquet scan metric.
     pub(crate) physical_bytes_scanned: Option<u64>,
-    /// Number of files represented by executed file scan nodes.
+    /// Number of files executed file scan nodes opened: the files they were
+    /// planned to read, less those `DataFusion`'s `FilePruner` skipped.
     pub(crate) files_scanned: u64,
     /// Number of file partitions represented by executed scan nodes.
     pub(crate) partitions_scanned: u64,
@@ -269,6 +295,11 @@ impl OracleQueryScanStats {
     }
 
     /// Reads the pinned `DataFusion` scan metric once after physical execution.
+    ///
+    /// Files are counted from the plan before execution, and `DataFusion`
+    /// skips files whose statistics exclude them only as it opens each one,
+    /// so the skipped files are subtracted last. A file split into several
+    /// ranges counts once per range on both sides.
     pub(crate) fn finalize(&mut self) {
         if self.finalized {
             return;
@@ -302,9 +333,16 @@ impl OracleQueryScanStats {
         if available {
             self.physical_bytes_scanned = Some(total);
         }
+        self.files_scanned = self.files_scanned.saturating_sub(self.pruning.files_pruned);
     }
 
     /// Visits each physical node exactly once, accumulating leaf scan evidence.
+    ///
+    /// A distributed plan's stages hang off their network boundaries rather
+    /// than off children, and a split leaf holds one scan per task, so both
+    /// are descended to count the files and partitions every task was planned
+    /// to read. Those scans execute on followers; their bytes and pruning
+    /// arrive through [`record_distributed_scan_metrics`] instead.
     fn visit(plan: &dyn ExecutionPlan, stats: &mut Self) {
         if let Some(source) = plan.downcast_ref::<DataSourceExec>()
             && let Some(config) = source.data_source().downcast_ref::<FileScanConfig>()
@@ -321,6 +359,16 @@ impl OracleQueryScanStats {
         }
         if let Some(source) = plan.downcast_ref::<LiveScribeExec>() {
             stats.remote_handles.push(Arc::clone(source.scan_metrics()));
+        }
+        if let Some(leaf) = plan.downcast_ref::<DistributedLeafExec>() {
+            for variant in leaf.variants() {
+                Self::visit(variant.as_ref(), stats);
+            }
+        }
+        if let Some(boundary) = plan.as_network_boundary()
+            && let Stage::Local(stage) = boundary.input_stage()
+        {
+            Self::visit(stage.plan.as_ref(), stats);
         }
         for child in plan.children() {
             Self::visit(child.as_ref(), stats);
@@ -391,9 +439,18 @@ pub(crate) async fn record_distributed_scan_metrics(
         datafusion_distributed::DistributedMetricsFormat::Aggregated,
     )
     .await?;
-    let mut totals = WorkerScanStats::default();
-    fold_distributed_scan_metrics(&with_metrics, &mut totals);
-    sink.record_footer(totals);
+    let mut bytes_scanned = None;
+    let mut pruning = PruningEvidence::default();
+    fold_distributed_scan_metrics(&with_metrics, &mut bytes_scanned, &mut pruning);
+    sink.record_footer(WorkerScanStats {
+        bytes_scanned,
+        row_groups_scanned: pruning.row_groups_scanned,
+        row_groups_pruned: pruning.row_groups_pruned,
+        row_groups_pruned_bloom: pruning.row_groups_pruned_bloom,
+        rows_pruned_page_index: pruning.rows_pruned_page_index,
+        ..WorkerScanStats::default()
+    });
+    sink.record_pruned_files(pruning.files_pruned);
     Ok(with_metrics)
 }
 
@@ -404,33 +461,25 @@ pub(crate) async fn record_distributed_scan_metrics(
 /// plain child walk sees only the coordinator's own stage and reports a query
 /// that scanned nothing. Descending both edges is what reaches the follower
 /// leaves where the reads actually happened.
-fn fold_distributed_scan_metrics(node: &Arc<dyn ExecutionPlan>, totals: &mut WorkerScanStats) {
+fn fold_distributed_scan_metrics(
+    node: &Arc<dyn ExecutionPlan>,
+    bytes_scanned: &mut Option<u64>,
+    pruning: &mut PruningEvidence,
+) {
     if let Some(metrics) = node.metrics() {
         let metrics = metrics.aggregate_by_name();
         if let Some(bytes) = sum_named_count(&metrics, "bytes_scanned") {
-            totals.bytes_scanned = Some(totals.bytes_scanned.unwrap_or(0).saturating_add(bytes));
+            *bytes_scanned = Some(bytes_scanned.unwrap_or(0).saturating_add(bytes));
         }
-        let pruning = parquet_pruning(&metrics);
-        totals.row_groups_scanned = totals
-            .row_groups_scanned
-            .saturating_add(pruning.row_groups_scanned);
-        totals.row_groups_pruned = totals
-            .row_groups_pruned
-            .saturating_add(pruning.row_groups_pruned);
-        totals.row_groups_pruned_bloom = totals
-            .row_groups_pruned_bloom
-            .saturating_add(pruning.row_groups_pruned_bloom);
-        totals.rows_pruned_page_index = totals
-            .rows_pruned_page_index
-            .saturating_add(pruning.rows_pruned_page_index);
+        pruning.add(parquet_pruning(&metrics));
     }
     if let Some(boundary) = node.as_network_boundary()
-        && let datafusion_distributed::Stage::Local(stage) = boundary.input_stage()
+        && let Stage::Local(stage) = boundary.input_stage()
     {
-        fold_distributed_scan_metrics(&stage.plan, totals);
+        fold_distributed_scan_metrics(&stage.plan, bytes_scanned, pruning);
     }
     for child in node.children() {
-        fold_distributed_scan_metrics(child, totals);
+        fold_distributed_scan_metrics(child, bytes_scanned, pruning);
     }
 }
 
@@ -845,6 +894,100 @@ impl AsyncFileReader for TenantParquetReader {
     }
 }
 
+/// Reads a tenant's warehouse Parquet objects through the node's object store,
+/// proving every footer's tenant before a row is decoded.
+///
+/// The leader's own scans take their reader factory from here. A distributed
+/// stage reaches a worker as plain `DataFusion` protobuf, which carries the
+/// scan but never its reader factory, so the decoded scan would read through
+/// the default factory and skip the proof; [`Self::bind`] restores the same
+/// factory there through upstream's [`WorkerPlanRewriteHandler`] seam. A footer
+/// is therefore proved identically wherever its scan runs.
+#[derive(Debug)]
+pub(crate) struct TenantWarehouseReads {
+    /// The node's warehouse store and footer cache.
+    objects: Arc<BifrostIcebergStorage>,
+    /// Authenticated tenant every footer must name.
+    tenant: DataTenantId,
+}
+
+impl TenantWarehouseReads {
+    /// Binds the node's warehouse store to one authenticated tenant.
+    pub(crate) fn new(objects: Arc<BifrostIcebergStorage>, tenant: DataTenantId) -> Self {
+        Self { objects, tenant }
+    }
+
+    /// Builds `DataFusion`'s warehouse reader factory — cached when the node
+    /// has a footer cache — behind the tenant proof.
+    fn reader_factory(&self) -> Arc<dyn ParquetFileReaderFactory> {
+        let store = Arc::clone(self.objects.storage().objects());
+        let inner: Arc<dyn ParquetFileReaderFactory> = match self.objects.storage().metadata_cache()
+        {
+            Some(cache) => Arc::new(CachedParquetFileReaderFactory::new(
+                store,
+                Arc::clone(cache),
+            )),
+            None => Arc::new(DefaultParquetFileReaderFactory::new(store)),
+        };
+        Arc::new(TenantParquetReaderFactory {
+            inner,
+            tenant: self.tenant,
+        })
+    }
+
+    /// Rebinds every file scan in a decoded stage plan to this tenant's
+    /// warehouse reader factory.
+    ///
+    /// Only the scan's reader factory changes; its files, projection,
+    /// predicate, and partitioning are the ones the coordinator planned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` plan error when a file scan is not a Parquet
+    /// scan of warehouse-relative paths, the only file scan Oracle plans.
+    fn bind(&self, plan: Arc<dyn ExecutionPlan>) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let factory = self.reader_factory();
+        plan.transform_up(|node| {
+            let Some(exec) = node.downcast_ref::<DataSourceExec>() else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() else {
+                return Ok(Transformed::no(node));
+            };
+            let Some(parquet) = config.file_source().downcast_ref::<ParquetSource>() else {
+                return plan_err!("Oracle stages read only Parquet file scans");
+            };
+            if config.object_store_url != ObjectStoreUrl::local_filesystem() {
+                return plan_err!("Oracle stages read only warehouse-relative Parquet files");
+            }
+            let mut config = config.clone();
+            config.file_source = Arc::new(
+                parquet
+                    .clone()
+                    .with_parquet_file_reader_factory(Arc::clone(&factory)),
+            );
+            let exec = exec.clone().with_data_source(Arc::new(config));
+            Ok(Transformed::yes(Arc::new(exec) as Arc<dyn ExecutionPlan>))
+        })
+        .data()
+    }
+}
+
+impl WorkerPlanRewriteHandler for TenantWarehouseReads {
+    /// Binds a worker's decoded stage plan to this tenant's warehouse reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`Self::bind`] refusal, which aborts the stage.
+    fn rewrite_worker_plan(
+        &self,
+        event: WorkerPlanRewriteEvent,
+    ) -> DataFusionResult<WorkerPlanRewriteEventResponse> {
+        self.bind(event.plan)
+            .map(WorkerPlanRewriteEventResponse::new)
+    }
+}
+
 /// Where a hot leaf's Parquet objects live.
 pub(crate) enum HotObjects {
     /// Immutable objects under the warehouse, read through the node's storage
@@ -893,22 +1036,19 @@ pub(super) fn hot_parquet_scan(
             .map(|field| field.name().clone())
             .collect::<Vec<_>>(),
     ));
-    let (inner, warehouse, lease): (Arc<dyn ParquetFileReaderFactory>, _, _) = match objects {
-        HotObjects::Warehouse(store) => {
-            let objects = Arc::clone(store.storage().objects());
-            let inner: Arc<dyn ParquetFileReaderFactory> = match store.storage().metadata_cache() {
-                Some(cache) => Arc::new(CachedParquetFileReaderFactory::new(
-                    objects,
-                    Arc::clone(cache),
-                )),
-                None => Arc::new(DefaultParquetFileReaderFactory::new(objects)),
-            };
-            (inner, Some(store), None)
-        }
+    let (factory, warehouse, lease): (Arc<dyn ParquetFileReaderFactory>, _, _) = match objects {
+        HotObjects::Warehouse(store) => (
+            TenantWarehouseReads::new(Arc::clone(&store), tenant).reader_factory(),
+            Some(store),
+            None,
+        ),
         HotObjects::Staged(lease) => (
-            Arc::new(DefaultParquetFileReaderFactory::new(Arc::new(
-                LocalFileSystem::new(),
-            ))),
+            Arc::new(TenantParquetReaderFactory {
+                inner: Arc::new(DefaultParquetFileReaderFactory::new(Arc::new(
+                    LocalFileSystem::new(),
+                ))),
+                tenant,
+            }),
             None,
             lease.map(Arc::new),
         ),
@@ -918,7 +1058,7 @@ pub(super) fn hot_parquet_scan(
             global: options.execution.parquet.clone(),
             ..TableParquetOptions::default()
         })
-        .with_parquet_file_reader_factory(Arc::new(TenantParquetReaderFactory { inner, tenant }));
+        .with_parquet_file_reader_factory(factory);
     let files = files
         .into_iter()
         .map(|file| {
@@ -957,9 +1097,6 @@ pub(super) fn hot_parquet_scan(
     let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
         .with_file_groups(groups)
         .with_statistics(statistics)
-        .with_expr_adapter(Some(
-            super::variant_sql::OracleVariantSql::shared().file_adapter(),
-        ))
         .build();
     Ok(DataSourceExec::from_data_source(config))
 }
@@ -1133,23 +1270,38 @@ impl HotFileSource {
             min_micros,
             max_micros,
         } = self.event_time
-            && let Ok(index) = schema.index_of(WYRD_EVENT_TIME)
-            && let arrow::datatypes::DataType::Timestamp(
-                arrow::datatypes::TimeUnit::Microsecond,
-                zone,
-            ) = schema.field(index).data_type()
         {
-            let column = &mut statistics.column_statistics[index];
-            column.min_value = Precision::Exact(datafusion::scalar::ScalarValue::TimestampMicrosecond(
-                Some(min_micros),
-                zone.clone(),
-            ));
-            column.max_value = Precision::Exact(datafusion::scalar::ScalarValue::TimestampMicrosecond(
-                Some(max_micros),
-                zone.clone(),
-            ));
+            set_event_time_bounds(&mut statistics, schema, min_micros, max_micros);
         }
         (statistics != Statistics::new_unknown(schema)).then_some(statistics)
+    }
+}
+
+/// Records exact `wyrd_event_time` min/max (inclusive microseconds) in
+/// `statistics`, which describe one container under `schema`.
+///
+/// Exact bounds are what `DataFusion`'s pruning requires to exclude a
+/// container. A `schema` without `wyrd_event_time` as microsecond timestamps
+/// leaves `statistics` unchanged, so the container is kept.
+pub(super) fn set_event_time_bounds(
+    statistics: &mut Statistics,
+    schema: &Schema,
+    min_micros: i64,
+    max_micros: i64,
+) {
+    if let Ok(index) = schema.index_of(WYRD_EVENT_TIME)
+        && let arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, zone) =
+            schema.field(index).data_type()
+    {
+        let column = &mut statistics.column_statistics[index];
+        column.min_value = Precision::Exact(datafusion::scalar::ScalarValue::TimestampMicrosecond(
+            Some(min_micros),
+            zone.clone(),
+        ));
+        column.max_value = Precision::Exact(datafusion::scalar::ScalarValue::TimestampMicrosecond(
+            Some(max_micros),
+            zone.clone(),
+        ));
     }
 }
 
@@ -1349,8 +1501,11 @@ impl OracleTableProvider {
                 DataFusionError::Plan("Oracle requires the pinned IcebergTableScan".to_owned())
             })?;
         let mut files = published_files(published, None).await?;
-        files.extend(self.hot_files.iter().cloned());
+        // Only the files Iceberg kept: a hot file's event-time bounds are
+        // first checked by the scan's file pruner, and fetching its footer
+        // here would read a file that pruner then excludes.
         self.cache_footers(&files, options).await;
+        files.extend(self.hot_files.iter().cloned());
         hot_parquet_scan(
             files,
             HotObjects::Warehouse(Arc::clone(&self.objects)),
@@ -1811,6 +1966,22 @@ pub(super) mod tests {
         assert_eq!(stats.partitions_scanned, 1);
     }
 
+    /// Files counted from the plan but skipped by a distributed task's
+    /// `FilePruner` are not reported as scanned.
+    #[test]
+    fn scan_stats_exclude_files_distributed_tasks_pruned() {
+        let scans = Arc::new(RemoteScanMetrics::default());
+        scans.record_pruned_files(2);
+        let mut stats = OracleQueryScanStats {
+            files_scanned: 3,
+            remote_handles: vec![scans],
+            ..OracleQueryScanStats::default()
+        };
+        stats.finalize();
+        assert_eq!(stats.files_scanned, 1);
+        assert_eq!(stats.pruning.files_pruned, 2);
+    }
+
     /// Writes one real file of `groups` row groups through the production
     /// writer recipe, one row group per supplied value block, and returns its
     /// bytes. Flushing between blocks is what makes the file multi-row-group:
@@ -2165,7 +2336,10 @@ pub(super) mod tests {
         FileReadPlan::new(
             &reader,
             schema,
-            super::super::leaf_paths::LeafPaths::default().projection(schema),
+            datafusion::physical_expr::projection::ProjectionExprs::from_indices(
+                &(0..schema.fields().len()).collect::<Vec<_>>(),
+                schema,
+            ),
             filter,
             20,
         )
@@ -2416,6 +2590,71 @@ pub(super) mod tests {
         }
     }
 
+    /// A scan decoded from the wire reads its warehouse object only once a
+    /// worker binds it, and then only for the footer's own tenant.
+    ///
+    /// The hot scan is round-tripped through `DataFusion`'s own physical plan
+    /// protobuf, exactly as a distributed stage reaches a worker, which drops
+    /// its reader factory. Bound for the fixture tenant it reads every row;
+    /// bound for another tenant it refuses before any row.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the decoded scan does not round-trip, the proven tenant
+    /// does not read every row, or the foreign tenant reads one.
+    #[tokio::test]
+    async fn decoded_stage_scans_read_only_as_the_bound_tenant() {
+        let root = tempfile::tempdir().expect("decoded-scan fixture directory");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let size = write_split_fixture(&root.path().join("stage.parquet"), &schema, &[1, 2, 3]);
+        let scan = fixture_hot_scan(
+            root.path(),
+            vec![split_file("stage.parquet", size)],
+            *FIXTURE_TENANT,
+            &schema,
+            &crate::resources::OracleSessionShape::for_test().config_options(),
+        );
+        let context = Arc::new(TaskContext::default());
+        let decoded = datafusion_proto::bytes::physical_plan_from_bytes(
+            &datafusion_proto::bytes::physical_plan_to_bytes(scan).expect("the scan encodes"),
+            &context,
+        )
+        .expect("the scan decodes");
+
+        let proven = TenantWarehouseReads::new(warehouse_objects(root.path()), *FIXTURE_TENANT)
+            .bind(Arc::clone(&decoded))
+            .expect("the proven tenant binds");
+        let mut rows = collect_int64(
+            proven
+                .execute(0, Arc::clone(&context))
+                .expect("proven stream"),
+        )
+        .await;
+        rows.sort_unstable();
+        assert_eq!(rows, vec![1, 2, 3], "the proven tenant reads every row");
+
+        let foreign =
+            TenantWarehouseReads::new(warehouse_objects(root.path()), DataTenantId::new_v7())
+                .bind(decoded)
+                .expect("a foreign tenant binds");
+        let mut stream = foreign.execute(0, context).expect("foreign stream");
+        let refusal = loop {
+            match stream.next().await {
+                Some(Ok(batch)) => assert_eq!(batch.num_rows(), 0, "a foreign tenant reads no row"),
+                Some(Err(error)) => break error,
+                None => panic!("a foreign tenant's read must fail"),
+            }
+        };
+        assert!(
+            is_tenant_invariant_error(&refusal),
+            "a foreign tenant is a tenant refusal, saw {refusal}"
+        );
+    }
+
     /// A recorded row count is inexact scan statistics, so `DataFusion` can
     /// never answer `count(*)` from it without opening the file and proving
     /// its footer tenant.
@@ -2612,12 +2851,11 @@ pub(super) mod tests {
             false,
         )]));
         let root = tempfile::tempdir().expect("event-time fixture directory");
-        let bounded = |min_micros, max_micros| {
-            crate::catalog::event_time::EventTimeStatistics::Bounded {
+        let bounded =
+            |min_micros, max_micros| crate::catalog::event_time::EventTimeStatistics::Bounded {
                 min_micros,
                 max_micros,
-            }
-        };
+            };
         let written = |name: &str, values: &[i64], event_time| HotFileSource {
             event_time,
             ..split_file(
@@ -2626,9 +2864,17 @@ pub(super) mod tests {
             )
         };
         let files = vec![
-            written("overlapping.parquet", &[lower, upper], bounded(lower, upper)),
+            written(
+                "overlapping.parquet",
+                &[lower, upper],
+                bounded(lower, upper),
+            ),
             // Touches the upper endpoint exactly; closed intervals overlap.
-            written("endpoint.parquet", &[upper, upper + 9], bounded(upper, upper + 9)),
+            written(
+                "endpoint.parquet",
+                &[upper, upper + 9],
+                bounded(upper, upper + 9),
+            ),
             written("unusable.parquet", &[lower + 1, 0], unusable_event_time()),
             HotFileSource {
                 event_time: bounded(0, lower - 1),
@@ -2636,7 +2882,12 @@ pub(super) mod tests {
             },
         ];
         let options = crate::resources::OracleSessionShape::for_test().config_options();
-        let bound = |micros| lit(ScalarValue::TimestampMicrosecond(Some(micros), Some(zone.clone())));
+        let bound = |micros| {
+            lit(ScalarValue::TimestampMicrosecond(
+                Some(micros),
+                Some(zone.clone()),
+            ))
+        };
         let filter = col(WYRD_EVENT_TIME)
             .gt_eq(bound(lower))
             .and(col(WYRD_EVENT_TIME).lt_eq(bound(upper)));
@@ -2645,9 +2896,10 @@ pub(super) mod tests {
             &filter,
             &options,
         );
-        let batches = datafusion::physical_plan::collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
-            .await
-            .expect("event-time scan reads");
+        let batches =
+            datafusion::physical_plan::collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
+                .await
+                .expect("event-time scan reads");
         let mut values = batches
             .iter()
             .flat_map(|batch| {
@@ -2681,10 +2933,16 @@ pub(super) mod tests {
         // Exact merged bounds would let `min`/`max` be answered unopened,
         // skipping the footer tenant proof.
         let statistics = datafusion::physical_plan::StatisticsContext::new()
-            .compute(scan.as_ref(), &datafusion::physical_plan::StatisticsArgs::new())
+            .compute(
+                scan.as_ref(),
+                &datafusion::physical_plan::StatisticsArgs::new(),
+            )
             .expect("scan statistics");
         assert!(
-            !statistics.column_statistics[0].min_value.is_exact().unwrap_or(false),
+            !statistics.column_statistics[0]
+                .min_value
+                .is_exact()
+                .unwrap_or(false),
             "{statistics:?}"
         );
     }
@@ -2694,8 +2952,11 @@ pub(super) mod tests {
         let batch = RecordBatch::try_new(
             Arc::clone(schema),
             vec![
-                cast(&Int64Array::from(values.to_vec()), schema.field(0).data_type())
-                    .expect("split fixture values cast to the schema"),
+                cast(
+                    &Int64Array::from(values.to_vec()),
+                    schema.field(0).data_type(),
+                )
+                .expect("split fixture values cast to the schema"),
             ],
         )
         .expect("split fixture batch");
@@ -3167,7 +3428,7 @@ pub(super) mod tests {
     /// # Panics
     ///
     /// Panics if the fixed hour boundary is rejected, which is a fixture bug.
-    fn one_live_route(tenant: DataTenantId) -> LiveTableRoutes {
+    pub(in crate::oracle) fn one_live_route(tenant: DataTenantId) -> LiveTableRoutes {
         LiveTableRoutes {
             binding: wyrd_spec::vala::api::TenantTableBinding {
                 tenant_id: tenant,
@@ -3193,11 +3454,10 @@ pub(super) mod tests {
     ///
     /// This is the production Interactive leader path for
     /// `SELECT duration_ms FROM ... WHERE status_code = 'STATUS_CODE_ERROR'`.
-    /// The closure is `[duration_ms, status_code]`: the requested output and
-    /// the predicate-only column the leaves prune with. `unused_payload` is
-    /// requested by nobody and must not appear in any leaf. Pushdown is
-    /// `Inexact`, so the provider returns every row and `DataFusion` filters
-    /// above it.
+    /// Pushdown is `Inexact`, so `DataFusion` asks the scan for the output
+    /// column and the predicate column, `[duration_ms, status_code]`, and
+    /// filters above it. `unused_payload` is requested by nobody and must not
+    /// appear in any leaf; the provider returns every row.
     ///
     /// # Panics
     /// Panics if provider construction, scan planning, or execution violates
@@ -3213,7 +3473,10 @@ pub(super) mod tests {
             projection_closure_provider(tenant, Some(one_live_route(tenant))).await;
 
         let public = provider.schema();
-        let projection = vec![public.index_of("duration_ms").expect("public duration_ms")];
+        let projection = vec![
+            public.index_of("duration_ms").expect("public duration_ms"),
+            public.index_of("status_code").expect("public status_code"),
+        ];
         let predicate = col("status_code").eq(lit("STATUS_CODE_ERROR"));
         let session = SessionContext::new_with_config(
             crate::resources::OracleSessionShape::for_test().session_config(),
@@ -3224,11 +3487,9 @@ pub(super) mod tests {
             .await
             .expect("closure scan plans");
 
-        // The public result is exactly the requested column.
-        assert_eq!(column_names(&plan), vec!["duration_ms".to_string()]);
-
-        // The source union sits directly under the output projection.
-        let union = Arc::clone(plan.children()[0]);
+        // The requested columns are the closure, so the source union is the
+        // scan itself, with no projection above it.
+        let union = Arc::clone(&plan);
         assert!(union.downcast_ref::<UnionExec>().is_some());
         let closure = vec!["duration_ms".to_string(), "status_code".to_string()];
         assert_eq!(column_names(&union), closure);
@@ -3241,7 +3502,7 @@ pub(super) mod tests {
             assert_eq!(child, &closure);
         }
 
-        // One ERROR row and one OK row in, both out as `duration_ms`. The
+        // One ERROR row and one OK row in, both out. The
         // live leaf's peer stream is substituted by its rows, projected onto
         // the same closure the leaf planned.
         let plan = plan

@@ -1,8 +1,8 @@
 //! The per-file Parquet read plan, for tests.
 //!
 //! Every Oracle file is read by `DataFusion`'s own `ParquetSource`, which plans
-//! each file through `DataFusion`'s shared [`PerFileParquetReadPlanner`] and the
-//! Oracle Variant file adapter. [`FileReadPlan`] calls that same planner on one
+//! each file through `DataFusion`'s shared [`PerFileParquetReadPlanner`] and its
+//! default expression adapter. [`FileReadPlan`] calls that same planner on one
 //! file so tests can assert which leaves, row groups, and pages a Struct field
 //! (`get_field`) or Variant path (`variant_get`) selects.
 
@@ -16,11 +16,10 @@ use datafusion::datasource::physical_plan::parquet::{
 use datafusion::error::Result as DataFusionResult;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::projection::ProjectionExprs;
+use datafusion::physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, RowSelection};
 use parquet::file::metadata::ParquetMetaData;
-
-use super::variant_sql::OracleVariantSql;
 
 /// One Parquet file's read plan from `DataFusion`'s shared per-file planner.
 ///
@@ -64,7 +63,7 @@ impl FileReadPlan {
             logical_file_schema: Arc::clone(logical_schema),
             physical_file_schema: Arc::clone(&physical_schema),
             metadata: Arc::clone(&metadata),
-            expr_adapter_factory: OracleVariantSql::shared().file_adapter(),
+            expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
             max_in_list_size,
             file_metrics: file_metrics.clone(),
         })?;
@@ -394,6 +393,11 @@ pub(super) mod tests {
             .expect("per-file plan")
     }
 
+    /// Builds `v ->> key`, the text of a top-level key of the fixture Variant.
+    fn text_at(key: &str) -> Expr {
+        datafusion::functions_variant::VARIANT_GET_TEXT.call(vec![col("v"), lit(key)])
+    }
+
     /// Returns the dotted paths of the Parquet leaves `plan` decodes.
     pub(in crate::oracle) fn decoded_leaves(published: &Bytes, plan: &FileReadPlan) -> Vec<String> {
         let reader =
@@ -455,7 +459,8 @@ pub(super) mod tests {
                 id += i64::try_from(documents.len()).expect("group length fits i64");
                 let schema = Arc::new(Schema::new(vec![
                     Field::new("id", DataType::Int64, false),
-                    Field::new("v", variant.data_type().clone(), true),
+                    Field::new("v", variant.data_type().clone(), true)
+                        .with_metadata(variant_field("v", true).metadata().clone()),
                 ]));
                 RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(ids)), variant])
                     .expect("group batch")
@@ -487,10 +492,9 @@ pub(super) mod tests {
 
     /// One fixture file served as table `t` through the production hot scan.
     ///
-    /// Queries plan with stock `DataFusion` and the Oracle Variant SQL over an
-    /// empty `t`; the scan is then swapped for [`hot_parquet_scan`] over the
-    /// fixture object and [`LeafPathPushdown`](super::super::leaf_paths::LeafPathPushdown)
-    /// trims it, as the Oracle provider's hot leaf is planned.
+    /// Queries plan with stock `DataFusion` over an empty `t`; the scan is then
+    /// swapped for [`hot_parquet_scan`] over the fixture object, as the Oracle
+    /// provider's hot leaf is planned.
     pub(in crate::oracle) struct HotTable {
         /// Warehouse root holding the fixture object for the table's lifetime.
         root: tempfile::TempDir,
@@ -498,7 +502,7 @@ pub(super) mod tests {
         size: usize,
         /// The table schema the file is read against.
         schema: SchemaRef,
-        /// Session with the Oracle Variant SQL installed and `t` registered.
+        /// Default-featured session with `t` registered.
         context: datafusion::prelude::SessionContext,
     }
 
@@ -514,13 +518,7 @@ pub(super) mod tests {
         pub(in crate::oracle) fn new(file: &Bytes, schema: SchemaRef) -> Self {
             let root = tempfile::tempdir().expect("hot table root");
             std::fs::write(root.path().join(Self::OBJECT), file).expect("hot table object");
-            let context = datafusion::prelude::SessionContext::new_with_state(
-                OracleVariantSql::shared()
-                    .install(
-                        datafusion::execution::SessionStateBuilder::new().with_default_features(),
-                    )
-                    .build(),
-            );
+            let context = datafusion::prelude::SessionContext::new();
             context
                 .register_table(
                     "t",
@@ -564,14 +562,13 @@ pub(super) mod tests {
         }
 
         /// Plans `sql` over `t` with its scan swapped for the hot scan, its
-        /// filters pushed into that scan by `DataFusion`'s `FilterPushdown`,
-        /// the projections above merged into it by `ProjectionPushdown`, and
-        /// the result trimmed by the leaf-path rule, the order an Oracle
-        /// session runs them in.
+        /// filters pushed into that scan by `DataFusion`'s `FilterPushdown`
+        /// and the projections above merged into it by `ProjectionPushdown`,
+        /// the order an Oracle session runs them in.
         ///
         /// Each call plans afresh: executing a plan leaves state behind (a
         /// `TopK`'s dynamic filter), so a reused plan would not start from what
-        /// the rule sees at planning.
+        /// the rules see at planning.
         ///
         /// # Panics
         /// Panics when the query does not plan.
@@ -630,13 +627,9 @@ pub(super) mod tests {
             let filtered = datafusion::physical_optimizer::filter_pushdown::FilterPushdown::new()
                 .optimize(swapped, options)
                 .expect("filter pushdown");
-            let merged =
-                datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown::new()
-                    .optimize(filtered, options)
-                    .expect("projection pushdown");
-            super::super::leaf_paths::LeafPathPushdown
-                .optimize(merged, options)
-                .expect("pushdown")
+            datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown::new()
+                .optimize(filtered, options)
+                .expect("projection pushdown")
         }
 
         /// Runs `plan` to completion on this table's session.
@@ -731,7 +724,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn both_readers_use_shared_per_file_plan() {
         let shredded = write_file(true);
-        let variant_a = || OracleVariantSql::shared().text_at(col("v"), &["a".to_owned()]);
+        let variant_a = || text_at("a");
         let struct_a = || datafusion::functions::core::expr_fn::get_field(col("s"), "a");
         let leaves = [("s_a", struct_a()), ("v_a", variant_a())];
 
@@ -791,74 +784,59 @@ pub(super) mod tests {
         );
     }
 
-    /// Returns the leaves a read of `v` trimmed to `paths` decodes from
-    /// `published`, and each path's `->>` text read through the hot scan.
+    /// Returns the leaves a projection of `v ->> key` for each of `keys`
+    /// decodes from `published`, and each key's text read through the hot
+    /// scan.
     ///
     /// # Panics
     ///
     /// Panics when the plan does not build, decode, or evaluate.
-    async fn read_trimmed(
+    async fn read_keys(
         published: &Bytes,
-        paths: &[Vec<String>],
+        keys: &[&str],
     ) -> (Vec<String>, Vec<Vec<Option<String>>>) {
-        let schema = logical_schema();
-        let column = Arc::new(datafusion::physical_expr::expressions::Column::new("v", 2));
-        let projection = ProjectionExprs::new([ProjectionExpr::new(
-            OracleVariantSql::trimmed(
-                column,
-                &Arc::new(schema.field_with_name("v").expect("v").clone()),
-                paths.iter().cloned().collect(),
-            ),
-            "v",
-        )]);
-        let reader =
-            ArrowReaderMetadata::load(published, ArrowReaderOptions::new()).expect("valid footer");
-        let read_plan =
-            FileReadPlan::new(&reader, &schema, projection, None, 20).expect("per-file plan");
-        let select = paths
+        let exprs = keys
             .iter()
-            .map(|keys| {
-                let (last, parents) = keys.split_last().expect("a path names a key");
-                let mut path = "v".to_owned();
-                for key in parents {
-                    use std::fmt::Write as _;
-                    write!(path, " -> '{key}'").expect("writing to a String cannot fail");
-                }
-                format!("{path} ->> '{last}'")
-            })
+            .map(|key| (*key, text_at(key)))
+            .collect::<Vec<_>>();
+        let select = keys
+            .iter()
+            .map(|key| format!("v ->> '{key}'"))
             .collect::<Vec<_>>()
             .join(", ");
-        let batch = HotTable::new(published, schema)
+        let batch = HotTable::new(published, logical_schema())
             .sql(&format!("SELECT {select} FROM t ORDER BY id"))
             .await;
-        (decoded_leaves(published, &read_plan), texts(&batch))
+        (
+            decoded_leaves(published, &plan(published, &exprs, None)),
+            texts(&batch),
+        )
     }
 
-    /// A Variant read for only some paths decodes just their leaves (a
+    /// A Variant read for only some keys decodes just their leaves (a
     /// shredded key's subtree, or the root residual for a key the file did
     /// not shred, plus `metadata`) and never a sibling shredded child, yet
-    /// every path reads exactly what an all-residual file returns.
+    /// every key reads exactly what an all-residual file returns.
     ///
     /// # Panics
     ///
     /// Panics when a read decodes other leaves or any value differs.
     #[tokio::test]
-    async fn trimmed_variant_reads_only_its_paths_leaves() {
+    async fn variant_key_reads_decode_only_their_leaves() {
         let shredded = write_file(true);
         let unshredded = write_file(false);
-        let path = |key: &str| vec![key.to_owned()];
-        for (paths, leaves) in [
+        for (keys, leaves) in [
             (
-                vec![path("a")],
+                vec!["a"],
                 vec![
                     "v.metadata",
                     "v.typed_value.a.value",
                     "v.typed_value.a.typed_value",
                 ],
             ),
-            (vec![path("c")], vec!["v.metadata", "v.value"]),
+            (vec!["c"], vec!["v.metadata", "v.value"]),
             (
-                vec![path("a"), path("c")],
+                vec!["a", "c"],
                 vec![
                     "v.metadata",
                     "v.value",
@@ -867,11 +845,11 @@ pub(super) mod tests {
                 ],
             ),
         ] {
-            let (decoded, texts) = read_trimmed(&shredded, &paths).await;
-            assert_eq!(decoded, leaves, "{paths:?}");
-            let (whole, expected) = read_trimmed(&unshredded, &paths).await;
+            let (decoded, texts) = read_keys(&shredded, &keys).await;
+            assert_eq!(decoded, leaves, "{keys:?}");
+            let (whole, expected) = read_keys(&unshredded, &keys).await;
             assert_eq!(whole, ["v.metadata", "v.value"]);
-            assert_eq!(texts, expected, "{paths:?}");
+            assert_eq!(texts, expected, "{keys:?}");
         }
     }
 
@@ -980,7 +958,8 @@ pub(super) mod tests {
     /// all-typed group outside the literal is skipped whether `a` is shredded
     /// as `Int64` or narrowed to `Int16` or `Int8`, a `Utf8` comparison
     /// against an integer shredding prunes nothing, a `BIGINT` literal
-    /// outside an `Int8` leaf's range prunes nothing and matches nothing, and
+    /// outside an `Int8` leaf's range prunes every all-typed group and matches
+    /// nothing, and
     /// the hot scan returns identical rows with statistics pruning on and off.
     ///
     /// # Panics
@@ -1012,7 +991,7 @@ pub(super) mod tests {
             Some(a_type),
         );
         let table = HotTable::new(&published, groups_schema());
-        let text = || OracleVariantSql::shared().text_at(col("v"), &["a".to_owned()]);
+        let text = || text_at("a");
         let number = || {
             Expr::Cast(datafusion::logical_expr::expr::Cast::new(
                 Box::new(text()),
@@ -1041,11 +1020,7 @@ pub(super) mod tests {
             (
                 number().eq(lit(1_000_i64)),
                 "CAST(v ->> 'a' AS BIGINT) = 1000",
-                if a_type == &DataType::Int8 {
-                    vec![0, 1, 2]
-                } else {
-                    vec![1]
-                },
+                vec![1],
                 vec![],
             ),
         ] {

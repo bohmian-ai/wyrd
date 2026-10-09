@@ -1822,9 +1822,12 @@ impl WyrdTestCluster {
         {
             builder = builder.with_oracle_query_slot_limit_for_test(slots);
         }
-        if let Some(oracle) = self.oracle_runtime.clone() {
-            builder = builder.with_oracle_runtime_for_test(oracle);
-        }
+        // Journey tables hold kilobytes. One byte per scan task spreads them
+        // over the cluster's Oracle followers the way a production-sized table
+        // spreads under the default, unless a journey states its own value.
+        let mut oracle = self.oracle_runtime.clone().unwrap_or_default();
+        oracle.file_scan_bytes_per_task.get_or_insert(1);
+        builder = builder.with_oracle_runtime_for_test(oracle);
         if let Some(root) = self.gateway_provider_root.clone() {
             builder = builder.with_gateway_provider_root_for_test(root);
         }

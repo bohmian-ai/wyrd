@@ -714,10 +714,8 @@ fn decode_lower_hex(text: &str, width: i32) -> Option<Vec<u8>> {
     }
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(width);
-    for pair in bytes.chunks_exact(2) {
-        let hi = lower_hex_digit(pair[0])?;
-        let lo = lower_hex_digit(pair[1])?;
-        out.push(hi << 4 | lo);
+    for &[hi, lo] in bytes.as_chunks::<2>().0 {
+        out.push(lower_hex_digit(hi)? << 4 | lower_hex_digit(lo)?);
     }
     Some(out)
 }

@@ -1809,7 +1809,12 @@ fn decode_base64_text(
     let complete_len = unpadded.len() / 4 * 4;
     let mut output = Vec::with_capacity(decoded_len);
 
-    for (quartet_index, quartet) in unpadded[..complete_len].chunks_exact(4).enumerate() {
+    for (quartet_index, quartet) in unpadded[..complete_len]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let source_offset = offset + quartet_index * 4;
         let a = base64_value(quartet[0])
             .ok_or_else(|| JsonDecodeError::at(source_offset, "invalid OTLP JSON base64"))?;
@@ -2217,7 +2222,7 @@ impl<'de> JsonCursor<'de> {
             token.raw
         };
         let mut bytes = Vec::with_capacity(token.decoded_len / 2);
-        for pair in text.chunks_exact(2) {
+        for pair in text.as_chunks::<2>().0 {
             let high = hex_nibble(pair[0]).ok_or_else(|| self.error("invalid OTLP hex digit"))?;
             let low = hex_nibble(pair[1]).ok_or_else(|| self.error("invalid OTLP hex digit"))?;
             bytes.push((high << 4) | low);

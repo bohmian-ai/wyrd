@@ -727,8 +727,8 @@ mod pg_tests {
     /// Struct events. Through `bifrost.query` an agent reads `->>` text, `->`
     /// and whole Variant cells as JSON values, a Struct child by exact field
     /// access, a Variant nested in a Struct, and parsed integers beyond 2^53
-    /// and at `u64::MAX` exactly; invalid JSON in `parse_json` is the stable Variant error and
-    /// `try_parse_json` is null.
+    /// and at `u64::MAX` exactly; invalid JSON in `parse_json` is a query
+    /// execution failure and `try_parse_json` is null.
     ///
     /// # Errors
     ///
@@ -737,7 +737,7 @@ mod pg_tests {
     /// # Panics
     ///
     /// Panics when a value renders differently or the invalid-JSON query is
-    /// not refused with `WYRD_VALA_400_VARIANT_INVALID_JSON`.
+    /// not refused with `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn builtin_variant_and_struct_payloads_are_queryable() -> Result<(), McpJourneyError> {
@@ -797,8 +797,8 @@ mod pg_tests {
             .await?;
         assert_eq!(
             problem(invalid)?["code"],
-            serde_json::json!("WYRD_VALA_400_VARIANT_INVALID_JSON"),
-            "invalid JSON in parse_json is the stable Variant error"
+            serde_json::json!("WYRD_VALA_500_QUERY_EXECUTION_FAILED"),
+            "invalid JSON in parse_json is a query execution failure"
         );
 
         client.cancel().await?;

@@ -1979,11 +1979,8 @@ fn repeated_varint_count_across_messages(
 /// Returns a malformed-request error for a partial trailing value.
 fn extend_fixed64(bytes: &[u8], values: &mut Vec<u64>) -> Result<(), IngestError> {
     packed_fixed64_count(bytes)?;
-    for chunk in bytes.chunks_exact(8) {
-        let raw: [u8; 8] = chunk
-            .try_into()
-            .map_err(|_| malformed("invalid packed fixed64 value"))?;
-        values.push(u64::from_le_bytes(raw));
+    for chunk in bytes.as_chunks::<8>().0 {
+        values.push(u64::from_le_bytes(*chunk));
     }
     Ok(())
 }
@@ -1995,11 +1992,8 @@ fn extend_fixed64(bytes: &[u8], values: &mut Vec<u64>) -> Result<(), IngestError
 /// Returns a malformed-request error for a partial trailing value.
 fn extend_doubles(bytes: &[u8], values: &mut Vec<f64>) -> Result<(), IngestError> {
     packed_fixed64_count(bytes)?;
-    for chunk in bytes.chunks_exact(8) {
-        let raw: [u8; 8] = chunk
-            .try_into()
-            .map_err(|_| malformed("invalid packed double value"))?;
-        values.push(f64::from_bits(u64::from_le_bytes(raw)));
+    for chunk in bytes.as_chunks::<8>().0 {
+        values.push(f64::from_bits(u64::from_le_bytes(*chunk)));
     }
     Ok(())
 }

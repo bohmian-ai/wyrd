@@ -4247,12 +4247,10 @@ impl OracleExecution {
 
     /// Builds a default-featured session state for `config` under this grant:
     /// the Oracle session for `config` (see
-    /// [`crate::oracle::variant_sql::OracleVariantSql::session`]) with its
+    /// [`crate::oracle::session::OracleSessionTemplate::session`]) with its
     /// runtime swapped for the grant's, as `SessionContext` swaps a runtime.
     ///
-    /// The Oracle Variant SQL surface is installed before the state exists,
-    /// so admission execution and follower decode resolve the same functions
-    /// the leader planned with. Sessions that need upstream's distributed
+    /// Sessions that need upstream's distributed
     /// builder hooks compose [`Self::configure`] and [`Self::runtime`]
     /// themselves; every other session under a grant is built here.
     #[must_use]
@@ -4261,7 +4259,7 @@ impl OracleExecution {
         config: datafusion::execution::context::SessionConfig,
     ) -> datafusion::execution::SessionState {
         datafusion::execution::SessionStateBuilder::new_from_existing(
-            crate::oracle::variant_sql::OracleVariantSql::shared().session(self.configure(config)),
+            crate::oracle::session::OracleSessionTemplate::shared().session(self.configure(config)),
         )
         .with_runtime_env(Arc::clone(&self.runtime))
         .build()

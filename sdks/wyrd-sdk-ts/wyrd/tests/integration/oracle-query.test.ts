@@ -540,13 +540,16 @@ describe("Variant query journey", () => {
           () => undefined,
           (error: unknown) => error,
         );
-      expect(early).toMatchObject({ code: "WYRD_VALA_400_VARIANT_INVALID_JSON" });
+      const failed = {
+        code: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+        details: { variant: "query_execution_failed" },
+      };
+      expect(early).toMatchObject(failed);
 
-      // A failure after a delivered batch keeps the pre-stream problem: rows
-      // from id 8192 fail only in the second 8192-row batch. DataFusion
-      // projects batches on several partitions, so that batch may fail before
-      // or after the first one is delivered. An unrelated late cast failure
-      // stays generic, and neither result is returned partially.
+      // A failure after a delivered batch refuses the whole result: rows from
+      // id 8192 fail only in the second 8192-row batch. DataFusion projects
+      // batches on several partitions, so that batch may fail before or after
+      // the first one is delivered.
       const lateFqn = `vala.datasets.variant_late_${Date.now().toString(36)}`;
       const writer = await Bifrost.connect({
         table: TableConfig.fromJsonSchema(lateFqn, {
@@ -576,20 +579,10 @@ describe("Variant query journey", () => {
       );
       await writer.shutdown();
       server.waitForBifrostPublication();
-      const { code, status, detail, details } = early as WyrdError;
-      for (const [value, expected] of [
-        [
-          "parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)",
-          { code, status, detail, details },
-        ],
-        [
-          "CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)",
-          {
-            code: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
-            details: { variant: "query_execution_failed" },
-          },
-        ],
-      ] as const) {
+      for (const value of [
+        "parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)",
+        "CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)",
+      ]) {
         const sql = `SELECT id, ${value} AS v FROM ${lateFqn}`;
         let delivered = 0;
         const streamed = await (async () => {
@@ -604,8 +597,8 @@ describe("Variant query journey", () => {
           delivered,
         );
         expect(streamed).toBeInstanceOf(WyrdError);
-        expect(streamed).toMatchObject(expected);
-        await expect(reader.sql(sql)).rejects.toMatchObject(expected);
+        expect(streamed).toMatchObject(failed);
+        await expect(reader.sql(sql)).rejects.toMatchObject(failed);
       }
     } finally {
       server.shutdown();

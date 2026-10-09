@@ -49,7 +49,7 @@ Query a Variant with these operators and functions:
 |---|---|
 | `v -> 'key'`, `v -> n` | The Variant at an object key or array index, or null when absent |
 | `v ->> 'key'`, `v ->> n` | The same value as text: a string as itself, any other value as its JSON text, null when absent or JSON null |
-| `parse_json(text)` | The Variant for JSON text; invalid JSON fails with `WYRD_VALA_400_VARIANT_INVALID_JSON` |
+| `parse_json(text)` | The Variant for JSON text; invalid JSON fails the query with `WYRD_VALA_500_QUERY_EXECUTION_FAILED` |
 | `try_parse_json(text)` | The same, returning null on invalid JSON |
 | `to_json(v)` | The JSON text of a Variant |
 

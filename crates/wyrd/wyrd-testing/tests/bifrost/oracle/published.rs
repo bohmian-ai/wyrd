@@ -206,7 +206,6 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         "the pruning phase needs both source variants present, saw {compacted} compacted \
          and {hot} hot"
     );
-    let checkpoint = cluster.telemetry().checkpoint()?;
     let reads_before = server.object_reads_for_test().ranged_reads();
     let empty = query_ids_between(
         owner.client(),
@@ -219,33 +218,10 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         empty.is_empty(),
         "an interval no object overlaps returns exactly no rows, got {empty:?}"
     );
-    let delta = cluster.telemetry().delta_since(&checkpoint)?;
     assert_eq!(
         server.object_reads_for_test().ranged_reads(),
         reads_before,
         "an excluded object's footer is never read"
-    );
-    // Only the hot path decides exclusion from file bounds; the Iceberg
-    // snapshot prunes inside its own scan planning, and no second walk of the
-    // pinned file list runs to manufacture a per-source series.
-    let excluded = metric_value(
-        &delta,
-        "bifrost_oracle_file_pruning_total",
-        BifrostMetricKind::Counter,
-        &[("outcome", "excluded")],
-    );
-    assert!(
-        excluded >= 1.0 && excluded <= f64::from(u32::try_from(hot)?),
-        "every hot object is excluded before its footer, and only hot objects \
-         are counted, saw {excluded} for {hot} hot objects"
-    );
-    assert!(
-        delta
-            .metrics
-            .iter()
-            .filter(|sample| sample.family == "bifrost_oracle_file_pruning_total")
-            .all(|sample| !sample.labels.contains_key("source")),
-        "pruning carries no telemetry-only source label"
     );
 
     // 7. Production teardown drains the parked promotion commit.
@@ -747,19 +723,15 @@ async fn expired_process_shutdown_returns_failure() {
 const ROW_VARIANT: &str = "parse_json('{\"k\":\"' || filter_key || \
      '\",\"n\":9007199254740993,\"o\":{\"a\":[1,\"x\",null]}}')";
 
-/// Every production Oracle session exposes the one Variant SQL surface.
+/// Every production Oracle session exposes `DataFusion`'s Variant SQL.
 ///
 /// One four-pod topology runs the same operator and function matrix through
 /// the Interactive leader session and through an Analytical graph whose stages
 /// round-trip the distributed plan to both followers, so each session decodes
-/// and executes the Variant UDFs itself. Invalid `parse_json` text is the
-/// stable Variant error on both paths, before the first batch or after a
-/// delivered one, while `try_parse_json` is null, and a
-/// Variant read of a sensitive gateway payload is refused before any remote
-/// work. Plan shape (`variant_get` for Variant, `get_field` for Struct) is the
-/// shared installer's contract, pinned by
-/// `oracle::variant_sql::tests::variant_operators_and_functions_follow_the_contract`;
-/// this journey proves every production session runs that installer.
+/// and executes the Variant functions itself. Invalid `parse_json` text is the
+/// generic query execution failure on both paths, before the first batch or
+/// after a delivered one, while `try_parse_json` is null, and a Variant read
+/// of a sensitive gateway payload is refused before any remote work.
 ///
 /// # Panics
 ///
@@ -865,15 +837,11 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
         return Err(format!("the Analytical Variant matrix returned {rows:?}").into());
     }
 
-    // Invalid text is the stable Variant error whichever session meets it,
-    // before any batch or after a valid one: the late terminal carries the
-    // same catalog problem, and the whole result is refused.
-    let invalid_json = wyrd_spec::error::WyrdError::from(BifrostError::VariantInvalidJson {
-        field: "parse_json".to_owned(),
-        row: 0,
-        path: String::new(),
-    })
-    .problem();
+    // Invalid text is the generic execution failure whichever session meets
+    // it, before any batch or after a valid one, and the whole result is
+    // refused.
+    let invalid_json =
+        wyrd_spec::error::WyrdError::from(BifrostError::QueryExecutionFailed).problem();
     for (case, sql) in [
         (
             "Interactive invalid JSON",
@@ -942,15 +910,15 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     Ok(())
 }
 
-/// Proves a failure in a later batch keeps its catalog problem.
+/// Proves a failure in a later batch refuses the whole result.
 ///
 /// One object streams 8192-row batches through the Interactive leader, so rows
 /// from id 8192 fail only in the second batch. Two objects read through a
 /// bounded sort run as an Analytical graph whose coordinator merges ten sorted
 /// batches before projecting them, so rows from id 36864 fail only in the last
-/// batch. Each late Variant failure must match the pre-stream problem exactly,
-/// an unrelated late cast failure must stay the generic execution failure, and
-/// every collected result is refused rather than returned partially.
+/// batch. Each late Variant failure must carry `invalid_json`, a late cast
+/// failure the generic execution failure, and every collected result is
+/// refused rather than returned partially.
 ///
 /// The failure is accepted on either surface: `DataFusion` projects batches on
 /// several partitions, so the failing batch may overtake a clean one. When a
@@ -1287,7 +1255,7 @@ async fn struct_and_variant_share_physical_pushdown() -> Result<(), JourneyError
     // Every later cut must return exactly the content Scribe's hot objects
     // return, Variant values included.
     let contents = format!(
-        "SELECT id, s['a'], variant_as_text(doc) FROM {fqn} WHERE id < {} ORDER BY id",
+        "SELECT id, s['a'], to_json(doc) FROM {fqn} WHERE id < {} ORDER BY id",
         3 * PUSHDOWN_ROWS_PER_FILE
     );
     let (_, hot_rows) = run_rows(&reader, &contents).await?;

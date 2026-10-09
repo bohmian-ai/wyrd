@@ -10,7 +10,7 @@ previous one is done. Do not add work that is not listed here.
 | 1 | Spec revision 21 (one read path) | done, approved |
 | 2 | Delete unneeded and incorrect code | done; workspace compiles (`cargo check --workspace --all-features --tests`) |
 | 2a | Spec revision 26 (Variant is a DataFusion feature) | done, approved (`spec-revision-26-datafusion-variant.md`) |
-| 3 | Implement the correct way (below) | in progress: order items 1–3, V1, V2 done; V3 F5 done, Lists (F1/F2) next |
+| 3 | Implement the correct way (below) | in progress: order items 1–3, V1, V2 done; V3 F5 done; V3 Lists (F1/F2) under independent review (see V3 status) |
 | 4 | Run focused tests | not started |
 | 5 | Run release benchmarks | Variant bench written and passing on a fast build (`release-nonlto`); final LTO run not started |
 
@@ -116,6 +116,44 @@ its own fork tests passing (shown with output), with and without the
 - **V6 — Fork cleanup.** Delete the item-3 adapter-factory codec hook. Wyrd
   then pins the published fork instead of the `df-snap2` snapshot (handoff
   step 4).
+
+### Working in the fork: you are the DataFusion maintainer
+
+Everything in the fork is written as production DataFusion code: the
+`variant` feature is meant to ship in DataFusion itself. No pull request is
+opened anywhere; the fork is published to `bohmian-ai` only (handoff step 4).
+
+- Decide as a DataFusion maintainer would. Wyrd and Bifrost rules, names and
+  behavior never apply inside the fork. Generic pieces know nothing about
+  Variant; Variant pieces know nothing about Wyrd.
+- No ad hoc changes: no workarounds, special cases, or test-only shortcuts
+  to get a Wyrd journey or benchmark through. If DataFusion lacks an
+  extension point, add the general one in its owning crate.
+- Follow the fork's own standards: `AGENTS.md`, the contributor guide
+  (`docs/source/contributor-guide/`, including `api-health.md` for public
+  API changes), and `.ai/skills/` where relevant (`add-benchmarks` for
+  benchmark changes). Use the pinned toolchain (`rust-toolchain.toml`,
+  1.98.1: `cargo +1.98.1 ...`). Wyrd's `mise.toml` pins the same 1.98.1
+  (user, 2026-10-08), so both repos build and lint on one compiler.
+- Every fork commit passes, with output shown: `cargo fmt --all`,
+  `cargo clippy --all-targets --all-features -- -D warnings`
+  (`./dev/rust_lint.sh` runs the full lint suite), and the tests of every
+  changed crate with and without the `variant` feature.
+- Performance is a requirement, not a report: the latency table above
+  holds for every phase. Non-Variant, Struct and unshredded Variant
+  planning and execution unchanged; shredded key reads much faster than
+  unshredded; whole-Variant reads of shredded files at most 2x unshredded
+  (`parquet_variant_query`, mimalloc). Work that does not apply to a plan
+  costs it nothing. Measure changed paths against the fork base before
+  calling a phase done.
+- Every change and implementation follows the owning repository's
+  conventions and standards (user, 2026-10-08). Before writing code, read
+  the nearest existing code in the owning crate and match its patterns.
+  Tests come first and live in the owning crate: unit tests for each new
+  piece before any integration test. Every tree rewrite is shown to
+  terminate (a rewrite whose output can match its own pattern returns
+  `TreeNodeRecursion::Jump`). Never run an integration test whose pieces
+  have no passing unit tests.
 
 Wyrd switch (after V6):
 - Enable `datafusion/variant`.
@@ -261,6 +299,370 @@ Each item depends only on items above it.
     physical-expr-adapter 42, expr 263, core `parquet_integration` 252 with
     `variant`, 244 without.
   - Next: Lists (F1/F2), then the `parquet_variant_query` benchmark.
+  - V3 Lists status (2026-10-08): the first attempt was rejected by the
+    user. Its lambda rebinding (`LambdaExpr::replace_parameter` via
+    `transform_down`) re-entered its own `cast(x)` output and recursed
+    forever, OOMing the machine (test process killed at 63, 72, 83 GB).
+    It was written without unit tests and rerun without reading the kernel
+    log. All lambda rebinding and lambda leaf tracking has been deleted.
+    What remains, uncommitted and unverified: `l[i]['f']` leaf selection
+    through Lists in `datasource-parquet`, the adapter's List cast
+    narrowing below element access, and `core/tests/parquet/list_leaf_projection.rs`.
+    An independent review decides REVISE or START_OVER for that remainder
+    and an approach for `array_transform` (F2).
+  - V3 F1 revision (2026-10-08, after review REVISE C-1..C-10, uncommitted):
+    `list_leaf_projection.rs` deleted; byte evidence moved to
+    `parquet_nested_schema_pruning.slt` per repo convention. Adapter unit
+    tests and read-plan unit tests added first. The slt exposed a regression
+    (`events[1]` from `narrow` read 312 B against the 172 B whole-column
+    clip, because the List cast now sits below element access); fixed by
+    clipping a cast of an element access with `clip_for_cast`, as for
+    whole-column casts. Measured: `events[2]['x']` 87 B (narrow and
+    full_schema, baselines 172 B / 312 B); `events[1]` 172 B. C-9
+    (`physical_plan` projection rebased over the narrowed read) has its own
+    test. Green: adapter and datasource-parquet unit tests with and without
+    `variant`, the three nested slt files, `parquet_integration` Variant
+    tests (default 244, `variant` 252, no warnings), fork clippy
+    `-D warnings`. `parquet_struct_projection` (release-nonlto) against a
+    bfe8d793c worktree: every struct and flat case within run-to-run noise
+    (a first F1 run was an unexplained fast outlier; the rerun matched
+    base). F2 widen-back was withdrawn: Variant `metadata` and shredded
+    object fields are non-nullable, and `cast_column_to_field` turns any
+    differing Variant type into a layout conversion.
+  - V3 F2 (approved by the user 2026-10-08: rebinding). Read-plan analysis
+    is read-only: `PushdownChecker` binds a list element lambda's parameter
+    to (root, path + Element) and walks the body, falling back to the whole
+    element when shadowed, used whole, or unresolvable.
+    `HigherOrderFunctionExpr::rebind_list_element` (physical-expr) rebinds
+    the parameter to the read element field with a `TreeNodeRewriter`: it
+    jumps over shadowing lambdas and visits each node once in `f_up`, so a
+    `bind` output containing the variable is never revisited (the crash
+    cause). `rebase_onto_read` calls it with an identity bind; the adapter
+    moves a generated List cast into the lambda with a cast bind.
+    Done: `rebind_list_element` + 4 unit tests (narrowed list with nested
+    lambda equals full-list result, bind-once, shadowing, no list element
+    lambda), physical-expr clippy clean. Read-plan side done:
+    `PushdownChecker` binds list element lambda parameters (shadow frames
+    pushed per `LambdaExpr` in `f_down`, popped in `f_up`; a path through a
+    Map reads below its last resolvable step); `rebase_onto_read` rebinds
+    with an identity bind. Tests: `build_projection_read_plan_follows_list_element_lambdas`
+    (body field, Struct-nested List, whole/unread element, capture,
+    shadowing, nested lambdas, Map) and
+    `rebased_list_element_lambdas_evaluate_over_narrowed_reads` (decoded
+    narrowed read equals full-file evaluation, with empty and null Lists).
+    Suites green with and without `variant`: datasource-parquet 284,
+    physical-expr 1658, adapter 45; datasource-parquet clippy clean.
+    Bench invalid (2026-10-08): base and fork shared one `CARGO_TARGET_DIR`
+    and hash to the same bench binary, so the "current" run recompiled
+    nothing and re-ran the base binary (0 `Compiling` lines). Its deltas
+    (+14% to -70%) are base-vs-base noise, unpinned under `powersave`. The
+    earlier F1 "equal to base" result was measured the same way and is
+    unproven. Redo: separate target dirs, frozen binaries, `taskset` to one
+    CCD, interleaved rounds, A/B delta judged against each case's A/A spread
+    Redone with separate target dirs and frozen binaries (release-nonlto,
+    F1+F2 incl. adapter vs bfe8d793c): full suites base-then-current flagged
+    `*/unshredded/select_variant` +9-12%; alternating the same case alone
+    (base, cur x3) shows no difference (narrow 1.42/1.47/1.42 vs
+    1.43/1.44/1.43 ms; wide 7.73/7.27/8.13 vs 7.11/6.97/6.91; nested
+    3.17/3.17/3.21 vs 3.20/3.11/3.11), and `perf` user-space profiles match
+    within 0.35% with no new symbol. Planning cases unchanged or 1-3% faster.
+    Struct bench: no reproducible regression.
+    Adapter lambda cast pushdown done (`try_narrow_list_element_lambda`,
+    `narrow_expr` split from `rewrite_expr`); adapter tests pass incl.
+    `test_narrow_list_cast_into_lambda_body`. Slt lambda cases dropped: DF55
+    SQL cannot bind lambda parameters over table columns (`No field named
+    e`), so byte evidence goes in a core DataFrame-API integration test.
+    Done: `shredded_paths_read_only_their_leaves` checks
+    `array_transform(l, x -> x['v'] ->> 'a')[1]` values and reads under a
+    tenth of the whole-Variant bytes (8/8 `variant::` tests pass). Committed
+    F1+F2 as fork bb29c006c after fmt, clippy -D warnings (all features),
+    datasource-parquet 284 + adapter 46 (with and without variant),
+    physical-expr 1658 + expr 263, parquet_integration 244 / 252 with
+    variant, nested slt files. Left uncommitted by decision: the
+    datafusion-testing pointer, `file_pruner.rs`, the `assert!` hunk in
+    `core/tests/parquet/variant.rs`. C-8 docs done (read plan docs name
+    Lists; uncommitted, goes with V4).
+  - V4 in progress (2026-10-08). The optimizer crate forbids function
+    dependencies and name lookups ("use methods on the UDF traits"), so:
+    new `HigherOrderUDFImpl::list_element_map` (result keeps the List's
+    offsets and nulls, element i = lambda(element i)); `array_transform`
+    declares it. `PushDownLeafProjections` threads `&dyn OptimizerConfig`
+    (was the alias generator) and, at an `Unnest`, calls
+    `try_push_through_unnest`: pairs on depth-1 unnested List elements that
+    the recovery projection does not read whole become `map(l, x -> f(x))`
+    below the `Unnest`, which unnests the result; pass-through pairs ride
+    along; anything else keeps the barrier. Recovery columns, not
+    `columns_needed` (inflated by pair refs), decide "read whole". Only
+    runs when an extraction projection sits on an `Unnest`. Tests:
+    3 optimizer unit tests (projection, filter, barrier without benefit /
+    without a registered map), all 885 optimizer tests pass; slt
+    `unnest(events)['x']` reads 87 B (= `events[2]['x']`) vs 172 B whole,
+    same results, plan shows `array_transform` in the scan. Full slt found
+    one changed plan (`unnest.slt:665`, column also selected whole): added
+    `reads_mapped_lists_whole` (sources traced through the projection
+    below the `Unnest`) so no-benefit cases keep the barrier; recovery
+    columns are computed only on the `Unnest` path. Core
+    `unnest(l)['v'] ->> 'a'` reads < 1/10 of whole. V4 committed as fork
+    c165beeb4 (with C-8 docs) after fmt, clippy -D warnings (all
+    features), optimizer 885 / expr 263 / functions-nested 132,
+    datasource-parquet 284 with and without variant, parquet_integration
+    244 / 252, core_integration unnest 15, full slt 520/520. Next: V5.
+  - V5 done (2026-10-08). Placed in `PruningPredicate`, not the
+    adapter, so row filters and projections evaluate nothing new: the
+    rewrite only shapes statistics. New declarative
+    `ScalarUDFImpl::stored_value` -> `StoredValue { arg_index, typed_path,
+    residual_path }`: where the residual field is null the call returns
+    the typed field cast to its return type. `ScalarFunctionExpr::
+    stored_value` validates it. `RequiredColumns::rewrite_struct_fields`
+    (already per file, against the physical schema) rewrites
+    `[CAST(]f(..)[ AS t)] op lit` into `CAST(typed AS <f type>) op lit OR
+    residual IS NOT NULL` over synthetic nested-field columns, so a row
+    group is skipped only when its residual is all null and the typed
+    bounds exclude the literal. Integer/Boolean typed fields compared
+    through a string return as integer/Boolean `t` cast directly (exact
+    round trip); string comparison of integers stays unprunable via the
+    existing cast-order check. Marks `has_filter_semantics_only` (full-match
+    inversion does not guard function nulls). `variant_get_text` declares
+    it for a fully shredded literal key path whose last `typed_value` is a
+    string, integer, or Boolean. Tests: pruning unit
+    `stored_value_comparison_prunes_only_all_null_residuals`; core
+    `typed_key_comparisons_prune_row_groups` (3 row groups, residual in
+    one, string / integer / reversed / unprunable-text cases, results and
+    `row_groups_pruned_statistics`). Shared `table()` helper in the core
+    test replaces two copies of the write-and-register code.
+    V5 committed as fork 603f257a5 after fmt, clippy -D warnings (all
+    features), expr 263 / physical-expr 1658 / pruning 110,
+    datasource-parquet 284 with and without variant, parquet_integration
+    244 / 253, full slt 520/520. Crates are tested one per `cargo test`:
+    testing expr, physical-expr, pruning and functions-variant together
+    builds `functions-nested` without `sql` while `datafusion-expr/sql` is
+    on, and `RawBinaryExpr.op`'s feature-dependent type then fails to
+    compile (existing upstream feature setup).
+  - V6 done (2026-10-08): fork b4ea3f642 removes the item-3 codec hook
+    (codec trait methods and dispatch, encode/decode ctx methods, proto
+    field 18, proto and physical-plan adapter deps, its round-trip test);
+    return-field metadata and the by-name Variant round trip stay.
+    `regen.sh` reproduces the proto models. d36fb87ed fixes clippy 1.98
+    `unused_async_trait_impl` in the encryption-less Parquet opener
+    (`std::future::Ready`, no `#[allow]`), which only the no-extra-features
+    build hits. Evidence: fmt; clippy -D warnings for datasource-parquet
+    without features and proto / proto-models / physical-plan /
+    datasource / datasource-parquet with all features; proto 17 + 264 + 4,
+    datasource 177 + 8. Next: publish (handoff step 4).
+  - Wyrd 1.98.1 lint fallout fixed without `#[allow]`: `as_chunks` in OTLP
+    decode, boxed `PublicationError::Write` source (136 B -> under 128 B),
+    `unwrap_or` in the load harness, ready-future opendal test fakes, and
+    `BackendSigner` cloud/non-cloud split matching `presign_part`. Both
+    `mise run lints` steps pass; `wyrd-storage` 57/57.
+  - Published (2026-10-08): new fork `bohmian-ai/arrow-rs`, branch
+    `wyrd-unshred-presize` at c134488d6604; DataFusion fork commit 75b11dedd
+    pins it by git and is pushed to `bohmian-ai/datafusion` (fast-forward
+    38b7a7a0a..75b11dedd). Wyrd `[patch.crates-io]` points every
+    datafusion-* crate (now including `datafusion-functions-variant`) at
+    75b11dedd and every arrow-rs crate at c134488d6604 (uncommitted, lands
+    with the switch).
+  - Wyrd switch in progress (uncommitted):
+    - `vala-bifrost-redux` enables `datafusion/variant` and drops
+      `parquet-variant-json` (`parquet-variant`/`-compute` stay: the writer,
+      residual, and table code use them).
+    - Deleted `oracle/variant_sql.rs` and `oracle/leaf_paths.rs`; the session
+      template moved to `oracle/session.rs` (`OracleSessionTemplate`, default
+      features only). Analytical worker/planning sessions drop the install
+      (the distributed worker builder already has default features).
+      `with_expr_adapter` removed from `hot_parquet_scan`; `FileReadPlan`
+      uses `DefaultPhysicalExprAdapterFactory`. `ORACLE_VARIANT_SQL_VERSION`
+      removed from both digests.
+    - Journeys (SDK Rust/Python/TS, MCP, peer `published.rs`): invalid
+      `parse_json` now expects `WYRD_VALA_500_QUERY_EXECUTION_FAILED`;
+      `variant_as_text(doc)` -> `to_json(doc)`. `bifrost-design.md` Variant
+      SQL section and `docs/.../schema.svx` updated.
+    - `oracle::` lib tests: 164/170. `exec::projected_leaf_union_preserves_predicate_columns`
+      and `follower::scribe_live_sources_read_every_row_once_at_their_partition_count`
+      fail on predicate/closure shape that step 2 removed (no
+      `assignment.predicates`, no closure projection); they belong to plan
+      item 6. Four `nested_pushdown` Variant tests fail: a filter pushed
+      Exact into the hot scan returns every row when the file's `v` lacks
+      the Variant extension annotation (the `write_groups_with_a` fixture);
+      annotated files filter correctly.
+    - Diagnosis (independent diagnostician agreed):
+      - Symptom: `v -> 'o' ->> 'x' = '2'` returns [1, 2, 3], not [2]; the
+        same holds for the CAST, absent-key, and typed-pruning cases.
+      - Evidence:
+        - the fixture field has no extension (`nested_pushdown.rs`
+          `write_groups_with_a`);
+        - the fork adapter keeps `CAST(v AS variant)` unless the *file*
+          field is a Variant (`schema_rewriter.rs` `try_drop_layout_cast`);
+        - `PushdownChecker` then sees the bare struct `v`, so no candidate
+          is built (`row_filter.rs` `prebuild_row_filter_candidates`), and
+          `RowFilterContext::try_new` installs none;
+        - the plan already removed the `FilterExec` (`try_pushdown_filters`
+          checked the table schema).
+      - Cause: the test fixture writes an unannotated Variant. Production
+        writers always annotate (`tables/fields.rs:261`).
+      - Fix site: the fixture now annotates `v`, as `write_file` does. The
+        Int8 `= 1000` case now expects row group [1]: the fork prunes the
+        all-typed Int8 groups, which can never hold 1000; the old Wyrd
+        adapter skipped this. The rustdoc was updated to match.
+      - Latent fork defect, not fixed: a predicate claimed Exact at plan
+        time is silently dropped when a file's adapted predicate is not
+        row-filter-pushable (an unannotated Variant from an external writer,
+        or a struct cast from schema evolution). The result is wrong rows,
+        not slow rows.
+  - Blocker (2026-10-09, user: "fix the issue at its root"): the first full
+    `mise run test:bifrost` after the switch failed 37 tests. Every failure
+    traced to one of four causes:
+    - `datafusion-distributed` panic (fork defect):
+      - Symptom: an empty table's query returns 500.
+      - Evidence: trace shows a divide by zero at
+        `file_scan_config.rs:68` (`i % ev.task_count`).
+      - Cause: the default estimator desires 0 tasks for a scan with no
+        bytes, and the planner accepted a zero count.
+      - Fix site: fork `8647526`. `TaskCountAnnotation::limit` bounds every
+        reconciled count to 1..=budget. Test
+        `test_file_scan_without_bytes_runs_in_one_task` fails without it.
+      - Also fork `0b81b12`: the TPC-H and TPC-DS plan snapshots were stale
+        since the Arrow 60 move. They were refreshed; correctness suites
+        pass (TPC-H 22, TPC-DS 95).
+      - Pushed to `bohmian-ai/datafusion-distributed` `wyrd-arrow60`.
+    - `parse_json` u64 (fork defect):
+      - Symptom: `18446744073709551615` became `1.8446744073709552e19`.
+      - Cause: arrow-rs `json_to_variant` fell back to f64 above
+        `i64::MAX`.
+      - Fix site: arrow-rs `0d0eb24` uses `From<u64>` (exact scale-0
+        Decimal16, as ingest does) and enables upstream's ignored
+        `decimal16_large_integer` test.
+      - The DataFusion fork's `a4ff14550` pins it and adds
+        `parse_json_keeps_unsigned_64_bit_integers_exact`.
+    - Silently dropped filter (fork defect, the latent one below), fixed in
+      DataFusion `220fc50b3`. A row-filter candidate whose only obstacle is
+      a nested column used whole now decodes those roots instead of being
+      dropped. Test `pushed_filter_applies_to_a_variant_without_its_extension`
+      fails without it.
+      - Fork evidence: fmt, clippy `-D warnings`; datasource-parquet 284
+        with and without `variant`; `parquet_integration` 244 without and
+        255 with; sqllogictests.
+      - Pushed `75b11dedd..a4ff14550`.
+    - Items 2, 4, 5, 6 and 7 unfinished: step 2 deleted Wyrd's analytical
+      task-count, routing, leaf-split and placeholder scheme, and nothing
+      has replaced it yet. This explains the "settled Interactive" and
+      "graph did not settle" journeys, the off-by-one footer read
+      (`persisted_input` prefetches hot footers before `FilePruner` runs),
+      and the two out-of-date oracle unit tests. User (2026-10-09): do NOT
+      bring back that code; rebuild analytical on native
+      `datafusion-distributed` and the fork only.
+    - Wyrd re-pinned: DataFusion `a4ff145`, arrow-rs `0d0eb24`,
+      datafusion-distributed `0b81b12`.
+  - Items 2+4+7 design (research agent, checked against the forks):
+    - Item 2:
+      - No Wyrd codec. The fork's `ParquetSource` proto carries predicate,
+        projection, options and per-file statistics.
+      - The planning session keeps `.with_distributed_planner()` defaults,
+        `LiveUnionBoundary` and `children_isolator_unions(false)`.
+      - Upstream's `file_scan_config_bytes_per_partition` becomes an
+        optional Oracle runtime value. `None` means the upstream default
+        (production); journeys set 1 so tiny fixtures distribute.
+    - Item 4: an upstream `WorkerPlanRewriteHandler` on the worker session
+      swaps each decoded Parquet `DataSourceExec`'s reader factory for the
+      tenant footer-proof factory over this node's warehouse objects. The
+      tenant comes from the verified stage identity. Any other file scan is
+      refused.
+    - Item 7: `OracleQueryScanStats::visit` counts files and partitions from
+      the pre-execution plan by descending every `DistributedLeafExec`
+      variant and every `Stage::Local` input. Bytes and pruning still come
+      from `fold_distributed_scan_metrics`, because
+      `rewrite_distributed_plan_with_metrics` wraps nodes in an opaque
+      `MetricsWrapperExec`.
+    - Item 5 follow-up: `persisted_input` caches footers for the published
+      files only, before hot files join the scan.
+    - Item 6: `LiveScribeExec::handle_child_pushdown_result` takes the
+      non-dynamic parent filters in the Pre phase, reports them all
+      unsupported (the leader keeps its `FilterExec`), and `fragment()`
+      encodes `FilterExec(predicate, RemoteSourcePlaceholderExec)`. The
+      follower runs `FilterPushdown` after decode, so the predicate reaches
+      the staged `ParquetSource`. Dynamic filters are not shipped.
+    - Item 8, second half: the staged-scan row-group pruning test was
+      re-added in the first half; the live predicate peer journey is
+      `peer_network::security::leaf_predicates_round_trip_and_execute`. Its
+      Struct `IN` and Variant `->>` predicate is planned by a default
+      session as a `FilterExec` over the placeholder, and a one-literal plan
+      change under the signed fragment digest is refused.
+    - Item 9: `distributed.rs` comments now describe per-task scans that
+      carry the pushed predicate, with no follower assignment.
+    - Journey class assertions that encoded the deleted rule change with
+      the contract:
+      - a scan and a GROUP BY on one table now get the same class;
+      - an Interactive case uses a live-only or empty table;
+      - no assertion depends on which follower runs a stage.
+    - Fork gap, not Wyrd's: a single-task stage holding `LiveScribeExec`
+      below a multi-task consumer can be routed to a worker and fails
+      visibly (no encoding). If a journey reaches it, the fix is a
+      coordinator-only leaf in `datafusion-distributed`.
+    - Evidence after fixes (2026-10-08, fourth session):
+      - `oracle::` unit tests 172/172, including
+        `exec::tests::decoded_stage_scans_read_only_as_the_bound_tenant`
+        and `live::tests::pushed_filter_ships_on_the_fragment_and_stays_on_the_leader`;
+      - Scribe journeys 4/4 and `pg_bifrost_e2e
+        builtin_variant_and_struct_payloads_are_queryable` pass against the
+        published fork pins;
+      - full `mise run test:bifrost`: see the next entry.
+    - `wyrd-testing/tests/bifrost/oracle/published.rs` no longer asserts
+      `bifrost_oracle_file_pruning_total`: Wyrd's pruner and its metric are
+      gone, replaced by `DataFusion`'s `FilePruner`. The ranged-read claim
+      that an excluded object's footer is never read stays.
+    - Full `mise run test:bifrost` (fifth session): 8 of 9 lanes passed.
+      In the Oracle journey phase, 42 of 53 passed. Two read-only
+      diagnosticians traced the 11 failures:
+      - Group A, 6 journeys (`stale_attempt`, `telemetry`,
+        `pushdown_exchange_spill`, `single_planner`, `transport_drop`,
+        `two_tenants`):
+        - Symptom: an Analytical class was expected, Interactive was seen.
+        - Evidence: no `DistributedExec` root for the 12-row,
+          one-object tables.
+        - Cause: native `datafusion-distributed` distributes only a scan
+          spanning more than one task. One published object is one task.
+        - Fix site: the fixtures. Analytical tables are published as two
+          objects; Interactive cases read separate one-object tables.
+      - Hot and Iceberg filtering, "files expected 1, saw 3":
+        - Cause: files were counted from the plan before execution, but
+          `FilePruner` skips files as it opens them.
+        - Fix site: `OracleQueryScanStats::finalize` subtracts
+          `files_ranges_pruned_statistics` (`PruningEvidence::files_pruned`,
+          and `RemoteScanMetrics::record_pruned_files` for distributed
+          folds).
+        - Unit test: `exec::tests::scan_stats_exclude_files_distributed_tasks_pruned`.
+      - `live_query_routes_only_relevant_scribes`, "saw [1,1,1]":
+        - Cause: route event-time pruning was deleted along with
+          `ScanPredicate`, but the spec keeps it.
+        - Fix site: `LiveScribeExec::handle_child_pushdown_result` calls
+          `LiveTableRoutes::selected_by`, which runs DataFusion's
+          `PruningPredicate` over one `Statistics` per route, bounded by
+          its time partition.
+        - Unit test: `live::tests::event_time_predicate_selects_only_overlapping_routes`.
+      - `published_workers_and_live_scribes_share_one_plan`, "leases on
+        [1,2]": the assertion encoded the deleted single-destination rule.
+        Task placement is now upstream's, so at least one frozen worker must
+        lease.
+      - Focused rerun of these 10, plus
+        `pg_analytical_cancel_deadline_and_slow_consumer_leave_six_clean_nodes`
+        and the new peer journey: 12/12 pass (`WYRD_LOG=info`).
+      - MCP `agent_runs_three_table_analytical_query_through_mcp`
+        (confirmed by a fresh read-only diagnostician):
+        - Symptom: after the `max_rows: 1` refusal, the leader graph keeps
+          `memory_bytes=1864`. The release times out, readiness goes false,
+          and `await_cleanup_paused` times out (mcp.rs:173).
+        - Evidence: the trace shows stage 0 `outcome="failed"`, then "leader
+          graph was not confirmed drained". The plan is a leader-local
+          `HashJoinExec` (CollectLeft) whose `OnceAsync` build side
+          (`HashJoinInput` reservation) lives on the plan node.
+        - Cause: `AnalyticalGraphLifecycle::settle` took the metric fold,
+          which owns the executed root plan, only on success. On any other
+          terminal the plan stayed in the graph entry, and the entry is only
+          removed once the pool is idle, so the release waited on itself.
+          `Drop` already dropped the fold.
+        - Fix site: `settle` drops the unfolded fold after closing the
+          exchanges and before the release. The forks are not involved:
+          upstream caches the CollectLeft build on the plan node by design.
+        - Evidence: `mise run test:bifrost:journey:oracle` 53/53 pass.
 
 ## Step 4: focused tests
 
@@ -365,7 +767,12 @@ How Wyrd builds today (root `Cargo.toml` `[patch.crates-io]`):
   `bohmian-ai/iceberg-compaction`, `bohmian-ai/datafusion-distributed`, all
   pinned by git `rev`.
 
-Remaining, in order:
+Done since this handoff: steps 1–5 (forks published and pinned: DataFusion
+`a4ff14550`, arrow-rs `0d0eb24`, datafusion-distributed `0b81b12`) and the
+step 6 code items. Remaining: a green `mise run test:bifrost`, fmt/lints,
+the Wyrd commit, then steps 7 and 8.
+
+Original list, in order:
 1. V3 Lists (F1/F2), with the lambda-rebind risk, and their tests.
 2. V4 `unnest`, V5 pruning.
 3. V6: delete the item-3 codec hook.

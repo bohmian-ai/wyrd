@@ -435,15 +435,14 @@ impl OracleBenchTables {
         Ok(context)
     }
 
-    /// An empty Oracle session: `bench_session_config` with the Variant SQL
-    /// surface installed.
+    /// An empty Oracle session under `bench_session_config`.
     ///
     /// # Panics
     ///
     /// Panics when the fixed test composition has no Oracle capability.
     fn wyrd_session() -> datafusion::prelude::SessionContext {
         datafusion::prelude::SessionContext::new_with_state(
-            crate::oracle::variant_sql::OracleVariantSql::shared()
+            crate::oracle::session::OracleSessionTemplate::shared()
                 .session(crate::oracle::bindings::bench_session_config()),
         )
     }

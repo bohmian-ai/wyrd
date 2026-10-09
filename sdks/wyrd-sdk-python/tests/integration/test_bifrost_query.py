@@ -461,9 +461,9 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
     The exporter writes Variant attribute collections and Struct events. The
     Arrow terminal keeps the Variant extension, the typed terminal decodes
     every Variant into ``dict``, ``list``, and exact ``int`` values, Struct
-    access stays exact, and ``parse_json`` over invalid JSON is the stable
-    Variant error, before the first batch or after a delivered one, while
-    ``try_parse_json`` is null.
+    access stays exact, and ``parse_json`` over invalid JSON is the generic
+    query execution failure, before the first batch or after a delivered one,
+    while ``try_parse_json`` is null.
     """
 
     import os
@@ -549,13 +549,12 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
 
     with pytest.raises(WyrdError) as invalid:
         reader.sql(f"SELECT parse_json('{{bad') AS v {where}")
-    assert invalid.value.code == "WYRD_VALA_400_VARIANT_INVALID_JSON"
+    assert invalid.value.code == "WYRD_VALA_500_QUERY_EXECUTION_FAILED"
 
-    # A failure after a delivered batch keeps the pre-stream problem: rows from
-    # id 8192 fail only in the second 8192-row batch. DataFusion projects
-    # batches on several partitions, so that batch may fail before or after
-    # the first one is delivered. An unrelated late cast failure stays
-    # generic, and neither result is returned partially.
+    # A failure after a delivered batch refuses the whole result: rows from id
+    # 8192 fail only in the second 8192-row batch. DataFusion projects batches
+    # on several partitions, so that batch may fail before or after the first
+    # one is delivered.
     class LateRow(BaseModel):
         id: int
         value: str
@@ -581,10 +580,9 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
     )
     writer.shutdown()
     wyrd_server.flush_bifrost()
-    early = invalid.value
-    for value, expected in [
-        ("parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)", early),
-        ("CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)", None),
+    for value in [
+        "parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)",
+        "CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)",
     ]:
         sql = f"SELECT id, {value} AS v FROM {late_fqn}"
         delivered = 0
@@ -595,13 +593,5 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
         with pytest.raises(WyrdError) as collected:
             reader.sql(sql)
         for late in (streamed.value, collected.value):
-            if expected is None:
-                assert late.code == "WYRD_VALA_500_QUERY_EXECUTION_FAILED"
-                assert late.details == {"variant": "query_execution_failed"}
-            else:
-                assert (late.code, late.status, late.detail, late.details) == (
-                    expected.code,
-                    expected.status,
-                    expected.detail,
-                    expected.details,
-                )
+            assert late.code == "WYRD_VALA_500_QUERY_EXECUTION_FAILED"
+            assert late.details == {"variant": "query_execution_failed"}

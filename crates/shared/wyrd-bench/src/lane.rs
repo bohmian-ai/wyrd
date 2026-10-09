@@ -529,8 +529,7 @@ pub fn compare_bifrost_stages(
             .iter()
             .find(|report| {
                 bifrost_envelope(report)
-                    .ok()
-                    .is_some_and(|envelope| envelope["lane"] == before_envelope["lane"])
+                    .is_ok_and(|envelope| envelope["lane"] == before_envelope["lane"])
             })
             .ok_or_else(|| {
                 ScenarioError::Invalid(format!(

@@ -1969,7 +1969,7 @@ mod tests {
 
     use async_trait::async_trait;
     use prost::Message as _;
-    use tower::{Layer as _, Service as _};
+    use tower::Service as _;
 
     use super::super::analytical::{
         AnalyticalStageIngressConfig, DataFusionQueryId, PublicQueryId,
@@ -2493,6 +2493,7 @@ mod tests {
                     chrono::Duration::seconds(30),
                     BifrostPeerTls::unreachable_for_test(),
                 )),
+                objects: crate::oracle::exec::tests::warehouse_objects(&std::env::temp_dir()),
             });
             let identity = StageWireIdentity {
                 source_node_id: NodeId::new(Uuid::from_u128(1)),

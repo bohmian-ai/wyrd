@@ -11,8 +11,8 @@
 //!    production Oracle provider reading the snapshot through the published
 //!    path. Measures the speed of published data.
 //!
-//! Unshredded against shredded Variant reads are DataFusion's own behavior and
-//! are measured by DataFusion's `parquet_variant_query` benchmark.
+//! Unshredded against shredded Variant reads are `DataFusion`'s own behavior and
+//! are measured by `DataFusion`'s `parquet_variant_query` benchmark.
 //!
 //! Both sides of every pair use the Oracle session configuration
 //! (`OracleSessionShape`): same target partitions, same Parquet options. The

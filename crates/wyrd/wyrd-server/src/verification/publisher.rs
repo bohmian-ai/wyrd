@@ -55,9 +55,9 @@ pub enum PublicationError {
     Write {
         /// The table whose batch failed.
         table: String,
-        /// The client or server failure.
+        /// The client or server failure, boxed to keep the error small.
         #[source]
-        source: BifrostClientError,
+        source: Box<BifrostClientError>,
     },
 }
 
@@ -157,7 +157,7 @@ impl ResultPublisher {
                 .await
                 .map_err(|source| PublicationError::Write {
                     table: batch.table.clone(),
-                    source,
+                    source: Box::new(source),
                 })?;
         }
         Ok(())
@@ -304,7 +304,9 @@ impl PublicationFault {
         if take_if(&self.fail_on, table) {
             return Err(PublicationError::Write {
                 table: table.to_owned(),
-                source: BifrostClientError::Protocol("test-injected refusal".to_owned()),
+                source: Box::new(BifrostClientError::Protocol(
+                    "test-injected refusal".to_owned(),
+                )),
             });
         }
         Ok(())

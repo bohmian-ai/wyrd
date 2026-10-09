@@ -1485,6 +1485,7 @@ impl<'a> OracleRoleBuilder<'a> {
         let default_split = OracleClassSplit::derive(raw_slots);
         let oracle_config = OracleConfig {
             max_workers_per_query: config.oracle.max_workers_per_query,
+            file_scan_bytes_per_task: config.oracle.file_scan_bytes_per_task,
             attempt_memory_bytes: config.oracle.max_frame_bytes.min(8 * 1024 * 1024),
             interactive_slots: calibrated
                 .as_ref()

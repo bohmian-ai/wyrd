@@ -76,12 +76,14 @@ use super::dispatcher::{
     BifrostPeerTls, DispatchCandidate, GraphLeaseRequest, OraclePeerTransportDirectory,
     ParticipantGrant, PendingGraphActivation, ReservationRegistry,
 };
+use super::exec::TenantWarehouseReads;
 use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
 use super::query_stream::RunningQueryTerminalOwner;
 use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
 };
+use crate::catalog::iceberg_storage::BifrostIcebergStorage;
 use crate::resources::OracleExecution;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
@@ -424,6 +426,9 @@ pub struct AnalyticalSessionBuilder {
     /// wraps an empty worker at an address no peer advertises, so the cycle
     /// cannot form and every stage operation takes the governed peer transport.
     detached_local_worker: Arc<LocalWorkerContext>,
+    /// The node's warehouse store, which every decoded stage scan reads through
+    /// behind the graph tenant's footer proof.
+    objects: Arc<BifrostIcebergStorage>,
 }
 
 impl fmt::Debug for AnalyticalSessionBuilder {
@@ -436,7 +441,8 @@ impl fmt::Debug for AnalyticalSessionBuilder {
 }
 
 impl AnalyticalSessionBuilder {
-    /// Binds the builder to one node-local runtime registry.
+    /// Binds the builder to one node-local runtime registry, egress owner,
+    /// and warehouse store.
     ///
     /// # Panics
     ///
@@ -446,6 +452,7 @@ impl AnalyticalSessionBuilder {
     pub fn new(
         registry: Arc<AnalyticalRuntimeRegistry>,
         egress: Arc<AnalyticalStageEgress>,
+        objects: Arc<BifrostIcebergStorage>,
     ) -> Self {
         let detached_url = Url::parse("detached://oracle.invalid")
             .expect("the detached worker address is a valid URL");
@@ -455,6 +462,7 @@ impl AnalyticalSessionBuilder {
             detached_local_worker: Arc::new(
                 Worker::default().to_local_worker_context(detached_url),
             ),
+            objects,
         }
     }
 
@@ -477,14 +485,16 @@ impl AnalyticalSessionBuilder {
 
 #[async_trait]
 impl WorkerSessionBuilder for AnalyticalSessionBuilder {
-    /// Replaces the worker's process runtime with this query's own runtime.
+    /// Replaces the worker's process runtime with this query's own runtime,
+    /// and binds every scan the decoded stage holds to the graph tenant's
+    /// footer-proved warehouse reads.
     ///
     /// # Errors
     ///
     /// Returns [`DataFusionError::Execution`] when the stage operation's
-    /// headers do not resolve to a registered graph. Upstream surfaces this as
-    /// the task's terminal error, so no partition of an unresolvable graph ever
-    /// executes.
+    /// headers do not resolve to a registered graph, or this node recorded no
+    /// authorized identity for it. Upstream surfaces this as the task's
+    /// terminal error, so no partition of an unresolvable graph ever executes.
     async fn build_session_state(
         &self,
         ctx: WorkerQueryContext,
@@ -524,12 +534,29 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
             config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
             config.set_distributed_channel_resolver(resolver);
         }
+        // A decoded scan carries no reader factory; without this one it would
+        // read through `DataFusion`'s default and skip the footer tenant proof.
+        let tenant = self
+            .egress
+            .tenant(key)
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "Oracle analytical stage cannot resolve its tenant: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Oracle analytical stage was never authorized on this node".to_owned(),
+                )
+            })?;
+        config.set_distributed_worker_plan_rewrite_handler(TenantWarehouseReads::new(
+            Arc::clone(&self.objects),
+            tenant,
+        ));
         config.set_extension(Arc::clone(&self.detached_local_worker));
         builder = builder.with_config(config);
-        // The stage plan names Variant functions; the worker must resolve them
-        // from the same registry the leader planned with.
-        Ok(super::variant_sql::OracleVariantSql::shared()
-            .install(builder.with_runtime_env(Arc::clone(graph.runtime())))
+        Ok(builder
+            .with_runtime_env(Arc::clone(graph.runtime()))
             .build())
     }
 }
@@ -727,6 +754,19 @@ impl AnalyticalStageEgress {
             .recorded(graph)?
             .map(|recorded| recorded.cut.urls())
             .unwrap_or_default())
+    }
+
+    /// Returns the tenant one authorized graph's stages read as.
+    ///
+    /// Returns `None` when this node holds no recorded identity for `graph`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned.
+    fn tenant(&self, graph: AnalyticalGraphKey) -> Result<Option<DataTenantId>, BifrostError> {
+        Ok(self
+            .recorded(graph)?
+            .map(|recorded| recorded.identity.tenant_id))
     }
 
     /// Reads one graph's recorded identity, deadline, and frozen cut.
@@ -1280,6 +1320,8 @@ pub struct AnalyticalStageIngressConfig {
     pub reservations: Arc<ReservationRegistry>,
     /// Outbound capability a middle stage on this node signs its peers with.
     pub egress: Arc<AnalyticalStageEgress>,
+    /// The node's warehouse store every stage scan on this node reads through.
+    pub objects: Arc<BifrostIcebergStorage>,
 }
 
 /// Authenticated follower entry point for Analytical stage operations.
@@ -1315,6 +1357,8 @@ pub struct AnalyticalStageIngress {
     graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphEntry>>,
     /// Outbound capability this node's own middle stages sign through.
     egress: Arc<AnalyticalStageEgress>,
+    /// The node's warehouse store every graph worker's stage scans read through.
+    objects: Arc<BifrostIcebergStorage>,
     /// Bounded queue the caller-drop path hands graphs to for settlement.
     ///
     /// Cleared by shutdown, which is how the driver learns to finish. A send
@@ -1511,6 +1555,7 @@ impl AnalyticalStageIngress {
             supervisor,
             reservations,
             egress,
+            objects,
         } = config;
         // Sized from the one capacity root that already bounds graph
         // admission, so the queue can always hold every graph this node is
@@ -1546,6 +1591,7 @@ impl AnalyticalStageIngress {
                 reservations,
                 graphs: Mutex::new(HashMap::new()),
                 egress,
+                objects,
                 settlement: Mutex::new(Some(sender)),
                 driver: Mutex::new(driver),
                 accepting: AtomicBool::new(true),
@@ -1566,6 +1612,7 @@ impl AnalyticalStageIngress {
         Worker::from_session_builder(AnalyticalSessionBuilder::new(
             Arc::clone(self.supervisor.registry()),
             Arc::clone(&self.egress),
+            Arc::clone(&self.objects),
         ))
     }
 
@@ -2519,8 +2566,9 @@ impl AnalyticalGraphLifecycle {
     /// The order is the invariant, and this is the only place it exists: move
     /// the graph out of `Active` so nothing new is admitted, cancel unless the
     /// graph succeeded, join the attempt and every driver it retained, close
-    /// the graph's exchanges, drop every participant grant, wait for the
-    /// envelope's own nested children to go idle, release the graph, and only
+    /// the graph's exchanges, drop its unfolded plan and every participant
+    /// grant, wait for the envelope's own nested children to go idle, release
+    /// the graph, and only
     /// then release the admission owner. Cleanup that cannot be confirmed
     /// leaves every unresolved owner in the `Draining` entry and returns the
     /// failure, so a success terminal is unreachable and readiness stays false.
@@ -2570,6 +2618,11 @@ impl AnalyticalGraphLifecycle {
         // drops them, and it has to happen before the envelope's children are
         // waited on or the wait would be for bytes nothing will release.
         self.close_exchanges();
+        // An unfolded graph's fold still owns the executed root plan, whose
+        // nodes keep reservations past their streams (a `CollectLeft` hash
+        // join's build side), so it is dropped before the envelope is waited
+        // on. A folded graph already took it.
+        drop(self.supervisor.take_metric_fold(self.graph));
         // Closing every admit stream is the release: each follower drops its
         // grant and cancels whatever it built on it.
         drop(self.grants.take());
@@ -3365,6 +3418,36 @@ mod tests {
         ))
     }
 
+    /// Records `graph` on `egress` as authorized for the fixture tenant, as
+    /// stage ingress does before any of the graph's sessions is built.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the egress refuses the fixture claims.
+    fn record_fixture_tenant(egress: &AnalyticalStageEgress, graph: AnalyticalGraphKey) {
+        let tenant = *super::super::exec::tests::FIXTURE_TENANT;
+        let claims = super::super::peer::StageTicketClaims {
+            tenant_id: tenant.as_uuid().as_bytes().to_vec(),
+            ..Default::default()
+        };
+        egress
+            .record(
+                graph,
+                &AuthorizedStage {
+                    claims,
+                    tenant_id: tenant,
+                },
+                Arc::default(),
+            )
+            .expect("the fixture claims record");
+    }
+
+    /// The warehouse store a fixture node's stage scans read through; no
+    /// fixture here reads a file, so the root is never touched.
+    fn fixture_objects() -> Arc<BifrostIcebergStorage> {
+        super::super::exec::tests::warehouse_objects(&std::env::temp_dir())
+    }
+
     /// The pinned upstream worker retains all three seams Wyrd's handle needs.
     ///
     /// This is the feasibility gate for the whole Analytical path. It fails if
@@ -3402,9 +3485,12 @@ mod tests {
             !Arc::ptr_eq(&process_runtime, &query_runtime),
             "the fixture must distinguish the process runtime from the query runtime"
         );
+        let egress = fixture_egress();
+        record_fixture_tenant(&egress, key);
         let worker = Worker::from_session_builder(AnalyticalSessionBuilder::new(
             Arc::clone(&registry),
-            fixture_egress(),
+            egress,
+            fixture_objects(),
         ))
         .with_runtime_env(Arc::clone(&process_runtime));
 
@@ -3731,6 +3817,7 @@ mod tests {
                 supervisor: Arc::clone(&supervisor),
                 reservations: Arc::clone(&reservations),
                 egress: fixture_egress(),
+                objects: fixture_objects(),
             });
             let graph = AnalyticalGraphKey::new(
                 PublicQueryId::from_uuid(Uuid::from_u128(11)),
@@ -3884,6 +3971,7 @@ mod tests {
                     oracle_fence: self.fence,
                     ticket_ttl: chrono::Duration::seconds(30),
                     peer_tls: BifrostPeerTls::unreachable_for_test(),
+                    file_scan_bytes_per_task: None,
                 },
             )
         }
@@ -6602,6 +6690,9 @@ pub struct AnalyticalExecutionConfig {
     pub ticket_ttl: chrono::Duration,
     /// Immutable peer identity every leader-side channel is dialed through.
     pub peer_tls: BifrostPeerTls,
+    /// Parquet bytes each distributed scan task reads; `None` keeps
+    /// `datafusion-distributed`'s default.
+    pub file_scan_bytes_per_task: Option<usize>,
 }
 
 /// What one Analytical execution left behind once it drained.
@@ -6915,8 +7006,9 @@ impl AnalyticalExecutionHandle {
     /// query owns anything Analytical. It reuses the admitted query's own
     /// state — catalog, registered providers, runtime, and grant-derived
     /// config — and adds exactly what the pinned planner consults while it
-    /// transforms: the frozen worker set, the cut-derived task count, the leaf
-    /// split, and this node's codec. It deliberately installs no channel
+    /// transforms: the frozen worker set, the union and live-leaf placement
+    /// rules, and the configured scan bytes per task. Task counts, leaf
+    /// splitting, and the plan's encoding are upstream's own. It deliberately installs no channel
     /// resolver: channels are resolved from the execution `TaskContext`, which
     /// only the authoritative leader session supplies, so nothing built here
     /// can dial a peer.
@@ -6949,6 +7041,11 @@ impl AnalyticalExecutionHandle {
         config
             .set_distributed_children_isolator_unions(false)
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        if let Some(bytes) = self.config.file_scan_bytes_per_task {
+            config
+                .set_distributed_file_scan_config_bytes_per_partition(bytes)
+                .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        }
         let state = datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
             local.state(),
         )
@@ -7051,13 +7148,10 @@ impl AnalyticalExecutionHandle {
         // codec that matched, so a second entry shifts every position past the
         // one a follower builds from its own single install, and the follower
         // then refuses the plan with "Can't find required codec in codec list".
-        let state = super::variant_sql::OracleVariantSql::shared()
-            .install(
-                datafusion::execution::session_state::SessionStateBuilder::new()
-                    .with_default_features()
-                    .with_config(config)
-                    .with_runtime_env(Arc::clone(runtime.runtime())),
-            )
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config)
+            .with_runtime_env(Arc::clone(runtime.runtime()))
             .with_distributed_planner()
             .build();
         Ok(SessionContext::new_with_state(state))

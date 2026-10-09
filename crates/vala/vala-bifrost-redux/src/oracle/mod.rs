@@ -101,10 +101,9 @@ pub(super) type DegradedSourceAccumulator = Arc<std::sync::Mutex<Vec<DegradedPar
 pub fn query_lifecycle_observer_for_test() -> std::sync::Arc<query_stream::QueryLifecycleObserver> {
     query_stream::query_lifecycle_observer_for_test()
 }
-pub(crate) mod leaf_paths;
+pub(crate) mod session;
 mod tail_discovery;
 pub mod telemetry;
-pub mod variant_sql;
 
 use telemetry::{
     OracleAdmissionOutcome, OracleAdmissionReason, OracleCancellationReason, query_class_label,
@@ -924,6 +923,9 @@ pub struct OracleConfig {
     pub queue_capacity: u32,
     /// Longest queue wait for either class; the total deadline may end it sooner.
     pub max_queue_wait: Duration,
+    /// Parquet bytes each distributed Analytical scan task reads; `None`
+    /// keeps `datafusion-distributed`'s default.
+    pub file_scan_bytes_per_task: Option<usize>,
 }
 
 impl Default for OracleConfig {
@@ -941,6 +943,7 @@ impl Default for OracleConfig {
             analytical_slots: 4,
             queue_capacity: admission::DEFAULT_QUEUE_CAPACITY,
             max_queue_wait: admission::DEFAULT_MAX_QUEUE_WAIT,
+            file_scan_bytes_per_task: None,
         }
     }
 }
@@ -1317,6 +1320,10 @@ struct AnalyticalCompositionInputs {
     peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,
     /// Immutable peer identity every east-west channel is dialed through.
     peer_tls: dispatcher::BifrostPeerTls,
+    /// The node's warehouse store every stage scan on this node reads through.
+    objects: Arc<crate::catalog::iceberg_storage::BifrostIcebergStorage>,
+    /// Parquet bytes each distributed scan task reads; `None` keeps upstream's.
+    file_scan_bytes_per_task: Option<usize>,
 }
 
 /// Builds one node's Analytical execution handle from its composed owners.
@@ -1336,6 +1343,8 @@ fn compose_analytical_handle(
         reservations,
         peer_transports,
         peer_tls,
+        objects,
+        file_scan_bytes_per_task,
     } = inputs;
     let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
     let egress = Arc::new(analytical::AnalyticalStageEgress::new(
@@ -1352,6 +1361,7 @@ fn compose_analytical_handle(
             supervisor: Arc::clone(&supervisor),
             reservations,
             egress,
+            objects,
         });
     Arc::new(analytical::AnalyticalExecutionHandle::new(
         analytical::AnalyticalExecutionOwners {
@@ -1364,6 +1374,7 @@ fn compose_analytical_handle(
             oracle_fence: fence,
             ticket_ttl: ANALYTICAL_STAGE_TICKET_TTL,
             peer_tls,
+            file_scan_bytes_per_task,
         },
     ))
 }
@@ -1474,6 +1485,8 @@ impl Oracle {
                         fence: admission.local_role.fencing_token,
                         reservations: Arc::clone(&config.reservations),
                         peer_transports: config.peer_transports.as_ref().map(Arc::clone),
+                        objects: Arc::clone(config.catalog.objects()),
+                        file_scan_bytes_per_task: config.config.file_scan_bytes_per_task,
                     })
                 });
         Ok(Self {
@@ -2866,8 +2879,9 @@ impl Oracle {
         let config = shape
             .session_config()
             .with_extension(Arc::new(OracleExecutionLock::new()));
-        let planning =
-            SessionContext::new_with_state(variant_sql::OracleVariantSql::shared().session(config));
+        let planning = SessionContext::new_with_state(
+            session::OracleSessionTemplate::shared().session(config),
+        );
         let providers_started = Instant::now();
         self.register_cut_providers(&planning, context, cuts, &live.tables)
             .await?;

@@ -1,9 +1,11 @@
 //! Leader-owned streaming source over the selected Scribe live routes.
 //!
 //! Oracle discovers each referenced table's reported Scribe streams before
-//! its single physical planning pass, keeps only the routes safe event-time
-//! pruning cannot exclude, and plants one [`LiveScribeExec`] per scan at the
-//! session's target partitions, dealing its routes across them. Planning opens
+//! its single physical planning pass and plants one [`LiveScribeExec`] per
+//! scan at the session's target partitions, dealing its routes across them.
+//! When `DataFusion`'s `FilterPushdown` offers the leaf its filters, the leaf
+//! keeps only the routes a `PruningPredicate` over each route's event-time
+//! bounds cannot exclude. Planning opens
 //! nothing. At execution each partition dispatches one signed fragment per
 //! route it owns, in turn, to that route's Scribe and hands every batch to
 //! `DataFusion` as it arrives, so no live fragment is ever materialized on the
@@ -19,10 +21,20 @@ use std::time::Duration;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
+use datafusion::common::Statistics;
+use datafusion::common::pruning::PrunableStatistics;
 use datafusion::common::tree_node::{Transformed, TreeNode as _, TreeNodeRecursion};
+use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::DynamicFilterTracking;
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::utils::conjunction;
+use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
+use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::filter_pushdown::{
+    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -78,6 +90,55 @@ pub(crate) struct LiveTableRoutes {
     pub(crate) binding: TenantTableBinding,
     /// Reported routes, in discovery order.
     pub(crate) routes: Vec<LiveScribeRoute>,
+}
+
+impl LiveTableRoutes {
+    /// Returns the routes `predicate` cannot exclude, in discovery order.
+    ///
+    /// Each route is one container whose exact `wyrd_event_time` bounds are
+    /// its time partition, inclusive start to exclusive end, so `DataFusion`'s
+    /// `PruningPredicate` decides it as it decides a file. A predicate that
+    /// does not plan as a pruning predicate, or does not constrain event time,
+    /// keeps every route.
+    pub(super) fn selected_by(
+        &self,
+        predicate: &Arc<dyn PhysicalExpr>,
+        schema: &SchemaRef,
+    ) -> Self {
+        let statistics = self
+            .routes
+            .iter()
+            .map(|route| {
+                let partition =
+                    crate::catalog::layout::TimePartition::from_wire(route.time_partition);
+                let mut statistics = Statistics::new_unknown(schema);
+                super::exec::set_event_time_bounds(
+                    &mut statistics,
+                    schema,
+                    partition.start_unix_micros(),
+                    partition.end_utc().timestamp_micros().saturating_sub(1),
+                );
+                Arc::new(statistics)
+            })
+            .collect();
+        let keep = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(schema))
+            .try_build(Arc::clone(predicate))
+            .and_then(|pruning| {
+                pruning.prune(&PrunableStatistics::new(statistics, Arc::clone(schema)))
+            })
+            .unwrap_or_else(|_| vec![true; self.routes.len()]);
+        Self {
+            binding: self.binding.clone(),
+            routes: self
+                .routes
+                .iter()
+                .zip(keep)
+                .filter(|(_, keep)| *keep)
+                .map(|(route, _)| route.clone())
+                .collect(),
+        }
+    }
 }
 
 /// Post-admission capability every live partition dispatches through.
@@ -146,6 +207,13 @@ pub(super) struct LiveScribeExec {
     required_columns: Vec<String>,
     /// Advertised closure schema and the session's target partitions.
     properties: Arc<PlanProperties>,
+    /// Conjunction of the query filters `DataFusion`'s `FilterPushdown`
+    /// offered this leaf, shipped to every Scribe above its placeholder.
+    ///
+    /// The Scribe pushes it into its own staged scan, so a fragment returns
+    /// only the rows that can pass. The leader keeps its `FilterExec`, so the
+    /// result never depends on how much the Scribe narrowed.
+    predicate: Option<Arc<dyn PhysicalExpr>>,
     /// Scan evidence every validated fragment completion folds in, shared by
     /// every clone of this leaf so the query's collector reads one total.
     scan_metrics: Arc<RemoteScanMetrics>,
@@ -155,8 +223,9 @@ impl LiveScribeExec {
     /// Plans one live leaf over already-selected routes at `partitions`
     /// output partitions, the planning session's target partitions.
     ///
-    /// `routes.routes` must be non-empty; a scan with nothing selected plants no
-    /// live leaf at all.
+    /// `routes.routes` must be non-empty; a scan with nothing discovered plants
+    /// no live leaf at all. Pushed filters may later prune every route, and
+    /// each partition then ends empty.
     pub(super) fn new(
         routes: LiveTableRoutes,
         schema_fingerprint: String,
@@ -175,6 +244,7 @@ impl LiveScribeExec {
                 datafusion::physical_plan::execution_plan::EmissionType::Incremental,
                 datafusion::physical_plan::execution_plan::Boundedness::Bounded,
             )),
+            predicate: None,
             scan_metrics: Arc::default(),
         }
     }
@@ -191,13 +261,14 @@ impl LiveScribeExec {
     /// Builds the signed fragment and destination for one route.
     ///
     /// The encoded plan is the same identity-bound placeholder a Scribe
-    /// follower decodes for any hot-provider assignment; its fingerprint binds
-    /// the ticket, the request, and the footer to one another.
+    /// follower decodes for any hot-provider assignment, under a `FilterExec`
+    /// of the pushed predicate when there is one; its fingerprint binds the
+    /// ticket, the request, and the footer to one another.
     ///
     /// # Errors
     ///
-    /// Returns a `DataFusion` plan error when the placeholder cannot be
-    /// encoded.
+    /// Returns a `DataFusion` plan error when the placeholder or its filter
+    /// cannot be built or encoded.
     fn fragment(
         &self,
         route: &LiveScribeRoute,
@@ -209,13 +280,18 @@ impl LiveScribeExec {
             route.node_id,
             route.writer_epoch,
         );
+        let mut plan: Arc<dyn ExecutionPlan> =
+            Arc::new(super::codec::RemoteSourcePlaceholderExec::new(
+                scan_id.clone(),
+                &self.schema_fingerprint,
+                self.schema(),
+            ));
+        if let Some(predicate) = &self.predicate {
+            plan = Arc::new(FilterExec::try_new(Arc::clone(predicate), plan)?);
+        }
         let physical_plan_bytes =
             datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(
-                Arc::new(super::codec::RemoteSourcePlaceholderExec::new(
-                    scan_id.clone(),
-                    &self.schema_fingerprint,
-                    self.schema(),
-                )),
+                plan,
                 &super::codec::OraclePhysicalExtensionCodec::encoder(),
             )?
             .to_vec();
@@ -271,15 +347,53 @@ impl DisplayAs for LiveScribeExec {
 }
 
 impl ExecutionPlan for LiveScribeExec {
-    /// This leaf owns no physical expression.
+    /// Visits the pushed predicate, the only physical expression this leaf owns.
+    ///
+    /// # Errors
+    /// Returns the visitor's error.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        match &self.predicate {
+            Some(predicate) => f(predicate),
+            None => Ok(TreeNodeRecursion::Continue),
+        }
+    }
+
+    /// Takes the static filters `DataFusion` pushes to this leaf as the
+    /// predicate every fragment ships with.
+    ///
+    /// Every filter is reported unsupported, so the leader's `FilterExec`
+    /// stays above the leaf. Dynamic filters, which join and `TopK` operators
+    /// update while the query runs, are left to the leader: a fragment could
+    /// only carry a stale copy of one.
     ///
     /// # Errors
     /// Never returns an error; the signature is fixed by the trait.
-    fn apply_expressions(
+    fn handle_child_pushdown_result(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
-    ) -> DataFusionResult<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
+        phase: FilterPushdownPhase,
+        child_pushdown_result: ChildPushdownResult,
+        _config: &ConfigOptions,
+    ) -> DataFusionResult<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        let filters = child_pushdown_result
+            .parent_filters
+            .iter()
+            .map(|filter| &filter.filter)
+            .filter(|filter| !DynamicFilterTracking::classify(filter).contains_dynamic_filter())
+            .cloned()
+            .chain(self.predicate.iter().cloned())
+            .collect::<Vec<_>>();
+        let propagation = FilterPushdownPropagation::all_unsupported(child_pushdown_result);
+        if phase != FilterPushdownPhase::Pre || filters.is_empty() {
+            return Ok(propagation);
+        }
+        let predicate = conjunction(filters);
+        let mut leaf = self.clone();
+        leaf.routes = Arc::new(self.routes.selected_by(&predicate, &self.schema()));
+        leaf.predicate = Some(predicate);
+        Ok(propagation.with_updated_node(Arc::new(leaf)))
     }
 
     /// Returns the stable diagnostic operator name.
@@ -792,6 +906,117 @@ mod tests {
 
     use super::*;
     use crate::oracle::dispatcher::{NativeCompletion, NativeOutputTally};
+
+    /// A query filter pushed to the live leaf ships on every fragment above
+    /// the placeholder, while the leader keeps its own `FilterExec`.
+    ///
+    /// # Panics
+    /// Panics when pushdown drops the leader's filter, leaves the leaf without
+    /// the predicate, or the fragment's encoded root is not a filter.
+    #[test]
+    fn pushed_filter_ships_on_the_fragment_and_stays_on_the_leader() {
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+        use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
+        use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
+        use prost::Message as _;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let leaf = Arc::new(LiveScribeExec::new(
+            crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7()),
+            "f".repeat(64),
+            vec!["v".to_owned()],
+            Arc::clone(&schema),
+            1,
+        ));
+        let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("v", 0)),
+            datafusion::logical_expr::Operator::Gt,
+            Arc::new(Literal::new(3_i64.into())),
+        ));
+        let plan = FilterPushdown::new()
+            .optimize(
+                Arc::new(FilterExec::try_new(predicate, leaf).expect("filter plans")),
+                &ConfigOptions::default(),
+            )
+            .expect("pushdown runs");
+
+        let filter = plan
+            .downcast_ref::<FilterExec>()
+            .expect("the leader keeps its filter");
+        let live = filter
+            .input()
+            .downcast_ref::<LiveScribeExec>()
+            .expect("the live leaf stays under the filter");
+        assert!(live.predicate.is_some(), "the leaf took the pushed filter");
+        let (fragment, _) = live
+            .fragment(&live.routes.routes[0], 0)
+            .expect("the fragment encodes");
+        let root = PhysicalPlanNode::decode(fragment.physical_plan_bytes.as_slice())
+            .expect("the fragment plan decodes");
+        assert!(
+            matches!(root.physical_plan_type, Some(PhysicalPlanType::Filter(_))),
+            "the fragment ships the filter above its placeholder"
+        );
+    }
+
+    /// An event-time predicate keeps only the routes whose hour it can match,
+    /// and a predicate on any other column keeps every route.
+    ///
+    /// # Panics
+    /// Panics when a fixture partition cannot be built or the selection keeps
+    /// the wrong routes.
+    #[test]
+    fn event_time_predicate_selects_only_overlapping_routes() {
+        use arrow::datatypes::TimeUnit;
+        use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
+        use datafusion::scalar::ScalarValue;
+        use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
+
+        const HOUR_MICROS: i64 = 3_600_000_000;
+        let first_hour = 1_787_493_600_000_000_i64;
+        let mut routes =
+            crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7());
+        let mut later = routes.routes[0].clone();
+        later.time_partition = TimePartitionWire::new(
+            wyrd_spec::vala::api::TimeGranularityWire::Hour,
+            DateTime::from_timestamp_micros(first_hour + HOUR_MICROS).expect("instant"),
+        )
+        .expect("hour boundary");
+        routes.routes.push(later.clone());
+        let zone: Option<Arc<str>> = Some("UTC".into());
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new(
+                WYRD_EVENT_TIME,
+                DataType::Timestamp(TimeUnit::Microsecond, zone.clone()),
+                false,
+            ),
+        ]));
+        let at_least = |column: &str, index: usize, value: ScalarValue| -> Arc<dyn PhysicalExpr> {
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new(column, index)),
+                datafusion::logical_expr::Operator::GtEq,
+                Arc::new(Literal::new(value)),
+            ))
+        };
+
+        let in_later_hour = at_least(
+            WYRD_EVENT_TIME,
+            1,
+            ScalarValue::TimestampMicrosecond(Some(first_hour + HOUR_MICROS), zone),
+        );
+        assert_eq!(
+            routes.selected_by(&in_later_hour, &schema).routes,
+            vec![later]
+        );
+
+        let unrelated = at_least("v", 0, ScalarValue::Int64(Some(3)));
+        assert_eq!(
+            routes.selected_by(&unrelated, &schema).routes,
+            routes.routes
+        );
+    }
 
     /// Encodes `rows` through the Scribe's own attempt encoder.
     fn frames(fingerprint: &str, rows: &[i64]) -> Vec<WorkerAttemptFrame> {

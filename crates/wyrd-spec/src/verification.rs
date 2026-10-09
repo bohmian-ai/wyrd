@@ -617,9 +617,10 @@ pub enum VerificationExecutionDetail {
     Eval(EvalReport),
     /// The one check result of a task Verifier.
     Task {
-        /// The assertion or judge result of the one check.
+        /// The assertion or judge result of the one check, boxed because it
+        /// is far larger than the other variants.
         #[cfg_attr(feature = "server", schema(value_type = Object))]
-        result: AssertionResult,
+        result: Box<AssertionResult>,
     },
 }
 

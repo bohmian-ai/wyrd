@@ -264,7 +264,7 @@ impl DirectExecutor {
             }
         };
         checked
-            .map(VerifierReport::Task)
+            .map(|result| VerifierReport::Task(Box::new(result)))
             .map_err(|error| match error {
                 EvalExecError::JudgeUnavailable { .. }
                 | EvalExecError::JudgeRetriesExhausted { .. }

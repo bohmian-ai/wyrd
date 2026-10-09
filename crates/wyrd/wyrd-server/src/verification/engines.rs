@@ -37,7 +37,8 @@ pub enum VerifierReport {
         verdict: VerificationVerdict,
     },
     /// A task Verifier's one check, judged directly; it passes or fails.
-    Task(AssertionResult),
+    /// Boxed because the result dwarfs every other report.
+    Task(Box<AssertionResult>),
 }
 
 impl VerifierReport {

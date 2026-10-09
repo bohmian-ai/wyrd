@@ -1579,13 +1579,6 @@ impl<'a> OracleRoleBuilder<'a> {
             node_id,
             tail_tls.clone(),
         ));
-        let reconciliation_limit_bytes = resource_plan
-            .managed_memory_bytes
-            .checked_div(4)
-            .filter(|limit| *limit > 0)
-            .ok_or_else(|| {
-                ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
-            })?;
         let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
             tail_tls,
             local_scribe.as_ref().map(|scribe| scribe.tail_service()),
@@ -1625,10 +1618,7 @@ impl<'a> OracleRoleBuilder<'a> {
             vala: postgres.vala().clone(),
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
-            memory: OracleMemoryResources {
-                resources,
-                reconciliation_limit_bytes,
-            },
+            memory: OracleMemoryResources { resources },
             audit: audit.clone(),
             reservations,
             stage_authority: Some(stage_authority),

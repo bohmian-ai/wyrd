@@ -235,8 +235,6 @@ pub struct QueryOptions {
 pub struct OracleMemoryResources {
     /// Narrow Oracle capability issued by the one production composition.
     pub resources: crate::resources::OracleResources,
-    /// Maximum bytes reserved by one query for reconciliation state.
-    pub reconciliation_limit_bytes: usize,
 }
 
 /// Point-in-time readiness inputs used by role-separated lifecycle journeys.

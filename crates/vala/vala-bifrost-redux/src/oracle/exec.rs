@@ -1101,41 +1101,12 @@ pub(super) fn hot_parquet_scan(
     Ok(DataSourceExec::from_data_source(config))
 }
 
-/// The exact files a follower may read from a pinned snapshot.
-///
-/// `files` holds the storage-qualified locations the leader signed.
-/// `aliases` maps every other spelling a manifest may record for one of them —
-/// the canonical tenant-relative key and the table-relative suffix — onto that
-/// location, so a file recorded in either spelling resolves to the file the
-/// leader signed.
-pub(crate) struct PublishedAssignment {
-    /// Storage-qualified locations the leader signed.
-    pub(crate) files: std::collections::BTreeSet<String>,
-    /// Alternate manifest spellings, keyed by spelling, valued by location.
-    pub(crate) aliases: std::collections::BTreeMap<String, String>,
-}
-
-impl PublishedAssignment {
-    /// Resolves one planned manifest path to the storage-qualified location an
-    /// assignment would name it by.
-    fn location(&self, planned: &str) -> String {
-        self.aliases
-            .get(planned)
-            .cloned()
-            .unwrap_or_else(|| planned.to_owned())
-    }
-}
-
 /// Lists the data files Iceberg plans for the pinned snapshot `scan` names,
 /// as sources [`hot_parquet_scan`] reads exactly like hot files.
 ///
-/// Iceberg only lists the files. The leader passes no `assigned` and plans
-/// with the scan's pushed predicate, so manifest statistics drop files. A
-/// follower passes the files its leader signed and plans the snapshot
-/// unfiltered: every assigned file must be in that plan, or the snapshot has
-/// drifted and the read is refused rather than silently returning fewer rows.
-/// Only assigned files are read. A leader's scan of a table with no snapshot
-/// returns no file without building an Iceberg scan.
+/// Iceberg only lists the files, planned with the scan's pushed predicate so
+/// manifest statistics drop files. A scan of a table with no snapshot returns
+/// no file without building an Iceberg scan.
 ///
 /// Wyrd writes no delete file and no encrypted file. A planned file with
 /// either is refused: the reader would ignore its deletes, and an encrypted
@@ -1145,16 +1116,11 @@ impl PublishedAssignment {
 ///
 /// Returns the mapped Iceberg error when file planning fails (a vanished
 /// manifest is marked stale), [`BifrostError::QueryTenantInvariant`] for a
-/// file with key metadata, a not-implemented error for a file with deletes,
-/// and a plan error when an assigned file is not in the snapshot.
-pub(super) async fn published_files(
-    scan: &IcebergTableScan,
-    assigned: Option<&PublishedAssignment>,
-) -> DataFusionResult<Vec<HotFileSource>> {
-    // A leader's scan of a table with no snapshot plans no file; skip
-    // building Iceberg's scan, which probes the host's parallelism each time.
-    if assigned.is_none()
-        && scan.snapshot_id().is_none()
+/// file with key metadata, and a not-implemented error for a file with deletes.
+pub(super) async fn published_files(scan: &IcebergTableScan) -> DataFusionResult<Vec<HotFileSource>> {
+    // A scan of a table with no snapshot plans no file; skip building
+    // Iceberg's scan, which probes the host's parallelism each time.
+    if scan.snapshot_id().is_none()
         && scan.table().metadata().current_snapshot().is_none()
     {
         return Ok(Vec::new());
@@ -1163,10 +1129,10 @@ pub(super) async fn published_files(
     if let Some(snapshot_id) = scan.snapshot_id() {
         builder = builder.snapshot_id(snapshot_id);
     }
-    if let (None, Some(predicate)) = (assigned, scan.predicates()) {
+    if let Some(predicate) = scan.predicates() {
         builder = builder.with_filter(predicate.clone());
     }
-    let mut tasks = builder
+    let tasks = builder
         .build()
         .map_err(iceberg_datafusion_error)?
         .plan_files()
@@ -1175,37 +1141,6 @@ pub(super) async fn published_files(
         .try_collect::<Vec<FileScanTask>>()
         .await
         .map_err(iceberg_datafusion_error)?;
-    if let Some(assigned) = assigned {
-        let planned = tasks
-            .iter()
-            .map(|task| assigned.location(&task.data_file_path))
-            .collect::<std::collections::BTreeSet<_>>();
-        if !assigned.files.is_subset(&planned) {
-            // Counts only: which objects a tenant owns must not reach a log
-            // line. They separate "the snapshot lost files the leader signed"
-            // from "the two sides spelled the same files differently".
-            metrics::counter!(
-                "bifrost_oracle_security_events_total",
-                "event_class" => "assignment_drift"
-            )
-            .increment(1);
-            tracing::warn!(
-                assigned = assigned.files.len(),
-                planned = planned.len(),
-                unresolved = assigned.files.difference(&planned).count(),
-                aliased = assigned.aliases.len(),
-                "Oracle follower assignment differs from the pinned snapshot's planned files"
-            );
-            return Err(DataFusionError::Plan(
-                "authenticated Oracle assignment differs from planned files".to_owned(),
-            ));
-        }
-        tasks.retain(|task| {
-            assigned
-                .files
-                .contains(&assigned.location(&task.data_file_path))
-        });
-    }
     if tasks.iter().any(|task| task.key_metadata.is_some()) {
         return Err(QueryCatalogError::external(
             BifrostError::QueryTenantInvariant,
@@ -1500,7 +1435,7 @@ impl OracleTableProvider {
             .ok_or_else(|| {
                 DataFusionError::Plan("Oracle requires the pinned IcebergTableScan".to_owned())
             })?;
-        let mut files = published_files(published, None).await?;
+        let mut files = published_files(published).await?;
         // Only the files Iceberg kept: a hot file's event-time bounds are
         // first checked by the scan's file pruner, and fetching its footer
         // here would read a file that pruner then excludes.

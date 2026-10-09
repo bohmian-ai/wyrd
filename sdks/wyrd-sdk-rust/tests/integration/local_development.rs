@@ -1,7 +1,7 @@
 //! A developer runs Wyrd locally with only the administrator key `wyrd
 //! setup` printed: they register and hydrate an assistant, invoke a model
-//! through the Gateway, observe and verify a Run, export its spans with the
-//! stock OpenTelemetry exporter, and query the evidence back. No key is
+//! through the Gateway, observe and verify a Run, export its spans through
+//! `start_telemetry`, and query the evidence back. No key is
 //! issued and nothing is flushed on the server's behalf.
 //!
 //! [`work`] is that whole workflow for one client, so the signed-in story
@@ -10,9 +10,6 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
-use opentelemetry::KeyValue;
-use opentelemetry::trace::{Tracer as _, TracerProvider as _};
-use opentelemetry_sdk::trace::SdkTracerProvider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -25,7 +22,9 @@ use wyrd_sdk::gateway::{
     ProviderCredentialWrite, ProviderCredentialWriteSource, ProviderDeployment,
     ProviderDeploymentName, ProviderId,
 };
+use wyrd_sdk::observe::Run;
 use wyrd_sdk::operator_connections::SecretBearer;
+use wyrd_sdk::otel::{Telemetry, start_telemetry};
 use wyrd_sdk::state::WyrdState;
 use wyrd_sdk::{Bifrost, Gateway, VerifierKind, WyrdClient};
 use wyrd_testing::server::{WyrdTestServer, WyrdTestServerBuilder};
@@ -102,10 +101,10 @@ impl Local {
 
 /// What [`work`] leaves running for a caller to keep using.
 pub struct Worked {
-    /// The tracer provider over the stock exporter, still open.
-    pub provider: SdkTracerProvider,
-    /// The registered Agent the Run verified, as `wyrd.card_ref` text.
-    pub agent: String,
+    /// The state the workflow ran, already shut down.
+    pub state: WyrdState,
+    /// The telemetry pipeline the workflow installed.
+    pub telemetry: Telemetry,
     /// The Agent's registry UID.
     pub agent_uid: String,
 }
@@ -149,16 +148,11 @@ pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
         .as_ref()
         .expect("hydrated Card carries its UID")
         .to_string();
-    let agent = wyrd_sdk::cards::CardRef {
-        uid: None,
-        ..agent_ref.clone()
-    }
-    .to_string();
     let run_id = run.run_id().to_string();
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(wyrd_sdk::otel::span_exporter(client).expect("the exporter builds"))
-        .build();
-    export(&provider, &agent, &run_id);
+    let telemetry = start_telemetry(&state).expect("telemetry installs");
+    start_telemetry(&state).expect("a second start is idempotent");
+    export(&run.for_card("agent").expect("agent view")).await;
+    telemetry.shutdown().expect("spans export");
     state.shutdown().await.expect("emits drain");
 
     let bifrost = Bifrost::connect(client).await.expect("Bifrost connects");
@@ -184,27 +178,17 @@ pub async fn work(deployment: &Deployment, client: &WyrdClient) -> Worked {
         assert_eq!(rows[0].card_uid.as_ref(), Some(uid), "{table}");
     }
     Worked {
-        provider,
-        agent,
+        state,
+        telemetry,
         agent_uid,
     }
 }
 
-/// Export one `answer` span attributed to `agent` and `run_id` and flush it.
-///
-/// # Panics
-/// Panics when the export fails.
-pub fn export(provider: &SdkTracerProvider, agent: &str, run_id: &str) {
-    provider
-        .tracer("wyrd.tests.local")
-        .in_span("answer", |context| {
-            use opentelemetry::trace::TraceContextExt as _;
-            context.span().set_attributes([
-                KeyValue::new("wyrd.card_ref", agent.to_owned()),
-                KeyValue::new("wyrd.run_id", run_id.to_owned()),
-            ]);
-        });
-    provider.force_flush().expect("spans export");
+/// Start and end one `answer` span inside `run`'s scope, which attributes it
+/// to that Run and Card.
+pub async fn export(run: &Run) {
+    run.scope(async { tracing::info_span!("answer").in_scope(|| ()) })
+        .await;
 }
 
 /// Write the `openai-key` credential and deploy `gpt-4o` on it as `client`.
@@ -284,7 +268,10 @@ pub async fn invoke(deployment: &Deployment, client: &WyrdClient) -> String {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn admin_key_completes_the_local_workflow() {
-    let local = Box::pin(Local::start(WyrdTestServer::builder())).await;
+    let local = Box::pin(Local::start(
+        WyrdTestServer::builder().without_process_telemetry_for_test(),
+    ))
+    .await;
     let key = local
         .deployment
         .server()
@@ -295,8 +282,44 @@ async fn admin_key_completes_the_local_workflow() {
         .deployment
         .client(secrecy::ExposeSecret::expose_secret(&key));
 
-    let worked = work(&local.deployment, &client).await;
+    work(&local.deployment, &client).await;
 
-    worked.provider.shutdown().expect("the provider stops");
+    local.deployment.shutdown().await;
+}
+
+/// `start_telemetry` refuses a process whose application already installed a
+/// global subscriber, and leaves that subscriber in place.
+///
+/// # Panics
+/// Panics when the bundle does not load or the refusal is not the catalog one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the repository-managed Postgres journey lifecycle"]
+async fn start_telemetry_refuses_the_applications_own_subscriber() {
+    let local = Box::pin(Local::start(
+        WyrdTestServer::builder().without_process_telemetry_for_test(),
+    ))
+    .await;
+    let key = local
+        .deployment
+        .server()
+        .tenant_admin_key()
+        .await
+        .expect("the setup administrator key");
+    let client = local
+        .deployment
+        .client(secrecy::ExposeSecret::expose_secret(&key));
+    let cards = Cards::with_client(client.clone());
+    register(&cards, "cards/latency_baseline/latency-baseline.yaml").await;
+    register(&cards, "cards/verify_in_real_time/latency-model.yaml").await;
+    let assistant = register(&cards, "cards/verify_in_real_time/assistant.yaml").await;
+    let bundle = hydrate(&cards, &assistant.root).await;
+    let state = WyrdState::from_path_with_client(bundle.path().join("bundle"), client)
+        .expect("the bundle loads");
+    tracing::subscriber::set_global_default(tracing::subscriber::NoSubscriber::default())
+        .expect("the application installs its own subscriber");
+
+    let refusal = start_telemetry(&state).expect_err("the application's subscriber stays");
+
+    assert_eq!(refusal.code(), "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS");
     local.deployment.shutdown().await;
 }

@@ -43,6 +43,23 @@ pub use lifecycle::{DRIFT_OBSERVATIONS_TABLE, EVAL_OBSERVATIONS_TABLE};
 /// queue slot on a table Gate would reject.
 const DATASETS_PREFIX: &str = "vala.datasets.";
 
+tokio::task_local! {
+    /// The `(card_ref, run_id)` text of the innermost [`Run::scope`] the
+    /// current task runs in, which a telemetry span processor stamps on spans.
+    static RUN_SCOPE: (String, String);
+}
+
+/// The `(card_ref, run_id)` text of the innermost [`Run::scope`] the current
+/// task runs in, or `None` outside every scope.
+///
+/// A telemetry span processor reads this when a span starts so the span
+/// carries the record-level `wyrd.card_ref` and `wyrd.run_id` attributes
+/// Bifrost extracts.
+#[must_use]
+pub fn current_run_scope() -> Option<(String, String)> {
+    RUN_SCOPE.try_with(Clone::clone).ok()
+}
+
 /// One application invocation, optionally scoped to a registered Card.
 ///
 /// Cloning a run is cloning its view: the `run_id` and the state-owned Bifrost
@@ -65,6 +82,20 @@ pub struct Run {
 }
 
 impl Run {
+    /// Run `future` inside this view's scope, so spans its task starts carry
+    /// this run and Card once `wyrd_sdk::otel::start_telemetry` installed
+    /// telemetry.
+    ///
+    /// The scope is a Tokio task-local: it follows `future` across awaits but
+    /// not into tasks it spawns, and an inner scope shadows an outer one until
+    /// it completes. No IO happens here.
+    pub fn scope<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        RUN_SCOPE.scope(
+            (self.subject.to_string(), self.run_id.as_str().to_owned()),
+            future,
+        )
+    }
+
     /// Open a run over `state` whose first view observes `subject`, opened
     /// as `alias`.
     ///

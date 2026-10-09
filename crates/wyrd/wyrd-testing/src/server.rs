@@ -4493,6 +4493,19 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Leave the process-global `tracing` subscriber unowned, so a journey
+    /// can install the application's own telemetry pipeline, such as
+    /// `wyrd_sdk::otel::start_telemetry`, after the server starts.
+    ///
+    /// The server keeps a telemetry guard that installs nothing, so a failing
+    /// test prints no captured spans or metrics.
+    #[must_use]
+    pub fn without_process_telemetry_for_test(self) -> Self {
+        self.with_telemetry(Arc::new(wyrd_telemetry::init_test_only_no_global(
+            wyrd_telemetry::TelemetryConfig::default(),
+        )))
+    }
+
     /// Attach the process-installed production telemetry pipeline.
     #[must_use]
     pub(crate) fn with_telemetry(mut self, telemetry: Arc<TelemetryGuard>) -> Self {

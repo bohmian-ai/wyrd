@@ -195,7 +195,7 @@ pub async fn export(run: &Run) {
 ///
 /// # Panics
 /// Panics when the credential or deployment is refused.
-async fn configure_gateway(client: &WyrdClient) {
+pub async fn configure_gateway(client: &WyrdClient) {
     cli::put_provider_credential(
         &ProviderCredentialWrite {
             name: ProviderCredentialName::new("openai-key").expect("credential name"),

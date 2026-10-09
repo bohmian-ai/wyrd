@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: conflicting-desk
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  tables:
+    - name: tickets
+      schema:
+        type: object
+        properties:
+          ticket_id: {type: string}
+          priority: {type: integer}
+        required: [ticket_id, priority]
+  components:
+    - alias: agent
+      ref:
+        kind: Agent
+        name: support-agent
+        version: 1.0.0
+        space: default

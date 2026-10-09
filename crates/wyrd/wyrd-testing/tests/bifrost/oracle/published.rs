@@ -910,25 +910,25 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     Ok(())
 }
 
-/// Proves a failure in a later batch refuses the whole result.
+/// Proves a failure in a later batch refuses the whole result after the rows
+/// before it were delivered.
 ///
-/// One object streams 8192-row batches through the Interactive leader, so rows
-/// from id 8192 fail only in the second batch. Two objects read through a
-/// bounded sort run as an Analytical graph whose coordinator merges ten sorted
-/// batches before projecting them, so rows from id 36864 fail only in the last
-/// batch. Each late Variant failure must carry `invalid_json`, a late cast
-/// failure the generic execution failure, and every collected result is
-/// refused rather than returned partially.
-///
-/// The failure is accepted on either surface: `DataFusion` projects batches on
-/// several partitions, so the failing batch may overtake a clean one. When a
-/// terminal frame is present it must report the expected path after one
-/// delivered batch.
+/// Each failing expression is evaluated as a one-row window ordered by `id`,
+/// so it runs on the single sorted stream the window reads: a plain projection
+/// over more than one batch of rows is round-robined across partitions by
+/// `DataFusion`, and its failing batch can then overtake the clean one. One
+/// object read through the Interactive leader fails from id 8192, so exactly
+/// one 8192-row batch is delivered first. Two objects of duplicated ids read
+/// through a bounded sort run as an Analytical graph and fail from id 36864,
+/// after 73728 rows. Each late Variant failure must carry `invalid_json`, a
+/// late cast failure the generic execution failure, every terminal must report
+/// its path and exact delivered rows, and no result is returned partially.
 ///
 /// # Errors
 ///
-/// Returns the first case that settled, ran on the wrong path, reported an
-/// empty terminal, or carried a different problem.
+/// Returns the first case that settled, failed before its stream opened, ran
+/// on the wrong path, delivered other than its clean rows, or carried a
+/// different problem.
 async fn prove_late_failures(
     cluster: &PeerCluster,
     client: &WyrdClient,
@@ -951,32 +951,42 @@ async fn prove_late_failures(
     let generic = wyrd_spec::error::WyrdError::from(BifrostError::QueryExecutionFailed).problem();
     let sorted =
         format!("(SELECT id FROM vala.bifrost.{analytical} ORDER BY id LIMIT 81920) AS sorted");
-    for (case, path, sql, expected) in [
+    let late = |value: &str, source: &str| {
+        format!(
+            "SELECT id, FIRST_VALUE({value}) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW \
+             AND CURRENT ROW) AS v FROM {source}"
+        )
+    };
+    let interactive = format!("vala.bifrost.{interactive}");
+    for (case, path, sql, delivered, expected) in [
         (
             "Interactive late invalid JSON",
             QueryClass::Interactive,
-            format!(
-                "SELECT id, parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{{bad' END) AS v \
-                 FROM vala.bifrost.{interactive}"
+            late(
+                "parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)",
+                &interactive,
             ),
+            8192,
             invalid_json,
         ),
         (
             "Analytical late invalid JSON",
             QueryClass::Analytical,
-            format!(
-                "SELECT id, parse_json(CASE WHEN id < 36864 THEN '1' ELSE '{{bad' END) AS v \
-                 FROM {sorted}"
+            late(
+                "parse_json(CASE WHEN id < 36864 THEN '1' ELSE '{bad' END)",
+                &sorted,
             ),
+            73728,
             invalid_json,
         ),
         (
             "Interactive late cast failure",
             QueryClass::Interactive,
-            format!(
-                "SELECT id, CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT) AS v \
-                 FROM vala.bifrost.{interactive}"
+            late(
+                "CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)",
+                &interactive,
             ),
+            8192,
             &generic,
         ),
     ] {
@@ -986,11 +996,16 @@ async fn prove_late_failures(
                 return Err(format!("{case} returned {} rows", result.num_rows()).into());
             }
         };
-        if let Some(terminal) = error.terminal() {
-            expect_path(case, terminal.query_class, path)?;
-            if terminal.row_count == 0 {
-                return Err(format!("{case} reported an empty terminal").into());
-            }
+        let terminal = error
+            .terminal()
+            .ok_or_else(|| format!("{case} failed before the stream opened: {error}"))?;
+        expect_path(case, terminal.query_class, path)?;
+        if terminal.row_count != delivered {
+            return Err(format!(
+                "{case} delivered {} rows before failing, not {delivered}",
+                terminal.row_count
+            )
+            .into());
         }
         let problem = wyrd_spec::error::WyrdError::from(&error).problem();
         if &problem != expected {

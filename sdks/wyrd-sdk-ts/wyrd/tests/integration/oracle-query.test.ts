@@ -546,10 +546,12 @@ describe("Variant query journey", () => {
       };
       expect(early).toMatchObject(failed);
 
-      // A failure after a delivered batch refuses the whole result: rows from
-      // id 8192 fail only in the second 8192-row batch. DataFusion projects
-      // batches on several partitions, so that batch may fail before or after
-      // the first one is delivered.
+      // A failure after a delivered batch refuses the whole result: each value
+      // is evaluated as a one-row window ordered by id, so the rows stream
+      // through one sorted partition in 8192-row batches and rows from id 8192
+      // fail only after the first batch was delivered. A plain projection
+      // would be round-robined across partitions, letting the failing batch
+      // overtake the clean one.
       const lateFqn = `vala.datasets.variant_late_${Date.now().toString(36)}`;
       const writer = await Bifrost.connect({
         table: TableConfig.fromJsonSchema(lateFqn, {
@@ -583,7 +585,9 @@ describe("Variant query journey", () => {
         "parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)",
         "CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)",
       ]) {
-        const sql = `SELECT id, ${value} AS v FROM ${lateFqn}`;
+        const sql =
+          `SELECT id, FIRST_VALUE(${value}) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW ` +
+          `AND CURRENT ROW) AS v FROM ${lateFqn}`;
         let delivered = 0;
         const streamed = await (async () => {
           for await (const batch of await reader.stream({ sql })) {
@@ -593,9 +597,7 @@ describe("Variant query journey", () => {
           () => undefined,
           (error: unknown) => error,
         );
-        expect([0, 8192], "at most the one valid batch preceded the failure").toContain(
-          delivered,
-        );
+        expect(delivered, "one valid batch preceded the failure").toBe(8192);
         expect(streamed).toBeInstanceOf(WyrdError);
         expect(streamed).toMatchObject(failed);
         await expect(reader.sql(sql)).rejects.toMatchObject(failed);

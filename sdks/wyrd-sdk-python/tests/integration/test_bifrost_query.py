@@ -551,10 +551,12 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
         reader.sql(f"SELECT parse_json('{{bad') AS v {where}")
     assert invalid.value.code == "WYRD_VALA_500_QUERY_EXECUTION_FAILED"
 
-    # A failure after a delivered batch refuses the whole result: rows from id
-    # 8192 fail only in the second 8192-row batch. DataFusion projects batches
-    # on several partitions, so that batch may fail before or after the first
-    # one is delivered.
+    # A failure after a delivered batch refuses the whole result: each value is
+    # evaluated as a one-row window ordered by id, so the rows stream through
+    # one sorted partition in 8192-row batches and rows from id 8192 fail only
+    # after the first batch was delivered. A plain projection would be
+    # round-robined across partitions, letting the failing batch overtake the
+    # clean one.
     class LateRow(BaseModel):
         id: int
         value: str
@@ -584,12 +586,15 @@ def test_builtin_variant_and_struct_payloads_are_queryable(
         "parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)",
         "CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)",
     ]:
-        sql = f"SELECT id, {value} AS v FROM {late_fqn}"
+        sql = (
+            f"SELECT id, FIRST_VALUE({value}) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW "
+            f"AND CURRENT ROW) AS v FROM {late_fqn}"
+        )
         delivered = 0
         with pytest.raises(WyrdError) as streamed:
             for batch in reader.stream(sql):
                 delivered += batch.num_rows
-        assert delivered in (0, 8192), "at most the one valid batch preceded the failure"
+        assert delivered == 8192, "one valid batch preceded the failure"
         with pytest.raises(WyrdError) as collected:
             reader.sql(sql)
         for late in (streamed.value, collected.value):

@@ -2730,8 +2730,8 @@ mod pg_tests {
     /// and typed `sql_as`. The raw result keeps the Variant extension, the
     /// typed result decodes every Variant into native JSON, Struct access
     /// stays exact, invalid JSON in `parse_json` is a query execution failure,
-    /// and `try_parse_json` is null. A failure after a delivered batch refuses
-    /// the whole result.
+    /// and `try_parse_json` is null. A failure after one delivered batch
+    /// arrives on the terminal and refuses the whole result.
     ///
     /// # Panics
     ///
@@ -2830,10 +2830,12 @@ mod pg_tests {
             .expect_err("invalid JSON in parse_json is a query error");
         assert_eq!(sdk_code(&invalid), "WYRD_VALA_500_QUERY_EXECUTION_FAILED");
 
-        // A failure after a delivered batch refuses the whole result: rows
-        // from id 8192 fail only in the second 8192-row batch. DataFusion
-        // projects batches on several partitions, so that batch may fail
-        // before or after the first one is delivered.
+        // A failure after a delivered batch refuses the whole result: each
+        // value is evaluated as a one-row window ordered by id, so the rows
+        // stream through one sorted partition in 8192-row batches and rows
+        // from id 8192 fail only after the first batch was delivered. A plain
+        // projection would be round-robined across partitions, letting the
+        // failing batch overtake the clean one.
         let late_fqn = owned_fqn("variant_late");
         let late_table = Bifrost::connect_with_table(&client, table(&late_fqn))
             .await
@@ -2858,23 +2860,24 @@ mod pg_tests {
         srv.flush_bifrost()
             .await
             .expect("publish the late-failure rows");
-        let late = bifrost
-            .sql(&format!(
-                "SELECT id, CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT) AS v \
-                 FROM {late_fqn}"
-            ))
-            .await
-            .expect_err("a late failure refuses the whole result");
-        if let Some(terminal) = late.terminal() {
+        let early = wyrd_spec::error::WyrdError::from(&invalid).problem();
+        for value in [
+            "parse_json(CASE WHEN id < 8192 THEN '1' ELSE '{bad' END)",
+            "CAST(CASE WHEN id < 8192 THEN '1' ELSE 'x' END AS BIGINT)",
+        ] {
+            let late = bifrost
+                .sql(&format!(
+                    "SELECT id, FIRST_VALUE({value}) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW \
+                     AND CURRENT ROW) AS v FROM {late_fqn}"
+                ))
+                .await
+                .expect_err("a late failure refuses the whole result");
+            let terminal = late
+                .terminal()
+                .expect("the failure arrives on the terminal");
             assert_eq!(terminal.row_count, 8192, "one valid batch preceded it");
+            assert_eq!(wyrd_spec::error::WyrdError::from(&late).problem(), early);
         }
-        assert_eq!(
-            wyrd_spec::error::WyrdError::from(&late).problem(),
-            wyrd_spec::error::WyrdError::from(
-                wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
-            )
-            .problem()
-        );
 
         srv.shutdown().await.expect("server shutdown");
     }

@@ -219,3 +219,38 @@ lanes for touched projections. Run focused loader, authorization, route, MCP,
 and real-time SDK journeys through `mise`; record exact selectors for every
 named test. Full unrelated Bifrost and gateway suites and broad aggregate
 gates run once at change review.
+
+## Implementation evidence
+
+Commits: `b7dfc99b4`, `c5f5b92fc`, `284e4bc92`, `b28a69236`, `d075016ed`,
+`7d3c83e32`, `d9f9f57af`, `1c0cd630a`, `cb135b313`, `a3e204818`.
+
+The task kind is a standalone Verifier implementation. It is not an Eval. It
+runs one check through the existing per-check executors,
+`AssertionTaskExecutor::assert` and `JudgeTaskExecutor::judge`, and through the
+existing Skald judge invoker (`EvalEngine::judge_invoker`). It has its own
+pieces: `VerifierReport::Task`, `VerificationExecutionDetail::Task`, the
+`task_context` input, and `VerifierKind::{TaskAssertion, TaskLlmJudge}`.
+`Judgment.counts` is absent for a task. The queued runner refuses a task with
+`implementation_unavailable`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-001-2 | `b7dfc99b4`: Python and TS `PrincipalSummary.card_ref` typed as optional CardRef | `mise run py:typecheck`; `mise run ts:typecheck`; `mise run codegen:check` | PASS |
+| FIND-TASK-001-3 | `c5f5b92fc`, plus rustdoc on every item touched since | `mise run fmt`; `mise run lints` | PASS |
+| REQ-003A task contract | `crates/wyrd-spec/src/card/verifier.rs` (`TaskVerifierSpec`, `VerifierTask`, rejects `depends_on`/`condition`); `crates/wyrd-spec/tests/fixtures/verifier-task-{assertion,llm-judge}.yaml` | `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=card::verifier_card_tests::task_verifier_yaml_deserializes_as_task_verifier_spec) \| test(=card::verifier_card_tests::task_verifier_rejects_graph_fields_wrappers_and_unknown_kinds)'`; lib lanes of wyrd-spec, wyrd-runtime, vala-eval, wyrd-client, and wyrd-loader (1371 passed); `mise run codegen:check` | PASS |
+| REQ-003A binding (Agent, Service, component; no `runs_on`) | `crates/wyrd/wyrd-cli/tests/fixtures/loader/end_to_end/{agent1/cohort-check.yaml,agent1/agent.yaml,service.yaml}`; `runs_on` is optional; `freeze` skips explicit-only bindings | `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli --run-ignored=all -E 'test(/^loader::end_to_end::/) \| test(/^card_lifecycle::/)'` with the Postgres wrapper (22 passed) | PASS |
+| REQ-003A direct execution, assertion and mock LLM judge | `crates/wyrd/wyrd-server/src/verification/direct.rs` (`task`) | `pg_verification_routes::direct_execution_judges_inline_without_runs`, `::direct_execution_refusals_are_stable`, `::direct_execution_calls_the_judge_provider` via `mise exec -- cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^pg_verification_routes::/)'` (9 passed) | PASS |
+| REQ-003A permission | `Resource::Verifier`, `PermissionScope::Verifier(CardUid)`, `verifier_run`/`verifier_run_any`; `workload` and `editor` hold `verifier:run`/All; `VerificationControl::{execute,start_run}` authorizes the resolved Verifier UID and audits allow and deny; `VerifierRunQueue::target_cards` supplies the binding's Verifier | `mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(=permission::tests::verifier_run_is_uid_scoped_and_distinct_from_eval_run) \| test(/^builtin_roles::tests::/)'`; route tests above, including the evals-only, unrelated-UID, and exact-UID Card-bound cases and the manual-run evals-only denial; `pg_verifier_runs` (26 passed); `mise run test:principals:integration` (exit 0) | PASS |
+| REQ-003A MCP discovery | `crates/wyrd/wyrd-server/src/mcp/verification.rs` gates visibility on `Resource::Verifier`/`Action::Run` | `mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(/^verification::pg_tests::/) \| test(=discovery::pg_tests::agent_discovers_only_authorized_tables_and_layout)'` (4 passed) | PASS |
+| REQ-003A Rust client journey | `fixtures/cards/verify_in_real_time/{answer-check,answer-graded}.yaml` bound on the `agent` component without `runs_on` | `mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^verify_in_real_time::/)'`: `agent_answer_is_judged_by_its_task_check`, `graded_answer_passes_the_task_llm_judge`, `caller_without_the_verifier_grant_is_refused`, `exact_verifier_grant_verifies_only_that_verifier`, `another_tenant_cannot_verify_the_assistant`; Eval and Drift cases are kept (14 passed) | PASS |
+| REQ-003A Python client journey | `sdks/wyrd-sdk-python/tests/integration/test_verify_in_real_time.py` | `uv run python -m pytest -q -m integration tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py` with the Postgres wrapper (15 passed); `mise run py:format`; `mise run py:lints`; `mise run py:typecheck` | PASS |
+| REQ-003A TypeScript client journey | `sdks/wyrd-sdk-ts/wyrd/tests/integration/verify-in-real-time.test.ts`; the harness `scopedApiKey` accepts typed scoped permissions | `pnpm exec vitest run tests/integration/verify-in-real-time.test.ts tests/integration/local-development.test.ts` with the Postgres wrapper (15 passed); `mise run ts:format`; `mise run ts:lints`; `mise run ts:typecheck` | PASS |
+| Docs | `docs/.../how-to/evaluate`, `how-to/observe`, `concepts/authorization`, regenerated `llms-full.txt` | `mise run docs:check` | PASS |
+| Boundaries | none added | `mise run check:deps` (exit 0) | PASS |
+
+Non-goals confirmed excluded: no migration, no historical-schema test, no Role
+alias, no direct principal permissions, no MCP principal surface, no
+compatibility route, no second refresh path, no Rust gateway adapter, no second
+attribution layer, and no queued Task runs. `changes/active/verified-change-contract/*`
+is not part of this candidate.

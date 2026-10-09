@@ -714,8 +714,13 @@ root, never an independently sized pool: the view refuses growth past that
 query's own ceiling, and the root's single tracked spill-fair pool, bounded by
 the shared Bifrost memory cap that Scribe, Forge, and in-flight transport also
 charge, arbitrates what all live queries hold together. No role holds a fixed
-share or a precharge: an idle role holds nothing, and every charge returns
-when its owner ends. Aggregate governed reservations therefore cannot sum above
+share or a precharge, with one exception: when an Oracle-serving node sets up
+`DataFusion`'s Parquet footer cache at composition, it charges the cache's
+whole `metadata_cache_bytes` budget to the Oracle memory root and holds it for
+the storage owner's life, because that cache reports no per-entry charge; a
+zero budget sets up no cache and charges nothing. Apart from that standing
+charge an idle role holds nothing, and every charge returns when its owner
+ends. Aggregate governed reservations therefore cannot sum above
 the Bifrost cap.
 
 The cap comes from the detected process or pod memory limit. `wyrd-server`
@@ -1218,9 +1223,7 @@ across a restart; durable batch, file, and task rows answer that question.
   pre-registers only the decisions an admission branch can make, and
   `oracle_admission_queue_duration_seconds` records each waiter once. Scan
   counters report the executed plan's files, bytes, partitions, and row
-  groups. `bifrost_oracle_file_pruning_total{outcome}` counts hot-object
-  exclusions decided from declared bounds; Iceberg pruning happens inside its
-  own scan planning and is not re-walked for telemetry.
+  groups.
 - **Variant layout.** `bifrost_variant_residual_share{writer}` records, for
   each final Scribe object and Forge output, the uncompressed bytes of its
   Variants' root residual `value` leaves as a share of all their

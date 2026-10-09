@@ -469,6 +469,10 @@ mod tests {
     }
 
     /// Reads one remote object back in full for test assertions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the object is missing or its bytes cannot be read.
     async fn remote_bytes(store: &Arc<dyn ObjectStore>, identity: &ParquetObjectIdentity) -> Bytes {
         store
             .get(&ObjectPath::from(identity.as_str()))

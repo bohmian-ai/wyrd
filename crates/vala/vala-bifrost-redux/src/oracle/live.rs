@@ -973,6 +973,8 @@ mod tests {
         use datafusion::scalar::ScalarValue;
         use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
+        /// One hour in microseconds, the width of each fixture route's
+        /// time partition.
         const HOUR_MICROS: i64 = 3_600_000_000;
         let first_hour = 1_787_493_600_000_000_i64;
         let mut routes =

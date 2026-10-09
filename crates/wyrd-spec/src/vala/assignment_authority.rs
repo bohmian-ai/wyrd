@@ -273,6 +273,11 @@ mod tests {
     }
 
     /// Returns the normative fingerprint, tenant, and projection closure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed fixture tenant UUID fails to parse, which cannot
+    /// happen.
     fn base_vector() -> (String, uuid::Uuid, Vec<String>) {
         let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
         let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff")
@@ -286,6 +291,10 @@ mod tests {
     }
 
     /// Digests one assignment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the assignment cannot be encoded for the digest.
     fn digest_of(assignment: &AssignmentDigestInput<'_>) -> String {
         assignment_authority_digest(std::slice::from_ref(assignment)).expect("fixture encodes")
     }

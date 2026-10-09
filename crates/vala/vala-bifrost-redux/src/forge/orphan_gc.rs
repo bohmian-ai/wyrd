@@ -2291,6 +2291,11 @@ mod tests {
     }
 
     /// Object metadata older than the matrix cutoff.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Unix epoch is not a representable timestamp, which
+    /// cannot happen.
     fn orphan_matrix_aged() -> ObjectMeta {
         object_meta(DateTime::<Utc>::from_timestamp_millis(0).expect("timestamp"))
     }

@@ -460,6 +460,10 @@ mod tests {
     use super::*;
 
     /// Writes `count` objects under `prefix` in reverse key order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture store refuses a write.
     async fn seed_reversed(
         objects: &Arc<dyn ObjectStore>,
         prefix: &str,

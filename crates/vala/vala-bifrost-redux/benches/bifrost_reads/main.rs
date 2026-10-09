@@ -11,14 +11,14 @@
 //!    production Oracle provider reading the snapshot through the published
 //!    path. Measures the speed of published data.
 //! 3. `variant`: the same Variant objects written unshredded and shredded by
-//!    Bifrost's own writer, each read by plain `DataFusion`, the Wyrd hot read
-//!    and the Wyrd published read, end to end and planning only, with the
-//!    cases of `DataFusion`'s `parquet_variant_query` benchmark (see
-//!    `variant`).
+//!    Bifrost's own writer, each read through the Wyrd hot and published
+//!    paths. Proves shredding returns the same rows and speeds up key reads
+//!    (see `variant`).
 //!
 //! Both sides of every pair use the Oracle session configuration
-//! (`OracleSessionShape`): same target partitions, same Parquet options. The
-//! only difference is the table provider. `-- hot`, `-- published` or
+//! (`OracleSessionShape`): same target partitions, same Parquet options. In
+//! `hot` and `published` the only difference is the table provider; in
+//! `variant` it is the file layout. `-- hot`, `-- published` or
 //! `-- variant` runs one section.
 //!
 //! [`GLOBAL`] installs the server's allocator.

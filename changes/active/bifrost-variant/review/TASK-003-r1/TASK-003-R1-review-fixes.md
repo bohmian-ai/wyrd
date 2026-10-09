@@ -474,45 +474,32 @@ distributed queries.**
 
 ### Group 7: Variant shred/unshred benchmark in Wyrd (user-directed)
 
-- **Purpose:** prove end to end, through Wyrd's read path, that shredding
-  and unshredding work and meet the latency gates.
-- **Model:** the DataFusion fork's `datafusion/core/benches/parquet_variant_query.rs`.
-  It compares the same objects written unshredded vs shredded, with the same
-  SQL, the same rows and the same build.
-- **Where:** add a `variant` group to Wyrd's existing
+- **Purpose:** prove, through Wyrd's read paths, that Bifrost's Variant
+  shredding works and speeds up key reads. Small by design. Engine-level
+  Variant performance belongs to the DataFusion fork's
+  `datafusion/core/benches/parquet_variant_query.rs`, the source of truth for
+  DataFusion logic; this section does not duplicate it (user decision,
+  2026-10-09, replacing an earlier word-for-word copy of that bench).
+- **Where:** a `variant` section of Wyrd's existing
   `crates/vala/vala-bifrost-redux/benches/bifrost_reads` bench, reusing its
-  harness, its mimalloc setup and its plain-DataFusion vs Wyrd reporting.
-  Do not create a new bench crate.
-- **Data:**
-  - Copy the DataFusion bench's three shapes (narrow, wide, nested), their
-    row counts, their 16 KiB per-row strings and their six SQL cases each
-    (`select_variant`, `select_all`, the single-key and two-key cases, and
-    the inner-object cases), word for word.
-  - Write the files through Bifrost's own Variant write path twice: once
-    with shredding off (unshredded) and once with it on (shredded, onto the
-    objects' own type).
-  - Both tables declare the canonical, unshredded Variant.
-- **Cases:** each `{shape}/{layout}/{case}` is timed two ways:
-  - read by plain DataFusion over the same files;
-  - read through Wyrd, on both the hot path and the published path, as the
-    existing `bifrost_reads` groups do.
-
-  Each also gets a planning-only timing, as the DataFusion bench does.
-- **Equivalence first:** before any timing, each case's rows (sorted, Variant
-  rendered to JSON) must be equal across both layouts, both engines and both
-  Wyrd paths. A mismatch aborts the bench with the case name.
-- **Sampling:** Criterion with 3 s warm-up and at least 20 samples per case;
-  report p50 and p95 from the samples.
-- **Gates** (any miss fails the task; record it, do not tune the bench):
-  - shredded single-key and two-key reads: p50 at most 0.8x unshredded;
-  - shredded whole-Variant reads (`select_variant`, `select_all`): p50 at
-    most 2.0x unshredded;
-  - planning: p50 within ±10% across layouts;
-  - Wyrd vs plain DataFusion on the same files and case: p50 at most 1.10x.
-- **Baselines:** keep the existing no-Variant and Struct groups and their
-  evidence; the new group adds to them.
+  harness and mimalloc setup. No new bench crate.
+- **Data:** three object shapes (narrow, wide, nested; 2 batches of 256 rows,
+  16 KiB strings), each written twice through Bifrost's own Variant write
+  path: once unshredded, once shredded onto the objects' own type. Both
+  tables declare the canonical, unshredded Variant.
+- **Cases:** per shape, one key read, one wider extraction where the shape
+  has one (wide `select_two_string_fields`, nested `select_inner_object`),
+  and the whole value (`select_variant`). Each runs on the Wyrd hot and Wyrd
+  published paths. No plain-DataFusion side and no planning-only timing.
+- **Equivalence first:** before timing, each case's rows (sorted, Variant
+  rendered to JSON) must be equal across both layouts on each path; a
+  mismatch aborts with the case name.
+- **Gates** (any miss fails the task; record it, do not tune the bench),
+  shredded over unshredded p50, per path:
+  - key reads and extractions: at most 0.8x;
+  - whole-Variant reads: at most 2.0x.
 - **Run:** `mise run bench:bifrost:reads`, with the `dist` profile from
-  FIND-003-19. Record the table in the plan's Step 5 evidence, replacing
+  FIND-003-19. Record the tables in the plan's Step 5 evidence, replacing
   the mislabeled run.
 
 ## Done when

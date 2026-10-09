@@ -1,37 +1,28 @@
-//! Section 3 (`-- variant`): Variant reads, unshredded vs shredded, through
-//! plain `DataFusion` and both Wyrd read paths over the same files.
+//! Section 3 (`-- variant`): proves Bifrost's Variant shredding works and
+//! speeds up key reads through Wyrd.
 //!
-//! The shapes, row counts, 16 KiB strings and SQL cases are `DataFusion`'s
-//! `parquet_variant_query` benchmark's, word for word: narrow, wide and nested
-//! objects, 2 batches of 256 rows, one 256-row row group per batch. Each shape
-//! is written twice through Bifrost's own Variant write path (the Bifrost
-//! writer recipe, the Scribe sampler under `BIFROST_VARIANT_SHREDDING`, and the
-//! layout's `shred`): once unshredded, once shredded onto the objects' own
-//! type. Both tables declare the canonical, unshredded Variant, as a table does
-//! when its files may hold either layout.
+//! The same Variant objects are written twice through Bifrost's own Variant
+//! write path (the Bifrost writer recipe, the Scribe sampler under
+//! `BIFROST_VARIANT_SHREDDING`, and the layout's `shred`): once unshredded,
+//! once shredded onto the objects' own type. Both tables declare the
+//! canonical, unshredded Variant, as a table does when its files may hold
+//! either layout. Three object shapes (narrow, wide, nested; 2 batches of 256
+//! rows, 16 KiB strings) each run a key read, a wider extraction where the
+//! shape has one, and the whole value.
 //!
-//! Every `{shape}/{layout}/{case}` runs on three engines over the same file:
-//! plain `DataFusion` (a `ListingTable` under the canonical schema, as the
-//! `DataFusion` benchmark registers it), the Wyrd hot read, and the Wyrd
-//! published read. Before any timing, every case's rows (sorted, Variant as
-//! JSON) must be equal across both layouts and all three engines; a mismatch
-//! aborts naming the case. Then each case is timed end to end and planning
-//! alone: [`WARM_UP`] of untimed runs, then [`SAMPLES`] timed runs per engine,
-//! the engines alternating every run. The section prints both tables and every
-//! gate the plan sets with its ratio and verdict.
+//! Each Wyrd read path (hot and published) is one [`Report`] whose left side
+//! is the unshredded file and right side the shredded one, so every case
+//! asserts both layouts return identical rows before it is timed. Engine-level
+//! Variant performance is `DataFusion`'s `parquet_variant_query` benchmark's
+//! job, not this section's.
 
 use std::fs::File;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
-use datafusion::datasource::file_format::parquet::ParquetFormat;
-use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
-};
 use datafusion::prelude::SessionContext;
 use iceberg::writer::file_writer::variant_shredding::{VariantLayout, VariantSampler};
 use parquet::arrow::ArrowWriter;
@@ -39,7 +30,7 @@ use parquet_variant_compute::cast_to_variant;
 use vala_bifrost_redux::bench_support::OracleBenchTables;
 use vala_bifrost_redux::parquet::BIFROST_VARIANT_SHREDDING;
 
-use crate::report::{self, Latency, Side, micros};
+use crate::report::{Report, Side};
 
 /// Batches written per file.
 const NUM_BATCHES: usize = 2;
@@ -47,19 +38,15 @@ const NUM_BATCHES: usize = 2;
 const WRITE_RECORD_BATCH_SIZE: usize = 256;
 /// Bytes in every string leaf.
 const LARGE_STRING_LEN: usize = 16 * 1024;
-/// Untimed running time per case before its samples, as Criterion's warm-up.
-const WARM_UP: Duration = Duration::from_secs(3);
-/// Timed runs per engine per case.
-const SAMPLES: usize = 30;
-/// The two file layouts, `(layout, shredded)`, in report order.
-const LAYOUTS: [(&str, bool); 2] = [("unshredded", false), ("shredded", true)];
-/// The engines' column labels; index 0 is the plain `DataFusion` baseline.
-const ENGINES: [&str; 3] = ["datafusion", "wyrd hot", "wyrd published"];
-/// Cases that read the whole Variant, held to the looser layout gate.
-const WHOLE_VARIANT: [&str; 2] = ["select_variant", "select_all"];
+/// The case that reads the whole Variant, held to the looser gate.
+const WHOLE_VARIANT: &str = "select_variant";
+/// Highest shredded / unshredded p50 for a key read or extraction.
+const KEY_READ_LIMIT: f64 = 0.8;
+/// Highest shredded / unshredded p50 for a whole-Variant read.
+const WHOLE_VARIANT_LIMIT: f64 = 2.0;
 
 /// `(shape, the objects' type, [(case, SQL)])`.
-type Shape = (&'static str, Fields, [(&'static str, &'static str); 6]);
+type Shape = (&'static str, Fields, Vec<(&'static str, &'static str)>);
 
 /// A non-null `Utf8` object key.
 fn utf8(name: &str) -> Field {
@@ -71,29 +58,20 @@ fn small_int() -> Field {
     Field::new("small_int", DataType::Int32, false)
 }
 
-/// The `DataFusion` benchmark's three shapes and their six cases each.
+/// The three shapes and their cases: a key read, a wider extraction where the
+/// shape has more than one key to extract, and the whole value.
 fn shapes() -> [Shape; 3] {
     let inner = Fields::from(vec![utf8("large_string"), small_int()]);
     [
         (
             "narrow",
             inner.clone(),
-            [
-                ("select_variant", "SELECT s FROM t"),
+            vec![
                 (
                     "select_small_field",
                     "SELECT CAST(s ->> 'small_int' AS INT) FROM t",
                 ),
-                ("select_large_field", "SELECT s ->> 'large_string' FROM t"),
-                ("select_all", "SELECT * FROM t"),
-                (
-                    "select_id_and_small_field",
-                    "SELECT id, CAST(s ->> 'small_int' AS INT) FROM t",
-                ),
-                (
-                    "sum_small_field",
-                    "SELECT SUM(CAST(s ->> 'small_int' AS INT)) FROM t",
-                ),
+                (WHOLE_VARIANT, "SELECT s FROM t"),
             ],
         ),
         (
@@ -105,22 +83,16 @@ fn shapes() -> [Shape; 3] {
                 utf8("str_d"),
                 small_int(),
             ]),
-            [
-                ("select_variant", "SELECT s FROM t"),
+            vec![
                 (
                     "select_small_field",
                     "SELECT CAST(s ->> 'small_int' AS INT) FROM t",
                 ),
-                ("select_one_string_field", "SELECT s ->> 'str_a' FROM t"),
                 (
                     "select_two_string_fields",
                     "SELECT s ->> 'str_a', s ->> 'str_b' FROM t",
                 ),
-                ("select_all", "SELECT * FROM t"),
-                (
-                    "sum_small_field",
-                    "SELECT SUM(CAST(s ->> 'small_int' AS INT)) FROM t",
-                ),
+                (WHOLE_VARIANT, "SELECT s FROM t"),
             ],
         ),
         (
@@ -129,19 +101,13 @@ fn shapes() -> [Shape; 3] {
                 Field::new("inner", DataType::Struct(inner), false),
                 utf8("extra_string"),
             ]),
-            [
-                ("select_variant", "SELECT s FROM t"),
-                ("select_inner_object", "SELECT s -> 'inner' FROM t"),
+            vec![
                 (
                     "select_inner_small_field",
                     "SELECT CAST(s -> 'inner' ->> 'small_int' AS INT) FROM t",
                 ),
-                ("select_extra_string", "SELECT s ->> 'extra_string' FROM t"),
-                ("select_all", "SELECT * FROM t"),
-                (
-                    "sum_inner_small_field",
-                    "SELECT SUM(CAST(s -> 'inner' ->> 'small_int' AS INT)) FROM t",
-                ),
+                ("select_inner_object", "SELECT s -> 'inner' FROM t"),
+                (WHOLE_VARIANT, "SELECT s FROM t"),
             ],
         ),
     ]
@@ -170,7 +136,7 @@ fn column(field: &Field, rows: Range<usize>) -> ArrayRef {
 }
 
 /// Writes one shape's objects in one layout through Bifrost's Variant write
-/// path and returns its three engines.
+/// path and returns the Wyrd hot and published sessions over that file.
 ///
 /// The file is `{root}/{shape}/{layout}/data.parquet`. The logical schema is
 /// `id Int32, s Variant` with Iceberg field ids; the encoder opens on the
@@ -181,13 +147,15 @@ fn column(field: &Field, rows: Range<usize>) -> ArrayRef {
 /// # Panics
 ///
 /// Panics when the file cannot be written, the sampler does not shred `s`, or
-/// an engine cannot be registered.
-async fn engines(
+/// a session cannot be registered.
+async fn sessions(
     tables: &OracleBenchTables,
     root: &Path,
-    (shape, fields): (&str, &Fields),
-    (layout, shredded): (&str, bool),
-) -> [SessionContext; 3] {
+    shape: &str,
+    fields: &Fields,
+    shredded: bool,
+) -> [SessionContext; 2] {
+    let layout = if shredded { "shredded" } else { "unshredded" };
     let plain = Schema::new(vec![
         Field::new("id", DataType::Int32, false),
         wyrd_types::variant::variant_field("s", false),
@@ -255,26 +223,6 @@ async fn engines(
     }
     writer.close().expect("close");
 
-    let native = OracleBenchTables::native_session();
-    let options =
-        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
-    let config = ListingTableConfig::new(
-        ListingTableUrl::parse(dir.to_str().expect("UTF-8 fixture path")).expect("table URL"),
-    )
-    .with_listing_options(options)
-    .with_schema(Arc::clone(&schema));
-    // The session's statistics cache, as `register_parquet` attaches it.
-    let listing = ListingTable::try_new(config)
-        .expect("native table")
-        .with_cache(
-            native
-                .runtime_env()
-                .cache_manager
-                .get_file_statistic_cache(),
-        );
-    native
-        .register_table("t", Arc::new(listing))
-        .expect("native table");
     let hot = tables
         .session(&[("t", Arc::clone(&schema), &path)])
         .await
@@ -284,219 +232,80 @@ async fn engines(
         .published_session(&[("t", &table)])
         .await
         .expect("Wyrd published session");
-    [native, hot, published]
+    [hot, published]
 }
 
-/// What one timed run measures.
-#[derive(Clone, Copy)]
-enum Measure {
-    /// Plan, execute, and collect every batch.
-    Run,
-    /// Plan to a physical plan only.
-    Plan,
-}
-
-impl Measure {
-    /// Runs `sql` in `context` once and returns how long this measure took.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the query fails to plan or execute.
-    async fn once(self, context: &SessionContext, sql: &str) -> Duration {
-        match self {
-            Self::Run => report::run(&Side { context, sql }).await,
-            Self::Plan => {
-                let start = Instant::now();
-                context
-                    .sql(sql)
-                    .await
-                    .expect("plans")
-                    .create_physical_plan()
-                    .await
-                    .expect("plans physically");
-                start.elapsed()
-            }
-        }
-    }
-
-    /// Warms every engine up for [`WARM_UP`], then takes [`SAMPLES`] timed
-    /// runs of each, the engines alternating every run so machine drift lands
-    /// on all of them equally.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the query fails to plan or execute.
-    async fn sample(self, engines: &[SessionContext; 3], sql: &str) -> [Latency; 3] {
-        let start = Instant::now();
-        while start.elapsed() < WARM_UP {
-            for context in engines {
-                self.once(context, sql).await;
-            }
-        }
-        let mut samples: [Vec<Duration>; 3] = Default::default();
-        for _ in 0..SAMPLES {
-            for (context, runs) in engines.iter().zip(&mut samples) {
-                runs.push(self.once(context, sql).await);
-            }
-        }
-        samples.map(Latency::of)
-    }
-}
-
-/// One timed `{shape}/{layout}/{case}`: each engine's end-to-end and
-/// planning latency, in [`ENGINES`] order.
-struct Timed {
-    /// The shape.
-    shape: &'static str,
-    /// The file layout.
-    layout: &'static str,
-    /// The case.
-    case: &'static str,
-    /// End-to-end latency per engine.
-    run: [Latency; 3],
-    /// Planning latency per engine.
-    plan: [Latency; 3],
-}
-
-/// The section's results, in run order.
+/// The section's results: one unshredded-vs-shredded report per Wyrd path.
 pub struct VariantReport {
-    /// Every timed case.
-    timed: Vec<Timed>,
+    /// Wyrd hot, then Wyrd published.
+    paths: [Report; 2],
 }
 
-/// Writes every shape in both layouts under `root`, proves every case
-/// equivalent everywhere, then times every case.
+/// Writes every shape in both layouts under `root`, then, per Wyrd path,
+/// proves each case returns the same rows from both layouts and times it.
 ///
 /// # Panics
 ///
 /// Panics when a fixture cannot be written or registered, a query fails, or a
-/// case's rows differ between layouts or engines; the message names the case.
+/// case's rows differ between layouts; the message names the case.
 pub async fn run(tables: &OracleBenchTables, root: &Path) -> VariantReport {
-    let mut written = Vec::new();
+    let mut paths = [
+        Report::new("Variant on Wyrd hot", "unshredded", "shredded"),
+        Report::new("Variant on Wyrd published", "unshredded", "shredded"),
+    ];
     for (shape, fields, cases) in shapes() {
-        let mut layouts = Vec::new();
-        for layout in LAYOUTS {
-            layouts.push((
-                layout.0,
-                engines(tables, root, (shape, &fields), layout).await,
-            ));
-        }
-        written.push((shape, cases, layouts));
-    }
-    for (shape, cases, layouts) in &written {
-        for (case, sql) in cases {
-            let expected = report::rows(&layouts[0].1[0], sql).await;
-            for (layout, engines) in layouts {
-                for (engine, context) in ENGINES.iter().zip(engines) {
-                    assert!(
-                        report::rows(context, sql).await == expected,
-                        "{shape}/{layout}/{case}: {engine} returns different rows from \
-                         datafusion over the unshredded file for `{sql}`"
-                    );
-                }
+        let unshredded = sessions(tables, root, shape, &fields, false).await;
+        let shredded = sessions(tables, root, shape, &fields, true).await;
+        for (report, (left, right)) in paths.iter_mut().zip(unshredded.iter().zip(&shredded)) {
+            for &(case, sql) in &cases {
+                report
+                    .time(
+                        &format!("{shape}/{case}"),
+                        Side { context: left, sql },
+                        Side {
+                            context: right,
+                            sql,
+                        },
+                    )
+                    .await;
             }
         }
     }
-    let mut timed = Vec::new();
-    for (shape, cases, layouts) in &written {
-        for (layout, engines) in layouts {
-            for (case, sql) in cases {
-                timed.push(Timed {
-                    shape,
-                    layout,
-                    case,
-                    run: Measure::Run.sample(engines, sql).await,
-                    plan: Measure::Plan.sample(engines, sql).await,
-                });
-                eprintln!("timed {shape}/{layout}/{case}");
-            }
-        }
-    }
-    VariantReport { timed }
+    VariantReport { paths }
 }
 
 impl VariantReport {
-    /// Prints the end-to-end table, the planning table, and every gate.
+    /// Prints each path's table, then every gate with its verdict.
     pub fn print(&self) {
-        Self::table(
-            "Variant reads: plain DataFusion vs Wyrd hot and published",
-            |t| &t.run,
-            &self.timed,
-        );
-        Self::table("Variant planning only", |t| &t.plan, &self.timed);
+        for report in &self.paths {
+            report.print();
+        }
         let gates = self.gates();
         let missed = gates.iter().filter(|gate| gate.ends_with("MISS |")).count();
         println!("\n## Variant gates ({missed} of {} missed)\n", gates.len());
-        println!("| gate | case | engine | ratio | limit | verdict |");
-        println!("|---|---|---|---:|---|---|");
+        println!("| path | case | shredded / unshredded p50 | limit | verdict |");
+        println!("|---|---|---:|---|---|");
         for gate in &gates {
             println!("{gate}");
         }
     }
 
-    /// Prints one titled table of `latency` per engine for every timed case.
-    fn table(title: &str, latency: impl Fn(&Timed) -> &[Latency; 3], timed: &[Timed]) {
-        println!("\n## {title}\n");
-        print!("| case |");
-        for engine in ENGINES {
-            print!(" {engine} p50 | {engine} p95 |");
-        }
-        println!("\n|---|{}", "---:|---:|".repeat(ENGINES.len()));
-        for t in timed {
-            print!("| `{}/{}/{}` |", t.shape, t.layout, t.case);
-            for l in latency(t) {
-                print!(" {} | {} |", micros(l.p50), micros(l.p95));
-            }
-            println!();
-        }
-    }
-
-    /// Every gate with its ratio and `PASS` or `MISS`, each as one Markdown
-    /// table row.
-    ///
-    /// Shredded over unshredded p50: at most 0.8x for key reads and 2.0x for
-    /// whole-Variant reads, per engine; planning within ±10%, per engine. Wyrd
-    /// over plain `DataFusion` p50: at most 1.10x, per layout and Wyrd path.
+    /// Every gate as one Markdown table row: shredded over unshredded p50 at
+    /// most [`KEY_READ_LIMIT`] for key reads and extractions and
+    /// [`WHOLE_VARIANT_LIMIT`] for whole-Variant reads, per Wyrd path.
     fn gates(&self) -> Vec<String> {
-        let ratio = |a: &Latency, b: &Latency| a.p50.as_secs_f64() / b.p50.as_secs_f64();
-        let verdict = |pass: bool| if pass { "PASS" } else { "MISS" };
         let mut gates = Vec::new();
-        for shredded in self.timed.iter().filter(|t| t.layout == "shredded") {
-            let id = format!("{}/{}", shredded.shape, shredded.case);
-            let unshredded = self
-                .timed
-                .iter()
-                .find(|t| {
-                    t.layout == "unshredded" && t.shape == shredded.shape && t.case == shredded.case
-                })
-                .expect("every case is timed in both layouts");
-            let limit = if WHOLE_VARIANT.contains(&shredded.case) {
-                2.0
-            } else {
-                0.8
-            };
-            for (engine, index) in ENGINES.iter().zip(0..) {
-                let run = ratio(&shredded.run[index], &unshredded.run[index]);
+        for (path, report) in ["hot", "published"].iter().zip(&self.paths) {
+            for (case, unshredded, shredded) in &report.rows {
+                let ratio = shredded.p50.as_secs_f64() / unshredded.p50.as_secs_f64();
+                let limit = if case.ends_with(WHOLE_VARIANT) {
+                    WHOLE_VARIANT_LIMIT
+                } else {
+                    KEY_READ_LIMIT
+                };
+                let verdict = if ratio <= limit { "PASS" } else { "MISS" };
                 gates.push(format!(
-                    "| shredded / unshredded | `{id}` | {engine} | {run:.2} | <= {limit} | {} |",
-                    verdict(run <= limit)
-                ));
-                let plan = ratio(&shredded.plan[index], &unshredded.plan[index]);
-                gates.push(format!(
-                    "| planning shredded / unshredded | `{id}` | {engine} | {plan:.2} | 0.9 to 1.1 | {} |",
-                    verdict((0.9..=1.1).contains(&plan))
-                ));
-            }
-        }
-        for t in &self.timed {
-            for (engine, index) in ENGINES.iter().zip(0..).skip(1) {
-                let wyrd = ratio(&t.run[index], &t.run[0]);
-                gates.push(format!(
-                    "| Wyrd / DataFusion | `{}/{}/{}` | {engine} | {wyrd:.2} | <= 1.10 | {} |",
-                    t.shape,
-                    t.layout,
-                    t.case,
-                    verdict(wyrd <= 1.10)
+                    "| {path} | `{case}` | {ratio:.2} | <= {limit} | {verdict} |"
                 ));
             }
         }

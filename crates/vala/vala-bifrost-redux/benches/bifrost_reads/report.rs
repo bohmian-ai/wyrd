@@ -45,7 +45,7 @@ pub struct Report {
     /// The right side's column label.
     right: &'static str,
     /// `(case, left, right)` in run order.
-    rows: Vec<(String, Latency, Latency)>,
+    pub rows: Vec<(String, Latency, Latency)>,
 }
 
 impl Report {

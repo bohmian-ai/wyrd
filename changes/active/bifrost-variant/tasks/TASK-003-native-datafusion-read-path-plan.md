@@ -673,6 +673,19 @@ scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner &&
 Plus the `vala-bifrost-redux` unit tests, and the fork tests for every
 changed DataFusion crate with and without the `variant` feature.
 
+Evidence (2026-10-09, Wyrd `029da306f`):
+- the command above passes 2/2;
+- `vala-bifrost-redux` `oracle::` unit tests pass 174/174;
+- full `mise run test:bifrost` passes every lane (`exit=0`; Oracle journeys
+  53/53);
+- `mise run fmt`, `mise run lints` and `git diff --check` are clean;
+- the fork tests are `scratchpad/verify6.sh`, finishing `ALL-OK` 38s before
+  `a4ff14550` was committed. They cover fmt, clippy `--all-targets
+  --all-features`, the `datafusion-datasource-parquet` lib with and without
+  `datafusion-common/variant`, `datafusion-functions-variant`, the
+  `datafusion` `parquet_integration` tests with and without `variant`, and
+  sqllogictests.
+
 ## Step 5: release benchmarks
 
 `mise run bench:bifrost:reads` (Wyrd overhead: `hot` and `published`) plus the
@@ -742,6 +755,60 @@ latency requirements table above.
   `physical_plan_tpch_all` and `physical_select_all_from_1000`,
   `parquet_struct_query` `struct_access`, `filter_struct_field_eq` and
   `filter_top_level_with_struct_select`, plus `parquet_variant_query`.
+
+### Step 5 evidence (2026-10-09, LTO `release`, `cargo +1.98.1`)
+
+- Base is a fork export at `38b7a7a0a`. On is a clean export of the published
+  `a4ff14550` with `variant`, so the excluded local edits are not included.
+- Script: `scratchpad/bench/run.sh` and `resume.sh`. Results table:
+  `scratchpad/bench/table.py`. The clean export links the base's ClickBench
+  data, which `sql_planner` requires.
+- p50 / p95, base → on:
+  - `physical_plan_tpch_all`: 25.1 / 25.4 → 24.6 / 25.1 ms
+  - `physical_select_all_from_1000`: 12.3 / 12.8 → 11.8 / 12.1 ms
+  - `struct_access`: 2.65 / 2.74 → 2.60 / 2.69 ms
+  - `filter_struct_field_eq`: 3.43 / 3.54 → 3.36 / 3.42 ms
+  - `filter_top_level_with_struct_select`: 3.49 / 3.57 → 3.39 / 3.45 ms
+
+  Non-Variant and Struct are unchanged.
+- `parquet_variant_query`, p50 / p95, unshredded → shredded:
+  - planning is equal in all 18 cases (e.g. narrow `sum_small_field`
+    179 / 180 → 177 / 179 µs).
+  - Whole-Variant reads, all under the 2x limit:
+
+    | object | `select_variant` | `select_all` |
+    |---|---|---|
+    | narrow | 1.03 / 1.07 → 1.34 / 1.40 ms | 1.05 / 1.16 → 1.29 / 1.41 ms |
+    | nested | 2.97 / 3.18 → 3.74 / 3.96 ms | 3.01 / 3.34 → 3.78 / 3.91 ms |
+    | wide | 7.14 / 8.33 → 9.71 / 10.2 ms | 7.95 / 8.43 → 10.0 / 10.7 ms |
+
+  - Key reads are lower in every case:
+    - wide `select_small_field`: 5.79 / 6.09 ms → 272 / 298 µs
+    - nested `select_inner_small_field`: 2.39 / 2.66 ms → 283 / 308 µs
+    - narrow `select_small_field`: 981 µs / 1.02 ms → 267 / 283 µs
+    - wide `select_two_string_fields`: 9.84 / 10.7 → 4.29 / 4.53 ms
+- `mise run bench:bifrost:reads` (`dist`, mimalloc), DataFusion → Wyrd, p50 / p95:
+  - Hot file:
+    - `point_lookup`: 350 / 368 → 354 / 382 µs
+    - `select_narrow`: 241 / 247 → 223 / 235 µs
+    - `select_wide`: 9247 / 9908 → 10023 / 10787 µs
+    - `count_star`: 185 / 204 → 198 / 210 µs
+    - `group_by`: 416 / 427 → 410 / 420 µs
+    - `time_range`: 386 / 392 → 387 / 400 µs
+    - `struct_field`: 633 / 773 → 577 / 666 µs
+    - `list_predicate`: 425 / 436 → 395 / 407 µs
+  - Published:
+    - `point_lookup`: 659 / 890 → 420 / 627 µs
+    - `select_narrow`: 305 / 337 → 276 / 424 µs
+    - `select_wide`: 9950 / 10939 → 10059 / 11578 µs
+    - `count_star`: 10692 / 12726 → 621 / 911 µs
+    - `group_by`: 1557 / 1700 → 600 / 764 µs
+    - `time_range`: 690 / 807 → 460 / 643 µs
+    - `struct_field`: 851 / 983 → 726 / 882 µs
+    - `list_predicate`: 687 / 797 → 515 / 662 µs
+  - Open: hot `select_wide` is about 0.8 ms above native at p50. It is the
+    only case where Wyrd is slower beyond noise, and it is not yet
+    diagnosed.
 
 ## Handoff (2026-10-08): remaining work, in order
 

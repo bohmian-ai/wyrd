@@ -149,6 +149,8 @@ mod sdk {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
+    /// The fixed Card UID every correlated harness row asserts, so tests can
+    /// compare the correlation a facade call carries against one known value.
     fn card() -> CardUid {
         "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22"
             .parse()

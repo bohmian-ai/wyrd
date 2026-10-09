@@ -26,7 +26,7 @@ docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; exit 1
   test -n "$container"
   WYRD_APP_PASSWORD="$app_password" WYRD_PLATFORM_ADMIN_PASSWORD="$platform_admin_password" \
     docker exec -i -e WYRD_APP_PASSWORD -e WYRD_PLATFORM_ADMIN_PASSWORD "$container" \
-    psql --username=wyrd_test_admin --dbname=wyrd <"$role_sql"
+    psql --username=wyrd_test_admin --dbname=wyrd -v ON_ERROR_STOP=1 <"$role_sql"
   test "$(psql "$DATABASE_URL" -Atqc "SELECT rolcanlogin, rolbypassrls, rolsuper, rolcreatedb FROM pg_roles WHERE rolname = '\''wyrd_app'\''")" = "t|f|f|f"
   managed_memberships="$(psql "$DATABASE_URL" -Atqc "SELECT count(*) FROM pg_auth_members edge JOIN pg_roles granted ON granted.oid=edge.roleid JOIN pg_roles member ON member.oid=edge.member WHERE granted.rolname IN ('\''wyrd_app'\'','\''wyrd_platform_admin'\'') AND member.rolname IN ('\''wyrd_app'\'','\''wyrd_platform_admin'\'')")"
   test "$managed_memberships" = "0"

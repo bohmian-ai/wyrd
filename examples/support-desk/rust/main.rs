@@ -9,6 +9,14 @@ use std::time::Duration;
 
 use wyrd_sdk::WyrdClient;
 
+/// Deploys the support desk, serves its requests, waits for the Verifier
+/// verdicts, and prints one passing and one failing explanation.
+///
+/// # Errors
+///
+/// Returns [`support_desk::Error`] when the ambient client configuration is
+/// missing or invalid, the temporary bundle directory cannot be created, or
+/// any deploy, serve, verdict-wait, or explain call to the server fails.
 #[tokio::main]
 async fn main() -> Result<(), support_desk::Error> {
     let client = WyrdClient::from_global()?;

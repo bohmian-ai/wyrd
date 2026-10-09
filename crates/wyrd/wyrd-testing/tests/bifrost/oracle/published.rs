@@ -295,6 +295,94 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
 /// query timeout keeps cancellation the cause of the terminal.
 const CANCELLED_READ_DRAIN: Duration = Duration::from_secs(15);
 
+/// A read stalled during physical planning ends at the query deadline.
+///
+/// Physical planning reads storage: for every Iceberg-published file it keeps,
+/// the Oracle provider fetches the Parquet footer into the node's metadata
+/// cache before execution starts. With that cache enabled and cold, the first
+/// query's first ranged read is such a planning read; holding it must not hold
+/// the query past its deadline.
+///
+/// # Panics
+///
+/// Panics when the stalled query does not end in `QueryTimeout`.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn planning_read_stall_ends_at_query_deadline() {
+    prove_planning_read_stall_times_out()
+        .await
+        .expect("a stalled planning read ends at the query deadline");
+}
+
+/// Stalls the first planning footer read and requires a `QueryTimeout`.
+///
+/// One row is written, promoted to Iceberg, and pinned, so the query plans one
+/// published file whose footer is not yet cached. The stall is held until the
+/// query has ended, so only the deadline can end it; an outer bound turns a
+/// hang into a failure instead of a stuck lane.
+///
+/// # Errors
+///
+/// Returns a client, ingest, Forge, or lifecycle error, and a descriptive error
+/// when the stall is not reached, the query hangs, settles, or fails with any
+/// problem other than `QueryTimeout`.
+async fn prove_planning_read_stall_times_out() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+        BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
+    )
+    .await?;
+    let server = cluster
+        .server(0)
+        .ok_or("the one-pod cluster runs one server")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_planning_stall");
+    let fqn = format!("vala.bifrost.{table}");
+    register_table(server, tenant, &table).await?;
+    let reader = writer(server, "planning-stall-reader").await?;
+    reader
+        .write(&fqn, &journey_schema(), [journey_row(1, "row-1")])
+        .await?;
+    server.flush_bifrost().await?;
+    compact_sealed_batch(&cluster, tenant, &table, 1).await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let stall = server.object_reads_for_test().arm_stall();
+    let query = tokio::spawn({
+        let client = reader.client().clone();
+        let sql = format!("SELECT id FROM {fqn}");
+        async move {
+            let mut stream = wyrd_client::Bifrost::query_only(&client)
+                .query(&BifrostQueryRequest {
+                    sql,
+                    deadline_ms: Some(PLANNING_STALL_DEADLINE_MS),
+                })
+                .await?;
+            while stream.next_batch().await?.is_some() {}
+            Ok::<_, wyrd_client::bifrost::BifrostClientError>(())
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), stall.wait_until_reached())
+        .await
+        .map_err(|_| "the query never reached the planning read")?;
+    let outcome = tokio::time::timeout(Duration::from_secs(60), query)
+        .await
+        .map_err(|_| "a query stalled in planning must end at its deadline, not hang")??;
+    let code = match &outcome {
+        Err(error) => sdk_code(error),
+        Ok(()) => return Err("a query stalled in planning settled".into()),
+    };
+    if code != "WYRD_VALA_504_QUERY_TIMEOUT" {
+        return Err(format!("a query stalled in planning failed as {code}: {outcome:?}").into());
+    }
+    stall.release();
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Deadline of the query whose planning read is stalled, well inside the
+/// journey's outer bound.
+const PLANNING_STALL_DEADLINE_MS: i64 = 2_000;
+
 /// Gate and Oracle families the query-stream windows print as evidence.
 const QUERY_STREAM_FAMILIES: [&str; 11] = [
     "bifrost_gate_requests_total",

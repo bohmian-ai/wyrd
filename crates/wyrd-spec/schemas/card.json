@@ -10123,12 +10123,37 @@
             "null"
           ]
         },
+        "tables": {
+          "description": "Bifrost dataset tables this Service writes.\n\nRegistration validates and ensures each one in `vala.datasets` before the Service becomes active; removing the Service never drops them.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ServiceTable"
+          }
+        },
         "verified_by": {
           "description": "Continuous verification bindings owned by this Service as a whole.",
           "type": "array",
           "items": {
             "$ref": "#/definitions/VerificationBinding"
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ServiceTable": {
+      "description": "One Bifrost dataset table a Service declares.\n\n`schema` is a JSON Schema object in the subset Bifrost table registration accepts (a Pydantic `model_json_schema()` shape); an existing table of the same name must carry the same fields.",
+      "type": "object",
+      "required": [
+        "name",
+        "schema"
+      ],
+      "properties": {
+        "name": {
+          "description": "Dataset table name inside `vala.datasets`.",
+          "type": "string"
+        },
+        "schema": {
+          "description": "JSON Schema object describing the table's user fields."
         }
       },
       "additionalProperties": false

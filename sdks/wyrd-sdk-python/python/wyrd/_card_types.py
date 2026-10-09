@@ -3004,7 +3004,19 @@ class ServiceSpec:
     runtime: ServiceRuntime | None = None
     service_config: dict[str, NonSecretValue] = field(default_factory=dict)
     service_type: str | None = None
+    tables: list[ServiceTable] = field(default_factory=list)
     verified_by: list[VerificationBinding] = field(default_factory=list)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ServiceTable:
+    """One Bifrost dataset table a Service declares.
+
+    `schema` is a JSON Schema object in the subset Bifrost table registration accepts (a Pydantic `model_json_schema()` shape); an existing table of the same name must carry the same fields.
+    """
+
+    name: str
+    schema: JsonValue
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -4786,8 +4798,10 @@ _OBJECTS: dict[str, tuple[tuple[str, bool, tuple], ...]] = {
         ("runtime", False, ("union", [("ref", "ServiceRuntime"), ("prim", "null")])),
         ("service_config", False, ("map", ("ref", "NonSecretValue"))),
         ("service_type", False, ("union", [("prim", "string"), ("prim", "null")])),
+        ("tables", False, ("array", ("ref", "ServiceTable"))),
         ("verified_by", False, ("array", ("ref", "VerificationBinding"))),
     ),
+    "ServiceTable": (("name", True, ("prim", "string")), ("schema", True, ("prim", "any"))),
     "SklearnMeta": (
         ("framework_version", True, ("prim", "string")),
         ("model_subtype", False, ("union", [("prim", "string"), ("prim", "null")])),

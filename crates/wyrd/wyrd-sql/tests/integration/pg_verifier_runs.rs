@@ -1722,7 +1722,7 @@ async fn claim_reports_postgres_measured_queue_wait_and_age() {
 fn record(subject: &CardUid, writer: &CardUid, record_id: &str) -> ObservationRecord {
     ObservationRecord {
         subject: subject.clone(),
-        writer: writer.clone(),
+        writer: Some(writer.clone()),
         record_id: record_id.to_owned(),
         event_time: at(22, 11, 59),
     }
@@ -1932,12 +1932,14 @@ async fn frames_naming_subjects_in_opposite_orders_serialize() {
     assert_eq!(run_count(&mut conn).await, 4);
 }
 
-/// An Eval record runs only the bindings its writer owns (REQ-108).
+/// An Eval record of a Card-bound writer runs only the bindings its writer
+/// owns, while an unbound writer's record runs every binding of its subject.
 ///
 /// Services A and B each own an `observations_ready` binding on A's Card. A
 /// record A writes runs A's binding and never B's: not while B is active, and
 /// not when the record is retried after B authenticates again. A record B
-/// writes on the same subject runs B's binding and not A's.
+/// writes on the same subject runs B's binding and not A's. A record written
+/// by a principal bound to no Card runs both.
 ///
 /// # Panics
 /// Panics when a binding takes a run of a record its owner did not write, or
@@ -2023,6 +2025,27 @@ async fn observation_runs_follow_the_writer() {
         ordinals(&mut conn, b_binding).await,
         numbered(&[("b-1", 1)]),
         "B never takes a run of A's record"
+    );
+
+    let unbound = ObservationRecord {
+        writer: None,
+        ..record(&a, &a, "u-1")
+    };
+    assert_eq!(
+        queue
+            .enqueue_observation_batch(&mut conn, &[unbound])
+            .await
+            .expect("an unbound writer's record enqueues"),
+        2,
+        "a writer bound to no Card activates every binding of the subject"
+    );
+    assert_eq!(
+        ordinals(&mut conn, a_binding).await,
+        numbered(&[("a-1", 1), ("a-2", 2), ("u-1", 3)])
+    );
+    assert_eq!(
+        ordinals(&mut conn, b_binding).await,
+        numbered(&[("b-1", 1), ("u-1", 2)])
     );
 }
 

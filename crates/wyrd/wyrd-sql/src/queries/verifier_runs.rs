@@ -122,11 +122,14 @@ const LOCK_OBSERVATION_BINDING_SQL: &str = r"
 /// the same order and one simply waits for the other instead of forming a
 /// cycle.
 const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r"
-    SELECT binding_id, subject_card_uid, owner_card_uid
-      FROM wyrd.verification_bindings
-     WHERE activation = 'observations_ready'
-       AND (subject_card_uid, owner_card_uid) IN (SELECT * FROM unnest($1::uuid[], $2::uuid[]))
-     ORDER BY binding_id
+    SELECT b.binding_id, b.subject_card_uid, b.owner_card_uid
+      FROM wyrd.verification_bindings b
+     WHERE b.activation = 'observations_ready'
+       AND EXISTS (SELECT 1
+                     FROM unnest($1::uuid[], $2::uuid[]) AS u(subject, writer)
+                    WHERE u.subject = b.subject_card_uid
+                      AND (u.writer IS NULL OR u.writer = b.owner_card_uid))
+     ORDER BY b.binding_id
        FOR NO KEY UPDATE
 ";
 
@@ -846,8 +849,10 @@ pub struct ObservationRecord {
     /// Subject Card the observation was emitted for.
     pub subject: CardUid,
     /// Card the writing principal is bound to; only `observations_ready`
-    /// bindings whose exact owner is this Card take a run of it.
-    pub writer: CardUid,
+    /// bindings whose exact owner is this Card take a run of it. `None` is a
+    /// writer bound to no Card, whose record activates every
+    /// `observations_ready` binding of its subject.
+    pub writer: Option<CardUid>,
     /// Logical input record ID, unique per binding's runs.
     pub record_id: String,
     /// Committed observation's server event time, frozen on the run.
@@ -1529,17 +1534,18 @@ impl VerifierRunQueue {
         )
     }
 
-    /// Enqueue one Eval run per `observations_ready` binding the writer owns
-    /// on each record's subject, for every record of a batch, in one insert
-    /// statement.
+    /// Enqueue one Eval run per `observations_ready` binding the writer
+    /// activates on each record's subject, for every record of a batch, in
+    /// one insert statement.
     ///
     /// Called after the observations are durably committed, never inside
     /// their ingest transaction. One statement locks and lists, in binding
-    /// order, every `observations_ready` binding whose subject and exact
-    /// owner Card match a record's subject and writer, so concurrent
-    /// batches touching the same bindings serialize instead of deadlocking
-    /// and another owner's binding on the same subject takes no run
-    /// (REQ-108). Each such binding whose Verifier, subject, and
+    /// order, every `observations_ready` binding whose subject matches a
+    /// record's subject and whose exact owner Card is the record's writer,
+    /// or any owner when the writer is bound to no Card. Concurrent batches
+    /// touching the same bindings therefore serialize instead of
+    /// deadlocking, and a Card-bound writer never activates another owner's
+    /// binding on the same subject. Each such binding whose Verifier, subject, and
     /// implementation accept an Eval record contributes one row per matching
     /// record; one
     /// [`INSERT_OBSERVATION_RUNS_SQL`] then writes them all. A record that
@@ -1560,9 +1566,14 @@ impl VerifierRunQueue {
         conn: &mut TenantConn<'_>,
         records: &[ObservationRecord],
     ) -> Result<u64, SqlxError> {
-        let (subjects, writers): (Vec<Uuid>, Vec<Uuid>) = records
+        let (subjects, writers): (Vec<Uuid>, Vec<Option<Uuid>>) = records
             .iter()
-            .map(|record| (record.subject.as_uuid(), record.writer.as_uuid()))
+            .map(|record| {
+                (
+                    record.subject.as_uuid(),
+                    record.writer.as_ref().map(CardUid::as_uuid),
+                )
+            })
             .unzip();
         let bindings: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(LOCK_OBSERVATION_SUBJECTS_SQL)
             .bind(subjects)
@@ -1579,7 +1590,11 @@ impl VerifierRunQueue {
                 continue;
             }
             for record in records.iter().filter(|record| {
-                record.subject.as_uuid() == subject && record.writer.as_uuid() == writer
+                record.subject.as_uuid() == subject
+                    && record
+                        .writer
+                        .as_ref()
+                        .is_none_or(|bound| bound.as_uuid() == writer)
             }) {
                 run_ids.push(VerificationRunId::new_v7().as_uuid());
                 binding_ids.push(binding);
@@ -1604,8 +1619,8 @@ impl VerifierRunQueue {
     /// Whether `binding`'s target accepts an Eval record now: Verifier ready,
     /// subject available, Eval implementation.
     ///
-    /// No owner activity is read: the record's writer is bound to the
-    /// binding's owner and has just authenticated (REQ-108).
+    /// No owner activity is read: the record's writer has just authenticated
+    /// and was authorized to attribute the record to its subject.
     ///
     /// # Errors
     /// Returns the database error when a read fails, or a decode error when

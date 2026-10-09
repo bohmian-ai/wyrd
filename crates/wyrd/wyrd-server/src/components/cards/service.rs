@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use wyrd_queue::json_schema_to_fieldspec;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
 use wyrd_spec::DataTenantId;
@@ -38,6 +40,7 @@ use wyrd_spec::registry::{
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
+use wyrd_spec::vala::api::RegisterTableRequest;
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
@@ -69,6 +72,7 @@ use wyrd_storage::StorageError;
 use wyrd_storage::service::{upload_abort, upload_init};
 use wyrd_storage::tenant_path;
 
+use crate::bifrost::service::register_table;
 use crate::components::auth::Caller;
 use crate::components::cards::mapping::{
     existing_row_to_response, lifecycle_status, outcome_row_to_response,
@@ -558,14 +562,55 @@ pub async fn register_card(
             replayed
         } else {
             validate_request(&request)?;
+            let tables = declared_tables(&request.submissions)?;
             let (order, root) = plan_registration_graph(&request.submissions)?;
             let external_refs = resolve_external(state, caller, &request.submissions).await?;
+            for table in tables {
+                register_table(state, caller.clone(), table).await?;
+            }
             let plan = plan_registration(request, request_hash, external_refs, order, root);
             RegistrationWriter { state, caller }
                 .write(idempotency_key, plan)
                 .await?
         };
     initialize_uploads(state, caller, operation_id, seed, idempotency_key).await
+}
+
+/// The Bifrost dataset registrations every submitted Service declares.
+///
+/// Each declared JSON Schema is parsed into Bifrost user fields here, before
+/// any table or Card is written, so an unsupported schema refuses the whole
+/// registration. [`register_card`] then ensures each table through the
+/// catalog owner, which refuses a conflicting existing schema before the
+/// Card transaction opens; tables are never dropped afterwards.
+///
+/// # Errors
+/// Returns `WYRD_VALA_400_SCHEMA_PARSE` for a schema outside the supported
+/// subset and `WYRD_REGISTRY_422_INVALID_CARD_SPEC` for an undecodable spec.
+fn declared_tables(submissions: &[CardSubmission]) -> Result<Vec<RegisterTableRequest>, WyrdError> {
+    let mut tables = Vec::new();
+    for submission in submissions {
+        if submission.kind != CardKind::Service {
+            continue;
+        }
+        let Spec::Service(spec) =
+            Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?
+        else {
+            continue;
+        };
+        for table in spec.tables {
+            tables.push(RegisterTableRequest {
+                namespace: BifrostNamespace::Datasets.as_str().to_owned(),
+                fields: json_schema_to_fieldspec(&table.schema)?,
+                name: table.name,
+                physical_layout: None,
+                compaction_target_file_size_bytes: None,
+                compaction_type: None,
+            });
+        }
+    }
+    Ok(tables)
 }
 
 /// Whether any submitted verification binding names an `on_failure` Operator.

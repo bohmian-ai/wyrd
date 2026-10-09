@@ -3896,3 +3896,122 @@ async fn runtime_activity_follows_only_qualifying_exchanges() {
 
     server.shutdown().await.expect("test server shuts down");
 }
+
+/// A Service registration carrying `tables`, with each table schema given.
+fn service_with_tables(name: &str, tables: Value, key: &str) -> Request<Body> {
+    standalone_card_request("Service", name, json!({ "tables": tables }), key)
+}
+
+/// The four-field `tickets` JSON Schema a support Service declares.
+fn tickets_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ticket_id": { "type": "string" },
+            "question": { "type": "string" },
+            "answer": { "type": "string" },
+            "refund": { "type": "boolean" }
+        },
+        "required": ["ticket_id", "question", "answer", "refund"]
+    })
+}
+
+/// A Service's declared tables are ensured before it becomes active, and an
+/// incompatible or unsupported declaration refuses the registration first.
+///
+/// Registering `ticket-desk` creates `vala.datasets.tickets` with exactly its
+/// four declared fields; a second Service declaring the same table with the
+/// same schema registers against it. A Service declaring `tickets` with a
+/// different field is refused with `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`
+/// and a free-form object schema with `WYRD_VALA_400_SCHEMA_PARSE`; neither
+/// leaves any Card, operation, principal, or binding behind, and the stored
+/// table keeps its original fields.
+///
+/// # Panics
+/// Panics when the server fails to start or stop, a route call fails, or any
+/// status, stable error code, stored field list, or no-write assertion does
+/// not hold.
+#[tokio::test(flavor = "current_thread")]
+async fn service_declared_tables_are_ensured_before_activation() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("table-author", &["editor"])
+        .await
+        .expect("author bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let tickets = json!([{ "name": "tickets", "schema": tickets_schema() }]);
+    let describe = || {
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/bifrost/tables/vala.datasets/tickets")
+            .body(Body::empty())
+            .expect("describe request builds")
+    };
+
+    for (name, key) in [
+        ("ticket-desk", "tables-desk"),
+        ("ticket-twin", "tables-twin"),
+    ] {
+        let registered = server
+            .oneshot_authenticated(&jwt, service_with_tables(name, tickets.clone(), key))
+            .await
+            .expect("registration responds");
+        assert_eq!(registered.status(), StatusCode::CREATED, "{name} registers");
+    }
+    let described = server
+        .oneshot_authenticated(&jwt, describe())
+        .await
+        .expect("describe responds");
+    assert_eq!(described.status(), StatusCode::OK);
+    let fields: Vec<String> = response_json(described).await["user_fields"]
+        .as_array()
+        .expect("user fields are a list")
+        .iter()
+        .map(|field| field["name"].as_str().expect("field has a name").to_owned())
+        .collect();
+    assert_eq!(fields, ["ticket_id", "question", "answer", "refund"]);
+
+    let mut conflicting = tickets_schema();
+    conflicting["properties"]["priority"] = json!({ "type": "integer" });
+    let refusals = [
+        (
+            "ticket-clash",
+            json!([{ "name": "tickets", "schema": conflicting }]),
+            StatusCode::CONFLICT,
+            "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+        ),
+        (
+            "ticket-freeform",
+            json!([{ "name": "freeform", "schema": { "type": "object" } }]),
+            StatusCode::BAD_REQUEST,
+            "WYRD_VALA_400_SCHEMA_PARSE",
+        ),
+    ];
+    for (name, tables, status, code) in refusals {
+        let refused = server
+            .oneshot_authenticated(&jwt, service_with_tables(name, tables, name))
+            .await
+            .expect("refused registration responds");
+        assert_eq!(refused.status(), status, "{name}");
+        assert_eq!(response_json(refused).await["code"], code, "{name}");
+        assert_no_registration_writes(&server, name, name).await;
+    }
+    let unchanged = server
+        .oneshot_authenticated(&jwt, describe())
+        .await
+        .expect("describe responds");
+    assert_eq!(
+        response_json(unchanged).await["user_fields"]
+            .as_array()
+            .expect("user fields are a list")
+            .len(),
+        4,
+        "the conflicting declaration never altered the stored table"
+    );
+
+    server.shutdown().await.expect("test server shuts down");
+}

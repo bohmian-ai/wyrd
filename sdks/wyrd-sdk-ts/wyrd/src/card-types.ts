@@ -3897,9 +3897,31 @@ export interface ServiceSpec {
    */
   readonly service_type?: string | null;
   /**
+   * Bifrost dataset tables this Service writes.
+   *
+   * Registration validates and ensures each one in `vala.datasets` before the Service becomes active; removing the Service never drops them.
+   */
+  readonly tables?: readonly ServiceTable[];
+  /**
    * Continuous verification bindings owned by this Service as a whole.
    */
   readonly verified_by?: readonly VerificationBinding[];
+}
+
+/**
+ * One Bifrost dataset table a Service declares.
+ *
+ * `schema` is a JSON Schema object in the subset Bifrost table registration accepts (a Pydantic `model_json_schema()` shape); an existing table of the same name must carry the same fields.
+ */
+export interface ServiceTable {
+  /**
+   * Dataset table name inside `vala.datasets`.
+   */
+  readonly name: string;
+  /**
+   * JSON Schema object describing the table's user fields.
+   */
+  readonly schema: unknown;
 }
 
 /**

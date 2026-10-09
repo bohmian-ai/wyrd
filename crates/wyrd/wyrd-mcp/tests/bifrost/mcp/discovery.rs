@@ -21,7 +21,7 @@ mod pg_tests {
     use wyrd_testing::bifrost::seed_query_fixture;
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
-    /// caller that also holds tenant principal administration, `evals:run`, and
+    /// caller that also holds tenant principal administration, `verifier:run`, and
     /// `operators:write`: every read tool, then that caller's write tools.
     const ADVERTISED_TOOLS: [&str; 32] = [
         "bifrost.list_tables",

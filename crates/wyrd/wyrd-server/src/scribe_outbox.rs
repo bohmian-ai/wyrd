@@ -832,17 +832,17 @@ mod tests {
 
     use chrono::Utc;
     use vala_bifrost_redux::contracts::ScribeError;
-    use wyrd_spec::DataTenantId;
     use wyrd_runtime::audit::AuditStage;
+    use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{
         GATEWAY_CAPTURE_PRINCIPAL, PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag,
     };
     use wyrd_spec::gateway::GatewayCaptureMode;
     use wyrd_spec::ids::{CardUid, VerificationResultId};
     use wyrd_spec::reference::CardRef;
-    use wyrd_spec::verification::DriftWindow;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
+    use wyrd_spec::verification::DriftWindow;
     use wyrd_sql::queries::verifier_runs::RunInput;
     use wyrd_tonic::tonic::Code;
 

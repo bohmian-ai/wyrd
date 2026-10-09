@@ -59,22 +59,27 @@ result, no Operator dispatch, no Bifrost read or write, and no Eval sampling.
   baseline; Custom scores the mean of `profile.metric_name`.
 - `{"kind": "eval_record", "context": {...}, "media": [...]}` for
   assertion-only and LLM-judge Evals. Judges receive the supplied context.
+- `{"kind": "task_context", "context": {...}, "media": [...]}` for task
+  Verifiers, which run one assertion or LLM-judge check.
 
 A `200` response carries `execution_id`, the exact `verifier` and `subject`
 references, `kind`, `verdict` (`passed`, `failed`, or `inconclusive`),
-`summary`, `counts`, and `detail` (`{"drift": ...}` or `{"eval": ...}`). A
+`summary`, `counts` (Drift and Eval only), and `detail` (`{"drift": ...}`,
+`{"eval": ...}`, or `{"task": {"result": ...}}`). A
 `failed` verdict is a successful response. `execution_id` appears only in the
 response, the audit record, and the trace; it is not queryable.
 
-The caller needs `evals:run` scoped to both the Verifier and the subject. Each
-request records one allowed or denied audit decision. Bounds are a 1 MiB body,
+The caller needs `verifier:run` on the selected Verifier: a grant scoped to
+its UID or to all Verifiers. `evals:run`, a grant on another Verifier, or the
+binding alone does not authorize it. Each request records one allowed or
+denied audit decision. Bounds are a 1 MiB body,
 at most 64 columns × 100,000 values of `drift_samples`, a 256 KiB
-`eval_record.context`, and a 60-second execution deadline.
+`eval_record.context` or `task_context.context`, and a 60-second execution deadline.
 
 | Status | Code | Condition |
 |---|---|---|
 | 400 | `WYRD_VERIFICATION_400_INPUT_INVALID` | Malformed request |
-| 403 | `WYRD_PERMISSION_403_DENIED_RBAC` | No `evals:run` for the Verifier or subject |
+| 403 | `WYRD_PERMISSION_403_DENIED_RBAC` | No `verifier:run` for the Verifier |
 | 404 | `WYRD_VERIFICATION_404_TARGET_NOT_FOUND` | Unknown or cross-tenant Verifier or subject |
 | 409 | `WYRD_VERIFICATION_409_BASELINE_NOT_READY` | No `ready` fitted baseline |
 | 409 | `WYRD_VERIFICATION_409_BASELINE_LEGACY` | Baseline fitted under an earlier format |
@@ -93,8 +98,8 @@ judges its own subject with a Verifier bound to it in `verified_by`, named by
 the Verifier Card's `metadata.name`: `run.observe().verify(name, &input).await` in
 Rust, `run.observe.verify(name, input)` in Python (returning a
 `wyrd.observe.Judgment`), and `await run.observe.verify(name, input)` in
-TypeScript. An Eval Verifier takes one context object and optional media; a
+TypeScript. An Eval or task Verifier takes one context object and optional media; a
 Drift Verifier takes a non-empty list of flat feature rows, sent as
 `drift_samples` columns. The MCP tool
 `verification.execute` takes the same request and appears only to a caller
-holding `evals:run`.
+holding `verifier:run`.

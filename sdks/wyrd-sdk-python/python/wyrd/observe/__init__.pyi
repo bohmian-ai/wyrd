@@ -116,6 +116,8 @@ class Judgment:
         "eval_assertion",
         "eval_llm_judge",
         "eval_other",
+        "task_assertion",
+        "task_llm_judge",
         "unknown",
     ]:
         """The Verifier classification: method family and profile."""
@@ -132,13 +134,13 @@ class Judgment:
         ...
 
     @property
-    def counts(self) -> dict[str, Any]:
-        """Count-only rollup of the judgment as its wire mapping."""
+    def counts(self) -> dict[str, Any] | None:
+        """Count-only rollup of a Drift or Eval judgment; ``None`` for a task Verifier."""
         ...
 
     @property
     def detail(self) -> dict[str, Any]:
-        """The engine report: ``{"drift": {...}}`` or ``{"eval": {...}}``."""
+        """The engine report: ``{"drift": ...}``, ``{"eval": ...}``, or ``{"task": {"result": ...}}``."""
         ...
 
 class Observe:

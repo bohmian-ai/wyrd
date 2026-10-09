@@ -75,7 +75,7 @@ The resolution path:
   rows={[
     ['admin', 'All resources and actions (*)'],
     ['editor', 'workload, plus cards:write, cards:delete, artifacts:write, policy:lock, services:install'],
-    ['workload', 'viewer, plus bifrost_table:write, bifrost_record:write, evals:run, workflows:run, triggers:write, operators:invoke, gateway:invoke'],
+    ['workload', 'viewer, plus bifrost_table:write, bifrost_record:write, evals:run, verifier:run, workflows:run, triggers:write, operators:invoke, gateway:invoke'],
     ['viewer', 'cards:read, artifacts:read, audit:read, operators:read, gateway:read, gateway_payload:read, bifrost_table:read, bifrost_query:read']
   ]}
 />

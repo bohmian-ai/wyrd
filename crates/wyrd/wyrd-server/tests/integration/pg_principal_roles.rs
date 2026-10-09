@@ -106,35 +106,37 @@ fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `principal`'s staged `operation` decisions as (permission, outcome) once
-/// the audit outbox has settled.
+/// `principal`'s retained `operation` decisions as (permission, outcome),
+/// sorted by outcome, once every decision staged so far is retained.
 ///
 /// # Panics
-/// Panics when the outbox does not settle or the audit rows cannot be read.
+/// Panics when audit retention does not settle or the audit rows cannot be read.
 async fn decisions(
     server: &WyrdTestServer,
     operation: &str,
     principal: Uuid,
 ) -> Vec<(String, String)> {
     server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await_audit_retained()
         .await
-        .expect("audit outbox settles");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
+        .expect("audit retention settles");
+    let mut rows: Vec<(String, String)> = server
+        .retained_audit_records(
+            server.data_tenant_id(),
+            "permission, outcome",
+            &format!("operation = '{operation}' AND audit_principal_id = '{principal}'"),
+        )
         .await
-        .expect("tenant connection opens");
-    let rows = sqlx::query_as(
-        "SELECT permission, outcome FROM vala.audit_staging \
-          WHERE operation = $1 AND principal_id = $2 \
-          ORDER BY outcome",
-    )
-    .bind(operation)
-    .bind(principal)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("audit rows read");
-    conn.commit().await.expect("audit read commits");
+        .expect("audit rows read")
+        .into_iter()
+        .map(|row| {
+            (
+                row[0].clone().unwrap_or_default(),
+                row[1].clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort_by(|left, right| left.1.cmp(&right.1));
     rows
 }
 

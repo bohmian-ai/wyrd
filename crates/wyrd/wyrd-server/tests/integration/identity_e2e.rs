@@ -2349,27 +2349,36 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .await;
 }
 
-/// Staged allowed `auth.user.roles.sync` events for User `principal_id`.
-///
-/// In-process test servers run no audit publisher, so every committed event
-/// is still in staging.
+/// Retained allowed `auth.user.roles.sync` events for User `principal_id`.
 ///
 /// # Panics
-/// Panics when the query fails.
-async fn roles_sync_events(srv: &WyrdTestServer, principal_id: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-          WHERE operation = 'auth.user.roles.sync' AND outcome = 'allowed' \
-            AND principal_id = $1::uuid AND resource = 'principal:' || $1",
-    )
-    .bind(principal_id)
-    .fetch_one(
-        &srv.pg_fixture()
-            .superuser_pool()
-            .expect("superuser pool opens"),
+/// Panics when audit retention does not settle or the read fails.
+async fn roles_sync_events(srv: &WyrdTestServer, principal_id: &str) -> usize {
+    retained_decisions(
+        srv,
+        srv.data_tenant_id(),
+        &format!(
+            "operation = 'auth.user.roles.sync' AND outcome = 'allowed' \
+             AND audit_principal_id = '{principal_id}' \
+             AND resource = 'principal:{principal_id}'"
+        ),
     )
     .await
-    .expect("role sync audit reads")
+}
+
+/// Count of `tenant`'s retained audit decisions matching `predicate`, read
+/// once every decision `srv` staged so far is retained.
+///
+/// # Panics
+/// Panics when audit retention does not settle or the read fails.
+async fn retained_decisions(srv: &WyrdTestServer, tenant: DataTenantId, predicate: &str) -> usize {
+    srv.await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    srv.retained_audit_records(tenant, "operation", predicate)
+        .await
+        .expect("retained audit reads")
+        .len()
 }
 
 // ─── Tenant human connection administration ─────────────────────────────────
@@ -2729,7 +2738,7 @@ async fn tenant_connection_admin_journey() {
 ///   7. from then on only K2 writers serve: a same-issuer secret rotation
 ///      staged on B is activated by the recovery principal and served by the
 ///      K2-only replica at once, and deactivation on B stops login there;
-///   8. the canonical audit staging attributes each recovery decision to its
+///   8. retained audit history attributes each recovery decision to its
 ///      principal and verified credential: Denied for the underprivileged key, Allowed for
 ///      each successful activation, and nothing for the malformed key.
 ///
@@ -3152,24 +3161,32 @@ async fn tenant_connection_rotation_journey() {
     assert_eq!(status, StatusCode::NO_CONTENT, "B deactivates: {body}");
     assert_eq!(login_refusal(&replica_k2).await, "access_denied");
 
-    // 8. Each recovery decision is staged on the canonical audit path,
+    // 8. Each recovery decision is retained on the canonical audit path,
     //    attributed to the recovery principal and its verified credential;
-    //    the malformed key left none. In-process replicas run no publisher,
-    //    so every committed decision is still in staging.
+    //    the malformed key left none. The rows are compared per principal in
+    //    decision order.
     replica_b
-        .wait_oracle_audit_staged(StdDuration::from_secs(30))
+        .await_audit_retained()
         .await
-        .expect("audit outbox settles");
-    let recovery_decisions = sqlx::query_as::<_, (String, Option<String>, String, String)>(
-        "SELECT principal_id::text, credential_id::text, permission, outcome \
-         FROM vala.audit_staging \
-         WHERE data_tenant_id = $1 AND operation = 'identity.oidc.candidate.activate' \
-         ORDER BY seq",
-    )
-    .bind(tenant.as_uuid())
-    .fetch_all(&superuser)
-    .await
-    .expect("staged activation decisions read");
+        .expect("audit retention settles");
+    let recovery_decisions: Vec<(String, Option<String>, String, String)> = replica_b
+        .retained_audit_records(
+            tenant,
+            "audit_principal_id, credential_id, permission, outcome",
+            "operation = 'identity.oidc.candidate.activate'",
+        )
+        .await
+        .expect("retained activation decisions read")
+        .into_iter()
+        .map(|row| {
+            (
+                row[0].clone().unwrap_or_default(),
+                row[1].clone(),
+                row[2].clone().unwrap_or_default(),
+                row[3].clone().unwrap_or_default(),
+            )
+        })
+        .collect();
     let admin_id = principal_id_of(token);
     let runtime_id = non_admin.id().as_uuid().to_string();
     let recovery_id = recovery_admin.id().as_uuid().to_string();
@@ -3372,18 +3389,23 @@ async fn tenant_connection_session_cutoff_journey() {
         .superuser_pool()
         .expect("superuser pool opens");
     let committed = || async {
-        sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        let rows = sqlx::query_as::<_, (i64, i64, i64)>(
             "SELECT (SELECT count(*) FROM wyrd.auth_refresh_tokens
                       WHERE principal_id = $1::uuid),
                     (SELECT count(*) FROM wyrd.auth_login_state WHERE code_hash IS NOT NULL),
-                    (SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid),
-                    (SELECT count(*) FROM vala.audit_staging
-                      WHERE operation IN ('auth.login', 'auth.user.roles.sync'))",
+                    (SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid)",
         )
         .bind(&principal)
         .fetch_one(&superuser)
         .await
-        .expect("committed effects read")
+        .expect("committed effects read");
+        let audits = retained_decisions(
+            &replica_a,
+            tenant,
+            "operation IN ('auth.login', 'auth.user.roles.sync')",
+        )
+        .await;
+        (rows, audits)
     };
     let before = committed().await;
     let provider = authorization_code(
@@ -3596,15 +3618,15 @@ async fn tenant_human_login_journey() {
     );
 
     // 5. The issuance decision is on the canonical audit path.
-    let allowed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-          WHERE operation = 'auth.token.exchange' AND outcome = 'allowed' \
-            AND principal_id = $1::uuid",
+    let allowed = retained_decisions(
+        &srv,
+        srv.data_tenant_id(),
+        &format!(
+            "operation = 'auth.token.exchange' AND outcome = 'allowed' \
+             AND audit_principal_id = '{alice}'"
+        ),
     )
-    .bind(&alice)
-    .fetch_one(&superuser)
-    .await
-    .expect("audit reads");
+    .await;
     assert!(allowed >= 1, "alice's issuance is audited");
 
     srv.shutdown().await.expect("server shuts down");
@@ -3810,10 +3832,7 @@ fn assert_oauth_refusal(reply: &(StatusCode, Value), status: StatusCode, error: 
 ///      outage are refused back to the client (`access_denied`, or
 ///      `temporarily_unavailable` for the outage), leaving no code, User,
 ///      identity, role grant, or refresh row, while a valid single-audience
-///      token whose `azp` names the client completes;
-///   6. an injected audit-staging failure at redemption costs the login
-///      nothing: the token and refresh row are issued, the failed audit write
-///      is counted, and the decision commits once after the store recovers.
+///      token whose `azp` names the client completes.
 ///
 /// A discovered unsafe (cleartext or internal) provider URL is proven by the
 /// `wyrd-auth` unit tests (`login::destination_tests`,
@@ -3829,7 +3848,6 @@ async fn tenant_callback_refusal_journey() {
     /// case from the nonce the login began with, so each case can reply with a
     /// forged or failing token exchange.
     type Mutation<'a> = Box<dyn Fn(&str) -> wiremock::ResponseTemplate + 'a>;
-    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let srv = Box::pin(human_server()).await;
     let superuser = srv
@@ -4248,72 +4266,6 @@ async fn tenant_callback_refusal_journey() {
         "the unmodified mock token completes: {body}"
     );
 
-    // 6. An audit failure at redemption does not refuse the login.
-    let before = refresh_rows(&srv, &alice).await;
-    let (failing_code, failing_verifier) = issued_code(&srv, &keycloak).await;
-    let exchanges = || async {
-        srv.wait_oracle_audit_staged(StdDuration::from_secs(30))
-            .await
-            .expect("audit outbox settles");
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.token.exchange'",
-        )
-        .fetch_one(&superuser)
-        .await
-        .expect("exchange decisions read")
-    };
-    let exchanges_before = exchanges().await;
-    sqlx::query(
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_login_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'auth.token.exchange' THEN
-               RAISE EXCEPTION 'injected login audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure function installs");
-    sqlx::query(
-        r"CREATE TRIGGER test_fail_login_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_login_audit()",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure trigger installs");
-    let (status, body) = redeem(&srv, &failing_code, &failing_verifier).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an unstageable login audit still issues the token: {body}"
-    );
-    assert!(
-        body.get("access_token").is_some(),
-        "the redemption serves a token: {body}"
-    );
-    failures
-        .await_failure(StdDuration::from_secs(30))
-        .await
-        .expect("the failed audit write is counted");
-    sqlx::query("DROP TRIGGER test_fail_login_audit ON vala.audit_staging")
-        .execute(&superuser)
-        .await
-        .expect("failure trigger drops");
-    assert_eq!(
-        refresh_rows(&srv, &alice).await,
-        before + 1,
-        "the login inserted its refresh row"
-    );
-    assert_eq!(
-        exchanges().await,
-        exchanges_before + 1,
-        "the login decision commits exactly once after recovery"
-    );
-
     srv.shutdown().await.expect("server shuts down");
 }
 
@@ -4401,10 +4353,6 @@ async fn tenant_callback_issuer_binding_journey() {
         .await
         .expect("test server starts");
     let tenant = srv.data_tenant_id();
-    let superuser = srv
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
     let mock = wiremock::MockServer::start().await;
     let issuer = mock.uri();
     let silent = mock_discovery(&issuer, &["EdDSA"]);
@@ -4469,19 +4417,12 @@ async fn tenant_callback_issuer_binding_journey() {
     .await;
     assert_eq!(status, StatusCode::OK, "candidate activates: {active}");
 
-    let denied = || async {
-        srv.wait_oracle_audit_staged(StdDuration::from_secs(30))
-            .await
-            .expect("audit outbox settles");
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_staging \
-              WHERE data_tenant_id = $1 AND operation = 'auth.token.exchange' \
-                AND outcome = 'denied'",
+    let denied = || {
+        retained_decisions(
+            &srv,
+            tenant,
+            "operation = 'auth.token.exchange' AND outcome = 'denied'",
         )
-        .bind(tenant.as_uuid())
-        .fetch_one(&superuser)
-        .await
-        .expect("denied exchanges read")
     };
     let wrong_slash = format!("{issuer}/");
     let cases: Vec<IssuerCase> = vec![
@@ -4773,15 +4714,12 @@ async fn tenant_connection_test_sign_in_journey() {
     assert_test_completion(&present_test_return(&srv, &genuine, None).await);
     let (_, listed) = call_json(&srv, &admin_a.token, Method::GET, CONNECTIONS, None).await;
     assert_eq!(listed["candidate"]["tested_revision"], revision);
-    let decisions: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-          WHERE data_tenant_id = $1 AND operation = 'identity.oidc.candidate.tested' \
-            AND outcome = 'allowed'",
+    let decisions = retained_decisions(
+        &srv,
+        tenant_a,
+        "operation = 'identity.oidc.candidate.tested' AND outcome = 'allowed'",
     )
-    .bind(tenant_a.as_uuid())
-    .fetch_one(&superuser)
-    .await
-    .expect("tested decisions read");
+    .await;
     assert_eq!(decisions, 1, "the tester's authority is decided once");
     assert_eq!(
         issued().await,

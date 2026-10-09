@@ -21,6 +21,7 @@ use wyrd_spec::ids::{
 };
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::AuditOutcome;
+use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::{
     ExecuteVerificationRequest, Judgment, StartVerificationRunRequest, VerificationBindingStatus,
@@ -484,6 +485,7 @@ impl<'a> VerificationControl<'a> {
         self.stage_result(
             caller.data_tenant_id,
             execution_id,
+            request.run_id.as_ref(),
             &target,
             &report,
             started_at,
@@ -505,15 +507,18 @@ impl<'a> VerificationControl<'a> {
     /// The result takes the execution's identity, so the response's
     /// `execution_id` is the `result_id` of its rows. It is attributed to the
     /// tenant SYSTEM principal and the exact Verifier exactly like a queued
-    /// result, with no run, owner, binding, or Trigger. A Drift result records
-    /// the execution interval as its window; an Eval or task result records
-    /// the execution's synthetic record. The verdict is already decided, so a
+    /// result, carries the caller's application Run `run_id` when supplied,
+    /// and has no owner, binding, or Trigger. A Drift result records the
+    /// execution interval as its window; an Eval or task result records the
+    /// application Run's record (the `execution_id` when no Run is supplied)
+    /// as its source. The verdict is already decided, so a
     /// missing SYSTEM principal or an unbuildable payload is logged and the
     /// result is not recorded.
     fn stage_result(
         &self,
         tenant: DataTenantId,
         execution_id: VerificationExecutionId,
+        run_id: Option<&RunId>,
         target: &DirectTarget,
         report: &VerifierReport,
         started_at: DateTime<Utc>,
@@ -536,7 +541,10 @@ impl<'a> VerificationControl<'a> {
             }),
             VerifierImplementation::Eval(_) | VerifierImplementation::Task(_) => {
                 RunInput::EvalRecord {
-                    record_id: execution_id.as_uuid().to_string(),
+                    record_id: run_id.map_or_else(
+                        || execution_id.as_uuid().to_string(),
+                        |run| run.as_str().to_owned(),
+                    ),
                     event_time: started_at,
                 }
             }
@@ -549,7 +557,7 @@ impl<'a> VerificationControl<'a> {
         let verifier_version = target.verifier.version.to_string();
         let built = ResultPayloadBuilder::new(
             ResultRun {
-                run_id: None,
+                run_id,
                 verifier_version: &verifier_version,
                 subject_card_uid: subject,
                 owner_card_uid: None,

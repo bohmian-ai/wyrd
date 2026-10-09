@@ -4,8 +4,8 @@
 //! graph. This module turns the caller's input into the wire input the
 //! Verifier's kind takes, in the same forms `observe.eval` and
 //! `observe.drift` accept, and owns the one transport call to
-//! `POST /v1/verification/execute`. It records nothing: no observation, run,
-//! dispatch, or Bifrost write.
+//! `POST /v1/verification/execute`. It writes no observation, run, or
+//! dispatch; the server records the judgment as one result of the Run.
 
 use std::collections::BTreeMap;
 use std::time::Duration;

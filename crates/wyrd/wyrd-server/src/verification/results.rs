@@ -6,7 +6,8 @@
 //! payload can never drift from the registered contract. Every batch also
 //! carries the three correlation columns Scribe admits from a native payload:
 //! `card_ref` (the Verifier, resolved against the frame principal's Verifier scope),
-//! `run_id` (the Verifier run, null for a direct execution), and
+//! `run_id` (the application Run judged, null when none, as for scheduled
+//! Drift), and
 //! `wyrd_event_time` (the one server-chosen
 //! event time shared by the summary and every detail row).
 
@@ -28,7 +29,8 @@ use vala_bifrost_redux::tables::verification::ResultsTable;
 use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable, ResultItemsTable};
 use vala_drift::{DriftReport, DriftVerdict};
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
-use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
+use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
+use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput};
@@ -129,9 +131,10 @@ impl ResultPayload {
 /// separated from the lease so the mapping can be exercised without a claim.
 #[derive(Debug, Clone, Copy)]
 pub struct ResultRun<'a> {
-    /// The Verifier run, stored as the managed `run_id`; `None` for a direct
-    /// execution, which creates no run.
-    pub run_id: Option<VerificationRunId>,
+    /// The application Run judged, stored as the managed `run_id`: the
+    /// observed record's Run for continuous Eval, the caller's Run for a
+    /// direct execution, and `None` when there is none, as for scheduled Drift.
+    pub run_id: Option<&'a RunId>,
     /// Exact Verifier Card version used.
     pub verifier_version: &'a str,
     /// Verified subject Card.
@@ -146,11 +149,13 @@ pub struct ResultRun<'a> {
     pub input: &'a RunInput,
 }
 
-impl<'a> From<&'a ClaimedRun> for ResultRun<'a> {
-    /// Borrow the result-relevant identities of a claimed run.
-    fn from(run: &'a ClaimedRun) -> Self {
+impl<'a> ResultRun<'a> {
+    /// Borrow the result-relevant identities of a claimed run judged for the
+    /// application Run `run_id`.
+    #[must_use]
+    pub fn claimed(run: &'a ClaimedRun, run_id: Option<&'a RunId>) -> Self {
         Self {
-            run_id: Some(run.lease.run_id),
+            run_id,
             verifier_version: &run.verifier_version,
             subject_card_uid: &run.subject_card_uid,
             owner_card_uid: run.owner_card_uid.as_ref(),
@@ -559,7 +564,7 @@ impl<'a> ResultPayloadBuilder<'a> {
         ]);
         arrays.push(text(std::iter::repeat_n(Some(self.verifier_ref), rows)));
         arrays.push(text(std::iter::repeat_n(
-            self.run.run_id.map(|run_id| run_id.to_string()),
+            self.run.run_id.map(RunId::as_str),
             rows,
         )));
         arrays.push(timestamps(std::iter::repeat_n(Some(self.event_time), rows)));
@@ -722,8 +727,8 @@ mod tests {
 
     /// Owned identities of one binding run, borrowed as a [`ResultRun`].
     struct TestRun {
-        /// The Verifier run.
-        run_id: VerificationRunId,
+        /// The application Run judged.
+        run_id: RunId,
         /// Subject Card.
         subject: CardUid,
         /// Binding owner Card.
@@ -740,7 +745,7 @@ mod tests {
         /// Borrow this run as the builder's view.
         fn view(&self) -> ResultRun<'_> {
             ResultRun {
-                run_id: Some(self.run_id),
+                run_id: Some(&self.run_id),
                 verifier_version: "1.2.0",
                 subject_card_uid: &self.subject,
                 owner_card_uid: Some(&self.owner),
@@ -767,7 +772,7 @@ mod tests {
     /// A binding run over `input`.
     fn run(input: RunInput) -> TestRun {
         TestRun {
-            run_id: VerificationRunId::new_v7(),
+            run_id: RunId::new(),
             subject: uid(),
             owner: uid(),
             binding: BindingId::new_v7(),
@@ -899,7 +904,10 @@ mod tests {
                     cell(batch, "result_id", row).as_deref(),
                     Some(result_id.as_str())
                 );
-                assert_eq!(cell(batch, RUN_ID, row), Some(run.run_id.to_string()));
+                assert_eq!(
+                    cell(batch, RUN_ID, row).as_deref(),
+                    Some(run.run_id.as_str())
+                );
                 assert_eq!(
                     cell(batch, CARD_REF, row).as_deref(),
                     Some("prod/Verifier/check@1.2.0")
@@ -982,6 +990,7 @@ mod tests {
             &VerifierReport::Eval {
                 report,
                 verdict: VerificationVerdict::Passed,
+                run_id: None,
             },
         );
         let tables: Vec<_> = payload.batches().iter().map(|b| b.table.as_str()).collect();
@@ -1028,6 +1037,7 @@ mod tests {
             &VerifierReport::Eval {
                 report: EvalReport::default(),
                 verdict: VerificationVerdict::Inconclusive,
+                run_id: None,
             },
         );
         assert_eq!(payload.batches().len(), 1);
@@ -1035,6 +1045,90 @@ mod tests {
         assert_eq!(
             details,
             r#"{"duration_ms":0,"failed_tasks":0,"pass_rate":0,"passed_tasks":0,"total_tasks":0}"#
+        );
+    }
+
+    /// A direct task judgment writes exactly one `vala.verification.results`
+    /// row and no detail row: the task verdict, exact Verifier version and
+    /// subject, null binding facts and window, the application Run's record as
+    /// source, the execution interval, and its one `AssertionResult` as details.
+    #[test]
+    fn direct_task_writes_one_summary_row() {
+        let subject = uid();
+        let application = RunId::new();
+        let input = RunInput::EvalRecord {
+            record_id: application.as_str().to_owned(),
+            event_time: at(10),
+        };
+        let result = AssertionResult {
+            task_id: TaskId::new("no-refund-promise").expect("task id"),
+            passed: false,
+            actual: Some(serde_json::json!("we will refund you")),
+            expected: serde_json::json!("refund"),
+            operator: ComparisonOperator::NotContains,
+            message: None,
+            stage: 0,
+            started_at: at(11),
+            duration_ms: 3,
+        };
+        let payload = ResultPayloadBuilder::new(
+            ResultRun {
+                run_id: Some(&application),
+                verifier_version: "1.0.0",
+                subject_card_uid: &subject,
+                owner_card_uid: None,
+                binding_id: None,
+                trigger: None,
+                input: &input,
+            },
+            "prod/Verifier/no-refund-promise@1.0.0",
+            VerificationResultId::new_v7(),
+            at(20),
+            at(10),
+            at(20),
+        )
+        .build(&VerifierReport::Task(Box::new(result.clone())))
+        .expect("a task report maps");
+        assert_eq!(payload.verdict(), VerificationVerdict::Failed);
+        let [only] = payload.batches() else {
+            panic!("a task writes exactly one batch");
+        };
+        assert_eq!(only.table, "vala.verification.results");
+        let row = &only.batch;
+        assert_eq!(row.num_rows(), 1);
+        for (column, expected) in [
+            ("result_id", Some(payload.result_id().to_string())),
+            ("implementation", Some("task".to_owned())),
+            ("execution_status", Some("completed".to_owned())),
+            ("verdict", Some("failed".to_owned())),
+            ("verifier_version", Some("1.0.0".to_owned())),
+            ("subject_card_uid", Some(subject.to_string())),
+            ("owner_card_uid", None),
+            ("binding_id", None),
+            ("trigger_identity", None),
+            ("source_record_id", Some(application.as_str().to_owned())),
+            (RUN_ID, Some(application.as_str().to_owned())),
+            (
+                CARD_REF,
+                Some("prod/Verifier/no-refund-promise@1.0.0".to_owned()),
+            ),
+        ] {
+            assert_eq!(cell(row, column, 0), expected, "{column}");
+        }
+        let times = |column: &str| {
+            let array = row
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("{column} column exists"))
+                .as_primitive::<TimestampMicrosecondType>();
+            array.is_valid(0).then(|| array.value(0))
+        };
+        assert_eq!(times("window_start"), None);
+        assert_eq!(times("window_end"), None);
+        assert_eq!(times("started_at"), Some(at(10).timestamp_micros()));
+        assert_eq!(times("ended_at"), Some(at(20).timestamp_micros()));
+        assert_eq!(
+            cell(row, "details", 0),
+            Some(canonical_json(&result).expect("result encodes"))
         );
     }
 

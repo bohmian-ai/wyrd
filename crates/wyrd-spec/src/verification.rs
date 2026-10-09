@@ -29,6 +29,7 @@ use crate::vala::eval::EvalTask;
 use crate::vala::eval::ids::TaskId;
 use crate::vala::eval::media::MediaRef;
 use crate::vala::eval::result::AssertionResult;
+use crate::vala::ids::RunId;
 
 /// Longest manual Drift window a caller may request: 31 days.
 ///
@@ -535,6 +536,11 @@ pub struct ExecuteVerificationRequest {
     pub subject_card_uid: CardUid,
     /// The supplied input.
     pub input: DirectVerificationInput,
+    /// The caller's application Run the judgment belongs to, recorded as the
+    /// result's `run_id` and source record; omitted when the caller has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    pub run_id: Option<RunId>,
 }
 
 impl ExecuteVerificationRequest {

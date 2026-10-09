@@ -748,7 +748,7 @@ fn result(
     }
     .to_string();
     let payload = match ResultPayloadBuilder::new(
-        ResultRun::from(run),
+        ResultRun::claimed(run, report.run_id()),
         &verifier_ref,
         result_id,
         event_time,

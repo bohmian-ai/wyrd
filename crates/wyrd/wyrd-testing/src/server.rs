@@ -1202,15 +1202,29 @@ impl WyrdTestServer {
 
     /// Flush the server-owned Scribe through its staged and claim lifecycle.
     ///
-    /// This is intentionally test-tier only: production callers use the
-    /// generation and shutdown coordinators rather than reaching into Scribe.
-    /// The flush itself is the production path, so what a journey observes
-    /// afterwards is what a real pod publishes.
+    /// The server's Scribe outbox settles first, so audit decisions, gateway
+    /// captures, and Verifier results staged before the call reach Scribe
+    /// before it flushes. This is intentionally test-tier only: production
+    /// callers use the generation and shutdown coordinators rather than
+    /// reaching into Scribe. The flush itself is the production path, so what
+    /// a journey observes afterwards is what a real pod publishes.
     ///
     /// # Errors
-    /// Returns an error when the server has no Scribe or a residue claim
-    /// cannot publish.
+    /// Returns an error when staged writes do not reach Scribe or the flush
+    /// does not settle within the bound, the server has no Scribe, or a
+    /// residue claim cannot publish.
     pub async fn flush_bifrost(&self) -> Result<(), WyrdTestServerError> {
+        let unwritten = self
+            .inner
+            .state
+            .scribe_outbox
+            .settle(std::time::Instant::now() + FLUSH_BIFROST_BOUND)
+            .await;
+        if unwritten != 0 {
+            return Err(WyrdTestServerError::Flush(format!(
+                "{unwritten} staged Scribe writes did not settle within {FLUSH_BIFROST_BOUND:?}"
+            )));
+        }
         tokio::time::timeout(
             FLUSH_BIFROST_BOUND,
             self.inner.state.flush_scribe_for_test(),

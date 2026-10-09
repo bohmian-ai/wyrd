@@ -41,6 +41,7 @@ use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_spec::vala::managed_columns::CARD_UID;
 use wyrd_storage::tenant_path;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::WyrdTestServer;
@@ -68,8 +69,8 @@ const MISSING_TRACE: &str = "6c9f000809149214e37ac744924fd71d";
 /// Name of the one span exported under [`LANDED_TRACE`].
 const SPAN_NAME: &str = "judge-call";
 
-/// Write the Service graph: two Agents, five Eval Verifiers, the judge Prompt,
-/// and one Operator. Returns the Service path.
+/// Write the Service graph: two Agents, five Eval Verifiers, one explicit-only
+/// task Verifier, the judge Prompt, and one Operator. Returns the Service path.
 ///
 /// The judge Prompt is native OpenAI Chat with a JSON-schema response and one
 /// `${media:shot}` placeholder, built through Skald rather than hand-written.
@@ -152,8 +153,12 @@ fn write_graph(root: &Path) -> PathBuf {
             ),
         ),
         (
+            "task.yaml",
+            "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: eval-task\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: task\n    spec: {kind: assertion, id: x_is_one, context_path: $.x, operator: equals, expected: 1}\n".to_owned(),
+        ),
+        (
             "service.yaml",
-            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: eval-service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./gated.yaml\n          runs_on: {kind: observations_ready}\n          on_failure: [./operator.yaml]\n        - verifier: ./ungated.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./skipped.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./sampled.yaml\n          runs_on: {kind: observations_ready}\n    - alias: traced\n      ref: ./traced-agent.yaml\n      verified_by:\n        - verifier: ./traced.yaml\n          runs_on: {kind: observations_ready}\n".to_owned(),
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: eval-service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./gated.yaml\n          runs_on: {kind: observations_ready}\n          on_failure: [./operator.yaml]\n        - verifier: ./ungated.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./skipped.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./sampled.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./task.yaml\n    - alias: traced\n      ref: ./traced-agent.yaml\n      verified_by:\n        - verifier: ./traced.yaml\n          runs_on: {kind: observations_ready}\n".to_owned(),
         ),
     ];
     for (name, body) in files {
@@ -513,8 +518,9 @@ async fn assert_unresulted(
         server,
         tenant,
         format!(
-            "SELECT result_id FROM vala.verification.results WHERE run_id = '{}'",
-            run.run
+            "SELECT result_id FROM vala.verification.results \
+             WHERE {CARD_UID} = '{}' AND source_record_id = '{}'",
+            run.verifier_uid, run.record_id
         ),
     )
     .await?;
@@ -822,6 +828,21 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         if errored.state.error_code.as_deref() != Some("eval_execution_failed") {
             return Err(format!("the error is not an execution failure: {errored:?}").into());
         }
+    }
+    // Every result, sampled out or scored, records the application Run that
+    // wrote its observation, never the Verifier run.
+    let correlated = texts(
+        &query(
+            &server,
+            tenant,
+            "SELECT DISTINCT run_id FROM vala.verification.results".to_owned(),
+        )
+        .await?,
+    )?;
+    if correlated != [Some(run.run_id().as_str().to_owned())] {
+        return Err(
+            format!("results are not correlated to the application Run: {correlated:?}").into(),
+        );
     }
 
     // The frozen record identity and the committed event time of the row.
@@ -2436,6 +2457,106 @@ async fn eval_runs_follow_the_writing_owner() -> Result<(), ServerJourneyError> 
     let expected = vec![(owner_a, from_a), ("eval-owner-b".to_owned(), from_b)];
     if runs != expected {
         return Err(format!("expected one run per writer's own binding, read {runs:?}").into());
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// A direct task judgment through `observe.verify` records exactly one
+/// `vala.verification.results` row correlated to the caller's application
+/// Run, with no detail row, no verifier run, and no dispatch.
+///
+/// The row carries `result_id = execution_id`, the task verdict, the exact
+/// Verifier version and subject, null binding facts and window, the Run as
+/// both `run_id` and `source_record_id`, the execution interval, and the
+/// canonical `AssertionResult` as `details`.
+///
+/// # Errors
+/// Returns server, registration, query, or fixture errors, or a description of
+/// the first recorded value that does not match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn direct_task_judgment_records_one_correlated_result() -> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let service = write_graph(root.path());
+    let bundle = root.path().join("bundle");
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let admin = connect(
+        &server,
+        &api_key(
+            server
+                .bootstrap_service("direct_task_admin", &["admin"])
+                .await?,
+        ),
+    );
+    register(&admin, &service, &bundle).await;
+    let state = WyrdState::from_path_with_client(&bundle, admin.clone())?;
+    let run = state.run();
+    let agent = run.for_card("agent")?;
+    let judgment = agent
+        .observe()
+        .verify("eval-task", &json!({ "x": 2 }))
+        .await?;
+    server.flush_bifrost().await?;
+
+    let result = judgment.execution_id.as_uuid();
+    let cell =
+        async |column: &str, table: &str| -> Result<Vec<Option<String>>, ServerJourneyError> {
+            texts(
+                &query(
+                    &server,
+                    tenant,
+                    format!("SELECT {column} FROM {table} WHERE result_id = '{result}'"),
+                )
+                .await?,
+            )
+        };
+    let application = Some(run.run_id().as_str().to_owned());
+    let subject = agent.subject().uid.as_ref().map(ToString::to_string);
+    for (column, expected) in [
+        ("implementation", Some("task".to_owned())),
+        ("execution_status", Some("completed".to_owned())),
+        ("verdict", Some("failed".to_owned())),
+        ("verifier_version", Some("1.0.0".to_owned())),
+        ("subject_card_uid", subject),
+        ("owner_card_uid", None),
+        ("binding_id", None),
+        ("trigger_identity", None),
+        ("CAST(window_start AS VARCHAR)", None),
+        ("source_record_id", application.clone()),
+        ("run_id", application),
+    ] {
+        let read = cell(column, "vala.verification.results").await?;
+        if read != [expected.clone()] {
+            return Err(format!("{column}: expected [{expected:?}], read {read:?}").into());
+        }
+    }
+    let details = cell("details", "vala.verification.results").await?;
+    let [Some(details)] = details.as_slice() else {
+        return Err(format!("expected one details payload, read {details:?}").into());
+    };
+    let details: Value = serde_json::from_str(details)?;
+    if details["task_id"] != "x_is_one" || details["passed"] != false || details["actual"] != 2 {
+        return Err(format!("details are not the AssertionResult: {details}").into());
+    }
+    let intervals = cell(
+        "CAST(started_at <= ended_at AS VARCHAR)",
+        "vala.verification.results",
+    )
+    .await?;
+    if intervals != [Some("true".to_owned())] {
+        return Err(format!("the execution interval is not ordered: {intervals:?}").into());
+    }
+    if !cell("result_id", "vala.eval.result_items")
+        .await?
+        .is_empty()
+    {
+        return Err("a direct task wrote a detail row".into());
+    }
+    if !seed.observation_runs().await?.is_empty() {
+        return Err("a direct task created a verifier run".into());
     }
     server.shutdown().await?;
     Ok(())

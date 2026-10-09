@@ -332,9 +332,10 @@ impl Observe<'_> {
     /// to this view's subject in the hydrated graph; the subject is always
     /// this view's. An Eval Verifier takes one context object, in the forms
     /// [`Observe::eval`] accepts; a Drift Verifier takes a non-empty sequence
-    /// of feature rows, in the forms [`Observe::drift`] accepts. It judges
-    /// only: no observation, run, Operator dispatch, or Bifrost write, and
-    /// Bifrost need not be started. A `failed` verdict is a normal return.
+    /// of feature rows, in the forms [`Observe::drift`] accepts. It creates
+    /// no observation, run, or Operator dispatch, and Bifrost need not be
+    /// started; the server records the judgment as one result correlated to
+    /// this Run. A `failed` verdict is a normal return.
     ///
     /// # Arguments
     /// * `verifier` - The `metadata.name` of a Verifier bound to this view's subject.
@@ -427,6 +428,7 @@ impl Observe<'_> {
             verifier_uid: bound.verifier_uid,
             subject_card_uid: bound.subject_uid,
             input: verify::direct_input(bound.implementation, input, media)?,
+            run_id: Some(self.run.run_id.clone()),
         };
         verify::execute(state.client()?, &request).await
     }

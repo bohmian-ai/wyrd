@@ -172,7 +172,7 @@ impl EvalEngine {
                 Ok::<_, ReadStart>((reader, record))
             })
             .await;
-        let (reader, record) = match read {
+        let (reader, (record, observed_run)) = match read {
             Ok(read) => read,
             Err(ReadStart::Authority(error)) => {
                 return EngineOutcome::Retry(failed(
@@ -192,6 +192,7 @@ impl EvalEngine {
                 return EngineOutcome::Completed(VerifierReport::Eval {
                     report: EvalReport::default(),
                     verdict: VerificationVerdict::Inconclusive,
+                    run_id: observed_run,
                 });
             }
             Err(error) => {
@@ -229,8 +230,15 @@ impl EvalEngine {
                 }
             }
         }
-        self.score(tenant, run, spec, &record, traces, telemetry)
+        match self
+            .score(tenant, run, spec, &record, traces, telemetry)
             .await
+        {
+            EngineOutcome::Completed(report) => {
+                EngineOutcome::Completed(report.with_run(observed_run))
+            }
+            outcome => outcome,
+        }
     }
 
     /// Score `record` through the one Eval execution path and map its report.
@@ -562,7 +570,8 @@ impl BifrostReader {
     }
 
     /// Read one committed observation of `subject` by its record ID, pruned
-    /// to the UTC day of its frozen server `event_time`.
+    /// to the UTC day of its frozen server `event_time`, with the managed
+    /// application `run_id` that wrote it (`None` when the row names none).
     ///
     /// # Errors
     /// Returns [`ReadError::Admission`] when Bifrost refuses the read at
@@ -573,10 +582,10 @@ impl BifrostReader {
         subject: &str,
         record_id: &str,
         event_time: DateTime<Utc>,
-    ) -> Result<EvalRecordObservation, ReadError> {
+    ) -> Result<(EvalRecordObservation, Option<RunId>), ReadError> {
         let (start, end) = utc_day(event_time);
         let batches = Box::pin(self.query(format!(
-            "SELECT record_id, session_id, context, trace_id, span_id, created_at, media \
+            "SELECT record_id, session_id, context, trace_id, span_id, created_at, media, run_id \
                  FROM vala.eval.observations \
                  WHERE card_uid = '{}' AND record_id = '{}' \
                    AND wyrd_event_time >= TIMESTAMP '{start}' \
@@ -617,7 +626,8 @@ impl BifrostReader {
                 .transpose()
                 .map(Option::unwrap_or_default)
         };
-        serde_json::from_value(json!({
+        let run_id = text(batch, "run_id", 0)?.map(RunId::from_string);
+        let record = serde_json::from_value(json!({
             "record_id": text(batch, "record_id", 0)?,
             "session_id": text(batch, "session_id", 0)?,
             "context": json_text("context")?,
@@ -626,7 +636,8 @@ impl BifrostReader {
             "created_at": created_at,
             "media": json_text("media")?,
         }))
-        .map_err(|error| format!("record {record_id} does not decode: {error}").into())
+        .map_err(|error| format!("record {record_id} does not decode: {error}"))?;
+        Ok((record, run_id))
     }
 
     /// Read the visible spans of `trace_id` received from the start of the

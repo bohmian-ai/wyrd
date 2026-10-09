@@ -36,7 +36,7 @@ use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
-use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
+use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::eval::TaskId;
@@ -114,11 +114,11 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     let task = tokio::spawn(runtime.run(stop.clone()));
 
     let deadline = tokio::time::Instant::now() + WAIT;
-    let (run, row) = loop {
+    let row = loop {
         if let Some(run) = seed.runs().await?.first().copied() {
             let row = seed.run(run).await?;
             if row.status != "pending" && row.status != "running" {
-                break (run, row);
+                break row;
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -132,12 +132,22 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         return Err(format!("the run settled {row:?}").into());
     };
 
+    // The runner stages its result on its own outbox after settling the run;
+    // it reaches the peer Scribe only once that outbox drains.
+    let unwritten = oracle
+        .state()
+        .scribe_outbox
+        .settle(std::time::Instant::now() + WAIT)
+        .await;
+    if unwritten != 0 {
+        return Err(format!("{unwritten} results never reached the peer Scribe").into());
+    }
     scribe.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
     let system = seed.system_principal();
     let identity = |alias: &str| {
         format!(
-            "{alias}{RUN_ID} = '{run}' AND {alias}result_id = '{result}' \
+            "{alias}{RUN_ID} IS NULL AND {alias}result_id = '{result}' \
              AND {alias}{PRINCIPAL_ID} = '{system}' AND {alias}{CARD_UID} = '{verifier}' \
              AND {alias}subject_card_uid = '{subject}' AND {alias}owner_card_uid = '{owner}' \
              AND {alias}binding_id = '{binding}'"
@@ -145,7 +155,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     };
     let checks = [
         (
-            format!("SELECT result_id FROM vala.verification.results WHERE {RUN_ID} = '{run}'"),
+            format!("SELECT result_id FROM vala.verification.results WHERE result_id = '{result}'"),
             1,
             "one published summary for the run",
         ),
@@ -158,7 +168,9 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
             "the summary carries every exact identity",
         ),
         (
-            format!("SELECT result_id FROM vala.drift.result_features WHERE {RUN_ID} = '{run}'"),
+            format!(
+                "SELECT result_id FROM vala.drift.result_features WHERE result_id = '{result}'"
+            ),
             2,
             "two published feature rows for the run",
         ),
@@ -166,7 +178,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
             format!(
                 "SELECT f.result_id FROM vala.drift.result_features f \
                  JOIN vala.verification.results r \
-                   ON f.result_id = r.result_id AND f.{RUN_ID} = r.{RUN_ID} \
+                   ON f.result_id = r.result_id \
                   AND f.{WYRD_EVENT_TIME} = r.{WYRD_EVENT_TIME} \
                   AND f.{PRINCIPAL_ID} = r.{PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
                  WHERE {}",
@@ -755,6 +767,7 @@ impl<'a> ResultLayoutJourney<'a> {
                         }],
                     },
                     verdict: VerificationVerdict::Inconclusive,
+                    run_id: None,
                 },
             ),
         };
@@ -766,7 +779,7 @@ impl<'a> ResultLayoutJourney<'a> {
         .to_string();
         let payload = ResultPayloadBuilder::new(
             ResultRun {
-                run_id: Some(VerificationRunId::new_v7()),
+                run_id: None,
                 verifier_version: "1.0.0",
                 subject_card_uid: &self.subject,
                 owner_card_uid: Some(&self.subject),

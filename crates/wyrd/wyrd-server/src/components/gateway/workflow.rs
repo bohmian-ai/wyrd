@@ -107,6 +107,7 @@ impl WyrdGatewayCaller for ServerWyrdGatewayCaller {
             deployment: None,
             stream: false,
             timeout: call.timeout,
+            subject: None,
         };
         let outcome = GatewayInvocation::new(&self.state)
             .run(&self.caller, request, false, cancellation)

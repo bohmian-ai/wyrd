@@ -267,6 +267,7 @@ fn request(requested: &str, bound: Option<(u64, u64)>, timeout: Duration) -> Gat
             ]
         }),
         timeout,
+        subject: None,
     }
 }
 
@@ -1627,6 +1628,7 @@ async fn gateway_onboards_compatible_provider_at_runtime() {
         stream: false,
         usage_bound: None,
         timeout: Duration::from_secs(10),
+        subject: None,
     };
 
     let response = GatewayInvocation::new(&state)
@@ -3095,6 +3097,144 @@ async fn gateway_capture_follows_policy_and_never_affects_the_call() {
     );
 }
 
+/// Proves a call's Run and Card attribution is authorized before dispatch
+/// and recorded on its captured row.
+///
+/// A caller bound to no Card attributes a registered Agent: the call row's
+/// `card_ref` names that Agent with its registry UID, its `run_id` is the
+/// Run, and Scribe receives the frame scoped to exactly that Card. An
+/// unregistered Card is refused with `WYRD_VALA_403_CARD_UNRESOLVED`, and a
+/// Card-bound Agent naming a Card outside its signed scope with
+/// `WYRD_VALA_403_BIFROST_CARD_SCOPE`; neither refusal dispatches or
+/// captures.
+///
+/// # Panics
+///
+/// Panics when the fixture, an answer, a refusal code, the dispatch count, or
+/// a captured correlation value differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gateway_correlation_is_authorized_before_dispatch_and_captured() {
+    use arrow::array::AsArray as _;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::vala::ids::RunId;
+
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let dispatch = Scripted::shared();
+    let (state, scribe) = RecordingScribe::attach(replica(&fixture, dispatch.clone()).await);
+    configure(&state, tenant, json!([]), json!([]), "allow_unpriced").await;
+    GatewayAdministration::new(&state)
+        .put_capture(
+            &admin(tenant),
+            GatewayCapturePolicyWrite {
+                mode: GatewayCaptureMode::Metadata,
+                payload_fields: BTreeSet::new(),
+            },
+        )
+        .await
+        .expect("metadata policy stores");
+    let agent: CardRef = "prod/Agent/support-agent@1.0.0".parse().expect("agent ref");
+    let mut conn = fixture.tenant_conn_for(tenant).await.expect("tenant conn");
+    wyrd_dev_fixtures::cards::seed_backing_card(&mut conn, &agent, Uuid::now_v7()).await;
+    let uid = wyrd_sql::queries::cards::get_card_by_ref(
+        &mut conn,
+        agent.kind.clone(),
+        agent.space.as_ref().expect("space"),
+        &agent.name,
+        &agent.version,
+    )
+    .await
+    .expect("agent registered")
+    .card_uid;
+    conn.commit().await.expect("seed commits");
+    let run = RunId::new();
+    let call = |card: &CardRef| GatewayCallRequest {
+        subject: Some(super::GatewayCallSubject {
+            run_id: run.clone(),
+            card: card.clone(),
+        }),
+        ..request("acme/a", Some((1000, 500)), Duration::from_secs(10))
+    };
+    let invocation = GatewayInvocation::new(&state);
+    let unbound = invoker(tenant, 1, [provider_access()]);
+
+    dispatch.push(Step::Return(completed(100, 50)));
+    invocation
+        .invoke(&unbound, call(&agent))
+        .await
+        .expect("an attributed call completes");
+    drain_gateway(&state).await;
+    let received = scribe.received();
+    let calls = received
+        .iter()
+        .find(|frame| frame.table == "vala.gateway.calls")
+        .expect("the call row delivers");
+    let attributed = CardRef {
+        uid: Some(uid),
+        ..agent.clone()
+    };
+    assert_eq!(
+        calls.card_scope,
+        CardRefScope::own(&attributed).as_slice(),
+        "Scribe stamps card_uid from exactly the attributed Agent"
+    );
+    let row =
+        arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(calls.ipc.clone()), None)
+            .expect("the call stream opens")
+            .next()
+            .expect("one batch")
+            .expect("the batch decodes");
+    let text = |name: &str| {
+        row.column_by_name(name)
+            .expect(name)
+            .as_string::<i32>()
+            .value(0)
+            .to_owned()
+    };
+    assert_eq!(text("card_ref"), attributed.to_string());
+    assert_eq!(text("run_id"), run.as_str());
+
+    let unregistered: CardRef = "prod/Agent/ghost@1.0.0".parse().expect("ghost ref");
+    let scoped = Caller {
+        principal: Principal::new(
+            principal(2),
+            PrincipalKind::Agent {
+                card_ref: unregistered.clone(),
+                card_ref_scope: CardRefScope::own(&unregistered),
+            },
+            tenant,
+            Vec::<RoleRef>::new(),
+            PermissionSet::from_iter([provider_access()]),
+        ),
+        ..invoker(tenant, 2, [])
+    };
+    for (caller, card, code) in [
+        (&unbound, &unregistered, "WYRD_VALA_403_CARD_UNRESOLVED"),
+        (&scoped, &agent, "WYRD_VALA_403_BIFROST_CARD_SCOPE"),
+    ] {
+        let refused = invocation
+            .invoke(caller, call(card))
+            .await
+            .expect_err("an unauthorized attribution is refused");
+        assert_eq!(refused.code(), code);
+    }
+    drain_gateway(&state).await;
+    assert_eq!(
+        dispatch.seen().len(),
+        1,
+        "no refused attribution dispatched"
+    );
+    assert_eq!(
+        scribe
+            .received()
+            .iter()
+            .filter(|frame| frame.table == "vala.gateway.calls")
+            .count(),
+        1,
+        "no refused attribution captured"
+    );
+}
+
 /// Builds a gateway replica whose Bifrost catalog is bound to `fixture`'s own
 /// Postgres.
 ///
@@ -4087,6 +4227,7 @@ async fn gateway_observations_are_bounded_correlated_and_secret_free() {
         stream: false,
         usage_bound: None,
         timeout: Duration::from_secs(10),
+        subject: None,
     };
     let invocation = GatewayInvocation::new(&state);
 

@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
+use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::Schema;
 use arrow::json::ReaderBuilder;
 use base64::Engine;
@@ -46,6 +46,7 @@ use wyrd_tonic::otlp::trace::v1::span::SpanKind;
 use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
+use super::invocation::GatewayCallSubject;
 use crate::scribe_outbox::ScribeTable;
 use crate::state::AppState;
 
@@ -143,6 +144,8 @@ pub(crate) struct CallFacts {
     pub(crate) entries: Vec<GatewayAccountingEntryV1>,
     /// Capture policy admitted with the call.
     pub(crate) policy: GatewayCapturePolicy,
+    /// Authorized Run and Card attribution, its Card carrying the UID.
+    pub(crate) subject: Option<GatewayCallSubject>,
     /// Unredacted request content, present only when the policy selects it.
     pub(crate) request: Option<Value>,
     /// Response content, present only when the policy selects it: a
@@ -171,6 +174,8 @@ pub struct CallCapture {
     spans: Vec<GatewayAttemptSpanFieldsV1>,
     /// Request that admitted the call, published with both batches.
     request_id: RequestId,
+    /// Authorized Run and Card the row is correlated to.
+    subject: Option<GatewayCallSubject>,
 }
 
 impl CallCapture {
@@ -263,11 +268,16 @@ impl CallCapture {
             objects,
             spans,
             request_id: facts.request_id,
+            subject: facts.subject,
         })
     }
 
     /// Builds the one-row `vala.gateway.calls` batch over the table's user
-    /// fields followed by its null `card_ref` and `run_id` correlation inputs.
+    /// fields followed by its `card_ref` and `run_id` correlation inputs.
+    ///
+    /// The correlation inputs carry the authorized subject, whose `card_ref`
+    /// text includes the Card UID Scribe stamps as `card_uid`, or are null for
+    /// an uncorrelated call.
     ///
     /// # Errors
     ///
@@ -281,11 +291,20 @@ impl CallCapture {
         decoder
             .serialize(std::slice::from_ref(&self.payload))
             .map_err(|_| CaptureDrop::Projection)?;
-        decoder
+        let batch = decoder
             .flush()
             .ok()
             .flatten()
-            .ok_or(CaptureDrop::Projection)
+            .ok_or(CaptureDrop::Projection)?;
+        let Some(subject) = &self.subject else {
+            return Ok(batch);
+        };
+        let mut columns = batch.columns().to_vec();
+        let user = columns.len() - 2;
+        columns.truncate(user);
+        columns.push(Arc::new(StringArray::from(vec![subject.card.to_string()])));
+        columns.push(Arc::new(StringArray::from(vec![subject.run_id.as_str()])));
+        RecordBatch::try_new(batch.schema(), columns).map_err(|_| CaptureDrop::Projection)
     }
 
     /// Builds the canonical `vala.traces.spans` batch of the attempt spans.
@@ -916,6 +935,7 @@ pub(crate) mod tests {
             }],
             entries: Vec::new(),
             policy,
+            subject: None,
             request: Some(json!({
                 "model": "acme/a",
                 "api_key": CANARY,
@@ -1192,7 +1212,8 @@ pub(crate) mod recording {
         pub(crate) tenant: DataTenantId,
         /// Principal the frame was submitted under.
         pub(crate) principal: PrincipalId,
-        /// Card scope of that principal, from which Scribe stamps `card_uid`.
+        /// Card scope Scribe stamps `card_uid` from: the frame's attributed
+        /// Cards when it carries them, otherwise its principal's scope.
         pub(crate) card_scope: Vec<CardRef>,
         /// Fully qualified destination table.
         pub(crate) table: String,
@@ -1213,8 +1234,9 @@ pub(crate) mod recording {
                 tenant: frame.authenticated_tenant,
                 principal: frame.principal.id,
                 card_scope: frame
-                    .principal
-                    .card_ref_scope()
+                    .attributed_cards
+                    .as_ref()
+                    .or_else(|| frame.principal.card_ref_scope())
                     .map(|scope| scope.as_slice().to_vec())
                     .unwrap_or_default(),
                 table: frame.table.fqn(),

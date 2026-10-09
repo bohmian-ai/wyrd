@@ -34,6 +34,7 @@ use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeError, ScribeIngressFrame};
+use vala_bifrost_redux::gate::attribution::native_card_refs;
 use vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
@@ -392,7 +393,9 @@ impl ScribeBatch {
     ///
     /// An audit frame is submitted under the platform audit principal, the
     /// one principal Scribe admits for the system owner's audit history; a
-    /// capture frame under the reserved capture principal; a result frame
+    /// capture frame under the reserved capture principal, attributed to the
+    /// UID-bearing Cards its rows name, which the gateway authorized against
+    /// the caller before the call; a result frame
     /// under the tenant SYSTEM principal whose Card scope is exactly the
     /// Verifier, from which Scribe stamps `card_uid`. The principal carries no
     /// permission: all are server-internal writes that evaluate none, and its
@@ -410,8 +413,17 @@ impl ScribeBatch {
                 },
             ),
         };
+        let attributed_cards = match self.verifier {
+            None => {
+                let cards = native_card_refs(&self.ipc);
+                cards.split_first().map(|(root, rest)| {
+                    CardRefScope::from_root_and_members(root, rest.iter().cloned())
+                })
+            }
+            Some(_) => None,
+        };
         ScribeIngressFrame {
-            attributed_cards: None,
+            attributed_cards,
             principal: Principal::new(id, kind, self.tenant, Vec::new(), PermissionSet::new()),
             authenticated_tenant: self.tenant,
             table: self.table.table_ref(),

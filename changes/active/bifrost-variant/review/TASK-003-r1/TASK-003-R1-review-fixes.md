@@ -414,6 +414,41 @@ distributed queries.**
   `mise.toml`. The Step 5 numbers in the plan that are labelled `dist` were
   actually built with the release profile, so relabel them.
 
+### Group 7: Variant shred/unshred benchmark in Wyrd (user-directed)
+
+- **Purpose:** prove end to end, through Wyrd's read path, that shredding
+  and unshredding work and meet the latency gates.
+- **Model:** the DataFusion fork's `datafusion/core/benches/parquet_variant_query.rs`.
+  It compares the same objects written unshredded vs shredded, with the same
+  SQL, the same rows and the same build.
+- **Where:** add a `variant` group to Wyrd's existing
+  `crates/vala/vala-bifrost-redux/benches/bifrost_reads` bench, reusing its
+  harness, its mimalloc setup and its plain-DataFusion vs Wyrd reporting.
+  Do not create a new bench crate.
+- **Data:**
+  - Copy the DataFusion bench's three shapes (narrow, wide, nested), their
+    row counts, their 16 KiB per-row strings and their six SQL cases each
+    (`select_variant`, `select_all`, the single-key and two-key cases, and
+    the inner-object cases), word for word.
+  - Write the files through Bifrost's own Variant write path twice: once
+    with shredding off (unshredded) and once with it on (shredded, onto the
+    objects' own type).
+  - Both tables declare the canonical, unshredded Variant.
+- **Cases:** each `{shape}/{layout}/{case}` is timed two ways:
+  - read by plain DataFusion over the same files;
+  - read through Wyrd.
+
+  Each also gets a planning-only timing, as the DataFusion bench does.
+- **Gates,** checked from the report, p50 and p95:
+  - shredded single-key reads are faster than unshredded;
+  - shredded whole-Variant reads (`select_variant`, `select_all`) are at
+    most 2x unshredded;
+  - planning is equal across layouts;
+  - Wyrd is within noise of plain DataFusion on the same files.
+- **Run:** `mise run bench:bifrost:reads`, with the `dist` profile from
+  FIND-003-19. Record the table in the plan's Step 5 evidence, replacing
+  the mislabeled run.
+
 ## Done when
 
 - Every new test above passes, with output shown in the exact

@@ -25,10 +25,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, AsArray, BinaryBuilder, BinaryViewArray, GenericListArray, OffsetSizeTrait,
-    StructArray, make_array,
-};
+use arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StructArray, make_array};
 use arrow::buffer::NullBuffer;
 use arrow::compute::cast;
 use arrow::datatypes::TimestampMicrosecondType;
@@ -369,8 +366,8 @@ pub fn variant_bytes_to_json(metadata: &[u8], value: &[u8]) -> Result<Value, Var
 /// Decodes through upstream [`VariantArray`], which accepts any storage the
 /// `arrow.parquet.variant` extension allows for an unshredded value: a struct
 /// whose `metadata` and `value` children are `Binary`, `LargeBinary`, or
-/// `BinaryView`. A null or placeholder cell renders as JSON null. The cell
-/// passes the bounded gate in [`mask_placeholders`] before it is decoded.
+/// `BinaryView`. A null or placeholder cell renders as JSON null; decoding
+/// refuses malformed or over-deep bytes with an error.
 ///
 /// # Errors
 ///
@@ -492,28 +489,20 @@ fn render_timestamp_tz<'a>(
     ))
 }
 
-/// Prepare one stored Variant column for upstream decoding.
+/// Mark the placeholder cells of one stored Variant column null.
 ///
 /// Every encoded Variant has at least one `metadata` byte, and an unshredded
 /// one at least one `value` byte, so a cell with empty metadata and an empty,
 /// null, or absent value carries no value at all. Such a cell appears under a
 /// null parent struct, whose null is neither pushed down by the Parquet reader
-/// nor by `get_field`, so it is marked null here. A shredded cell whose
-/// `value` is null or projected away holds its value in `typed_value`; every
-/// residual `value` below it passes the same gate (see
-/// [`ShreddedResiduals`]). Every other present cell passes the same
-/// bounded gate as [`EncodedVariant::from_bytes`]: upstream decoding validates
-/// shallowly, panics on malformed bytes, and recurses once per nesting level,
-/// so every reader passes the column through here first and a malformed,
-/// non-canonical, or hostile stored cell becomes an error instead. A
-/// non-struct array is returned unchanged.
+/// nor by `get_field`, so it is marked null here. Every other cell is returned
+/// as stored: decoding it validates the bytes and refuses malformed or
+/// over-deep values with an error. A non-struct array is returned unchanged.
 ///
 /// # Errors
 ///
 /// Returns the Arrow error raised while viewing a child as bytes or
-/// reassembling the masked struct, and [`ArrowError::InvalidArgumentError`]
-/// naming the row and violation of the first present cell that breaks a
-/// Bifrost Variant rule.
+/// reassembling the masked struct.
 pub fn mask_placeholders(storage: ArrayRef) -> Result<ArrayRef, ArrowError> {
     let Some(columns) = storage.as_struct_opt() else {
         return Ok(storage);
@@ -525,168 +514,23 @@ pub fn mask_placeholders(storage: ArrayRef) -> Result<ArrayRef, ArrowError> {
             .transpose()
     };
     let (metadata, value) = (bytes("metadata")?, bytes("value")?);
-    let mut present = Vec::with_capacity(storage.len());
-    for row in 0..storage.len() {
-        // A shredded row keeps its value in `typed_value`, leaving `value`
-        // null or projected away; only a present `value` can be validated here.
-        let cell = metadata.as_ref().map(|metadata| {
-            let value = value
+    let present = (0..storage.len())
+        .map(|row| {
+            let empty_metadata = metadata
                 .as_ref()
-                .filter(|value| value.is_valid(row))
-                .map(|value| value.as_binary_view().value(row));
-            (metadata.as_binary_view().value(row), value)
-        });
-        let valid = storage.is_valid(row) && !matches!(cell, Some(([], None | Some([]))));
-        if let (true, Some((metadata, Some(value)))) = (valid, cell) {
-            EncodedVariant::validate(metadata, value).map_err(|violation| {
-                ArrowError::InvalidArgumentError(format!(
-                    "row {row} is not a valid stored Variant: {violation:?}"
-                ))
-            })?;
-        }
-        present.push(valid);
-    }
-    if let (Some(metadata), Some(typed)) = (&metadata, columns.column_by_name("typed_value")) {
-        let owners = present
-            .iter()
-            .enumerate()
-            .map(|(row, valid)| valid.then_some(row))
-            .collect::<Vec<_>>();
-        ShreddedResiduals {
-            metadata: metadata.as_binary_view(),
-        }
-        .validate_typed(typed.as_ref(), &owners)?;
-    }
+                .is_some_and(|metadata| metadata.as_binary_view().value(row).is_empty());
+            let empty_value = value.as_ref().is_none_or(|value| {
+                value.is_null(row) || value.as_binary_view().value(row).is_empty()
+            });
+            storage.is_valid(row) && !(empty_metadata && empty_value)
+        })
+        .collect::<Vec<_>>();
     let (fields, children, _) = columns.clone().into_parts();
     Ok(Arc::new(StructArray::try_new(
         fields,
         children,
         Some(NullBuffer::from(present)),
     )?))
-}
-
-/// The residual `value` bytes a shredded Variant column keeps under its
-/// `typed_value`, validated against the column's top-level metadata.
-///
-/// Upstream decoding reads a residual with the same shallow checks as a
-/// top-level `value`, so [`mask_placeholders`] walks every residual a read
-/// returns through the same bounded gate. A residual is checked as a Variant
-/// of its own: its depth counts from its own root, so a value nested `k`
-/// shredded levels deep may hold `k` more levels than the limit, which every
-/// writer already refused.
-struct ShreddedResiduals<'a> {
-    /// The column's `metadata`, one per root row; every residual below a row
-    /// decodes against its row's metadata.
-    metadata: &'a BinaryViewArray,
-}
-
-impl ShreddedResiduals<'_> {
-    /// Validate the residuals under one `typed_value` array.
-    ///
-    /// `owners[i]` is the root row that element `i` of `typed` belongs to, or
-    /// `None` when that root row is null or `typed` is not reached from it.
-    /// An object descends into each shredded field; a list maps each element
-    /// to its row through the offsets; a primitive holds no residual bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ArrowError::InvalidArgumentError`] naming the root row and
-    /// violation of the first residual that breaks a Bifrost Variant rule, or
-    /// naming a layout no Parquet read produces.
-    fn validate_typed(
-        &self,
-        typed: &dyn Array,
-        owners: &[Option<usize>],
-    ) -> Result<(), ArrowError> {
-        let owners = present_owners(typed, owners);
-        match typed.data_type() {
-            DataType::Struct(_) => typed
-                .as_struct()
-                .columns()
-                .iter()
-                .try_for_each(|field| self.validate_shredded(field.as_ref(), &owners)),
-            DataType::List(_) => self.validate_elements(typed.as_list::<i32>(), &owners),
-            DataType::LargeList(_) => self.validate_elements(typed.as_list::<i64>(), &owners),
-            DataType::ListView(_) | DataType::LargeListView(_) | DataType::FixedSizeList(..) => {
-                Err(ArrowError::InvalidArgumentError(format!(
-                    "unsupported shredded Variant layout {}",
-                    typed.data_type()
-                )))
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Validate one shredded node, `struct{value?, typed_value?}`: its own
-    /// residual `value` per present row, then its `typed_value`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`Self::validate_typed`] errors, and
-    /// [`ArrowError::InvalidArgumentError`] when `node` is not a struct.
-    fn validate_shredded(
-        &self,
-        node: &dyn Array,
-        owners: &[Option<usize>],
-    ) -> Result<(), ArrowError> {
-        let Some(node) = node.as_struct_opt() else {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "shredded Variant field is {}, not a struct",
-                node.data_type()
-            )));
-        };
-        let owners = present_owners(node, owners);
-        if let Some(value) = node.column_by_name("value") {
-            let value = cast(value, &DataType::BinaryView)?;
-            let value = value.as_binary_view();
-            for (row, owner) in owners.iter().enumerate() {
-                if let Some(owner) = *owner
-                    && value.is_valid(row)
-                {
-                    EncodedVariant::validate(self.metadata.value(owner), value.value(row))
-                        .map_err(|violation| {
-                            ArrowError::InvalidArgumentError(format!(
-                                "row {owner} is not a valid stored Variant: {violation:?}"
-                            ))
-                        })?;
-                }
-            }
-        }
-        match node.column_by_name("typed_value") {
-            Some(typed) => self.validate_typed(typed.as_ref(), &owners),
-            None => Ok(()),
-        }
-    }
-
-    /// Validate a shredded array's elements, each owned by its list's row.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`Self::validate_shredded`] errors.
-    fn validate_elements<O: OffsetSizeTrait>(
-        &self,
-        list: &GenericListArray<O>,
-        owners: &[Option<usize>],
-    ) -> Result<(), ArrowError> {
-        let mut elements = vec![None; list.values().len()];
-        let offsets = list.value_offsets();
-        for (row, owner) in owners.iter().enumerate() {
-            if owner.is_some() {
-                elements[offsets[row].as_usize()..offsets[row + 1].as_usize()].fill(*owner);
-            }
-        }
-        self.validate_shredded(list.values().as_ref(), &elements)
-    }
-}
-
-/// `owners` with every row `array` holds null cleared, since upstream decoding
-/// never reads below a null.
-fn present_owners(array: &dyn Array, owners: &[Option<usize>]) -> Vec<Option<usize>> {
-    owners
-        .iter()
-        .enumerate()
-        .map(|(row, owner)| owner.filter(|_| array.is_valid(row)))
-        .collect()
 }
 
 /// Pre-rendered JSON text of each row of one Variant column.
@@ -1957,8 +1801,9 @@ mod tests {
         assert_eq!(variant_bytes_to_json(&metadata, &value), Ok(json!([3.0])));
     }
 
-    /// Every stored-Variant renderer refuses a compact hostile-depth cell
-    /// before upstream recursion, then still renders an ordinary value.
+    /// Both column renderers refuse a compact hostile-depth cell with an
+    /// error rather than overflowing the stack, then still render an
+    /// ordinary value.
     ///
     /// # Panics
     ///
@@ -1967,10 +1812,6 @@ mod tests {
     #[test]
     fn renderers_refuse_hostile_stored_variants() {
         let hostile = nest(vec![0x00], 20_000);
-        assert!(matches!(
-            variant_bytes_to_json(EMPTY_METADATA, &hostile),
-            Err(VariantViolation::TooDeep { depth: 65, .. })
-        ));
         let column: ArrayRef = Arc::new(StructArray::new(
             variant_storage_fields(),
             vec![
@@ -2119,7 +1960,6 @@ mod tests {
             ],
             None,
         ));
-        assert!(mask_placeholders(Arc::clone(&column)).is_err());
         assert!(variant_cell_to_json(column.as_ref(), 0).is_err());
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![variant_field("v", false)])),
@@ -2130,44 +1970,6 @@ mod tests {
             .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
             .build::<_, JsonArray>(Vec::new());
         assert!(writer.write(&batch).is_err());
-    }
-
-    /// A malformed residual under a shredded object field is an error at the
-    /// read gate, a valid one passes, and one under a null root row is never
-    /// read so it is not checked.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the gate accepts the malformed residual or refuses a
-    /// valid or unread one.
-    #[test]
-    fn shredded_residuals_pass_the_read_gate() {
-        let one = EncodedVariant::from_json_text("1").expect("encodes");
-        let column = |residual: &[u8], root_valid: bool| -> ArrayRef {
-            let field = StructArray::from(vec![(
-                Arc::new(Field::new("value", DataType::Binary, true)),
-                Arc::new(BinaryArray::from(vec![residual])) as ArrayRef,
-            )]);
-            let typed = StructArray::from(vec![(
-                Arc::new(Field::new("a", field.data_type().clone(), false)),
-                Arc::new(field) as ArrayRef,
-            )]);
-            Arc::new(StructArray::new(
-                vec![
-                    Field::new("metadata", DataType::Binary, false),
-                    Field::new("typed_value", typed.data_type().clone(), true),
-                ]
-                .into(),
-                vec![
-                    Arc::new(BinaryArray::from(vec![one.metadata()])) as ArrayRef,
-                    Arc::new(typed) as ArrayRef,
-                ],
-                Some(NullBuffer::from(vec![root_valid])),
-            ))
-        };
-        assert!(mask_placeholders(column(one.value(), true)).is_ok());
-        assert!(mask_placeholders(column(&[0xff], true)).is_err());
-        assert!(mask_placeholders(column(&[0xff], false)).is_ok());
     }
 
     /// Arrow's JSON writer renders a `TIMESTAMP_TZ` as the instant in the

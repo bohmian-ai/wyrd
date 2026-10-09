@@ -104,9 +104,10 @@ const FIXTURE_GROUPS: i64 = 3;
 
 /// Number of published objects every fixture table is written as.
 ///
-/// The distributed planner distributes a scan only when it spans more than
-/// one task, and the harness plans one task per published object, so every
-/// journey here needs at least two objects to run Analytical.
+/// One published object is one file group and one partition; with an inexact
+/// row count and trusted row estimates no repartition is added, so its scan
+/// has no stage boundary and stays Interactive. Every journey here therefore
+/// needs at least two objects to run Analytical.
 const FIXTURE_OBJECTS: i64 = 2;
 
 /// Writes and publishes one fixture table on the cluster's ingest node.

@@ -33,10 +33,11 @@ async fn graph_lease_owns_exact_resources_for_complete_graph() {
 
 /// Drives the lease scenarios against one live multi-process topology.
 ///
-/// The topology is three Oracles and one Scribe because a graph only becomes
-/// distributed when a leaf stage has more than one task, and the leader is not
-/// a participant in its own worker set: two remote followers and two published
-/// files are the smallest shape that puts a real stage on a real peer.
+/// The topology is three Oracles and one Scribe because a scan of one published
+/// file is one partition with no repartition and so no stage boundary, and the
+/// leader is not a participant in its own worker set: two remote followers and
+/// two published files are the smallest shape that puts a real stage on a real
+/// peer.
 ///
 /// # Errors
 ///

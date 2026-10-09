@@ -75,9 +75,9 @@ fn request(sql: &str) -> BifrostQueryRequest {
 /// Ids `0..FIXTURE_ROWS` are split evenly across `objects` writes, each
 /// flushed into its own object, and every object holds every `filter_key`
 /// group, so totals and group counts do not depend on `objects`. The class a
-/// statement settles follows this layout: the distributed planner splits a
-/// scan of two or more objects across tasks at the harness's one byte per
-/// task, and leaves a one-object scan on the leader.
+/// statement settles follows this layout: a scan of two or more objects
+/// distributes, while one object is one file group and one partition with no
+/// repartition and so no stage boundary, which leaves its scan on the leader.
 ///
 /// # Errors
 /// Returns missing-ingest-node, registration, credential, append, flush, or
@@ -233,8 +233,8 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
         WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
     let tenant = cluster.data_tenant_id();
     let table = seed_table(&cluster, "analytical_cleanup", 2).await?;
-    // A one-object table stays on the leader, so its scan is the graphless
-    // Interactive case.
+    // One object is one partition with no repartition and so no stage
+    // boundary: its scan is the graphless Interactive case.
     let interactive_table = seed_table(&cluster, "analytical_cleanup_ui", 1).await?;
     let query_server = cluster.server(0).ok_or("missing query node")?;
     let engine = Arc::clone(
@@ -741,9 +741,9 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let api_key = cluster
         .provision_public_api_key("single-planner-caller")
         .await?;
-    // Class follows table layout: the two-object table spans more than one
-    // task and distributes, while the one-object scan table stays on the
-    // leader as the graphless Interactive case.
+    // Class follows table layout: the two-object table distributes, while the
+    // one-object scan table is one partition with no repartition and so no
+    // stage boundary, the graphless Interactive case.
     let table = format!("single_planner_{}", uuid::Uuid::now_v7().simple());
     cluster.register_table(PEER_SCRIBE, &table).await?;
     let half = FIXTURE_ROWS / 2;
@@ -786,8 +786,8 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         }
     }
 
-    // A one-object scan plans as one task, so its root is normal and the
-    // statement is Interactive.
+    // A one-object scan is one partition with no repartition and so no stage
+    // boundary, so its root is normal and the statement is Interactive.
     let scan = run_public(&client, &scan_sql).await?;
     expect_public(
         &scan,
@@ -1151,8 +1151,8 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     cluster.register_table(PEER_SCRIBE, &table).await?;
     cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
     cluster.ingest_rows(PEER_SCRIBE, &table, 0, 12, 3).await?;
-    // The UI table publishes one object, so its scan is a single-partition
-    // leader-executable leaf and its root is normal. The Analytical table above
+    // The UI table publishes one object, one partition with no repartition
+    // and so no stage boundary, and its root is normal. The Analytical table above
     // publishes two, which is what gives its grouped statement real remote work
     // to distribute.
     let ui_table = format!("public_activation_ui_{suffix}");
@@ -1617,8 +1617,9 @@ async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
     cluster
         .ingest_rows(BOUNDED_SCRIBE, &table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)
         .await?;
-    // The UI table publishes one object, so its scan stays a leader-executable
-    // leaf and its root stays Interactive while the Analytical graph is held.
+    // The UI table publishes one object, one partition with no repartition
+    // and so no stage boundary, so its root stays Interactive while the
+    // Analytical graph is held.
     let ui_table = format!("bounded_workers_ui_{suffix}");
     cluster.register_table(BOUNDED_SCRIBE, &ui_table).await?;
     cluster

@@ -386,11 +386,12 @@ async fn prove_interactive_window(
 
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
-            // The UI table publishes one object, so its scan is one task that
-            // stays on the leader as Interactive: class follows table layout,
-            // not the statement's operators. An Analytical query would never
-            // reach the Interactive floor this window exists to observe. Rows
-            // are counted, not ordered.
+            // The UI table publishes one object: one partition with no
+            // repartition and so no stage boundary, so its scan stays on the
+            // leader as Interactive. Class follows table layout, not the
+            // statement's operators. An Analytical query would never reach
+            // the Interactive floor this window exists to observe. Rows are
+            // counted, not ordered.
             sql: format!("SELECT id, filter_key FROM vala.bifrost.{table}"),
             deadline_ms: Some(INTERACTIVE_DEADLINE_MS),
         })
@@ -757,9 +758,9 @@ fn accept_frame(
 /// are ones this cluster's own Scribe encoded. Ids `0..rows` are split into
 /// `objects` contiguous ranges, each flushed on its own so it publishes as one
 /// object. Query class follows that layout, not the statement's operators: a
-/// table of more than one object spans more than one scan task and
-/// distributes as Analytical, while a one-object table stays on the leader
-/// as Interactive.
+/// table of more than one object distributes as Analytical, while a
+/// one-object table is one partition with no repartition and so no stage
+/// boundary, and stays on the leader as Interactive.
 ///
 /// # Errors
 ///
@@ -1816,8 +1817,8 @@ fn scheduling_interactive_sql(table: &str) -> String {
 
 /// Builds the grouped aggregate over a scheduling tenant's two-object table.
 ///
-/// The table spans more than one scan task, so the plan distributes as
-/// Analytical.
+/// The table publishes two objects, more than one partition, so the plan
+/// distributes as Analytical.
 fn scheduling_analytical_sql(table: &str) -> String {
     format!("SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key")
 }

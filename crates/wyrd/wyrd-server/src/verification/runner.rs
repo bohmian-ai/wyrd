@@ -80,7 +80,7 @@ const PERSIST_MAX: Duration = Duration::from_secs(5);
 /// The single transition one claimed run ends in.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Transition {
-    /// The result was staged; settle `completed` with it.
+    /// The result was built; settle `completed` with it, then stage it.
     Complete {
         /// The staged result.
         result_id: VerificationResultId,
@@ -327,18 +327,19 @@ impl VerifierRunner {
     /// Execute the run and map the attempt to a transition.
     ///
     /// A run without a loadable Verifier terminates; otherwise the Verifier
-    /// executes and a completed report is staged. Never fails: every failure
-    /// becomes the [`Transition`] it maps to.
+    /// executes and a completed report is built into its result write, which
+    /// the caller stages only once the lease-fenced settlement completes the
+    /// run. Never fails: every failure becomes the [`Transition`] it maps to.
     async fn execute(
         &self,
         tenant: DataTenantId,
         run: &ClaimedRun,
         verifier: Result<Arc<CachedVerifier>, VerificationError>,
         telemetry: &ExecutionTelemetry,
-    ) -> Transition {
+    ) -> (Transition, Option<ScribeWrite>) {
         let verifier = match verifier {
             Ok(verifier) => verifier,
-            Err(error) => return Transition::Terminate(TerminalStatus::Errored, error),
+            Err(error) => return (Transition::Terminate(TerminalStatus::Errored, error), None),
         };
         telemetry.classify(VerifierKind::of(&verifier.implementation));
         let started_at = Utc::now();
@@ -353,90 +354,27 @@ impl VerifierRunner {
             )
             .await;
         let Ok(outcome) = executed else {
-            return Transition::Terminate(
-                TerminalStatus::TimedOut,
-                failure(
-                    EXECUTION_TIMED_OUT,
-                    "the Verifier exceeded its execution deadline",
+            return (
+                Transition::Terminate(
+                    TerminalStatus::TimedOut,
+                    failure(
+                        EXECUTION_TIMED_OUT,
+                        "the Verifier exceeded its execution deadline",
+                    ),
                 ),
+                None,
             );
         };
-        match outcome {
+        let transition = match outcome {
             EngineOutcome::Completed(report) => {
-                self.stage(tenant, run, &verifier.reference, &report, started_at)
+                return result(run, &verifier.reference, &report, started_at);
             }
             EngineOutcome::Retry(error) => Transition::Retry(error),
             EngineOutcome::AwaitingTrace(error) => Transition::AwaitTrace(error),
             EngineOutcome::Deferred(error) => Transition::Defer(error),
             EngineOutcome::Terminal(status, error) => Transition::Terminate(status, error),
-        }
-    }
-
-    /// Build `report`'s result payload once and stage it on the Scribe outbox.
-    ///
-    /// Mints one result ID and one producer event time shared by every row —
-    /// a result fact this process observes, not a coordination instant — and
-    /// stages the payload attributed to the tenant SYSTEM principal and the
-    /// exact `verifier`. Staging never waits, so the run completes with the
-    /// staged result at once.
-    ///
-    /// A missing SYSTEM principal or an unbuildable report terminates
-    /// `errored`.
-    fn stage(
-        &self,
-        tenant: DataTenantId,
-        run: &ClaimedRun,
-        verifier: &CardRef,
-        report: &VerifierReport,
-        started_at: DateTime<Utc>,
-    ) -> Transition {
-        let principal = match system_principal(run) {
-            Ok(principal) => principal,
-            Err(transition) => return transition,
         };
-        let result_id = VerificationResultId::new_v7();
-        let event_time = Utc::now();
-        let verifier_ref = CardRef {
-            uid: None,
-            ..verifier.clone()
-        }
-        .to_string();
-        let payload = match ResultPayloadBuilder::new(
-            ResultRun::from(run),
-            &verifier_ref,
-            result_id,
-            event_time,
-            started_at,
-            event_time,
-        )
-        .build(report)
-        {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::warn!(run_id = %run.lease.run_id, %error, "verification result encoding failed");
-                return Transition::Terminate(
-                    TerminalStatus::Errored,
-                    failure(RESULT_INVALID, "the verification result cannot be encoded"),
-                );
-            }
-        };
-        let verdict = payload.verdict();
-        self.outbox.stage(
-            tenant,
-            ScribeWrite::Result {
-                payload,
-                attribution: VerifierAttribution {
-                    verifier: verifier.clone(),
-                    principal,
-                },
-            },
-        );
-        Transition::Complete {
-            result_id,
-            verdict,
-            summary: report.summary(),
-            counts: report.counts(),
-        }
+        (transition, None)
     }
 
     /// The one closed dispatch over Verifier implementations.
@@ -704,11 +642,11 @@ impl VerifierRunner {
         let origin = run.origin.as_str();
         let held = self.renewal.hold(tenant, run.lease.token, abandon);
         let lost = held.lost();
-        let transition = tokio::select! {
+        let (transition, result) = tokio::select! {
             biased;
-            () = abandon.cancelled() => Transition::Release,
-            () = lost.cancelled() => Transition::LeaseLost,
-            transition = self.execute(tenant, run, verifier, &telemetry) => transition,
+            () = abandon.cancelled() => (Transition::Release, None),
+            () = lost.cancelled() => (Transition::LeaseLost, None),
+            executed = self.execute(tenant, run, verifier, &telemetry) => executed,
         };
         let transition = match transition {
             Transition::LeaseLost if abandon.is_cancelled() => Transition::Release,
@@ -734,6 +672,13 @@ impl VerifierRunner {
                 "settlement_failed"
             }
         };
+        // Staged only once this lease completed the run, so a stale holder's
+        // or an unsettled attempt's result never reaches Bifrost.
+        if outcome == "completed"
+            && let Some(result) = result
+        {
+            self.outbox.stage(tenant, result);
+        }
         let span = tracing::Span::current();
         span.record("outcome", outcome);
         let failed = !matches!(
@@ -765,6 +710,73 @@ impl VerifierRunner {
         telemetry.finish(outcome, failed);
         refused
     }
+}
+
+/// Build `report`'s result payload once into the write that completes `run`.
+///
+/// Mints one result ID and one producer event time shared by every row — a
+/// result fact this process observes, not a coordination instant — attributed
+/// to the tenant SYSTEM principal and the exact `verifier`. The write is
+/// returned rather than staged: only a settlement that still holds the lease
+/// may stage it, so a holder that lost its lease writes no result.
+///
+/// A missing SYSTEM principal or an unbuildable report terminates `errored`
+/// with no write.
+fn result(
+    run: &ClaimedRun,
+    verifier: &CardRef,
+    report: &VerifierReport,
+    started_at: DateTime<Utc>,
+) -> (Transition, Option<ScribeWrite>) {
+    let principal = match system_principal(run) {
+        Ok(principal) => principal,
+        Err(transition) => return (transition, None),
+    };
+    let result_id = VerificationResultId::new_v7();
+    let event_time = Utc::now();
+    let verifier_ref = CardRef {
+        uid: None,
+        ..verifier.clone()
+    }
+    .to_string();
+    let payload = match ResultPayloadBuilder::new(
+        ResultRun::from(run),
+        &verifier_ref,
+        result_id,
+        event_time,
+        started_at,
+        event_time,
+    )
+    .build(report)
+    {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(run_id = %run.lease.run_id, %error, "verification result encoding failed");
+            return (
+                Transition::Terminate(
+                    TerminalStatus::Errored,
+                    failure(RESULT_INVALID, "the verification result cannot be encoded"),
+                ),
+                None,
+            );
+        }
+    };
+    let verdict = payload.verdict();
+    (
+        Transition::Complete {
+            result_id,
+            verdict,
+            summary: report.summary(),
+            counts: report.counts(),
+        },
+        Some(ScribeWrite::Result {
+            payload,
+            attribution: VerifierAttribution {
+                verifier: verifier.clone(),
+                principal,
+            },
+        }),
+    )
 }
 
 /// The tenant SYSTEM principal the claim returned, when it is an active

@@ -73,16 +73,19 @@ export declare class NativeWyrdTestServer {
   /**
    * Mint an API key for a principal holding exactly `permissions`.
    *
-   * `permissions` are `resource:action` strings. This is the door a journey
-   * uses to prove an access gate from the caller's side: it seeds one role
-   * carrying only those grants and bootstraps a service onto it.
+   * Each permission is either a `resource:action` string, which grants every
+   * object of that operation, or an object in the persisted typed
+   * permission projection (`resource`, `action`, `scope`), which expresses
+   * object scope such as one Verifier. This is the door a journey uses to
+   * prove an access gate from the caller's side: it seeds one role carrying
+   * only those grants and bootstraps a service onto it.
    *
    * # Errors
    *
    * Returns a napi error for an unparsable permission, or when the harness
    * is closed or role seeding or bootstrapping fails.
    */
-  scopedApiKey(role: string, permissions: Array<string>): string
+  scopedApiKey(role: string, permissions: Array<any>): string
   /**
    * Provision a second active tenant so a journey can prove cross-tenant
    * isolation, returning its tenant ID.

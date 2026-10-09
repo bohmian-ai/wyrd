@@ -178,16 +178,23 @@ impl NativeWyrdTestServer {
 
     /// Mint an API key for a principal holding exactly `permissions`.
     ///
-    /// `permissions` are `resource:action` strings. This is the door a journey
-    /// uses to prove an access gate from the caller's side: it seeds one role
-    /// carrying only those grants and bootstraps a service onto it.
+    /// Each permission is either a `resource:action` string, which grants every
+    /// object of that operation, or an object in the persisted typed
+    /// permission projection (`resource`, `action`, `scope`), which expresses
+    /// object scope such as one Verifier. This is the door a journey uses to
+    /// prove an access gate from the caller's side: it seeds one role carrying
+    /// only those grants and bootstraps a service onto it.
     ///
     /// # Errors
     ///
     /// Returns a napi error for an unparsable permission, or when the harness
     /// is closed or role seeding or bootstrapping fails.
     #[napi]
-    pub fn scoped_api_key(&self, role: String, permissions: Vec<String>) -> Result<String> {
+    pub fn scoped_api_key(
+        &self,
+        role: String,
+        permissions: Vec<serde_json::Value>,
+    ) -> Result<String> {
         let result = self.scoped_api_key_borrowed(&role, &permissions);
         drop(role);
         drop(permissions);
@@ -202,7 +209,11 @@ impl NativeWyrdTestServer {
     /// Returns a napi error for an unparsable permission, or when the harness
     /// lock is poisoned, the server is closed, or seeding or bootstrapping
     /// fails.
-    fn scoped_api_key_borrowed(&self, role: &str, permissions: &[String]) -> Result<String> {
+    fn scoped_api_key_borrowed(
+        &self,
+        role: &str,
+        permissions: &[serde_json::Value],
+    ) -> Result<String> {
         let guard = self
             .server
             .lock()
@@ -212,12 +223,17 @@ impl NativeWyrdTestServer {
             .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
         let parsed = permissions
             .iter()
-            .map(|value| {
-                value.parse::<wyrd_runtime::Permission>().map_err(|_| {
-                    napi::Error::from_reason(format!(
-                        "`{value}` is not a resource:action permission"
-                    ))
-                })
+            .map(|value| match value {
+                serde_json::Value::String(token) => {
+                    token.parse::<wyrd_runtime::Permission>().map_err(|_| {
+                        napi::Error::from_reason(format!(
+                            "`{token}` is not a resource:action permission"
+                        ))
+                    })
+                }
+                typed => serde_json::from_value(typed.clone()).map_err(|error| {
+                    napi::Error::from_reason(format!("invalid permission {typed}: {error}"))
+                }),
             })
             .collect::<Result<Vec<_>>>()?;
         let bootstrap = wyrd_runtime::runtime()

@@ -347,11 +347,11 @@ fn gateway_call(
         model: ModelRef::from_projection(model).expect("model ref"),
         fallback,
         timeout,
-        correlation: WorkflowGatewayCorrelation {
+        correlation: Some(WorkflowGatewayCorrelation {
             run_id: run_id(),
             step_id: "step".to_owned(),
             attempt: 1,
-        },
+        }),
     }
 }
 

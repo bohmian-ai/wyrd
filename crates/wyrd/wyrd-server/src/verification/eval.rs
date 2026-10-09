@@ -12,14 +12,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, AsArray as _, BinaryArray, Int32Array, Int64Array, StringArray};
-use arrow::datatypes::DataType;
+use arrow::array::{Array, ArrayRef, AsArray as _};
+use arrow::datatypes::{DataType, Int32Type, Int64Type, TimestampMicrosecondType};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value, json};
-use skald_runtime::ProviderRegistry;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use vala_bifrost_redux::catalog::TableRef;
@@ -61,9 +60,11 @@ use wyrd_storage::{StorageError, StorageHandle};
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValueList, any_value};
 use wyrd_tonic::prost::Message as _;
 
-use super::authority::{SystemReadAuthority, SystemReadAuthorityError};
+use super::authority::{SystemReadAuthority, SystemReadAuthorityError, writer_caller};
 use super::engines::{EngineOutcome, VerifierReport};
 use super::telemetry::{ExecutionTelemetry, Phase, WaitSink};
+use crate::components::auth::Caller;
+use crate::components::gateway::ServerWyrdGatewayCaller;
 use crate::query::scheduled::ScheduledQueryCaller;
 use crate::state::AppState;
 
@@ -98,8 +99,6 @@ const SPANS_NOT_CREATED: &str = "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND";
 pub struct EvalEngine {
     /// Server state supplying Bifrost reads, the registry, and object storage.
     state: AppState,
-    /// Model providers the production judge invoker calls.
-    providers: Arc<ProviderRegistry>,
     /// How long after its record a run may still read trace spans: the
     /// runtime's trace deadline plus one day of slack for enqueue latency and
     /// clock skew. It closes the upper end of every span read.
@@ -107,19 +106,14 @@ pub struct EvalEngine {
 }
 
 impl EvalEngine {
-    /// Build the engine over `state`, judging through `providers`, reading
+    /// Build the engine over `state`, judging through its gateway, reading
     /// traces up to `trace_deadline` (plus one day of slack) after a record.
     #[must_use]
-    pub fn new(
-        state: AppState,
-        providers: Arc<ProviderRegistry>,
-        trace_deadline: Duration,
-    ) -> Self {
+    pub fn new(state: AppState, trace_deadline: Duration) -> Self {
         let trace_deadline = chrono::Duration::from_std(trace_deadline)
             .unwrap_or_else(|_| chrono::Duration::minutes(5));
         Self {
             state,
-            providers,
             trace_window: trace_deadline + chrono::Duration::days(1),
         }
     }
@@ -172,7 +166,7 @@ impl EvalEngine {
                 Ok::<_, ReadStart>((reader, record))
             })
             .await;
-        let (reader, (record, observed_run)) = match read {
+        let (reader, (record, observed_run, writer)) = match read {
             Ok(read) => read,
             Err(ReadStart::Authority(error)) => {
                 return EngineOutcome::Retry(failed(
@@ -204,6 +198,28 @@ impl EvalEngine {
                 ));
             }
         }
+        let writer = match writer.filter(|_| needs_judge(spec)) {
+            None => None,
+            Some(writer) => match writer_caller(&self.state, tenant, &writer).await {
+                Ok(caller) => Some(caller),
+                Err(error) if error.status() >= 500 => {
+                    return EngineOutcome::Retry(failed(
+                        run_id,
+                        EXECUTION_FAILED,
+                        "the observation writer's authority cannot be recovered",
+                        &error,
+                    ));
+                }
+                Err(error) => {
+                    return terminal(failed(
+                        run_id,
+                        EXECUTION_FAILED,
+                        "the observation writer has no authority to judge",
+                        &error,
+                    ));
+                }
+            },
+        };
         let traces = InMemoryTraceSource::new();
         if let Some(trace_id) = record.trace_id.filter(|_| needs_trace(spec)) {
             match Box::pin(telemetry.phase(
@@ -231,7 +247,14 @@ impl EvalEngine {
             }
         }
         match self
-            .score(tenant, run, spec, &record, traces, telemetry)
+            .score(
+                self.judge_invoker(tenant, writer.as_ref(), telemetry),
+                run,
+                spec,
+                &record,
+                traces,
+                telemetry,
+            )
             .await
         {
             EngineOutcome::Completed(report) => {
@@ -244,10 +267,11 @@ impl EvalEngine {
     /// Score `record` through the one Eval execution path and map its report.
     ///
     /// A trace that is still missing when a task needs it waits; every other
-    /// execution error retries and never becomes a failed assertion.
+    /// execution error retries and never becomes a failed assertion. `judge`
+    /// calls run as the observation's writer.
     async fn score(
         &self,
-        tenant: DataTenantId,
+        judge: Arc<dyn JudgeInvoker>,
         run: &ClaimedRun,
         spec: &EvalSpec,
         record: &EvalRecordObservation,
@@ -257,7 +281,7 @@ impl EvalEngine {
         let run_id = run.lease.run_id;
         let eval_run = RunId::from_string(run_id.to_string());
         match self
-            .judge_record(tenant, eval_run, spec, record, traces, telemetry)
+            .judge_record(judge, eval_run, spec, record, traces, telemetry)
             .await
         {
             Ok(report) => EngineOutcome::Completed(report),
@@ -291,11 +315,16 @@ impl EvalEngine {
     /// The production judge invoker of `tenant`, timed on `telemetry`.
     ///
     /// The Skald invoker over the tenant's registry and media, with each
-    /// invocation recorded as one wait. Shared by the Eval path and a direct
-    /// task Verifier's LLM judge so both call judge providers the same way.
+    /// invocation recorded as one wait. Every judge model call goes through
+    /// the in-process gateway as `caller`, the principal that initiated the
+    /// judgment, so its authorization, accounting, capture, and audit apply.
+    /// `caller` is `None` only for a spec with no LLM judge; a judge call
+    /// then finds no provider and fails terminally. Shared by the Eval path
+    /// and a direct task Verifier's LLM judge.
     pub fn judge_invoker(
         &self,
         tenant: DataTenantId,
+        caller: Option<&Caller>,
         telemetry: &ExecutionTelemetry,
     ) -> Arc<dyn JudgeInvoker> {
         let registry = Arc::new(TenantRegistry {
@@ -307,22 +336,29 @@ impl EvalEngine {
             tenant,
         });
         let inner = SkaldJudgeInvoker::new(
-            Arc::clone(&self.providers),
+            Arc::default(),
             Arc::clone(&registry) as Arc<dyn AgentCardResolver>,
             registry,
         )
         .with_media_resolver(media);
+        let inner = match caller {
+            Some(caller) => inner.with_wyrd_gateway(Arc::new(ServerWyrdGatewayCaller::new(
+                self.state.clone(),
+                caller.clone(),
+            ))),
+            None => inner,
+        };
         Arc::new(TimedJudge {
             inner,
             waits: telemetry.waits(),
         })
     }
 
-    /// Score one `record` of `tenant` under `spec` and map its report.
+    /// Score one `record` under `spec` and map its report.
     ///
     /// The one Eval execution path of queued runs and direct execution: it
-    /// judges through the production Skald invoker over the tenant's registry
-    /// and media, with `traces` as the only trace source. Plan construction
+    /// judges through `judge`, the [`Self::judge_invoker`] of the record's
+    /// tenant and caller, with `traces` as the only trace source. Plan construction
     /// is the `prepare` phase and every judge invocation is a wait on
     /// `telemetry`.
     ///
@@ -331,14 +367,13 @@ impl EvalEngine {
     /// context capture failed.
     pub async fn judge_record(
         &self,
-        tenant: DataTenantId,
+        judge: Arc<dyn JudgeInvoker>,
         eval_run: RunId,
         spec: &EvalSpec,
         record: &EvalRecordObservation,
         traces: InMemoryTraceSource,
         telemetry: &ExecutionTelemetry,
     ) -> Result<VerifierReport, ScoreFailure> {
-        let judge = self.judge_invoker(tenant, telemetry);
         let scoring = telemetry
             .prepare(async {
                 ScenarioScoring::new(
@@ -368,6 +403,13 @@ pub enum ScoreFailure {
     Execute(EvalExecError),
     /// An observed value could not be captured into the report.
     Capture(EvalExecError),
+}
+
+/// Whether any task of `spec` calls an LLM judge.
+fn needs_judge(spec: &EvalSpec) -> bool {
+    spec.tasks
+        .values()
+        .any(|task| matches!(task, EvalTask::LlmJudge(_)))
 }
 
 /// Whether any task of `spec` asserts over the record's trace.
@@ -571,7 +613,8 @@ impl BifrostReader {
 
     /// Read one committed observation of `subject` by its record ID, pruned
     /// to the UTC day of its frozen server `event_time`, with the managed
-    /// application `run_id` that wrote it (`None` when the row names none).
+    /// application `run_id` that wrote it (`None` when the row names none)
+    /// and its managed writer `principal_id`.
     ///
     /// # Errors
     /// Returns [`ReadError::Admission`] when Bifrost refuses the read at
@@ -582,10 +625,10 @@ impl BifrostReader {
         subject: &str,
         record_id: &str,
         event_time: DateTime<Utc>,
-    ) -> Result<(EvalRecordObservation, Option<RunId>), ReadError> {
+    ) -> Result<(EvalRecordObservation, Option<RunId>, Option<String>), ReadError> {
         let (start, end) = utc_day(event_time);
         let batches = Box::pin(self.query(format!(
-            "SELECT record_id, session_id, context, trace_id, span_id, created_at, media, run_id \
+            "SELECT record_id, session_id, context, trace_id, span_id, created_at, media, run_id, principal_id \
                  FROM vala.eval.observations \
                  WHERE card_uid = '{}' AND record_id = '{}' \
                    AND wyrd_event_time >= TIMESTAMP '{start}' \
@@ -617,7 +660,10 @@ impl BifrostReader {
             .map(SpanId::from_bytes)
             .transpose()
             .map_err(|error| error.to_string())?;
-        let created_at = int64(batch, "created_at", 0)?
+        let created_at = column(batch, "created_at")?
+            .as_primitive_opt::<TimestampMicrosecondType>()
+            .ok_or("created_at is not a microsecond timestamp")
+            .map(|at| at.is_valid(0).then(|| at.value(0)))?
             .and_then(DateTime::<Utc>::from_timestamp_micros)
             .ok_or("created_at is missing")?;
         let json_text = |name| -> Result<Value, String> {
@@ -637,7 +683,7 @@ impl BifrostReader {
             "media": json_text("media")?,
         }))
         .map_err(|error| format!("record {record_id} does not decode: {error}"))?;
-        Ok((record, run_id))
+        Ok((record, run_id, text(batch, "principal_id", 0)?))
     }
 
     /// Read the visible spans of `trace_id` received from the start of the
@@ -919,66 +965,75 @@ fn quoted(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-/// Column `name` of `batch` cast to `to`.
+/// Column `name` of `batch`.
+///
+/// Cell readers index the column in its stored Arrow type rather than casting
+/// it: a cast copies the whole column, and a span decode reads every cell.
 ///
 /// # Errors
-/// Returns a description when the column is absent or cannot be cast.
-fn column(batch: &RecordBatch, name: &str, to: &DataType) -> Result<Arc<dyn Array>, String> {
-    let column = batch
+/// Returns a description when the column is absent.
+fn column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a ArrayRef, String> {
+    batch
         .column_by_name(name)
-        .ok_or_else(|| format!("column {name} is missing"))?;
-    arrow::compute::cast(column, to).map_err(|error| format!("column {name}: {error}"))
+        .ok_or_else(|| format!("column {name} is missing"))
 }
 
 /// Text value of column `name` at `row`, `None` when null.
 ///
 /// # Errors
-/// Returns the column failure.
+/// Returns the column failure or a column that is not text.
 fn text(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<String>, String> {
-    let column = column(batch, name, &DataType::Utf8)?;
-    let column = column
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| format!("column {name} is not text"))?;
-    Ok(column.is_valid(row).then(|| column.value(row).to_owned()))
+    let column = column(batch, name)?;
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    let value = match column.data_type() {
+        DataType::Utf8 => column.as_string::<i32>().value(row),
+        DataType::LargeUtf8 => column.as_string::<i64>().value(row),
+        DataType::Utf8View => column.as_string_view().value(row),
+        _ => return Err(format!("column {name} is not text")),
+    };
+    Ok(Some(value.to_owned()))
 }
 
 /// Byte value of column `name` at `row`, `None` when null.
 ///
 /// # Errors
-/// Returns the column failure.
+/// Returns the column failure or a column that is not binary.
 fn bytes(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<Vec<u8>>, String> {
-    let column = column(batch, name, &DataType::Binary)?;
-    let column = column
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| format!("column {name} is not binary"))?;
-    Ok(column.is_valid(row).then(|| column.value(row).to_vec()))
+    let column = column(batch, name)?;
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    let value = match column.data_type() {
+        DataType::Binary => column.as_binary::<i32>().value(row),
+        DataType::LargeBinary => column.as_binary::<i64>().value(row),
+        DataType::BinaryView => column.as_binary_view().value(row),
+        DataType::FixedSizeBinary(_) => column.as_fixed_size_binary().value(row),
+        _ => return Err(format!("column {name} is not binary")),
+    };
+    Ok(Some(value.to_vec()))
 }
 
 /// 64-bit integer value of column `name` at `row`, `None` when null.
 ///
 /// # Errors
-/// Returns the column failure.
+/// Returns the column failure or a column that is not `Int64`.
 fn int64(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<i64>, String> {
-    let column = column(batch, name, &DataType::Int64)?;
-    let column = column
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| format!("column {name} is not an integer"))?;
+    let column = column(batch, name)?
+        .as_primitive_opt::<Int64Type>()
+        .ok_or_else(|| format!("column {name} is not a 64-bit integer"))?;
     Ok(column.is_valid(row).then(|| column.value(row)))
 }
 
 /// 32-bit integer value of column `name` at `row`, `None` when null.
 ///
 /// # Errors
-/// Returns the column failure.
+/// Returns the column failure or a column that is not `Int32`.
 fn int32(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<i32>, String> {
-    let column = column(batch, name, &DataType::Int32)?;
-    let column = column
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| format!("column {name} is not an integer"))?;
+    let column = column(batch, name)?
+        .as_primitive_opt::<Int32Type>()
+        .ok_or_else(|| format!("column {name} is not a 32-bit integer"))?;
     Ok(column.is_valid(row).then(|| column.value(row)))
 }
 

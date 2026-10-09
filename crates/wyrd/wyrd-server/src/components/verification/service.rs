@@ -457,7 +457,7 @@ impl<'a> VerificationControl<'a> {
                 tokio::time::timeout(
                     EXECUTION_DEADLINE,
                     DirectExecutor::new(self.state).execute(
-                        caller.data_tenant_id,
+                        caller,
                         execution_id,
                         &request.verifier_uid,
                         &target.implementation,

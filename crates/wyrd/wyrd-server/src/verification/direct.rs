@@ -40,6 +40,7 @@ use super::drift::{BASELINE_LEGACY, BASELINE_NOT_READY, FittedBaselines};
 use super::engines::{EngineOutcome, VerifierReport};
 use super::eval::{EvalEngine, ScoreFailure};
 use super::telemetry::ExecutionTelemetry;
+use crate::components::auth::Caller;
 use crate::state::AppState;
 
 pub use wyrd_spec::verification::EXECUTION_DEADLINE;
@@ -47,7 +48,7 @@ pub use wyrd_spec::verification::EXECUTION_DEADLINE;
 /// Owner of the engine half of a direct execution.
 ///
 /// Built per request from the process state: it holds the fitted-baseline
-/// loader and the Eval engine judging through the state's judge providers.
+/// loader and the Eval engine, whose judges call the gateway as the caller.
 pub struct DirectExecutor {
     /// Ready fitted baselines of PSI and SPC Verifiers.
     baselines: FittedBaselines,
@@ -61,19 +62,16 @@ impl DirectExecutor {
     pub fn new(state: &AppState) -> Self {
         Self {
             baselines: FittedBaselines::new(state.clone()),
-            eval: EvalEngine::new(
-                state.clone(),
-                Arc::clone(&state.judge_providers),
-                Duration::ZERO,
-            ),
+            eval: EvalEngine::new(state.clone(), Duration::ZERO),
         }
     }
 
-    /// Judge `input` with `implementation` of `verifier_uid` for `tenant`.
+    /// Judge `input` with `implementation` of `verifier_uid` for `caller`.
     ///
     /// Drift scores the supplied columns with the shared `vala-drift` scorer;
     /// Eval scores one synthetic record through the queued Eval path; a task
     /// runs its one assertion or LLM judge directly on the supplied context.
+    /// Every judge model call goes through the gateway as `caller`.
     /// Preparation — baseline load, input conversion, plan construction —
     /// is the `prepare` phase on `telemetry`.
     ///
@@ -87,13 +85,14 @@ impl DirectExecutor {
     /// [`DirectExecutor::eval`].
     pub async fn execute(
         &self,
-        tenant: DataTenantId,
+        caller: &Caller,
         execution_id: VerificationExecutionId,
         verifier_uid: &CardUid,
         implementation: &VerifierImplementation,
         input: &DirectVerificationInput,
         telemetry: &ExecutionTelemetry,
     ) -> Result<VerifierReport, WyrdError> {
+        let tenant = caller.data_tenant_id;
         match (implementation, input) {
             (
                 VerifierImplementation::Drift(spec),
@@ -115,7 +114,7 @@ impl DirectExecutor {
                     created_at: Utc::now(),
                     media: media.clone(),
                 };
-                self.eval(tenant, execution_id, spec, &record, telemetry)
+                self.eval(caller, execution_id, spec, &record, telemetry)
                     .await
             }
             (
@@ -123,7 +122,7 @@ impl DirectExecutor {
                 DirectVerificationInput::TaskContext { context, media },
             ) => {
                 self.task(
-                    tenant,
+                    caller,
                     execution_id,
                     spec,
                     context,
@@ -231,7 +230,7 @@ impl DirectExecutor {
     /// when the check cannot evaluate the context.
     async fn task(
         &self,
-        tenant: DataTenantId,
+        caller: &Caller,
         execution_id: VerificationExecutionId,
         spec: &TaskVerifierSpec,
         context: &serde_json::Map<String, Value>,
@@ -255,13 +254,15 @@ impl DirectExecutor {
                 let _score = tracing::info_span!("verification.score").entered();
                 AssertionTaskExecutor::new().assert(task, &snapshot, 0)
             }
-            VerifierTask::LlmJudge(task) => {
-                JudgeTaskExecutor::new(self.eval.judge_invoker(tenant, telemetry))
-                    .judge(task, &snapshot, 0)
-                    .instrument(tracing::info_span!("verification.score"))
-                    .await
-                    .map(|(result, _)| result)
-            }
+            VerifierTask::LlmJudge(task) => JudgeTaskExecutor::new(self.eval.judge_invoker(
+                caller.data_tenant_id,
+                Some(caller),
+                telemetry,
+            ))
+            .judge(task, &snapshot, 0)
+            .instrument(tracing::info_span!("verification.score"))
+            .await
+            .map(|(result, _)| result),
         };
         checked
             .map(|result| VerifierReport::Task(Box::new(result)))
@@ -332,7 +333,7 @@ impl DirectExecutor {
     /// spec or an uncapturable report.
     async fn eval(
         &self,
-        tenant: DataTenantId,
+        caller: &Caller,
         execution_id: VerificationExecutionId,
         spec: &EvalSpec,
         record: &EvalRecordObservation,
@@ -352,7 +353,8 @@ impl DirectExecutor {
         let run = RunId::from_string(execution_id.to_string());
         self.eval
             .judge_record(
-                tenant,
+                self.eval
+                    .judge_invoker(caller.data_tenant_id, Some(caller), telemetry),
                 run,
                 spec,
                 record,

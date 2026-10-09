@@ -1954,7 +1954,11 @@ mod tests {
             call: crate::route::WyrdGatewayCall,
             _cancellation: &tokio_util::sync::CancellationToken,
         ) -> Result<skald_spec::ProviderResponse, skald_providers::ProviderError> {
-            let step = call.correlation.step_id.clone();
+            let step = call
+                .correlation
+                .as_ref()
+                .map(|c| c.step_id.clone())
+                .unwrap_or_default();
             crate::test_support::lock(&self.calls).push(call);
             crate::test_support::lock(&self.replies)
                 .get_mut(&step)
@@ -2111,7 +2115,7 @@ mod tests {
             let by_step = |id: &str| -> Vec<&crate::route::WyrdGatewayCall> {
                 calls
                     .iter()
-                    .filter(|call| call.correlation.step_id == id)
+                    .filter(|call| call.correlation.as_ref().is_some_and(|c| c.step_id == id))
                     .collect()
             };
             let routed = by_step("routed");
@@ -2119,8 +2123,14 @@ mod tests {
             assert_eq!(routed[0].fallback.as_ref(), Some(&fallback));
             assert_eq!(routed[0].model.to_string(), "openai/gpt-test");
             assert!(routed[0].timeout <= Duration::from_secs(30) && !routed[0].timeout.is_zero());
-            assert_eq!(routed[0].correlation.run_id, run.run_id);
-            assert_eq!(routed[0].correlation.attempt, 1);
+            assert_eq!(
+                routed[0].correlation,
+                Some(crate::route::WorkflowGatewayCorrelation {
+                    run_id: run.run_id,
+                    step_id: "routed".to_owned(),
+                    attempt: 1
+                })
+            );
             assert!(matches!(
                 &routed[0].request,
                 ProviderRequest::OpenAiChatCompletion(_)

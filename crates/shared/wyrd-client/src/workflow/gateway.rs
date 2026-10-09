@@ -73,9 +73,9 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
         name = "workflow.gateway.call",
         skip_all,
         fields(
-            wyrd.workflow.run_id = %call.correlation.run_id,
-            wyrd.workflow.step_id = %call.correlation.step_id,
-            wyrd.workflow.attempt = call.correlation.attempt,
+            wyrd.workflow.run_id = call.correlation.as_ref().map(|c| tracing::field::display(c.run_id)),
+            wyrd.workflow.step_id = call.correlation.as_ref().map(|c| c.step_id.as_str()),
+            wyrd.workflow.attempt = call.correlation.as_ref().map(|c| c.attempt),
         )
     )]
     async fn call(

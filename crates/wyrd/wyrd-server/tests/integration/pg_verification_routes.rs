@@ -1391,25 +1391,71 @@ async fn direct_execution_calls_the_judge_provider() {
         )
         .await
         .expect("task judge Verifier registers");
-    let (_, jwt) = user(&server, "vx-judge-writer", &["editor"]).await;
-    for (judge, kind) in [(eval, "eval_record"), (task, "task_context")] {
-        let body = execute_body(
+    let bodies = [(eval, "eval_record"), (task, "task_context")].map(|(judge, kind)| {
+        execute_body(
             &judge,
             &service,
             json!({ "kind": kind, "context": { "answer": "yes" } }),
         )
-        .to_string();
-        judged_by_provider(&server, &provider, &jwt, body).await;
+        .to_string()
+    });
+    server
+        .seed_role(
+            "vx_judge_runner",
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await
+        .expect("runner role seeds");
+    let (_, unprivileged) = user(&server, "vx-judge-unprivileged", &["vx_judge_runner"]).await;
+    let (_, jwt) = user(&server, "vx-judge-writer", &["editor"]).await;
+    for body in &bodies {
+        refused_before_upstream(&server, &provider, &jwt, body.clone()).await;
+    }
+    server
+        .deploy_gateway_model_for_test("gpt-test", "vx_judge_invoker")
+        .await
+        .expect("judge model deploys");
+    for body in &bodies {
+        refused_before_upstream(&server, &provider, &unprivileged, body.clone()).await;
+        judged_by_provider(&server, &provider, &jwt, body.clone()).await;
+    }
+    for body in bodies {
+        provider_failure_withheld(&server, &provider, &jwt, body).await;
     }
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// Executes `body` once against a provider grading it passed, then once
-/// against a failing provider, asserting the verdict and the stable,
-/// detail-free dependency refusal.
+/// Executes `body` as a caller the gateway refuses (no deployment, or no
+/// invoke grant), asserting the stable dependency refusal and that the
+/// provider was never called.
 ///
 /// # Panics
-/// Panics when a route fails to respond or a status, verdict, code, or
+/// Panics when the route fails to respond or the status, code, or provider
+/// call count differs from the expectation.
+async fn refused_before_upstream(
+    server: &WyrdTestServer,
+    provider: &wiremock::MockServer,
+    jwt: &str,
+    body: String,
+) {
+    provider.reset().await;
+    let (status, problem) = post_execute(server, jwt, body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{problem}");
+    assert_eq!(problem["code"], "WYRD_VERIFICATION_502_DEPENDENCY_FAILED");
+    assert!(
+        provider
+            .received_requests()
+            .await
+            .is_none_or(|requests| requests.is_empty()),
+        "the gateway refused before upstream IO"
+    );
+}
+
+/// Executes `body` once against a provider grading it passed, asserting the
+/// verdict and exactly one provider call.
+///
+/// # Panics
+/// Panics when the route fails to respond or the status, verdict, or
 /// provider call count differs from the expectation.
 async fn judged_by_provider(
     server: &WyrdTestServer,
@@ -1433,10 +1479,28 @@ async fn judged_by_provider(
         .expect(1)
         .mount(provider)
         .await;
-    let (status, response) = post_execute(server, jwt, body.clone()).await;
+    let (status, response) = post_execute(server, jwt, body).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["verdict"], "passed", "{response}");
     provider.verify().await;
+}
+
+/// Executes `body` against a failing provider, asserting the stable,
+/// detail-free dependency refusal. The first failure also removes the
+/// deployment from gateway selection, so a later call is refused before
+/// upstream IO with the same refusal.
+///
+/// # Panics
+/// Panics when the route fails to respond or the status or code differs, or
+/// the refusal leaks provider detail.
+async fn provider_failure_withheld(
+    server: &WyrdTestServer,
+    provider: &wiremock::MockServer,
+    jwt: &str,
+    body: String,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
 
     provider.reset().await;
     Mock::given(method("POST"))

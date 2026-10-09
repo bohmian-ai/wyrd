@@ -4,33 +4,47 @@ use std::any::Any;
 use std::time::Instant;
 
 use futures_util::future::BoxFuture;
-use tracing::{Instrument as _, Span};
+use opentelemetry::trace::FutureExt as _;
+use tracing::Span;
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use wyrd_spec::vala::api::QueryClass;
 
-/// Carries the spawning task's span into every task `DataFusion` spawns.
+/// Carries the spawning task's trace context into every task `DataFusion`
+/// spawns.
 ///
 /// `DataFusion` runs partitions, repartitioning, and coalescing on its own
 /// spawned tasks, which start with no span. Without this, work a query plan
 /// does on those tasks, such as a remote peer fragment, would be a separate
 /// trace root rather than child work of the query that caused it.
+///
+/// Only the OpenTelemetry context crosses, never a `tracing` handle: a handle
+/// would keep the caller's span open until an aborted task's future is
+/// dropped, which Tokio does after the query has already ended, so a finished
+/// query's span would close late or after its exporter was read. Spans opened
+/// on the task still parent on the caller's span through the attached
+/// context.
 struct QuerySpanJoinSetTracer;
 
 impl datafusion::common::runtime::JoinSetTracer for QuerySpanJoinSetTracer {
-    /// Instruments a spawned future with the span current at spawn time.
+    /// Runs a spawned future under the trace context current at spawn time.
     fn trace_future(
         &self,
         future: BoxFuture<'static, Box<dyn Any + Send>>,
     ) -> BoxFuture<'static, Box<dyn Any + Send>> {
-        Box::pin(future.instrument(Span::current()))
+        Box::pin(future.with_context(Span::current().context()))
     }
 
-    /// Runs a spawned blocking closure inside the span current at spawn time.
+    /// Runs a spawned blocking closure under the trace context current at
+    /// spawn time.
     fn trace_block(
         &self,
         block: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
     ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
-        let span = Span::current();
-        Box::new(move || span.in_scope(block))
+        let context = Span::current().context();
+        Box::new(move || {
+            let _attached = context.attach();
+            block()
+        })
     }
 }
 

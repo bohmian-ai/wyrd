@@ -2146,11 +2146,6 @@ pub struct AppState {
     pub verification: Arc<VerificationHealth>,
     /// Key-encryption keys that seal and open Operator connection credentials.
     pub operator_keys: Arc<OperatorKeys>,
-    /// Model providers Eval judges call, in queued runs and direct execution.
-    ///
-    /// The environment-built process default unless a test or embedding
-    /// process replaces it with [`AppState::with_judge_providers`].
-    pub judge_providers: Arc<skald_runtime::ProviderRegistry>,
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
@@ -2211,7 +2206,6 @@ impl AppState {
             peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
             verification: Arc::default(),
             operator_keys: Arc::new(OperatorKeys::default()),
-            judge_providers: skald_runtime::default_registry(),
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
         }
@@ -2303,14 +2297,6 @@ impl AppState {
     #[must_use]
     pub fn with_gateway_engine(mut self, engine: GatewayEngine) -> Self {
         self.gateway_engine = Arc::new(engine);
-        self
-    }
-
-    /// Judge every Eval, queued or direct, through `providers` instead of
-    /// the environment-built process default.
-    #[must_use]
-    pub fn with_judge_providers(mut self, providers: Arc<skald_runtime::ProviderRegistry>) -> Self {
-        self.judge_providers = providers;
         self
     }
 

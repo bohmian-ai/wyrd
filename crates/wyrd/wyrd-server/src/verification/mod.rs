@@ -226,7 +226,6 @@ impl VerificationRuntime {
         VerificationRuntimeBuilder {
             state,
             limits: RuntimeLimits::default(),
-            providers: None,
             endpoints: ProviderEndpoints::default(),
             #[cfg(feature = "test-support")]
             publication_fault: None,
@@ -307,8 +306,6 @@ pub struct VerificationRuntimeBuilder<'a> {
     state: &'a AppState,
     /// Runtime bounds.
     limits: RuntimeLimits,
-    /// Model providers Eval judges call; the state's judge providers when `None`.
-    providers: Option<Arc<skald_runtime::ProviderRegistry>>,
     /// Slack and PagerDuty endpoints Operators deliver to.
     endpoints: ProviderEndpoints,
     /// Test-only publication faults.
@@ -327,14 +324,6 @@ impl VerificationRuntimeBuilder<'_> {
     #[must_use]
     pub fn limits(mut self, limits: RuntimeLimits) -> Self {
         self.limits = limits;
-        self
-    }
-
-    /// Judge Eval runs through `providers` instead of the state's
-    /// [`judge_providers`](AppState::judge_providers).
-    #[must_use]
-    pub fn providers(mut self, providers: Arc<skald_runtime::ProviderRegistry>) -> Self {
-        self.providers = Some(providers);
         self
     }
 
@@ -448,12 +437,7 @@ impl VerificationRuntimeBuilder<'_> {
                 outbox,
                 VerifierEngines::new(
                     DriftEngine::new(self.state.clone(), self.limits.execution_timeout),
-                    self::eval::EvalEngine::new(
-                        self.state.clone(),
-                        self.providers
-                            .unwrap_or_else(|| Arc::clone(&self.state.judge_providers)),
-                        self.limits.trace_deadline,
-                    ),
+                    self::eval::EvalEngine::new(self.state.clone(), self.limits.trace_deadline),
                 ),
                 self.limits,
             );

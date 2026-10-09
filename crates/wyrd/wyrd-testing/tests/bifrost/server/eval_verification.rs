@@ -263,18 +263,31 @@ async fn start_state(bundle: &Path, client: &WyrdClient) -> WyrdState {
     state
 }
 
-/// Compose and spawn a verification runtime with fast bounds and the local
-/// provider; returns its stop token and task.
+/// Role granting exactly the gateway invoke scope the judge Prompt's
+/// `openai` provider needs; the observation writer holds it to judge.
+const JUDGE_ROLE: &str = "eval_judge_invoker";
+
+/// Boot a bound server whose gateway serves every model call, LLM judges
+/// included, from the local `provider`.
+///
+/// # Errors
+/// Returns the server start error.
+async fn gateway_server(provider: &MockServer) -> Result<WyrdTestServer, ServerJourneyError> {
+    let root = url::Url::parse(&provider.uri())?;
+    Ok(Box::pin(
+        WyrdTestServer::builder()
+            .with_gateway_provider_root_for_test(root)
+            .start_bound(),
+    )
+    .await?)
+}
+
+/// Compose and spawn a verification runtime with fast bounds; its judges
+/// call the server's gateway. Returns its stop token and task.
 ///
 /// # Panics
 /// Panics when the runtime does not compose.
-fn spawn_runtime(server: &WyrdTestServer, provider: &str) -> (CancellationToken, JoinHandle<()>) {
-    let providers = skald_runtime::ProviderRegistry::for_provider(
-        &skald_spec::ProviderName::OpenAi,
-        provider,
-        Some("journey-key"),
-    )
-    .expect("the local provider registers");
+fn spawn_runtime(server: &WyrdTestServer) -> (CancellationToken, JoinHandle<()>) {
     let runtime = VerificationRuntime::builder(server.state())
         .limits(RuntimeLimits {
             lease: Duration::from_mins(1),
@@ -286,7 +299,6 @@ fn spawn_runtime(server: &WyrdTestServer, provider: &str) -> (CancellationToken,
             trace_deadline: Duration::from_secs(20),
             ..RuntimeLimits::default()
         })
-        .providers(Arc::new(providers))
         .build()
         .expect("the runtime composes");
     let stop = CancellationToken::new();
@@ -649,7 +661,8 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
     let root = tempfile::tempdir()?;
     let service = write_graph(root.path());
     let bundle = root.path().join("bundle");
-    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let provider = MockServer::start().await;
+    let server = Box::pin(gateway_server(&provider)).await?;
     let tenant = server.data_tenant_id();
     let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
     let admin = api_key(
@@ -657,17 +670,20 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
             .bootstrap_service("eval_journey_admin", &["admin"])
             .await?,
     );
-    let receipt = register(&connect(&server, &admin), &service, &bundle).await;
+    let admin_client = connect(&server, &admin);
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    let receipt = register(&admin_client, &service, &bundle).await;
     let writer = api_key(
         server
-            .credential_registered_service(&receipt.root, &[])
+            .credential_registered_service(&receipt.root, &[JUDGE_ROLE])
             .await?,
     );
     let client = connect(&server, &writer);
 
-    let provider = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "chatcmpl_eval", "object": "chat.completion", "created": 1_700_000_000,
             "model": "gpt-test",
@@ -759,7 +775,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
     // Runs enqueued while no runtime runs are durable and complete once one
     // starts; this is the restart-recovery path.
     let queued = enqueued(&seed, 28).await?;
-    let (stop, task) = spawn_runtime(&server, &provider.uri());
+    let (stop, task) = spawn_runtime(&server);
     let runs = settle(&seed, queued).await?;
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
@@ -954,7 +970,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
     );
     state.shutdown().await?;
     server.flush_bifrost().await?;
-    let (stop, task) = spawn_runtime(&server, &provider.uri());
+    let (stop, task) = spawn_runtime(&server);
     let landed = record_id(&server, tenant, "landed").await?;
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
@@ -1442,10 +1458,14 @@ struct TraceJourney {
     client: WyrdClient,
     /// Bearer token of the admin principal that exports spans.
     token: String,
+    /// Local `OpenAI`-compatible upstream the server's gateway serves judges
+    /// from.
+    provider: MockServer,
 }
 
 impl TraceJourney {
-    /// Boot a bound server and register [`write_trace_graph`] through the SDK.
+    /// Boot a bound server whose gateway is rooted at a fresh local provider
+    /// and register [`write_trace_graph`] through the SDK.
     ///
     /// # Errors
     /// Returns server, registration, credential, or fixture errors.
@@ -1453,7 +1473,8 @@ impl TraceJourney {
         let root = tempfile::tempdir()?;
         let service = write_trace_graph(root.path());
         let bundle = root.path().join("bundle");
-        let server = Box::pin(WyrdTestServer::start_bound()).await?;
+        let provider = MockServer::start().await;
+        let server = Box::pin(gateway_server(&provider)).await?;
         let tenant = server.data_tenant_id();
         let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
         let admin = api_key(
@@ -1461,10 +1482,14 @@ impl TraceJourney {
                 .bootstrap_service("eval_trace_admin", &["admin"])
                 .await?,
         );
-        let receipt = register(&connect(&server, &admin), &service, &bundle).await;
+        let admin_client = connect(&server, &admin);
+        server
+            .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+            .await?;
+        let receipt = register(&admin_client, &service, &bundle).await;
         let writer = api_key(
             server
-                .credential_registered_service(&receipt.root, &[])
+                .credential_registered_service(&receipt.root, &[JUDGE_ROLE])
                 .await?,
         );
         let client = connect(&server, &writer);
@@ -1479,6 +1504,7 @@ impl TraceJourney {
             bundle,
             client,
             token,
+            provider,
         })
     }
 
@@ -1508,12 +1534,8 @@ impl TraceJourney {
     ///
     /// # Errors
     /// Returns a settle timeout or the runtime task's failure.
-    async fn run_to(
-        &self,
-        provider: &str,
-        count: usize,
-    ) -> Result<Vec<ObservationRun>, ServerJourneyError> {
-        let (stop, task) = spawn_runtime(&self.server, provider);
+    async fn run_to(&self, count: usize) -> Result<Vec<ObservationRun>, ServerJourneyError> {
+        let (stop, task) = spawn_runtime(&self.server);
         let runs = settle(&self.seed, count).await;
         stop.cancel();
         tokio::time::timeout(WAIT, task).await??;
@@ -1707,8 +1729,7 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
         .await?;
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
 
-    let provider = MockServer::start().await;
-    let runs = journey.run_to(&provider.uri(), 3).await?;
+    let runs = journey.run_to(3).await?;
     let evidence = record_id(&journey.server, journey.tenant, "evidence-1").await?;
     for record in [&past, &future] {
         let outside = run_of(&runs, "eval-trace-evidence", record)?;
@@ -1746,7 +1767,7 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
             &[(json!({ "marker": "evidence-2" }), None)],
         )
         .await?;
-    let runs = journey.run_to(&provider.uri(), 4).await?;
+    let runs = journey.run_to(4).await?;
     let again = record_id(&journey.server, journey.tenant, "evidence-2").await?;
     let rerun = run_of(&runs, "eval-trace-evidence", &again)?;
     assert_completed(&journey.server, journey.tenant, rerun, "passed", (6, 0), 0).await?;
@@ -1828,9 +1849,9 @@ async fn continuous_eval_refuses_a_trace_over_the_span_ceiling() -> Result<(), S
         )
         .await?;
 
-    let provider = MockServer::start().await;
+    let provider = &journey.provider;
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "chatcmpl_eval", "object": "chat.completion", "created": 1_700_000_000,
             "model": "gpt-test",
@@ -1838,9 +1859,9 @@ async fn continuous_eval_refuses_a_trace_over_the_span_ceiling() -> Result<(), S
                 "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
             "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
         })))
-        .mount(&provider)
+        .mount(provider)
         .await;
-    let runs = journey.run_to(&provider.uri(), 2).await?;
+    let runs = journey.run_to(2).await?;
     let ceiling = record_id(&journey.server, journey.tenant, "ceiling").await?;
     let overflow = record_id(&journey.server, journey.tenant, "overflow").await?;
     assert_completed(
@@ -1970,8 +1991,7 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
     ) {
         return Err(format!("a tenant without a System principal resolved {missing:?}").into());
     }
-    let provider = MockServer::start().await;
-    let runs = journey.run_to(&provider.uri(), 1).await?;
+    let runs = journey.run_to(1).await?;
     let record = record_id(server, tenant, "authority").await?;
     let refused = run_of(&runs, "eval-trace-evidence", &record)?;
     // No run has published yet, so the results table does not even exist.
@@ -2136,7 +2156,8 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     let root = tempfile::tempdir()?;
     let service = write_graph(root.path());
     let bundle = root.path().join("bundle");
-    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let provider = MockServer::start().await;
+    let server = Box::pin(gateway_server(&provider)).await?;
     let tenant = server.data_tenant_id();
     let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
     let admin = api_key(
@@ -2144,16 +2165,19 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
             .bootstrap_service("eval_errors_admin", &["admin"])
             .await?,
     );
-    let receipt = register(&connect(&server, &admin), &service, &bundle).await;
+    let admin_client = connect(&server, &admin);
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    let receipt = register(&admin_client, &service, &bundle).await;
     let writer = api_key(
         server
-            .credential_registered_service(&receipt.root, &[])
+            .credential_registered_service(&receipt.root, &[JUDGE_ROLE])
             .await?,
     );
     let client = connect(&server, &writer);
-    let provider = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
             "error": { "message": PROVIDER_SENTINEL, "type": "invalid_request_error" }
         })))
@@ -2188,7 +2212,7 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     state.shutdown().await?;
     server.flush_bifrost().await?;
     let queued = enqueued(&seed, 2 * AGENT_BINDINGS).await?;
-    let (stop, task) = spawn_runtime(&server, &provider.uri());
+    let (stop, task) = spawn_runtime(&server);
     settle(&seed, queued).await?;
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
@@ -2232,7 +2256,7 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     )
     .execute(&superuser)
     .await?;
-    let (stop, task) = spawn_runtime(&server, &provider.uri());
+    let (stop, task) = spawn_runtime(&server);
     let unclaimed = unclaimed_while_cards_fail(&superuser).await;
     sqlx::query("DROP POLICY eval_errors_refuse ON wyrd.cards")
         .execute(&superuser)

@@ -25,8 +25,10 @@ serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 skald-agent = { workspace = true }
 skald-prompt = { workspace = true }
+skald-providers = { workspace = true }
 skald-runtime = { workspace = true }
 skald-spec = { workspace = true }
+skald-workflow = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
 tracing = { workspace = true }
@@ -39,7 +41,6 @@ wyrd-utils = { workspace = true }
 workspace-hack.workspace = true
 wyrd-semver = { workspace = true }
 serde_json = { workspace = true }
-skald-providers = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros", "test-util"] }
 

@@ -44,13 +44,14 @@ mod test_support;
 pub mod workflow;
 pub mod workflow_surface;
 
+pub use attempt::agent_error_retryable;
 pub use bodies::{AgentTools, CardBodies, card_body_dependencies};
 pub use error::{WorkflowError, WorkflowResult};
 pub use plan::DEFAULT_MAX_RETRIES;
 pub use route::{
     DEFAULT_GATEWAY_CALL_TIMEOUT, ExternalEndpointProfile, ExternalGatewayBinding,
     ExternalGatewayBindings, WorkflowExecutionDependencies, WorkflowGatewayCorrelation,
-    WyrdGatewayCall, WyrdGatewayCaller,
+    WyrdGatewayCall, WyrdGatewayCaller, wyrd_gateway_registry,
 };
 pub use workflow::{DEFAULT_MAX_CONCURRENCY, WorkflowExecutionLimits, WorkflowRunOptions};
 pub use workflow_surface::{

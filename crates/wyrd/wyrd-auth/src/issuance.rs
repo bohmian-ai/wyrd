@@ -429,7 +429,14 @@ impl TenantTokenIssuer {
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
         let tenant = conn.data_tenant_id();
-        let (principal, roles, permissions) = self.resolve(conn, principal_id, &grant).await?;
+        let (principal, roles, permissions) = self
+            .resolve(
+                conn,
+                principal_id,
+                grant.is_human(),
+                grant.records_owner_activity(),
+            )
+            .await?;
         let expires_at = Utc::now() + self.settings.access_ttl;
         let scope_mint = grant
             .scope_mint_kind()
@@ -495,7 +502,14 @@ impl TenantTokenIssuer {
         principal_id: Uuid,
         grant: TenantGrant,
     ) -> Result<VerifiedToken, IssuanceError> {
-        let (principal, roles, permissions) = self.resolve(conn, principal_id, &grant).await?;
+        let (principal, roles, permissions) = self
+            .resolve(
+                conn,
+                principal_id,
+                grant.is_human(),
+                grant.records_owner_activity(),
+            )
+            .await?;
         let claims = self.issuing_key.access_claims(
             grant.into_access_grant(principal, roles, permissions),
             self.settings.access_ttl,
@@ -503,13 +517,50 @@ impl TenantTokenIssuer {
         Ok(claims.into_verified().map_err(auth_error_to_wyrd)?)
     }
 
-    /// Resolve the principal `grant` issues for, with its current roles and
-    /// permissions.
+    /// Recover the current authority of `principal_id`, the stored writer of
+    /// a durable record, for server work queued on its behalf.
+    ///
+    /// The principal is read as a user when one has that id and as a service
+    /// account otherwise, then resolved exactly as [`Self::verify`] resolves
+    /// it — tenant admission, active status, current roles and permissions,
+    /// and a Card-bound principal's Card scope — so revoking a role or
+    /// suspending the principal takes effect for queued work too. Nothing is
+    /// presented, signed, or recorded: the result carries no credential and
+    /// no delegation, and no owner activity or audit is written.
+    ///
+    /// # Errors
+    /// Every [`Self::verify`] error except the activity write.
+    #[tracing::instrument(level = "debug", skip(self, conn), fields(principal_id = %principal_id), err)]
+    pub async fn recover(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal_id: Uuid,
+    ) -> Result<VerifiedToken, IssuanceError> {
+        let human = user_by_id(conn, principal_id).await?.is_some();
+        let (principal, roles, permissions) =
+            self.resolve(conn, principal_id, human, false).await?;
+        let claims = self.issuing_key.access_claims(
+            AccessGrant {
+                principal,
+                roles,
+                permissions,
+                credential_id: None,
+                act: None,
+                audience: TokenAudience::Wyrd,
+            },
+            self.settings.access_ttl,
+        )?;
+        Ok(claims.into_verified().map_err(auth_error_to_wyrd)?)
+    }
+
+    /// Resolve `principal_id` — a user when `human`, else a service account —
+    /// with its current roles and permissions.
     ///
     /// Refuses a tenant that does not admit credentials and a principal that
     /// is missing or not active, resolves a Card-bound principal's Card scope,
-    /// and records owner activity when the grant is a Card-bound machine's own
-    /// durable credential.
+    /// and records owner activity when `records_activity` is set for a
+    /// Card-bound principal, which only a machine's own durable-credential
+    /// grant sets.
     ///
     /// # Errors
     /// As [`Self::issue`], less the signing errors.
@@ -517,13 +568,14 @@ impl TenantTokenIssuer {
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: Uuid,
-        grant: &TenantGrant,
+        human: bool,
+        records_activity: bool,
     ) -> Result<(TokenPrincipalRef, Vec<RoleRef>, PermissionSet), IssuanceError> {
         let tenant = conn.data_tenant_id();
         if !tenant_admits_credentials(conn, tenant).await? {
             return Err(IssuanceError::TenantNotAdmitting);
         }
-        let (principal, role_names) = if grant.is_human() {
+        let (principal, role_names) = if human {
             let user = user_by_id(conn, principal_id)
                 .await?
                 .filter(|user| user.status == "active")
@@ -561,7 +613,7 @@ impl TenantTokenIssuer {
         })?;
         let permissions = resolve_permissions(conn, &roles).await?;
 
-        if grant.records_owner_activity() && principal.card_ref.is_some() {
+        if records_activity && principal.card_ref.is_some() {
             record_machine_authentication(conn, principal.id).await?;
         }
         Ok((principal, roles, permissions))

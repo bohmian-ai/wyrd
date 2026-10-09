@@ -523,9 +523,6 @@ pub struct WyrdTestServerBuilder {
     /// Built-in provider base URLs of an attached HTTP gateway engine; `None`
     /// keeps the default engine that dispatches nothing.
     gateway_endpoints: Option<BuiltinEndpoints>,
-    /// `OpenAI`-compatible mock upstream every Eval judge, queued or direct,
-    /// calls, set with the gateway provider root.
-    verification_provider: Option<Url>,
     /// Address and token variable the declared test Vault backend uses.
     ///
     /// `None` keeps the unreachable default address and the default token
@@ -664,7 +661,6 @@ impl Default for WyrdTestServerBuilder {
             limits: None,
             workflow_config: None,
             gateway_endpoints: None,
-            verification_provider: None,
             gateway_vault_backend: None,
             stalled_drain_for_test: None,
             shutdown_drain_for_test: None,
@@ -3239,6 +3235,77 @@ impl WyrdTestServer {
         conn.commit().await.map_err(sql)
     }
 
+    /// Deploy `openai/{model}` Chat Completions behind a managed `openai-key`
+    /// credential through the gateway administration routes, and seed `role`
+    /// granting gateway invoke on the `openai` provider.
+    ///
+    /// A judge or Agent Prompt naming `openai/{model}` then resolves through
+    /// the gateway to the provider root the server was built with, and only a
+    /// principal holding `role` may invoke it.
+    ///
+    /// # Errors
+    /// Returns an error when the administrator cannot be bootstrapped, an
+    /// administration request is refused, or the role write fails.
+    pub async fn deploy_gateway_model_for_test(
+        &self,
+        model: &str,
+        role: &str,
+    ) -> Result<(), WyrdTestServerError> {
+        let Bootstrap::User { jwt, .. } = self
+            .bootstrap_user(&format!("gateway-admin-{}", Uuid::now_v7()), &["admin"])
+            .await?
+        else {
+            return Err(WyrdTestServerError::Io(
+                "user bootstrap returned a machine principal".to_owned(),
+            ));
+        };
+        for (route, body) in [
+            (
+                "provider-credentials/openai-key".to_owned(),
+                serde_json::json!({
+                    "name": "openai-key",
+                    "provider": "openai",
+                    "source": { "managed_secret": { "secret": "sk-gateway-upstream" } },
+                }),
+            ),
+            (
+                format!("provider-deployments/{model}"),
+                serde_json::json!({
+                    "name": model,
+                    "model": { "provider": "openai", "model": model },
+                    "adapter": "openai",
+                    "auth": { "bearer": { "credential": "openai-key" } },
+                    "capabilities": ["chat_completions"],
+                    "routing_weight": 1,
+                }),
+            ),
+        ] {
+            let request = Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/admin/gateway/{route}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+            let response = self.oneshot_authenticated(&jwt, request).await?;
+            if !response.status().is_success() {
+                return Err(WyrdTestServerError::Io(format!(
+                    "{route}: {}",
+                    response.status()
+                )));
+            }
+        }
+        self.seed_role(
+            role,
+            &[Permission::gateway_invoke(
+                wyrd_spec::auth::GatewayAccess::Provider {
+                    provider: wyrd_spec::ids::ProviderId::new("openai")
+                        .map_err(|error| WyrdTestServerError::Io(error.to_string()))?,
+                },
+            )],
+        )
+        .await
+    }
+
     /// Grant a role to a bootstrapped principal.
     ///
     /// # Errors
@@ -4010,15 +4077,13 @@ impl WyrdTestServerBuilder {
     ///
     /// `OpenAI` is served under `root`'s `/v1` segment; Anthropic, Gemini, and
     /// Vertex at `root` itself, where each provider's native paths begin.
-    /// Delegates to [`Self::with_gateway_endpoints_for_test`]. The same `/v1`
-    /// upstream also serves the `OpenAI` Eval judge of a bound server's queued
-    /// runs and direct executions, so a language journey roots both model
-    /// paths at one local mock.
+    /// Delegates to [`Self::with_gateway_endpoints_for_test`]. Eval judges
+    /// call the gateway too, so a language journey roots every model path at
+    /// one local mock.
     #[must_use]
-    pub fn with_gateway_provider_root_for_test(mut self, root: Url) -> Self {
+    pub fn with_gateway_provider_root_for_test(self, root: Url) -> Self {
         let mut openai = root.clone();
         openai.set_path("/v1");
-        self.verification_provider = Some(openai.clone());
         self.with_gateway_endpoints_for_test(BuiltinEndpoints {
             openai: Some(openai),
             anthropic: Some(root.clone()),
@@ -4903,15 +4968,6 @@ impl WyrdTestServerBuilder {
         }
         if let Some(limits) = self.limits {
             state = state.with_limits(limits);
-        }
-        if let Some(provider) = &self.verification_provider {
-            let providers = skald_runtime::ProviderRegistry::for_provider(
-                &skald_spec::ProviderName::OpenAi,
-                provider.as_str(),
-                Some("wyrd-test-provider-key"),
-            )
-            .map_err(|error| start(error.to_string()))?;
-            state = state.with_judge_providers(Arc::new(providers));
         }
         if let Some(workflow) = self.workflow_config {
             state = state.with_workflow_config(workflow);

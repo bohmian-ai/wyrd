@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 use skald_agent::{Agent, AgentError, run_config_from_agent_run_config_spec};
 use skald_prompt::Prompt;
-use skald_runtime::ProviderRegistry;
+use skald_providers::ProviderError;
+use skald_runtime::{ProviderRegistry, SkaldRuntimeError};
+use skald_workflow::{WyrdGatewayCaller, agent_error_retryable, wyrd_gateway_registry};
 use tokio::sync::Mutex;
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::reference::{CardRef, InlineableRef};
@@ -51,6 +53,9 @@ pub struct SkaldJudgeInvoker {
     prompts: Arc<dyn PromptCardResolver>,
     /// Resolver for record media; `None` refuses any media-bearing call.
     media: Option<Arc<dyn MediaResolver>>,
+    /// Governed Wyrd gateway serving every judge model call in place of
+    /// `providers`; `None` calls `providers` directly.
+    gateway: Option<Arc<dyn WyrdGatewayCaller>>,
     cached_agent: Mutex<Option<(InlineableRef<AgentSpec>, Arc<Agent>)>>,
     /// Per-attempt outer deadline.
     pub call_deadline: Duration,
@@ -69,6 +74,7 @@ impl SkaldJudgeInvoker {
             agents,
             prompts,
             media: None,
+            gateway: None,
             cached_agent: Mutex::new(None),
             call_deadline: Duration::from_mins(1),
         }
@@ -78,6 +84,17 @@ impl SkaldJudgeInvoker {
     #[must_use]
     pub fn with_media_resolver(mut self, resolver: Arc<dyn MediaResolver>) -> Self {
         self.media = Some(resolver);
+        self
+    }
+
+    /// Serve every judge model call through the Wyrd gateway `caller`.
+    ///
+    /// The judge Agent then dispatches only to the gateway adapter keyed by
+    /// its Prompt's provider, so the gateway's authorization, accounting,
+    /// capture, and audit apply to each call and `providers` is never used.
+    #[must_use]
+    pub fn with_wyrd_gateway(mut self, caller: Arc<dyn WyrdGatewayCaller>) -> Self {
+        self.gateway = Some(caller);
         self
     }
 
@@ -170,10 +187,23 @@ impl SkaldJudgeInvoker {
             || "inline-judge".to_owned(),
             |reference| reference.name.to_string(),
         );
-        let agent = Agent::new(prompt)
+        let gateway = match &self.gateway {
+            Some(caller) => Some(Arc::new(
+                wyrd_gateway_registry(Arc::clone(caller), prompt.native()).ok_or_else(|| {
+                    JudgeError::Terminal {
+                        reason: "WYRD_WORKFLOW_422_ROUTE_UNSUPPORTED: judge Prompt provider and model are not a gateway model identity".to_owned(),
+                    }
+                })?,
+            )),
+            None => None,
+        };
+        let mut agent = Agent::new(prompt)
             .with_id(id)
             .with_tools(std::iter::empty())
             .with_run_config(run_config_from_agent_run_config_spec(&spec.run_config));
+        if let Some(registry) = gateway {
+            agent = agent.with_provider_registry(registry);
+        }
         let agent = Arc::new(agent);
         *cached = Some((judge_ref.clone(), Arc::clone(&agent)));
         Ok(agent)
@@ -237,7 +267,22 @@ fn validate_judge_agent(spec: &AgentSpec) -> Result<(), JudgeError> {
     Ok(())
 }
 
+/// Classify an Agent failure for the judge retry loop.
+///
+/// A gateway problem the Workflow classification deems terminal — such as a
+/// permission denial or an unknown model — stays terminal with its stable
+/// code leading the reason; every other provider failure is retryable.
 fn map_agent_error(error: AgentError) -> JudgeError {
+    if let AgentError::Provider(SkaldRuntimeError::Provider {
+        source: ProviderError::RemoteProblem(problem),
+        ..
+    }) = &error
+        && !agent_error_retryable(&error)
+    {
+        return JudgeError::Terminal {
+            reason: format!("{}: {}", problem.code, problem.message),
+        };
+    }
     match error {
         AgentError::Timeout { duration } => JudgeError::Timeout {
             elapsed_ms: elapsed_millis(duration),

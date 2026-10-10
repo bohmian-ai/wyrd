@@ -52,3 +52,24 @@ async fn cli_device_login_journey() {
 async fn mcp_proxy_discovers_and_reads_with_shared_auth() {
     mcp_journey::mcp_proxy_discovers_and_reads_with_shared_auth().await;
 }
+
+/// Root of the selective host-installation journey, so its exact name
+/// selects it.
+///
+/// # Panics
+/// Panics when any step of
+/// [`mcp_journey::mcp_install_changes_only_selected_hosts`] differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_install_changes_only_selected_hosts() {
+    mcp_journey::mcp_install_changes_only_selected_hosts().await;
+}
+
+/// Root of the external-server MCP journey, so its exact name selects it.
+///
+/// # Panics
+/// Panics when any step of
+/// [`mcp_journey::mcp_external_server_preserves_global_endpoint`] differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_external_server_preserves_global_endpoint() {
+    mcp_journey::mcp_external_server_preserves_global_endpoint().await;
+}

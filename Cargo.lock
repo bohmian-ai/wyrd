@@ -11310,6 +11310,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tracing-subscriber",
  "url",
  "uuid",

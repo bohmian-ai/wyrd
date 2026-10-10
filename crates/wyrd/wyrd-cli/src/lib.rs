@@ -16,6 +16,8 @@ pub mod error;
 mod eval;
 pub mod gateway;
 pub mod load;
+/// `wyrd mcp`: MCP host installation and the host-facing stdio proxy.
+pub mod mcp;
 mod operator_connection;
 mod platform;
 mod principal;

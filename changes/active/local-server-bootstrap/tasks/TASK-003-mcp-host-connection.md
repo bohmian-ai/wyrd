@@ -144,3 +144,59 @@ credential or permission contract different from the approved shared path.
 `changes/active/local-server-bootstrap/spec.md` revision 5;
 `AGENTS.md` §§2, 9, 11; `architecture/references/languages/agent-harness.md`;
 `architecture/wyrd-security-posture.md`.
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+| --- | --- | --- | --- |
+| Selected hosts discover and call a read tool over shared auth (REQ-013, REQ-014, INV-001) | `crates/wyrd/wyrd-cli/src/mcp/proxy.rs` bridges stdio to `/mcp` through `client::from_global` | `mcp_proxy_discovers_and_reads_with_shared_auth` (exact `--test cli` command) | PASS |
+| Seven host variants, selection-only writes, repeat/conflict/unwritable per host (REQ-011, REQ-012, INV-004) | `crates/wyrd/wyrd-cli/src/mcp/{mod,hosts}.rs` (`HostInstaller`, JSON/TOML/YAML edits) | `mcp_install_changes_only_selected_hosts`; `mcp::hosts` unit tests (4); Python `test_mcp_host_connection.py` (8); TS `mcp-host-connection.test.ts` (3) | PASS |
+| External server retained; no local server; global `config.toml` untouched (REQ-013, AC-006) | `--server` validated with `HttpConfig::validate`, stored in host args only | `mcp_external_server_preserves_global_endpoint`; Python `test_external_server_preserves_global_endpoint` | PASS |
+| Host config contains no credential | Entry holds only binary path, `mcp proxy [--server]`, `env.WYRD_CONFIG_HOME` | Journey, Python, and TS assertions that the API key is absent from every host file | PASS |
+| Stable, redacted failures (auth, permission, network, host config) | `WyrdCliError::{McpHostSelection, McpHostInstall, McpProxy}`; in-process codes `WYRD_SPEC_400_VALIDATION`, `WYRD_CLIENT_400_CONFIG_INVALID` | Journey failure cases; parametrized Python/TS invalid cases; `docs:check` (MCP host codes table) | PASS |
+| Language tests use typed in-process commands, not argv | `wyrd_cli::commands::mcp_install` projected via `wyrd.testing.cli.mcp_install` and `@wyrd/testing` `cli.mcpInstall`; TASK-002 argv `server install` tests removed (covered by Rust `server_install.rs`) | `py:test:cli:unit` (6), `ts:test:unit`, `py:typecheck`, `ts:typecheck`, `codegen:check` | PASS |
+| Docs and docsite | `reference/cli.svx` `wyrd mcp`; generated `api/errors.md`, `llms*.txt`; docsite `connect/connect-an-agent-through-mcp.md` (`wyrd-doc-site` commit `70a559944`) | `docs:check`; docsite `docs:check:commands`, `docs:linkcheck`, `docs:build`, `docs:a11y`; reader test | PASS |
+| Format, lints, owner lane | — | `fmt`, `lints`, `py:lints`, `ts:lints`, `ts:format`, `mise run test:wyrd`, `git diff --check` | PASS |
+
+**Scope change.** Spec revision 5 (owner-approved) adds Cursor, Pi, and Hermes
+Agent. Host contracts were checked against current docs: pi.dev/docs/latest/mcp
+(`~/.pi/agent/mcp.json`, `PI_CODING_AGENT_DIR`), cursor.com/docs/context/mcp
+(`~/.cursor/mcp.json`), and the Hermes Agent MCP docs (`~/.hermes/config.yaml`
+`mcp_servers`, `HERMES_HOME`).
+
+**Hermes YAML.** No comment-preserving YAML dependency is installed and
+`serde_yaml` is lossy, so the entry is written as one JSON flow line (valid
+YAML) by a guarded line edit, then re-parsed and compared; any mismatch,
+including inline `mcp_servers: {}`, reports `unreadable` and leaves the file
+unchanged.
+
+**Reuse map.** Auth, endpoint precedence, and transport reuse
+`ClientConfig`/`WyrdClient`/`client::from_global`; no second credential
+source, token cache, or tool catalog was added.
+
+**Diagnosis — `pg_verification_runtime::unscored_drift_publishes_only_the_summary`
+failed once in `test:wyrd` (`left: []`, `right: ["vala.verification.results"]`).**
+
+- Symptom: `harness.writes()` returned no batch after `wait_run` saw the run
+  `completed`.
+- Evidence: `VerifierRunner::settle` committed the fenced `complete`
+  (`verification/runner.rs`, `conn.commit()`), and only afterwards did
+  `attempt` call `outbox.stage`; `Outbox::stage` is the only place `pending`
+  rises, and `PublicationFault::sent` returns as soon as `settle()` sees
+  `pending == 0`.
+- Cause: the completion became visible in PostgreSQL before its result was
+  pending on the outbox, contradicting the runner's module contract ("the run
+  completes once it is staged"); a reader polling between commit and stage saw
+  `completed` with nothing to settle.
+- Fix site: `VerifierRunner::settle` now stages the result inside the
+  lease-fenced transaction, after `complete` applies and before commit. A
+  stale lease stages nothing; a commit failure retried under the same lease
+  does not stage twice; a lost lease after a failed commit can leave one
+  extra result for a re-executed run (owner-accepted trade-off). Other callers
+  exposed to the same window (`pg_verification_runtime` completed-run, lost-ack,
+  multi-replica, and reclaim tests) are fixed at the same owner.
+- Diagnostician: independent read-only report confirmed the cause and fix
+  site. Verified by all 32 `pg_verification_runtime` tests and `test:wyrd`.
+
+**Non-goals.** No profile system, MCP secret store, separate package CLI,
+second tool catalog, or global endpoint rewrite was added.

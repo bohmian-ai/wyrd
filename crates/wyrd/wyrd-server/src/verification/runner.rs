@@ -8,7 +8,8 @@
 //! [`VerifierImplementation`] and ends in exactly one fenced transition the
 //! runner applies itself. A completed report becomes one result payload,
 //! staged on the process [`ScribeOutbox`] attributed to the tenant's SYSTEM
-//! principal and the exact Verifier, and the run completes once it is staged;
+//! principal and the exact Verifier inside the fenced transaction that
+//! completes the run, so a visible completion always has its result staged;
 //! delivery belongs to the outbox and never re-executes the run. A retryable
 //! failure is retried within the run's attempt budget; a terminal failure is
 //! terminated without a verdict; work abandoned by shutdown is released with
@@ -22,9 +23,8 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
-use std::sync::Mutex;
-#[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -43,7 +43,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict, VerifierKind};
 use wyrd_sql::queries::cards::fetch_card_row;
 use wyrd_sql::queries::verifier_runs::{
-    ClaimedRun, RetryOutcome, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
+    ClaimedRun, RetryOutcome, Settlement, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
 };
 use wyrd_sql::{OperatorPool, ParsedCardRow, SqlError, TenantConn, WyrdPostgres};
 
@@ -80,7 +80,7 @@ const PERSIST_MAX: Duration = Duration::from_secs(5);
 /// The single transition one claimed run ends in.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Transition {
-    /// The result was built; settle `completed` with it, then stage it.
+    /// The result was built; settle `completed` and stage it before commit.
     Complete {
         /// The staged result.
         result_id: VerificationResultId,
@@ -330,8 +330,8 @@ impl VerifierRunner {
     ///
     /// A run without a loadable Verifier terminates; otherwise the Verifier
     /// executes and a completed report is built into its result write, which
-    /// the caller stages only once the lease-fenced settlement completes the
-    /// run. Never fails: every failure becomes the [`Transition`] it maps to.
+    /// [`settle`](Self::settle) stages inside the lease-fenced transaction
+    /// that completes the run. Never fails: every failure becomes the [`Transition`] it maps to.
     async fn execute(
         &self,
         tenant: DataTenantId,
@@ -403,6 +403,14 @@ impl VerifierRunner {
 
     /// Apply `transition` to `run` in one tenant transaction.
     ///
+    /// When a [`Transition::Complete`] applies under this lease, the write in
+    /// `result` is taken and staged on the outbox before the transaction
+    /// commits, so no reader sees the run `completed` before its result is
+    /// pending. A stale lease stages nothing. If the commit then fails, the
+    /// already-staged write keeps its result ID: a retried settlement under
+    /// the same lease completes the run without staging again, and a lost
+    /// lease leaves the result written for a run another claim re-executes.
+    ///
     /// Returns the stable outcome label: `completed`, `retrying`,
     /// `exhausted`, `awaiting_trace`, `cancelled`, `timed_out`, `errored`,
     /// `released`, `deferred`, or `stale_lease` when another claim already
@@ -416,6 +424,7 @@ impl VerifierRunner {
         tenant: DataTenantId,
         run: &ClaimedRun,
         transition: Transition,
+        result: &Mutex<Option<ScribeWrite>>,
     ) -> Result<&'static str, SqlError> {
         if transition == Transition::LeaseLost {
             return Ok("stale_lease");
@@ -428,12 +437,19 @@ impl VerifierRunner {
                 verdict,
                 summary,
                 counts,
-            } => settled(
-                self.queue
+            } => {
+                let settlement = self
+                    .queue
                     .complete(&mut conn, lease, result_id, verdict, &summary, counts)
-                    .await?,
-                "completed",
-            ),
+                    .await?;
+                if settlement == Settlement::Applied
+                    && let Some(write) =
+                        result.lock().unwrap_or_else(PoisonError::into_inner).take()
+                {
+                    self.outbox.stage(tenant, write);
+                }
+                settled(settlement, "completed")
+            }
             Transition::Retry(error) => {
                 tracing::warn!(
                     run_id = %lease.run_id,
@@ -603,7 +619,10 @@ impl LeasedWork for VerifierRunner {
     /// is logged; the lease then expires into a reclaim.
     async fn release_late(&self, tenant: DataTenantId, claim: &AttemptClaim) {
         let run = &claim.run;
-        match self.settle(tenant, run, Transition::Release).await {
+        match self
+            .settle(tenant, run, Transition::Release, &Mutex::new(None))
+            .await
+        {
             Ok(outcome) => {
                 tracing::info!(run_id = %run.lease.run_id, outcome, "claim committed after shutdown began; released");
             }
@@ -659,11 +678,14 @@ impl VerifierRunner {
         if let Some(error) = transition.error() {
             tracing::Span::current().record("error_code", error.code.as_str());
         }
+        let result = Mutex::new(result);
         let settled = telemetry
             .phase(
                 Phase::Settlement,
-                persist(lost, || self.settle(tenant, run, transition.clone()))
-                    .instrument(tracing::info_span!("verification.settle")),
+                persist(lost, || {
+                    self.settle(tenant, run, transition.clone(), &result)
+                })
+                .instrument(tracing::info_span!("verification.settle")),
             )
             .await;
         drop(held);
@@ -674,13 +696,6 @@ impl VerifierRunner {
                 "settlement_failed"
             }
         };
-        // Staged only once this lease completed the run, so a stale holder's
-        // or an unsettled attempt's result never reaches Bifrost.
-        if outcome == "completed"
-            && let Some(result) = result
-        {
-            self.outbox.stage(tenant, result);
-        }
         let span = tracing::Span::current();
         span.record("outcome", outcome);
         let failed = !matches!(

@@ -10,7 +10,7 @@ order: 13
 
 <Aside title="Placeholder">
 
-This page is a stub. Build instructions, a systemd unit example, and release-artifact references are still being written.
+This page is a stub. A systemd unit example is still being written.
 
 </Aside>
 
@@ -18,11 +18,32 @@ The server is a single compiled binary with no runtime interpreter. Deploying it
 
 The shape of a binary deployment:
 
-- Build with `cargo build --release -p wyrd-server`, or use a published release artifact once available.
+- Install the newest stable release with `wyrd server install`, download a release bundle yourself, or build with `cargo build --release -p wyrd-server`.
 - Provide the environment from [Configuration](/self-hosting/configuration/), including external Postgres, storage, and a signing key.
 - Run it under a supervisor (systemd, or your platform's equivalent) that sends `SIGTERM` on stop so the server drains gracefully. Set the stop timeout above `WYRD_SHUTDOWN_DRAIN_MS`.
 
-A systemd unit example and the release-artifact naming will land here.
+A systemd unit example will land here.
+
+## Release bundles
+
+Each GitHub release publishes one bundle per supported host, holding `wyrd-server` and the built UI under `ui/build`:
+
+| Host | Bundle |
+| --- | --- |
+| macOS, Apple silicon | `wyrd-server-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `wyrd-server-x86_64-apple-darwin.tar.gz` |
+| Linux (glibc), x86_64 | `wyrd-server-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux (glibc), aarch64 | `wyrd-server-aarch64-unknown-linux-gnu.tar.gz` |
+
+`checksums.txt` lists each bundle's SHA-256, and `checksums.txt.sig` is a raw Ed25519 signature over it from the Wyrd release key. `wyrd server install` checks that signature with the key built into the CLI, checks the bundle's digest, and only then extracts it under `<wyrd config dir>/server/versions/<version>` and points `server/current` at it. A failed download, signature, digest, or extraction leaves the previous installation active. To verify a manual download the same way:
+
+```sh
+openssl pkeyutl -verify -pubin -inkey release-signing-key.pem -rawin \
+  -in checksums.txt -sigfile checksums.txt.sig
+shasum -a 256 --check --ignore-missing checksums.txt
+```
+
+`release-signing-key.pem` is `crates/wyrd/wyrd-cli/src/server/release-signing-key.pem` in the Wyrd repository.
 
 ## Related
 

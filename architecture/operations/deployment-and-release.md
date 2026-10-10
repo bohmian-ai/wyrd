@@ -242,6 +242,21 @@ journeys against the published registry digest named in its manifest.
   durable format or contract. The incident commander then chooses roll-forward
   remediation or verified restore; deployment automation does not guess.
 
+## Local server bundles
+
+Each release publishes `wyrd-server-<target>.tar.gz` for
+`aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`, plus
+`checksums.txt` and `checksums.txt.sig`: a raw Ed25519 signature over the
+checksums made with the `WYRD_RELEASE_SIGNING_KEY` release secret.
+Publication refuses a secret whose public half differs from the key the CLI
+embeds (`crates/wyrd/wyrd-cli/src/server/release-signing-key.pem`).
+`wyrd server install` selects the highest stable, non-draft `v<semver>`
+release, refuses one outside the CLI's caret-compatible version line, and
+verifies the signature and bundle digest before extracting into a staging
+directory that becomes runnable only by an atomic rename and link swap.
+Rotating the signing key requires a CLI release that embeds the new key.
+
 ## Release evidence
 
 A production release records:

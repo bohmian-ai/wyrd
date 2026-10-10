@@ -758,12 +758,13 @@ units its filters cannot rule out by their recorded bounds, counted in decoded
 bytes. A Parquet unit is a row group of a published file, hot file, or staged
 run, counted by its uncompressed column chunks from the footer (a file whose
 footer cannot be read counts its size on disk); a memtable unit is an append
-batch, counted by the Arrow memory it retains. Oracle sizes published and hot
+batch, counted by each column's Arrow data, recorded once at append so sizing
+adds stored numbers. Oracle sizes published and hot
 files; each Scribe reports its memtable batches and staged runs for the same
 columns and filters, and its follower sizes its memtable leaf from the batches
 it actually keeps. Neither the grant nor the pinned file count changes it.
 Where the rule cannot apply (a filter conjunct that does not plan, a footer
-not read) sizing keeps more and counts it in
+not read, a batch column without a recorded size) sizing counts it in
 `bifrost_scan_sizing_fallback_total{reason}`; Oracle counts the row groups it
 sized in `oracle_query_row_groups_sized_total`, read beside
 `oracle_query_row_groups_scanned_total`, and the query capacity benchmark

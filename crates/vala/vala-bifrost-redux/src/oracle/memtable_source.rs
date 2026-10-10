@@ -42,7 +42,7 @@ pub(super) struct MemtableSource {
     /// Exact bounds of each batch in `inner`, partition by partition, column
     /// for column with the source schema.
     statistics: Vec<Vec<Arc<Statistics>>>,
-    /// The sizing that deals batches over partitions by their Arrow bytes.
+    /// The sizing that deals batches over partitions by their recorded column bytes.
     partitioning: crate::scan_sizing::OraclePartitioning,
 }
 
@@ -65,7 +65,7 @@ impl MemtableSource {
         schema: SchemaRef,
     ) -> DataFusionResult<Self> {
         let (batches, bounds): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
-        let bytes = ScanSizer::new(&ScanScope::default(), &schema).batch_bytes(&batches, &bounds);
+        let bytes = ScanSizer::new(&ScanScope::default(), &schema).batch_bytes(&bounds);
         let partitions = partitioning.scan_partitions(bytes, cap);
         let mut dealt = vec![(Vec::new(), Vec::new()); partitions];
         for (index, (batch, bounds)) in batches.into_iter().zip(bounds).enumerate() {
@@ -86,8 +86,8 @@ impl MemtableSource {
     /// none.
     ///
     /// The kept batches are re-dealt round-robin over
-    /// [`crate::scan_sizing::OraclePartitioning::scan_partitions`] of their Arrow bytes,
-    /// never more than this source had, so a point lookup that keeps one
+    /// [`crate::scan_sizing::OraclePartitioning::scan_partitions`] of their
+    /// recorded column bytes, never more than this source had, so a point lookup that keeps one
     /// batch runs as one partition rather than one per core. A predicate that
     /// does not plan as a pruning predicate, or a partition whose bounds
     /// cannot be evaluated, keeps every batch it covers.

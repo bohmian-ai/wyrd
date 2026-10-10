@@ -239,8 +239,9 @@ impl ScanScope {
 /// A scan reads units, each with recorded bounds: a memtable batch, or a
 /// Parquet row group of a staged run, hot file, or published file. The sizer
 /// plans the scope's filters once, drops every unit the bounds rule out, and
-/// counts the covered columns of the rest in decoded bytes: Arrow memory for
-/// a batch, uncompressed size for a column chunk. Decoded, because a
+/// counts the covered columns of the rest in decoded bytes: a batch column's
+/// Arrow data, recorded once when Scribe appends it, and a column chunk's
+/// uncompressed size. Decoded, because a
 /// partition's work is decoding, so one partition size means the same work
 /// on every tier. Oracle sizes published and hot files with it, the Scribe
 /// listing its memtable batches and staged runs, and the Scribe follower its
@@ -250,6 +251,9 @@ pub(crate) struct ScanSizer<'scope> {
     scope: &'scope ScanScope,
     /// The scope's filters planned once against the table schema.
     pruning: Option<BatchPruning>,
+    /// Indexes of the sized schema's columns the scope covers, in the order
+    /// a memtable batch's column statistics are recorded.
+    covered: Vec<usize>,
     /// Throwaway metrics the row-group pruner requires; never reported.
     metrics: datafusion::datasource::physical_plan::parquet::ParquetFileMetrics,
 }
@@ -263,6 +267,13 @@ impl<'scope> ScanSizer<'scope> {
         Self {
             scope,
             pruning: scope.pruning(schema),
+            covered: schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| scope.covers(field.name()))
+                .map(|(index, _)| index)
+                .collect(),
             metrics: datafusion::datasource::physical_plan::parquet::ParquetFileMetrics::new(
                 0,
                 "scan_sizing",
@@ -363,36 +374,37 @@ impl<'scope> ScanSizer<'scope> {
         )
     }
 
-    /// Returns the Arrow bytes of the scope's columns in the `batches` whose
-    /// `statistics` the filters cannot rule out.
+    /// Returns the decoded bytes of the scope's columns in the memtable
+    /// batches whose recorded `statistics` the filters cannot rule out.
     ///
     /// `statistics` holds one entry per batch, as Scribe records them on
-    /// append, and [`Self::keep`] decides which batches count. A batch
-    /// counts each distinct allocation its covered columns retain once, by
-    /// the measure Scribe's memory governance uses.
+    /// append with each column's [`ColumnStatistics::byte_size`], so sizing
+    /// sums stored numbers and never walks a batch. [`Self::keep`] decides
+    /// which batches count. A covered column without a recorded size counts
+    /// nothing and is recorded as [`SizingFallback::UnsizedColumn`].
+    ///
+    /// [`ColumnStatistics::byte_size`]: datafusion::common::ColumnStatistics::byte_size
     #[must_use]
-    pub(crate) fn batch_bytes(
-        &self,
-        batches: &[arrow::record_batch::RecordBatch],
-        statistics: &[Arc<datafusion::common::Statistics>],
-    ) -> u64 {
-        batches
+    pub(crate) fn batch_bytes(&self, statistics: &[Arc<datafusion::common::Statistics>]) -> u64 {
+        statistics
             .iter()
-            .zip(self.keep(statistics, batches.len()))
+            .zip(self.keep(statistics, statistics.len()))
             .filter(|(_, keep)| *keep)
-            .map(|(batch, _)| {
-                let covered: Vec<usize> = batch
-                    .schema_ref()
-                    .fields()
+            .flat_map(|(batch, _)| {
+                self.covered
                     .iter()
-                    .enumerate()
-                    .filter(|(_, field)| self.scope.covers(field.name()))
-                    .map(|(index, _)| index)
-                    .collect();
-                batch.project(&covered).map_or(0, |covered| {
-                    u64::try_from(crate::scribe::memory::retained_arrow_bytes(&covered))
-                        .unwrap_or(u64::MAX)
-                })
+                    .map(|index| batch.column_statistics.get(*index))
+            })
+            .map(|column| {
+                column
+                    .and_then(|column| column.byte_size.get_value())
+                    .map_or_else(
+                        || {
+                            record_fallback(SizingFallback::UnsizedColumn, "no recorded byte size");
+                            0
+                        },
+                        |bytes| u64::try_from(*bytes).unwrap_or(u64::MAX),
+                    )
             })
             .fold(0_u64, u64::saturating_add)
     }
@@ -423,8 +435,8 @@ impl ScanSize {
     }
 }
 
-/// A point where sizing could not apply its rule and kept more than the
-/// scan may read.
+/// A point where sizing could not apply its rule, so its count differs from
+/// what the scan reads.
 ///
 /// Each one is silent in the answer, which stays exact, so it is counted in
 /// `bifrost_scan_sizing_fallback_total{reason}` and logged at DEBUG with its
@@ -437,6 +449,9 @@ enum SizingFallback {
     /// A Parquet file's footer was not read, so the file counts its size on
     /// disk.
     UnreadFooter,
+    /// A memtable batch column has no recorded byte size, so it counts
+    /// nothing.
+    UnsizedColumn,
 }
 
 impl SizingFallback {
@@ -445,6 +460,7 @@ impl SizingFallback {
         match self {
             Self::DroppedConjunct => "dropped_conjunct",
             Self::UnreadFooter => "unread_footer",
+            Self::UnsizedColumn => "unsized_column",
         }
     }
 }
@@ -537,56 +553,54 @@ mod tests {
         );
     }
 
-    /// Memtable batches are sized by the covered columns of the batches the
-    /// filters keep by their recorded bounds.
+    /// Memtable batches are sized by the column byte sizes Scribe records on
+    /// append, summed over the covered columns of the batches the filters
+    /// keep by their recorded bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture batch cannot be built or a size differs from
+    /// the Arrow data of the kept, covered columns.
     #[test]
     fn scan_sizer_counts_covered_columns_of_kept_batches() {
         use arrow::array::{Int64Array, StringArray};
         use arrow::datatypes::{DataType, Field, Schema};
         use arrow::record_batch::RecordBatch;
-        use datafusion::common::stats::Precision;
-        use datafusion::common::{ScalarValue, Statistics};
         use datafusion::logical_expr::{col, lit};
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("payload", DataType::Utf8, false),
         ]));
-        let batch = |start: i64| {
-            let batch = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(Int64Array::from_iter_values(start..start + 100)),
-                    Arc::new(StringArray::from_iter_values(
-                        (0..100).map(|_| "x".repeat(64)),
-                    )),
-                ],
+        let statistics = |start: i64| {
+            crate::scribe::memtable::batch_statistics(
+                &RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![
+                        Arc::new(Int64Array::from_iter_values(start..start + 100)),
+                        Arc::new(StringArray::from_iter_values(
+                            (0..100).map(|_| "x".repeat(64)),
+                        )),
+                    ],
+                )
+                .expect("batch"),
             )
-            .expect("batch");
-            let mut statistics = Statistics::new_unknown(&schema);
-            statistics.column_statistics[0].min_value =
-                Precision::Exact(ScalarValue::Int64(Some(start)));
-            statistics.column_statistics[0].max_value =
-                Precision::Exact(ScalarValue::Int64(Some(start + 99)));
-            (batch, Arc::new(statistics))
         };
-        let (batches, statistics): (Vec<_>, Vec<_>) = [batch(0), batch(100)].into_iter().unzip();
-        let ids = |batch: &RecordBatch| {
-            u64::try_from(crate::scribe::memory::retained_arrow_bytes(
-                &batch.project(&[0]).expect("project"),
-            ))
-            .expect("size")
-        };
-        let everything = ScanScope::default();
-        let all = ScanSizer::new(&everything, &schema).batch_bytes(&batches, &statistics);
-        assert!(all > ids(&batches[0]) + ids(&batches[1]));
+        let statistics = [statistics(0), statistics(100)];
+        // 100 ids of 8 bytes; 101 offsets of 4 bytes and 100 values of 64.
+        let (ids, payloads) = (800, 101 * 4 + 6_400);
 
+        let everything = ScanScope::default();
+        assert_eq!(
+            ScanSizer::new(&everything, &schema).batch_bytes(&statistics),
+            2 * (ids + payloads)
+        );
         let ids_over_150 = ScanScope {
             columns: vec!["id".to_owned()],
             filters: vec![col("id").gt(lit(150_i64))],
         };
         assert_eq!(
-            ScanSizer::new(&ids_over_150, &schema).batch_bytes(&batches, &statistics),
-            ids(&batches[1])
+            ScanSizer::new(&ids_over_150, &schema).batch_bytes(&statistics),
+            ids
         );
     }
 

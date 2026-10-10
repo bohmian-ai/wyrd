@@ -34,8 +34,9 @@ pub struct ActiveTailStream {
     /// Exact Scribe stream incarnation serving that partition.
     pub stream: tail::TailStreamIdentity,
     /// Live bytes the listing's [`ScanScope`] reads in this partition:
-    /// in-scope Arrow bytes of the memtable batches its filters cannot rule
-    /// out, plus the encoded bytes of the partition's staged runs.
+    /// the decoded in-scope bytes of the memtable batches and staged-run row
+    /// groups its filters cannot rule out, as [`crate::scan_sizing::ScanSizer`]
+    /// counts them.
     pub bytes: u64,
 }
 
@@ -883,17 +884,9 @@ pub(crate) mod tests {
         let (columns, filters) = scope.to_wire();
         let scope = ScanScope::from_wire(columns, &filters);
         assert_eq!(scope.filters.len(), 1, "the conjunct survives the wire");
-        let value_bytes = |values: Vec<i64>| {
-            crate::scribe::memory::retained_arrow_bytes(
-                &arrow::record_batch::RecordBatch::try_from_iter([(
-                    "value",
-                    Arc::new(Int64Array::from(values)) as arrow::array::ArrayRef,
-                )])
-                .expect("one-column batch"),
-            )
-        };
-        let kept = value_bytes(vec![4, 5]);
-        let pruned = value_bytes(vec![1, 2, 3]);
+        // Each batch's one Int64 column, recorded at append as 8 bytes a row.
+        let kept = 2 * 8;
+        let pruned = 3 * 8;
 
         let scoped = service
             .active_partitions_for_table(tenant, &binding.table_ref, &scope)
@@ -902,11 +895,8 @@ pub(crate) mod tests {
             .active_partitions_for_table(tenant, &binding.table_ref, &ScanScope::default())
             .expect("unscoped listing reads the memtable");
 
-        assert_eq!(scoped, vec![(day, u64::try_from(kept).expect("fits"))]);
-        assert_eq!(
-            unscoped,
-            vec![(day, u64::try_from(kept + pruned).expect("fits"))]
-        );
+        assert_eq!(scoped, vec![(day, kept)]);
+        assert_eq!(unscoped, vec![(day, kept + pruned)]);
     }
 
     /// A listing status keeps its closed class instead of one state error.

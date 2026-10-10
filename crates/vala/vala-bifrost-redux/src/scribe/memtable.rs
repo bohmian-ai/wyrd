@@ -1702,8 +1702,7 @@ impl ReadableSource {
     /// Returns the bytes `scope` reads from the captured batches, measured by
     /// [`crate::scan_sizing::ScanSizer::batch_bytes`].
     fn scoped_bytes(&self, scope: &crate::scan_sizing::ScanScope) -> u64 {
-        crate::scan_sizing::ScanSizer::new(scope, &self.schema)
-            .batch_bytes(&self.batches, &self.statistics)
+        crate::scan_sizing::ScanSizer::new(scope, &self.schema).batch_bytes(&self.statistics)
     }
 
     /// Appends each captured batch, projected to `required_columns`, to
@@ -1750,14 +1749,26 @@ impl ReadableSource {
     }
 }
 
-/// Computes one append batch's exact row count and primitive-column bounds.
+/// Computes one append batch's exact row count, every column's byte size,
+/// and primitive-column bounds.
+///
+/// This is the one producer of memtable batch statistics, at append and at
+/// replay; projection and the follower carry them unchanged.
+///
+/// Each column's byte size is its Arrow data, sliced to the batch, as
+/// [`arrow::array::ArrayData::get_slice_memory_size`] counts it: the decoded
+/// bytes a scan of that column reads, independent of how many columns share
+/// one received allocation. Recorded once here, it lets
+/// [`crate::scan_sizing::ScanSizer::batch_bytes`] size every query by adding
+/// numbers. A size Arrow cannot compute stays unknown, which sizing counts
+/// as a fallback.
 ///
 /// Only primitive columns (integers, floats, decimals, dates, times,
 /// timestamps) get a minimum and maximum: they cost one vectorized pass at
 /// insert, which a live read then saves on every query that can rule the
 /// batch out. Other columns, and a primitive column whose bound cannot be
 /// computed, stay unknown, which never prunes.
-fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
+pub(crate) fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
     let mut statistics = Statistics::new_unknown(batch.schema_ref());
     statistics.num_rows = Precision::Exact(batch.num_rows());
     for (column, bounds) in batch
@@ -1766,6 +1777,9 @@ fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
         .zip(statistics.column_statistics.iter_mut())
     {
         bounds.null_count = Precision::Exact(column.null_count());
+        if let Ok(bytes) = column.to_data().get_slice_memory_size() {
+            bounds.byte_size = Precision::Exact(bytes);
+        }
         if !column.data_type().is_primitive() {
             continue;
         }

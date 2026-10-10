@@ -1839,3 +1839,30 @@ Fewer partitions helps every read case and costs nothing on the 10M-row
 scans, so per-query fan-out, not parallelism, dominates these queries. Not
 yet measured on the parquet tier or the 100M-row heavy fixture, where fixed
 8 partitions could under-parallelize a large scan.
+
+### Runs 23–24, 2026-10-10: one scan sizer
+
+Run 23 (commit `1190c539a`, both tiers): `ScanSizer` sizes every tier;
+sized row groups equal scanned row groups on every parquet case, 0
+fallbacks. Parquet large-scan CPU per query fell (table-aggregate 20.3 →
+10.9 ms, full-scan 136.6 → 98.6 ms); parquet 1m-aggregate x8 p50 rose 15.2 →
+20.7 ms because accurate sizing grants it about one partition under the
+24 MiB chunk calibrated while sizing over-counted. Hot selective lost about
+12% to measuring every memtable batch per query (17.7% of its samples).
+
+Run 24 (hot): each batch's per-column bytes are recorded once at append in
+`ColumnStatistics::byte_size` (Arrow `get_slice_memory_size`), and
+`ScanSizer::batch_bytes` sums them. Run 19 / 23 / 24: selective x1 619 /
+548 / 633 qps, x16 4,870 / 4,207 / 5,260, x64 6,483 / 5,684 / 6,197;
+small-aggregate x64 2,744 / 3,471 / 3,673; small-aggregate while writing
+640 / 855 / 953; 1m-aggregate x8 758 / 839 / 872. Selective server CPU per
+query 1.88 → 1.63 ms (x1), 4.82 → 3.85 ms (x64). No FAIL, no divergence.
+
+### Order, 2026-10-10 (agreed)
+
+1. Close step 1 with one parquet 1m-aggregate check at a 12 MiB chunk.
+2. Steps 3–5 (telemetry generator, codec measurement, telemetry query
+   benchmark); the full chunk sweep runs on the telemetry benchmark, both
+   tiers, not on the events fixture.
+3. Step 2 (write tail retest), then step 6.
+4. Then: Local/Distributed rename, 100M-row heavy fixture, logs.

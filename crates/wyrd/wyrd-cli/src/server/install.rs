@@ -476,9 +476,28 @@ mod tests {
         );
     }
 
-    /// The embedded official signing key parses.
+    /// The embedded key verifies a signature made the way the release
+    /// workflow makes it (`openssl pkeyutl -sign -rawin` with the private
+    /// key), and rejects the same signature over altered checksums.
     #[test]
-    fn official_signing_key_is_valid() {
-        VerifyingKey::from_public_key_pem(OFFICIAL_SIGNING_KEY).expect("embedded key");
+    fn official_key_verifies_openssl_release_signatures() {
+        let key = VerifyingKey::from_public_key_pem(OFFICIAL_SIGNING_KEY).expect("embedded key");
+        let checksums = b"abc123  wyrd-server-x86_64-unknown-linux-gnu.tar.gz\n";
+        let signature = Signature::from_bytes(&[
+            0xfe, 0x64, 0xe6, 0xbb, 0x32, 0xa0, 0x3f, 0x1c, 0xa6, 0x87, 0x4c, 0x83, 0x5b, 0xfb,
+            0x6c, 0x0f, 0x16, 0x7b, 0xd8, 0xa0, 0x95, 0x67, 0x9a, 0xc3, 0x09, 0xbc, 0x56, 0x6e,
+            0x72, 0xac, 0x98, 0xda, 0x67, 0x86, 0x2c, 0x23, 0x26, 0x27, 0x25, 0x20, 0xc1, 0xc1,
+            0x76, 0x3e, 0xf0, 0x0c, 0x99, 0x96, 0x5f, 0x61, 0xd0, 0x72, 0x38, 0x26, 0xb7, 0xa5,
+            0xd1, 0x8d, 0xd3, 0x7e, 0xae, 0x60, 0x71, 0x04,
+        ]);
+        key.verify_strict(checksums, &signature)
+            .expect("release signature verifies");
+        assert!(
+            key.verify_strict(
+                b"abc124  wyrd-server-x86_64-unknown-linux-gnu.tar.gz\n",
+                &signature
+            )
+            .is_err()
+        );
     }
 }

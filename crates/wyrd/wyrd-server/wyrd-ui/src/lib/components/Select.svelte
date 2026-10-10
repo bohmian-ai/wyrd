@@ -47,7 +47,7 @@
   }
   label {
     font-size: 8.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
     text-transform: uppercase;
     color: var(--muted);
@@ -66,11 +66,10 @@
     appearance: none;
     font-family: var(--fm);
     font-size: 11px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     padding: 7px 26px 7px 10px;
     border: 2px solid var(--border);
     border-radius: var(--r);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     background: var(--surface);
     color: var(--text);
     max-width: 100%;
@@ -81,11 +80,9 @@
   }
   select:hover {
     transform: translate(-1px, -1px);
-    box-shadow: 5px 5px 0 0 var(--shadow);
   }
   select:active {
     transform: translate(2px, 2px);
-    box-shadow: 1px 1px 0 0 var(--shadow);
   }
   /* the caret is drawn on the wrapper so it never intercepts the click */
   .field::after {
@@ -132,7 +129,6 @@
       padding: 0;
       border: 2px solid var(--border);
       border-radius: var(--r);
-      box-shadow: 6px 6px 0 0 var(--shadow);
       background: var(--surface);
     }
     option {
@@ -151,12 +147,12 @@
     }
     option:hover,
     option:focus {
-      background: var(--brand-soft);
+      background: var(--declare-soft);
     }
     option::checkmark {
       content: '✓';
-      color: var(--brand-strong);
-      font-weight: 700;
+      color: var(--declare);
+      font-weight: var(--weight-strong);
     }
   }
 </style>

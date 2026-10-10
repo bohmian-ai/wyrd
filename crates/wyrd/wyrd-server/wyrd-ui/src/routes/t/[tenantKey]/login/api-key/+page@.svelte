@@ -10,7 +10,7 @@
 <main class="entry">
   <div class="card">
     <header>
-      <img src={logo} alt="" width="28" height="28" /><span class="wordmark">bohmian</span>
+      <img src={logo} alt="" width="28" height="28" /><span class="wordmark">Wyrd</span>
       <span class="product">WYRD</span>
     </header>
     <h1>Sign in to {data.tenant.key}</h1>
@@ -35,6 +35,7 @@
   .entry {
     min-height: 100dvh;
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     padding: 64px 24px;
     background: var(--bg);
@@ -47,9 +48,8 @@
     padding: 32px;
     background: var(--surface);
     border: 2px solid var(--border);
-    border-top: 4px solid var(--brand-strong);
+    border-top: 4px solid var(--declare);
     border-radius: var(--r);
-    box-shadow: 6px 6px 0 var(--shadow);
   }
   header {
     display: flex;
@@ -58,18 +58,18 @@
     gap: 10px;
   }
   .wordmark {
-    font: 600 18px var(--font-serif);
+    font: 600 18px var(--font-sans);
   }
   .product {
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
     border: 2px solid var(--border);
     border-radius: var(--r);
     padding: 4px 12px;
-    background: var(--brand-btn);
-    color: var(--brand-btn-ink);
+    background: var(--declare);
+    color: var(--declare-ink);
   }
   h1 {
-    font: 700 24px var(--font-display);
+    font: var(--weight-strong) 24px var(--font-sans);
     text-align: center;
     overflow-wrap: anywhere;
   }
@@ -83,7 +83,7 @@
     color: var(--muted);
   }
   label {
-    font: 700 11px var(--font-mono);
+    font: var(--weight-strong) 11px var(--font-mono);
   }
   p {
     font: 12px/18px var(--font-sans);

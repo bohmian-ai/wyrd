@@ -117,11 +117,9 @@
 
   {#each model.boxes as box (box.name)}
     <line class="sq-lifeline" x1={box.x + PART_W / 2} y1={PART_H} x2={box.x + PART_W / 2} y2={model.lifelineBottom} />
-    <rect class="node-shadow" x={box.x + 4} y={4} width={PART_W} height={PART_H} />
     <rect class="node-fill-accent" x={box.x} y={0} width={PART_W} height={PART_H} />
     <rect class="node-stroke" x={box.x} y={0} width={PART_W} height={PART_H} />
     <text class="node-text node-text-on-accent" x={box.x + PART_W / 2} y={dense ? 21 : 25}>{box.name}</text>
-    <rect class="node-shadow" x={box.x + 4} y={model.lifelineBottom + 4} width={PART_W} height={PART_H} />
     <rect class="node-fill-accent" x={box.x} y={model.lifelineBottom} width={PART_W} height={PART_H} />
     <rect class="node-stroke" x={box.x} y={model.lifelineBottom} width={PART_W} height={PART_H} />
     <text class="node-text node-text-on-accent" x={box.x + PART_W / 2} y={model.lifelineBottom + (dense ? 21 : 25)}>{box.name}</text>

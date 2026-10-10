@@ -1,7 +1,7 @@
 import adapter from '@sveltejs/adapter-static';
-import { mdsvex, escapeSvelte } from 'mdsvex';
-import { createHighlighter } from 'shiki';
-import { wyrdLight, wyrdDark, WYRD_THEMES } from './src/lib/shiki-theme.js';
+import { mdsvex } from 'mdsvex';
+import { fenceBlock, embedCodeFromFile } from './src/lib/mdsvex/highlight.js';
+import { remarkUpdated } from './src/lib/updated.js';
 import rehypeSlug from 'rehype-slug';
 import rehypeAutolinkHeadings from 'rehype-autolink-headings';
 import { fileURLToPath } from 'url';
@@ -52,11 +52,23 @@ function rehypeBaseLinks() {
   return (tree) => visit(tree);
 }
 
+// Mark a bold lead-in (`**Declare.** ...`) that opens a paragraph with the
+// `term` class, so docs.css can underline it without raw HTML in content.
+function rehypeLeadIns() {
+  const visit = (node) => {
+    const first = node.children?.[0];
+    if (node.tagName === 'p' && first?.tagName === 'strong' && /\.$/.test(first.children?.[0]?.value ?? '')) {
+      first.properties = { ...first.properties, className: ['term'] };
+    }
+    node.children?.forEach(visit);
+  };
+  return (tree) => visit(tree);
+}
+
 // Wrap every markdown table in a horizontal-scroll container so wide tables
 // (error catalog, schema reference, card fields) scroll within the content
-// column on narrow viewports instead of forcing page-level overflow. The 2px
-// ink frame + 5px radius + hard shadow live on `.mk .main table` (arcade.css);
-// the `.table-scroll` wrapper is the horizontal-scroll container.
+// column on narrow viewports instead of forcing page-level overflow. The
+// `.table-scroll` wrapper is the horizontal-scroll container (docs.css).
 function rehypeWrapTables() {
   const wrap = (node) => {
     if (!Array.isArray(node.children)) return;
@@ -76,29 +88,6 @@ function rehypeWrapTables() {
   return (tree) => wrap(tree);
 }
 
-// One shared Shiki highlighter on the custom Wyrd themes (brand-token syntax
-// colors). Dual-theme output emits inline `--shiki-dark` custom props; arcade.css
-// activates them under `:root[data-theme="dark"]`.
-const highlighter = await createHighlighter({
-  themes: [wyrdLight, wyrdDark],
-  langs: [
-    'bash',
-    'shell',
-    'json',
-    'toml',
-    'yaml',
-    'rust',
-    'python',
-    'typescript',
-    'javascript',
-    'svelte',
-    'html',
-    'css',
-    'markdown',
-    'text'
-  ]
-});
-
 // Every component an `.svx`/`.md` page may reference without a per-page import.
 // Includes the highlighter's auto-injected <CodeBlock>.
 const AUTHORING_COMPONENTS = [
@@ -106,9 +95,6 @@ const AUTHORING_COMPONENTS = [
   'Aside',
   'LangTabs',
   'LangTab',
-  'CodeFromFile',
-  'CardTileGrid',
-  'CardTile',
   'DataTable',
   'CardSummary',
   'Pagination',
@@ -137,17 +123,18 @@ function injectMdsvexComponents() {
     /** @param {{ content: string, filename?: string }} input */
     markup({ content, filename }) {
       if (!filename || !/\.(svx|md)$/.test(filename)) return;
-      const used = AUTHORING_COMPONENTS.filter((name) =>
-        new RegExp(`<${name}[\\s/>]`).test(content)
-      );
-      if (used.length === 0) return;
+      // <CodeFromFile> is expanded here, at build time, into a highlighted
+      // <CodeBlock>, so embedded repository files never ship to the client.
+      const { code, dependencies } = embedCodeFromFile(content);
+      const used = AUTHORING_COMPONENTS.filter((name) => new RegExp(`<${name}[\\s/>]`).test(code));
+      if (used.length === 0) return { code, dependencies };
       const importLine = `\timport { ${used.join(', ')} } from '$lib/mdsvex/components.js';`;
-      const match = content.match(instanceScript);
+      const match = code.match(instanceScript);
       if (match && match.index !== undefined) {
         const at = match.index + match[0].length;
-        return { code: `${content.slice(0, at)}\n${importLine}\n${content.slice(at)}` };
+        return { code: `${code.slice(0, at)}\n${importLine}\n${code.slice(at)}`, dependencies };
       }
-      return { code: `<script>\n${importLine}\n</script>\n${content}` };
+      return { code: `<script>\n${importLine}\n</script>\n${code}`, dependencies };
     }
   };
 }
@@ -157,25 +144,16 @@ const mdsvexOptions = {
   extensions: ['.svx', '.md'],
   layout: path.join(__dirname, 'src/lib/mdsvex/Layout.svelte'),
   highlight: {
-    highlighter: async (code, lang = 'text') => {
-      const themes = WYRD_THEMES;
-      let html;
-      try {
-        html = highlighter.codeToHtml(code, { lang: lang || 'text', themes });
-      } catch {
-        html = highlighter.codeToHtml(code, { lang: 'text', themes });
-      }
-      // Wrap with CodeBlock (bare name supplied by injectMdsvexComponents) to
-      // add copy-to-clipboard and the Direction A `.ch` header. escapeSvelte'd
-      // html means backticks/braces inside Shiki output don't break the template
-      // literal; CodeBlock renders {@html html} verbatim so dual-theme inline
-      // --shiki-dark props survive. `lang` drives the header's language label.
-      return `<CodeBlock lang="${lang || 'text'}" html={\`${escapeSvelte(html)}\`} />`;
-    }
+    // Fences become a <CodeBlock> (bare name supplied by injectMdsvexComponents)
+    // that adds the label/copy header; `lang` drives the language label, and the
+    // info string may add `title="..."` and a `{3,5-7}` list of lines to mark.
+    highlighter: (code, lang, meta) => fenceBlock(code, lang, meta ?? undefined)
   },
+  remarkPlugins: [remarkUpdated],
   rehypePlugins: [
     rehypeBaseLinks,
     rehypeWrapTables,
+    rehypeLeadIns,
     rehypeSlug,
     [rehypeAutolinkHeadings, { behavior: 'wrap' }]
   ]
@@ -193,7 +171,15 @@ const config = {
     // Static assets live in public/ (favicon, llms.txt, llms-full.txt) — the
     // generator scripts write there. SvelteKit's default is static/.
     files: { assets: 'public' },
-    prerender: { handleHttpError: 'warn' }
+    prerender: {
+      handleHttpError: 'warn',
+      // The content catch-all prerenders one entry per published page, so it is
+      // unseen only while the content tree is empty — a valid, landing-only
+      // site. Any other unseen route still fails the build.
+      handleUnseenRoutes: ({ routes, message }) => {
+        if (routes.some((route) => route !== '/[...slug]')) throw new Error(message);
+      }
+    }
   }
 };
 

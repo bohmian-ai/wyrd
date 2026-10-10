@@ -109,7 +109,7 @@
 
 <style>
   .tile-value {
-    font: 700 24px var(--font-mono);
+    font: var(--weight-strong) 24px var(--font-mono);
     margin: 0 0 6px;
   }
   .tile-unit {

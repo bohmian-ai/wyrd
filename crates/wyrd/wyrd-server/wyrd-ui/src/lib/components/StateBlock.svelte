@@ -39,10 +39,10 @@
   {#if state === 'empty'}
     <!-- The brand's node-and-curve motif, whispered behind quiet-empty regions only. -->
     <svg class="bg" aria-hidden="true" viewBox="0 0 320 120" preserveAspectRatio="xMaxYMid slice">
-      <path d="M0 90 C 80 90, 120 30, 200 30 S 300 70, 320 70" fill="none" stroke="var(--brand-strong)" stroke-width="1.5" />
-      <path d="M0 30 C 90 30, 150 100, 240 100 S 310 40, 320 40" fill="none" stroke="var(--lime-text)" stroke-width="1.5" />
-      <circle cx="200" cy="30" r="4" fill="var(--brand-strong)" />
-      <circle cx="240" cy="100" r="4" fill="var(--lime-text)" />
+      <path d="M0 90 C 80 90, 120 30, 200 30 S 300 70, 320 70" fill="none" stroke="var(--declare)" stroke-width="1.5" />
+      <path d="M0 30 C 90 30, 150 100, 240 100 S 310 40, 320 40" fill="none" stroke="var(--observe)" stroke-width="1.5" />
+      <circle cx="200" cy="30" r="4" fill="var(--declare)" />
+      <circle cx="240" cy="100" r="4" fill="var(--observe)" />
       <rect x="112" y="58" width="9" height="9" rx="2" fill="var(--muted)" />
     </svg>
   {/if}
@@ -83,11 +83,11 @@
     position: relative;
   }
   .wy-state[data-state='error'] {
-    --sc: var(--danger-text);
+    --sc: var(--danger);
   }
   .wy-state[data-state='unauthorized'],
   .wy-state[data-state='partial'] {
-    --sc: var(--warn-text);
+    --sc: var(--warn);
   }
   .hd {
     display: flex;
@@ -99,7 +99,7 @@
   .st {
     font-family: var(--fm);
     font-size: 8.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
     text-transform: uppercase;
     color: var(--sc);
@@ -108,9 +108,9 @@
     font-size: 11px;
   }
   .t {
-    font-family: var(--font-display);
+    font-family: var(--font-sans);
     font-size: 13px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .d {
     margin: 6px 0 0;
@@ -128,7 +128,7 @@
     margin-top: 9px;
     font-family: var(--fm);
     font-size: 11px;
-    font-weight: 700;
-    color: var(--brand-strong);
+    font-weight: var(--weight-strong);
+    color: var(--declare);
   }
 </style>

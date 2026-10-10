@@ -103,10 +103,10 @@
   .lnk {
     font-family: var(--fm);
     font-size: 9px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
     text-transform: uppercase;
-    color: var(--brand-strong);
+    color: var(--declare);
   }
   .latest {
     display: flex;
@@ -116,9 +116,9 @@
     margin: 0 0 8px;
   }
   .lv {
-    font-family: var(--font-display);
+    font-family: var(--font-sans);
     font-size: 22px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     color: var(--text);
   }
   .lu,

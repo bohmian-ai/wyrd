@@ -53,13 +53,13 @@
     stroke: var(--border);
   }
   .bar {
-    fill: var(--brand-strong);
+    fill: var(--declare);
     stroke: var(--border);
   }
   .val {
     font-family: var(--fm);
     font-size: 10px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     fill: var(--text);
   }
   .cat {

@@ -8,15 +8,14 @@ import type { EntryGenerator, PageLoad } from './$types';
 export const entries: EntryGenerator = () => allSlugs().map((slug) => ({ slug }));
 
 // Archetype is resolved at build time from frontmatter + slug shape.
-// No server runtime; the four content archetypes cover all non-home routes.
-export type Archetype = 'article' | 'hub' | 'reference' | 'fathom';
+// No server runtime; three content archetypes cover all non-home routes.
+export type Archetype = 'article' | 'hub' | 'reference';
 
 function resolveArchetype(slug: string, meta: DocMetadata): Archetype {
-  if (meta.pillar === 'fathom') return 'fathom';
   // Directory-index: another slug starts with this slug as a path prefix,
   // meaning this entry is a section parent.
   if (allSlugs().some((s) => s.startsWith(`${slug}/`))) return 'hub';
-  if (meta.group === 'api' || meta.group === 'reference') return 'reference';
+  if (meta.section === 'Reference') return 'reference';
   return 'article';
 }
 

@@ -48,7 +48,7 @@
     right: 6px;
     font-family: var(--fm);
     font-size: 9px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.4px;
     text-transform: uppercase;
     padding: 3px 7px;

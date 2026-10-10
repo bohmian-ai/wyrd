@@ -1,0 +1,138 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { escapeSvelte } from 'mdsvex';
+import { createHighlighter } from 'shiki';
+import { wyrdCode, WYRD_THEME } from '../shiki-theme.js';
+
+// Build-time code rendering for `.svx`/`.md` pages. Markdown fences and
+// `<CodeFromFile>` embeds both become a `<CodeBlock>` carrying pre-highlighted
+// HTML, so neither the highlighter nor any embedded source reaches the browser.
+
+const REPO_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
+
+// One shared Shiki highlighter on the token-driven Wyrd code theme.
+const highlighter = await createHighlighter({
+  themes: [wyrdCode],
+  langs: [
+    'bash',
+    'shell',
+    'json',
+    'toml',
+    'yaml',
+    'rust',
+    'python',
+    'typescript',
+    'javascript',
+    'svelte',
+    'html',
+    'css',
+    'markdown',
+    'text'
+  ]
+});
+
+/**
+ * Highlight `code` and wrap it in the `<CodeBlock>` markup a page renders.
+ * `escapeSvelte` keeps backticks and braces in Shiki output from breaking the
+ * template literal; an unknown language falls back to plain text. `marked` is
+ * a 1-based line list such as `3,5-7`; those lines get the `hl` class.
+ * @param {string} code
+ * @param {string} [lang]
+ * @param {string} [title]
+ * @param {string} [marked]
+ */
+export function codeBlock(code, lang = 'text', title, marked) {
+  const lines = parseLines(marked);
+  /** @type {import('shiki').ShikiTransformer[]} */
+  const transformers = [
+    {
+      line(node, line) {
+        if (lines.has(line)) this.addClassToHast(node, 'hl');
+      }
+    }
+  ];
+  let html;
+  try {
+    html = highlighter.codeToHtml(code, { lang, theme: WYRD_THEME, transformers });
+  } catch {
+    html = highlighter.codeToHtml(code, { lang: 'text', theme: WYRD_THEME, transformers });
+  }
+  const titleAttr = title ? ` title="${title}"` : '';
+  return `<CodeBlock lang="${lang}"${titleAttr} html={\`${escapeSvelte(html)}\`} />`;
+}
+
+/**
+ * Render a markdown fence. The info string after the language may carry
+ * `title="file.py"` and a `{3,5-7}` line list to mark.
+ * @param {string} code
+ * @param {string} [lang]
+ * @param {string} [meta]
+ */
+export function fenceBlock(code, lang, meta = '') {
+  const title = meta.match(/title="([^"]*)"/)?.[1];
+  const marked = meta.match(/\{([\d,\s-]+)\}/)?.[1];
+  return codeBlock(code, lang || 'text', title, marked);
+}
+
+/**
+ * @param {string} [spec] 1-based lines such as `3,5-7`
+ * @returns {Set<number>}
+ */
+function parseLines(spec) {
+  const lines = new Set();
+  for (const part of (spec ?? '').split(',')) {
+    const [a, b] = part.trim().split('-').map((n) => Number.parseInt(n, 10));
+    if (!Number.isFinite(a)) continue;
+    for (let n = a; n <= (Number.isFinite(b) ? b : a); n++) lines.add(n);
+  }
+  return lines;
+}
+
+/**
+ * Replace every `<CodeFromFile file lang [title] [range] [highlight] />` tag with the
+ * highlighted `<CodeBlock>` for that repository file. `file` is a repo path
+ * under crates/, examples/, python/, or sdks/ (leading `../` or `/` is
+ * tolerated); `range` is an inclusive 1-based line span such as `5-10`;
+ * `highlight` marks lines, counted within the embedded span, such as `2,4-6`.
+ * Throws, failing the build, for a missing file, a bad range, or a
+ * non-literal attribute. Returns the embedded files so Vite rebuilds the page
+ * when one changes.
+ * @param {string} content
+ * @returns {{ code: string, dependencies: string[] }}
+ */
+export function embedCodeFromFile(content) {
+  /** @type {string[]} */
+  const dependencies = [];
+  const code = content.replace(/<CodeFromFile\b([^>]*?)\/>/g, (tag, attrs) => {
+    if (attrs.includes('{')) throw new Error(`CodeFromFile: attributes must be literal strings: ${tag}`);
+    const props = Object.fromEntries([...attrs.matchAll(/(\w+)="([^"]*)"/g)].map((m) => [m[1], m[2]]));
+    const tail = props.file?.match(/(?:crates|examples|python|sdks)\/.*$/)?.[0];
+    if (!tail || !props.lang) throw new Error(`CodeFromFile: needs a repo "file" and a "lang": ${tag}`);
+    const abs = path.join(REPO_ROOT, tail);
+    if (path.relative(REPO_ROOT, abs).startsWith('..')) throw new Error(`CodeFromFile: file not found: ${props.file}`);
+    let src;
+    try {
+      src = readFileSync(abs, 'utf8');
+    } catch {
+      throw new Error(`CodeFromFile: file not found: ${props.file}`);
+    }
+    dependencies.push(abs);
+    return codeBlock(props.range ? sliceRange(src, props.range) : src, props.lang, props.title ?? path.basename(tail), props.highlight);
+  });
+  return { code, dependencies };
+}
+
+/**
+ * @param {string} src
+ * @param {string} range
+ */
+function sliceRange(src, range) {
+  const [a, b] = range.split('-');
+  const start = Number.parseInt(a, 10);
+  const end = Number.parseInt(b ?? a, 10);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 1 || end < start) {
+    throw new Error(`CodeFromFile: invalid range "${range}"`);
+  }
+  return src.split('\n').slice(start - 1, end).join('\n');
+}

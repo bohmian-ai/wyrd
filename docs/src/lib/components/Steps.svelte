@@ -1,9 +1,8 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
 
-  // Numbered steps list. Children are arbitrary content; each direct child is
-  // treated as one step. Renders as an <ol> with brutalist counter chrome
-  // (token-bound border, radius, shadow) and no raw hex.
+  // Numbered procedure. Each direct <li> child is one step, drawn as a numbered
+  // node on a 1px spine (Evidence Thread procedure grammar).
   let { children }: { children?: Snippet } = $props();
 </script>
 
@@ -13,34 +12,41 @@
 
 <style>
   .wyrd-steps {
+    position: relative;
     list-style: none;
+    margin: 24px 0;
     padding: 0;
-    margin: 1.5rem 0;
     counter-reset: step;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
+  }
+  .wyrd-steps::before {
+    content: '';
+    position: absolute;
+    top: 14px;
+    bottom: 14px;
+    left: 12px;
+    width: 1px;
+    background: var(--border);
   }
   .wyrd-steps :global(li) {
+    position: relative;
     counter-increment: step;
-    display: grid;
-    grid-template-columns: 2rem 1fr;
-    gap: 14px;
-    align-items: start;
-    background: var(--surface);
-    border: 2px solid var(--border);
-    border-radius: var(--r);
-    box-shadow: 3px 3px 0 0 var(--shadow);
-    padding: 14px 16px;
+    max-width: none;
+    margin: 0;
+    padding: 0 0 20px 42px;
   }
   .wyrd-steps :global(li::before) {
     content: counter(step);
-    font-family: var(--font-display);
-    font-size: 1.1rem;
-    font-weight: 700;
-    color: var(--rune-strong);
-    line-height: 1;
-    padding-top: 2px;
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 25px;
+    height: 25px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--text);
+    border-radius: var(--r);
+    background: var(--surface);
+    font: 11px/1 var(--font-mono);
   }
   .wyrd-steps :global(li > :first-child) {
     margin-top: 0;

@@ -1,5 +1,11 @@
 # Wyrd product mocks — route-mapped SVG contact sheets
 
+> **Visual treatment superseded.** These sheets predate Evidence Thread and still draw the
+> retired palette, fonts, and hard-shadow geometry. They remain the route, information-
+> architecture, and state-coverage reference for the `wyrd-ui-foundation` pages only. For
+> every visual decision, `../../DESIGN.md`, `../../palette.json`, `../../components.json`,
+> and `../styleguide.html` govern.
+
 Directly viewable SVG contact sheets covering every route in the approved
 `wyrd-ui-foundation` specification, each page drawn twice: light and dark. The
 two themes carry identical information, hierarchy, geometry, fixture data and

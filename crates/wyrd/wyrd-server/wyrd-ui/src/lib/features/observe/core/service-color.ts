@@ -5,13 +5,13 @@
  * text, so the mapping only needs to be stable within one view and
  * distinguishable, not semantic. Tokens come from the brand theme so both
  * modes stay consistent. Assignment is by first appearance, which keeps the
- * root service on the identity blue and avoids hash collisions.
+ * root service on Declare indigo and avoids hash collisions.
  */
 const palette = [
-  'var(--brand-strong)',
-  'var(--server-bar)',
-  'var(--lime)',
-  'var(--control-bar)'
+  'var(--declare)',
+  'var(--observe)',
+  'var(--text)',
+  'var(--muted)'
 ];
 
 /** Maps each distinct service, in order of first appearance, to a palette colour. */

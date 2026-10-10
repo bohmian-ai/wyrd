@@ -1,100 +1,23 @@
 // Frontmatter-driven nav derivation. Reads validated entries from content.ts,
-// filters to published pages, maps content groups into reader-intent sections,
-// and exposes the sidebar tree plus a flat spine for prev/next pagination.
-//
-// `section` is an escape hatch for pages that cross the normal group mapping.
-// The common case only needs a product/topic `group`, so adding a page does not
-// require editing a central navigation list.
+// keeps the published pages, and arranges them by the approved section and
+// topic order. Sections appear only once they hold a published page, so the
+// sidebar, pager, and shell links never point at an empty destination.
 
-import type { DocMetadata } from './content.js';
-import { allSlugs, getEntry } from './content.js';
+import type { DocMetadata, Section } from './content.js';
+import { SECTIONS, TOPICS, allSlugs, getEntry } from './content.js';
 
-export type NavItem = { label: string; path: string; soon?: boolean };
-export type NavSection = { label: string; items: NavItem[] };
-export type NavGroup = {
-  label: string;
-  kind?: string;
-  sections: NavSection[];
-  items: NavItem[];
-};
+export type NavItem = { label: string; path: string };
+// A topic subhead inside a section; `label` is undefined for sections without
+// topics, whose pages form one unlabeled list.
+export type NavTopic = { label?: string; items: NavItem[] };
+export type NavGroup = { label: Section; topics: NavTopic[]; items: NavItem[] };
+export type NavEntry = { slug: string; meta: DocMetadata };
 
-// Top-level navigation is organized by reader intent. Product/topic groups are
-// nested inside those sections, so a page can be found by either what the
-// reader wants to do or the Wyrd component they are working with.
-export const GROUP_ORDER: readonly string[] = [
-  'Start here',
-  'Learn Wyrd',
-  'Build with Wyrd',
-  'Products and components',
-  'Reference',
-  'Operate Wyrd',
-  'For agents'
-];
-
-const GROUP_SECTION: Record<string, string> = {
-  Overview: 'Start here',
-  'Get Started': 'Start here',
-  Tutorials: 'Learn Wyrd',
-  Concepts: 'Learn Wyrd',
-  Architecture: 'Learn Wyrd',
-  'How-to': 'Build with Wyrd',
-  Bifrost: 'Products and components',
-  Cards: 'Products and components',
-  Skald: 'Products and components',
-  Fathom: 'Products and components',
-  Reference: 'Reference',
-  'Self-hosting': 'Operate Wyrd',
-  'For Agents': 'For agents'
-};
-
-const GROUP_ORDER_WITHIN_SECTION: readonly string[] = [
-  'Overview',
-  'Get Started',
-  'Tutorials',
-  'Concepts',
-  'Architecture',
-  'How-to',
-  'Cards',
-  'Bifrost',
-  'Skald',
-  'Fathom',
-  'Reference',
-  'Self-hosting',
-  'For Agents'
-];
-
-function sectionFor(meta: DocMetadata): string {
-  if (meta.section) return meta.section;
-  if (meta.group && GROUP_SECTION[meta.group]) return GROUP_SECTION[meta.group];
-  if (meta.pillar === 'fathom') return 'Products and components';
-  return 'Learn Wyrd';
-}
-
-function groupOrderIndex(label: string): number {
-  return GROUP_ORDER_WITHIN_SECTION.findIndex(
-    (group) => group.toLowerCase() === label.toLowerCase()
-  );
-}
-
-function sectionOrderIndex(label: string): number {
-  return GROUP_ORDER.findIndex((group) => group.toLowerCase() === label.toLowerCase());
-}
-
-function sortLabels(labels: string[], indexOf: (label: string) => number): void {
-  labels.sort((a, b) => {
-    const ia = indexOf(a);
-    const ib = indexOf(b);
-    if (ia !== -1 && ib !== -1) return ia - ib;
-    if (ia !== -1) return -1;
-    if (ib !== -1) return 1;
-    return a.localeCompare(b);
-  });
-}
-
-function navItem(slug: string, meta: DocMetadata): NavItem {
-  const item: NavItem = { label: meta.title, path: slugToPath(slug) };
-  if (meta.pillar === 'fathom') item.soon = true;
-  return item;
+// Planned products and planned journeys are reachable by URL and search with
+// their status, but never sit in primary navigation beside shipped tasks.
+// Drafts join navigation only when `drafts` is set, which the dev server does.
+export function inPrimaryNav(meta: DocMetadata, drafts = false): boolean {
+  return (drafts || !meta.draft) && meta.pillar !== 'fathom' && meta.status !== 'planned';
 }
 
 // Convert a content slug to a base-free nav path. Empty slug → root '/';
@@ -118,55 +41,30 @@ function normalize(path: string): string {
   return path === '/' ? '/' : path.replace(/\/$/, '');
 }
 
-function buildNav(): { nav: NavGroup[]; flat: NavItem[] } {
-  type Entry = { slug: string; meta: DocMetadata };
-
-  const entries: Entry[] = allSlugs()
-    .map((slug) => ({ slug, meta: getEntry(slug)!.metadata }))
-    .filter(({ meta }) => !meta.draft);
-
-  const sectionBuckets = new Map<string, Map<string, Entry[]>>();
-  for (const entry of entries) {
-    const section = sectionFor(entry.meta);
-    const group = entry.meta.group ?? entry.meta.title;
-    const groups = sectionBuckets.get(section) ?? new Map<string, Entry[]>();
-    const items = groups.get(group) ?? [];
-    items.push(entry);
-    groups.set(group, items);
-    sectionBuckets.set(section, groups);
-  }
-
-  for (const groups of sectionBuckets.values()) {
-    for (const items of groups.values()) {
-      items.sort((a, b) => {
-        const oa = a.meta.order ?? Infinity;
-        const ob = b.meta.order ?? Infinity;
-        if (oa !== ob) return oa - ob;
-        return a.slug.localeCompare(b.slug);
-      });
-    }
-  }
-
-  const sectionLabels = [...sectionBuckets.keys()];
-  sortLabels(sectionLabels, sectionOrderIndex);
+// Arrange entries into sections (approved order), topics (approved order), and
+// pages (frontmatter `order`, then slug by code point, as generate_llms_txt.py
+// sorts). Pure, so the shape is testable
+// against a fixture corpus independent of the pages published today.
+export function buildNav(entries: NavEntry[], drafts = false): NavGroup[] {
+  const rank = (a: NavEntry, b: NavEntry) =>
+    (a.meta.order ?? Infinity) - (b.meta.order ?? Infinity) || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0);
+  const published = entries.filter(({ meta }) => inPrimaryNav(meta, drafts)).sort(rank);
 
   const groups: NavGroup[] = [];
-  for (const sectionLabel of sectionLabels) {
-    const buckets = sectionBuckets.get(sectionLabel)!;
-    const groupLabels = [...buckets.keys()];
-    sortLabels(groupLabels, groupOrderIndex);
-    const sections = groupLabels.map((label) => ({
-      label,
-      items: buckets.get(label)!.map(({ slug, meta }) => navItem(slug, meta))
-    }));
-    groups.push({
-      label: sectionLabel,
-      sections,
-      items: sections.flatMap((section) => section.items)
-    });
+  for (const section of SECTIONS) {
+    const inSection = published.filter(({ meta }) => meta.section === section);
+    if (inSection.length === 0) continue;
+    const topics = (TOPICS[section] ?? [undefined])
+      .map((label) => ({
+        label,
+        items: inSection
+          .filter(({ meta }) => meta.topic === label)
+          .map(({ slug, meta }) => ({ label: meta.title, path: slugToPath(slug) }))
+      }))
+      .filter((topic) => topic.items.length > 0);
+    groups.push({ label: section, topics, items: topics.flatMap((topic) => topic.items) });
   }
-
-  return { nav: groups, flat: groups.flatMap((group) => group.items) };
+  return groups;
 }
 
 // Lazily computed and memoized. buildNav() reads content.ts's module-level
@@ -174,25 +72,48 @@ function buildNav(): { nav: NavGroup[]; flat: NavItem[] } {
 // components that import this module — so computing at top level would re-enter
 // content.ts mid-initialization and read `bySlug` in its TDZ. Deferring the
 // first build to first access (sidebar render / siblings call) breaks that cycle.
-let cache: { nav: NavGroup[]; flat: NavItem[] } | undefined;
-function derived(): { nav: NavGroup[]; flat: NavItem[] } {
-  return (cache ??= buildNav());
+let cache: NavGroup[] | undefined;
+
+// Sidebar tree for the published content: ordered sections with their pages.
+// The dev server also shows drafts so they can be reviewed in place.
+export function navGroups(): NavGroup[] {
+  return (cache ??= buildNav(
+    allSlugs().map((slug) => ({ slug, meta: getEntry(slug)!.metadata })),
+    import.meta.env?.DEV ?? false
+  ));
 }
 
-// Sidebar tree: ordered groups with their items.
-export function navGroups(): NavGroup[] {
-  return derived().nav;
+// First published page of a section, or undefined while the section is empty.
+// Shell and landing links resolve through this so they never outrun content.
+export function firstPage(section: Section, nav = navGroups()): NavItem | undefined {
+  return nav.find((group) => group.label === section)?.items[0];
+}
+
+// Section and page for a base-prefixed browser pathname: the current-location
+// cue shown by the sidebar and the narrow-screen navigation control.
+export function locate(
+  pathname: string,
+  base = '/wyrd',
+  nav = navGroups()
+): { section: Section; item: NavItem } | undefined {
+  const target = normalize(stripBase(pathname, base));
+  for (const group of nav) {
+    const item = group.items.find((it) => normalize(it.path) === target);
+    if (item) return { section: group.label, item };
+  }
+  return undefined;
 }
 
 // Return the prev and next pages relative to a given browser pathname.
 // pathname is base-prefixed (e.g. `/wyrd/cards/`); comparison is base-normalized.
 export function siblings(
   pathname: string,
-  base = '/wyrd'
+  base = '/wyrd',
+  nav = navGroups()
 ): { prev?: NavItem; next?: NavItem } {
-  const navFlat = derived().flat;
+  const flat = nav.flatMap((group) => group.items);
   const target = normalize(stripBase(pathname, base));
-  const i = navFlat.findIndex((it) => normalize(it.path) === target);
+  const i = flat.findIndex((it) => normalize(it.path) === target);
   if (i === -1) return {};
-  return { prev: navFlat[i - 1], next: navFlat[i + 1] };
+  return { prev: flat[i - 1], next: flat[i + 1] };
 }

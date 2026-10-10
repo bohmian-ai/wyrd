@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { toSlug, validateFrontmatter } from './content.js';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { render } from 'svelte/server';
+import { toSlug, validateFrontmatter, type DocMetadata } from './content.js';
+import DocPage from '../routes/[...slug]/+page.svelte';
+import { lastCommitDate, remarkUpdated } from './updated.js';
 
 describe('toSlug', () => {
   it('maps index.md to the directory root (empty string for top-level)', () => {
@@ -22,6 +28,11 @@ describe('toSlug', () => {
       'guides/build-a-workflow'
     );
   });
+
+  it('maps local mock pages to the same slugs as published pages', () => {
+    expect(toSlug('/mocks/pages/get-started/quickstart.md')).toBe('get-started/quickstart');
+    expect(toSlug('/mocks/pages/index.md')).toBe('');
+  });
 });
 
 describe('validateFrontmatter', () => {
@@ -30,8 +41,8 @@ describe('validateFrontmatter', () => {
       title: '  Hello World  ',
       description: 'A test page',
       pillar: 'wyrd',
-      section: 'Learn Wyrd',
-      group: 'Concepts',
+      section: 'Build and verify',
+      topic: 'Declare',
       order: 1,
       draft: false
     });
@@ -39,8 +50,8 @@ describe('validateFrontmatter', () => {
       title: 'Hello World',
       description: 'A test page',
       pillar: 'wyrd',
-      section: 'Learn Wyrd',
-      group: 'Concepts',
+      section: 'Build and verify',
+      topic: 'Declare',
       order: 1,
       draft: false
     });
@@ -78,28 +89,134 @@ describe('validateFrontmatter', () => {
 
   it('accepts the fathom and shared pillars', () => {
     expect(
-      validateFrontmatter('/src/content/docs/f.md', { title: 'X', pillar: 'fathom' }).pillar
+      validateFrontmatter('/src/content/docs/f.md', { title: 'X', pillar: 'fathom', section: 'Understand' }).pillar
     ).toBe('fathom');
     expect(
-      validateFrontmatter('/src/content/docs/s.md', { title: 'X', pillar: 'shared' }).pillar
+      validateFrontmatter('/src/content/docs/s.md', { title: 'X', pillar: 'shared', section: 'Understand' }).pillar
     ).toBe('shared');
   });
 
   it('omits optional fields not present in raw frontmatter', () => {
     const result = validateFrontmatter('/src/content/docs/minimal.md', {
       title: 'Minimal',
-      pillar: 'wyrd'
+      pillar: 'wyrd',
+      section: 'Reference'
     });
-    expect(result).toEqual({ title: 'Minimal', pillar: 'wyrd' });
+    expect(result).toEqual({ title: 'Minimal', pillar: 'wyrd', section: 'Reference' });
   });
 
   it('drops optional fields of the wrong type instead of forwarding them', () => {
     const result = validateFrontmatter('/src/content/docs/typed.md', {
       title: 'X',
       pillar: 'wyrd',
+      section: 'Reference',
       order: '3',
       draft: 'true'
     });
-    expect(result).toEqual({ title: 'X', pillar: 'wyrd' });
+    expect(result).toEqual({ title: 'X', pillar: 'wyrd', section: 'Reference' });
+  });
+
+  // A journey's availability is a reader-facing claim, so a mistyped status
+  // fails the build instead of silently dropping the label.
+  it('accepts runnable, partial, and planned journey status', () => {
+    for (const status of ['runnable', 'partial', 'planned'] as const) {
+      expect(
+        validateFrontmatter('/src/content/docs/j.svx', { title: 'X', pillar: 'wyrd', section: 'Reference', status })
+          .status
+      ).toBe(status);
+    }
+  });
+
+  it('throws naming the path for an unknown journey status', () => {
+    expect(() =>
+      validateFrontmatter('/src/content/docs/bad-status.svx', {
+        title: 'X',
+        pillar: 'wyrd',
+        section: 'Reference',
+        status: 'beta'
+      })
+    ).toThrow(/bad-status\.svx.*runnable, partial, planned/);
+  });
+
+  // Section and topic place a page in the approved map; a typo must fail the
+  // build instead of silently moving the page or leaving it unreachable.
+  it('throws naming the path when section is missing or unknown', () => {
+    expect(() => validateFrontmatter('/src/content/docs/no-section.md', { title: 'X', pillar: 'wyrd' })).toThrow(
+      /no-section\.md.*Get started, Build and verify, Connect, Operate, Understand, Reference/
+    );
+    expect(() =>
+      validateFrontmatter('/src/content/docs/old.md', { title: 'X', pillar: 'wyrd', section: 'Run Wyrd' })
+    ).toThrow(/old\.md/);
+  });
+
+  it('requires a Declare, Observe, or Verify topic under Build and verify', () => {
+    expect(() =>
+      validateFrontmatter('/src/content/docs/no-topic.md', { title: 'X', pillar: 'wyrd', section: 'Build and verify' })
+    ).toThrow(/no-topic\.md.*Declare, Observe, Verify/);
+  });
+
+  it('rejects a topic in a section without topics', () => {
+    expect(() =>
+      validateFrontmatter('/src/content/docs/deep.md', { title: 'X', pillar: 'wyrd', section: 'Operate', topic: 'Deploy' })
+    ).toThrow(/deep\.md.*no topics/);
+  });
+
+  it('keeps a YYYY-MM-DD update date and drops any other value', () => {
+    const base = { title: 'X', pillar: 'wyrd', section: 'Reference' };
+    expect(validateFrontmatter('/src/content/docs/u.md', { ...base, updated: '2026-09-30' }).updated).toBe('2026-09-30');
+    expect(validateFrontmatter('/src/content/docs/u.md', { ...base, updated: 'yesterday' }).updated).toBeUndefined();
+  });
+});
+
+// Update dates come from the repository history of the page source, never the
+// build clock, so a page that has not been committed shows no date at all.
+describe('page update date', () => {
+  const docsRoot = fileURLToPath(new URL('../..', import.meta.url));
+  const tracked = `${docsRoot}package.json`;
+  const gitDate = (file: string) =>
+    execFileSync('git', ['log', '-1', '--format=%cs', '--', file], { cwd: docsRoot, encoding: 'utf8' }).trim();
+  const untracked = `${docsRoot}.svelte-kit/updated-probe.md`;
+  mkdirSync(`${docsRoot}.svelte-kit`, { recursive: true });
+  writeFileSync(untracked, '# probe\n');
+
+  it('is the date of the last commit that changed the file', () => {
+    expect(lastCommitDate(tracked)).toBe(gitDate(tracked));
+    expect(lastCommitDate(tracked)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  });
+
+  it('is absent for a file with no commit history', () => {
+    expect(lastCommitDate(untracked)).toBeUndefined();
+    expect(lastCommitDate(`${docsRoot}does-not-exist.md`)).toBeUndefined();
+  });
+
+  it('replaces any authored value in page frontmatter with the repository date', () => {
+    const committed = { filename: tracked, data: { fm: { title: 'X', updated: '2001-01-01' } } };
+    remarkUpdated()(undefined, committed);
+    expect(committed.data.fm.updated).toBe(gitDate(tracked));
+
+    const uncommitted = { filename: untracked, data: { fm: { title: 'X', updated: '2001-01-01' } } };
+    remarkUpdated()(undefined, uncommitted);
+    expect(uncommitted.data.fm).toEqual({ title: 'X' });
+  });
+});
+
+describe('page rendering', () => {
+  const show = (metadata: DocMetadata) =>
+    render(DocPage, { props: { data: { slug: 'none', metadata, archetype: 'article' } } }).body;
+
+  it('shows the commit date as a machine-readable time', () => {
+    expect(show({ title: 'X', pillar: 'wyrd', section: 'Reference', updated: '2026-09-30' })).toContain(
+      'Last updated <time datetime="2026-09-30">September 30, 2026</time>'
+    );
+  });
+
+  it('renders the frontmatter title as the page heading', () => {
+    expect(show({ title: 'Declare a Service', pillar: 'wyrd', section: 'Build and verify', topic: 'Declare' })).toMatch(
+      /<h1[^>]*>Declare a Service<\/h1>/
+    );
+  });
+
+  it('shows no date for a page without commit history', () => {
+    expect(show({ title: 'X', pillar: 'wyrd', section: 'Reference' })).not.toContain('Last updated');
   });
 });

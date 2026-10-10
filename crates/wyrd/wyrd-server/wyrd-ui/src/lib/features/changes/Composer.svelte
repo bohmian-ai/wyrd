@@ -63,7 +63,7 @@
   .text-action {
     border: 0;
     background: transparent;
-    color: var(--brand-strong);
+    color: var(--declare);
     font: 11px var(--font-mono);
     padding: 2px;
     cursor: pointer;

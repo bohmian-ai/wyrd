@@ -63,7 +63,7 @@
     overflow-wrap: anywhere;
   }
   .file-list a[aria-current] {
-    background: var(--brand-soft);
+    background: var(--declare-soft);
     padding: 6px;
     border: 2px solid var(--border);
     border-radius: var(--r);
@@ -95,7 +95,7 @@
   }
   .line-action {
     background: var(--surface);
-    color: var(--brand-strong);
+    color: var(--declare);
     border: 2px solid var(--border);
     border-radius: var(--r);
     cursor: pointer;

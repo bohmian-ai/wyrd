@@ -30,7 +30,7 @@
     gap: 4px;
     font-family: var(--fm);
     font-size: 8.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.5px;
     text-transform: uppercase;
     padding: 3px 7px;
@@ -44,16 +44,16 @@
     background: var(--surface);
   }
   .wy-badge[data-tone='ok'] {
-    --bc: var(--ok-text);
+    --bc: var(--ok);
   }
   .wy-badge[data-tone='warn'] {
-    --bc: var(--warn-text);
+    --bc: var(--warn);
   }
   .wy-badge[data-tone='danger'] {
-    --bc: var(--danger-text);
+    --bc: var(--danger);
   }
   .wy-badge[data-tone='running'] {
-    --bc: var(--brand-strong);
+    --bc: var(--declare);
   }
   .gl {
     font-size: 9px;

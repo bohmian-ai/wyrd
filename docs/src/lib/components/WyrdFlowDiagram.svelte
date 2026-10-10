@@ -4,7 +4,7 @@
   //   - fan: a root box (steps[0]) dispatching to N sibling branches (steps[1..])
   //     off a left spine — used for the /auth/token grant match.
   // Box color/geometry reuse the shared `.wyrd-diagram` token rules in
-  // arcade.css (node-* / arrow-label classes) so light/dark both work. The arrow
+  // docs.css (node-* / arrow-label classes) so light/dark both work. The arrow
   // marker is defined per instance with a title-derived id so multiple diagrams
   // on one page never collide on `#wyrd-arrow`.
   type Step = {
@@ -112,7 +112,6 @@
   {/each}
 
   {#each model.boxes as box (box.y + '-' + box.x)}
-    <rect class="node-shadow" x={box.x + 5} y={box.y + 5} width={box.w} height={box.h} />
     <rect class={box.accent ? 'node-fill-accent' : 'node-fill'} x={box.x} y={box.y} width={box.w} height={box.h} />
     <rect class="node-stroke" x={box.x} y={box.y} width={box.w} height={box.h} />
     <text

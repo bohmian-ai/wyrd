@@ -28,7 +28,7 @@
   </svg>
   <div class="entry-foreground">
   <header>
-    <span class="brand"><img src={logo} alt="" width="28" height="28" /><span class="wordmark">bohmian</span></span>
+    <span class="brand"><img src={logo} alt="" width="28" height="28" /><span class="wordmark">Wyrd</span></span>
     <span class="product">WYRD</span>
     {#if data.session}
       <details><summary class="app-control">{data.session.subject.name}</summary><form method="POST" action="?/logout"><button class="app-control" type="submit">Sign out</button></form></details>
@@ -74,6 +74,8 @@
     isolation: isolate;
     overflow: hidden;
     display: grid;
+    /* A bounded track, so the card's width: 100% resolves against the viewport, not its content. */
+    grid-template-columns: minmax(0, 1fr);
     place-items: center;
     padding: 64px 24px 96px;
     background: var(--bg);
@@ -92,18 +94,27 @@
     opacity: 0.42;
   }
   .incoming {
-    stroke: var(--brand-strong);
+    stroke: var(--declare);
   }
   .outgoing {
-    stroke: var(--lime-text);
+    stroke: var(--observe);
   }
   .incoming-node {
-    fill: var(--brand-strong);
+    fill: var(--declare);
     opacity: 0.85;
   }
   .outgoing-node {
-    fill: var(--lime-text);
+    fill: var(--observe);
     opacity: 0.9;
+  }
+  /* Lime at thread opacity vanishes on the light canvas; deepen it toward ink
+     there only. The token itself stays the same lime in both modes. */
+  :global([data-mode='light']) .outgoing {
+    stroke: color-mix(in srgb, var(--observe) 70%, var(--text));
+    opacity: 0.55;
+  }
+  :global([data-mode='light']) .outgoing-node {
+    fill: color-mix(in srgb, var(--observe) 70%, var(--text));
   }
   .connection-web rect {
     fill: var(--text);
@@ -114,9 +125,8 @@
     padding: 36px 32px;
     background: var(--surface);
     border: 2px solid var(--border);
-    border-top: 4px solid var(--brand-strong);
+    border-top: 4px solid var(--declare);
     border-radius: var(--r);
-    box-shadow: 6px 6px 0 var(--shadow);
   }
   header,
   .brand {
@@ -134,15 +144,15 @@
     border-radius: var(--r);
   }
   .wordmark {
-    font: 600 18px var(--font-serif);
+    font: 600 18px var(--font-sans);
   }
   .product {
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
     border: 2px solid var(--border);
     border-radius: var(--r);
     padding: 4px 12px;
-    background: var(--brand-btn);
-    color: var(--brand-btn-ink);
+    background: var(--declare);
+    color: var(--declare-ink);
   }
   header .app-control {
     font-size: 10px;
@@ -160,7 +170,7 @@
     padding-top: 8px;
   }
   h1 {
-    font: 700 26px var(--font-display);
+    font: var(--weight-strong) 26px var(--font-sans);
     text-align: center;
   }
   .intro {

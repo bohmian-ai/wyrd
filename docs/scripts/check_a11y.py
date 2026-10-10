@@ -7,8 +7,9 @@ Asserts:
 - accessible-name + focusability on search / theme-toggle / nav-drawer controls
 - light+dark WCAG AA contrast from wyrd-tokens.css (text+muted on bg)
 
-Excludes: docs/build/404.html (JS-only fallback shell) and docs/build/mocks/**
-(component fixture pages). Requires: `mise run docs:build` first.
+Checks exactly the published content pages (every non-draft page in
+src/content/docs), so a landing-only build is valid. The home page and 404.html
+render without the doc shell and are exempt. Requires: `mise run docs:build`.
 """
 
 from __future__ import annotations
@@ -17,20 +18,13 @@ import re
 import sys
 from pathlib import Path
 
+from generate_llms_txt import CONTENT_DIR, read_frontmatter, slug_for
+
 
 DOCS_ROOT = Path(__file__).resolve().parents[1]
 BUILD_DIR = DOCS_ROOT / "build"
 TOKENS_CSS = DOCS_ROOT / "src" / "styles" / "wyrd-tokens.css"
 WCAG_AA = 4.5
-
-# Fail-closed floor on a truncated prerender. The site emits 33 real doc content
-# pages (the home and Fathom splashes are full-bleed archetypes, exempt from the
-# doc-shell contract below). A masked prerender failure (a content page throwing
-# at render) silently drops pages and omits index.html while the build still exits
-# 0. Asserting index.html plus a page floor turns that regression class into a hard
-# a11y-gate failure instead of a vacuously-green run over whatever HTML survived.
-MIN_REAL_PAGES = 33
-
 
 # ─── WCAG contrast helpers ────────────────────────────────────────────────────
 
@@ -187,26 +181,13 @@ def check_page(path: Path) -> list[str]:
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-# The home splash (root index.html) and the Fathom teaser are full-bleed holding
-# pages with no doc shell — no <main>, splash heading structure. They are exempt
-# from the doc-shell a11y contract, like 404.html. index.html existence is still
-# asserted separately in main() as a prerender-truncation guard.
-_SKIP_FILES = frozenset({"404.html", "index.html"})
-_SKIP_DIRS = frozenset({"mocks", "pagefind", "_app", "fathom"})
-
-
-def _real_pages() -> list[Path]:
-    pages = []
-    for html in sorted(BUILD_DIR.rglob("*.html")):
-        rel = html.relative_to(BUILD_DIR)
-        parts = rel.parts
-        # Skip root-level exclusions and excluded directory trees
-        if parts[0] in _SKIP_FILES:
-            continue
-        if parts[0] in _SKIP_DIRS:
-            continue
-        pages.append(html)
-    return pages
+def published_pages() -> list[Path]:
+    """Expected HTML for every published page, mirroring content.ts allSlugs()."""
+    return sorted(
+        BUILD_DIR / slug_for(path) / "index.html"
+        for path in CONTENT_DIR.rglob("*")
+        if path.suffix in {".svx", ".md"} and read_frontmatter(path).get("draft") != "true"
+    )
 
 
 def main() -> int:
@@ -216,10 +197,7 @@ def main() -> int:
 
     failures: list[str] = []
 
-    # Fail-closed on a truncated prerender: the home route must be emitted and
-    # the page count must clear the floor. A masked render failure drops pages
-    # and omits index.html while exiting 0; assert both before any a11y check so
-    # the gate cannot pass vacuously over a partial build.
+    # The home route must be emitted even when no content page is published.
     if not (BUILD_DIR / "index.html").exists():
         failures.append(
             "build/index.html missing — prerender truncated (home route did not emit)"
@@ -230,14 +208,15 @@ def main() -> int:
     else:
         failures.extend(check_contrast(TOKENS_CSS.read_text(encoding="utf-8")))
 
-    pages = _real_pages()
-    if not pages:
-        failures.append("No HTML pages found in docs/build (run docs:build first)")
-    elif len(pages) < MIN_REAL_PAGES:
-        failures.append(
-            f"Only {len(pages)} doc pages emitted, expected >= {MIN_REAL_PAGES} "
-            "— prerender truncated (pages silently dropped)"
-        )
+    # Fail closed on a truncated prerender: a page that throws at render is
+    # silently dropped while the build still exits 0.
+    pages = published_pages()
+    missing = [page for page in pages if not page.exists()]
+    failures.extend(
+        f"{page.relative_to(BUILD_DIR)} missing — prerender truncated (page silently dropped)"
+        for page in missing
+    )
+    pages = [page for page in pages if page.exists()]
     for page in pages:
         failures.extend(check_page(page))
 

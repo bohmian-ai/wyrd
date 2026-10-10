@@ -8,21 +8,12 @@ importers:
 
   .:
     dependencies:
-      '@fontsource/archivo':
-        specifier: 5.2.8
-        version: 5.2.8
-      '@fontsource/archivo-black':
-        specifier: 5.2.8
-        version: 5.2.8
-      '@fontsource/jetbrains-mono':
-        specifier: 5.2.8
-        version: 5.2.8
-      '@fontsource/press-start-2p':
-        specifier: 5.2.7
-        version: 5.2.7
-      '@fontsource/vt323':
-        specifier: 5.2.7
-        version: 5.2.7
+      '@fontsource/familjen-grotesk':
+        specifier: 5.3.0
+        version: 5.3.0
+      '@fontsource/fragment-mono':
+        specifier: 5.3.0
+        version: 5.3.0
     devDependencies:
       '@sveltejs/adapter-static':
         specifier: 3.0.10
@@ -84,20 +75,11 @@ packages:
   '@emnapi/wasi-threads@1.2.1':
     resolution: {integrity: sha512-uTII7OYF+/Mes/MrcIOYp5yOtSMLBWSIoLPpcgwipoiKbli6k322tcoFsxoIIxPDqW01SQGAgko4EzZi2BNv2w==}
 
-  '@fontsource/archivo-black@5.2.8':
-    resolution: {integrity: sha512-3zNj/o9LzWyDl/UEpY5IOHpAQyUtFr3hQaFS7NSKwCLLkXOfH/CMCt1L2b2Z+OF25OURtOYenCadgAebALz7/A==}
+  '@fontsource/familjen-grotesk@5.3.0':
+    resolution: {integrity: sha512-Kh6DXwAtw+kyvCSpiOI3wss/LvOJtJJRl9NTf9YpYpmcpsZ5BGQLTF9nVm9TUmnpLTe4z3iyAcvnLfsQgQR0lg==}
 
-  '@fontsource/archivo@5.2.8':
-    resolution: {integrity: sha512-Fc4yuMt85MmcYooUVpYHAJRJTymPv2+J9HsMP2f5mxR/0pIWgE2V5XfgNTavPpklX2rJFprdT36iE6Rr8ds9MA==}
-
-  '@fontsource/jetbrains-mono@5.2.8':
-    resolution: {integrity: sha512-6w8/SG4kqvIMu7xd7wt6x3idn1Qux3p9N62s6G3rfldOUYHpWcc2FKrqf+Vo44jRvqWj2oAtTHrZXEP23oSKwQ==}
-
-  '@fontsource/press-start-2p@5.2.7':
-    resolution: {integrity: sha512-ezSxYRchANoteja170ZHh2Tt4oejmVEvX42VFPOVVvERSZ68pcuZFjbhHfrK/sNjYmaGg656y7B3431ojO9PCQ==}
-
-  '@fontsource/vt323@5.2.7':
-    resolution: {integrity: sha512-8JTMM23vMhQxin9Cn/ijty8cNwXW4INrln0VAJ2227Rz0CVfkzM3qr3l/CqudZJ6BXCnbCGUTdf2ym3cTNex8A==}
+  '@fontsource/fragment-mono@5.3.0':
+    resolution: {integrity: sha512-vpOLZhWq7Z6wUPo1qMl16Y4yjQJiN0d9TXX2oUtiYXmqUrXU23Wuto73Knyak+osdlIuHz46srpBZb2pfhHCIA==}
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -1062,15 +1044,9 @@ snapshots:
       tslib: 2.8.1
     optional: true
 
-  '@fontsource/archivo-black@5.2.8': {}
+  '@fontsource/familjen-grotesk@5.3.0': {}
 
-  '@fontsource/archivo@5.2.8': {}
-
-  '@fontsource/jetbrains-mono@5.2.8': {}
-
-  '@fontsource/press-start-2p@5.2.7': {}
-
-  '@fontsource/vt323@5.2.7': {}
+  '@fontsource/fragment-mono@5.3.0': {}
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:

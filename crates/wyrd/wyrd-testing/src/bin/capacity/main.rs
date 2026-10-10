@@ -129,8 +129,8 @@ struct Cli {
     /// S3-compatible endpoint of that store.
     #[arg(long, env = "WYRD_STORAGE_ENDPOINT_URL")]
     storage_endpoint_url: String,
-    /// Database owner URL, exported by the Postgres wrapper; `migrate` runs
-    /// and the queue backlog is read as this owner.
+    /// Cluster administrator URL, exported by the Postgres wrapper; the
+    /// queue backlog is read across every tenant as this superuser.
     #[arg(long, env = "WYRD_TEST_DATABASE_ADMIN_URL", hide_env_values = true)]
     database_admin_url: String,
 }
@@ -494,14 +494,7 @@ impl Benchmark {
     /// seeded observations already written stay in the database and store;
     /// a retry starts a fresh database through the Postgres wrapper.
     async fn provision(&mut self) -> Result<()> {
-        let first = LocalServer::start(
-            &self.binary,
-            &self.cli.database_admin_url,
-            &TENANTS,
-            &self.env(0),
-            Envelope::POD,
-        )
-        .await?;
+        let first = LocalServer::start(&self.binary, &TENANTS, &self.env(0), Envelope::POD).await?;
         let mut tenants = Vec::new();
         for setup in first.tenants() {
             self.auth_pace.tick().await;
@@ -954,7 +947,7 @@ esac
         let mut benchmark = Benchmark::prepare(cli, lifetime).await.expect("prepare");
         benchmark.output = scratch.path().join("capacity");
         std::fs::create_dir_all(&benchmark.output).expect("output directory");
-        let replica = LocalServer::start(&server, "postgres://unused", &[], &[], Envelope::POD)
+        let replica = LocalServer::start(&server, &[], &[], Envelope::POD)
             .await
             .expect("the stand-in serves");
         benchmark.deployment = Some(super::Deployment {

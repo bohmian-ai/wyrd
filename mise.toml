@@ -911,8 +911,16 @@ description = "Build the wyrd-server release binary"
 run = "cargo build --release --locked -p wyrd-server --features cloud"
 
 [tasks."test:server:startup"]
-description = "Official image journey: external Postgres, migrate, setup, nginx HTTP and gRPC, restart, migration refusal and retry"
-run = "bash scripts/server/test-startup.sh"
+description = "Official image journeys: the development setup, then the team deployment"
+run = ["mise run test:server:startup:dev", "mise run test:server:startup:prod"]
+
+[tasks."test:server:startup:dev"]
+description = "Official image, development setup: one ordinary login that owns its database, migrate, serve, setup"
+run = "bash scripts/server/test-startup-dev.sh"
+
+[tasks."test:server:startup:prod"]
+description = "Official image, team deployment: platform and tenant logins, migrate, setup, nginx HTTP and gRPC, restart, migration refusal and retry"
+run = "bash scripts/server/test-startup-prod.sh"
 
 [tasks."test:server:peer"]
 description = "Peer mode across real server processes: join and remote query, mTLS-only admission, typed-context and incompatible-protocol refusals"
@@ -1632,30 +1640,28 @@ depends = [
 [tasks."db:migrate"]
 hide = true
 description = """Verify wyrd-sql migrations are idempotent against the local docker-compose Postgres.
-Runs as the database owner, as `wyrd-server migrate` does, after checking that the serving
-roles (wyrd_app no-BYPASSRLS, wyrd_platform_admin BYPASSRLS) are present.
+Runs as the platform login that owns the database, as `wyrd-server migrate` does.
 """
 
 run = "scripts/postgres/with-test-postgres.sh -- mise run db:migrate:inner"
 [tasks."db:migrate:inner"]
 hide = true
 description = """Verify wyrd-sql migrations are idempotent against the local docker-compose Postgres.
-Runs as the database owner, as `wyrd-server migrate` does, after checking that the serving
-roles (wyrd_app no-BYPASSRLS, wyrd_platform_admin BYPASSRLS) are present.
+Runs as the platform login that owns the database, as `wyrd-server migrate` does.
 """
 run = "cargo nextest run --locked -p wyrd-sql --test integration -E 'test(=pg_migration::pg_tests::migrations_apply_and_are_idempotent)'"
 
 [tasks."test:sql"]
 hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
-Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
+Brings up Postgres, creates the platform and tenant logins, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
 """
 
 run = "scripts/postgres/with-test-postgres.sh -- mise run test:sql:inner"
 [tasks."test:sql:inner"]
 hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
-Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
+Brings up Postgres, creates the platform and tenant logins, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
 """
 run = """
 cargo nextest run --locked -p wyrd-sql --test-threads=1
@@ -1687,11 +1693,6 @@ run = "bash scripts/postgres/test-contract.sh"
 hide = true
 description = "Prove two isolated Postgres wrappers use distinct projects and ports"
 run = "bash scripts/postgres/test-concurrency.sh"
-
-[tasks."test:postgres:roles"]
-hide = true
-description = "Audit production-shaped Postgres role attributes, memberships, and connectivity"
-run = "bash scripts/postgres/test-roles.sh"
 
 [tasks."test:postgres:inventory"]
 hide = true

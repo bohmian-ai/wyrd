@@ -169,9 +169,9 @@ pub enum SqlError {
         code = "WYRD_SQL_500_INSUFFICIENT_PRIVILEGE",
         status = 500,
         title = "Insufficient database privileges",
-        remediation = "Run `wyrd-server migrate` with WYRD_DATABASE_URL set to the database-owner \
-                       login; a serving WYRD_DATABASE_URL authenticates as wyrd_app and never \
-                       runs DDL."
+        remediation = "Run `wyrd-server migrate` as the platform login (WYRD_PLATFORM_DATABASE_URL, \
+                       else WYRD_DATABASE_URL), which must own the database or hold CREATE on it; \
+                       serving processes never run DDL."
     )]
     #[error("insufficient database privileges: {detail}")]
     InsufficientPrivilege {
@@ -189,15 +189,16 @@ pub enum SqlError {
     #[error("stored tenant identifier violated Wyrd's UUIDv7 contract: {0}")]
     InvalidDataTenantId(#[source] wyrd_spec::ids::IdError),
 
-    /// The serving database is unmigrated or its roles, grants, or row-level
-    /// security do not match what serving Wyrd requires.
+    /// The serving database is unmigrated, its row-level security does not
+    /// match what serving Wyrd requires, or a serving login would defeat it.
     #[wyrd_error(
         code = "WYRD_SQL_503_SCHEMA_NOT_READY",
         status = 503,
         title = "Database schema is not ready for serving",
-        remediation = "Run `wyrd-server migrate` with the database-owner login, and serve with \
-                       WYRD_DATABASE_URL as wyrd_app and WYRD_PLATFORM_DATABASE_URL as \
-                       wyrd_platform_admin."
+        remediation = "Run `wyrd-server migrate` as the platform login. Serve with ordinary \
+                       logins that are neither superuser nor BYPASSRLS: WYRD_DATABASE_URL alone, \
+                       or a WYRD_PLATFORM_DATABASE_URL login that owns Wyrd's objects plus a \
+                       WYRD_DATABASE_URL login that does not."
     )]
     #[error("database schema is not ready for serving: {detail}")]
     SchemaNotReady {

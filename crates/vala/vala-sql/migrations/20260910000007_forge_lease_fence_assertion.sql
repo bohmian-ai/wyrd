@@ -1,4 +1,4 @@
--- Let the Vala application role assert a Forge lease fence while holding the
+-- Let a Vala tenant connection assert a Forge lease fence while holding the
 -- lease row lock in the same transaction as a tenant mutation.
 CREATE OR REPLACE FUNCTION vala.assert_maintenance_lease_fence(
     p_lease_key text,
@@ -11,8 +11,10 @@ SECURITY DEFINER
 SET search_path = vala, pg_catalog
 AS $$
 DECLARE
+    prior text := coalesce(current_setting('app.operator', true), '');
     matched boolean;
 BEGIN
+    PERFORM set_config('app.operator', 'on', true);
     SELECT EXISTS (
         SELECT 1
           FROM vala.maintenance_leases
@@ -24,9 +26,7 @@ BEGIN
     )
     INTO matched;
 
+    PERFORM set_config('app.operator', prior, true);
     RETURN matched;
 END;
 $$;
-
-REVOKE ALL ON FUNCTION vala.assert_maintenance_lease_fence(text, uuid, bigint) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION vala.assert_maintenance_lease_fence(text, uuid, bigint) TO wyrd_app;

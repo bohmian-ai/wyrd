@@ -62,6 +62,8 @@ ALTER TABLE wyrd.auth_login_state FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_login_state
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_login_state TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- The callback knows only the state. It learns which tenant to open a
 -- row-level-secured transaction for through this one answer, and nothing
@@ -70,19 +72,23 @@ CREATE POLICY tenant_isolation ON wyrd.auth_login_state
 -- without the random state cannot name a row.
 CREATE FUNCTION wyrd.auth_login_state_tenant(p_state_hash bytea)
 RETURNS uuid
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
-STABLE
 SET search_path = pg_catalog, wyrd
 AS $$
-    SELECT data_tenant_id FROM wyrd.auth_login_state
+DECLARE
+    prior text := coalesce(current_setting('app.operator', true), '');
+    tenant uuid;
+BEGIN
+    PERFORM set_config('app.operator', 'on', true);
+    SELECT data_tenant_id INTO tenant FROM wyrd.auth_login_state
     WHERE state_hash = p_state_hash
       AND consumed_at IS NULL
-      AND expires_at > statement_timestamp()
+      AND expires_at > statement_timestamp();
+    PERFORM set_config('app.operator', prior, true);
+    RETURN tenant;
+END;
 $$;
-
-REVOKE EXECUTE ON FUNCTION wyrd.auth_login_state_tenant(bytea) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION wyrd.auth_login_state_tenant(bytea) TO wyrd_app;
 
 -- A human refresh family with no login-connection provenance predates
 -- connection binding and cannot be attributed to any provider, least of all a

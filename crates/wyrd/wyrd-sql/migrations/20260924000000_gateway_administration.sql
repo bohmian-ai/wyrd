@@ -53,6 +53,8 @@ ALTER TABLE wyrd.gateway_provider_credentials FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.gateway_provider_credentials
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.gateway_provider_credentials TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Provider deployments
@@ -85,6 +87,8 @@ ALTER TABLE wyrd.gateway_provider_deployments FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.gateway_provider_deployments
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.gateway_provider_deployments TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Tenant policies: one row per tenant, also the policy write lock.
@@ -105,6 +109,8 @@ ALTER TABLE wyrd.gateway_policies FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.gateway_policies
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.gateway_policies TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Versioned model pricing owned by the governance policy.
@@ -127,6 +133,8 @@ ALTER TABLE wyrd.gateway_model_pricing FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.gateway_model_pricing
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.gateway_model_pricing TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Append-only accounting ledger.
@@ -164,6 +172,5 @@ ALTER TABLE wyrd.gateway_accounting_entries FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.gateway_accounting_entries
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
--- The ledger is append-only for the runtime role.
-REVOKE UPDATE, DELETE ON wyrd.gateway_accounting_entries FROM wyrd_app;
+CREATE POLICY operator_access ON wyrd.gateway_accounting_entries TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

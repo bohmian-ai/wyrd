@@ -854,8 +854,8 @@ fn extract_detail_phase(detail: &AuditDetail) -> Result<ForgeOperationPhase, Sql
 /// 4. the operation state row (advisory lock, then `FOR UPDATE`),
 /// 5. the claim rows for that operation.
 ///
-/// Every method here runs on the operator pool because the claim table grants
-/// `INSERT`/`DELETE` to `wyrd_platform_admin` only; the transaction binds
+/// Every method here runs on the operator pool because claims are operator
+/// work across tenants; the transaction binds
 /// `wyrd.current_tenant()` first so RLS-shaped predicates behave exactly as
 /// they do on a tenant connection.
 impl ForgeOperations<'_> {
@@ -1441,9 +1441,9 @@ pub(crate) async fn bind_tenant(
 
 /// Locks the caller's maintenance lease row and proves it still owns the fence.
 ///
-/// `vala.maintenance_leases` is a cross-tenant control-plane table with no RLS,
-/// and the SECURITY DEFINER assertion function is granted to `wyrd_app` only,
-/// so the operator path takes the same `FOR UPDATE` lock directly.
+/// `vala.maintenance_leases` is a cross-tenant control-plane table that admits
+/// only operator sessions, so the operator path takes the same `FOR UPDATE`
+/// lock the SECURITY DEFINER assertion function takes for tenant sessions.
 ///
 /// # Errors
 /// Returns [`SqlError::InvariantViolation`] when the fence is lost and

@@ -16,19 +16,9 @@ ALTER TABLE vala.audit_staging ADD CONSTRAINT audit_staging_principal_kind_check
     CHECK (principal_kind IN ('global_admin', 'tenant_admin', 'user', 'service', 'agent'));
 
 -- A platform-plane decision has no owning tenant, so it stages under the
--- `wyrd-system` sentinel through the operator role rather than through a
+-- `wyrd-system` sentinel through an operator session rather than through a
 -- tenant's application connection. That is what keeps one canonical append and
 -- one publisher: the platform's decision and its `platform.*` effect commit in
 -- the same operator transaction, and the ordinary publisher drains the sentinel
 -- tenant's staged rows into retained history like any other tenant's.
 --
--- `append_audit` names `data_tenant_id` in every statement, so the row-level
--- security this role bypasses is not what bounds the write.
---
--- The grant is exactly what appending costs and nothing more. The chain head is
--- read and advanced; staged rows are only inserted. The operator therefore
--- still cannot read, amend, or remove any tenant's audit — a role that bypasses
--- row-level security must not be able to see across tenants, and appending a
--- decision never requires it.
-GRANT SELECT, INSERT, UPDATE ON vala.audit_chain_head TO wyrd_platform_admin;
-GRANT         INSERT          ON vala.audit_staging   TO wyrd_platform_admin;

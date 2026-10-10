@@ -40,10 +40,10 @@ case "${*: -1}" in
 esac
 DOCKER
 chmod +x "$temp_dir/bin/docker"
-# A host psql that predates `\getenv`: bootstrap must never reach it.
+# A host psql of an arbitrary version: database setup must never reach it.
 cat >"$temp_dir/bin/psql" <<'PSQL'
 #!/usr/bin/env bash
-echo "host psql 14 must not run role bootstrap" >&2
+echo "host psql must not run database setup" >&2
 exit 42
 PSQL
 chmod +x "$temp_dir/bin/psql"
@@ -60,12 +60,16 @@ env_capture="$temp_dir/env"
 "$wrapper" -- bash -c 'printf "%s\n%s\n" "$DATABASE_URL" "$WYRD_DATABASE_URL" >"$1"' _ "$env_capture"
 test "$(wc -l <"$env_capture" | tr -d ' ')" -eq 2
 grep -Eq '^postgres://wyrd_test_admin:.*@127\.0\.0\.1:[1-9][0-9]*/wyrd$' "$env_capture"
-grep -Eq '^postgres://wyrd_app:.*@127\.0\.0\.1:[1-9][0-9]*/wyrd$' "$env_capture"
+grep -Eq '^postgres://wyrd_tenant:.*@127\.0\.0\.1:[1-9][0-9]*/wyrd$' "$env_capture"
 up_project="$(awk '/ up / {for(i=1;i<=NF;i++) if($i=="--project-name") print $(i+1)}' "$FAKE_DOCKER_LOG")"
 down_project="$(awk '/ down / {for(i=1;i<=NF;i++) if($i=="--project-name") print $(i+1)}' "$FAKE_DOCKER_LOG")"
 test -n "$up_project" && test "$up_project" = "$down_project"
-assert_contains "$FAKE_DOCKER_LOG" "exec -T postgres psql --username=wyrd_test_admin --dbname=wyrd --set=ON_ERROR_STOP=1 --set=app_password=wyrd_app_pw --set=platform_admin_password=wyrd_platform_admin_pw"
-cmp -s "$FAKE_PSQL_STDIN" "$root/crates/wyrd/wyrd-sql/bootstrap/roles.sql" || { echo "container psql did not receive roles.sql on stdin" >&2; exit 1; }
+assert_contains "$FAKE_DOCKER_LOG" "exec -T postgres psql --username=wyrd_test_admin --dbname=wyrd --set=ON_ERROR_STOP=1 --quiet"
+assert_contains "$FAKE_PSQL_STDIN" "CREATE ROLE wyrd_platform LOGIN PASSWORD 'wyrd_platform_pw';"
+assert_contains "$FAKE_PSQL_STDIN" "CREATE ROLE wyrd_tenant LOGIN PASSWORD 'wyrd_tenant_pw';"
+assert_contains "$FAKE_PSQL_STDIN" "ALTER DATABASE wyrd OWNER TO wyrd_platform;"
+setup_sql="$root/scripts/postgres/test-database-setup.sql"
+tail -c "$(wc -c <"$setup_sql")" "$FAKE_PSQL_STDIN" | cmp -s - "$setup_sql" || { echo "container psql did not receive the database setup on stdin" >&2; exit 1; }
 assert_not_contains "$FAKE_DOCKER_LOG" "docker ps"
 assert_not_contains "$FAKE_DOCKER_LOG" "docker rm"
 

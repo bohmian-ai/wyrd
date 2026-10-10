@@ -1,8 +1,6 @@
 //! Typed storage settings parsed once at server boot.
 
-use crate::env_parse::{
-    env_optional, env_required, parse_bool, parse_u32_clamped, parse_u64_clamped,
-};
+use crate::env_parse::{env_optional, parse_bool, parse_u32_clamped, parse_u64_clamped};
 use crate::error::{ConfigParseError, StorageError};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -18,8 +16,11 @@ pub const MAX_PRESIGN_TTL_SECS: u32 = 3600;
 /// Default upload part size in bytes.
 pub const DEFAULT_PART_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Required variable naming the storage location as `file:`, `s3:`, `gs:`, or `az:` URL.
+/// Variable naming the storage location as `file:`, `s3:`, `gs:`, or `az:` URL.
 const STORAGE_URL_VAR: &str = "WYRD_STORAGE_URL";
+/// Local storage root, relative to the working directory, used when
+/// `WYRD_STORAGE_URL` is unset; it sits beside Bifrost's `.wyrd/bifrost`.
+const DEFAULT_LOCAL_ROOT: &str = ".wyrd/storage";
 /// Optional variable pointing a cloud backend at an S3-compatible service or emulator.
 const ENDPOINT_URL_VAR: &str = "WYRD_STORAGE_ENDPOINT_URL";
 
@@ -176,18 +177,26 @@ pub struct AzureConfig {
 ///
 /// `WYRD_STORAGE_URL` selects the backend through [`BackendConfig::from_url`],
 /// `WYRD_STORAGE_ENDPOINT_URL` optionally overrides the service endpoint, and
-/// `AWS_REGION` supplies the S3 region. Tuning variables keep their defaults.
+/// `AWS_REGION` supplies the S3 region. When `WYRD_STORAGE_URL` is unset the
+/// server is running locally: storage is the local directory
+/// [`DEFAULT_LOCAL_ROOT`] under the working directory, created if missing.
+/// Tuning variables keep their defaults.
 ///
 /// # Errors
 /// Returns [`StorageError::ConfigParse`] with the exact variable name when an
-/// environment variable is missing, malformed, or fails storage boot
-/// validation.
+/// environment variable is malformed or fails storage boot validation, or when
+/// the default local root cannot be created.
 pub fn from_env() -> Result<StorageSettings, StorageError> {
-    let backend = BackendConfig::from_url(
-        &env_required(STORAGE_URL_VAR)?,
-        env_optional(ENDPOINT_URL_VAR)?,
-        env_optional("AWS_REGION")?,
-    )?;
+    let backend = match env_optional(STORAGE_URL_VAR)? {
+        Some(url) => BackendConfig::from_url(
+            &url,
+            env_optional(ENDPOINT_URL_VAR)?,
+            env_optional("AWS_REGION")?,
+        )?,
+        None => BackendConfig::Local {
+            root: default_local_root()?,
+        },
+    };
 
     let require_encryption = parse_bool("WYRD_STORAGE_REQUIRE_ENCRYPTION", false)?;
     let presign_ttl_secs = parse_u32_clamped(
@@ -287,6 +296,30 @@ fn local_root(raw: &str, url: &Url) -> Result<PathBuf, StorageError> {
             ConfigParseError::InvalidPath(format!("path does not exist: {}", root.display())),
         );
     }
+    Ok(root)
+}
+
+/// Create [`DEFAULT_LOCAL_ROOT`] under the working directory and return its
+/// absolute path.
+///
+/// # Errors
+/// Returns an `InvalidPath` configuration error for `WYRD_STORAGE_URL` when
+/// the working directory is unreadable or the directory cannot be created.
+fn default_local_root() -> Result<PathBuf, StorageError> {
+    let root = std::env::current_dir()
+        .map(|cwd| cwd.join(DEFAULT_LOCAL_ROOT))
+        .or_else(|error| {
+            config_err(
+                STORAGE_URL_VAR,
+                ConfigParseError::InvalidPath(error.to_string()),
+            )
+        })?;
+    std::fs::create_dir_all(&root).or_else(|error| {
+        config_err(
+            STORAGE_URL_VAR,
+            ConfigParseError::InvalidPath(format!("cannot create {}: {error}", root.display())),
+        )
+    })?;
     Ok(root)
 }
 
@@ -501,12 +534,29 @@ mod tests {
         });
     }
 
-    /// Boot refuses to guess a backend when `WYRD_STORAGE_URL` is absent.
+    /// An unset `WYRD_STORAGE_URL` selects local storage at `.wyrd/storage`
+    /// under the working directory and creates it.
     #[test]
-    fn missing_storage_url_reports_exact_var() {
+    fn unset_storage_url_creates_default_local_root() {
+        let cwd = tempfile::tempdir().expect("temp dir");
+        let expected = cwd
+            .path()
+            .canonicalize()
+            .expect("canonical temp dir")
+            .join(".wyrd/storage");
         with_clean_env(Vec::new(), || {
-            let err = from_env().expect_err("missing storage url");
-            assert_config_var(&err, "WYRD_STORAGE_URL");
+            let previous = std::env::current_dir().expect("current dir");
+            std::env::set_current_dir(cwd.path()).expect("enter temp dir");
+            let settings = from_env();
+            std::env::set_current_dir(previous).expect("restore current dir");
+            let settings = settings.expect("default local storage");
+            assert_eq!(
+                settings.backend,
+                BackendConfig::Local {
+                    root: expected.clone()
+                }
+            );
+            assert!(expected.is_dir(), "default local root is created");
         });
     }
 

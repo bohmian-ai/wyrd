@@ -1,6 +1,6 @@
-//! Public Rust SDK half of the `test:server:startup` image journey.
+//! Public Rust SDK half of the `test:server:startup:prod` image journey.
 //!
-//! `scripts/server/test-startup.sh` starts the official application image and
+//! `scripts/server/test-startup-prod.sh` starts the official application image and
 //! runs these two ignored tests against it through nginx: `write` before a
 //! container restart and `verify` after it. Each client is configured only by
 //! `WYRD_SERVER_URL` and `WYRD_API_KEY`, so gRPC must reach nginx's public
@@ -142,7 +142,7 @@ async fn read_ids(
 /// Before restart: derive gRPC from the server URL, write through HTTP and
 /// gRPC, and prove an explicit gRPC override also works.
 #[tokio::test]
-#[ignore = "run by scripts/server/test-startup.sh against the official image"]
+#[ignore = "run by scripts/server/test-startup-prod.sh against the official image"]
 async fn startup_image_write() {
     let client = env_client();
     let server_url = client.server_url().to_owned();
@@ -213,7 +213,7 @@ async fn startup_image_write() {
 /// After restart: the credential, Card, artifact bytes, and acknowledged
 /// Bifrost rows written before the restart are all still readable.
 #[tokio::test]
-#[ignore = "run by scripts/server/test-startup.sh against the official image"]
+#[ignore = "run by scripts/server/test-startup-prod.sh against the official image"]
 async fn startup_image_verify() {
     let dir = state_dir();
     let state = std::fs::read_to_string(dir.join("state")).expect("write phase state");

@@ -15,7 +15,7 @@ pub mod queries;
 pub mod row_types;
 
 pub use postgres::ValaPostgres;
-pub use wyrd_sql::{MigrationLease, OperatorPool, SchemaAccess, TenantConn, error::SqlError};
+pub use wyrd_sql::{MigrationLease, OperatorPool, RowScope, TenantConn, error::SqlError};
 
 /// Tenant-scoped Vala observability schema owned by `vala-sql`.
 pub const OBSERVABILITY_SCHEMA: &str = "vala";
@@ -49,11 +49,11 @@ pub async fn migrate(lease: &mut MigrationLease) -> Result<(), SqlError> {
 
 /// Prove the Vala schema contract holds for serving.
 ///
-/// Checks every embedded Vala migration and checksum; that the runtime role
-/// uses `vala` without DDL and cannot reach `iceberg_catalog`, whose metadata
-/// locations are cross-tenant, while the platform role owns that catalog's
-/// DDL; and tenant isolation in `vala`. Serving role attributes belong to
-/// `wyrd_sql::verify_schema`. Read-only.
+/// Checks every embedded Vala migration and checksum, and that every `vala`
+/// table forces row-level security under its tenant and operator policies.
+/// `iceberg_catalog` carries no row-level security: only the platform login,
+/// which owns it, may reach it, and serving logins are checked by
+/// `wyrd_sql`. Read-only.
 ///
 /// # Errors
 /// Returns [`SqlError::SchemaNotReady`] for the first failed check,
@@ -64,20 +64,8 @@ pub async fn verify_schema(operator: &OperatorPool) -> Result<(), SqlError> {
         .verify_migrations(MIGRATION_LEDGER, &MIGRATOR)
         .await?;
     operator
-        .verify_schema_privileges(
-            OBSERVABILITY_SCHEMA,
-            SchemaAccess::Usage,
-            SchemaAccess::Usage,
-        )
-        .await?;
-    operator
-        .verify_schema_privileges(
-            ICEBERG_CATALOG_SCHEMA,
-            SchemaAccess::None,
-            SchemaAccess::UsageCreate,
-        )
-        .await?;
-    operator.verify_tenant_isolation(OBSERVABILITY_SCHEMA).await
+        .verify_row_security(OBSERVABILITY_SCHEMA, RowScope::Tenant)
+        .await
 }
 
 #[cfg(test)]
@@ -198,7 +186,7 @@ mod tests {
         }
     }
 
-    /// Verifies the Forge/Oracle migration partition and forward grant owner.
+    /// Verifies the Forge/Oracle migration partition and a stable older checksum.
     #[test]
     fn forge_and_oracle_migrations_have_unique_forward_owners() {
         let files = migration_files();
@@ -222,17 +210,8 @@ mod tests {
         let old_olap_digest = Sha256::digest(old_olap.as_bytes());
         assert_eq!(
             format!("{old_olap_digest:x}"),
-            "a2df17d99f1ee29c1ead1fca2ea30c0062cd918d9d5b5e3f41f30ac6cdc259ef",
+            "e7c5ec6049618065d6e38bd9835839b68fc7ea3b479aecd86322ed0882aeca8e",
             "older migration checksum must remain stable"
-        );
-        let oracle_coordination = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("migrations/20260910000013_oracle_coordination.sql"),
-        )
-        .expect("Oracle coordination migration is readable");
-        assert!(
-            oracle_coordination
-                .contains("GRANT SELECT ON vala.bifrost_tables TO wyrd_platform_admin")
         );
     }
 

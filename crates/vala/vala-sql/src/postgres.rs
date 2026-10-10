@@ -9,9 +9,8 @@ use secrecy::ExposeSecret;
 use sqlx::PgPool;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
-use wyrd_sql::dsn::WYRD_APP_ROLE;
 use wyrd_sql::pool::build_pool;
-use wyrd_sql::schema_check::verify_login_name;
+use wyrd_sql::schema_check::verify_tenant_pool;
 use wyrd_sql::{OperatorPool, PoolConfig, SqlError, TenantConn};
 
 /// Drop-safe telemetry for one Vala runtime-pool acquisition.
@@ -63,16 +62,19 @@ impl Drop for PoolAcquireLifecycle<'_> {
 
 /// Runtime-ready Vala Postgres handle.
 ///
-/// Holds the dedicated Vala/Bifrost runtime pool (the `wyrd_app` login).
-/// Construction never migrates; serving boot calls [`Self::validate_schema`]
-/// before it reports ready.
+/// Holds the dedicated Vala/Bifrost runtime pool, which connects as the tenant
+/// login. Construction never migrates; serving boot calls
+/// [`Self::validate_schema`] before it reports ready.
 #[derive(Clone)]
 pub struct ValaPostgres {
     pool: PgPool,
+    /// Whether the runtime pool uses the login shared with the platform pool
+    /// ([`ResolvedDsns::shares_login`]), which selects the tenant-login checks.
+    shared_login: bool,
 }
 
 impl ValaPostgres {
-    /// Build the Vala runtime pool from the serving `wyrd_app` DSN.
+    /// Build the Vala runtime pool from the tenant DSN ([`ResolvedDsns::app`]).
     ///
     /// No DDL runs and nothing is validated; call [`Self::validate_schema`]
     /// before serving.
@@ -83,29 +85,25 @@ impl ValaPostgres {
         let pool = build_pool(dsns.app.expose_secret(), vala_pool_config())
             .await
             .map_err(SqlError::Connect)?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            shared_login: dsns.shares_login(),
+        })
     }
 
     /// Prove the database is ready for serving Vala and Bifrost traffic.
     ///
-    /// Checks that the runtime pool logs in, and acts, as exactly `wyrd_app`,
-    /// then the Vala schema contract ([`crate::verify_schema`]) through the
-    /// deployment's `operator` capability: every embedded Vala migration and
-    /// checksum, schema privileges — including no runtime access to the
-    /// cross-tenant Iceberg catalog — and tenant isolation policies. Read-only;
-    /// no DDL runs.
+    /// The runtime pool's login must stay bound by row-level security over the
+    /// Vala schemas ([`verify_tenant_pool`]); then the Vala schema contract
+    /// ([`crate::verify_schema`]) holds through the deployment's `operator`
+    /// session. Read-only; no DDL runs.
     ///
     /// # Errors
     /// Returns [`SqlError::SchemaNotReady`] for the first failed check,
     /// [`SqlError::MigrateChecksum`] for checksum drift, and
     /// [`SqlError::Connect`] on query failure.
     pub async fn validate_schema(&self, operator: &OperatorPool) -> Result<(), SqlError> {
-        let (session, current): (String, String) =
-            sqlx::query_as("SELECT session_user::text, current_user::text")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(SqlError::Connect)?;
-        verify_login_name(WYRD_APP_ROLE, &session, &current)?;
+        verify_tenant_pool(&self.pool, !self.shared_login, crate::OWNED_SCHEMAS).await?;
         crate::verify_schema(operator).await
     }
 
@@ -115,7 +113,10 @@ impl ValaPostgres {
     /// `testing` / `cfg(test)`.
     #[must_use]
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            shared_login: false,
+        }
     }
 
     /// Borrow the Vala/Bifrost runtime pool.

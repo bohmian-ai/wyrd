@@ -1,6 +1,6 @@
 ---
 title: Database
-description: Postgres setup for the server. The two serving roles, the one-off migrate step, and readiness checks.
+description: Postgres setup for the server. The logins you create, the one-off migrate step, and readiness checks.
 pillar: wyrd
 group: Self-hosting
 order: 5
@@ -8,25 +8,53 @@ order: 5
 
 # Database
 
-The server runs on PostgreSQL. Tenant isolation is enforced at the database layer with row-level security, so the server never serves traffic with one all-powerful login. You provide an external Postgres, migrate it once per release with the database-owner login, and then run the server with two narrower serving logins.
+The server runs on PostgreSQL. You create the logins, migrate once per release, and serve with either one login (local and small self-hosted deployments) or two (recommended for production). Wyrd never creates roles or grants privileges; it only checks that the logins you supply have the posture below.
 
-## Roles
+## Logins
 
-Create the two serving roles before you migrate. `crates/wyrd/wyrd-sql/bootstrap/roles.sql` is the bootstrap template; run it with `psql` 15 or later as the database owner, passing both passwords in the environment variables `WYRD_APP_PASSWORD` and `WYRD_PLATFORM_ADMIN_PASSWORD` and the owner's in `PGPASSWORD`, never as command-line arguments.
+Every Wyrd table forces row-level security. Tenant connections bind one tenant per transaction, and the `tenant_isolation` policy admits only that tenant's rows. Platform connections mark themselves as operator sessions, and the `operator_access` policy admits them to every row, but only for the login that owns Wyrd's objects: the login that ran `wyrd-server migrate`.
 
-| Role | Row-level security | What it does |
-| --- | --- | --- |
-| `wyrd_app` | enforced | All request traffic. Sees only its tenant's rows. |
-| `wyrd_platform_admin` | bypasses RLS | Audited cross-tenant platform work and the Bifrost Iceberg catalog. |
+| Login | `WYRD_DATABASE_URL` | `WYRD_PLATFORM_DATABASE_URL` | Privileges you grant |
+| --- | --- | --- | --- |
+| Platform | One-login mode | Two-login mode | Owns the database (or holds `CREATE` on it), so `migrate` creates and owns the `platform`, `wyrd`, `vala`, and `iceberg_catalog` schemas. |
+| Tenant | Two-login mode | — | `USAGE` on `platform`, `wyrd`, and `vala`; `SELECT`, `INSERT`, `UPDATE`, `DELETE` on tables and `USAGE`, `SELECT` on sequences in `wyrd` and `vala`. Nothing in `iceberg_catalog`. |
 
-Neither serving role can create or drop databases or run migrations. The owner login you migrate with needs `BYPASSRLS` (or superuser) and must never be given to a serving process.
+Neither login may be a superuser or hold `BYPASSRLS`; Postgres exempts those from every policy, so boot refuses them. Neither needs `CREATEDB` or `CREATEROLE`.
+
+One login is the simplest setup: create an ordinary login that owns the database.
+
+```sql
+CREATE ROLE wyrd LOGIN PASSWORD '…';
+CREATE DATABASE wyrd OWNER wyrd;
+```
+
+Two logins keep a compromised serving process confined to row-level security: the tenant login does not own Wyrd's objects, so the operator policy never applies to it. As a cluster administrator, create both logins and the database, then grant the tenant login its privileges before you migrate:
+
+```sql
+CREATE ROLE wyrd_platform LOGIN PASSWORD '…';
+CREATE ROLE wyrd_tenant LOGIN PASSWORD '…';
+CREATE DATABASE wyrd OWNER wyrd_platform;
+\connect wyrd
+CREATE SCHEMA platform AUTHORIZATION wyrd_platform;
+CREATE SCHEMA wyrd AUTHORIZATION wyrd_platform;
+CREATE SCHEMA vala AUTHORIZATION wyrd_platform;
+GRANT USAGE ON SCHEMA platform, wyrd, vala TO wyrd_tenant;
+ALTER DEFAULT PRIVILEGES FOR ROLE wyrd_platform IN SCHEMA wyrd, vala
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO wyrd_tenant;
+ALTER DEFAULT PRIVILEGES FOR ROLE wyrd_platform IN SCHEMA wyrd, vala
+    GRANT USAGE, SELECT ON SEQUENCES TO wyrd_tenant;
+```
+
+The login names are yours to choose. Grant the tenant login nothing beyond this list: boot refuses a separate tenant login that owns, or is a member of the owner of, a Wyrd table, holds `TRUNCATE`, `REFERENCES`, or `TRIGGER` on one, or holds any privilege on a table without row-level security.
 
 ## Migrations
 
-Migrations are a separate one-off step, not part of server boot. Run it with `WYRD_DATABASE_URL` set to the database-owner login before starting or upgrading servers:
+Migrations are a separate one-off step, not part of server boot. Run it with the same URLs you serve with before starting or upgrading servers; it connects as the platform login:
 
 ```bash
-WYRD_DATABASE_URL="postgresql://owner:owner-pw@db.internal:5432/wyrd" wyrd-server migrate
+WYRD_DATABASE_URL="postgresql://wyrd_tenant:tenant-pw@db.internal:5432/wyrd" \
+WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform:platform-pw@db.internal:5432/wyrd" \
+  wyrd-server migrate
 ```
 
 It applies every Wyrd and Vala migration, validates the result, and exits. It is idempotent, so rerunning it after a partial failure is safe.
@@ -43,23 +71,19 @@ Wyrd has no down migrations and never restores automatically.
 
 ## Serving
 
-A serving process receives exactly two URLs:
-
-| Variable | Role | Purpose |
-| --- | --- | --- |
-| `WYRD_DATABASE_URL` | `wyrd_app` | Request traffic under row-level security. |
-| `WYRD_PLATFORM_DATABASE_URL` | `wyrd_platform_admin` | Cross-tenant platform work and the Iceberg catalog. |
+`WYRD_DATABASE_URL` is the only required URL. `WYRD_PLATFORM_DATABASE_URL` is optional and defaults to it.
 
 ```bash
-export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
-export WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform_admin:admin-pw@db.internal:5432/wyrd"
+# Production: two logins.
+export WYRD_DATABASE_URL="postgresql://wyrd_tenant:tenant-pw@db.internal:5432/wyrd"
+export WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform:platform-pw@db.internal:5432/wyrd"
 ```
 
-The server never runs DDL. Before it reports ready it checks that every migration it embeds is applied with a matching checksum, that each serving login has exactly its expected row-level-security posture, and that every tenant table forces row-level security. If any check fails, boot stops with `WYRD_SQL_503_SCHEMA_NOT_READY`; run `wyrd-server migrate` and start again.
+The server never runs DDL. Before it reports ready it checks that every migration it embeds is applied with a matching checksum, that every Wyrd table forces row-level security with exactly its expected policies, that the platform login owns Wyrd's objects, and that neither login is a superuser or holds `BYPASSRLS`. With two logins it also checks the tenant login against the list above. If any check fails, boot stops with `WYRD_SQL_503_SCHEMA_NOT_READY` naming the cause.
 
 ### Pool tuning
 
-Pool settings are covered in [Configuration](/self-hosting/configuration/): `WYRD_PG_POOL_MAX` (default 32) and `WYRD_PG_POOL_ACQUIRE_MS` (default 5000). Size your cluster's `max_connections` above the sum of the app, Vala, and platform-admin pools across replicas.
+Pool settings are covered in [Configuration](/self-hosting/configuration/): `WYRD_PG_POOL_MAX` (default 32) and `WYRD_PG_POOL_ACQUIRE_MS` (default 5000). Size your cluster's `max_connections` above the sum of the tenant, Vala, and platform pools across replicas.
 
 ## Related
 

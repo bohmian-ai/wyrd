@@ -19,8 +19,13 @@ tenant key in their foreign keys, including cross-schema references.
 
 ## Runtime tenant binding
 
-Postgres row-level security is the authoritative tenant boundary. Runtime
-tenant traffic uses the `wyrd_app` login role without `BYPASSRLS`. Every
+Postgres row-level security is the authoritative tenant boundary, and the pool
+decides scope. Every table forces RLS. Tenant-keyed tables carry a
+`tenant_isolation` policy for every role; every table carries an
+`operator_access` policy, targeting only the login that ran the migrations,
+which admits sessions with `app.operator=on`. Platform and catalog pools
+connect with that flag; tenant pools never set it, and a separate tenant login
+gains nothing by setting it because the policy does not apply to it. Every
 tenant-scoped logical operation acquires one `TenantConn`, which binds the
 verified `DataTenantId` through transaction-local configuration and opens the
 transaction in one round trip:
@@ -76,35 +81,37 @@ Cross-crate transactional coordination is not supported. Cross-crate work does
 not extend a transaction by importing another crate's private query modules. A cross-owner durable effect uses its declared committed
 handoff and idempotent consumer semantics.
 
-## Roles, pools, and boot
+## Logins, pools, and boot
 
-| Role | Lifetime | Capability |
+| Login | Lifetime | Capability |
 |---|---|---|
-| `wyrd_app` | Runtime | Tenant-scoped RLS traffic through `TenantConn` |
-| `wyrd_platform_admin` | Runtime | Fenced, audited cross-tenant work through `OperatorPool`; Bifrost Iceberg catalog owner |
-| database owner | `wyrd-server migrate` only | Ordered DDL for Wyrd and Vala schemas; never given to a serving process |
+| platform (`WYRD_PLATFORM_DATABASE_URL`, else `WYRD_DATABASE_URL`) | `wyrd-server migrate` and runtime | Owns every Wyrd object; fenced, audited cross-tenant operator sessions through `OperatorPool`; Bifrost Iceberg catalog |
+| tenant (`WYRD_DATABASE_URL`) | Runtime | Tenant-scoped RLS traffic through `TenantConn` |
 
-`wyrd-server migrate` reads the owner DSN from `WYRD_DATABASE_URL`, applies
+`wyrd-server migrate` connects as the platform login, applies
 `wyrd_sql::migrate` and then `vala_sql::migrate` under the migration advisory
 lock, validates both ledgers and forced RLS, and exits.
 
 Serving boot performs these steps in order:
 
-1. Resolve `WYRD_DATABASE_URL` (`wyrd_app`) and `WYRD_PLATFORM_DATABASE_URL`
-   (`wyrd_platform_admin`); both are required.
-2. Build the serving pools. No DDL runs.
-3. `WyrdPostgres::validate_schema` and `ValaPostgres::validate_schema` verify
-   login posture, every embedded migration version and checksum, forced RLS on
-   tenant tables, and the catalog privilege boundary.
+1. Resolve the required `WYRD_DATABASE_URL` and the optional
+   `WYRD_PLATFORM_DATABASE_URL`, which defaults to it.
+2. Build the tenant pool and the platform operator pool. No DDL runs.
+3. `WyrdPostgres::validate_schema` and `ValaPostgres::validate_schema` refuse
+   a superuser or `BYPASSRLS` login and a platform login that does not own
+   Wyrd's objects; with two logins they also refuse a tenant login that owns
+   them, holds `TRUNCATE`, `REFERENCES`, or `TRIGGER`, or reaches a table RLS
+   does not protect. Then they verify every embedded migration version and
+   checksum and forced RLS under each table's exact policies.
 4. Construct runtime `TenantConn` and approved `OperatorPool` owners and make
    only those capabilities available to services.
 
 There is no embedded Postgres. The canonical test harness uses
-repository-managed, lane-isolated Postgres databases migrated by their owner
-login.
+repository-managed, lane-isolated Postgres databases owned and migrated by a
+platform login and served with a separate tenant login.
 
 Pool configuration has one canonical typed model. Unsuffixed `WYRD_DB_*`
-settings tune the application pool; `_MIGRATOR` tunes the one-off migration
+settings tune the tenant pool; `_MIGRATOR` tunes the one-off migration
 pool and `_PLATFORM_ADMIN` the platform pool. Missing suffixed settings use that role's
 typed defaults and never inherit the application value.
 

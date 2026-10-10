@@ -35,6 +35,8 @@ ALTER TABLE vala.audit_chain_head FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.audit_chain_head
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON vala.audit_chain_head TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- 2. Append-only staged decisions. entry_hash = SHA256(prev_hash ‖ canonical(seq, event)),
 --    computed in Rust — vala-sql owns the canonical encoding. seq is gapless per
@@ -64,11 +66,8 @@ ALTER TABLE vala.audit_staging FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.audit_staging
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-GRANT SELECT, INSERT, UPDATE ON vala.audit_chain_head TO wyrd_app;
--- DELETE is the publisher draining rows already durable in
--- vala.system.audit_log. Rows are never mutated in place.
-GRANT SELECT, INSERT, DELETE ON vala.audit_staging TO wyrd_app;
+CREATE POLICY operator_access ON vala.audit_staging TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- 3. Immutability enforcement: a staged row is never rewritten. Draining
 --    removes a published row; it never edits one.

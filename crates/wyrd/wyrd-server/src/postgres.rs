@@ -18,7 +18,8 @@ impl ServerPostgres {
     ///
     /// Serving never migrates: both schema owners validate that `wyrd-server
     /// migrate` already applied their embedded migrations unchanged and that
-    /// the two serving logins carry exactly their expected authority, so a
+    /// the serving logins match their declared posture — two exact named
+    /// roles, or one shared login that bypasses row-level security — so a
     /// misprovisioned database fails here, before the server reports ready.
     ///
     /// # Errors
@@ -32,7 +33,7 @@ impl ServerPostgres {
         let operator = wyrd
             .operator_pool()
             .ok_or_else(|| SqlError::SchemaNotReady {
-                detail: "no wyrd_platform_admin pool is configured".to_owned(),
+                detail: "no platform pool is configured".to_owned(),
             })?;
         vala.validate_schema(&operator).await?;
         Ok(Self::from_parts(wyrd, vala))

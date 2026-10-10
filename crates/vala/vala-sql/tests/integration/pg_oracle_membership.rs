@@ -684,24 +684,6 @@ mod pg_tests {
         }
     }
 
-    /// Projects the privileges one role holds on one relation, sorted.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the `information_schema` privilege read fails.
-    async fn grants(pool: &PgPool, table: &str, grantee: &str) -> Vec<String> {
-        sqlx::query_scalar(
-            "SELECT privilege_type FROM information_schema.role_table_grants \
-              WHERE table_schema = 'vala' AND table_name = $1 AND grantee = $2 \
-              ORDER BY privilege_type",
-        )
-        .bind(table)
-        .bind(grantee)
-        .fetch_all(pool)
-        .await
-        .expect("grants read")
-    }
-
     /// Proves cut acquisition is one atomic, tenant-scoped statement whose
     /// active reads serialize with Forge and expire only once PostgreSQL time
     /// passes the query deadline bound at acquisition.
@@ -715,21 +697,13 @@ mod pg_tests {
         let reads = ActiveReads::start().await;
         let pool = &reads.superuser;
 
-        // Privilege boundary: the request role reaches the catalog only
-        // through the narrow definer, and the acquisition runs as the caller.
-        assert_eq!(
-            grants(pool, "oracle_active_table_reads", "wyrd_app").await,
-            ["DELETE", "INSERT", "SELECT", "UPDATE"]
-        );
-        assert_eq!(
-            grants(pool, "oracle_active_table_reads", "wyrd_platform_admin").await,
-            ["DELETE", "SELECT"]
-        );
+        // Privilege boundary: the tenant login reaches the catalog only
+        // through the narrow definer, owned by the migrating platform login,
+        // and the acquisition runs as the caller.
         let functions = sqlx::query(
             "SELECT p.proname, p.prosecdef, p.provolatile::text AS volatility, \
-                    pg_get_userbyid(p.proowner) AS owner, p.proconfig, \
-                    has_function_privilege('wyrd_app', p.oid, 'EXECUTE') AS app_exec, \
-                    has_function_privilege('public', p.oid, 'EXECUTE') AS public_exec \
+                    p.proowner = n.nspowner AS owned_by_platform, p.proconfig, \
+                    has_function_privilege('wyrd_tenant', p.oid, 'EXECUTE') AS app_exec \
                FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
               WHERE n.nspname = 'vala' \
                 AND p.proname IN ('oracle_catalog_metadata_location', 'oracle_acquire_table_cut') \
@@ -755,18 +729,12 @@ mod pg_tests {
             pointer.get::<bool, _>("prosecdef"),
             "the pointer read is the one definer"
         );
-        assert_eq!(pointer.get::<String, _>("owner"), "wyrd_platform_admin");
+        assert!(pointer.get::<bool, _>("owned_by_platform"));
         assert_eq!(
             pointer.get::<Option<Vec<String>>, _>("proconfig"),
             Some(vec!["search_path=\"\"".to_owned()])
         );
         assert!(pointer.get::<bool, _>("app_exec"));
-        for row in &functions {
-            assert!(
-                !row.get::<bool, _>("public_exec"),
-                "PUBLIC holds no execute privilege"
-            );
-        }
 
         let tenant_a = reads.tenant().await;
         let tenant_b = reads.tenant().await;

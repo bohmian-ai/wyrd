@@ -10,8 +10,7 @@
 -- comparable — each epoch starts a fresh LSN sequence at 0.
 --
 -- NO RLS: This is a cluster-level node registry, not tenant-scoped data.
--- All writes via OperatorPool (BYPASSRLS, audited). Reads via OperatorPool
--- for discovery.
+-- All writes and discovery reads go through OperatorPool (audited).
 
 CREATE TABLE vala.cluster_nodes (
     node_id         uuid PRIMARY KEY,
@@ -27,14 +26,3 @@ CREATE TABLE vala.cluster_nodes (
 -- heartbeat_at < now() - interval '15s' is not live (5s cadence, 15s TTL).
 CREATE INDEX cluster_nodes_role_heartbeat_idx
     ON vala.cluster_nodes (role, heartbeat_at);
-
--- OperatorPool grants (wyrd_platform_admin BYPASSRLS). All writes via
--- OperatorPool (BYPASSRLS, audited); reads via OperatorPool for discovery.
--- TenantConn for anything that projects tenant-scoped columns (none today).
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wyrd_platform_admin') THEN
-    RAISE EXCEPTION 'wyrd_platform_admin missing — run bootstrap/roles.sql / db:setup-roles';
-  END IF;
-END $$;
-
-GRANT SELECT, INSERT, UPDATE ON vala.cluster_nodes TO wyrd_platform_admin;

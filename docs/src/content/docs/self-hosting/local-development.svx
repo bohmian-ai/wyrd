@@ -9,16 +9,16 @@ order: 9
 # Local development
 
 This journey runs the same one-process boot path production uses: an external
-PostgreSQL, a one-off owner migration, and a server that serves with only the
-two serving logins. Everything lives on your machine and survives restarts.
+PostgreSQL, a one-off migration, and a server. Locally one ordinary login in
+`WYRD_DATABASE_URL` does all three. Everything lives on your machine and
+survives restarts.
 The next steps up are a [development server on Kubernetes](/self-hosting/kubernetes-development/)
 and a [production server on Kubernetes](/self-hosting/kubernetes-production/).
 
 <Aside title="Just want a throwaway server?">
 
 `mise run dev:backend` runs the same migrate-then-serve sequence against a
-throwaway Postgres that is **deleted when the server exits**. Set
-`WYRD_STORAGE_URL` first. Nothing you create there survives a restart, so use
+throwaway Postgres that is **deleted when the server exits**. Nothing you create there survives a restart, so use
 the steps below for anything you want to keep.
 
 </Aside>
@@ -33,10 +33,9 @@ the steps below for anything you want to keep.
 
 | Variable | When | Value in this journey | Source |
 | --- | --- | --- | --- |
-| `WYRD_DATABASE_URL` for `migrate` | Required, migration only | `postgresql://wyrd_owner:…@127.0.0.1:5432/wyrd` | The database-owner login you create with the container. Pass it only to `wyrd-server migrate`. |
-| `WYRD_DATABASE_URL` | Required | `postgresql://wyrd_app:…@127.0.0.1:5432/wyrd` | `wyrd_app` password from the role bootstrap. |
-| `WYRD_PLATFORM_DATABASE_URL` | Required | `postgresql://wyrd_platform_admin:…@127.0.0.1:5432/wyrd` | `wyrd_platform_admin` password from the role bootstrap. |
-| `WYRD_STORAGE_URL` | Required | `file://$PWD/.wyrd-dev/storage` | A durable local directory. A development object store such as MinIO also works: see [Storage](/self-hosting/storage/). |
+| `WYRD_DATABASE_URL` | Required | `postgresql://wyrd:…@127.0.0.1:5432/wyrd` | The login you create below. It owns the database, migrates, and serves. |
+| `WYRD_PLATFORM_DATABASE_URL` | Not used | unset | Set it only to separate the platform login, as [production](/self-hosting/database/#serving) does. When unset, it defaults to `WYRD_DATABASE_URL`. |
+| `WYRD_STORAGE_URL` | Optional | unset | When unset, storage is `.wyrd/storage` under the working directory, created on first start. A development object store such as MinIO also works: see [Storage](/self-hosting/storage/). |
 | `WYRD_BIFROST_DATA_DIR` | Recommended | `$PWD/.wyrd-dev/bifrost` | Scribe WAL, staging, and stable node identity. It defaults to `.wyrd/bifrost` under the working directory, so set it to stay independent of where you start the server. |
 | `APP_ENV` | Optional | `development` (the default) | Relaxes the production gates below. |
 | `WYRD_SIGNING_KEY_FILE` | Optional in development | `$PWD/.wyrd-dev/signing.pem` | Generated below. When unset, development mints an **ephemeral** key on each boot, so access tokens stop verifying after a restart. API keys stay valid either way. |
@@ -46,33 +45,32 @@ the steps below for anything you want to keep.
 The server binds HTTP on `0.0.0.0:8080` and gRPC on `127.0.0.1:50051`. Clients
 derive gRPC from the server URL (same host, port `50051`).
 
-## 1. Durable PostgreSQL and the serving roles
+## 1. Durable PostgreSQL
 
 ```bash
-mkdir -p .wyrd-dev/storage .wyrd-dev/bifrost
+mkdir -p .wyrd-dev
 docker volume create wyrd-dev-pg
 docker run -d --name wyrd-dev-pg -p 127.0.0.1:5432:5432 \
-  -e POSTGRES_DB=wyrd -e POSTGRES_USER=wyrd_owner -e POSTGRES_PASSWORD=owner-dev-pw \
+  -e POSTGRES_PASSWORD=admin-dev-pw \
   -v wyrd-dev-pg:/var/lib/postgresql/data postgres:16
-
-# Once: create wyrd_app and wyrd_platform_admin with their own passwords.
-docker exec -i wyrd-dev-pg psql -v ON_ERROR_STOP=1 -U wyrd_owner -d wyrd \
-  --set app_password=app-dev-pw --set platform_admin_password=platform-dev-pw \
-  < crates/wyrd/wyrd-sql/bootstrap/roles.sql
+until docker exec wyrd-dev-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+docker exec wyrd-dev-pg psql -U postgres -v ON_ERROR_STOP=1 \
+  -c "CREATE ROLE wyrd LOGIN PASSWORD 'wyrd-dev-pw'" \
+  -c "CREATE DATABASE wyrd OWNER wyrd"
 ```
 
-The named volume keeps the database across container restarts. Keep the three
-passwords in a local, gitignored file or your password manager. See
-[Database](/self-hosting/database/) for what each role may do.
+The named volume keeps the database across container restarts. The container's
+`postgres` superuser only creates the login; the server refuses to run as a
+superuser, which row-level security cannot scope. See
+[Database](/self-hosting/database/) for the two logins production uses.
 
 ## 2. Build, migrate, and generate a stable signing key
 
 ```bash
 mise exec -- cargo build -p wyrd-server -p wyrd-cli
 
-# The only process that ever receives the owner URL.
-WYRD_DATABASE_URL="postgresql://wyrd_owner:owner-dev-pw@127.0.0.1:5432/wyrd" \
-  ./target/debug/wyrd-server migrate
+export WYRD_DATABASE_URL="postgresql://wyrd:wyrd-dev-pw@127.0.0.1:5432/wyrd"
+./target/debug/wyrd-server migrate
 # -> Wyrd and Vala schemas are migrated and valid.
 
 openssl genpkey -algorithm ed25519 -out .wyrd-dev/signing.pem
@@ -82,9 +80,7 @@ openssl genpkey -algorithm ed25519 -out .wyrd-dev/signing.pem
 
 ```bash
 export APP_ENV=development
-export WYRD_DATABASE_URL="postgresql://wyrd_app:app-dev-pw@127.0.0.1:5432/wyrd"
-export WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform_admin:platform-dev-pw@127.0.0.1:5432/wyrd"
-export WYRD_STORAGE_URL="file://$PWD/.wyrd-dev/storage"
+export WYRD_DATABASE_URL="postgresql://wyrd:wyrd-dev-pw@127.0.0.1:5432/wyrd"
 export WYRD_BIFROST_DATA_DIR="$PWD/.wyrd-dev/bifrost"
 export WYRD_SIGNING_KEY_FILE="$PWD/.wyrd-dev/signing.pem"
 
@@ -100,8 +96,7 @@ curl -s http://127.0.0.1:8080/readyz    # 200 once the schema, storage, and Bifr
 
 ## 4. First-use setup
 
-Run setup once, from a terminal with the same two serving database URLs
-exported:
+Run setup once, from a terminal with the same `WYRD_DATABASE_URL` exported:
 
 ```bash
 ./target/debug/wyrd-server setup --tenant acme
@@ -205,10 +200,10 @@ clients exchange their API key again.
 
 | Symptom | Cause | Recovery |
 | --- | --- | --- |
-| Boot fails with `WYRD_SQL_503_SCHEMA_NOT_READY` | The schema is unmigrated, from another build, or its policies or grants drifted. | Run step 2's `migrate` with the owner URL, then start again. |
+| Boot fails with `WYRD_SQL_503_SCHEMA_NOT_READY` | The schema is unmigrated or from another build, its policies drifted, or the login is a superuser. The error names the cause. | Run step 2's `migrate` with the same URL, then start again. |
 | `migrate` reports a conflict | Another migrator holds the database-wide migration lease. | Wait for it to finish, then rerun. `migrate` is idempotent. |
 | `setup` asks for `WYRD_PLATFORM_CREDENTIAL` | The platform root already exists. | Export the stored root credential. If it is lost, run `wyrd-server recover-root` against the same database. |
-| Startup names a missing `WYRD_STORAGE_URL` or database URL | A required input is unset. | Export it and start again. |
+| Startup names a missing `WYRD_DATABASE_URL` | The required database URL is unset. | Export it and start again. |
 
 To start over, stop the server, `docker rm -f wyrd-dev-pg && docker volume rm wyrd-dev-pg`, and delete `.wyrd-dev/`.
 

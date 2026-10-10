@@ -25,11 +25,11 @@ SQL_CRATES = [
 ]
 
 # Vala query modules that perform narrow cross-tenant maintenance work through
-# the OperatorPool (`wyrd_platform_admin` BYPASSRLS). Maintenance leases use
-# global keys without a tenant column; the Forge active-table roster deliberately
+# the OperatorPool (the operator session). Maintenance leases use global keys
+# without a tenant column; the Forge active-table roster deliberately
 # inventories active tenant registrations. Both are operator-only surfaces, so
-# their isolation boundary is the DB role rather than tenant-scoped RLS. Must
-# take OperatorPool.
+# their isolation boundary is the operator_access policy rather than
+# tenant-scoped RLS. Must take OperatorPool.
 VALA_OPERATOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
     # Cross-tenant active Bifrost roster used only by the Forge scheduler.

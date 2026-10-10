@@ -166,7 +166,7 @@ pub(crate) fn test_storage() -> Arc<StorageHandle> {
     Arc::clone(&shared().storage)
 }
 
-/// Return the fixture's `wyrd_app` pool for tests that must persist rows under
+/// Return the fixture's tenant pool for tests that must persist rows under
 /// RLS. Its connections take reactor affinity from the process-wide persistent
 /// runtime that initialized the fixture, so DB-acquiring tests must run on that
 /// runtime via `wyrd_runtime::runtime().block_on(..)`.

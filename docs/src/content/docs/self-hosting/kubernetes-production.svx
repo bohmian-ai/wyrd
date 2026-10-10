@@ -1,6 +1,6 @@
 ---
 title: Production server on Kubernetes
-description: Run Wyrd in production on Kubernetes with the hardened profile, backed-up owner-only migrations, a shared object store, a scaled-out tier of `all` replicas plus an optional autoscaled Oracle read tier joined over dedicated-CA peer mTLS, and credential capture and rotation.
+description: Run Wyrd in production on Kubernetes with the hardened profile, backed-up migrations, a shared object store, a scaled-out tier of `all` replicas plus an optional autoscaled Oracle read tier joined over dedicated-CA peer mTLS, and credential capture and rotation.
 pillar: wyrd
 group: Self-hosting
 order: 11
@@ -62,7 +62,7 @@ Keep these apart. None of them substitutes for another.
 | --- | --- | --- | --- |
 | Public TLS certificate | Client traffic to your hostnames | Secret `wyrd-public-tls`, used only by the edge gateway | Your certificate manager |
 | Mesh workload certificates | The hop from the edge gateway to the pods | The mesh (Istio issues and rotates them) | Automatic |
-| Database logins (`<owner>`, `wyrd_app`, `wyrd_platform_admin`) and the database CA | Postgres, and proof that the pods reach the real server | Secrets `wyrd-owner` (migration Job only), `wyrd-db`, and `wyrd-db-ca` | `ALTER ROLE … PASSWORD`, update the Secret, roll the pods; replace `wyrd-db-ca` before your provider rotates its CA |
+| Database logins (`wyrd_tenant`, `wyrd_platform`) and the database CA | Postgres, and proof that the pods reach the real server | Secrets `wyrd-db` and `wyrd-db-ca` | `ALTER ROLE … PASSWORD`, update the Secret, roll the pods; replace `wyrd-db-ca` before your provider rotates its CA |
 | Wyrd client credentials (`wyrd_global_…`, `wyrd_sk_…`) and the signing key | Wyrd API identity | Your secret manager; the signing key also in Secret `wyrd-signing` | See [Credentials](#credentials) |
 | Object-store identity | The bucket | The provider's workload identity bound to the pods' ServiceAccount | Your cloud IAM |
 | Peer certificates | The private peer port between Wyrd pods | Secret `wyrd-peer-tls` (CA key stays offline) | See [Peer TLS](#peer-tls) |
@@ -77,9 +77,8 @@ unchanged.
 | Variable | When | Value | Source |
 | --- | --- | --- | --- |
 | `APP_ENV` | Required | `production` | Selects the hardened profile: a real signing key and gRPC reflection off. |
-| `WYRD_DATABASE_URL` in the migration Job | Required, Job only | owner URL ending `?sslmode=verify-full` | Secret `wyrd-owner`. |
-| `WYRD_DATABASE_URL` | Required | `wyrd_app` URL ending `?sslmode=verify-full` | Secret `wyrd-db`. |
-| `WYRD_PLATFORM_DATABASE_URL` | Required | `wyrd_platform_admin` URL ending `?sslmode=verify-full` | Secret `wyrd-db`. |
+| `WYRD_DATABASE_URL` | Required, Job and pods | `wyrd_tenant` URL ending `?sslmode=verify-full` | Secret `wyrd-db`. |
+| `WYRD_PLATFORM_DATABASE_URL` | Required, Job and pods | `wyrd_platform` URL ending `?sslmode=verify-full` | Secret `wyrd-db`. The migration Job connects as this login. |
 | `PGSSLROOTCERT` | Required, Job and pods | `/etc/wyrd/db-ca/ca.crt` | The standard Postgres variable: the CA every connection verifies the server's certificate against. Secret `wyrd-db-ca`. |
 | `WYRD_STORAGE_URL` | Required | `s3://<bucket>`, `gs://<bucket>`, or `az://<container>` | One shared bucket. `file://` is process-local and cannot serve peers. |
 | `AWS_REGION` or provider equivalent | Provider-dependent | your region | See [Storage](/self-hosting/storage/). Credentials come from the provider chain, bound to the pods' ServiceAccount (IRSA, GKE Workload Identity, Azure Workload Identity), not from static keys. |
@@ -104,8 +103,8 @@ reach an impostor or run unencrypted. Get the CA certificate from your
 provider (for example, the RDS or Cloud SQL server CA bundle) and save it as
 `db-ca.crt`:
 
-Load the three passwords into shell variables from your secret manager (for
-example `read -rs OWNER_PW`), using long random URL-safe values such as
+Load both passwords into shell variables from your secret manager (for
+example `read -rs TENANT_PW`), using long random URL-safe values such as
 `openssl rand -hex 32`. They never go on a command line: `psql` reads a
 password from `PGPASSWORD`, and `kubectl` reads each URL from a pipe.
 
@@ -114,16 +113,14 @@ DB="<db-host>:5432/wyrd?sslmode=verify-full"
 export PGSSLROOTCERT=$PWD/db-ca.crt
 ```
 
-Bootstrap the serving roles once as the owner, exactly as in the
-[development guide](/self-hosting/kubernetes-development/)
-but with `"postgresql://<owner>@$DB"`. Then check all three logins. Each line
-must print the role and `t` (encrypted):
+Create both logins and their privileges once, as described in
+[Database](/self-hosting/database/#logins). Then check both logins. Each line
+must print the login and `t` (encrypted):
 
 ```bash
 Q='SELECT current_user, ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()'
-PGPASSWORD="$OWNER_PW" psql "postgresql://<owner>@$DB" -Atc "$Q"
-PGPASSWORD="$APP_PW" psql "postgresql://wyrd_app@$DB" -Atc "$Q"
-PGPASSWORD="$PLATFORM_PW" psql "postgresql://wyrd_platform_admin@$DB" -Atc "$Q"
+PGPASSWORD="$TENANT_PW" psql "postgresql://wyrd_tenant@$DB" -Atc "$Q"
+PGPASSWORD="$PLATFORM_PW" psql "postgresql://wyrd_platform@$DB" -Atc "$Q"
 ```
 
 If the server's certificate does not chain to `db-ca.crt` or does not name
@@ -136,11 +133,9 @@ store, or `kubectl create secret` from a trusted machine), never from files
 committed anywhere:
 
 ```bash
-kubectl -n wyrd create secret generic wyrd-owner \
-  --from-file=database-url=<(printf %s "postgresql://<owner>:$OWNER_PW@$DB")
 kubectl -n wyrd create secret generic wyrd-db \
-  --from-file=database-url=<(printf %s "postgresql://wyrd_app:$APP_PW@$DB") \
-  --from-file=platform-database-url=<(printf %s "postgresql://wyrd_platform_admin:$PLATFORM_PW@$DB")
+  --from-file=database-url=<(printf %s "postgresql://wyrd_tenant:$TENANT_PW@$DB") \
+  --from-file=platform-database-url=<(printf %s "postgresql://wyrd_platform:$PLATFORM_PW@$DB")
 kubectl -n wyrd create secret generic wyrd-db-ca --from-file=ca.crt=db-ca.crt
 kubectl -n wyrd create secret tls wyrd-public-tls --cert=public.crt --key=public.key
 openssl genpkey -algorithm ed25519 -out signing.pem
@@ -179,8 +174,7 @@ Every migration, first install or upgrade, follows the same order:
 
 1. Take a database backup (or confirm a point-in-time recovery point) and
    **verify it restores**. Record the recovery point with the image digest.
-2. Run the migration Job below with the new image. It is the only workload
-   that receives the owner URL. It is the
+2. Run the migration Job below with the new image. It is the
    [development one](/self-hosting/kubernetes-development/)
    plus the database CA.
 3. On success, roll the core StatefulSet and the Oracle Deployment to the
@@ -202,7 +196,9 @@ spec:
           command: [wyrd-server, migrate]
           env:
             - name: WYRD_DATABASE_URL
-              valueFrom: {secretKeyRef: {name: wyrd-owner, key: database-url}}
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: database-url}}
+            - name: WYRD_PLATFORM_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: platform-database-url}}
             - {name: PGSSLROOTCERT, value: /etc/wyrd/db-ca/ca.crt}
           volumeMounts:
             - {name: db-ca, mountPath: /etc/wyrd/db-ca, readOnly: true}

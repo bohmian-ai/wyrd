@@ -207,8 +207,8 @@ To rotate the KEK, publish the new version's key first, then raise `WYRD_OPERATO
 
 These are documented in full on their own pages. In brief:
 
-- Database: set `WYRD_DATABASE_URL` (`wyrd_app`) and `WYRD_PLATFORM_DATABASE_URL` (`wyrd_platform_admin`) after running `wyrd-server migrate` with the owner login. See [Database](/self-hosting/database/).
-- Storage: set `WYRD_STORAGE_URL` (`file:///path`, `s3://bucket`, `gs://bucket`, or `az://account/container`). See [Storage](/self-hosting/storage/).
+- Database: `WYRD_DATABASE_URL` is required and `wyrd-server migrate` runs first. `WYRD_PLATFORM_DATABASE_URL` is optional and defaults to it; production sets the two to separate tenant and platform logins you create. See [Database](/self-hosting/database/).
+- Storage: set `WYRD_STORAGE_URL` (`file:///path`, `s3://bucket`, `gs://bucket`, or `az://account/container`). When unset, the server uses a local `.wyrd/storage` directory that other replicas cannot see. See [Storage](/self-hosting/storage/).
 
 ## Config file
 
@@ -247,9 +247,9 @@ Each page above documents one slice. Here is the full set of variables a product
 # Profile
 export APP_ENV=production
 
-# Database. Both roles exist and `wyrd-server migrate` has run.
-export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
-export WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform_admin:admin-pw@db.internal:5432/wyrd"
+# Database. Both logins exist and `wyrd-server migrate` has run.
+export WYRD_DATABASE_URL="postgresql://wyrd_tenant:tenant-pw@db.internal:5432/wyrd"
+export WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform:platform-pw@db.internal:5432/wyrd"
 
 # Storage (S3). AWS credentials resolve via the default SDK chain.
 export WYRD_STORAGE_URL=s3://wyrd-artifacts

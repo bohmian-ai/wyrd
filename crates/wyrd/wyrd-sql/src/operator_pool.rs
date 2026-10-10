@@ -1,8 +1,9 @@
-//! Audited cross-tenant BYPASSRLS pool handle.
+//! Audited cross-tenant operator pool handle.
 //!
-//! `OperatorPool` wraps the `wyrd_platform_admin` pool — the audited
-//! cross-tenant BYPASSRLS pool that operator and control-table functions use to
-//! enumerate or act across every tenant partition. It is the sole mechanism that
+//! `OperatorPool` wraps the platform pool — the audited operator session that
+//! every table's `operator_access` row-level-security policy admits — which
+//! operator and control-table functions use to enumerate or act across every
+//! tenant partition. It is the sole mechanism that
 //! query modules are allowed to hold for cross-tenant SQL; no query fn may take
 //! a bare `&PgPool`.
 
@@ -11,20 +12,20 @@ use wyrd_spec::DataTenantId;
 
 use crate::{SqlError, TenantConn};
 
-/// Audited cross-tenant BYPASSRLS Postgres pool handle.
+/// Audited cross-tenant operator-session Postgres pool handle.
 ///
-/// Wraps the `wyrd_platform_admin` pool. Every cross-tenant / operator /
+/// Wraps the platform pool. Every cross-tenant / operator /
 /// control-table query fn takes `&OperatorPool` and calls `op.pool()` inline in
 /// the `query!` invocation. Tenant-scoped transactions remain the responsibility
 /// of [`crate::WyrdPostgres`] or the owning tier's equivalent Postgres handle.
 ///
-/// The one-off `wyrd-server migrate` process also wraps its database-owner
+/// The one-off `wyrd-server migrate` process also wraps its platform-login
 /// pool in this handle to hold the migration lease and run the same schema
-/// checks serving boot runs; that owner pool never exists in a serving process.
+/// checks serving boot runs; that migration pool never exists in a serving
+/// process.
 ///
-/// `None` when no cross-tenant role is configured (single-app or dev setup).
-/// Production boot that requires cross-tenant maintenance fails fast when the
-/// accessor on `WyrdPostgres` / `ServerPostgres` returns `None`.
+/// `WyrdPostgres::operator_pool` returns `None` only for handles built without
+/// a platform pool (DB-free tests); production boot fails fast on `None`.
 #[derive(Clone)]
 pub struct OperatorPool(PgPool);
 
@@ -39,10 +40,10 @@ impl OperatorPool {
     /// that also carries the tenant key the canonical append names.
     ///
     /// This is not a third connection abstraction: it is the existing operator
-    /// pool handing back the existing tenant-scoped transaction type. Row-level
-    /// security is still bypassed here, which is exactly why `append_audit`
-    /// names `data_tenant_id` in every statement rather than relying on the
-    /// policy.
+    /// pool handing back the existing tenant-scoped transaction type. The
+    /// operator session still sees every tenant here, which is exactly why
+    /// `append_audit` names `data_tenant_id` in every statement rather than
+    /// relying on the policy.
     ///
     /// # Errors
     /// Returns [`SqlError::Connect`] when the pool cannot begin a transaction,
@@ -51,7 +52,7 @@ impl OperatorPool {
         TenantConn::acquire(&self.0, DataTenantId::SYSTEM_OWNER).await
     }
 
-    /// Borrow the underlying BYPASSRLS pool.
+    /// Borrow the underlying operator-session pool.
     ///
     /// Pass the returned reference directly to `query!` / `query_as!` as the
     /// executor. Do not store it separately.

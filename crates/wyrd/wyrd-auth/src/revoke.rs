@@ -441,10 +441,10 @@ pub(crate) mod pg_tests {
             conn.commit().await.expect("seed commits");
         }
 
-        // Remove the runtime role's write privilege so the revocation statement
+        // Remove the tenant login's write privilege so the revocation statement
         // fails exactly as an unavailable or misconfigured store would.
         let admin = fixture.superuser_pool().expect("superuser pool");
-        sqlx::query("REVOKE UPDATE ON wyrd.auth_service_accounts FROM wyrd_app")
+        sqlx::query("REVOKE UPDATE ON wyrd.auth_service_accounts FROM wyrd_tenant")
             .execute(&admin)
             .await
             .expect("privilege revoked");
@@ -459,7 +459,7 @@ pub(crate) mod pg_tests {
         .await;
         drop(conn);
 
-        sqlx::query("GRANT UPDATE ON wyrd.auth_service_accounts TO wyrd_app")
+        sqlx::query("GRANT UPDATE ON wyrd.auth_service_accounts TO wyrd_tenant")
             .execute(&admin)
             .await
             .expect("privilege restored");
@@ -468,7 +468,12 @@ pub(crate) mod pg_tests {
             panic!("a refused write must surface as an internal failure, got: {result:?}");
         };
         assert_eq!(message, "principal revocation failed");
-        for leaked in ["auth_service_accounts", "permission", "wyrd_app", "UPDATE"] {
+        for leaked in [
+            "auth_service_accounts",
+            "permission",
+            "wyrd_tenant",
+            "UPDATE",
+        ] {
             assert!(
                 !message.contains(leaked),
                 "the public message must not name {leaked}: {message}"

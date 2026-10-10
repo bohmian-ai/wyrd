@@ -24,16 +24,16 @@ The container keeps no database. Local artifact storage and Bifrost data live un
 ## First run
 
 ```bash
-# 1. Once per release, migrate with the database-owner login. This is the only
-#    process that ever gets the owner URL.
-docker run --rm -e WYRD_DATABASE_URL="postgresql://owner:…@db:5432/wyrd" \
-  "$IMAGE" wyrd-server migrate
+# The tenant and platform logins you created (see Database).
+DB_URLS=(-e WYRD_DATABASE_URL="postgresql://wyrd_tenant:…@db:5432/wyrd"
+         -e WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform:…@db:5432/wyrd")
 
-# 2. Serve with the two serving logins.
+# 1. Once per release, migrate. It connects as the platform login.
+docker run --rm "${DB_URLS[@]}" "$IMAGE" wyrd-server migrate
+
+# 2. Serve.
 docker run -d --name wyrd -p 8080:8080 -p 50051:50051 \
-  -e APP_ENV=production \
-  -e WYRD_DATABASE_URL="postgresql://wyrd_app:…@db:5432/wyrd" \
-  -e WYRD_PLATFORM_DATABASE_URL="postgresql://wyrd_platform_admin:…@db:5432/wyrd" \
+  -e APP_ENV=production "${DB_URLS[@]}" \
   -e WYRD_STORAGE_URL=file:///var/lib/wyrd/storage \
   -e WYRD_SIGNING_KEY_FILE=/run/secrets/signing.pem \
   -v wyrd-data:/var/lib/wyrd -v "$PWD/signing.pem:/run/secrets/signing.pem:ro" \

@@ -233,14 +233,7 @@ async fn benchmark(cli: Cli) -> Result<Outcome> {
         ("WYRD_TARGET", "server"),
         ("WYRD_MAX_FILE_RETENTION_TIME", seal.as_str()),
     ]);
-    let leader = LocalServer::start(
-        &binary,
-        &std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")?,
-        &["forge"],
-        &leader_env,
-        leader_envelope,
-    )
-    .await?;
+    let leader = LocalServer::start(&binary, &["forge"], &leader_env, leader_envelope).await?;
     let dependencies = Dependencies::connect().await?;
     let probe = LeaderProbe::new(dependencies.owner(), &probe_identity)?;
     let mut deployment = Deployment {

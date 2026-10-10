@@ -28,12 +28,9 @@ Wyrd is multi-tenant. One server serves many tenants, isolated in the database, 
 
 ## Start here
 
-The fastest way to see the server run is `mise run dev:backend`. It starts a throwaway Docker Postgres that is deleted when the server exits, runs `wyrd-server migrate`, and serves with the two serving database URLs. Skip the signing key and it mints an ephemeral one. You only have to point it at a storage directory.
+The fastest way to see the server run is `mise run dev:backend`. It starts a throwaway Docker Postgres that is deleted when the server exits, runs `wyrd-server migrate`, and serves with the two serving database URLs. Skip the signing key and it mints an ephemeral one, and storage defaults to `.wyrd/storage` under the working directory.
 
 ```bash
-mkdir -p .wyrd-dev/storage
-export WYRD_STORAGE_URL="file://$PWD/.wyrd-dev/storage"
-
 mise run dev:backend
 ```
 

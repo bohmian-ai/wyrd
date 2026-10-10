@@ -1,13 +1,11 @@
 mod pg_tests {
-    //! Regression test for S3.C2perm: wyrd_app must hold USAGE ON SCHEMA vala.
+    //! The separate tenant login reaches `vala` through the documented
+    //! operator setup alone.
     //!
-    //! Migration `20260801000002_vala_app_schema_usage` grants USAGE so the existing
-    //! per-table DML grants on `vala.*` become reachable. Without it, an INSERT into
-    //! `vala.bifrost_tables` through the request-path `wyrd_app` role fails with
-    //! Postgres 42501 (permission denied for schema vala) -- the exact gap the
-    //! shipped migrations left. This test uses the shared-DB `db.app` pool, which
-    //! connects as the runtime `wyrd_app` role, so the insert is gated by the same
-    //! grants production enforces; it would fail 42501 on base.
+    //! The test harness gives the tenant login only `USAGE` on the schema and
+    //! default table privileges, as the self-hosting guide tells a DBA to. An
+    //! INSERT into `vala.bifrost_tables` through the tenant pool proves that
+    //! setup suffices; without it Postgres refuses with 42501.
     //!
     //! Run via `mise run test:sql`.
 
@@ -30,7 +28,7 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    async fn schema_usage_grant_lets_wyrd_app_register_bifrost_table() {
+    async fn tenant_login_registers_bifrost_table() {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = DataTenantId::new_v7();
         fixture
@@ -41,10 +39,8 @@ mod pg_tests {
             .await
             .unwrap();
 
-        // `fixture.app_pool()` connects as the runtime `wyrd_app` role — the same
-        // RLS-enforced, non-BYPASSRLS identity the request path uses. No `SET ROLE`
-        // dance is needed: the insert is naturally gated by the grants production
-        // enforces, and without USAGE ON SCHEMA vala it 42501s.
+        // `fixture.app_pool()` connects as the separate tenant login the request
+        // path uses, so the insert is gated by the operator's grants.
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .unwrap();
@@ -59,7 +55,7 @@ mod pg_tests {
             &layout_fixture(),
         )
         .await
-        .expect("wyrd_app must reach vala.bifrost_tables once USAGE ON SCHEMA vala is granted");
+        .expect("the tenant login reaches vala.bifrost_tables");
 
         conn.commit().await.unwrap();
     }

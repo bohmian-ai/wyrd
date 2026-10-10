@@ -4,8 +4,10 @@ mod pg_tests {
     //! Skipped automatically when Wyrd database env vars are unset so the default
     //! test suite remains credential-free.
 
+    use secrecy::ExposeSecret;
     use sha2::Digest;
     use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_sql::dsn::ResolvedDsns;
     use wyrd_sql::{MIGRATION_LEASE_WAIT, OperatorPool};
 
     /// Fresh Vala migrations apply repeatedly without schema drift and leave
@@ -18,13 +20,15 @@ mod pg_tests {
     /// retired relation or function still resolves after migrating.
     #[tokio::test]
     async fn vala_migrations_apply_and_are_idempotent() {
-        let Some(owner_url) = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL").ok() else {
+        let Ok(dsns) = ResolvedDsns::from_env() else {
             return;
         };
-        let pool =
-            wyrd_sql::pool::build_pool(&owner_url, wyrd_sql::PoolConfig::migrator_defaults())
-                .await
-                .expect("owner pool");
+        let pool = wyrd_sql::pool::build_pool(
+            dsns.platform().expose_secret(),
+            wyrd_sql::PoolConfig::migrator_defaults(),
+        )
+        .await
+        .expect("platform pool");
 
         let mut lease = OperatorPool::from(pool.clone())
             .migration_lease(MIGRATION_LEASE_WAIT)
@@ -166,7 +170,7 @@ mod pg_tests {
         );
         assert_eq!(
             format!("{digest:x}"),
-            "ce869581019efb6689d9413efa77245f2381f464127e707458f4026178ca5d84",
+            "e8438de48385ad70ebeb7190ebfeaee8a7c1589c92eadf31ae3c2d1add47ddde",
             "20260802000000_vala_audit_staging.sql changed; applied migrations are immutable, \
              add a forward migration instead"
         );

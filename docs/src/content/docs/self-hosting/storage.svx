@@ -27,7 +27,7 @@ Clients move artifact bytes directly against the cloud store through short-lived
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `WYRD_STORAGE_URL` | none (required) | Backend and location, as above. |
+| `WYRD_STORAGE_URL` | `.wyrd/storage` under the working directory, created on start | Backend and location, as above. A `file://` root you set must already exist. |
 | `WYRD_STORAGE_ENDPOINT_URL` | none | `http` or `https` endpoint for an S3-compatible store, without credentials, query, or fragment. See [Custom endpoints](#custom-endpoints). |
 | `WYRD_STORAGE_REQUIRE_ENCRYPTION` | `false` | Require an encryption marker when an upload completes. |
 | `WYRD_STORAGE_PRESIGN_TTL_SECS` | `600` | Presigned URL lifetime. Clamped to `60`–`3600`. |

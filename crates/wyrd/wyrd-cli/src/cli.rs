@@ -10,6 +10,7 @@ use crate::operator_connection::OperatorConnectionCommand;
 use crate::platform::PlatformCommand;
 use crate::principal::PrincipalCommand;
 use crate::query::QueryCommand;
+use crate::server::ServerCommand;
 use crate::workflow::WorkflowCommand;
 
 /// Wyrd command-line interface.
@@ -59,6 +60,7 @@ impl Cli {
                 .map_err(Into::into),
             Command::Query(command) => crate::query::dispatch(command).await,
             Command::Gateway(command) => command.dispatch().await,
+            Command::Server(command) => command.dispatch().await.map_err(Into::into),
             Command::Workflow(command) => command.dispatch().await.map_err(Into::into),
         }
     }
@@ -104,6 +106,9 @@ pub enum Command {
     Gateway(GatewayCommand),
     /// Run Workflows locally or on the server, and inspect or cancel server runs.
     Workflow(WorkflowCommand),
+    /// Install and manage the official Wyrd server for this host.
+    #[command(subcommand)]
+    Server(ServerCommand),
 }
 
 /// Structural checks over the assembled command tree.

@@ -27,13 +27,17 @@ arrow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["pem"] }
 indicatif = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
+semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
 shellexpand = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 toml = { workspace = true }
@@ -57,9 +61,7 @@ assert_cmd = "2"
 axum = { workspace = true }
 base64 = { workspace = true }
 predicates = "3"
-sha2 = { workspace = true }
 sqlx = { workspace = true }
-tempfile = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }

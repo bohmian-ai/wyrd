@@ -21,6 +21,8 @@ mod platform;
 mod principal;
 pub mod query;
 pub mod registration;
+/// `wyrd server`: verified installation of official server releases.
+pub mod server;
 mod workflow;
 
 use clap::{Parser, error::ErrorKind};

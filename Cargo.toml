@@ -31,6 +31,7 @@ authors = ["Thorrester <sjforrester32@gmail.com>"]
 wyrd-spec = { path = "crates/wyrd-spec", version = "0.0.1" }
 wyrd-client = { path = "crates/shared/wyrd-client", version = "0.0.1" }
 wyrd-cli = { path = "crates/wyrd/wyrd-cli", version = "0.0.1" }
+wyrd-mcp = { path = "crates/wyrd/wyrd-mcp", version = "0.0.1" }
 wyrd-loader = { path = "crates/shared/wyrd-loader", version = "0.0.1" }
 skald-spec = { path = "crates/skald/skald-spec", version = "0.1.0" }
 skald-cache = { path = "crates/skald/skald-cache", version = "0.0.1" }
@@ -87,7 +88,8 @@ rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "
 axum = "0.8"
 # Official Rust MCP SDK. Wyrd pins one version workspace-wide and each owner
 # opts into the narrowest transport surface it serves: `wyrd-server` mounts the
-# Streamable HTTP server, `wyrd-mcp` connects the Streamable HTTP client.
+# Streamable HTTP server, `wyrd-mcp` connects the Streamable HTTP client, and
+# `wyrd-cli` bridges a host's stdio session onto that client.
 rmcp = { version = "3.2.0", default-features = false }
 # Server-sent-event types named in `rmcp`'s Streamable HTTP client trait
 # signatures. Wyrd never parses SSE itself; it only has to name the type.

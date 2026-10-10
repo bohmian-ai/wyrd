@@ -13,6 +13,9 @@ mod eval_support;
 mod gateway_server_journey;
 #[path = "loader.rs"]
 mod loader;
+/// `wyrd mcp proxy` and `wyrd mcp install` journeys.
+#[path = "mcp_journey.rs"]
+mod mcp_journey;
 #[path = "operator_journey.rs"]
 mod operator_journey;
 #[path = "principal_journey.rs"]
@@ -38,4 +41,14 @@ mod workflow_journey;
 #[ignore = "requires the Keycloak identity lane; run via `mise run test:identity:journey`"]
 async fn cli_device_login_journey() {
     cli_login_journey::cli_device_login_journey().await;
+}
+
+/// Root of the authenticated MCP proxy journey, so its exact name selects it.
+///
+/// # Panics
+/// Panics when any step of
+/// [`mcp_journey::mcp_proxy_discovers_and_reads_with_shared_auth`] differs.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_proxy_discovers_and_reads_with_shared_auth() {
+    mcp_journey::mcp_proxy_discovers_and_reads_with_shared_auth().await;
 }

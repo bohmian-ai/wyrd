@@ -20,6 +20,12 @@
 //! one Scribe shard, each step profiled, reported in retained Arrow MB/s, MB/s
 //! per server core, and rows/s (`mise run bench:bifrost:write-capacity`).
 //!
+//! `--fixture telemetry` writes the telemetry fixture instead: 10 million
+//! GenAI/HTTP spans exported through the OTLP gRPC collector into
+//! `vala.traces.spans`, settled into the tier, checked against exact answers,
+//! and, in the Parquet tier, judged on which span attribute keys the
+//! published files shred (`telemetry/<tier>/`).
+//!
 //! Run through `mise run bench:bifrost:query-capacity` (10 million rows, both
 //! tiers) or `mise run bench:bifrost:query-capacity -- --heavy` (100 million
 //! rows, Parquet only, broad window and full scan only). Every query window
@@ -31,6 +37,7 @@
 
 mod report;
 mod run;
+mod telemetry;
 mod workload;
 
 use std::path::{Path, PathBuf};
@@ -43,6 +50,7 @@ use wyrd_client::{GlobalConfig, WyrdClient};
 
 use report::Report;
 use run::Bench;
+use telemetry::Telemetry;
 use workload::{Case, Fixture, TABLE};
 use wyrd_testing::capacity::{install_tracing, release_binary};
 use wyrd_testing::release_server::{LocalServer, Placement, SERVER_URL};
@@ -130,8 +138,13 @@ impl Tier {
 ///
 /// Returns an error for a heavy hot run, or the server, client, or evidence
 /// failure that stopped the tier.
-async fn benchmark(heavy: bool, writes: bool, tier: Tier) -> Result<bool> {
-    let (fixture, mode) = if writes {
+async fn benchmark(heavy: bool, writes: bool, spans: bool, tier: Tier) -> Result<bool> {
+    if spans && (heavy || writes) {
+        return Err("--fixture telemetry runs alone, without --heavy or --writes".into());
+    }
+    let (fixture, mode) = if spans {
+        (Fixture::standard(), "telemetry")
+    } else if writes {
         (Fixture::standard(), "writes")
     } else if heavy {
         if tier == Tier::Hot {
@@ -150,6 +163,9 @@ async fn benchmark(heavy: bool, writes: bool, tier: Tier) -> Result<bool> {
     std::fs::create_dir_all(&output)?;
     if writes {
         return write_sweep(fixture, tier, &output).await;
+    }
+    if spans {
+        return telemetry_journey(fixture, tier, &output).await;
     }
     journey(fixture, heavy, tier, &output).await
 }
@@ -267,6 +283,44 @@ async fn journey(fixture: Fixture, heavy: bool, tier: Tier, output: &Path) -> Re
     Ok(report.passed())
 }
 
+/// The telemetry journey: start the server, export the span fixture over
+/// OTLP gRPC, put the spans in `tier`, check answers, judge the Parquet
+/// tier's Variant shredding, stop.
+///
+/// Returns whether every row passed.
+///
+/// # Errors
+///
+/// Returns a server, client, or evidence failure that stopped the journey.
+async fn telemetry_journey(fixture: Fixture, tier: Tier, output: &Path) -> Result<bool> {
+    let spans = Telemetry::standard();
+    let server =
+        LocalServer::start(&release_binary()?, &["bench"], tier.env(), Placement::Host).await?;
+    let client = WyrdClient::with_config(ClientConfig {
+        credential: Some(server.api_key().clone()),
+        ..ClientConfig::from_global_with_overrides(&GlobalConfig::default(), Some(SERVER_URL), None)
+    })?;
+    let bench = Bench::new(&server, &client, fixture, &[], output.join("profiles"));
+    let label = format!("{} telemetry spans, {}", tier.name(), server.describe());
+    let mut report = Report::new(fixture, label, server.memory_limit_bytes());
+
+    let written = bench.export_spans(spans, run::WRITERS).await?;
+    let (files, bytes) = parquet_files(&server.storage_dir());
+    report.write("export spans", &written, files, bytes);
+    report.tier("spans in tier", settle(&server, tier).await?);
+    report.answers(&bench.check(spans.questions()).await?);
+    if tier == Tier::Parquet {
+        report.tier(
+            "variant shredding",
+            telemetry::judge_shredding(&parquet_paths(&server.storage_dir())),
+        );
+    }
+
+    report.shutdown(&server.stop(&output.join("server.log")).map_err(Into::into));
+    report.write_to(output)?;
+    Ok(report.passed())
+}
+
 /// Where Scribe holds rows, from one `/metrics` scrape and the store.
 #[derive(Debug)]
 struct Residence {
@@ -375,7 +429,17 @@ async fn settle(server: &LocalServer, tier: Tier) -> Result<std::result::Result<
 
 /// Counts the Parquet objects and bytes under the `file://` store.
 fn parquet_files(root: &Path) -> (u64, u64) {
-    let (mut files, mut bytes) = (0, 0);
+    parquet_paths(root)
+        .iter()
+        .fold((0, 0), |(files, bytes), path| {
+            let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+            (files + 1, bytes + size)
+        })
+}
+
+/// Every Parquet object under the `file://` store rooted at `root`.
+fn parquet_paths(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(&directory)
@@ -390,12 +454,11 @@ fn parquet_files(root: &Path) -> (u64, u64) {
                 .extension()
                 .is_some_and(|extension| extension == "parquet")
             {
-                files += 1;
-                bytes += entry.metadata().map_or(0, |metadata| metadata.len());
+                found.push(path);
             }
         }
     }
-    (files, bytes)
+    found
 }
 
 /// Runs the benchmark and exits nonzero on any failed row or error.
@@ -405,6 +468,9 @@ async fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().collect();
     let heavy = arguments.iter().any(|argument| argument == "--heavy");
     let writes = arguments.iter().any(|argument| argument == "--writes");
+    let spans = arguments
+        .windows(2)
+        .any(|pair| pair[0] == "--fixture" && pair[1] == "telemetry");
     let tier = arguments
         .iter()
         .position(|argument| argument == "--tier")
@@ -413,7 +479,7 @@ async fn main() -> ExitCode {
             Tier::parse(name)
         });
     let outcome = match tier {
-        Ok(tier) => benchmark(heavy, writes, tier).await,
+        Ok(tier) => benchmark(heavy, writes, spans, tier).await,
         Err(error) => Err(error),
     };
     match outcome {

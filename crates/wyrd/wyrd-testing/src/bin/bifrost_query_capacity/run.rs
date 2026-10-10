@@ -20,8 +20,12 @@ use tokio_util::sync::CancellationToken;
 use wyrd_client::bifrost::{BifrostClientError, TableConfig};
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
+use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
+use wyrd_tonic::tonic::Request;
+use wyrd_tonic::tonic::transport::Channel;
 
 use crate::Result;
+use crate::telemetry::{self, Telemetry};
 use crate::workload::{self, Case, Fixture, Rows};
 use wyrd_testing::capacity::driver_cpu_seconds;
 use wyrd_testing::profile::{Capture, Profile};
@@ -454,36 +458,122 @@ impl<'a> Bench<'a> {
         .await?;
         writer.register().await?;
         let writer = Arc::new(writer);
+        let fixture = self.fixture;
+        self.send_requests(
+            rows,
+            workload::REQUEST_ROWS,
+            writers,
+            stop,
+            move |first, last| {
+                let writer = Arc::clone(&writer);
+                async move {
+                    let batch = fixture
+                        .batch(first, last)
+                        .map_err(|_| "fixture".to_owned())?;
+                    writer
+                        .write_batch(table, &batch)
+                        .await
+                        .map_err(|error| code(&error))
+                }
+            },
+        )
+        .await
+    }
+
+    /// Exports `spans` of the telemetry fixture through the server's OTLP
+    /// gRPC collector with the client's exchanged bearer, `writers` exporters at a time, in
+    /// [`telemetry::REQUEST_SPANS`]-span requests, as an application's
+    /// OpenTelemetry SDK batch exporters would.
+    ///
+    /// Each export resolves at the durable acknowledgement, so the rate is
+    /// the durable span rate. A rejected export is counted by its gRPC code,
+    /// and a partial success that drops spans as `partial-success`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the connection or evidence failure.
+    pub async fn export_spans(&self, fixture: Telemetry, writers: usize) -> Result<Measured> {
+        let channel = Channel::from_shared(self.client.grpc_url().to_owned())?
+            .connect()
+            .await?;
+        let exporter = TraceServiceClient::new(channel);
+        let auth = self.client.auth();
+        self.send_requests(
+            0..fixture.spans,
+            telemetry::REQUEST_SPANS,
+            writers,
+            CancellationToken::new(),
+            move |first, last| {
+                let (mut exporter, auth) = (exporter.clone(), Arc::clone(&auth));
+                async move {
+                    let bearer = auth.bearer().await.map_err(|_| "bearer".to_owned())?;
+                    let mut request = Request::new(fixture.request(first, last));
+                    request.metadata_mut().insert(
+                        "x-wyrd-access-token",
+                        format!("Bearer {}", bearer.expose())
+                            .parse()
+                            .map_err(|_| "bearer".to_owned())?,
+                    );
+                    let response = exporter
+                        .export(request)
+                        .await
+                        .map_err(|status| format!("{:?}", status.code()))?;
+                    match response.into_inner().partial_success {
+                        Some(partial) if partial.rejected_spans > 0 => {
+                            Err("partial-success".to_owned())
+                        }
+                        _ => Ok(()),
+                    }
+                }
+            },
+        )
+        .await
+    }
+
+    /// Sends `rows` in `chunk`-row requests from `writers` concurrent
+    /// senders until every request is sent or `stop` is cancelled, and
+    /// measures the window.
+    ///
+    /// The senders share one cursor, so requests go out in row order. `send`
+    /// resolves at the durable acknowledgement of rows `first..last`; its
+    /// error is the stable code it is counted by.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window's evidence failure.
+    async fn send_requests<F, Sent>(
+        &self,
+        rows: std::ops::Range<i64>,
+        chunk: i64,
+        writers: usize,
+        stop: CancellationToken,
+        send: F,
+    ) -> Result<Measured>
+    where
+        F: Fn(i64, i64) -> Sent + Clone + Send + 'static,
+        Sent: Future<Output = std::result::Result<(), String>> + Send,
+    {
         let window = Window::open(self.server).await?;
         let next = Arc::new(AtomicI64::new(rows.start));
         let end = rows.end;
         let mut tasks = JoinSet::new();
         for _ in 0..writers {
-            let (writer, next, stop, fixture) = (
-                Arc::clone(&writer),
-                Arc::clone(&next),
-                stop.clone(),
-                self.fixture,
-            );
+            let (next, stop, send) = (Arc::clone(&next), stop.clone(), send.clone());
             tasks.spawn(async move {
                 let mut measured = Measured::default();
                 while !stop.is_cancelled() {
-                    let first = next.fetch_add(workload::REQUEST_ROWS, Ordering::Relaxed);
+                    let first = next.fetch_add(chunk, Ordering::Relaxed);
                     if first >= end {
                         break;
                     }
-                    let last = (first + workload::REQUEST_ROWS).min(end);
-                    let Ok(batch) = fixture.batch(first, last) else {
-                        *measured.errors.entry("fixture".to_owned()).or_default() += 1;
-                        continue;
-                    };
+                    let last = (first + chunk).min(end);
                     let sent = Instant::now();
-                    match writer.write_batch(table, &batch).await {
+                    match send(first, last).await {
                         Ok(()) => {
                             measured.record(sent);
                             measured.rows += (last - first) as u64;
                         }
-                        Err(error) => *measured.errors.entry(code(&error)).or_default() += 1,
+                        Err(code) => *measured.errors.entry(code).or_default() += 1,
                     }
                 }
                 measured
@@ -532,23 +622,36 @@ impl<'a> Bench<'a> {
     ///
     /// Returns evidence failures; wrong answers are counted, not returned.
     pub async fn check_answers(&self, cases: &[Case]) -> Result<Measured> {
+        let questions = cases.iter().flat_map(|case| {
+            (0..case.variants()).map(|sequence| {
+                let (sql, expected) = self.question(*case, sequence);
+                (case.name(), sql, expected)
+            })
+        });
+        self.check(questions.collect()).await
+    }
+
+    /// Asks each named question once, in order, and checks its exact answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns evidence failures; a wrong answer is counted under its
+    /// question's name, not returned.
+    pub async fn check(&self, questions: Vec<(&'static str, String, Rows)>) -> Result<Measured> {
         let window = Window::open(self.server).await?;
         let mut measured = Measured {
             clients: 1,
             ..Measured::default()
         };
-        for case in cases {
-            for sequence in 0..case.variants() {
-                let (sql, expected) = self.question(*case, sequence);
-                let sent = Instant::now();
-                match ask(&self.queries, sql, &expected).await {
-                    Ok(()) => measured.record(sent),
-                    Err(error) => {
-                        *measured
-                            .errors
-                            .entry(format!("{}: {error}", case.name()))
-                            .or_default() += 1;
-                    }
+        for (name, sql, expected) in questions {
+            let sent = Instant::now();
+            match ask(&self.queries, sql, &expected).await {
+                Ok(()) => measured.record(sent),
+                Err(error) => {
+                    *measured
+                        .errors
+                        .entry(format!("{name}: {error}"))
+                        .or_default() += 1;
                 }
             }
         }

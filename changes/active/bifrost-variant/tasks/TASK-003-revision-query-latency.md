@@ -1866,3 +1866,36 @@ query 1.88 → 1.63 ms (x1), 4.82 → 3.85 ms (x64). No FAIL, no divergence.
    tiers, not on the events fixture.
 3. Step 2 (write tail retest), then step 6.
 4. Then: Local/Distributed rename, 100M-row heavy fixture, logs.
+
+### Runs 25–26, 2026-10-10: chunk check (parquet, same build, back to back)
+
+24 MiB / 12 MiB: 1m-aggregate x8 411 / 500 qps, p50 21.1 / 14.8 ms (2.25
+partitions at 12 MiB vs 1.25); 1m-aggregate while writing 169 / 226 qps;
+broad-window p50 34.2 / 28.9 ms at 29.5 / 49.0 ms CPU per query;
+table-aggregate p50 13.9 / 13.9 ms at 11.5 / 22.3 ms CPU; full-scan p50
+71.0 / 73.3 ms at 102.9 / 161.8 ms CPU. Selective and small-aggregate equal
+within noise. Write rows/s differ 25% between runs 23 and 25 on the same
+parquet code, so these runs carry no write conclusion. Step 1 closed: the
+1m-aggregate regression is the chunk size. 24 MiB stays the default; the
+latency-versus-CPU choice is made in the telemetry chunk sweep (step 5).
+
+### Runs 27–28, 2026-10-10: telemetry fixture (step 3)
+
+`--fixture telemetry`: 10M spans (1.25M 8-span traces over one day) exported
+over OTLP gRPC into `vala.traces.spans`, 512 spans per export, 4 exporters.
+
+| Row | parquet (run 27) | hot (run 28) |
+|---|---|---|
+| export spans | 43,623 spans/s, p50 44.9 ms, 1.21 cores — FAIL vs 200k floor | 44,168 spans/s, p50 45.0 ms, 0.92 cores — FAIL |
+| in tier | 18 published files in 58 s | memtable 9,454 MiB (≈945 B/span), peak 12.2 GiB |
+| exact answers (8) | PASS; promoted columns 10–70 ms, Variant key filters 456/432 ms | PASS; 79–133 ms, Variant key filters 884/1,701 ms |
+| variant shredding | PASS: 10 of 10 span files shred all 13 core/mid keys, not `retry.count` or `custom.*` | n/a |
+
+- Ack latency per request is ~45 ms whether it carries 512 spans or 16,384
+  event rows (run 24/25 `write events` p50 43.0/45.2 ms), so OTLP throughput
+  is writers × 512 / 45 ms; the server is not CPU-bound (≈1 core).
+- OTLP spans get `wyrd_event_time` = ingest time (`scribe/ingress.rs:439`), so
+  partitions and sort follow arrival; span-time windows prune only through
+  `start_time_unix_nano` statistics.
+- Variant key filters are ~20–40x slower than promoted-column filters on the
+  same table despite shredding (single cold check, not a measured window).

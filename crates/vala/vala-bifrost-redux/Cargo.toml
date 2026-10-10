@@ -35,6 +35,7 @@ cloud = ["wyrd-storage/cloud", "object_store/aws", "object_store/gcp", "object_s
 
 [dependencies]
 metrics.workspace = true
+mini-moka = { workspace = true }
 num-traits = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-queue = { workspace = true }

@@ -1384,10 +1384,10 @@ async fn assert_remote_query_telemetry(
     assert!(
         metric_value(
             &delta,
-            "oracle_query_phase_seconds",
-            BifrostMetricKind::HistogramCount,
-            &[("phase", "peer_open")]
-        ) >= 1.0,
+            "oracle_query_profile_nanoseconds_total",
+            BifrostMetricKind::Counter,
+            &[("event", "LiveScribeExec.fragment_open_time")]
+        ) > 0.0,
         "{oracle_outcome}: the remote live read opened a peer fragment"
     );
     if oracle_outcome == "client_drop" {

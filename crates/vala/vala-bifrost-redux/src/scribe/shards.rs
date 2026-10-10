@@ -1184,6 +1184,7 @@ impl ScribeShardRuntime {
                         partition_day: readable.partition_day,
                         generation: readable.generation,
                         rows: readable.batch,
+                        statistics: readable.statistics,
                     }),
             );
         }
@@ -4045,7 +4046,9 @@ impl ShardOwner {
     /// Inserts one post-fence slice and transfers its active owner to memtable.
     ///
     /// Counts the slice's rows in `bifrost_scribe_memtable_rows_inserted_total`
-    /// only after the memtable accepted them; a spent-batch replay is settled
+    /// and its charged Arrow bytes in
+    /// `bifrost_scribe_memtable_bytes_inserted_total` only after the memtable
+    /// accepted them; a spent-batch replay is settled
     /// by [`Self::discard_already_committed_slice`] and adds nothing.
     ///
     /// # Errors
@@ -4091,6 +4094,8 @@ impl ShardOwner {
             })?;
         metrics::counter!("bifrost_scribe_memtable_rows_inserted_total")
             .increment(u64::try_from(row_count).unwrap_or(u64::MAX));
+        metrics::counter!("bifrost_scribe_memtable_bytes_inserted_total")
+            .increment(u64::try_from(slice.memtable_bytes).unwrap_or(u64::MAX));
         self.active_json_bytes = self.active_json_bytes.saturating_add(payload_len);
         touched_keys.insert(slice.seal_key.clone());
         self.synced_not_inserted.remove(&AppendSliceId {
@@ -6291,7 +6296,7 @@ mod tests {
             .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
             .expect("seal second generation");
 
-        let immutable = owner.memtable.immutable.lock().expect("immutable lock");
+        let immutable = owner.memtable.immutable.write().expect("immutable lock");
         let generations = immutable.get(&key).expect("whole generation");
         assert_eq!(generations.len(), 1);
         assert!(

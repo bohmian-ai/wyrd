@@ -1029,7 +1029,16 @@ pub(super) async fn maintain_once(table: &ExpirableTable) -> (HeadShape, HeadSha
 /// Panics when a fixture dependency fails or the first promotion commits no
 /// snapshot.
 pub(super) async fn leader_only_table(name: &str) -> ExpirableTable {
-    let fixture = PromotionIntegrationFixture::start(name).await;
+    leader_only(PromotionIntegrationFixture::start(name).await).await
+}
+
+/// Starts [`leader_only_table`] over an already-configured fixture.
+///
+/// # Panics
+///
+/// Panics when a fixture dependency fails or the first promotion commits no
+/// snapshot.
+pub(super) async fn leader_only(fixture: PromotionIntegrationFixture) -> ExpirableTable {
     let store = CountingObjectStore::new(&fixture.storage);
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
@@ -1206,7 +1215,7 @@ pub(super) async fn latest_cleanup_task(fixture: &PromotionIntegrationFixture) -
 /// # Panics
 ///
 /// Panics when the read-only count fails.
-async fn expiry_attempts(fixture: &PromotionIntegrationFixture) -> i64 {
+pub(super) async fn expiry_attempts(fixture: &PromotionIntegrationFixture) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM vala.forge_tasks \
          WHERE data_tenant_id = $1 AND strategy = 'snapshot_expiry'",

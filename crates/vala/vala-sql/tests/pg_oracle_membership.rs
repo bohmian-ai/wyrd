@@ -351,36 +351,28 @@ async fn live_discovery_excludes_expired_heartbeat() {
 }
 
 mod pg_tests {
-    //! `PostgreSQL` integration coverage for Oracle active table reads.
+    //! `PostgreSQL` integration coverage for Oracle cut reads and Forge's
+    //! snapshot retention.
     //!
-    //! These tests drive the real acquisition function, release, and Forge's
-    //! destructive gate against a live database. Every assertion is about the
-    //! durable evidence Forge consumes, so each one fails closed.
+    //! These tests drive the real cut function and the retention statement
+    //! against a live database.
 
-    use chrono::Utc;
     use sqlx::{PgPool, Row};
     use uuid::Uuid;
-    use vala_sql::queries::cluster_nodes::ClusterNodes;
     use vala_sql::queries::olap_catalog::upsert_table;
     use vala_sql::queries::oracle_reader_authority::{
-        AcquiredTableCut, ActiveReadOwner, ActiveTableRef, BifrostTableMaintenanceAuthority,
-        OracleActiveTableReads,
+        BifrostTableMaintenanceAuthority, CutTableRef, OracleTableCuts, TableCut,
     };
-    use vala_sql::row_types::cluster_nodes::RoleRegistration;
     use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
     use vala_sql::{SqlError, TenantConn};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::vala::api::{
-        ClusterCapabilities, ClusterNodeKey, ClusterRole, OracleCapabilitiesV1, QueryClass,
-    };
 
     /// Logical namespace every table in this module is registered under.
     const NAMESPACE: &str = "vala.bifrost";
 
-    /// Remaining query time every fixture acquisition binds; long enough that
-    /// no row it writes is abandoned during the test.
-    const QUERY_DEADLINE: std::time::Duration = std::time::Duration::from_hours(1);
+    /// Retention window every supersession assertion runs under.
+    const RETENTION: std::time::Duration = std::time::Duration::from_hours(6);
 
     /// Canonical layout JSON one registration needs; its shape is opaque here.
     fn layout() -> serde_json::Value {
@@ -391,24 +383,18 @@ mod pg_tests {
         })
     }
 
-    /// One live database with two tenants, their registered tables, catalog
-    /// pointers, and one live Oracle fence.
-    struct ActiveReads {
+    /// One live database with registered tables and catalog pointers.
+    struct CutReads {
         /// Repository Postgres fixture owning the isolated database.
         fixture: PgFixture,
         /// Superuser pool for out-of-band arrangement and inspection.
         superuser: PgPool,
         /// Platform-catalog pool that owns `iceberg_catalog` at runtime.
         catalog: PgPool,
-        /// Physical node holding the Oracle fence every claim names.
-        node_id: Uuid,
-        /// The node's current Oracle fencing token.
-        fence: i64,
     }
 
-    impl ActiveReads {
-        /// Starts the fixture, creates the runtime catalog relation, and
-        /// registers one Oracle role.
+    impl CutReads {
+        /// Starts the fixture and creates the runtime catalog relation.
         ///
         /// # Panics
         ///
@@ -433,45 +419,10 @@ mod pg_tests {
             .execute(&catalog)
             .await
             .expect("runtime catalog relation exists");
-            let node_id = Uuid::now_v7();
-            let nodes = ClusterNodes::new(fixture.vala_postgres().clone());
-            let mut conn = fixture
-                .vala_postgres()
-                .tenant_conn(DataTenantId::SYSTEM_OWNER)
-                .await
-                .expect("system connection");
-            let row = nodes
-                .register(
-                    &mut conn,
-                    &RoleRegistration {
-                        key: ClusterNodeKey {
-                            node_id: wyrd_spec::vala::api::NodeId::new(node_id),
-                            role: ClusterRole::Oracle,
-                        },
-                        address: "http://oracle:5002".into(),
-                        capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                            storage_protocol_version: 1,
-                            cpu_cores: 4.0,
-                            memory_budget_bytes: 4096,
-                            cpu_cores_per_slot: 1.0,
-                            memory_bytes_per_slot: 1024,
-                            raw_slots: 4,
-                            usable_slots: 3,
-                            supported_classes: vec![QueryClass::Interactive],
-                            max_workers_per_query: 3,
-                        }),
-                        started_at: Utc::now(),
-                    },
-                )
-                .await
-                .expect("oracle role registers");
-            conn.commit().await.expect("registration commits");
             Self {
-                fence: i64::try_from(row.lease.fencing_token).expect("fence fits an i64"),
                 fixture,
                 superuser,
                 catalog,
-                node_id,
             }
         }
 
@@ -587,100 +538,70 @@ mod pg_tests {
                 .expect("tenant connection")
         }
 
-        /// The exact fence a query on this node records.
-        fn owner(&self, query_id: Uuid) -> ActiveReadOwner {
-            ActiveReadOwner {
-                query_id,
-                node_id: self.node_id,
-                fencing_token: self.fence,
-            }
-        }
-
-        /// Acquires a cut for one query and commits it.
+        /// Reads one tenant's cut over `tables` as one autocommit statement on
+        /// a plain request-role connection, as Oracle does.
         ///
         /// # Errors
         ///
-        /// Returns the acquisition's SQL error; the transaction then rolls back.
-        async fn acquire(
+        /// Returns the cut statement's SQL error.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the connection cannot be acquired.
+        async fn read(
             &self,
             tenant: DataTenantId,
-            query_id: Uuid,
             tables: &[&str],
-        ) -> Result<Vec<AcquiredTableCut>, SqlError> {
-            let refs: Vec<ActiveTableRef<'_>> = tables
+        ) -> Result<Vec<TableCut>, SqlError> {
+            let refs: Vec<CutTableRef<'_>> = tables
                 .iter()
-                .map(|table| ActiveTableRef {
+                .map(|table| CutTableRef {
                     namespace_name: NAMESPACE,
                     table_name: table,
                 })
                 .collect();
-            let mut conn = self.conn(tenant).await;
-            let cuts = OracleActiveTableReads::new(&mut conn)
-                .acquire(self.owner(query_id), QUERY_DEADLINE, &refs)
-                .await?;
-            conn.commit().await?;
-            Ok(cuts)
+            let mut conn = self.fixture.app_pool().acquire().await.expect("connection");
+            OracleTableCuts::new(&mut conn, tenant).read(&refs).await
         }
 
-        /// Counts every active read a query holds, across tenants.
+        /// Records `replaced` for one table under its exclusive authority, as
+        /// snapshot expiry does, and returns the retained snapshots.
         ///
         /// # Panics
         ///
-        /// Panics when the inspection fails.
-        async fn rows_for(&self, query_id: Uuid) -> i64 {
-            sqlx::query_scalar(
-                "SELECT count(*) FROM vala.oracle_active_table_reads WHERE query_id = $1",
-            )
-            .bind(query_id)
-            .fetch_one(&self.superuser)
-            .await
-            .expect("active reads count")
+        /// Panics when the authority or the statement fails.
+        async fn retained(
+            &self,
+            identity: &TableAuthorityIdentity,
+            replaced: &[i64],
+            retention: std::time::Duration,
+        ) -> Vec<i64> {
+            let mut conn = self.conn(identity.tenant).await;
+            let retained = BifrostTableMaintenanceAuthority::new(&mut conn)
+                .retained_supersessions(identity, replaced, retention)
+                .await
+                .expect("supersessions record");
+            conn.commit().await.expect("supersessions commit");
+            retained
         }
 
-        /// Runs Forge's destructive gate for one acquired table: a tenant
-        /// transaction takes the table's exclusive maintenance authority,
-        /// which discards abandoned reads and exists only while no read
-        /// remains, then surrenders it; committed so any discard sticks.
-        ///
-        /// # Errors
-        ///
-        /// Returns [`SqlError::Conflict`] while an active read remains, or the
-        /// SQL failure.
-        async fn forge_gate(&self, identity: &TableAuthorityIdentity) -> Result<(), SqlError> {
-            let mut conn = TenantConn::acquire(self.fixture.app_pool(), identity.tenant).await?;
-            let exclusive = BifrostTableMaintenanceAuthority::new(&mut conn)
-                .exclusive(identity.clone())
-                .await?;
-            let granted = exclusive.is_some();
-            drop(exclusive);
-            conn.commit().await?;
-            if !granted {
-                return Err(SqlError::Conflict {
-                    detail: "an Oracle query is still reading this table".to_owned(),
-                });
-            }
-            Ok(())
-        }
-
-        /// Moves a query's abandonment time into the past or the future in
+        /// Moves every recorded supersession of a tenant back by `hours` in
         /// database time.
         ///
         /// # Panics
         ///
         /// Panics when the update fails.
-        async fn set_abandoned(&self, query_id: Uuid, past: bool) {
+        async fn age(&self, tenant: DataTenantId, hours: i32) {
             sqlx::query(
-                "UPDATE vala.oracle_active_table_reads \
-                    SET acquired_at = statement_timestamp() - interval '2 hours', \
-                        abandon_after = statement_timestamp() \
-                          + CASE WHEN $2 THEN interval '-1 hour' ELSE interval '1 hour' END \
-                  WHERE query_id = $1",
+                "UPDATE vala.forge_snapshot_supersessions \
+                    SET observed_at = observed_at - make_interval(hours => $2) \
+                  WHERE data_tenant_id = $1",
             )
-            .bind(query_id)
-            .bind(past)
+            .bind(tenant.as_uuid())
+            .bind(hours)
             .execute(&self.superuser)
             .await
-            .expect("abandonment time moves");
+            .expect("supersessions age");
         }
     }
 
@@ -702,29 +623,21 @@ mod pg_tests {
         .expect("grants read")
     }
 
-    /// Proves cut acquisition is one atomic, tenant-scoped statement whose
-    /// active reads serialize with Forge and expire only once PostgreSQL time
-    /// passes the query deadline bound at acquisition.
+    /// Proves a cut is one read-only, tenant-scoped statement: deduplicated,
+    /// ordered, all-or-nothing, and never blocked by Forge's exclusive
+    /// maintenance authority.
     ///
     /// # Panics
     ///
-    /// Panics when any privilege, grouping, isolation, serialization,
-    /// abandonment, or release assertion fails.
+    /// Panics when any privilege, grouping, isolation, absence, or
+    /// non-blocking assertion fails.
     #[tokio::test]
-    async fn active_table_read_claim_is_atomic_tenant_scoped_and_postgres_expired() {
-        let reads = ActiveReads::start().await;
+    async fn table_cut_is_read_only_tenant_scoped_and_never_blocked() {
+        let reads = CutReads::start().await;
         let pool = &reads.superuser;
 
         // Privilege boundary: the request role reaches the catalog only
-        // through the narrow definer, and the acquisition runs as the caller.
-        assert_eq!(
-            grants(pool, "oracle_active_table_reads", "wyrd_app").await,
-            ["DELETE", "INSERT", "SELECT", "UPDATE"]
-        );
-        assert_eq!(
-            grants(pool, "oracle_active_table_reads", "wyrd_platform_admin").await,
-            ["DELETE", "SELECT"]
-        );
+        // through the narrow definer, and the cut runs as the caller.
         let functions = sqlx::query(
             "SELECT p.proname, p.prosecdef, p.provolatile::text AS volatility, \
                     pg_get_userbyid(p.proowner) AS owner, p.proconfig, \
@@ -732,25 +645,14 @@ mod pg_tests {
                     has_function_privilege('public', p.oid, 'EXECUTE') AS public_exec \
                FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
               WHERE n.nspname = 'vala' \
-                AND p.proname IN ('oracle_catalog_metadata_location', 'oracle_acquire_table_cut') \
+                AND p.proname IN ('oracle_catalog_metadata_location', 'oracle_read_table_cut') \
               ORDER BY p.proname",
         )
         .fetch_all(pool)
         .await
         .expect("function catalog reads");
         assert_eq!(functions.len(), 2);
-        let acquire = &functions[0];
-        assert_eq!(
-            acquire.get::<String, _>("proname"),
-            "oracle_acquire_table_cut"
-        );
-        assert!(
-            !acquire.get::<bool, _>("prosecdef"),
-            "acquisition runs as the caller"
-        );
-        assert_eq!(acquire.get::<String, _>("volatility"), "v");
-        assert!(acquire.get::<bool, _>("app_exec"));
-        let pointer = &functions[1];
+        let pointer = &functions[0];
         assert!(
             pointer.get::<bool, _>("prosecdef"),
             "the pointer read is the one definer"
@@ -760,8 +662,15 @@ mod pg_tests {
             pointer.get::<Option<Vec<String>>, _>("proconfig"),
             Some(vec!["search_path=\"\"".to_owned()])
         );
-        assert!(pointer.get::<bool, _>("app_exec"));
+        let cut = &functions[1];
+        assert_eq!(cut.get::<String, _>("proname"), "oracle_read_table_cut");
+        assert!(
+            !cut.get::<bool, _>("prosecdef"),
+            "the cut runs as the caller"
+        );
+        assert_eq!(cut.get::<String, _>("volatility"), "s", "the cut is STABLE");
         for row in &functions {
+            assert!(row.get::<bool, _>("app_exec"));
             assert!(
                 !row.get::<bool, _>("public_exec"),
                 "PUBLIC holds no execute privilege"
@@ -801,34 +710,11 @@ mod pg_tests {
         assert!(denied.to_string().contains("permission denied"), "{denied}");
         drop(direct);
 
-        // One statement: ordered, deduplicated, empty hot set retained, and
-        // claims invisible until the caller commits.
-        let q1 = Uuid::now_v7();
-        let refs = [
-            ActiveTableRef {
-                namespace_name: NAMESPACE,
-                table_name: "events",
-            },
-            ActiveTableRef {
-                namespace_name: NAMESPACE,
-                table_name: "quiet",
-            },
-            ActiveTableRef {
-                namespace_name: NAMESPACE,
-                table_name: "events",
-            },
-        ];
-        let mut conn = reads.conn(tenant_a).await;
-        let cuts = OracleActiveTableReads::new(&mut conn)
-            .acquire(reads.owner(q1), QUERY_DEADLINE, &refs)
+        // One statement: ordered, deduplicated, empty hot set retained.
+        let cuts = reads
+            .read(tenant_a, &["events", "quiet", "events"])
             .await
-            .expect("acquisition succeeds");
-        assert_eq!(
-            reads.rows_for(q1).await,
-            0,
-            "claims are invisible before commit"
-        );
-        conn.commit().await.expect("acquisition commits");
+            .expect("the cut reads");
         assert_eq!(cuts.len(), 2, "a repeated table is one cut");
         assert_eq!(cuts[0].identity.table_name, "events");
         assert_eq!(cuts[0].metadata_location, "s3://a/events/v1.metadata.json");
@@ -843,195 +729,218 @@ mod pg_tests {
             cuts[0]
                 .hot_files
                 .iter()
-                .all(|row| row.data_tenant_id == tenant_a.as_uuid())
-        );
-        assert!(
-            cuts[0].hot_files.iter().all(|row| row.row_count == 100
-                && row.min_event_time.is_some()
-                && row.max_event_time.is_some()),
-            "hot candidates project the durable row count and event-time bounds"
+                .all(|row| row.data_tenant_id == tenant_a.as_uuid()
+                    && row.row_count == 100
+                    && row.min_event_time.is_some()
+                    && row.max_event_time.is_some()),
+            "hot candidates project the tenant's durable row count and bounds"
         );
         assert_eq!(cuts[1].identity.table_name, "quiet");
         assert!(
             cuts[1].hot_files.is_empty(),
             "an empty hot set is a valid cut"
         );
-        assert_eq!(reads.rows_for(q1).await, 2, "one claim per distinct table");
-        let lifetime: (bool, f64) = sqlx::query_as(
-            "SELECT bool_and(node_id = $2 AND fencing_token = $3), \
-                    max(extract(epoch FROM abandon_after - acquired_at))::float8 \
-               FROM vala.oracle_active_table_reads WHERE query_id = $1",
-        )
-        .bind(q1)
-        .bind(reads.node_id)
-        .bind(reads.fence)
-        .fetch_one(pool)
-        .await
-        .expect("claim fence reads");
-        assert_eq!(
-            lifetime,
-            (true, 3600.0),
-            "exact fence, Postgres expiry at the bound query deadline"
-        );
 
         // Tenant isolation: the same logical name resolves to tenant B's own
-        // pointer and hot rows, and B cannot see A's claims.
-        let q2 = Uuid::now_v7();
+        // pointer and hot rows.
         let cut_b = reads
-            .acquire(tenant_b, q2, &["events"])
+            .read(tenant_b, &["events"])
             .await
-            .expect("tenant B acquires");
+            .expect("tenant B reads");
         assert_eq!(cut_b[0].metadata_location, "s3://b/events/v1.metadata.json");
         assert_eq!(cut_b[0].hot_files.len(), 1);
         assert_eq!(cut_b[0].hot_files[0].file_path, "b/hot-1.parquet");
-        let mut conn = reads.conn(tenant_b).await;
-        let visible: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM vala.oracle_active_table_reads")
-                .fetch_one(&mut **conn.transaction())
+
+        // The cut's tenant binding is statement-local: the next statement on
+        // the same connection sees no tenant. Inside a transaction already
+        // bound to another tenant the cut refuses instead of rebinding.
+        let mut plain = reads
+            .fixture
+            .app_pool()
+            .acquire()
+            .await
+            .expect("connection");
+        OracleTableCuts::new(&mut plain, tenant_b)
+            .read(&[CutTableRef {
+                namespace_name: NAMESPACE,
+                table_name: "events",
+            }])
+            .await
+            .expect("the cut reads");
+        let after: String =
+            sqlx::query_scalar("SELECT current_setting('app.current_tenant', true)")
+                .fetch_one(&mut *plain)
                 .await
-                .expect("tenant B reads its claims");
-        assert_eq!(visible, 1, "RLS hides tenant A's claims");
-        drop(conn);
+                .expect("setting reads");
+        assert_eq!(after, "", "the binding ends with the cut statement");
+        drop(plain);
+        let mut bound = reads.conn(tenant_a).await;
+        let refused = OracleTableCuts::new(bound.transaction(), tenant_b)
+            .read(&[CutTableRef {
+                namespace_name: NAMESPACE,
+                table_name: "events",
+            }])
+            .await
+            .expect_err("a cut never rebinds another tenant's transaction");
+        assert!(
+            refused
+                .to_string()
+                .contains("differs from the bound tenant"),
+            "{refused}"
+        );
+        drop(bound);
 
         // A missing registration or pointer fails the whole statement.
-        let q3 = Uuid::now_v7();
         assert!(matches!(
-            reads.acquire(tenant_b, q3, &["events", "quiet"]).await,
+            reads.read(tenant_b, &["events", "quiet"]).await,
             Err(SqlError::NoRows)
         ));
         assert!(matches!(
-            reads.acquire(tenant_a, q3, &["quiet", "unpublished"]).await,
+            reads.read(tenant_a, &["quiet", "unpublished"]).await,
             Err(SqlError::NoRows)
         ));
-        assert_eq!(reads.rows_for(q3).await, 0, "no partial claim set commits");
 
-        // Serialization: a live exclusive authority finishes its effect
-        // first, and the waiting acquisition observes its later pointer.
-        // A dedicated table keeps the earlier readers out of this ordering.
-        let events_a = cuts[0].identity.clone();
-        reads
-            .register(tenant_a, "serial", Some("s3://a/serial/v1.metadata.json"))
-            .await;
-        let probe = Uuid::now_v7();
-        let serial = reads
-            .acquire(tenant_a, probe, &["serial"])
-            .await
-            .expect("probe acquires")[0]
-            .identity
-            .clone();
-        let mut releaser = reads.conn(tenant_a).await;
-        OracleActiveTableReads::new(&mut releaser)
-            .release(probe)
-            .await
-            .expect("probe releases");
-        releaser.commit().await.expect("probe release commits");
+        // A live exclusive authority never blocks a cut, which observes the
+        // pointer committed before it.
         let mut forge = reads.conn(tenant_a).await;
         let exclusive = BifrostTableMaintenanceAuthority::new(&mut forge)
-            .exclusive(serial)
+            .exclusive(cuts[0].identity.clone())
             .await
-            .expect("exclusive authority statement")
-            .expect("no read holds the table");
-        let q4 = Uuid::now_v7();
-        let waiting = {
-            let app = reads.fixture.app_pool().clone();
-            let owner = reads.owner(q4);
-            tokio::spawn(async move {
-                let mut conn = TenantConn::acquire(&app, tenant_a).await?;
-                let cut = OracleActiveTableReads::new(&mut conn)
-                    .acquire(
-                        owner,
-                        QUERY_DEADLINE,
-                        &[ActiveTableRef {
-                            namespace_name: NAMESPACE,
-                            table_name: "serial",
-                        }],
-                    )
-                    .await?;
-                conn.commit().await?;
-                Ok::<_, SqlError>(cut)
-            })
-        };
-        loop {
-            let blocked: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity \
-                  WHERE wait_event_type = 'Lock' AND query LIKE '%oracle_acquire_table_cut%'",
-            )
-            .fetch_one(pool)
-            .await
-            .expect("lock waits read");
-            if blocked == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        // The destructive effect lands while the authority is still held.
-        reads
-            .move_pointer(tenant_a, "serial", "s3://a/serial/v2.metadata.json")
-            .await;
-        assert!(
-            !waiting.is_finished(),
-            "the reader cannot commit while the exclusive authority is live"
+            .expect("exclusive authority");
+        let during = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reads.read(tenant_a, &["events"]),
+        )
+        .await
+        .expect("a cut never waits on the exclusive authority")
+        .expect("the cut reads");
+        assert_eq!(
+            during[0].metadata_location,
+            "s3://a/events/v1.metadata.json"
         );
         drop(exclusive);
         forge
             .commit()
             .await
             .expect("forge surrenders its authority");
-        let later = waiting
-            .await
-            .expect("acquisition task joins")
-            .expect("acquisition succeeds");
-        assert_eq!(later[0].metadata_location, "s3://a/serial/v2.metadata.json");
+    }
 
-        // The other ordering: a committed reader makes Forge refuse.
-        assert!(matches!(
-            reads.forge_gate(&events_a).await,
-            Err(SqlError::Conflict { .. })
-        ));
-
-        // A read is abandoned only once PostgreSQL time passes its own
-        // abandon_after; the owner's fence plays no part.
-        let mut releaser = reads.conn(tenant_a).await;
+    /// Proves snapshot retention keeps a replaced snapshot for the window
+    /// measured from its first observation, forgets snapshots no longer
+    /// replaced, and stays tenant-scoped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a snapshot is released early or late, an observation is
+    /// re-stamped, or another tenant's observation is affected.
+    #[tokio::test]
+    async fn retained_supersessions_hold_replaced_snapshots_for_the_window() {
+        let reads = CutReads::start().await;
         assert_eq!(
-            OracleActiveTableReads::new(&mut releaser)
-                .release(q4)
-                .await
-                .expect("release"),
-            1
+            grants(&reads.superuser, "forge_snapshot_supersessions", "wyrd_app").await,
+            ["DELETE", "INSERT", "SELECT"]
         );
-        releaser.commit().await.expect("release commits");
-        reads.set_abandoned(q1, false).await;
-        assert!(matches!(
-            reads.forge_gate(&events_a).await,
-            Err(SqlError::Conflict { .. })
-        ));
-        assert_eq!(
-            reads.rows_for(q1).await,
-            2,
-            "a read before its deadline is never discarded"
-        );
-        reads.set_abandoned(q1, true).await;
+        let tenant_a = reads.tenant().await;
+        let tenant_b = reads.tenant().await;
         reads
-            .forge_gate(&events_a)
-            .await
-            .expect("a read past its deadline is discarded");
-        assert_eq!(
-            reads.rows_for(q1).await,
-            1,
-            "only the gated table's row is discarded"
-        );
+            .register(tenant_a, "events", Some("s3://a/events/v1.metadata.json"))
+            .await;
+        reads
+            .register(tenant_b, "events", Some("s3://b/events/v1.metadata.json"))
+            .await;
+        let a = reads.read(tenant_a, &["events"]).await.expect("a cut")[0]
+            .identity
+            .clone();
+        let b = reads.read(tenant_b, &["events"]).await.expect("b cut")[0]
+            .identity
+            .clone();
 
-        // Release is idempotent.
-        let mut releaser = reads.conn(tenant_a).await;
-        let mut owner = OracleActiveTableReads::new(&mut releaser);
-        assert_eq!(owner.release(q1).await.expect("release"), 1);
-        assert_eq!(owner.release(q1).await.expect("repeat release"), 0);
-        releaser.commit().await.expect("release commits");
-        assert_eq!(reads.rows_for(q1).await, 0);
         assert_eq!(
-            reads.rows_for(q2).await,
-            1,
-            "another tenant's claim is untouched"
+            reads.retained(&a, &[1, 2], std::time::Duration::ZERO).await,
+            Vec::<i64>::new(),
+            "a zero window retains nothing, even on first observation"
+        );
+        assert_eq!(
+            reads.retained(&a, &[1, 2], RETENTION).await,
+            [1, 2],
+            "an observation inside the window retains its snapshot"
+        );
+        reads.retained(&b, &[1], RETENTION).await;
+        reads.age(tenant_a, 5).await;
+        assert_eq!(
+            reads.retained(&a, &[1, 2, 3], RETENTION).await,
+            [1, 2, 3],
+            "five hours is inside the window; a new observation is retained"
+        );
+        reads.age(tenant_a, 2).await;
+        assert_eq!(
+            reads.retained(&a, &[1, 2, 3], RETENTION).await,
+            [3],
+            "the first observation, not a later one, starts the window"
+        );
+        assert_eq!(
+            reads.retained(&a, &[3], RETENTION).await,
+            [3],
+            "an expired snapshot's observation is forgotten"
+        );
+        reads.age(tenant_a, 7).await;
+        assert_eq!(
+            reads.retained(&a, &[1, 3], RETENTION).await,
+            [1],
+            "a re-replaced snapshot is observed afresh after being forgotten"
+        );
+        assert_eq!(
+            reads.retained(&b, &[1], RETENTION).await,
+            [1],
+            "another tenant's observation is untouched"
+        );
+    }
+
+    /// Proves every committed `vala.file_list` change notifies the Oracle cut
+    /// channel with its table, and a rolled-back change notifies nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the listener cannot start, a committed write is not
+    /// heard, or a rolled-back write is.
+    #[tokio::test]
+    async fn file_list_changes_notify_the_cut_channel_on_commit() {
+        let reads = CutReads::start().await;
+        let tenant = reads.tenant().await;
+        reads
+            .register(tenant, "events", Some("s3://a/events/v1.metadata.json"))
+            .await;
+        let mut listener = sqlx::postgres::PgListener::connect_with(reads.fixture.app_pool())
+            .await
+            .expect("listener connects");
+        listener.listen("bifrost_cut").await.expect("listens");
+
+        reads
+            .hot_row(tenant, "events", "a/hot-1.parquet", false, None)
+            .await;
+
+        let heard = tokio::time::timeout(std::time::Duration::from_secs(10), listener.recv())
+            .await
+            .expect("a committed insert is heard")
+            .expect("notification");
+        assert_eq!(
+            heard.payload(),
+            format!("{}|{NAMESPACE}|events", tenant.as_uuid()),
+            "the payload names exactly the changed table"
+        );
+        let mut rolled_back = reads.superuser.begin().await.expect("begin");
+        let deleted = sqlx::query("DELETE FROM vala.file_list WHERE data_tenant_id = $1")
+            .bind(tenant.as_uuid())
+            .execute(&mut *rolled_back)
+            .await
+            .expect("delete runs");
+        assert_eq!(deleted.rows_affected(), 1, "the trigger fired once");
+        rolled_back.rollback().await.expect("rollback");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), listener.recv())
+                .await
+                .is_err(),
+            "a rolled-back change is never heard"
         );
     }
 }

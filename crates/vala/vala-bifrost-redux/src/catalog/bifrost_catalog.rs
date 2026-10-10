@@ -2,7 +2,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use iceberg::io::object_cache::ObjectCache;
@@ -16,9 +15,7 @@ use iceberg_catalog_sql::SqlCatalog;
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 use vala_sql::queries::file_list::HotFileCut;
-use vala_sql::queries::oracle_reader_authority::{
-    AcquiredTableCut, ActiveReadOwner, ActiveTableRef, OracleActiveTableReads,
-};
+use vala_sql::queries::oracle_reader_authority::{CutTableRef, OracleTableCuts, TableCut};
 use vala_sql::row_types::file_list::HotFileRow;
 use vala_sql::{TenantConn, ValaPostgres};
 use wyrd_spec::DataTenantId;
@@ -28,6 +25,7 @@ use wyrd_spec::vala::api::{
     RegisterOutcome, RegisterTableResponse,
 };
 
+use crate::catalog::cut_cache::CutCache;
 use crate::catalog::error::BifrostCatalogError;
 use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
 use crate::catalog::iceberg_sql;
@@ -272,6 +270,14 @@ pub struct BifrostCatalog {
     /// each immutable manifest once per node instead of once per consumer per
     /// query. Seeded lazily because iceberg only builds a cache with a table.
     manifest_cache: Arc<std::sync::OnceLock<Arc<ObjectCache>>>,
+    /// Node-wide parsed Iceberg metadata documents, keyed by their location.
+    ///
+    /// Every commit writes a new `<version>-<uuid>.metadata.json` and moves
+    /// the catalog pointer to it, so a location's document never changes and
+    /// needs no invalidation: a publication is seen because the active cut
+    /// returns the new location. Concurrent misses on one location each read
+    /// it once; nothing waits on another query's read.
+    metadata_cache: mini_moka::sync::Cache<String, TableMetadataRef>,
     /// Registered UIDs this node has already read, by tenant and table name.
     ///
     /// A registration row is immutable once written: its UID is minted once,
@@ -288,6 +294,9 @@ pub struct BifrostCatalog {
     /// is never dropped, so a loaded schema stays authoritative for the life
     /// of the node. Grows with registered tables, never with writes.
     registered_schemas: Arc<RwLock<RegisteredSchemas>>,
+    /// Node-local Oracle cut cache, served only while [`Self::watch_cuts`]
+    /// is listening for invalidations.
+    cut_cache: Arc<CutCache>,
 }
 
 /// Registered Iceberg schemas a node has loaded, keyed by tenant and table
@@ -303,6 +312,14 @@ type RegisteredSchemas = HashMap<(DataTenantId, String), Arc<spec::Schema>>;
 /// exceed it. It sits outside the Oracle memory root because decoded
 /// manifests are small and shared across every query.
 const MANIFEST_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Entry limit of the node-wide parsed metadata cache.
+///
+/// Only each table's current document is read by new queries, so the limit
+/// bounds tables a node serves concurrently, with older versions evicted by
+/// LRU. ponytail: counted in entries, not bytes; weigh by document size if
+/// tables with long snapshot histories make entries large.
+const METADATA_CACHE_ENTRIES: u64 = 1024;
 
 /// Catalog pins observed by production code paths during serialized tests.
 ///
@@ -326,31 +343,30 @@ pub fn sealed_pin_count_for_test() -> usize {
     TEST_SEALED_PIN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Active-cut acquisition statements observed in serialized tests.
+/// Cut-read statements observed in serialized tests.
 ///
-/// A successful query acquires its whole cut in one statement and a metadata
+/// A successful query reads its whole cut in one statement and a metadata
 /// `NotFound` race in exactly two, so the count is the observable that proves
-/// neither per-table nor unbounded acquisition.
+/// neither per-table nor unbounded reads.
 #[cfg(any(test, feature = "test-support"))]
-static TEST_ACTIVE_CUT_ACQUISITIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static TEST_CUT_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Metadata reads still to be failed as object-store `NotFound`.
 #[cfg(any(test, feature = "test-support"))]
 static TEST_METADATA_NOT_FOUND_FAULTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Resets and returns the observed active-cut acquisition count.
+/// Resets and returns the observed cut-read count.
 #[cfg(any(test, feature = "test-support"))]
-pub fn reset_active_cut_acquisitions_for_test() -> usize {
-    TEST_ACTIVE_CUT_ACQUISITIONS.swap(0, std::sync::atomic::Ordering::SeqCst)
+pub fn reset_cut_reads_for_test() -> usize {
+    TEST_CUT_READS.swap(0, std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Makes the next `count` acquired metadata reads fail the way a removed
+/// Makes the next `count` cut metadata reads fail the way a removed
 /// document does: by reading a location that does not exist.
 ///
 /// Stands in for a catalog move whose superseded document was deleted between
-/// acquisition and the metadata read, which a test cannot place at that exact
+/// cut read and the metadata read, which a test cannot place at that exact
 /// point from outside the query.
 #[cfg(any(test, feature = "test-support"))]
 pub fn inject_metadata_not_found_for_test(count: usize) {
@@ -358,39 +374,26 @@ pub fn inject_metadata_not_found_for_test(count: usize) {
 }
 
 impl BifrostCatalog {
-    /// Acquires one query's complete active cut in one tenant statement.
+    /// Reads one query's complete cut in one read-only tenant statement.
     ///
-    /// Runs [`OracleActiveTableReads::acquire`] on one tenant transaction and
-    /// commits it before returning, so every returned pointer is already
-    /// protected by a durable active read when the caller opens its metadata.
-    /// A replayed acquisition for the same query refreshes the same rows.
-    ///
-    /// `deadline` is the query's one immutable absolute deadline. The
-    /// remaining duration bound into the statement is derived from it after
-    /// the tenant connection is obtained, so every acquisition, the one
-    /// permitted reacquisition included, expires its rows at that same
-    /// deadline in `PostgreSQL` time. `Ok(None)` means under one millisecond
-    /// remained and nothing was acquired; the caller reports its timeout.
+    /// Runs [`OracleTableCuts::read`] as one autocommit statement on a pooled
+    /// connection: the statement binds the tenant itself, so the cut costs one
+    /// round trip with no transaction. Nothing is recorded: the returned pointers stay readable for the
+    /// query's deadline because Forge retains a replaced snapshot for at least
+    /// the maximum query deadline.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::InvalidBinding`] when a table cannot be
     /// bound to `tenant`, [`BifrostCatalogError::TableNotFound`] when any table
-    /// has no registration or catalog pointer visible to the tenant (nothing
-    /// commits in that case), and a SQL error when the statement or commit
-    /// fails.
-    ///
-    /// # Cancellation
-    /// Dropping the future before commit rolls the acquisition back. Dropping
-    /// it after commit leaves the rows for PostgreSQL-time abandonment.
-    pub async fn acquire_active_cut(
+    /// has no registration or catalog pointer visible to the tenant, and a SQL
+    /// error when the connection or statement fails.
+    pub async fn read_cut(
         &self,
         tenant: DataTenantId,
-        owner: ActiveReadOwner,
-        deadline: Instant,
         tables: &[TableRef],
-    ) -> Result<Option<Vec<AcquiredTableCut>>, BifrostCatalogError> {
+    ) -> Result<Vec<TableCut>, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
-        TEST_ACTIVE_CUT_ACQUISITIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        TEST_CUT_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let bindings = tables
             .iter()
             .map(|table| {
@@ -400,72 +403,94 @@ impl BifrostCatalog {
             .collect::<Result<Vec<_>, _>>()?;
         let refs = bindings
             .iter()
-            .map(|binding| ActiveTableRef {
+            .map(|binding| CutTableRef {
                 namespace_name: &binding.logical_namespace,
                 table_name: &binding.table_name,
             })
             .collect::<Vec<_>>();
-        let mut conn = self.postgres.tenant_conn(tenant).await?;
-        // Derived only now, after the pool wait, so the row PostgreSQL stamps
-        // expires at the caller's original deadline however long the wait or
-        // however many times the cut is reacquired.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining < std::time::Duration::from_millis(1) {
-            return Ok(None);
-        }
-        let acquired = match OracleActiveTableReads::new(&mut conn)
-            .acquire(owner, remaining, &refs)
-            .await
-        {
+        let mut conn = self.postgres.conn().await?;
+        let cut = match OracleTableCuts::new(&mut conn, tenant).read(&refs).await {
             Err(vala_sql::SqlError::NoRows) => {
                 let names = tables.iter().map(TableRef::fqn).collect::<Vec<_>>();
                 return Err(BifrostCatalogError::TableNotFound(names.join(", ")));
             }
             other => other?,
         };
-        conn.commit().await?;
-        Ok(Some(acquired))
+        Ok(cut)
     }
 
-    /// Deletes every active table read one query holds, idempotently.
+    /// Returns one query's cut from the node's cut cache, or reads it with
+    /// [`Self::read_cut`] and caches it.
+    ///
+    /// Only cuts read at or after `not_before` are served (any when `None`);
+    /// Oracle passes its deadline minus the maximum query deadline, so every
+    /// served pointer outlives the query (see the `cut_cache` module). The cache serves
+    /// nothing until [`Self::watch_cuts`] is listening, so without it every
+    /// call reads Postgres.
     ///
     /// # Errors
-    /// Returns a SQL error when the tenant transaction, delete, or commit fails;
-    /// the rows then stay for PostgreSQL-time abandonment.
-    pub async fn release_active_reads(
+    /// Returns the errors of [`Self::read_cut`]; a cache hit cannot fail.
+    pub async fn read_cut_cached(
         &self,
         tenant: DataTenantId,
-        query_id: Uuid,
-    ) -> Result<u64, BifrostCatalogError> {
-        let mut conn = self.postgres.tenant_conn(tenant).await?;
-        let released = OracleActiveTableReads::new(&mut conn)
-            .release(query_id)
-            .await?;
-        conn.commit().await?;
-        Ok(released)
+        tables: &[TableRef],
+        not_before: Option<std::time::Instant>,
+    ) -> Result<Vec<TableCut>, BifrostCatalogError> {
+        let bindings = tables
+            .iter()
+            .map(|table| {
+                TenantTableBinding::resolve((tenant, table.clone()))
+                    .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let refs = bindings
+            .iter()
+            .map(|binding| CutTableRef {
+                namespace_name: &binding.logical_namespace,
+                table_name: &binding.table_name,
+            })
+            .collect::<Vec<_>>();
+        if let Some(cut) = self.cut_cache.get(tenant, &refs, not_before) {
+            return Ok(cut);
+        }
+        let generation = self.cut_cache.fill_generation();
+        let cut = self.read_cut(tenant, tables).await?;
+        if let Some(generation) = generation {
+            self.cut_cache
+                .insert(generation, std::time::Instant::now(), &cut);
+        }
+        Ok(cut)
     }
 
-    /// Materializes one table of a committed active cut.
+    /// Keeps the node's cut cache coherent until `shutdown`: listens on one
+    /// Vala pool connection for the `vala.file_list` trigger's notifications
+    /// and drops each cut they name. See [`CutCache::watch`].
+    pub async fn watch_cuts(&self, shutdown: tokio_util::sync::CancellationToken) {
+        self.cut_cache.watch(self.postgres.pool(), shutdown).await;
+    }
+
+    /// Materializes one table of a read cut.
     ///
-    /// Reads the exact metadata document the acquisition returned directly —
-    /// no cache, no pointer reread — pins its current snapshot's manifests,
-    /// and reconciles the acquisition's unresolved hot candidates against that
+    /// Reads the exact metadata document the cut returned — from the
+    /// node's metadata cache when this location was already parsed, never by
+    /// rereading the pointer — pins its current snapshot's manifests,
+    /// and reconciles the cut's unresolved hot candidates against that
     /// snapshot with the shared exact hot/Iceberg rule. The returned cut is
     /// then validated row by row against the tenant/table binding.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::InvalidBinding`] when the table cannot be
-    /// bound, [`BifrostCatalogError::MetadataMismatch`] when the acquisition
+    /// bound, [`BifrostCatalogError::MetadataMismatch`] when the cut
     /// identity disagrees with the requested table or a manifest or hot row
     /// violates the binding, [`BifrostCatalogError::AmbiguousPublication`] when
     /// a candidate cannot be placed, and [`BifrostCatalogError::Iceberg`] when
     /// the metadata document or a manifest cannot be read; a missing document
     /// reports [`BifrostCatalogError::is_missing_object`].
-    pub async fn materialize_acquired_cut(
+    pub async fn materialize_cut(
         &self,
         tenant: DataTenantId,
         table: &TableRef,
-        acquired: AcquiredTableCut,
+        acquired: TableCut,
     ) -> Result<PinnedSealedTable, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
         TEST_SEALED_PIN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -476,7 +501,7 @@ impl BifrostCatalog {
             || acquired.identity.table_name != binding.table_name
         {
             return Err(BifrostCatalogError::MetadataMismatch(
-                "active cut identity disagrees with the requested table".to_owned(),
+                "cut identity disagrees with the requested table".to_owned(),
             ));
         }
         let table_uid = TableUid::from_bytes(acquired.identity.table_uid);
@@ -495,8 +520,17 @@ impl BifrostCatalog {
             let missing = format!("{}.removed", acquired.metadata_location);
             TableMetadata::read_from(&self.file_io, &missing).await?;
         }
-        let metadata =
-            Arc::new(TableMetadata::read_from(&self.file_io, &acquired.metadata_location).await?);
+        let metadata = if let Some(metadata) = self.metadata_cache.get(&acquired.metadata_location)
+        {
+            metadata
+        } else {
+            let metadata = Arc::new(
+                TableMetadata::read_from(&self.file_io, &acquired.metadata_location).await?,
+            );
+            self.metadata_cache
+                .insert(acquired.metadata_location.clone(), Arc::clone(&metadata));
+            metadata
+        };
         let iceberg_table =
             self.cached_table(&identifier, metadata, Some(acquired.metadata_location))?;
         let pinned = self.pin_iceberg_snapshot(&iceberg_table, &binding).await?;
@@ -759,8 +793,10 @@ impl BifrostCatalog {
             objects: Arc::new(BifrostIcebergStorage::new(storage, &warehouse)),
             warehouse,
             manifest_cache: Arc::new(std::sync::OnceLock::new()),
+            metadata_cache: mini_moka::sync::Cache::new(METADATA_CACHE_ENTRIES),
             table_uids: Arc::default(),
             registered_schemas: Arc::default(),
+            cut_cache: Arc::default(),
         })
     }
 
@@ -2408,37 +2444,23 @@ mod production_pin_tests {
         assert!(deleted > 0, "the append wrote manifests");
     }
 
-    /// Acquires and materializes one table's current cut the way Oracle does.
-    ///
-    /// The fixture owner is a fresh query on an arbitrary positive fence;
-    /// acquisition records an active read but checks no Oracle liveness.
+    /// Reads and materializes one table's current cut the way Oracle does.
     ///
     /// # Panics
-    /// Panics when acquisition or materialization fails.
+    /// Panics when the cut read or materialization fails.
     async fn pin_current(
         catalog: &BifrostCatalog,
         tenant: DataTenantId,
         table: &TableRef,
     ) -> PinnedSealedTable {
-        let owner = vala_sql::queries::oracle_reader_authority::ActiveReadOwner {
-            query_id: uuid::Uuid::now_v7(),
-            node_id: uuid::Uuid::now_v7(),
-            fencing_token: 1,
-        };
-        let acquired = catalog
-            .acquire_active_cut(
-                tenant,
-                owner,
-                std::time::Instant::now() + std::time::Duration::from_hours(1),
-                std::slice::from_ref(table),
-            )
+        let cut = catalog
+            .read_cut(tenant, std::slice::from_ref(table))
             .await
-            .expect("the registered table acquires")
-            .expect("an hour remains before the deadline")
+            .expect("the registered table reads")
             .pop()
-            .expect("one acquired table");
+            .expect("one table cut");
         catalog
-            .materialize_acquired_cut(tenant, table, acquired)
+            .materialize_cut(tenant, table, cut)
             .await
             .expect("the committed snapshot pins")
     }

@@ -619,22 +619,30 @@ async fn prove_query_stream_telemetry(
             "retired family {family} must not be emitted"
         );
     }
-    assert!(
-        !finished.metrics.iter().any(|sample| {
-            sample.family == "oracle_query_phase_seconds"
-                && sample.labels.get("phase").is_some_and(|phase| {
-                    [
-                        "first_row",
-                        "terminal",
-                        "table_lookup",
-                        "manifest_scan",
-                        "hot_cut",
-                    ]
-                    .contains(&phase.as_str())
-                })
-        }),
-        "duplicate and per-substep phases are not emitted"
+    assert_eq!(
+        metric_value(
+            &finished,
+            "oracle_query_profiles_total",
+            BifrostMetricKind::Counter,
+            &[],
+        ),
+        1.0,
+        "one query emits one profile once its stream settles"
     );
+    for event in [
+        "Oracle.cut_read",
+        "DataSourceExec.time_elapsed_scanning_total",
+    ] {
+        assert!(
+            metric_value(
+                &finished,
+                "oracle_query_profile_nanoseconds_total",
+                BifrostMetricKind::Counter,
+                &[("event", event)],
+            ) > 0.0,
+            "the profile times {event}"
+        );
+    }
 
     let span = |name: &str| {
         finished

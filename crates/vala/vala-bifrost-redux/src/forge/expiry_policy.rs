@@ -9,9 +9,9 @@
 //! composed into a single decision, so that adding a protection means adding a
 //! root here rather than another guard somewhere along the call path.
 //!
-//! Active Oracle readers are not a root here: any active table read refuses
-//! the whole expiration at preparation, under the table's maintenance
-//! authority, so selection never reasons about which snapshots a reader needs.
+//! Oracle readers are protected by the retention root: a snapshot replaced
+//! less than the retention window ago may still be read, and the window is
+//! never shorter than the maximum query deadline. Readers record nothing.
 
 use std::collections::HashSet;
 
@@ -49,6 +49,12 @@ pub(super) struct SnapshotProtectionRoots {
     /// again would prepare two operations for the same deletion, so the claim
     /// removes it from this pass rather than refusing the pass.
     pub(super) claimed_snapshot_ids: Vec<i64>,
+    /// Snapshots first observed replaced less than the retention window ago.
+    ///
+    /// An Oracle query pinned the snapshot while it was current and may run
+    /// up to the maximum query deadline after that, so expiring it inside the
+    /// window could delete objects a running query still reads.
+    pub(super) retained_snapshot_ids: Vec<i64>,
     /// Fail-closed permission derived from unreconciled durable operations.
     pub(super) destructive_maintenance: DestructiveMaintenance,
 }
@@ -104,8 +110,8 @@ impl SnapshotExpiryPolicy<'_> {
     /// incomplete evidence is still a selection from incomplete evidence. The
     /// watermarks are then corroborated against Iceberg before they protect
     /// anything, so a watermark the table cannot account for fails the pass
-    /// instead of silently protecting nothing. There is no age or depth
-    /// retention: every replaced snapshot no root holds is selected.
+    /// instead of silently protecting nothing. The only age rule is the
+    /// retention root; every replaced snapshot no root holds is selected.
     ///
     /// # Errors
     ///
@@ -133,6 +139,7 @@ impl SnapshotExpiryPolicy<'_> {
             !held.contains(id)
                 && Some(*id) != self.roots.lineage_snapshot_id
                 && !self.roots.claimed_snapshot_ids.contains(id)
+                && !self.roots.retained_snapshot_ids.contains(id)
         });
         Ok(if snapshot_ids.is_empty() {
             SnapshotExpiryDecision::NoOp(SnapshotExpiryNoOp::NothingEligible)
@@ -216,6 +223,7 @@ mod tests {
             attempt_watermarks: Vec::new(),
             lineage_snapshot_id: None,
             claimed_snapshot_ids: Vec::new(),
+            retained_snapshot_ids: Vec::new(),
             destructive_maintenance: DestructiveMaintenance::Allowed,
         }
     }
@@ -323,6 +331,15 @@ mod tests {
                             timestamp_ms: 2_000,
                         },
                     ],
+                    ..bare_roots()
+                },
+            },
+            RootCase {
+                what: "a snapshot replaced inside the retention window",
+                protected: vec![10, 30],
+                ref_heads: Vec::new(),
+                roots: SnapshotProtectionRoots {
+                    retained_snapshot_ids: vec![10, 30],
                     ..bare_roots()
                 },
             },

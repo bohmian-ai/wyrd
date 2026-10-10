@@ -95,16 +95,19 @@ change. Per-table Iceberg properties control the work:
 | --- | --- | --- |
 | `wyrd.forge.enable-compaction` | `true` | Automatic data-file compaction. On for every table, including built-in tables; set `false` to turn it off. |
 | `wyrd.forge.compaction.type` | `small-files` | How the worker selects files: `small-files`, `full`, `files-with-delete`, or `auto`. A `copy-on-write` table always compacts `full`. |
-| `wyrd.forge.enable-snapshot-expiration` | `true` | Expires replaced snapshots as soon as no active query or other root retains them. |
+| `wyrd.forge.enable-snapshot-expiration` | `true` | Expires replaced snapshots once the retention window has passed and no other root retains them. |
 | `wyrd.forge.enable-manifest-rewrite` | `false` | Merges small manifests before expiry. Format-v3 tables are skipped. |
 | `commit.manifest.target-size-bytes` | 8 MiB | Manifest-rewrite target size. |
 | `commit.manifest.min-count-to-merge` | 100 | Minimum small manifests that trigger a merge. |
 
 Snapshot expiry never moves past the snapshot an in-flight compaction
-observed, and skips a table whose in-flight task observed none. The worker's
-final check still protects tables with active Oracle reads, unresolved
-operations, and the current head before anything is deleted. When the last
-query reading a table finishes, its replaced objects become eligible at once.
+observed, and skips a table whose in-flight task observed none. A replaced
+snapshot is kept for `forge.snapshot_retention_secs` (default 6 hours) after
+Forge first observes it replaced. Queries record no reads; this window is what
+keeps a running query's files, so the server refuses to start when it is
+shorter than `bifrost.oracle.max_query_deadline_ms` (default 6 hours). The
+worker's final check still protects unresolved operations and the current head
+before anything is deleted.
 
 The lease scope is:
 
@@ -311,18 +314,9 @@ failure:
 
 The worker and scheduler restart counters reuse these failure classes for the
 error that stopped the loop; an exit without an error to classify counts as
-`internal_invariant`. Three more families carry their own `reason` values:
+`internal_invariant`. Two more families carry their own `reason` values:
 leader revocations (`renewal_refused`, `renewal_failed`, `renewal_timeout`,
-`replaced`, `shutdown`), worker back-offs (`database_unavailable`), and expired
-cleanup refusals (`active_read`).
-
-`stage` names where an active Oracle read refused an expired-cleanup candidate
-preparation:
-
-| Value | What it means |
-| --- | --- |
-| `prepare` | The first candidate was refused before anything durable existed, so the claim was released without consuming retry budget. |
-| `replay` | A later candidate, or the replay of a retained one, was refused after the task was already prepared, so its exact frontier was retained for prepared-claim replay. |
+`replaced`, `shutdown`) and worker back-offs (`database_unavailable`).
 
 `outcome` names how one leader term renewal ended:
 
@@ -351,7 +345,6 @@ and sums across replicas.
 | `bifrost_forge_output_bytes_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect publishes bytes | Process-local |
 | `bifrost_forge_deleted_objects_total` | counter | `task_type` | At the delete boundary itself, once per accepted delete of a freshly proven-present, eligible object | Pre-delete-missing, refused, and already-absent recovery paths count nothing | Process-local |
 | `bifrost_forge_snapshots_expired_total` | counter | — | After committed or recovered expiration settlement | Counts individual snapshots, not tasks | Process-local |
-| `bifrost_forge_expired_cleanup_refusals_total` | counter | `stage`, `reason` (`active_read`) | Once per expired-cleanup candidate preparation an active Oracle read refused | Absent until the first refusal; a steady rise means a long-running read is holding cleanup back | Process-local |
 | `bifrost_forge_leader_decision_seconds` | histogram | `operation` (`commit`, `pull`, `report`) | Around each leader schedule operation, including the wait for the schedule lock | Absent on a replica that never held the leader term; excludes RPC and worker time | Process-local (leader) |
 
 ### Leader term families

@@ -1,11 +1,9 @@
 //! Forge's reads of one table's durable maintenance authority.
 //!
-//! Oracle records an active table read for every query that may still open a
-//! table's objects. Forge never interprets which snapshots a reader needs: any
-//! active read blocks destructive work for the whole table. Destruction runs
-//! only under [`TableAuthority::exclusive`], a capability that holds the
-//! table's maintenance-authority row through the effect's known outcome, so
-//! the reader check and the destructive effect cannot be separated.
+//! Oracle records nothing about its reads: snapshot retention protects them.
+//! Destruction runs only under [`TableAuthority::exclusive`], a capability
+//! that holds the table's maintenance-authority row through the effect's known
+//! outcome, so Forge's destructive protocols on one table never overlap.
 
 use vala_sql::TenantConn;
 use vala_sql::queries::oracle_reader_authority::{
@@ -75,29 +73,6 @@ impl<'conn, 'tx> TableAuthority<'conn, 'tx> {
         })
     }
 
-    /// Reports whether an Oracle query is still reading one table.
-    ///
-    /// Takes no lock: the answer is a scheduling hint only, it authorizes
-    /// nothing, and every destructive effect separately requires
-    /// [`Self::exclusive`]. Because it takes no lock it never waits on a
-    /// destructive owner currently holding the table's authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Invariant`] when the table is unregistered and
-    /// [`ForgeError::Sql`] when the registry or active-read read fails.
-    pub(super) async fn has_active_reads(
-        &mut self,
-        tenant: DataTenantId,
-        table_ref: &TableRef,
-    ) -> Result<bool, ForgeError> {
-        let identity = self.identity(tenant, table_ref).await?;
-        BifrostTableMaintenanceAuthority::new(self.conn)
-            .has_active_reads(&identity)
-            .await
-            .map_err(ForgeError::Sql)
-    }
-
     /// Takes the table's exclusive maintenance authority for destructive work.
     ///
     /// This is the only way Forge obtains the capability its snapshot-expiry
@@ -105,19 +80,17 @@ impl<'conn, 'tx> TableAuthority<'conn, 'tx> {
     /// value keeps this transaction mutably borrowed, so the caller drops it
     /// and then commits the transaction once the external effect's outcome is
     /// known — and before settlement, which takes the same row exclusively on
-    /// another connection. `Ok(None)` means an Oracle query still reads the
-    /// table; the caller ends the transaction without any destructive effect.
+    /// another connection.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Invariant`] when the table is unregistered and
-    /// [`ForgeError::Sql`] when the lock, identity check, or active-read
-    /// statements fail.
+    /// [`ForgeError::Sql`] when the lock or identity check fails.
     pub(super) async fn exclusive(
         mut self,
         tenant: DataTenantId,
         table_ref: &TableRef,
-    ) -> Result<Option<ExclusiveTableAuthority<'conn, 'tx>>, ForgeError> {
+    ) -> Result<ExclusiveTableAuthority<'conn, 'tx>, ForgeError> {
         let identity = self.identity(tenant, table_ref).await?;
         BifrostTableMaintenanceAuthority::new(self.conn)
             .exclusive(identity)
@@ -142,6 +115,31 @@ impl<'conn, 'tx> TableAuthority<'conn, 'tx> {
         let identity = self.identity(tenant, table_ref).await?;
         BifrostTableMaintenanceAuthority::new(self.conn)
             .claimed_snapshots(&identity)
+            .await
+            .map_err(ForgeError::Sql)
+    }
+
+    /// Records the table's replaced snapshots and returns those still inside
+    /// the retention window.
+    ///
+    /// `replaced` is every retained snapshot that is not current. A returned
+    /// snapshot was first observed replaced less than `retention` ago, so an
+    /// Oracle query may still be reading it and expiry must keep it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the table is unregistered and
+    /// [`ForgeError::Sql`] when the statement fails.
+    pub(super) async fn retained_supersessions(
+        &mut self,
+        tenant: DataTenantId,
+        table_ref: &TableRef,
+        replaced: &[i64],
+        retention: std::time::Duration,
+    ) -> Result<Vec<i64>, ForgeError> {
+        let identity = self.identity(tenant, table_ref).await?;
+        BifrostTableMaintenanceAuthority::new(self.conn)
+            .retained_supersessions(&identity, replaced, retention)
             .await
             .map_err(ForgeError::Sql)
     }
@@ -177,16 +175,5 @@ pub(super) fn require_covers(
             "destructive maintenance on {} is not covered by its exclusive table authority",
             table_ref.fqn()
         ),
-    })
-}
-
-/// The refusal a destructive path reports when an Oracle query still reads
-/// its table and no exclusive authority could be taken.
-///
-/// Carried as the same [`vala_sql::SqlError::Conflict`] the preparation refusal always
-/// produced, so retry and scheduling treat it identically.
-pub(super) fn active_read_refusal() -> ForgeError {
-    ForgeError::Sql(vala_sql::SqlError::Conflict {
-        detail: "an Oracle query is still reading this table".to_owned(),
     })
 }

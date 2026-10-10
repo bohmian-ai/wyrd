@@ -59,6 +59,13 @@ const DEFAULT_ORPHAN_GC_MAX_LIST_PAGES: usize = 1_024;
 /// frontier.
 const DEFAULT_ORPHAN_GC_RUN_BUDGET: Duration = Duration::from_mins(2);
 
+/// Default time a replaced snapshot is kept after Forge first observes it.
+///
+/// Equal to Oracle's maximum query deadline, which boot never lets exceed the
+/// configured retention, so a query always finishes before its snapshot can
+/// expire.
+const DEFAULT_SNAPSHOT_RETENTION: Duration = Duration::from_hours(6);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Limits and durability windows for one Forge maintenance loop.
 ///
@@ -99,6 +106,13 @@ pub struct ForgeConfig {
     pub default_target_file_size_bytes: u64,
     /// Age after which an unreferenced object may be deleted.
     pub orphan_gc_ttl: Duration,
+    /// Time a replaced snapshot is kept after Forge first observes it replaced.
+    ///
+    /// This is what protects Oracle readers, which record nothing: it must be
+    /// at least the maximum query deadline, which the server checks at boot.
+    /// Zero keeps no replaced snapshot and protects no reader. Operator-tunable
+    /// via `forge.snapshot_retention_secs`.
+    pub snapshot_retention: Duration,
     /// Maximum orphan candidates considered in one GC batch.
     pub max_gc_candidates_per_batch: usize,
     /// Maximum manifests or metadata records one maintenance pass may visit.
@@ -149,6 +163,7 @@ impl Default for ForgeConfig {
             small_file_threshold_percent: DEFAULT_SMALL_FILE_THRESHOLD_PERCENT,
             default_target_file_size_bytes: DEFAULT_TARGET_FILE_SIZE_BYTES,
             orphan_gc_ttl: Duration::from_hours(24),
+            snapshot_retention: DEFAULT_SNAPSHOT_RETENTION,
             max_gc_candidates_per_batch: 256,
             max_maintenance_items_per_tick: DEFAULT_MAX_MAINTENANCE_ITEMS_PER_TICK,
             max_maintenance_bytes_per_tick: DEFAULT_MAX_MAINTENANCE_BYTES_PER_TICK,

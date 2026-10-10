@@ -411,7 +411,7 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
     ///
     /// # Panics
     ///
-    /// Panics when the cut cannot be acquired, materialized, or released, when
+    /// Panics when the cut cannot be read or materialized, when
     /// a path is visible from both hot and promoted sources, or when the cut
     /// does not cover the sealed set exactly.
     async fn assert_exact_cut(
@@ -421,31 +421,16 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
         sealed: &BTreeSet<String>,
         label: &str,
     ) {
-        let query_id = uuid::Uuid::now_v7();
-        let acquired = catalog
-            .acquire_active_cut(
-                tenant,
-                vala_sql::queries::oracle_reader_authority::ActiveReadOwner {
-                    query_id,
-                    node_id: uuid::Uuid::now_v7(),
-                    fencing_token: 1,
-                },
-                std::time::Instant::now() + std::time::Duration::from_hours(1),
-                std::slice::from_ref(table),
-            )
+        let cut = catalog
+            .read_cut(tenant, std::slice::from_ref(table))
             .await
-            .expect("the registered table acquires its active cut")
-            .expect("an hour remains before the deadline")
+            .expect("the registered table reads its cut")
             .pop()
-            .expect("one acquired table");
+            .expect("one table cut");
         let pinned = catalog
-            .materialize_acquired_cut(tenant, table, acquired)
+            .materialize_cut(tenant, table, cut)
             .await
             .unwrap_or_else(|error| panic!("{label} cut: {error}"));
-        catalog
-            .release_active_reads(tenant, query_id)
-            .await
-            .expect("the inspection cut releases its active read");
         let hot = pinned
             .hot_files
             .iter()

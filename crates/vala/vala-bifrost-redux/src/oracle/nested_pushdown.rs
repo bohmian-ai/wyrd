@@ -557,6 +557,7 @@ pub(super) mod tests {
                 *FIXTURE_TENANT,
                 &self.schema,
                 &Arc::new(options.clone()),
+                None,
             )
             .expect("hot scan plans")
         }

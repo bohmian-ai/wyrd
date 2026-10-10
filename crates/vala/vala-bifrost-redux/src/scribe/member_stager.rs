@@ -444,6 +444,7 @@ mod tests {
             shard_id: 5,
             schema,
             batches: vec![batch],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),

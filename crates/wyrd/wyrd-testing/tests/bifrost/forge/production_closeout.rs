@@ -39,10 +39,9 @@ use wyrd_testing::bifrost::{
 
 /// Every Oracle-serving node's ranged-read pause, armed before a lazy public read.
 ///
-/// The query's leader commits its active table read before any object IO, so
-/// stalling the production storage owner at the first ranged read holds the
-/// query at a point where that read is already durable and observable,
-/// without adding any production seam.
+/// Stalling the production storage owner at the first ranged read holds the
+/// query mid-read, after its cut is pinned, without adding any production
+/// seam.
 struct OracleReadBarriers {
     /// One barrier per Oracle-serving node, paired with that node's identity.
     entries: Vec<(NodeId, Arc<ReadStall>)>,
@@ -1304,27 +1303,10 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     assert_output_geometry(&outputs, workload.expected.len(), target);
     journey.assert_objects(&inputs).await;
     journey.assert_objects(&outputs).await;
-    // Pause the follower at its first ranged read: the query's active table
-    // read must already be durable there, because acquisition commits it
-    // before any object IO.
-    let barriers = OracleReadBarriers::arm(&journey.cluster);
-    let paused_read = read_managed_rows(&reader, &table.qualified);
-    let inspect_protection = async {
-        let reader_node = tokio::time::timeout(PASS_BOUND, barriers.first_reached())
-            .await
-            .expect("lazy query reaches its first ranged read");
-        let active = journey
-            .cluster
-            .server_by_node(reader_node)
-            .expect("the stalled reader is a composed node")
-            .oracle_active_table_reads_for_test(&table.binding)
-            .await
-            .expect("active read inspection");
-        assert_eq!(active, 1, "the held query owns one active table read");
-        barriers.release();
-    };
-    let (actual, ()) = tokio::join!(paused_read, inspect_protection);
-    assert_eq!(actual, workload.expected);
+    assert_eq!(
+        read_managed_rows(&reader, &table.qualified).await,
+        workload.expected
+    );
     let rewrites = journey
         .observer
         .completed_strategies()
@@ -1404,7 +1386,7 @@ struct ReaderCleanupJourney {
     old_snapshot: i64,
     /// Exact data files the paused query must retain.
     old_files: BTreeMap<String, DataFile>,
-    /// Earlier replaced data object collected only after the reader releases.
+    /// Earlier replaced data object collected only after the retention window.
     earlier_object: String,
 }
 
@@ -1485,40 +1467,34 @@ impl ReaderCleanupJourney {
         }
     }
 
-    /// Waits for the terminal query to release its active table read.
+    /// Moves the table's recorded snapshot supersessions past the retention
+    /// window, as if the window had elapsed since Forge observed them.
     ///
     /// # Panics
-    /// Panics if the read survives the pass bound or inspection fails.
-    async fn wait_for_reader_release(&self) {
-        tokio::time::timeout(PASS_BOUND, async {
-            loop {
-                let active = self
-                    .roles
-                    .coordinator()
-                    .oracle_active_table_reads_for_test(&self.table.binding)
-                    .await
-                    .expect("active read inspection");
-                if active == 0 {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("terminal query releases its active table read");
+    /// Panics if the backdate fails.
+    async fn outlive_retention(&self) {
+        self.roles
+            .coordinator()
+            .age_snapshot_supersessions_for_test(
+                self.table.binding.tenant,
+                ForgeConfig::default().snapshot_retention + std::time::Duration::from_secs(60),
+            )
+            .await
+            .expect("supersessions backdate");
     }
 
     /// Holds a public reader across a rewrite and destructive passes, then
-    /// collects the earlier replaced object once the reader releases.
+    /// collects the earlier replaced object once the retention window passes.
     ///
-    /// While the query owns its active table read, another pod still rewrites
-    /// the table, but every maintenance pass defers expiry and cleanup, so the
-    /// earlier object, the reader's files, and its snapshot all survive.
+    /// While the query runs, another pod still rewrites the table, but inside
+    /// the retention window every maintenance pass keeps the replaced
+    /// snapshots, so the earlier object, the reader's files, and its snapshot
+    /// all survive. The query records nothing.
     ///
     /// # Panics
     /// Panics if the query was not protected, a held pass deletes anything, its
     /// terminal rows change, or the earlier object is not collected after
-    /// release.
+    /// the window.
     async fn protect_during_cleanup(&mut self) {
         let expected = canonical_order(self.workload.expected.clone());
         let barriers = OracleReadBarriers::arm(&self.roles.cluster);
@@ -1528,15 +1504,6 @@ impl ReaderCleanupJourney {
                 .await
                 .expect("lazy query reaches its first ranged read");
             assert_ne!(reader_node, self.roles.worker_node);
-            let active = self
-                .roles
-                .cluster
-                .server_by_node(reader_node)
-                .expect("the stalled reader is a composed node")
-                .oracle_active_table_reads_for_test(&self.table.binding)
-                .await
-                .expect("active read inspection");
-            assert_eq!(active, 1, "the held query owns one active table read");
             self.workload
                 .append_batch(&self.transport, &self.table.qualified, &[5, 6])
                 .await;
@@ -1553,7 +1520,7 @@ impl ReaderCleanupJourney {
             }
             assert!(
                 !self.roles.object_missing(&self.earlier_object).await,
-                "an active table read defers every destructive pass"
+                "the retention window defers every destructive pass"
             );
             self.roles.assert_objects(&self.old_files).await;
             let metadata = self
@@ -1577,10 +1544,10 @@ impl ReaderCleanupJourney {
             actual, expected,
             "old reader returns exactly its protected cut"
         );
-        self.wait_for_reader_release().await;
-        // With the last reader gone the earlier object is collected without an
-        // age wait; the reader's own files stay live through the head's
-        // rewrite lineage until `finish` moves the head on.
+        self.outlive_retention().await;
+        // Past the window the earlier object is collected; the reader's own
+        // files stay live through the head's rewrite lineage until `finish`
+        // moves the head on.
         self.roles
             .collect_exact(&self.table.binding, &self.earlier_object, &self.old_files)
             .await;
@@ -1602,6 +1569,7 @@ impl ReaderCleanupJourney {
             .expect("later rows flush");
         let (_, current) = self.roles.compact_small_table(&self.table.binding).await;
         self.roles.advance_maintenance(chrono::Duration::days(2));
+        self.outlive_retention().await;
         let old_path = self.old_files.keys().next().expect("old compacted object");
         self.roles
             .collect_exact(&self.table.binding, old_path, &current)
@@ -1629,7 +1597,8 @@ impl ReaderCleanupJourney {
     }
 }
 
-/// An old public reader defers cross-pod expiration and physical cleanup.
+/// The retention window keeps an old public reader's snapshot through
+/// cross-pod expiration and physical cleanup.
 ///
 /// # Panics
 /// Panics when durable protection, exact deletion ownership, or tenant rows fail.

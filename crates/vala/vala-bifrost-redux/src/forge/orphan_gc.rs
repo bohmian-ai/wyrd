@@ -1155,12 +1155,6 @@ impl Forge {
                 .open_outputs
                 .push(normalize(prepared.candidate.path.as_str())?);
         }
-        // An active Oracle table read may still open any object its cut
-        // named, so it blocks the pass. This is a lock-free hint: every
-        // deletion separately requires the table's exclusive authority.
-        roots.blocked |= super::table_authority::TableAuthority::new(&mut conn)
-            .has_active_reads(key.tenant, &key.table_ref)
-            .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         Ok(roots)
     }
@@ -1525,46 +1519,35 @@ impl Forge {
             })
             .await?;
         // The exclusive table authority is taken after the protection load
-        // and held through every delete's outcome. While a reader holds the table
-        // no authority exists and the whole batch is retained, exactly as a
-        // blocked protection retains it.
+        // and held through every delete's outcome.
         let mut authority_conn = self
             .core
             .vala
             .tenant_conn(table.key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let tally = match super::table_authority::TableAuthority::new(&mut authority_conn)
+        let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
             .exclusive(table.key.tenant, &table.key.table_ref)
-            .await?
-        {
-            // The lease TTL bounds the authority hold: an Oracle cut waits on
-            // this row, and the store has no request timeout of its own. A
-            // batch cut off at the bound leaves its operation open, and the
-            // idempotent replay re-proves every candidate.
-            Some(exclusive) => tokio::time::timeout(
-                self.core.config.lease_ttl,
-                self.apply_gc_deletions(
-                    lease,
-                    table,
-                    &exclusive,
-                    &protection,
-                    candidate_paths,
-                    request.deadline,
-                ),
-            )
-            .await
-            .unwrap_or(Err(ForgeError::Timeout {
-                operation: "orphan-GC deletion under table authority",
-            })),
-            None => Ok(GcDeletionTally {
-                skipped: candidate_paths
-                    .iter()
-                    .map(|path| path.as_str().to_owned())
-                    .collect(),
-                ..GcDeletionTally::default()
-            }),
-        };
+            .await?;
+        // The lease TTL bounds the authority hold: the store has no request
+        // timeout of its own. A batch cut off at the bound leaves its
+        // operation open, and the idempotent replay re-proves every candidate.
+        let tally = tokio::time::timeout(
+            self.core.config.lease_ttl,
+            self.apply_gc_deletions(
+                lease,
+                table,
+                &exclusive,
+                &protection,
+                candidate_paths,
+                request.deadline,
+            ),
+        )
+        .await
+        .unwrap_or(Err(ForgeError::Timeout {
+            operation: "orphan-GC deletion under table authority",
+        }));
+        drop(exclusive);
         authority_conn.commit().await.map_err(ForgeError::Sql)?;
         let GcDeletionTally {
             deleted,

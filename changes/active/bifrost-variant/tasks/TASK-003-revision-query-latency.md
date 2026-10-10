@@ -113,6 +113,30 @@ second session" below.
    show published-data query latency improved against the last recorded
    capacity run.
 
+   Diagnosis, 2026-10-09 (10M run at `184183725`, 8-CPU/16-GiB scope):
+   - **Symptom:** selective p50 53 ms at 1 client (target < 7 ms) and
+     small-aggregate while writing 68 qps (target ≥ 200). The report showed
+     `0 files` after every write, so no query read published Parquet.
+   - **Evidence:** the bench's events table wrote 10M rows in 7.3 s. Its
+     staging directory then held 105 files and 259 MiB of staged Parquet,
+     unchanged for the whole 4-minute read phase. No Iceberg data file was
+     written. The source is 10-second scrapes of the server's storage
+     directory (session scratchpad `scrapes/`). The memtable did rotate, so
+     the staged runs existed; only the claim that publishes them never fired.
+   - **Cause:** the claim trigger summed the members' *encoded* (ZSTD) bytes
+     against the 512 MiB target (`scribe/assembly.rs`, `target_prefix`).
+     Memtable rotation counts *raw* Arrow bytes at the same 512 MiB. A
+     rotation's worth of raw data compresses to well under 512 MiB encoded,
+     so a claim waited for the 600 s dwell, longer than the bench runs.
+   - **Fix site:** `ReadyMember` now carries raw bytes, and `target_prefix`
+     sums them (`84d4f3559`). The design doc's trigger row says raw
+     (`architecture/bifrost-design.md`). `255a6e0ec` adds
+     `bifrost_scribe_persistence_raw_bytes_total` beside the encoded counter,
+     so the staging compression ratio is raw rate / encoded rate. The other
+     caller of the member sizes is output rolling, which stays on encoded
+     bytes by design. Not rerun yet: the next query-capacity run must show
+     published files after the write step.
+
 ### Progress, 2026-10-08, second session
 
 Steps 1 and 2 done; step 3 profiled, fix waits on a user decision.
@@ -1570,3 +1594,56 @@ Owed by step 3:
   predicate journey in `peer_network/security.rs`.
 - Stale comments in `wyrd-testing/tests/bifrost/oracle/distributed.rs`
   (`OracleCatalogResolver`, `assignment.predicates`, `with_assigned_files`).
+
+### Spec revision 22, 2026-10-09 (user-approved): time-based snapshot retention
+
+Measured cause: every query spent three Postgres pool checkouts (claim, cut,
+release) to record and release active table reads; under concurrency the
+pool, not DataFusion, capped throughput.
+
+Change (REQ-035, INV-011, AC-015):
+
+- The Oracle cut is one read-only STABLE statement,
+  `vala.oracle_read_table_cut(jsonb)`: no lock, no row written, nothing
+  released. One pool checkout per query.
+- Query deadlines are capped at `bifrost.oracle.max_query_deadline_ms`
+  (default 6 h; the default deadline stays 2 h).
+- Forge records the first time it observes a snapshot replaced
+  (`vala.forge_snapshot_supersessions`, PostgreSQL time) and keeps it for
+  `forge.snapshot_retention_secs` (default 6 h). Server config validation
+  refuses retention < max deadline < default deadline.
+- Removed: `vala.oracle_active_table_reads`, `oracle_acquire_table_cut`, the
+  reader checks in expiry, expired cleanup, orphan GC and the GC hint, the
+  `bifrost_forge_expired_cleanup_refusals_total` family, and the leader
+  ownership log. The query profile is now held by the returned stream and
+  emitted once every descendant settles; `claim_acquire`/`claim_release`
+  became `cut_read`.
+- Tests: `reader_expiry_ordering.rs` now holds the AC-015 retention tests;
+  `pg_oracle_membership.rs` covers the read-only cut and the retention
+  statement; the closeout and held-query journeys backdate the recorded
+  supersessions instead of waiting for a reader release. Forge tier-2
+  fixtures run with zero retention so maintenance scenarios keep
+  first-pass expiry.
+
+#### Diagnosis: idle tables never expired after the window
+
+- **Symptom:** `replaced_snapshots_expire_only_after_the_retention_window`
+  kept three snapshots after the window passed (expected the head only).
+- **Evidence:** `WYRD_LOG=info,vala_bifrost_redux::forge=debug` showed the
+  second pass selecting the table (`snapshot_expiration_tables=1`) and
+  executing no `snapshot_expiry` task.
+- **Cause:** the leader planned an expiry task whenever an unheld replaced
+  snapshot existed. The first pass retained everything (inside the window) and
+  left the table unchanged, so every later plan had the same base snapshot and
+  plan hash; `forge_tasks_idempotency` plus `ON CONFLICT DO NOTHING` dropped
+  them as replays.
+- **Fix site:** `forge/gc.rs` `expire_snapshots`: the leader plans only when
+  some unheld replaced snapshot is past the window
+  (`any_past_retention`, the same `retained_supersessions` statement that
+  records first observations). Every planned task then changes the table.
+  The attempt still rechecks the window under the exclusive authority. Plan
+  shape unchanged (four fields). Other caller checked: `forge/expire.rs`
+  attempt selection.
+- **Known limit:** raising `snapshot_retention` between plan and execution
+  yields one no-op attempt; an idle table then waits for its next commit.
+  Fails safe (retains longer).

@@ -35,6 +35,9 @@ use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::filter_pushdown::{
     ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation,
 };
+use datafusion::physical_plan::metrics::{
+    ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, Time,
+};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -217,6 +220,10 @@ pub(super) struct LiveScribeExec {
     /// Scan evidence every validated fragment completion folds in, shared by
     /// every clone of this leaf so the query's collector reads one total.
     scan_metrics: Arc<RemoteScanMetrics>,
+    /// `DataFusion` metrics for opening and awaiting remote fragments,
+    /// registered per partition when it executes and read through
+    /// [`ExecutionPlan::metrics`] like every other operator's.
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl LiveScribeExec {
@@ -246,6 +253,7 @@ impl LiveScribeExec {
             )),
             predicate: None,
             scan_metrics: Arc::default(),
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 
@@ -406,6 +414,11 @@ impl ExecutionPlan for LiveScribeExec {
         &self.properties
     }
 
+    /// Returns the fragment open and wait times every executed partition recorded.
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
     /// A live source is always a leaf.
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         Vec::new()
@@ -463,6 +476,10 @@ impl ExecutionPlan for LiveScribeExec {
             leaf: self.clone(),
             routes,
             lock,
+            open_time: MetricBuilder::new(&self.metrics)
+                .subset_time("fragment_open_time", partition),
+            wait_time: MetricBuilder::new(&self.metrics)
+                .subset_time("fragment_wait_time", partition),
         };
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
@@ -556,6 +573,11 @@ struct LiveFragmentRead {
     routes: Vec<LiveScribeRoute>,
     /// Execution bindings bound after admission.
     lock: Arc<super::bindings::OracleExecutionLock>,
+    /// Time spent opening fragments until each peer accepted its stream,
+    /// channel connects included.
+    open_time: Time,
+    /// Time spent awaiting the next frame of an opened fragment.
+    wait_time: Time,
 }
 
 impl LiveFragmentRead {
@@ -589,11 +611,13 @@ impl LiveFragmentRead {
                     fragment.plan_fingerprint.clone(),
                     Arc::clone(&self.leaf.scan_metrics),
                 );
-                let mut frames = match live
+                let open = self.open_time.timer();
+                let opened = live
                     .dispatcher
                     .open_stream(&live.context, &fragment, &candidate)
-                    .await
-                {
+                    .await;
+                open.done();
+                let mut frames = match opened {
                     Ok(frames) => frames,
                     Err(error) => {
                         grant.ensure_live()?;
@@ -610,6 +634,7 @@ impl LiveFragmentRead {
                     }
                 };
                 loop {
+                    let wait = self.wait_time.timer();
                     let frame = tokio::select! {
                         () = grant.cancellation.cancelled() => Err(DataFusionError::Execution(
                             "Oracle query was cancelled during a live Scribe read".to_owned(),
@@ -622,6 +647,7 @@ impl LiveFragmentRead {
                         )),
                         frame = frames.next() => Ok(frame),
                     };
+                    wait.done();
                     let frame = frame?;
                     match frame {
                         None => {

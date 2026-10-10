@@ -597,6 +597,19 @@ impl BoundServer {
                 },
             ));
         }
+        // Oracle's cut cache serves only while this listener hears every
+        // `vala.file_list` change, so it runs wherever Oracle plans queries.
+        if self.state.bifrost.oracle_peer_service().is_some()
+            && let Some(catalog) = self.state.bifrost.catalog().map(Arc::clone)
+        {
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("oracle_cut_cache"),
+                async move {
+                    catalog.watch_cuts(shutdown).await;
+                },
+            ));
+        }
         // Retained audit history: one bounded sweep per interval moves each
         // tenant's oldest contiguous run of audit events out of the
         // transactional staging and retires it only once Scribe has it durably.

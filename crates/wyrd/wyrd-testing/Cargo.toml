@@ -118,6 +118,10 @@ wyrd-tls = { workspace = true }
 
 wiremock = { workspace = true }
 
+# The release-server launcher reads host and process usage on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 workspace-hack.workspace = true
 # The peer-context journey encodes a Scribe fragment exactly as a leader does.

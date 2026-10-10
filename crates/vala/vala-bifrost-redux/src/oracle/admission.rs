@@ -1509,16 +1509,14 @@ impl AdmittedQueryGuard {
     ///
     /// Returns [`BifrostError::QueryAdmissionRejected`] when the admitted
     /// envelope has already moved to an Analytical graph.
-    pub(super) fn execution_session(
+    pub(super) fn execution_task(
         &self,
         config: datafusion::prelude::SessionConfig,
-    ) -> Result<datafusion::prelude::SessionContext, BifrostError> {
+    ) -> Result<Arc<datafusion::execution::TaskContext>, BifrostError> {
         let execution = self
             .execution()
             .ok_or(BifrostError::QueryAdmissionRejected)?;
-        Ok(SessionContext::new_with_state(
-            execution.session_state(config),
-        ))
+        Ok(execution.session(config).1)
     }
 
     /// Returns the query-keyed ownership probe after live-tail drain completes.

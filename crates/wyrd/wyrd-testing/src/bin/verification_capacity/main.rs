@@ -27,7 +27,6 @@ mod evidence;
 mod fixture;
 mod judge;
 mod load;
-mod profile;
 mod report;
 mod step;
 
@@ -39,7 +38,7 @@ use clap::Parser;
 use secrecy::ExposeSecret as _;
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
 use wyrd_testing::capacity::{binary_identity, install_tracing, release_binary};
-use wyrd_testing::release_server::{CPUS, Envelope, LocalServer, MEMORY_BYTES};
+use wyrd_testing::release_server::{CPUS, Envelope, LocalServer, MEMORY_BYTES, Placement};
 
 use collector::Collector;
 use evidence::Queue;
@@ -156,7 +155,13 @@ async fn benchmark(cli: Cli) -> Result<bool> {
         .chain((0..cli.background).map(|index| format!("bg{index}")))
         .collect();
     let slug_refs: Vec<&str> = slugs.iter().map(String::as_str).collect();
-    let first = LocalServer::start(&binary, &slug_refs, &env(0), Envelope::POD).await?;
+    let first = LocalServer::start(
+        &binary,
+        &slug_refs,
+        &env(0),
+        Placement::Scoped(Envelope::POD),
+    )
+    .await?;
     let mut tenants = Vec::new();
     for (index, setup) in first.tenants().iter().enumerate() {
         tenants.push(Tenant::provision(setup, &work.path().join("tenants"), index < 2).await?);

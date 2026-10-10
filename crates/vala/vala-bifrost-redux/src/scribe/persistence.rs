@@ -542,6 +542,8 @@ impl ImmutableGeneration {
             seal_key: self.seal_key.clone(),
             schema: self.schema.clone(),
             batches: self.rows.clone(),
+            // Staging writes the rows; it never prunes them.
+            statistics: Vec::new(),
             metas: self.append_metas.clone(),
             opened_at: self.opened_at,
             closed_at: self.closed_at,

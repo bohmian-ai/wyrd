@@ -2577,12 +2577,6 @@ impl AnalyticalGraphLifecycle {
         // Closing every admit stream is the release: each follower drops its
         // grant and cancels whatever it built on it.
         drop(self.grants.take());
-
-        #[cfg(feature = "test-support")]
-        super::planner::record_leader_ownership(
-            self.graph.public_query_id.as_uuid(),
-            super::planner::LeaderOwnershipEvent::GraphRevoked,
-        );
         let mut running_query = None;
         if failure.is_none() {
             match self.release().release().await {
@@ -2811,11 +2805,6 @@ impl Drop for AnalyticalGraphLifecycle {
         self.cancel.cancel();
         drop(self.grants.take());
         drop(self.attempt.take());
-        #[cfg(feature = "test-support")]
-        super::planner::record_leader_ownership(
-            self.graph.public_query_id.as_uuid(),
-            super::planner::LeaderOwnershipEvent::GraphRevoked,
-        );
         drop(self.supervisor.take_metric_fold(self.graph));
         self.release().reclaim();
     }

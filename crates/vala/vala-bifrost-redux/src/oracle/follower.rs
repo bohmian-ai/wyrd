@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::TaskContext;
 use datafusion::execution::session_state::SessionState;
 use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
@@ -173,9 +174,7 @@ where
 fn request_session(
     execution: &crate::resources::OracleExecution,
 ) -> (SessionState, Arc<TaskContext>) {
-    let state = execution.session_state(datafusion::prelude::SessionConfig::new());
-    let task = Arc::new(TaskContext::from(&state));
-    (state, task)
+    execution.session(datafusion::prelude::SessionConfig::new())
 }
 
 /// Refuses a follower fragment that was assigned nothing to scan.
@@ -320,8 +319,21 @@ pub struct ScribeTailResolver<T = FetchLiveTailService> {
 
 /// Closed Scribe schema source separating production catalog IO from unit fixtures.
 enum ScribeSchemaSource {
-    /// Shared tenant-qualified production catalog.
-    Catalog(Arc<BifrostCatalog>),
+    /// Shared tenant-qualified production catalog, and the last schema it
+    /// returned for each tenant's table.
+    ///
+    /// A cached schema is used only while its fingerprint equals the one the
+    /// signed assignment carries, so a schema change reloads from the
+    /// catalog. Without it every hot query paid a registration read and an
+    /// Iceberg metadata load just to rebuild an unchanged schema.
+    // ponytail: one entry per tenant table ever queried, never evicted; bound
+    // it if registrations churn.
+    Catalog {
+        /// Shared tenant-qualified production catalog.
+        catalog: Arc<BifrostCatalog>,
+        /// Last catalog schema of each tenant's table.
+        schemas: std::sync::RwLock<HashMap<(DataTenantId, TableRef), SchemaRef>>,
+    },
     /// Focused unit-test schema with no external catalog.
     #[cfg(test)]
     Fixed(arrow::datatypes::SchemaRef),
@@ -340,7 +352,10 @@ impl ScribeTailResolver<FetchLiveTailService> {
     pub fn new(tail: Arc<FetchLiveTailService>, catalog: Arc<BifrostCatalog>) -> Self {
         Self {
             tail,
-            schema_source: ScribeSchemaSource::Catalog(catalog),
+            schema_source: ScribeSchemaSource::Catalog {
+                catalog,
+                schemas: std::sync::RwLock::default(),
+            },
         }
     }
 }
@@ -362,7 +377,8 @@ impl<T> ScribeTailResolver<T> {
     /// Memtable rows are projected to the signed closure and dealt round-robin
     /// across exactly the session's target partitions of one in-memory source,
     /// leaving unused partitions empty, so a sparse cut keeps the session
-    /// shape. The unserved staged runs are read by
+    /// shape. Each batch keeps the exact bounds Scribe recorded at append, so
+    /// the query's pushed predicate drops batches it cannot match. The unserved staged runs are read by
     /// `DataFusion`'s Parquet scan, so they get the row-group and page pruning
     /// every Oracle hot read gets, with no footer caching because a staged run
     /// is rewritable; the scan's files hold the staged lease until the plan
@@ -388,15 +404,18 @@ impl<T> ScribeTailResolver<T> {
         if !rows.is_empty() || runs.is_empty() {
             let mut groups = vec![Vec::new(); partitions];
             for (index, batch) in rows.iter().enumerate() {
-                groups[index % partitions].push(
-                    super::exec::project_batch(batch, Arc::clone(required_schema))
+                groups[index % partitions].push((
+                    super::exec::project_batch(&batch.rows, Arc::clone(required_schema))
                         .map_err(|_| fault("Scribe memtable rows do not match the closure"))?,
-                );
+                    Arc::clone(&batch.statistics),
+                ));
             }
-            leaves.push(
-                MemorySourceConfig::try_new_exec(&groups, Arc::clone(required_schema), None)
-                    .map_err(|_| fault("Scribe memtable source construction failed"))?,
-            );
+            let source = super::memtable_source::MemtableSource::try_new(
+                groups,
+                Arc::clone(required_schema),
+            )
+            .map_err(|_| fault("Scribe memtable source construction failed"))?;
+            leaves.push(Arc::new(DataSourceExec::new(Arc::new(source))));
         }
         if !runs.is_empty() {
             let mut files = Vec::with_capacity(runs.len());
@@ -419,6 +438,10 @@ impl<T> ScribeTailResolver<T> {
                     ),
                 });
             }
+            // A staged run's footer is never cached, so its row groups are
+            // unknown; one partition per run is the split a decoded follower
+            // plan has always had.
+            let runs = files.len();
             leaves.push(
                 super::exec::hot_parquet_scan(
                     files,
@@ -426,6 +449,7 @@ impl<T> ScribeTailResolver<T> {
                     assignment.binding.tenant_id,
                     required_schema,
                     session.config().options(),
+                    Some(runs),
                 )
                 .map_err(|_| fault("Scribe staged scan construction failed"))?,
             );
@@ -501,6 +525,10 @@ where
     /// live-tail page so a distributed query, whose leader never drains a local
     /// fence, still reports the live-tail page families an operator reads.
     ///
+    /// The table schema comes from the resolver's cache when its fingerprint
+    /// equals the assignment's, and from the catalog otherwise, which then
+    /// refreshes the cache.
+    ///
     /// Cancellation before the single snapshot returns exposes no batches or
     /// provider. Cancellation during provider construction drops the complete
     /// local cohort. A retry begins again from the authenticated assignment.
@@ -537,13 +565,32 @@ where
         ))
         .map_err(|_| "Scribe tenant/table binding is invalid".to_owned())?;
         let full_schema = match &self.schema_source {
-            ScribeSchemaSource::Catalog(catalog) => catalog
-                .assignment_schema(
-                    &assignment_table(&assignment.binding)?,
+            ScribeSchemaSource::Catalog { catalog, schemas } => {
+                let key = (
                     assignment.binding.tenant_id,
-                )
-                .await
-                .map_err(|_| "authenticated Scribe schema resolution failed".to_owned())?,
+                    assignment_table(&assignment.binding)?,
+                );
+                let cached = schemas
+                    .read()
+                    .ok()
+                    .and_then(|schemas| schemas.get(&key).cloned())
+                    .filter(|schema| {
+                        super::assignment_schema_fingerprint(schema.as_ref())
+                            == assignment.schema_fingerprint
+                    });
+                if let Some(schema) = cached {
+                    schema
+                } else {
+                    let schema = catalog
+                        .assignment_schema(&key.1, key.0)
+                        .await
+                        .map_err(|_| "authenticated Scribe schema resolution failed".to_owned())?;
+                    if let Ok(mut schemas) = schemas.write() {
+                        schemas.insert(key, Arc::clone(&schema));
+                    }
+                    schema
+                }
+            }
             #[cfg(test)]
             ScribeSchemaSource::Fixed(schema) => Arc::clone(schema),
         };
@@ -1493,7 +1540,11 @@ pub(crate) mod tests {
         assert!(parquet_options.enable_page_index);
     }
 
-    /// Proves every Oracle follower request rebuilds its governed `DataFusion` context.
+    /// Proves every Oracle follower request gets its own task context, and
+    /// that each one executes on its admitted execution's governed runtime.
+    ///
+    /// The planning state is a clone of the process template and so shares
+    /// its session id; only the task context carries the grant's runtime.
     ///
     /// # Panics
     /// Panics if either independent request fails provider resolution, native
@@ -1501,10 +1552,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn oracle_resolver_builds_fresh_request_local_context() {
         let execution = bounded_execution(1024, 1);
-        let (first_state, first_context) = request_session(&execution);
-        let (second_state, second_context) = request_session(&execution);
-        assert_ne!(first_state.session_id(), second_state.session_id());
+        let (_, first_context) = request_session(&execution);
+        let (_, second_context) = request_session(&execution);
         assert!(!Arc::ptr_eq(&first_context, &second_context));
+        for context in [&first_context, &second_context] {
+            assert!(Arc::ptr_eq(&context.runtime_env(), execution.runtime()));
+        }
         prove_role_local_providers_are_isolated_and_consumed_once().await;
         prove_role_local_providers_are_isolated_and_consumed_once().await;
         assert_complete_preflight_matrix().await;

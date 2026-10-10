@@ -1257,7 +1257,6 @@ const APPROVED_FORGE_FAMILIES: &[&str] = &[
     "bifrost_forge_worker_restarts_total",
     "bifrost_forge_worker_restart_backoff_seconds",
     "bifrost_forge_scheduler_restarts_total",
-    "bifrost_forge_expired_cleanup_refusals_total",
 ];
 
 /// Promoted rows survive a rewrite whose acceptance the committer never learned.

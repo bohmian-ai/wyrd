@@ -800,10 +800,7 @@ mod promotion_barrier {
                 &mut conn,
             )
             .exclusive(identity.clone())
-            .await?
-            .ok_or_else(|| SqlError::Conflict {
-                detail: "an Oracle query is still reading this table".to_owned(),
-            })?;
+            .await?;
         let prepared = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
             .expect("valid Forge resource")
             .prepare_snapshot_expiration(

@@ -685,7 +685,7 @@ fn live_rows(
         .expect(context)
         .into_parts();
     assert!(runs.is_empty(), "{context}: the fixture staged no run");
-    rows
+    rows.into_iter().map(|batch| batch.rows).collect()
 }
 
 /// Read the fixture's single hot value.

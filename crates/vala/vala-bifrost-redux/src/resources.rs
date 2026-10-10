@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use datafusion::config::ConfigOptions;
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::memory_pool::{
     FairSpillPool, MemoryConsumer, MemoryPool, MemoryReservation, TrackConsumersPool,
@@ -3998,8 +3997,9 @@ impl Drop for OracleQueryResources {
 /// A fully local scan runs one
 /// partition per core because it has no IO latency to hide, and each remote
 /// byte raises that linearly toward four partitions per core so remote reads
-/// overlap. The pinned file count plays no part; scan leaves split files by
-/// byte range so a single file still feeds every partition. Memory plays no
+/// overlap. The pinned file count plays no part here; a Parquet leaf splits
+/// its files by byte range into these partitions, capped at the row groups
+/// left after file pruning when their footers are known. Memory plays no
 /// part: the query's limit bounds only what the partitions may hold.
 ///
 /// # Errors
@@ -4125,7 +4125,10 @@ impl OracleSessionShape {
     /// fits in one batch is then neither split nor round-robined, as it is for
     /// an exact count. The logical optimizer runs its rules once, not
     /// `DataFusion`'s default three passes: each pass walks the whole plan and
-    /// costs tens of microseconds on every query. The leader's planning and
+    /// costs tens of microseconds on every query. The optimizer does not split
+    /// file scans: an Oracle Parquet leaf splits itself, capped at the row
+    /// groups it can give work to, and a second split by the optimizer would
+    /// spread those row groups back over every target partition. The leader's planning and
     /// execution sessions, the follower's per-request session, and every
     /// distributed stage session route through this one function, so no path
     /// can silently drift onto defaults.
@@ -4145,6 +4148,7 @@ impl OracleSessionShape {
             .execution
             .use_row_number_estimates_to_optimize_partitioning = true;
         config.options_mut().optimizer.max_passes = 1;
+        config.options_mut().optimizer.repartition_file_scans = false;
         config
     }
 }
@@ -4278,24 +4282,32 @@ impl OracleExecution {
         self.shape.apply(config)
     }
 
-    /// Builds a default-featured session state for `config` under this grant:
-    /// the Oracle session for `config` (see
-    /// [`OracleSessionTemplate::session`]) with its
-    /// runtime swapped for the grant's, as `SessionContext` swaps a runtime.
+    /// Builds one session under this grant: the Oracle session state for
+    /// `config` (see [`OracleSessionTemplate::session`]), which plans and
+    /// decodes, and the task context that executes its plans on the grant's
+    /// runtime.
     ///
-    /// Sessions that need upstream's distributed
-    /// builder hooks compose [`Self::configure`] and [`Self::runtime`]
-    /// themselves; every other session under a grant is built here.
+    /// The state keeps the template's process runtime; only the task context
+    /// carries the grant's runtime, memory pool, and spill limit, and the task
+    /// context is all execution reads. Rebuilding the state around the
+    /// grant's runtime instead would re-register every built-in function on
+    /// every query. Sessions that need upstream's distributed builder hooks
+    /// compose [`Self::configure`] and [`Self::runtime`] themselves; every
+    /// other session under a grant is built here.
     #[must_use]
-    pub fn session_state(
+    pub fn session(
         &self,
         config: datafusion::execution::context::SessionConfig,
-    ) -> datafusion::execution::SessionState {
-        SessionStateBuilder::new_from_existing(
-            OracleSessionTemplate::shared().session(self.configure(config)),
-        )
-        .with_runtime_env(Arc::clone(&self.runtime))
-        .build()
+    ) -> (
+        datafusion::execution::SessionState,
+        Arc<datafusion::execution::TaskContext>,
+    ) {
+        let state = OracleSessionTemplate::shared().session(self.configure(config));
+        let task = Arc::new(
+            datafusion::execution::TaskContext::from(&state)
+                .with_runtime(Arc::clone(&self.runtime)),
+        );
+        (state, task)
     }
 }
 
@@ -4437,7 +4449,37 @@ fn host_memory_limit() -> Result<(usize, ResourceSource), BifrostResourceError> 
     Ok((bytes, ResourceSource::Host))
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Reads the host's physical memory from `sysctl -n hw.memsize`, so a
+/// server on macOS sizes itself without `WYRD_BIFROST_MEMORY_LIMIT_BYTES`.
+///
+/// The `sysctl` binary is used rather than `sysctlbyname` because this crate
+/// denies `unsafe`; it runs once at startup.
+///
+/// # Errors
+///
+/// Returns [`BifrostResourceError::Unavailable`] when `sysctl` cannot run,
+/// exits unsuccessfully, or prints no byte count.
+#[cfg(target_os = "macos")]
+fn host_memory_limit() -> Result<(usize, ResourceSource), BifrostResourceError> {
+    let unavailable = |detail: String| BifrostResourceError::Unavailable { detail };
+    let output = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .map_err(|error| unavailable(format!("host memory detection failed: {error}")))?;
+    if !output.status.success() {
+        return Err(unavailable(format!(
+            "host memory detection failed: sysctl exited with {}",
+            output.status
+        )));
+    }
+    let bytes = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| unavailable(format!("host memory total is unreadable: {error}")))?;
+    Ok((bytes, ResourceSource::Host))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn host_memory_limit() -> Result<(usize, ResourceSource), BifrostResourceError> {
     Err(BifrostResourceError::Unavailable {
         detail: "host memory probe is unavailable; set WYRD_BIFROST_MEMORY_LIMIT_BYTES".to_owned(),
@@ -6058,7 +6100,8 @@ mod tests {
 
         assert_eq!(execution.shape(), OracleSessionShape::new(local));
         assert_eq!(execution.target_partitions(), local);
-        let state = execution.session_state(datafusion::prelude::SessionConfig::new());
+        let (state, task) = execution.session(datafusion::prelude::SessionConfig::new());
+        assert!(Arc::ptr_eq(&task.runtime_env(), execution.runtime()));
         assert_eq!(
             state.config().batch_size(),
             datafusion::prelude::SessionConfig::new().batch_size(),

@@ -13,6 +13,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_client::QueueConfig;
 use wyrd_client::state::WyrdState;
+use wyrd_testing::capacity::driver_cpu_seconds;
 use wyrd_testing::release_server::{LocalServer, Metrics};
 
 use crate::Result;
@@ -102,13 +103,13 @@ pub struct Record {
     pub send_p99_seconds: Option<f64>,
     /// Client process CPU per durable row, microseconds.
     pub client_cpu_us_per_row: Option<f64>,
-    /// Server cgroup CPU per durable row, microseconds.
+    /// Server CPU per durable row, microseconds.
     pub server_cpu_us_per_row: Option<f64>,
     /// Every failed AC-041 check, empty when the step passes.
     pub failures: Vec<String>,
 }
 
-/// The Gate counters one `/metrics` scrape and the server cgroup report.
+/// The Gate counters one `/metrics` scrape reports, and the server's CPU.
 struct ServerSnapshot {
     /// Frames the Gate accepted.
     frames: f64,
@@ -116,7 +117,7 @@ struct ServerSnapshot {
     frame_bytes: f64,
     /// Cumulative Gate write-duration buckets.
     buckets: Vec<(f64, f64)>,
-    /// Server cgroup CPU, microseconds.
+    /// Server CPU, microseconds.
     cpu_usec: u64,
 }
 
@@ -135,7 +136,7 @@ impl ServerSnapshot {
                 "bifrost_gate_request_duration_seconds",
                 &["operation=\"write\""],
             ),
-            cpu_usec: server.cgroup_stat("cpu.stat", "usage_usec"),
+            cpu_usec: server.cpu_usec(),
         })
     }
 
@@ -199,7 +200,7 @@ impl Bench<'_> {
         let model = state.run_for_card("model")?;
 
         let server_before = ServerSnapshot::take(self.server).await?;
-        let client_cpu_before = client_cpu_seconds()?;
+        let client_cpu_before = driver_cpu_seconds();
         let stop = CancellationToken::new();
         let sampler = tokio::spawn(sample(state.clone(), stop.clone()));
 
@@ -230,7 +231,7 @@ impl Bench<'_> {
         let draining = Instant::now();
         state.flush().await?;
         let drain_seconds = draining.elapsed().as_secs_f64();
-        let client_cpu = client_cpu_seconds()? - client_cpu_before;
+        let client_cpu = driver_cpu_seconds() - client_cpu_before;
         state.shutdown().await?;
         drop(proxy);
 
@@ -383,27 +384,6 @@ fn slope(samples: &[(f64, usize)]) -> f64 {
     } else {
         covariance / variance
     }
-}
-
-/// This process's user plus system CPU, seconds, from `/proc/self/stat`.
-///
-/// # Errors
-///
-/// Returns an error when the file is unreadable or malformed.
-fn client_cpu_seconds() -> Result<f64> {
-    let stat = std::fs::read_to_string("/proc/self/stat")?;
-    let fields: Vec<&str> = stat
-        .rsplit_once(')')
-        .ok_or("malformed /proc/self/stat")?
-        .1
-        .split_whitespace()
-        .collect();
-    let ticks = |index: usize| -> Result<u64> {
-        Ok(fields.get(index).ok_or("short /proc/self/stat")?.parse()?)
-    };
-    // ponytail: assumes USER_HZ = 100, Linux's fixed userspace tick on every
-    // mainstream architecture; read sysconf(_SC_CLK_TCK) if that ever differs.
-    Ok((ticks(11)? + ticks(12)?) as f64 / 100.0)
 }
 
 /// The server's default gRPC listener, which the delay proxy fronts.

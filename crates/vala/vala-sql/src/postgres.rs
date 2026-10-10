@@ -6,7 +6,8 @@
 use std::time::Duration;
 
 use secrecy::ExposeSecret;
-use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::{PgPool, Postgres};
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::dsn::WYRD_APP_ROLE;
@@ -122,6 +123,23 @@ impl ValaPostgres {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Acquire one plain connection from the Vala application pool.
+    ///
+    /// For a tenant statement that binds its own tenant, such as an Oracle
+    /// cut, and so runs as one autocommit round trip with no transaction.
+    /// The acquisition is observed like [`Self::tenant_conn`]'s.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Connect`] when the pool cannot supply a connection.
+    pub async fn conn(&self) -> Result<PoolConnection<Postgres>, SqlError> {
+        let mut lifecycle = PoolAcquireLifecycle::begin(&self.pool);
+        let result = Box::pin(self.pool.acquire())
+            .await
+            .map_err(SqlError::Connect);
+        lifecycle.finish(&result);
+        result
     }
 
     /// Open a tenant-scoped transaction through the Vala application pool.

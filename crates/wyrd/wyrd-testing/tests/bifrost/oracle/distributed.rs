@@ -23,13 +23,10 @@ use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::reader::FileReader;
 use vala_bifrost_redux::catalog::{
     TableRef, TableUid, TenantTableBinding, inject_metadata_not_found_for_test,
-    reset_active_cut_acquisitions_for_test,
+    reset_cut_reads_for_test,
 };
 use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::oracle::planner::{
-    LeaderOwnershipEvent, take_leader_ownership_order_for_test,
-};
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, Oracle, iceberg_projection_probe};
 use vala_bifrost_redux::parquet::footer::tenant_key_value;
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
@@ -4393,13 +4390,12 @@ async fn settle_query(
     Ok(())
 }
 
-/// Proves the active cut is one tenant-scoped statement with one bounded retry.
+/// Proves the cut is one tenant-scoped statement with one bounded retry.
 ///
-/// Cold and warm queries over one table and over a two-table join each acquire
+/// Cold and warm queries over one table and over a two-table join each read
 /// their whole cut in exactly one statement. One injected metadata `NotFound`
-/// after acquisition costs exactly one reacquisition and the query succeeds; a
-/// second consecutive `NotFound` is terminal and releases the query's active
-/// reads. A caller not granted the table is refused before any metadata read,
+/// after the read costs exactly one reread and the query succeeds; a second
+/// consecutive `NotFound` is terminal. A caller not granted the table is refused before any metadata read,
 /// so an armed fault stays unconsumed. Another tenant's lookup of the same name
 /// fails exactly as a never-registered name does, exposing no identity.
 ///
@@ -4407,11 +4403,10 @@ async fn settle_query(
 /// Returns server, catalog, or harness errors.
 ///
 /// # Panics
-/// Panics when a statement count, outcome, retained read, or error differs.
+/// Panics when a statement count, outcome, or error differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
--> Result<(), JourneyError> {
+async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<(), JourneyError> {
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
     let left = unique_table("cut_left");
@@ -4423,7 +4418,7 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
         "SELECT l.id FROM vala.bifrost.{left} l JOIN vala.bifrost.{right} r ON l.id = r.id"
     );
 
-    reset_active_cut_acquisitions_for_test();
+    reset_cut_reads_for_test();
     for (case, sql) in [
         ("cold one-table", &one),
         ("warm one-table", &one),
@@ -4432,34 +4427,27 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
     ] {
         settle_query(&server, query_context(tenant)?, sql).await?;
         assert_eq!(
-            reset_active_cut_acquisitions_for_test(),
+            reset_cut_reads_for_test(),
             1,
-            "{case} acquires its whole cut in one statement"
+            "{case} reads its whole cut in one statement"
         );
     }
 
     inject_metadata_not_found_for_test(1);
     settle_query(&server, query_context(tenant)?, &join).await?;
     assert_eq!(
-        reset_active_cut_acquisitions_for_test(),
+        reset_cut_reads_for_test(),
         2,
-        "one missing metadata document costs exactly one reacquisition"
+        "one missing metadata document costs exactly one reread"
     );
 
     inject_metadata_not_found_for_test(2);
     let terminal = settle_query(&server, query_context(tenant)?, &one).await;
     assert!(terminal.is_err(), "a second NotFound is terminal");
     assert_eq!(
-        reset_active_cut_acquisitions_for_test(),
+        reset_cut_reads_for_test(),
         2,
         "the terminal NotFound is not retried again"
-    );
-    let binding =
-        TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, &left)))?;
-    assert_eq!(
-        server.oracle_active_table_reads_for_test(&binding).await?,
-        0,
-        "the failed query released its active reads"
     );
 
     // A grant for some other table identity does not cover this one; the
@@ -4496,7 +4484,7 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
     );
     settle_query(&server, query_context(tenant)?, &one).await?;
     assert_eq!(
-        reset_active_cut_acquisitions_for_test(),
+        reset_cut_reads_for_test(),
         3,
         "the refused query read no metadata, so the armed fault fell to the next query"
     );
@@ -4526,240 +4514,6 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
     );
     server.shutdown().await?;
     Ok(())
-}
-
-/// Leader pod of the held-cut journey's Analytical graph.
-const HELD_CUT_LEADER: usize = 0;
-
-/// Follower pod whose `ExecuteTask` the held-cut journey holds.
-const HELD_CUT_FOLLOWER: usize = 1;
-
-/// Scribe pod that ingests the held-cut journey's rows.
-const HELD_CUT_SCRIBE: usize = 3;
-
-/// Counts the active table reads one table holds on the shared database.
-///
-/// # Errors
-/// Returns a harness error when the pod is not running or the read fails.
-async fn active_reads(
-    cluster: &PeerCluster,
-    binding: &TenantTableBinding,
-) -> Result<i64, JourneyError> {
-    Ok(cluster
-        .server(HELD_CUT_LEADER)?
-        .oracle_active_table_reads_for_test(binding)
-        .await?)
-}
-
-/// Waits until one table holds no active read, since a dropped owner's release
-/// runs on a spawned task after the drop returns.
-///
-/// # Errors
-/// Returns an error naming `case` when a read remains after the bound, or a
-/// harness error when the count cannot be read.
-async fn await_no_active_reads(
-    cluster: &PeerCluster,
-    binding: &TenantTableBinding,
-    case: &str,
-) -> Result<(), JourneyError> {
-    let deadline = tokio::time::Instant::now() + LIVE_SETTLE_TIMEOUT;
-    loop {
-        let reads = active_reads(cluster, binding).await?;
-        if reads == 0 {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("{case}: {reads} active reads remain").into());
-        }
-        tokio::time::sleep(SETTLEMENT_INTERVAL).await;
-    }
-}
-
-/// Proves the leader revoked each recorded Analytical graph before its claim.
-///
-/// Drains this process's leader ownership log and, for every query whose
-/// graph recorded a revocation, requires that revocation to precede the first
-/// release of the same query's active-read claim. Both transitions are
-/// appended synchronously where they happen, so a claim released while a
-/// follower grant or local driver is still owned is recorded first and fails
-/// here. `expected` is the number of Analytical graphs `case` must have
-/// produced, so a case that never reached a graph cannot pass vacuously.
-///
-/// # Errors
-/// Returns an error naming `case` when a graph count differs from `expected`,
-/// a claim release precedes its graph's revocation, or a revoked graph's
-/// claim never began releasing.
-fn assert_graphs_revoked_before_claims(case: &str, expected: usize) -> Result<(), JourneyError> {
-    let order = take_leader_ownership_order_for_test();
-    let position = |query: uuid::Uuid, event: LeaderOwnershipEvent| {
-        order
-            .iter()
-            .position(|recorded| *recorded == (query, event))
-    };
-    let graphs: BTreeSet<uuid::Uuid> = order
-        .iter()
-        .filter(|(_, event)| *event == LeaderOwnershipEvent::GraphRevoked)
-        .map(|(query, _)| *query)
-        .collect();
-    if graphs.len() != expected {
-        return Err(format!(
-            "{case}: {} Analytical graphs were revoked, not {expected}: {order:?}",
-            graphs.len()
-        )
-        .into());
-    }
-    for query in graphs {
-        let revoked = position(query, LeaderOwnershipEvent::GraphRevoked);
-        let released = position(query, LeaderOwnershipEvent::ClaimReleaseStarted)
-            .ok_or_else(|| format!("{case}: query {query} never released its claim: {order:?}"))?;
-        if revoked.is_none_or(|revoked| revoked > released) {
-            return Err(format!(
-                "{case}: query {query} released its claim before revoking its graph: {order:?}"
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-/// Proves one inseparable cut-and-claim owner holds active reads to the end.
-///
-/// An Analytical graph whose follower task is held keeps its single active
-/// read; releasing the follower lets the query finish, and the read is already
-/// gone when the caller receives the terminal frame. A caller that drops the
-/// query while that follower is still held releases its read once the drop
-/// reaches the owner. A caller that drops an already returned stream releases
-/// its read the same way. A query dropped at its post-pin boundary — after the
-/// claim committed but before any owner received it — releases its row too.
-/// In every case with a graph, the leader's ownership log shows that graph
-/// revoked every follower and local driver before its claim began releasing.
-///
-/// # Errors
-/// Returns cluster, ingest, or query errors.
-///
-/// # Panics
-/// Panics when an active read is released before its last descendant settles
-/// or survives a completed terminal; returns an error when a dropped owner or
-/// pin never releases its row.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(), JourneyError> {
-    let mut cluster = PeerCluster::start_with_slots(&[
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Scribe, None),
-    ])
-    .await?;
-    let tenant = cluster.tenant();
-    let table = unique_table("held_cut");
-    cluster.register_table(HELD_CUT_SCRIBE, &table).await?;
-    // Two published objects give the grouped statement remote work.
-    cluster
-        .ingest_rows(HELD_CUT_SCRIBE, &table, 0, 12, 3)
-        .await?;
-    cluster
-        .ingest_rows(HELD_CUT_SCRIBE, &table, 0, 12, 3)
-        .await?;
-    cluster.refresh_snapshots().await?;
-    let binding = TenantTableBinding::resolve((
-        tenant,
-        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Bifrost, &table),
-    ))?;
-    let engine = cluster
-        .server(HELD_CUT_LEADER)?
-        .state()
-        .bifrost_query()
-        .map(|query| Arc::clone(query.engine()))
-        .ok_or("the leader pod composes no Oracle")?;
-    let request = BifrostQueryRequest {
-        sql: format!(
-            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
-             GROUP BY filter_key ORDER BY filter_key"
-        ),
-        deadline_ms: None,
-    };
-
-    drop(vala_bifrost_redux::oracle::planner::take_leader_ownership_order_for_test());
-    // Success: the follower is held, so the graph cannot produce its first
-    // batch; once it is let go, the terminal arrives only after the read was
-    // released. The query runs inside the join because its first batch waits
-    // on the held follower.
-    cluster.arm_execute_pause(HELD_CUT_FOLLOWER)?;
-    let drain = async {
-        let mut stream = engine
-            .query_sql(query_context(tenant)?, request.clone())
-            .await?;
-        let mut class = None;
-        while let Some(frame) = futures_util::StreamExt::next(&mut stream.frames).await {
-            if let wyrd_spec::vala::api::QueryStreamFrame::Terminal(terminal) = frame? {
-                assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
-                assert_eq!(
-                    active_reads(&cluster, &binding).await?,
-                    0,
-                    "the read is released before the terminal frame is emitted"
-                );
-                class = Some(terminal.query_class);
-            }
-        }
-        Ok::<_, JourneyError>(class)
-    };
-    let hold = async {
-        cluster.await_execute_paused(HELD_CUT_FOLLOWER).await?;
-        assert_eq!(
-            active_reads(&cluster, &binding).await?,
-            1,
-            "a graph with a held follower keeps its one active read"
-        );
-        cluster.release_execute_pause(HELD_CUT_FOLLOWER)?;
-        Ok::<(), JourneyError>(())
-    };
-    let (class, ()) = tokio::try_join!(drain, hold)?;
-    assert_eq!(class, Some(QueryClass::Analytical));
-    assert_graphs_revoked_before_claims("a settled query", 1)?;
-
-    // Caller drop: dropping the query while its follower still reads releases
-    // the row; nothing can consume a result from the dropped leader.
-    let leader_baseline = cluster.ownership_snapshot(HELD_CUT_LEADER)?;
-    cluster.arm_execute_pause(HELD_CUT_FOLLOWER)?;
-    tokio::select! {
-        result = engine.query_sql(query_context(tenant)?, request.clone()) => {
-            return Err(format!("the held graph returned early: {:?}", result.map(|_| ())).into());
-        }
-        paused = cluster.await_execute_paused(HELD_CUT_FOLLOWER) => paused?,
-    }
-    cluster.release_execute_pause(HELD_CUT_FOLLOWER)?;
-    await_baseline(&cluster, HELD_CUT_LEADER, leader_baseline).await?;
-    await_no_active_reads(&cluster, &binding, "a dropped caller").await?;
-    assert_graphs_revoked_before_claims("a dropped caller", 1)?;
-
-    // Stream drop: the caller received the leader stream and drops it unread,
-    // so the stream's own owner collapses the graph and then the claim.
-    let stream = engine
-        .query_sql(query_context(tenant)?, request.clone())
-        .await?;
-    drop(stream);
-    await_no_active_reads(&cluster, &binding, "a dropped stream").await?;
-    assert_graphs_revoked_before_claims("a dropped stream", 1)?;
-
-    // Drop at the post-pin boundary: the claim committed but no owner
-    // received it, and the dropped pin still releases it.
-    let context = query_context(tenant)?;
-    cluster.arm_preparation_pause(HELD_CUT_LEADER, &context.request_id)?;
-    tokio::select! {
-        result = engine.query_sql(context, request) => {
-            return Err(format!("the paused query returned: {:?}", result.map(|_| ())).into());
-        }
-        () = async {
-            while cluster.preparation_pause_deadline(HELD_CUT_LEADER).is_none() {
-                tokio::task::yield_now().await;
-            }
-        } => {}
-    }
-    cluster.release_preparation_pause(HELD_CUT_LEADER)?;
-    await_no_active_reads(&cluster, &binding, "a dropped pin").await?;
-    assert_graphs_revoked_before_claims("a dropped pin", 0)?;
-    cluster.shutdown().await
 }
 
 /// Rows the held-query journey writes into each of its two hot objects.
@@ -4891,28 +4645,30 @@ async fn held_query_ids(
 /// Proves a held query owns its exact hot objects through promotion and rewrite.
 ///
 /// The query pins a cut of two Scribe hot files, then is held at its post-pin
-/// boundary with its active table read committed. While held, those same
-/// objects are promoted unchanged and their `file_list` rows become terminal,
-/// a small-files rewrite publishes one distinct replacement object and
-/// snapshot, and a leader maintenance pass — expiration, expired cleanup, and
-/// orphan cleanup — destroys nothing. Released, the query returns
-/// every row exactly once and the original paths still exist. Once its read is
-/// gone and an ordinary append moves the head off the rewrite (whose lineage
-/// root names the replaced snapshot), the next maintenance passes expire the
-/// replaced snapshot and delete exactly the original objects and their
-/// terminal `file_list` rows, while the replacement survives. No Forge clock
-/// is advanced.
+/// boundary, recording nothing. While held, those same objects are promoted
+/// unchanged and their `file_list` rows become terminal, a small-files rewrite
+/// publishes one distinct replacement object and snapshot, and a leader
+/// maintenance pass — expiration, expired cleanup, and orphan cleanup —
+/// destroys nothing, because the replaced snapshot is inside the retention
+/// window. Released, the query returns every row exactly once and the original
+/// paths still exist. Once an ordinary append moves the head off the rewrite
+/// (whose lineage root names the replaced snapshot) and the window has passed,
+/// the next maintenance passes expire the replaced snapshot and delete exactly
+/// the original objects and their terminal `file_list` rows, while the
+/// replacement survives. No Forge clock is advanced; the window's passing is
+/// the recorded supersessions backdated in `PostgreSQL`.
 ///
 /// # Errors
 /// Returns cluster, ingest, catalog, query, or SQL errors.
 ///
 /// # Panics
-/// Panics when any destructive step runs while the read is held, the query
-/// returns other than each row once, or cleanup deletes anything but the
-/// original objects.
+/// Panics when any destructive step runs inside the window, the query returns
+/// other than each row once, or cleanup deletes anything but the original
+/// objects.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(), JourneyError> {
+async fn held_query_survives_cleanup_until_the_retention_window_passes() -> Result<(), JourneyError>
+{
     let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         BifrostClusterSpec::one_mixed(),
         ForgeConfig::default(),
@@ -5009,11 +4765,6 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         })
         .await
         .map_err(|_| "the query never reached its post-pin hold")?;
-        assert_eq!(
-            server.oracle_active_table_reads_for_test(&binding).await?,
-            1,
-            "the held query owns one active table read over the hot cut"
-        );
 
         // Promotion appends the same objects unchanged and settles their rows.
         promotion.release_paused_before_commit();
@@ -5065,12 +4816,12 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
             "the rewrite published a distinct Forge object: {replacement}"
         );
 
-        // Every destructive path refuses while the read is held.
+        // Every destructive path keeps the replaced snapshot inside the window.
         held_query_maintenance_pass(server).await?;
         let held = held_query_live_files(catalog.as_ref(), &binding).await?;
         assert!(
             held.1.contains(&promoted_snapshot),
-            "snapshot expiration keeps the replaced snapshot while the read is held"
+            "snapshot expiration keeps the replaced snapshot inside the window"
         );
         for original in &originals {
             assert!(
@@ -5080,7 +4831,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
             assert_eq!(
                 held_query_file_row(&cluster, tenant, &table, original).await?,
                 Some((true, true)),
-                "{original}'s terminal file_list row survives while the read is held"
+                "{original}'s terminal file_list row survives inside the window"
             );
         }
         pause.release();
@@ -5092,11 +4843,6 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         ids,
         (1..=HELD_QUERY_OBJECTS * HELD_QUERY_ROWS).collect::<Vec<_>>(),
         "the held query returns every row exactly once"
-    );
-    assert_eq!(
-        server.oracle_active_table_reads_for_test(&binding).await?,
-        0,
-        "the settled query released its active table read"
     );
 
     // The rewrite head still names its base snapshot as lineage, which keeps
@@ -5126,10 +4872,15 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     .await
     .map_err(|_| "the later object never promoted beside the replacement")??;
 
-    // After the last reader, ordinary maintenance destroys only the originals.
+    // Past the window, ordinary maintenance destroys only the originals. Each
+    // pass first ages every supersession Forge has recorded so far.
+    let past_window = ForgeConfig::default().snapshot_retention + Duration::from_secs(60);
     let deleted = tokio::time::timeout(HELD_QUERY_TRANSITION_BOUND, async {
         for original in &originals {
             while cluster.object_exists(original).await? {
+                server
+                    .age_snapshot_supersessions_for_test(tenant, past_window)
+                    .await?;
                 held_query_maintenance_pass(server).await?;
             }
         }
@@ -5150,7 +4901,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         .await?;
         let live = held_query_live_files(catalog.as_ref(), &binding).await?;
         return Err(format!(
-            "an original object was never deleted after release: originals={originals:?} \
+            "an original object was never deleted after the window: originals={originals:?} \
              live={live:?} tasks={tasks:?}"
         )
         .into());
@@ -5158,7 +4909,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     let after = held_query_live_files(catalog.as_ref(), &binding).await?;
     assert!(
         !after.1.contains(&promoted_snapshot),
-        "the replaced snapshot expired after the last reader"
+        "the replaced snapshot expired after the window"
     );
     assert!(
         cluster.object_exists(&replacement).await?,

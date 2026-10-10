@@ -3450,32 +3450,33 @@ impl WyrdTestServer {
             .map_err(sql)
     }
 
-    /// Counts the active Oracle table reads one table currently holds.
+    /// Backdates every recorded snapshot supersession of one tenant by `age`.
     ///
-    /// Reads `vala.oracle_active_table_reads` under tenant RLS by the
-    /// registered table UID and ends the read transaction before returning, so
-    /// inspection holds no maintenance lock and never discards an abandoned
-    /// row.
+    /// Snapshot retention is measured in `PostgreSQL` time from Forge's first
+    /// observation of a replaced snapshot, which a journey cannot advance;
+    /// moving the recorded observation back is the equivalent. Runs on the
+    /// fixture superuser because the table is tenant-scoped under RLS.
     ///
     /// # Errors
-    /// Returns a harness SQL error when the table is unregistered or the read
-    /// transaction fails.
-    pub async fn oracle_active_table_reads_for_test(
+    /// Returns a harness SQL error when the superuser pool or the update fails.
+    pub async fn age_snapshot_supersessions_for_test(
         &self,
-        binding: &TenantTableBinding,
-    ) -> Result<i64, WyrdTestServerError> {
-        let mut conn = self.tenant_conn_for(binding.tenant).await?;
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.oracle_active_table_reads r \
-             JOIN vala.bifrost_tables t ON t.table_uid = r.table_uid \
-             WHERE t.fqn = $1",
+        tenant: DataTenantId,
+        age: Duration,
+    ) -> Result<(), WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let millis = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+        sqlx::query(
+            "UPDATE vala.forge_snapshot_supersessions \
+                SET observed_at = observed_at - $2 * interval '1 millisecond' \
+              WHERE data_tenant_id = $1",
         )
-        .bind(binding.table_ref.fqn())
-        .fetch_one(&mut **conn.transaction())
+        .bind(tenant.as_uuid())
+        .bind(millis)
+        .execute(&pool)
         .await
         .map_err(sql)?;
-        conn.commit().await.map_err(sql)?;
-        Ok(count)
+        Ok(())
     }
 
     /// Return the durable Scribe WAL root this fixture composed the server with.

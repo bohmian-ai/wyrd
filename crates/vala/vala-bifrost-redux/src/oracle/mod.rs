@@ -29,7 +29,6 @@ use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_sql::ValaPostgres;
-use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
 use wyrd_runtime::{DelegationStep, Permission, PermissionScope, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
@@ -72,6 +71,7 @@ pub use exec::iceberg_projection_probe;
 pub use exec::{remote_partition_attempts_for_test, reset_remote_partition_attempts_for_test};
 pub mod follower;
 mod live;
+mod memtable_source;
 #[cfg(test)]
 mod nested_pushdown;
 #[cfg(feature = "test-support")]
@@ -79,6 +79,7 @@ pub use live::live_source_batches_for_test;
 mod participant_cut;
 pub mod peer;
 pub mod planner;
+mod profile;
 mod query_stream;
 mod running;
 pub(crate) mod spill;
@@ -120,7 +121,6 @@ pub use participant_cut::{
     OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryAttemptRoster,
     OracleQueryParticipant,
 };
-use planner::ActiveReadClaim;
 pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
 pub use query_stream::QueryStreamLifecycle;
@@ -268,130 +268,6 @@ pub struct OracleRuntimeInspection {
     pub peer_running: u64,
     /// Analytical graph grants held open by a leader's admit stream.
     pub held_grants: u64,
-}
-
-/// Per-phase stopwatch for one SQL attempt after planning completes.
-///
-/// A single attempt total cannot distinguish real execution from time spent
-/// queued for admission, and those two call for opposite fixes: queueing is an
-/// admission-sizing problem, execution is a planning or parallelism problem.
-/// Splitting admit, audit-and-drain, and execute makes the dominant cost
-/// attributable from a single log line.
-///
-/// Elapsed values are cumulative from construction; each phase method converts
-/// its slice by subtracting the phases already recorded.
-struct AttemptPhaseTimer {
-    /// Monotonic origin, taken once planning has produced its cuts.
-    started_at: Instant,
-    /// Milliseconds spent acquiring admission.
-    admit_ms: u128,
-    /// Milliseconds spent auditing the cut and draining live tails.
-    drained_ms: u128,
-}
-
-impl AttemptPhaseTimer {
-    /// Starts the stopwatch for one attempt.
-    fn started() -> Self {
-        Self {
-            started_at: Instant::now(),
-            admit_ms: 0,
-            drained_ms: 0,
-        }
-    }
-
-    /// Records the admission phase as complete.
-    fn admitted(&mut self) {
-        self.admit_ms = self.started_at.elapsed().as_millis();
-    }
-
-    /// Records the audit-and-drain phase as complete.
-    fn drained(&mut self) {
-        self.drained_ms = self
-            .started_at
-            .elapsed()
-            .as_millis()
-            .saturating_sub(self.admit_ms);
-    }
-
-    /// Emits the three phase durations, deriving execution from the remainder.
-    fn emit(&self) {
-        tracing::debug!(
-            admit_ms = self.admit_ms,
-            drained_ms = self.drained_ms,
-            execute_ms = self
-                .started_at
-                .elapsed()
-                .as_millis()
-                .saturating_sub(self.admit_ms)
-                .saturating_sub(self.drained_ms),
-            "Oracle SQL attempt phase timings"
-        );
-    }
-}
-
-/// Closed set of Oracle query phases timed into `oracle_query_phase_seconds`.
-///
-/// Each phase is one named performance boundary of the leader or one remote
-/// fragment, timed once per occurrence. The leader phases (`snapshot_pin`,
-/// `scribe_listing`, `provider_setup`, `physical_planning`, `admission`) run
-/// one after another and do not overlap. The peer phases describe one remote
-/// fragment each and run concurrently with other fragments; `peer_first_frame`
-/// and `peer_terminal` both start when the fragment opened, so they are
-/// latencies, not additive steps. Total query time is
-/// `oracle_query_duration_seconds`, never a sum of phases. Only the phase is a
-/// label; the request identity stays on the enclosing trace span.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum QueryPhase {
-    /// Pinning the catalog snapshot and hot-file cut.
-    SnapshotPin,
-    /// Establishing a new authenticated channel to one peer.
-    PeerConnect,
-    /// Opening one remote fragment until the peer accepts the stream.
-    PeerOpen,
-    /// Receiving the first frame of one opened remote fragment.
-    PeerFirstFrame,
-    /// Draining one opened remote fragment to its end.
-    PeerTerminal,
-    /// Listing live Scribe streams on the frozen roster.
-    ScribeListing,
-    /// Registering the pinned cut's table providers.
-    ProviderSetup,
-    /// Planning the one physical root from SQL.
-    PhysicalPlanning,
-    /// Acquiring query admission.
-    Admission,
-}
-
-impl QueryPhase {
-    /// Returns the stable metric label for this phase.
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::SnapshotPin => "snapshot_pin",
-            Self::PeerConnect => "peer_connect",
-            Self::PeerOpen => "peer_open",
-            Self::PeerFirstFrame => "peer_first_frame",
-            Self::PeerTerminal => "peer_terminal",
-            Self::ScribeListing => "scribe_listing",
-            Self::ProviderSetup => "provider_setup",
-            Self::PhysicalPlanning => "physical_planning",
-            Self::Admission => "admission",
-        }
-    }
-
-    /// Records the time elapsed since `started` for this phase.
-    ///
-    /// Emits one histogram sample and one DEBUG event inside the current
-    /// span, which carries the request identity.
-    pub(crate) fn record(self, started: Instant) {
-        let elapsed = started.elapsed();
-        metrics::histogram!("oracle_query_phase_seconds", "phase" => self.as_str())
-            .record(elapsed.as_secs_f64());
-        tracing::debug!(
-            phase = self.as_str(),
-            elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
-            "Oracle query phase"
-        );
-    }
 }
 
 /// Namespace of the Oracle's production metric emitters.
@@ -896,6 +772,12 @@ pub struct OracleBuildConfig {
 /// It covers planning, queueing, and execution for both query classes.
 pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_hours(2);
 
+/// Longest total query deadline a caller may request.
+///
+/// Forge's snapshot retention is never shorter than this, so a query always
+/// finishes before the snapshot it read can expire.
+pub const MAX_QUERY_DEADLINE: Duration = Duration::from_hours(6);
+
 /// Local Oracle limits and bounded lifecycle settings.
 #[derive(Debug, Clone, Copy)]
 pub struct OracleConfig {
@@ -903,6 +785,8 @@ pub struct OracleConfig {
     pub max_sql_bytes: usize,
     /// Total query deadline applied when the caller supplies none.
     pub default_deadline: Duration,
+    /// Longest total query deadline; a larger request is clamped to it.
+    pub max_deadline: Duration,
     /// Fixed pod-local per-tenant Interactive slot-unit cap.
     pub tenant_interactive_slots: u32,
     /// Fixed pod-local per-tenant Analytical slot-unit cap; zero disables the class.
@@ -933,6 +817,7 @@ impl Default for OracleConfig {
         Self {
             max_sql_bytes: DEFAULT_MAX_SQL_BYTES,
             default_deadline: DEFAULT_QUERY_DEADLINE,
+            max_deadline: MAX_QUERY_DEADLINE,
             tenant_interactive_slots: 12,
             tenant_analytical_slots: 4,
             max_workers_per_query: 2,
@@ -1018,35 +903,15 @@ struct CutExecution {
 ///
 /// Pinned once per query and carried straight into the physical build, so the
 /// catalog is read once rather than once to size the query and again to run it.
-/// It is only ever created inside a [`ClaimedSqlCut`], whose claim keeps every
-/// table here protected from destructive maintenance.
+/// Every table here stays readable for the query's deadline because Forge
+/// retains a replaced snapshot for at least the maximum query deadline.
 pub struct PlannedSqlCut {
     /// Exact immutable table cuts.
     cuts: Vec<PinnedSealedTable>,
     /// Fraction of pinned sealed bytes in the local hot tier.
     local_ratio: f64,
-}
-
-/// The inseparable cut-and-claim owner one query attempt starts from.
-///
-/// Its fields are private to Oracle. The pair is split only by
-/// [`Oracle::run_sql_query`], whose frame keeps the claim until the attempt
-/// either hands it to the returned stream or has settled every descendant and
-/// releases it, and by the test-support Analytical lease, which releases it.
-pub struct ClaimedSqlCut {
-    /// The immutable cut every provider is built from.
-    cut: PlannedSqlCut,
-    /// This query's committed active reads on every table of `cut`.
-    claim: ActiveReadClaim,
-}
-
-impl ClaimedSqlCut {
-    /// Releases this attempt's active reads after a refusal before execution.
-    ///
-    /// Only valid while nothing built from the cut exists.
-    async fn release(self) {
-        self.claim.release().await;
-    }
+    /// This attempt's execution profile, shared with the returned stream.
+    profile: Arc<profile::QueryProfile>,
 }
 
 /// Borrowed inputs for staging the read decision and binding its sources.
@@ -1084,9 +949,6 @@ struct SqlAttemptInput<'a> {
     roster: OracleQueryAttemptRoster,
     /// Catalog snapshot already pinned in this process for this attempt.
     prepared: PlannedSqlCut,
-    /// The attempt's active-read claim, held by the caller's frame until the
-    /// returned stream takes it.
-    active_reads: &'a mut Option<ActiveReadClaim>,
 }
 
 /// Inputs for the pre-admission half of one attempt.
@@ -1665,18 +1527,9 @@ impl Oracle {
         BifrostError,
     > {
         let deadline_ms = self.capture_query_deadline(&request)?;
-        let (
-            roster,
-            ClaimedSqlCut {
-                cut: prepared,
-                claim,
-            },
-        ) = self
+        let (roster, prepared) = self
             .prepare_query_attempt(&context, &request, deadline_ms)
             .await?;
-        // A leased attempt is returned at rest and reads nothing here; the
-        // test that drives it owns whatever it executes afterwards.
-        claim.release().await;
         let deadline = instant_deadline(roster.deadline())?;
         let ClassifiedAttempt {
             planned,
@@ -1698,14 +1551,7 @@ impl Oracle {
             return Err(BifrostError::OracleRoleUnavailable);
         };
         let (mut admitted, running_query) = self
-            .admit_built_attempt(
-                &context,
-                &planned,
-                &participant_cut,
-                query_class,
-                deadline,
-                &mut AttemptPhaseTimer::started(),
-            )
+            .admit_built_attempt(&context, &planned, &participant_cut, query_class, deadline)
             .await?;
         let (session, ownership) = handle.lease_session(analytical::AnalyticalLeaseInputs {
             attempt: &attempt,
@@ -1762,7 +1608,7 @@ impl Oracle {
         context: &AuthorizedQueryContext,
         request: &BifrostQueryRequest,
         absolute_deadline_ms: i64,
-    ) -> Result<(OracleQueryAttemptRoster, ClaimedSqlCut), BifrostError> {
+    ) -> Result<(OracleQueryAttemptRoster, PlannedSqlCut), BifrostError> {
         let tables = self.validate_query(request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
@@ -1783,42 +1629,21 @@ impl Oracle {
             uuid::Uuid::parse_str(context.request_id.as_str())
                 .map_err(|_| BifrostError::QueryExecutionFailed)?,
         );
-        let fencing_token = i64::try_from(self.admission.local_role.fencing_token)
-            .map_err(|_| BifrostError::OracleRoleUnavailable)?;
         let snapshot = self.cluster.snapshot();
-        let pin_started = Instant::now();
         let planned = self
             .planner
-            .pin_cut(
-                context,
-                &tables,
-                deadline,
-                &self.catalog,
-                ActiveReadOwner {
-                    query_id: attempt_id.as_uuid(),
-                    node_id: self.admission.local_role.key.node_id.as_uuid(),
-                    fencing_token,
-                },
-            )
+            .pin_cut(context, &tables, deadline, &self.catalog)
             .await?;
-        QueryPhase::SnapshotPin.record(pin_started);
-        // Every refusal from here on owns a committed claim no descendant can
-        // read yet, so it releases the claim before it returns.
         #[cfg(feature = "test-support")]
         let held = self
             .hold_preparation_pause(context, deadline, wall_deadline)
             .await;
         #[cfg(not(feature = "test-support"))]
         let held = Ok(());
-        match held.and_then(|()| {
+        let roster = held.and_then(|()| {
             self.freeze_pinned_attempt(&snapshot, attempt_id, deadline, wall_deadline)
-        }) {
-            Ok(roster) => Ok((roster, planned)),
-            Err(error) => {
-                planned.release().await;
-                Err(error)
-            }
-        }
+        })?;
+        Ok((roster, planned))
     }
 
     /// Holds a pinned attempt at the test-support post-pin preparation pause.
@@ -1916,11 +1741,6 @@ impl Oracle {
     /// only submit a new logical query. Gate attaches its own request lifecycle
     /// to the returned stream afterwards rather than through this path.
     ///
-    /// The cut's active-read claim is split off and held in this frame: the
-    /// returned stream takes it and releases it at its terminal, and a failed
-    /// attempt — which settles every descendant before it returns — has it
-    /// released here before the error is returned.
-    ///
     /// # Errors
     /// Returns the same stable query, catalog, admission, visibility, audit,
     /// timeout, or execution errors as [`Self::query_sql`].
@@ -1940,38 +1760,7 @@ impl Oracle {
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
         roster: OracleQueryAttemptRoster,
-        prepared: ClaimedSqlCut,
-    ) -> Result<OracleQueryStream, BifrostError> {
-        let ClaimedSqlCut { cut, claim } = prepared;
-        let mut active_reads = Some(claim);
-        let result = self
-            .run_claimed_query(context, request, roster, cut, &mut active_reads)
-            .await;
-        // A failed attempt has settled every descendant before returning, so
-        // its claim is released here unless the stream already took it.
-        if result.is_err()
-            && let Some(claim) = active_reads
-        {
-            claim.release().await;
-        }
-        result
-    }
-
-    /// Runs the leader's checks and its one attempt while the caller holds the
-    /// attempt's active-read claim.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::OracleRoleUnavailable`] when this node is not
-    /// ready, [`BifrostError::QueryPeerSecurity`] when the roster does not name
-    /// this node and request, and otherwise the attempt's own terminal error.
-    async fn run_claimed_query(
-        &self,
-        context: AuthorizedQueryContext,
-        request: BifrostQueryRequest,
-        roster: OracleQueryAttemptRoster,
         prepared: PlannedSqlCut,
-        active_reads: &mut Option<ActiveReadClaim>,
     ) -> Result<OracleQueryStream, BifrostError> {
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
@@ -1983,30 +1772,18 @@ impl Oracle {
             return Err(BifrostError::QueryPeerSecurity);
         }
         let deadline = instant_deadline(roster.deadline())?;
-        // Phase timing at DEBUG: `oracle_query_duration_seconds` reports only a
-        // total, which cannot separate a slow catalog pin from a slow fan-out.
-        // This is the leader entry every public query passes through, so it is
-        // where pre-fragment latency is attributable.
-        let attempt_started = std::time::Instant::now();
         let mut query_telemetry = None;
-        let stream = self
-            .run_sql_attempt(
-                SqlAttemptInput {
-                    context: &context,
-                    request: &request,
-                    deadline,
-                    roster,
-                    prepared,
-                    active_reads,
-                },
-                &mut query_telemetry,
-            )
-            .await?;
-        tracing::debug!(
-            attempt_ms = attempt_started.elapsed().as_millis(),
-            "Oracle leader opened one query stream"
-        );
-        Ok(stream)
+        self.run_sql_attempt(
+            SqlAttemptInput {
+                context: &context,
+                request: &request,
+                deadline,
+                roster,
+                prepared,
+            },
+            &mut query_telemetry,
+        )
+        .await
     }
 
     /// Derives one candidate's immutable Analytical identity from the attempt.
@@ -2068,9 +1845,8 @@ impl Oracle {
         participant_cut: &OracleQueryAttemptCut,
         query_class: QueryClass,
         deadline: Instant,
-        phases: &mut AttemptPhaseTimer,
     ) -> Result<(AdmittedQueryGuard, RunningQueryTerminalOwner), BifrostError> {
-        let admission_started = Instant::now();
+        let admission = planned.profile.admission.timer();
         let mut admitted = self
             .admit_sql_query(
                 context,
@@ -2080,8 +1856,7 @@ impl Oracle {
                 participant_cut.attempt_id(),
             )
             .await?;
-        QueryPhase::Admission.record(admission_started);
-        phases.admitted();
+        admission.done();
         // Projected before any later transfer, never after: a selected
         // Analytical attempt moves this query's envelope out of the guard and
         // into the graph that owns it, and every physical projection is an
@@ -2158,8 +1933,9 @@ impl Oracle {
         audit: CutAuditInput<'_>,
         retained: &RetainedPhysicalPlan,
         cut_deadline: DateTime<Utc>,
-        phases: &mut AttemptPhaseTimer,
+        profile: &profile::QueryProfile,
     ) -> Result<Arc<OracleExecutionLock>, BifrostError> {
+        let _audit_bind = profile.audit_bind.timer();
         let admitted = audit.admitted;
         let deadline = audit.deadline;
         let sources = PlannedSources {
@@ -2169,7 +1945,6 @@ impl Oracle {
             live_listing_lost: retained.live_listing_lost,
         };
         self.audit_read_decision(audit)?;
-        phases.drained();
         self.bind_execution_sources(&retained.config, admitted, cut_deadline, deadline, &sources)
     }
 
@@ -2199,7 +1974,6 @@ impl Oracle {
             deadline,
             roster,
             prepared,
-            active_reads,
         } = input;
         let ClassifiedAttempt {
             planned,
@@ -2217,16 +1991,8 @@ impl Oracle {
                 query_telemetry,
             })
             .await?;
-        let mut phases = AttemptPhaseTimer::started();
         let (mut admitted, running_query) = self
-            .admit_built_attempt(
-                context,
-                &planned,
-                &participant_cut,
-                query_class,
-                deadline,
-                &mut phases,
-            )
+            .admit_built_attempt(context, &planned, &participant_cut, query_class, deadline)
             .await?;
         if let Some(telemetry) = query_telemetry.as_mut() {
             telemetry.admitted();
@@ -2243,7 +2009,7 @@ impl Oracle {
             },
             &retained,
             participant_cut.deadline(),
-            &mut phases,
+            &planned.profile,
         ) {
             Ok(bound) => bound,
             Err(error) => return release_error(deadline, admitted, error, "source rejection"),
@@ -2251,6 +2017,7 @@ impl Oracle {
         // Retained here only until execution: an Analytical query moves this
         // owner onto its graph, and what is left is what the stream still owes.
         let mut running_query = Some(running_query);
+        planned.profile.retain_root(&retained.root);
         let mut execution = match self
             .execute_retained_root(RetainedExecutionInput {
                 retained,
@@ -2264,10 +2031,7 @@ impl Oracle {
             })
             .await
         {
-            Ok(execution) => {
-                phases.emit();
-                execution
-            }
+            Ok(execution) => execution,
             Err(error) => {
                 return release_error(deadline, admitted, error, "execution rejection");
             }
@@ -2278,7 +2042,8 @@ impl Oracle {
         }
         let settlement = AttemptSettlement::new(deadline, &participant_cut);
         let output = AttemptOutput::new(execution, admitted, running_query);
-        settle_attempt_output(output, settlement, query_telemetry, active_reads).await
+        let profile = Arc::clone(&planned.profile);
+        settle_attempt_output(output, settlement, query_telemetry, profile).await
     }
 
     /// Executes the one retained root, graphless or on the Analytical graph.
@@ -2320,11 +2085,11 @@ impl Oracle {
                 .zip(analytical)
                 .ok_or(BifrostError::OracleRoleUnavailable)?,
             QueryClass::Interactive => {
-                let session = admitted.execution_session(config)?;
+                let task = admitted.execution_task(config)?;
                 let scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
                 let schema = root.schema();
-                let batches = execute_stream(root, session.task_ctx())
-                    .map_err(|error| map_datafusion_error(&error))?;
+                let batches =
+                    execute_stream(root, task).map_err(|error| map_datafusion_error(&error))?;
                 let batches = self.audit_tenant_refusal(context, batches);
                 return Ok(CutExecution {
                     schema,
@@ -2868,9 +2633,9 @@ impl Oracle {
     ) -> Result<RetainedPhysicalPlan, BifrostError> {
         let cuts = planned.cuts.as_slice();
         let target_partitions = self.admission.session_partitions(planned.local_ratio)?;
-        let listing_started = Instant::now();
+        let listing = planned.profile.scribe_listing.timer();
         let live = self.discover_live_routes(roster, cuts, deadline).await?;
-        QueryPhase::ScribeListing.record(listing_started);
+        listing.done();
         let oracles = roster.oracles();
         #[cfg(feature = "test-support")]
         record_physical_build(&roster.fingerprint());
@@ -2884,10 +2649,10 @@ impl Oracle {
         let planning = SessionContext::new_with_state(
             session::OracleSessionTemplate::shared().session(config),
         );
-        let providers_started = Instant::now();
+        let providers = planned.profile.provider_setup.timer();
         self.register_cut_providers(&planning, context, cuts, &live.tables)
             .await?;
-        QueryPhase::ProviderSetup.record(providers_started);
+        providers.done();
         let planning = match self.analytical.as_ref() {
             Some(handle) => handle.planning_session(&planning, oracles)?,
             None => planning,
@@ -2896,7 +2661,7 @@ impl Oracle {
         if self.take_analytical_plan_failure() {
             return Err(BifrostError::QueryExecutionFailed);
         }
-        let planning_started = Instant::now();
+        let physical_planning = planned.profile.physical_planning.timer();
         // Planning reads manifests and Parquet footers, so it runs under the
         // query deadline like every other read.
         let root = tokio::time::timeout_at(
@@ -2906,7 +2671,7 @@ impl Oracle {
         .await
         .map_err(|_| BifrostError::QueryTimeout)?
         .map_err(|OracleExecutionError::Public(error)| error)?;
-        QueryPhase::PhysicalPlanning.record(planning_started);
+        physical_planning.done();
         Ok(RetainedPhysicalPlan {
             config: planning.copied_config(),
             root,
@@ -3685,13 +3450,13 @@ impl AttemptSettlement {
 /// Returns [`BifrostError::QueryTimeout`] when the first batch does not arrive
 /// before the deadline, [`BifrostError::QueryExecutionFailed`] for a stale first
 /// batch or a missing telemetry guard, and the mapped first-batch failure
-/// otherwise. Only a returned stream takes `active_reads`; every error leaves
-/// the claim with the caller, which releases it after this settlement.
+/// otherwise. A returned stream holds `profile` until its terminal, so the
+/// profile is emitted only after every descendant settles.
 async fn settle_attempt_output(
     output: AttemptOutput,
     settle: AttemptSettlement,
     query_telemetry: &mut Option<QueryTelemetryGuard>,
-    active_reads: &mut Option<ActiveReadClaim>,
+    profile: Arc<profile::QueryProfile>,
 ) -> Result<OracleQueryStream, BifrostError> {
     let AttemptOutput {
         schema,
@@ -3777,9 +3542,7 @@ async fn settle_attempt_output(
         // `with_gate_lifecycle`; nothing on the attempt path owns one.
         gate_lifecycle: None,
         running_query,
-        // Taken only here, by the stream that releases it at its terminal;
-        // every failure above leaves it with the caller to release.
-        active_reads: active_reads.take(),
+        profile: Some(profile),
     }))
 }
 
@@ -4035,19 +3798,23 @@ mod tests {
     }
 
     /// Omitted, zero, and negative budgets fall back to the default; a positive
-    /// budget is honored exactly.
+    /// budget is honored up to the maximum and clamped above it.
     ///
     /// # Panics
     ///
     /// Panics when an omitted, zero, or negative budget does not resolve to the
-    /// configured default, or when a positive budget is not honored exactly.
+    /// configured default, when a positive budget under the maximum is not
+    /// honored exactly, or when one over the maximum is not clamped to it.
     #[test]
     fn request_deadline_projects_unusable_budgets_to_the_default() {
         let default = Duration::from_secs(30);
+        let max = Duration::from_secs(60);
         let planner = OraclePlanner::new(OracleConfig {
             default_deadline: default,
+            max_deadline: max,
             ..OracleConfig::default()
         });
+        assert_eq!(planner.request_deadline(Some(60_001)), max);
         assert_eq!(planner.request_deadline(None), default);
         assert_eq!(planner.request_deadline(Some(0)), default);
         assert_eq!(planner.request_deadline(Some(-5)), default);

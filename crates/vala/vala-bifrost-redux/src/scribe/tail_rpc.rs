@@ -7,7 +7,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::record_batch::RecordBatch;
 #[cfg(feature = "test-support")]
 use datafusion::physical_plan::SendableRecordBatchStream;
 use wyrd_spec::ids::DataTenantId;
@@ -321,6 +320,9 @@ pub struct HotBatch {
     pub generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
     /// Arrow rows projected to the request's required columns.
     pub rows: arrow::record_batch::RecordBatch,
+    /// Exact bounds of `rows`, column for column, computed when the rows
+    /// were appended; the follower prunes the batch with them.
+    pub statistics: std::sync::Arc<datafusion::common::Statistics>,
 }
 
 /// One opened Scribe live read: its bounded memtable cut and the staged runs
@@ -355,13 +357,13 @@ impl LiveTailBatches {
         }
     }
 
-    /// Splits the read into its memtable rows, the unserved staged run paths
-    /// in merge order, and the lease keeping those runs on disk.
+    /// Splits the read into its memtable batches, the unserved staged run
+    /// paths in merge order, and the lease keeping those runs on disk.
     ///
     /// The caller must hold the lease for as long as it reads any run path.
     #[must_use]
-    pub(crate) fn into_parts(self) -> (Vec<RecordBatch>, Vec<PathBuf>, Option<StagedSourceLease>) {
-        let rows = self.memtable.into_iter().map(|batch| batch.rows).collect();
+    pub(crate) fn into_parts(self) -> (Vec<HotBatch>, Vec<PathBuf>, Option<StagedSourceLease>) {
+        let rows = self.memtable;
         let runs = self
             .unserved
             .into_iter()
@@ -636,6 +638,7 @@ impl FetchLiveTailService {
                 partition_day: readable.partition_day,
                 generation: readable.generation,
                 rows: readable.batch,
+                statistics: readable.statistics,
             })
             .collect())
     }
@@ -928,7 +931,7 @@ pub(crate) mod tests {
         let (rows, runs, _lease) = read.into_parts();
         let mut values = rows
             .iter()
-            .flat_map(first_column_values)
+            .flat_map(|batch| first_column_values(&batch.rows))
             .collect::<Vec<_>>();
         for run in runs {
             let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(

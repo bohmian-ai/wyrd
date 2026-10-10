@@ -345,12 +345,10 @@ impl Forge {
     ///
     /// The pre-checks run on the leader: a processing compaction without an
     /// observed snapshot skips the table, one with a snapshot holds the chain
-    /// from the current snapshot down to it, and a table with no other
-    /// replaced snapshot skips, as does a table an Oracle query is reading.
-    /// The recorded expiry attempt then re-derives
-    /// its selection from durable roots — running attempts, claims, and
-    /// unresolved operations — and preparation refuses while an Oracle query
-    /// still reads the table. An unconsumed handoff from an earlier
+    /// from the current snapshot down to it, and a table with no unheld
+    /// replaced snapshot past the retention window skips. The recorded expiry
+    /// attempt then re-derives its selection from durable roots — running
+    /// attempts, claims, unresolved operations, and the retention window. An unconsumed handoff from an earlier
     /// failed cleanup is drained first, so a retry deletes only what is still
     /// proven unreachable.
     ///
@@ -377,8 +375,11 @@ impl Forge {
                 false
             }
             watermark => {
-                expiry_due(&table, watermark.flatten())
-                    && !self.table_is_read(key.tenant, &binding.table_ref).await?
+                let unheld = unheld_snapshots(&table, watermark.flatten());
+                !unheld.is_empty()
+                    && self
+                        .any_past_retention(key.tenant, &binding.table_ref, &table, &unheld)
+                        .await?
             }
         };
         let Some(task) = self
@@ -393,38 +394,50 @@ impl Forge {
         self.clean_expired(executor, key, stop).await
     }
 
-    /// Reports whether an Oracle query is reading one table, so the leader
-    /// records no expiry attempt that preparation would only refuse.
+    /// Reports whether any of `unheld` has been replaced for longer than the
+    /// retention window.
     ///
-    /// Advisory only: a refused attempt would stay the table's active attempt
-    /// until its retry, delaying the first pass after the last reader. The
-    /// authoritative check is preparation's own refusal under the table's
-    /// maintenance authority. Commits so abandoned reads it discards stay
-    /// discarded.
+    /// Records first observations of every replaced snapshot exactly as the
+    /// expiry pass does, so a snapshot's window starts at the first pass that
+    /// sees it replaced even when no task is planned. Planning a task only
+    /// when something is past the window keeps every planned task one that
+    /// changes the table, so the next plan is never an idempotent duplicate
+    /// of one that retained everything. The expiry pass rechecks the window
+    /// under the table's exclusive authority before deleting anything.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Sql`] when the transaction or statements fail and
-    /// [`ForgeError::Invariant`] when the table is unregistered.
-    async fn table_is_read(
+    /// Returns SQL errors from the tenant connection or the statement.
+    async fn any_past_retention(
         &self,
         tenant: DataTenantId,
         table_ref: &TableRef,
+        table: &Table,
+        unheld: &[i64],
     ) -> Result<bool, ForgeError> {
+        let current = table.metadata().current_snapshot_id();
+        let replaced = table
+            .metadata()
+            .snapshots()
+            .map(|snapshot| snapshot.snapshot_id())
+            .filter(|id| Some(*id) != current)
+            .collect::<Vec<_>>();
         let mut conn = self
             .core
             .vala
             .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let active = super::table_authority::TableAuthority::new(&mut conn)
-            .has_active_reads(tenant, table_ref)
+        let retained = super::table_authority::TableAuthority::new(&mut conn)
+            .retained_supersessions(
+                tenant,
+                table_ref,
+                &replaced,
+                self.core.config.snapshot_retention,
+            )
             .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        if active {
-            tracing::info!(table = %table_ref.fqn(), "Forge expiry deferred: an Oracle query is reading the table");
-        }
-        Ok(active)
+        Ok(unheld.iter().any(|id| !retained.contains(id)))
     }
 
     /// Builds the recorded expiry attempt for one table, when one is due.
@@ -606,15 +619,15 @@ impl Forge {
 /// table no longer retains skips the table. This is only the leader's
 /// pre-check: the recorded attempt re-derives its selection from every
 /// durable root before preparing anything.
-fn expiry_due(table: &Table, watermark: Option<i64>) -> bool {
+fn unheld_snapshots(table: &Table, watermark: Option<i64>) -> Vec<i64> {
     let metadata = table.metadata();
     let Some(current) = metadata.current_snapshot_id() else {
-        return false;
+        return Vec::new();
     };
     let mut held = HashSet::from([current]);
     if let Some(snapshot_id) = watermark {
         if metadata.snapshot_by_id(snapshot_id).is_none() {
-            return false;
+            return Vec::new();
         }
         let mut cursor = metadata
             .snapshot_by_id(current)
@@ -630,7 +643,9 @@ fn expiry_due(table: &Table, watermark: Option<i64>) -> bool {
     }
     metadata
         .snapshots()
-        .any(|snapshot| !held.contains(&snapshot.snapshot_id()))
+        .map(|snapshot| snapshot.snapshot_id())
+        .filter(|id| !held.contains(id))
+        .collect()
 }
 
 /// Builds the orphan-cleanup attempt for one table at one fixed cut.

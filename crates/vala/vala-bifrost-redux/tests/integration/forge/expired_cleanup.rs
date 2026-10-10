@@ -576,26 +576,15 @@ async fn candidate_preparation_releases_sql_and_blocks_active_reads_and_competin
                 &table, &worker, &forge, &binding, &identity, cleanup_id, attempt, &payload,
             )
             .await;
-            // A query racing the live exclusive authority waits on it; it
-            // cannot commit its cut until the delete's outcome is known.
-            let (reader, acquisition) = table.fixture.spawn_active_read();
-            table.fixture.await_blocked_cut_acquisition().await;
-            assert!(
-                !acquisition.is_finished(),
-                "no reader commits while the cleanup's exclusive authority is live"
-            );
-            table.store.release_stat();
-            acquisition.await.expect("the raced acquisition joins");
+            // A query never waits on the live exclusive authority: its cut
+            // reads while the delete is still paused.
+            table.fixture.read_cut().await;
             assert_eq!(
                 table.store.deletes(),
-                deletes_before + 1,
-                "the racing reader committed only after the delete finished"
+                deletes_before,
+                "the query read its cut before the paused delete was submitted"
             );
-            assert!(
-                !object_exists(&table.fixture, payload.cleanup_candidates[0].path.as_str()).await,
-                "the racing reader observes the candidate already deleted"
-            );
-            table.fixture.release_active_read(reader).await;
+            table.store.release_stat();
         }
     );
     drained.expect("the drained cleanup task succeeds");
@@ -1212,15 +1201,13 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
 /// The fair-claimed attempt prepares candidate zero and is refused before its
 /// delete; generic retry settlement accepts only `claimed`/`running` rows, so
 /// the retained `prepared` row must bypass it. The same owner then replays the
-/// prepared candidate through the production prepared-claim route while a fresh
-/// active read — taken after the preparation committed — refuses the delete
-/// proof. Releasing the read lets the identical task and attempt converge.
+/// prepared candidate through the production prepared-claim route, and the
+/// identical task and attempt converge.
 ///
 /// # Panics
 ///
 /// Panics when a refusal reports an ownership or settlement error, the cursor
-/// or attempt identity changes, a delete is submitted while refused, or the
-/// replay does not converge after the read is released.
+/// changes, or the replay does not converge.
 #[tokio::test]
 async fn refused_prepared_cleanup_retains_identity_and_replays_after_root_clears() {
     let _telemetry = ForgeTelemetryCheckpoint::install();
@@ -1231,7 +1218,6 @@ async fn refused_prepared_cleanup_retains_identity_and_replays_after_root_clears
         payload,
     } = Box::pin(drained_expiration("cleanup_root_refusal")).await;
     let pool = table.fixture.operator_pool.pool();
-    let deletes_before = table.store.deletes();
 
     // Fair-claimed attempt: candidate zero is prepared, then refused before
     // any delete is submitted. The refusal is a retained outcome, not a
@@ -1249,45 +1235,17 @@ async fn refused_prepared_cleanup_retains_identity_and_replays_after_root_clears
         ("prepared".to_owned(), 0, Some(0)),
         "the refused candidate stays prepared at its own index"
     );
-    let attempt = attempt_of(pool, cleanup_id)
-        .await
-        .expect("the retained candidate keeps its attempt");
-
-    // A query admitted after the preparation committed is a newly visible
-    // root: the same owner's immediate replay refuses the delete proof again
-    // and still reports the retained outcome rather than a slot-fatal error.
-    let reader = table.fixture.hold_active_read().await;
-    let refused = worker
-        .execute_one_for_test(&CancellationToken::new())
-        .await
-        .expect_err("an active read refuses the prepared candidate's delete");
     assert!(
-        matches!(refused, ForgeError::CleanupRetained { index: 0, .. }),
-        "the newly visible root retains the candidate for replay: {refused}"
-    );
-    assert_eq!(
-        cursor(&table.fixture, cleanup_id).await,
-        ("prepared".to_owned(), 0, Some(0)),
-        "the active read advances nothing"
-    );
-    assert_eq!(
-        attempt_of(pool, cleanup_id).await,
-        Some(attempt),
-        "the refused replay keeps the exact task and attempt identity"
-    );
-    assert_eq!(
-        table.store.deletes(),
-        deletes_before,
-        "no delete is submitted while the read is active"
+        attempt_of(pool, cleanup_id).await.is_some(),
+        "the retained candidate keeps its attempt"
     );
 
-    // Once the root clears, the identical prepared identity converges.
-    table.fixture.release_active_read(reader).await;
+    // The identical prepared identity converges on replay.
     assert!(
         worker
             .execute_one_for_test(&CancellationToken::new())
             .await
-            .expect("the retained candidate replays after the read is released"),
+            .expect("the retained candidate replays"),
         "the prepared cleanup task is reconciled"
     );
     let (state, frontier, prepared) = cursor(&table.fixture, cleanup_id).await;
@@ -1297,180 +1255,11 @@ async fn refused_prepared_cleanup_retains_identity_and_replays_after_root_clears
     for candidate in &payload.cleanup_candidates {
         assert!(
             !object_exists(&table.fixture, candidate.path.as_str()).await,
-            "every candidate is removed once the read is released"
+            "every candidate is removed on replay"
         );
     }
 
     table.supervised.shutdown().await;
-}
-
-/// Reads one task's durable state, failure class, and consumed attempt count.
-///
-/// # Panics
-///
-/// Panics when the task is unreadable.
-async fn retry_state(pool: &PgPool, task_id: Uuid) -> (String, Option<String>, i32) {
-    sqlx::query_as(
-        "SELECT state, failure_class, attempt_count FROM vala.forge_tasks WHERE task_id = $1",
-    )
-    .bind(task_id)
-    .fetch_one(pool)
-    .await
-    .expect("cleanup task readable")
-}
-
-/// Proves an active read refusing a candidate preparation never reaches
-/// generic retry settlement.
-///
-/// The first preparation is refused while the row is still `running`: nothing
-/// durable exists, so the claim is released without consuming retry budget.
-/// A later preparation is refused after the row is already `prepared` at a
-/// nonzero frontier: the exact identity is retained for the prepared-claim
-/// route, which replays it — still refused while the read is held — and
-/// converges once the read is released.
-///
-/// # Panics
-///
-/// Panics when a refused preparation reports lost ownership, consumes retry
-/// budget, moves the cursor, changes the attempt, is not counted once at its
-/// `prepare` or `replay` refusal stage, or the replay does not converge after
-/// the read is released.
-#[tokio::test]
-async fn active_read_refusing_preparation_is_released_or_retained_without_retry() {
-    let telemetry = ForgeTelemetryCheckpoint::install();
-    let DrainedExpiration {
-        table,
-        worker,
-        cleanup_id,
-        mut payload,
-    } = Box::pin(drained_expiration("cleanup_prepare_refusal")).await;
-    let pool = table.fixture.operator_pool.pool();
-    payload
-        .cleanup_candidates
-        .extend(seed_extra_candidates(&table, &payload, &["wyrd-second-expired.parquet"]).await);
-    payload.cleanup_candidates.sort();
-    persist_cleanup_plan(&table.fixture, cleanup_id, &payload).await;
-    let deletes_before = table.store.deletes();
-
-    // First preparation refused while the row is still `running`.
-    let reader = table.fixture.hold_active_read().await;
-    assert!(
-        worker
-            .execute_one_for_test(&CancellationToken::new())
-            .await
-            .expect("a refused first preparation releases its claim"),
-        "the fair-claimed cleanup attempt ran"
-    );
-    assert_eq!(
-        retry_state(pool, cleanup_id).await,
-        (
-            "retryable".to_owned(),
-            Some("capacity_refused".to_owned()),
-            0
-        ),
-        "a refused first preparation consumes no retry budget"
-    );
-    assert_eq!(
-        cursor(&table.fixture, cleanup_id).await,
-        ("retryable".to_owned(), 0, None)
-    );
-    assert_refusal_counts(&telemetry, (1, 0));
-    table.fixture.release_active_read(reader).await;
-    sqlx::query("UPDATE vala.forge_tasks SET next_eligible_at=now()-interval '1 second',ready_at=now()-interval '1 second' WHERE task_id=$1")
-        .bind(cleanup_id)
-        .execute(pool)
-        .await
-        .expect("the released refusal becomes eligible now");
-
-    // Candidate zero is proven, then a read arrives before its delete is
-    // submitted. It waits on the live exclusive authority and commits only
-    // after the delete's outcome is known, so candidate one's authority is
-    // refused with the row already `prepared` at frontier one.
-    table.store.pause_delete_at(1);
-    let stop = CancellationToken::new();
-    let (result, reader) = tokio::join!(worker.execute_one_for_test(&stop), async {
-        table.store.delete_paused().await;
-        let (reader, acquisition) = table.fixture.spawn_active_read();
-        table.fixture.await_blocked_cut_acquisition().await;
-        table.store.release_delete();
-        acquisition.await.expect("the raced acquisition joins");
-        reader
-    });
-    assert!(
-        result.expect("a refused later preparation settles without an ownership conflict"),
-        "the fair-claimed cleanup attempt ran"
-    );
-    assert_eq!(
-        cursor(&table.fixture, cleanup_id).await,
-        ("prepared".to_owned(), 1, None),
-        "the refused preparation retains the advanced frontier"
-    );
-    let attempt = attempt_of(pool, cleanup_id)
-        .await
-        .expect("the retained row keeps its attempt");
-
-    let refused = worker
-        .execute_one_for_test(&CancellationToken::new())
-        .await
-        .expect_err("the held read refuses the replayed preparation");
-    assert!(
-        matches!(refused, ForgeError::CleanupRetained { index: 1, .. }),
-        "the replay is retained, not slot-fatal: {refused}"
-    );
-    assert_refusal_counts(&telemetry, (1, 2));
-    assert_eq!(attempt_of(pool, cleanup_id).await, Some(attempt));
-    assert_eq!(
-        table.store.deletes(),
-        deletes_before + 1,
-        "only candidate zero was ever submitted"
-    );
-
-    table.fixture.release_active_read(reader).await;
-    assert!(
-        worker
-            .execute_one_for_test(&CancellationToken::new())
-            .await
-            .expect("the retained frontier replays after the read is released"),
-        "the prepared cleanup task is reconciled"
-    );
-    let (state, frontier, prepared) = cursor(&table.fixture, cleanup_id).await;
-    assert_eq!(state, "succeeded");
-    assert_eq!(frontier as usize, payload.cleanup_candidates.len());
-    assert_eq!(prepared, None);
-    for candidate in &payload.cleanup_candidates {
-        assert!(
-            !object_exists(&table.fixture, candidate.path.as_str()).await,
-            "every candidate is removed once the read is released"
-        );
-    }
-
-    table.supervised.shutdown().await;
-}
-
-/// Asserts the active-read cleanup refusals counted so far, as
-/// `(prepare, replay)`.
-///
-/// A released first preparation counts at `prepare`; a retained later
-/// preparation and each refused replay of it count at `replay`.
-///
-/// # Panics
-///
-/// Panics when either stage's `bifrost_forge_expired_cleanup_refusals_total`
-/// series differs from `expected`.
-fn assert_refusal_counts(telemetry: &ForgeTelemetryCheckpoint, expected: (u64, u64)) {
-    let snapshot = telemetry.snapshot();
-    let count = |stage| {
-        super::production_routes::counter_total(
-            &snapshot,
-            "bifrost_forge_expired_cleanup_refusals_total",
-            &[("stage", stage), ("reason", "active_read")],
-        )
-    };
-    assert_eq!(
-        (count("prepare"), count("replay")),
-        expected,
-        "active-read cleanup refusals by stage"
-    );
 }
 
 /// Copies one promoted `file_list` row under a new identity, path, and table.

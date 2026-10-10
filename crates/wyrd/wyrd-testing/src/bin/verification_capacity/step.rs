@@ -20,6 +20,7 @@ use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use wyrd_testing::capacity::{ResourceWindow, Resources, driver_cpu_seconds};
+use wyrd_testing::profile::{Capture, Profile};
 use wyrd_testing::release_server::LocalServer;
 
 use crate::Result;
@@ -28,7 +29,10 @@ use crate::evidence::{Queue, RunTally, Scrapes, ServerStats};
 use crate::fixture::{Kind, Tenant};
 use crate::judge::Judge;
 use crate::load::{Lane, MAX_IN_FLIGHT, Mode, Tally, TenantClients};
-use crate::profile::{Capture, Profile};
+
+/// Sampling frequency of a replica capture, hertz: low, so a long
+/// multi-replica step's sample count stays bounded.
+const PROFILE_HERTZ: u32 = 99;
 
 /// Longest a step may take to drain before its backlog is reported.
 const DRAIN_LIMIT: Duration = Duration::from_secs(300);
@@ -299,7 +303,12 @@ impl Deployment {
             let directory = root
                 .join(format!("{}-replicas-{}", plan.name(), self.replicas.len()))
                 .join(format!("replica-{}", replica.ordinal()));
-            captures.push(Capture::start(pid, replica.ordinal(), &directory)?);
+            captures.push(Capture::start(
+                pid,
+                replica.ordinal(),
+                PROFILE_HERTZ,
+                &directory,
+            )?);
         }
         Ok(captures)
     }

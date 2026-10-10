@@ -442,7 +442,7 @@ impl std::fmt::Display for StagingClaimId {
 /// longer would cost more than the smaller object does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimCause {
-    /// The ready prefix reached the configured encoded target.
+    /// The ready prefix reached the configured raw-byte target.
     Target,
     /// The oldest ready member exceeded the configured maximum dwell.
     Dwell,

@@ -851,8 +851,8 @@ fn extract_detail_phase(detail: &AuditDetail) -> Result<ForgeOperationPhase, Sql
 ///
 /// 1. the current live Forge table lease row (fence assertion),
 /// 2. the exact task/attempt/current-owner row,
-/// 3. the table maintenance-authority row that serializes reader widening
-///    against destructive maintenance for one tenant-qualified table,
+/// 3. the table maintenance-authority row that serializes Forge's destructive
+///    protocols on one tenant-qualified table,
 /// 4. the operation state row (advisory lock, then `FOR UPDATE`),
 /// 5. the claim rows for that operation.
 ///
@@ -864,8 +864,8 @@ impl ForgeOperations<'_> {
     /// Atomically prepares one snapshot-expiration selection.
     ///
     /// `exclusive` is the caller's live table authority: holding it is what
-    /// proves no Oracle read exists and none can be admitted, and the caller
-    /// keeps holding it through the Iceberg effect this preparation precedes.
+    /// proves no other Forge protocol is destroying on this table, and the
+    /// caller keeps holding it through the Iceberg effect this preparation precedes.
     /// This transaction therefore never locks the authority row itself — it
     /// would wait on the caller's own lock — and only verifies the capability
     /// covers the request's exact tenant and table.
@@ -1514,10 +1514,10 @@ async fn lock_expiration_task(
 }
 
 /// Takes the table's maintenance-authority row, the one-row-per-table boundary
-/// that gives reader widening and destructive maintenance a single winner.
+/// that serializes Forge's destructive protocols on one table.
 ///
-/// Shared by every fenced Forge maintenance workflow that must exclude reader
-/// widening for the duration of its own transaction.
+/// Shared by every fenced Forge maintenance workflow that must exclude another
+/// destructive protocol for the duration of its own transaction.
 ///
 /// # Errors
 /// Returns [`SqlError::Conflict`] when the table has no authority row or its
@@ -1578,47 +1578,6 @@ pub(crate) fn require_exclusive_authority(
         &table.namespace_name,
         &table.table_name,
     )
-}
-
-/// Discards one table's abandoned active reads and reports whether any
-/// active read remains.
-///
-/// The caller's tenant-bound transaction must already hold the table's
-/// maintenance-authority row in a mode that excludes cut acquisition
-/// (`FOR UPDATE` or `FOR NO KEY UPDATE`), so the answer stays true for the
-/// rest of that transaction. A row is abandoned once PostgreSQL time has
-/// passed its `abandon_after`, the owning query's deadline bound at
-/// acquisition; a live query releases its own rows before then. The
-/// abandonment delete commits with the caller's transaction.
-///
-/// # Errors
-///
-/// Returns [`SqlError`] when either statement fails.
-pub(crate) async fn active_table_reads_exist(
-    tx: &mut Transaction<'_, Postgres>,
-    identity: &TableAuthorityIdentity,
-) -> Result<bool, SqlError> {
-    sqlx::query(
-        r"
-        DELETE FROM vala.oracle_active_table_reads r
-         WHERE r.data_tenant_id = wyrd.current_tenant()
-           AND r.table_uid = $1
-           AND r.abandon_after <= statement_timestamp()
-        ",
-    )
-    .bind(identity.table_uid.as_slice())
-    .execute(&mut **tx)
-    .await
-    .map_err(SqlError::from)?;
-    let active: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM vala.oracle_active_table_reads \
-         WHERE data_tenant_id = wyrd.current_tenant() AND table_uid = $1)",
-    )
-    .bind(identity.table_uid.as_slice())
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(SqlError::from)?;
-    Ok(active)
 }
 
 /// Returns the exact ascending snapshot selection carried by a snapshot-expiry

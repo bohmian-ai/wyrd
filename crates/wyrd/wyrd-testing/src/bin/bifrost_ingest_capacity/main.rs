@@ -2,7 +2,7 @@
 //!
 //! An operator starts one release `wyrd-server` the way the
 //! local-development guide says (`migrate`, serve, `setup`) over the RustFS
-//! emulator. The tenant administrator registers a Service whose one
+//! emulator, on the whole host. The tenant administrator registers a Service whose one
 //! component is a Model and issues its key; the application hydrates the
 //! bundle and emits Drift observations of [`step::FEATURES`] numeric
 //! features through one `WyrdState` at a fixed open-loop rate.
@@ -19,7 +19,8 @@
 //!
 //! The report in `target/bifrost-ingest-capacity/` carries achieved rate,
 //! refusals, client bytes, drain time, durable rows, batch count and mean
-//! size, Gate write latency, and client and server CPU per row. Run through
+//! size, Gate write latency, and client and server CPU per row, under the
+//! host fingerprint its `envelope` records. Run through
 //! `mise run bench:bifrost:ingest-capacity`. Exits nonzero when any gating
 //! check fails.
 
@@ -34,7 +35,7 @@ use std::time::Duration;
 use clap::Parser;
 use wyrd_client::QueueConfig;
 use wyrd_testing::capacity::{install_tracing, release_binary};
-use wyrd_testing::release_server::{CPUS, Envelope, LocalServer, MEMORY_BYTES};
+use wyrd_testing::release_server::{LocalServer, Placement};
 
 use fixture::Tenant;
 use step::{Bench, Plan, Record};
@@ -97,7 +98,7 @@ async fn benchmark(cli: Cli) -> Result<bool> {
             cli.storage_endpoint_url.as_str(),
         ),
     ];
-    let server = LocalServer::start(&binary, &["m0"], &env, Envelope::POD).await?;
+    let server = LocalServer::start(&binary, &["m0"], &env, Placement::Host).await?;
     let setup = server
         .tenants()
         .first()
@@ -155,6 +156,12 @@ async fn benchmark(cli: Cli) -> Result<bool> {
         eprintln!("{}", line(&record));
         records.push(record);
     }
+    let envelope = serde_json::json!({
+        "cpus": server.cpus(),
+        "memory_bytes": server.memory_limit_bytes(),
+        "host": server.describe(),
+        "seconds": cli.seconds,
+    });
     let shutdown = server
         .stop(&output.join("server.log"))
         .map_err(|error| error.to_string());
@@ -173,7 +180,7 @@ async fn benchmark(cli: Cli) -> Result<bool> {
         output.join("report.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "passed": passed,
-            "envelope": { "cpus": CPUS, "memory_bytes": MEMORY_BYTES, "seconds": cli.seconds },
+            "envelope": envelope,
             "default_max_in_flight": default_in_flight,
             "smallest_passing_max_in_flight": smallest_passing,
             "shutdown_seconds": shutdown,

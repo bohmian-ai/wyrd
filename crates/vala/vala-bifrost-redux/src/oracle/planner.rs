@@ -1,12 +1,11 @@
 //! SQL planning owner for Oracle's immutable visibility cut.
 //!
-//! Planning validates read-only requests, records the query's active table
-//! reads and pins tenant-qualified metadata under one deadline, and builds
+//! Planning validates read-only requests, reads the query's cut and pins
+//! tenant-qualified metadata under one deadline, and builds
 //! session-local providers without performing admission, audit, or row
 //! execution side effects. The query class is derived
 //! later from the physical root alone, so nothing here classifies.
 
-use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,13 +13,10 @@ use num_traits::ToPrimitive;
 
 use super::*;
 use super::{
-    AuthorizedQueryContext, BifrostCatalog, BifrostCatalogError, BifrostError, ClaimedSqlCut,
-    PlannedSqlCut, TableRef,
+    AuthorizedQueryContext, BifrostCatalog, BifrostCatalogError, BifrostError, PlannedSqlCut,
+    TableRef,
 };
 use crate::catalog::{PinnedSealedTable, TableUid, TenantTableBinding};
-use uuid::Uuid;
-use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
-use wyrd_spec::DataTenantId;
 
 /// Query floor and logical-plan preparation owner.
 ///
@@ -67,208 +63,90 @@ impl OraclePlanner {
 
     /// Projects one request's `deadline_ms` to the total budget it runs under.
     ///
-    /// A positive value is honored exactly and uncapped. An omitted, zero, or
-    /// negative value takes this planner's configured default, so every entry
-    /// that owns a planner built from the boot-resolved configuration — local
-    /// Oracle entry and public forwarding alike — resolves the same budget.
+    /// A positive value is honored up to this planner's maximum deadline and
+    /// clamped to it above. An omitted, zero, or negative value takes the
+    /// configured default, so every entry that owns a planner built from the
+    /// boot-resolved configuration — local Oracle entry and public forwarding
+    /// alike — resolves the same budget. The maximum is what Forge's snapshot
+    /// retention is sized against, so no query outlives the snapshot it read.
     #[must_use]
     pub fn request_deadline(&self, requested_ms: Option<i64>) -> Duration {
         requested_ms
             .and_then(|deadline_ms| u64::try_from(deadline_ms).ok())
             .filter(|deadline_ms| *deadline_ms != 0)
             .map_or(self.config.default_deadline, Duration::from_millis)
-    }
-}
-
-/// One query's committed active table reads.
-///
-/// Created only by [`OraclePlanner::pin_cut`] after its acquisition statement
-/// commits, and carried inside [`ClaimedSqlCut`] and then the query's terminal
-/// owner. Terminal settlement awaits [`Self::release`]; a claim dropped
-/// without it (an abandoned stream or a cancelled query) spawns the same
-/// release on the current runtime. Rows a crashed node never released stay
-/// protective until `PostgreSQL` time passes their query deadline.
-pub(crate) struct ActiveReadClaim {
-    /// Catalog owning the tenant-scoped active-read statements.
-    catalog: Arc<BifrostCatalog>,
-    /// Tenant whose RLS scopes the rows.
-    tenant: DataTenantId,
-    /// Durable query identity the rows are keyed by.
-    query_id: Uuid,
-    /// Whether [`Self::release`] already ran, so drop skips its own release.
-    released: bool,
-}
-
-impl fmt::Debug for ActiveReadClaim {
-    /// Prints the claim's identity without its catalog handle.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ActiveReadClaim")
-            .field("query_id", &self.query_id)
-            .finish_non_exhaustive()
-    }
-}
-
-/// One leader-side ownership transition, recorded in order for test journeys.
-///
-/// Journeys read the order through [`take_leader_ownership_order_for_test`] to
-/// prove a query's active-read claim begins releasing only after its
-/// Analytical graph revoked every follower and stopped every local driver.
-#[cfg(feature = "test-support")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LeaderOwnershipEvent {
-    /// The query's Analytical graph dropped every participant grant and joined
-    /// or aborted every local driver.
-    GraphRevoked,
-    /// The query's active-read claim began its release.
-    ClaimReleaseStarted,
-}
-
-/// Process-wide ordered log of [`LeaderOwnershipEvent`]s keyed by query id.
-///
-/// Test-support only: appended synchronously at each transition, so the
-/// recorded order is the order the transitions happened in on this process.
-#[cfg(feature = "test-support")]
-static LEADER_OWNERSHIP_ORDER: std::sync::Mutex<Vec<(Uuid, LeaderOwnershipEvent)>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// Appends one transition for `query_id` to the test-support ordering log.
-///
-/// A poisoned log records nothing; the journey reading it then fails on the
-/// missing event rather than this owner panicking.
-#[cfg(feature = "test-support")]
-pub(crate) fn record_leader_ownership(query_id: Uuid, event: LeaderOwnershipEvent) {
-    if let Ok(mut order) = LEADER_OWNERSHIP_ORDER.lock() {
-        order.push((query_id, event));
-    }
-}
-
-/// Drains every leader ownership transition recorded on this process so far.
-///
-/// Returned in the order the transitions happened, each tagged with the query
-/// id that is both the Analytical graph's public id and the claim's owner id.
-#[cfg(feature = "test-support")]
-#[must_use]
-pub fn take_leader_ownership_order_for_test() -> Vec<(Uuid, LeaderOwnershipEvent)> {
-    LEADER_OWNERSHIP_ORDER
-        .lock()
-        .map(|mut order| std::mem::take(&mut *order))
-        .unwrap_or_default()
-}
-
-impl ActiveReadClaim {
-    /// Deletes every active read this query holds.
-    ///
-    /// Called only once nothing descended from the query can read its cut
-    /// again. A failed release is logged and counted rather than surfaced:
-    /// the query already has its terminal outcome, and the rows stay
-    /// protective until PostgreSQL-time abandonment reclaims them.
-    pub(crate) async fn release(mut self) {
-        self.released = true;
-        #[cfg(feature = "test-support")]
-        record_leader_ownership(self.query_id, LeaderOwnershipEvent::ClaimReleaseStarted);
-        Self::release_rows(&self.catalog, self.tenant, self.query_id).await;
-    }
-
-    /// Deletes one query's active reads, logging and counting a failure.
-    async fn release_rows(catalog: &BifrostCatalog, tenant: DataTenantId, query_id: Uuid) {
-        if let Err(error) = catalog.release_active_reads(tenant, query_id).await {
-            metrics::counter!("bifrost_oracle_active_read_release_failures_total").increment(1);
-            tracing::warn!(
-                error = %error,
-                query_id = %query_id,
-                "Oracle could not release active table reads; rows remain until abandonment"
-            );
-        }
-    }
-}
-
-impl Drop for ActiveReadClaim {
-    /// Spawns the release for a claim dropped before terminal settlement.
-    ///
-    /// Outside a Tokio runtime nothing can run the statement, so the rows stay
-    /// protective until `PostgreSQL` time passes their query deadline.
-    fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        #[cfg(feature = "test-support")]
-        record_leader_ownership(self.query_id, LeaderOwnershipEvent::ClaimReleaseStarted);
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let catalog = Arc::clone(&self.catalog);
-        let (tenant, query_id) = (self.tenant, self.query_id);
-        runtime.spawn(async move { Self::release_rows(&catalog, tenant, query_id).await });
+            .min(self.config.max_deadline)
     }
 }
 
 impl OraclePlanner {
-    /// Acquires the complete active cut and materializes every table from it,
-    /// reacquiring once if a selected metadata document is already gone.
+    /// Reads the complete cut and materializes every table from it, rereading
+    /// once if a selected metadata document is already gone.
     ///
-    /// One SQL statement records the active reads and returns every pointer
-    /// and hot candidate; it commits before any object IO. The resolved
-    /// tables are authorized next, still before any object IO, and then every
-    /// table's metadata and manifests are read concurrently. Only an
-    /// object-store `NotFound` on a selected document — a catalog move that
-    /// already deleted it — reacquires, and only once; the replay refreshes
-    /// the same rows. Every acquisition, the replay included, binds only the
-    /// time remaining before the attempt's one immutable `deadline`, so a
-    /// replay refreshes the rows' expiry to that same deadline rather than
-    /// extending it.
+    /// One read-only SQL statement returns every pointer and hot candidate.
+    /// The resolved tables are authorized next, still before any object IO,
+    /// and then every table's metadata and manifests are read concurrently.
+    /// Only an object-store `NotFound` on a selected document — a catalog move
+    /// that already deleted it — rereads, and only once. The first read may
+    /// come from the node's cut cache, bounded by `not_before`; the reread
+    /// always reads Postgres.
     ///
     /// # Errors
-    /// Returns [`BifrostError::QueryTimeout`] when under one millisecond
-    /// remains before an acquisition, [`BifrostError::QueryForbidden`] when the caller's grants do not
+    /// Returns [`BifrostError::QueryForbidden`] when the caller's grants do not
     /// cover every resolved table, the public catalog error for an
-    /// unregistered table or a failed acquisition or materialization, and the
-    /// second `NotFound` as the catalog's public failure.
-    async fn acquire_and_materialize(
+    /// unregistered table or a failed read or materialization, and the second
+    /// `NotFound` as the catalog's public failure.
+    async fn read_and_materialize(
         tables: &[TableRef],
         context: &AuthorizedQueryContext,
         catalog: &BifrostCatalog,
-        owner: ActiveReadOwner,
-        deadline: Instant,
+        profile: &super::profile::QueryProfile,
+        not_before: Option<Instant>,
     ) -> Result<Vec<PinnedSealedTable>, BifrostError> {
         let tenant = context.data_tenant_id;
-        let mut reacquired = false;
+        let mut reread = false;
         loop {
-            let acquired = catalog
-                .acquire_active_cut(tenant, owner, deadline, tables)
-                .await
-                .map_err(BifrostCatalogError::into_public)?
-                .ok_or(BifrostError::QueryTimeout)?;
-            let identities = acquired
+            let read = profile.cut_read.timer();
+            let cut = if reread {
+                catalog.read_cut(tenant, tables).await
+            } else {
+                catalog.read_cut_cached(tenant, tables, not_before).await
+            };
+            let cut = cut.map_err(BifrostCatalogError::into_public)?;
+            read.done();
+            let identities = cut
                 .iter()
                 .zip(tables)
-                .map(|(cut, table)| {
+                .map(|(table_cut, table)| {
                     TenantTableBinding::resolve((tenant, table.clone()))
-                        .map(|binding| (binding, TableUid::from_bytes(cut.identity.table_uid)))
+                        .map(|binding| {
+                            (binding, TableUid::from_bytes(table_cut.identity.table_uid))
+                        })
                         .map_err(|error| {
                             BifrostCatalogError::InvalidBinding(error.to_string()).into_public()
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            // Authorized on the acquired identities, before any metadata,
+            // Authorized on the resolved identities, before any metadata,
             // manifest, or data object is opened: the first point at which
             // every table has its registered UID.
             super::authorize_resolved_tables(context, &identities)?;
+            let materialize = profile.cut_materialize.timer();
             let materialized = futures_util::future::try_join_all(
-                acquired
-                    .into_iter()
+                cut.into_iter()
                     .zip(tables)
-                    .map(|(cut, table)| catalog.materialize_acquired_cut(tenant, table, cut)),
+                    .map(|(table_cut, table)| catalog.materialize_cut(tenant, table, table_cut)),
             )
             .await;
+            materialize.done();
             match materialized {
                 Ok(cuts) => return Ok(cuts),
-                Err(error) if error.is_missing_object() && !reacquired => {
+                Err(error) if error.is_missing_object() && !reread => {
                     tracing::warn!(
                         tables = tables.len(),
-                        "Oracle reacquired its active cut after a selected metadata document was removed"
+                        "Oracle reread its cut after a selected metadata document was removed"
                     );
-                    reacquired = true;
+                    reread = true;
                 }
                 Err(error) => return Err(error.into_public()),
             }
@@ -279,57 +157,39 @@ impl OraclePlanner {
     ///
     /// The planner owns parsing-adjacent metadata work and never executes rows;
     /// provider installation remains an Oracle composition concern after audit.
-    /// The whole pin — acquisition, authorization, and materialization — runs
-    /// under the leader deadline. Every failure after this call starts,
-    /// including the deadline, releases the query's active reads before it
-    /// returns, so only a successful pin hands a claim onward. Nothing here
-    /// derives a class — the class comes from the physical root built on top
-    /// of this cut.
+    /// The whole pin — cut read, authorization, and materialization — runs
+    /// under the leader deadline. Nothing durable is recorded, so a failed or
+    /// dropped pin leaves nothing to release. Nothing here derives a class —
+    /// the class comes from the physical root built on top of this cut.
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryTimeout`] when the deadline passes first,
     /// and authorization, catalog, or byte-accounting failures otherwise.
-    ///
-    /// # Cancellation
-    /// Dropping the future after acquisition committed leaves the rows to
-    /// PostgreSQL-time abandonment.
     pub(super) async fn pin_cut(
         &self,
         context: &AuthorizedQueryContext,
         tables: &[TableRef],
         deadline: Instant,
         catalog: &Arc<BifrostCatalog>,
-        owner: ActiveReadOwner,
-    ) -> Result<ClaimedSqlCut, BifrostError> {
-        // DEBUG, not INFO: one event per catalog pin per query is per-request
-        // decision detail, not a lifecycle transition. It is the only way to
-        // attribute pre-fragment query latency, which is otherwise invisible
-        // between admission and the first fragment dispatch.
-        let pin_started = std::time::Instant::now();
-        let claim = ActiveReadClaim {
-            catalog: Arc::clone(catalog),
-            tenant: context.data_tenant_id,
-            query_id: owner.query_id,
-            released: false,
-        };
-        let planned = tokio::time::timeout_at(
+    ) -> Result<PlannedSqlCut, BifrostError> {
+        let profile = Arc::new(super::profile::QueryProfile::new());
+        let cuts = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
-            Self::acquire_and_materialize(tables, context, catalog, owner, deadline),
+            Self::read_and_materialize(
+                tables,
+                context,
+                catalog,
+                &profile,
+                deadline.checked_sub(self.config.max_deadline),
+            ),
         )
         .await
-        .map_err(|_| BifrostError::QueryTimeout)
-        .and_then(|cuts| cuts)
-        .and_then(|cuts| {
-            let ratio = local_ratio(&cuts)?;
-            Ok((cuts, ratio))
-        });
-        let (cuts, local_ratio) = match planned {
-            Ok(planned) => planned,
-            Err(error) => {
-                claim.release().await;
-                return Err(error);
-            }
-        };
+        .map_err(|_| BifrostError::QueryTimeout)??;
+        let warehouse_local = matches!(
+            catalog.storage().backend(),
+            wyrd_storage::BackendConfig::Local { .. }
+        );
+        let local_ratio = local_ratio(&cuts, warehouse_local)?;
         tracing::debug!(
             tables = tables.len(),
             hot_files = cuts.iter().map(|cut| cut.hot_files.len()).sum::<usize>(),
@@ -337,22 +197,28 @@ impl OraclePlanner {
                 .iter()
                 .map(|cut| cut.iceberg_files.len())
                 .sum::<usize>(),
-            pin_ms = pin_started.elapsed().as_millis(),
             "Oracle pinned one sealed cut"
         );
-        Ok(ClaimedSqlCut {
-            cut: PlannedSqlCut { cuts, local_ratio },
-            claim,
+        Ok(PlannedSqlCut {
+            cuts,
+            local_ratio,
+            profile,
         })
     }
 }
 
-/// Derives the fraction of a cut's pinned bytes held in the local hot tier.
+/// Derives the fraction of a cut's pinned bytes this node reads from local disk.
+///
+/// Hot (staged) files are always local. Published and compacted Iceberg files
+/// are local only when the warehouse itself is the local filesystem, and
+/// remote on S3, GCS, or Azure. A cut with no sealed bytes reads nothing
+/// remote, so it is fully local: extra partitions would only hide IO latency
+/// that does not exist.
 ///
 /// # Errors
 /// Returns [`BifrostError::QueryAdmissionRejected`] when a persisted size is
 /// negative or the byte totals overflow.
-fn local_ratio(cuts: &[PinnedSealedTable]) -> Result<f64, BifrostError> {
+fn local_ratio(cuts: &[PinnedSealedTable], warehouse_local: bool) -> Result<f64, BifrostError> {
     let local_bytes = cuts.iter().try_fold(0_u64, |total, cut| {
         cut.hot_files.iter().try_fold(total, |total, file| {
             let bytes =
@@ -372,8 +238,8 @@ fn local_ratio(cuts: &[PinnedSealedTable]) -> Result<f64, BifrostError> {
     let total_bytes = local_bytes
         .checked_add(remote_bytes)
         .ok_or(BifrostError::QueryAdmissionRejected)?;
-    if total_bytes == 0 {
-        return Ok(0.0);
+    if warehouse_local || total_bytes == 0 {
+        return Ok(1.0);
     }
     local_bytes
         .to_f64()
@@ -389,10 +255,18 @@ mod tests {
     use datafusion::execution::context::SessionContext;
     use std::sync::Arc;
 
-    use super::register_session_table;
+    use super::{local_ratio, register_session_table};
     use crate::catalog::{TableRef, TenantTableBinding};
     use crate::namespaces::BifrostNamespace;
     use wyrd_spec::DataTenantId;
+
+    /// A cut with no sealed bytes reads nothing remote, so it is fully local
+    /// on every warehouse backend.
+    #[test]
+    fn empty_cut_is_fully_local() {
+        assert!((local_ratio(&[], false).expect("empty remote cut") - 1.0).abs() < f64::EPSILON);
+        assert!((local_ratio(&[], true).expect("empty local cut") - 1.0).abs() < f64::EPSILON);
+    }
 
     /// Both canonical hierarchy and quoted dotted-FQN SQL resolve identically.
     #[tokio::test]

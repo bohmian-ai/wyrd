@@ -255,6 +255,7 @@ fn resolve_forge_config(forge_runtime: &ForgeRuntimeConfig) -> (ForgeConfig, Dur
             .orphan_gc_ttl_secs
             .map(Duration::from_secs)
             .unwrap_or(base.orphan_gc_ttl),
+        snapshot_retention: forge_runtime.snapshot_retention(),
         orphan_gc_max_list_pages: forge_runtime
             .orphan_gc_max_list_pages
             .unwrap_or(base.orphan_gc_max_list_pages),
@@ -924,6 +925,7 @@ pub async fn compose_bifrost(
             authority: forwarding_authority,
             config: OracleConfig {
                 default_deadline: bifrost_config.oracle.default_query_deadline(),
+                max_deadline: bifrost_config.oracle.max_query_deadline(),
                 ..OracleConfig::default()
             },
         },
@@ -1518,6 +1520,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 |value| value.max_queue_wait,
             ),
             default_deadline: config.oracle.default_query_deadline(),
+            max_deadline: config.oracle.max_query_deadline(),
             ..OracleConfig::default()
         };
         let capabilities = OracleCapabilitiesV1 {
@@ -2185,6 +2188,7 @@ mod tests {
     fn resolve_forge_config_applies_supplied_overrides() {
         let runtime = ForgeRuntimeConfig {
             orphan_gc_ttl_secs: Some(3_600),
+            snapshot_retention_secs: Some(43_200),
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
             maintenance_interval_secs: Some(45),
@@ -2194,6 +2198,7 @@ mod tests {
         let (config, maintenance_interval) = resolve_forge_config(&runtime);
         assert_eq!(config.default_target_file_size_bytes, 2_147_483_648);
         assert_eq!(config.orphan_gc_ttl, Duration::from_secs(3_600));
+        assert_eq!(config.snapshot_retention, Duration::from_secs(43_200));
         assert_eq!(config.orphan_gc_max_list_pages, 64);
         assert_eq!(config.orphan_gc_run_budget, Duration::from_secs(30));
         assert_eq!(maintenance_interval, Duration::from_secs(45));

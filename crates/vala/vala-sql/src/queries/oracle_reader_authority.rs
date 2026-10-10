@@ -1,20 +1,18 @@
-//! Durable statements behind Oracle reader authority.
+//! Durable statements behind Oracle cuts and Forge table maintenance.
 //!
-//! Two owners share one serialization row per tenant-qualified table,
-//! `vala.bifrost_table_maintenance_authority`. Oracle cut acquisition takes it
-//! `FOR SHARE` inside the one statement that also records the query's active
-//! table reads; destructive Forge work takes it `FOR NO KEY UPDATE` as an
-//! [`ExclusiveTableAuthority`] that exists only while no active read does and
-//! is held through the destructive effect's known outcome. That gives the
-//! read-versus-destroy race exactly one durable winner per table: either the
-//! reader commits first and no authority exists, or destruction finishes
-//! first and the waiting reader selects the later pointer.
+//! Oracle reads a query's cut with one read-only statement and records
+//! nothing: readers are protected by Forge's snapshot retention window, not
+//! tracked. `vala.bifrost_table_maintenance_authority` is the per-table row
+//! destructive Forge work locks `FOR NO KEY UPDATE` as an
+//! [`ExclusiveTableAuthority`], serializing Forge's own protocols on one table.
+//! `vala.forge_snapshot_supersessions` records when Forge first observed each
+//! retained snapshot as no longer current, which is what the retention window
+//! is measured from.
 //!
 //! Every read fails closed. A missing row, an identity mismatch, or a
-//! malformed result is contradictory evidence and never degrades into
-//! "nothing is being read".
+//! malformed result is contradictory evidence.
 
-// raw-query grep allowlist: the Oracle reader-authority relations post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
+// raw-query grep allowlist: the Oracle cut and Forge supersession relations post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::time::Duration;
 
@@ -56,12 +54,11 @@ fn table_uid(bytes: Vec<u8>) -> Result<[u8; 16], SqlError> {
 /// Live, exclusive maintenance authority over one tenant-qualified table.
 ///
 /// Obtained only from [`BifrostTableMaintenanceAuthority::exclusive`] after
-/// the table's authority row was locked and no active Oracle read remained.
-/// It mutably borrows the transaction holding that lock, so the lock cannot be
-/// released while this value exists, and every destructive Forge operation
-/// takes `&ExclusiveTableAuthority` as its proof. There is no state in which
-/// the reader check passed, the authority was surrendered, and destruction is
-/// still callable: ending the transaction first ends this borrow.
+/// the table's authority row was locked. It mutably borrows the transaction
+/// holding that lock, so the lock cannot be released while this value exists,
+/// and every destructive Forge operation takes `&ExclusiveTableAuthority` as
+/// its proof that no other Forge protocol is destroying on the same table.
+/// Ending the transaction first ends this borrow.
 ///
 /// The owner holds no destructive SQL of its own. Forge's preparation and
 /// settlement transactions run on separate connections, so the caller drops
@@ -123,10 +120,9 @@ impl ExclusiveTableAuthority<'_, '_> {
 
 /// The single SQL serialization boundary for one tenant-qualified table.
 ///
-/// Cut acquisition share-locks this one row and destructive Forge preparation
-/// locks it exclusively, which is what gives the admission-versus-destruction
-/// race exactly one durable winner per table without taking a global physical
-/// lock.
+/// Destructive Forge preparation locks this one row exclusively, so Forge's
+/// destructive protocols on one table run one at a time without a global
+/// physical lock. Oracle never takes it.
 pub struct BifrostTableMaintenanceAuthority<'conn, 'tx> {
     /// Tenant-bound connection every statement runs inside.
     conn: &'conn mut TenantConn<'tx>,
@@ -141,7 +137,7 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
     /// Inserts the authority row for one newly registered Bifrost table.
     ///
     /// Registration writes this row inside its own transaction so the row
-    /// exists before any reader or maintenance owner can want it. That is what
+    /// exists before any cut or maintenance owner can want it. That is what
     /// lets every consumer treat a missing row as an identity failure instead
     /// of falling back to an advisory lock.
     ///
@@ -171,66 +167,26 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         Ok(())
     }
 
-    /// Reports, without taking any lock, whether an unabandoned Oracle read
-    /// still holds the table.
-    ///
-    /// This is a scheduling hint only and authorizes nothing: a reader may be
-    /// admitted or released the instant after it answers. Every destructive
-    /// effect instead requires [`Self::exclusive`]. Taking no lock is what
-    /// lets the hint run beside a held exclusive authority — including on the
-    /// same table, in another transaction — without waiting on it. Abandoned
-    /// reads (PostgreSQL time past `abandon_after`) are ignored here and
-    /// discarded only under the exclusive authority.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] when the identity is malformed
-    /// and [`SqlError`] when the read fails.
-    pub async fn has_active_reads(
-        &mut self,
-        identity: &TableAuthorityIdentity,
-    ) -> Result<bool, SqlError> {
-        identity.validate(BIFROST_CATALOG_NAME)?;
-        sqlx::query_scalar(
-            r"
-            SELECT EXISTS (
-                SELECT 1
-                  FROM vala.oracle_active_table_reads
-                 WHERE data_tenant_id = wyrd.current_tenant()
-                   AND table_uid = $1
-                   AND abandon_after > statement_timestamp()
-            )
-            ",
-        )
-        .bind(identity.table_uid.as_slice())
-        .fetch_one(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)
-    }
-
     /// Takes the table's exclusive maintenance authority and turns this owner
     /// into the capability destructive Forge work requires.
     ///
-    /// The row is locked `FOR NO KEY UPDATE`, the mode that conflicts with the
-    /// `FOR SHARE` Oracle cut acquisition takes but not with the `FOR KEY
-    /// SHARE` a claim row's foreign key takes, so a separate Forge preparation
-    /// transaction can still record claims while this one holds the row.
-    /// Abandoned reads are discarded under the rule
-    /// [`crate::queries::forge_operations::active_table_reads_exist`] owns; any
-    /// read that remains means no capability exists.
+    /// The row is locked `FOR NO KEY UPDATE`, the mode that conflicts with
+    /// another Forge holder but not with the `FOR KEY SHARE` a claim row's
+    /// foreign key takes, so a separate Forge preparation transaction can
+    /// still record claims while this one holds the row. No Oracle read is
+    /// consulted: snapshot retention protects readers.
     ///
     /// The lock lives for the rest of the borrowed transaction, which the
     /// returned capability keeps mutably borrowed: the caller cannot commit or
     /// roll it back — and so cannot surrender the authority — while the
     /// capability, and therefore any destructive call taking it, is alive.
-    /// `Ok(None)` still holds the lock until the caller ends the transaction.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError::InvariantViolation`] when the identity is malformed,
     /// names a table with no authority row, names a different table UID, or
     /// names a tenant other than the borrowed connection's; and [`SqlError`]
-    /// when the lock or either active-read statement fails.
+    /// when the lock statement fails.
     ///
     /// # Cancellation
     ///
@@ -239,7 +195,7 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
     pub async fn exclusive(
         self,
         identity: TableAuthorityIdentity,
-    ) -> Result<Option<ExclusiveTableAuthority<'conn, 'tx>>, SqlError> {
+    ) -> Result<ExclusiveTableAuthority<'conn, 'tx>, SqlError> {
         identity.validate(BIFROST_CATALOG_NAME)?;
         if identity.tenant != self.conn.data_tenant_id() {
             return Err(invariant(
@@ -271,18 +227,10 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
                 "Bifrost table maintenance authority names a different registered table UID",
             ));
         }
-        if crate::queries::forge_operations::active_table_reads_exist(
-            self.conn.transaction(),
-            &identity,
-        )
-        .await?
-        {
-            return Ok(None);
-        }
-        Ok(Some(ExclusiveTableAuthority {
+        Ok(ExclusiveTableAuthority {
             conn: self.conn,
             identity,
-        }))
+        })
     }
 
     /// Returns every snapshot of this table an unresolved Forge expiration has
@@ -316,38 +264,82 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         .await
         .map_err(SqlError::from)
     }
+
+    /// Records this table's replaced snapshots and returns those still inside
+    /// the retention window, in ascending order.
+    ///
+    /// `replaced` is every snapshot the table retains that is not current.
+    /// One statement records the PostgreSQL time of each first observation,
+    /// forgets observations of snapshots no longer retained, and returns every
+    /// replaced snapshot first observed less than `retention` ago, including
+    /// the ones observed now unless `retention` is zero. Snapshot expiry must
+    /// not select any of them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the identity is malformed
+    /// or `retention` exceeds `i64::MAX` milliseconds, and [`SqlError`] when
+    /// the statement fails.
+    pub async fn retained_supersessions(
+        &mut self,
+        identity: &TableAuthorityIdentity,
+        replaced: &[i64],
+        retention: Duration,
+    ) -> Result<Vec<i64>, SqlError> {
+        identity.validate(BIFROST_CATALOG_NAME)?;
+        let retention_ms = i64::try_from(retention.as_millis())
+            .map_err(|_| invariant("snapshot retention exceeds i64 milliseconds"))?;
+        sqlx::query_scalar(
+            r"
+            WITH forgotten AS (
+                DELETE FROM vala.forge_snapshot_supersessions
+                 WHERE data_tenant_id = wyrd.current_tenant()
+                   AND table_uid = $1
+                   AND snapshot_id <> ALL ($2)
+            ), observed AS (
+                INSERT INTO vala.forge_snapshot_supersessions
+                    (data_tenant_id, table_uid, snapshot_id, observed_at)
+                SELECT wyrd.current_tenant(), $1, replaced, statement_timestamp()
+                  FROM unnest($2::bigint[]) AS replaced
+                ON CONFLICT DO NOTHING
+                RETURNING snapshot_id, observed_at
+            )
+            SELECT snapshot_id
+              FROM observed
+             WHERE observed_at > statement_timestamp() - $3 * interval '1 millisecond'
+            UNION
+            SELECT snapshot_id
+              FROM vala.forge_snapshot_supersessions
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND table_uid = $1
+               AND snapshot_id = ANY ($2)
+               AND observed_at > statement_timestamp() - $3 * interval '1 millisecond'
+             ORDER BY snapshot_id
+            ",
+        )
+        .bind(identity.table_uid.as_slice())
+        .bind(replaced)
+        .bind(retention_ms)
+        .fetch_all(&mut **self.conn.transaction())
+        .await
+        .map_err(SqlError::from)
+    }
 }
 
 /// One logical table a query asks to read, as the planner canonicalized it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ActiveTableRef<'a> {
+pub struct CutTableRef<'a> {
     /// Canonical logical namespace, `vala.<segment>`.
     pub namespace_name: &'a str,
     /// Local table name inside that namespace.
     pub table_name: &'a str,
 }
 
-/// The exact Oracle role fence that owns one query's active table reads.
-///
-/// The fence identifies the node that recorded the reads. It carries no
-/// deadline: the query's remaining time shrinks between acquisitions, so each
-/// [`OracleActiveTableReads::acquire`] call binds the remaining duration its
-/// caller derived immediately before that statement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ActiveReadOwner {
-    /// Durable query identity Oracle already uses for the request.
-    pub query_id: Uuid,
-    /// Oracle node that admitted the query.
-    pub node_id: Uuid,
-    /// That node's current Oracle role fencing token.
-    pub fencing_token: i64,
-}
-
-/// One table of an acquired cut: its registered identity, the catalog pointer
-/// read under the table's authority lock, and its unresolved hot candidates.
+/// One table of a read cut: its registered identity, its catalog pointer, and
+/// its unresolved hot candidates.
 #[derive(Debug, Clone)]
-pub struct AcquiredTableCut {
-    /// Registered table identity the active read was recorded against.
+pub struct TableCut {
+    /// Registered table identity the cut resolved.
     pub identity: TableAuthorityIdentity,
     /// Current Iceberg metadata document location for the table.
     pub metadata_location: String,
@@ -357,61 +349,48 @@ pub struct AcquiredTableCut {
     pub hot_files: Vec<HotFileRow>,
 }
 
-/// Owner of one tenant's active Oracle table reads.
+/// Owner of one tenant's Oracle cut reads.
 ///
-/// Acquisition is one SQL statement that locks every requested table's
-/// maintenance authority, reads each catalog pointer and the unresolved hot
-/// candidates, and records one active read per query/table before returning
-/// any of it. The caller owns the transaction and must commit it before any
-/// metadata, manifest, or data-file IO.
-pub struct OracleActiveTableReads<'conn, 'tx> {
-    /// Tenant-bound connection whose RLS scopes every statement.
-    conn: &'conn mut TenantConn<'tx>,
+/// A cut is one read-only SQL statement that resolves every requested table,
+/// reads each catalog pointer, and returns the unresolved hot candidates. It
+/// takes no lock and writes no row, so nothing is released afterwards. The
+/// statement binds its tenant for RLS itself, so it runs as one autocommit
+/// round trip on a plain connection, with no transaction around it.
+pub struct OracleTableCuts<'conn> {
+    /// Connection the cut statement runs on.
+    conn: &'conn mut sqlx::PgConnection,
+    /// Tenant the statement binds, scoping every row it reads.
+    data_tenant_id: DataTenantId,
 }
 
-impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
-    /// Binds the owner to one tenant transaction.
-    pub fn new(conn: &'conn mut TenantConn<'tx>) -> Self {
-        Self { conn }
+impl<'conn> OracleTableCuts<'conn> {
+    /// Binds the owner to one connection and the tenant it reads for.
+    ///
+    /// `conn` must not be inside a transaction bound to another tenant; the
+    /// statement refuses that rather than rebinding.
+    pub fn new(conn: &'conn mut sqlx::PgConnection, data_tenant_id: DataTenantId) -> Self {
+        Self {
+            conn,
+            data_tenant_id,
+        }
     }
 
-    /// Acquires a complete cut and its active reads in one statement.
+    /// Reads a complete cut in one statement.
     ///
     /// `tables` is the planner's ordered, canonical table set; a repeated table
-    /// keeps its first position and yields one result and one active read. The
-    /// result has exactly one entry per distinct table, in input order. A
-    /// replayed acquisition for the same query refreshes the existing rows to
-    /// the caller's fence and a new PostgreSQL abandonment time. Each row may be
-    /// discarded once PostgreSQL time passes this statement's
-    /// `statement_timestamp()` plus `remaining`. The caller derives `remaining`
-    /// from its query's one absolute deadline immediately before each call, so
-    /// a replayed acquisition never extends protection past that deadline.
+    /// keeps its first position and yields one result. The result has exactly
+    /// one entry per distinct table, in input order.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError::NoRows`] when any table has no registration visible
-    /// to this tenant or no catalog pointer; no active read commits in that
-    /// case. Returns [`SqlError::InvariantViolation`] for an empty request, a
-    /// non-positive fence, a `remaining` duration shorter than one millisecond
-    /// or longer than `i64::MAX` milliseconds, or a result that does not contain exactly one
-    /// well-formed identity and pointer per requested table. Returns
-    /// [`SqlError`] when the statement fails.
-    ///
-    /// # Cancellation
-    ///
-    /// Dropping the future leaves the statement's effects in the caller's
-    /// uncommitted transaction, which rolls back with it.
-    pub async fn acquire(
-        &mut self,
-        owner: ActiveReadOwner,
-        remaining: Duration,
-        tables: &[ActiveTableRef<'_>],
-    ) -> Result<Vec<AcquiredTableCut>, SqlError> {
-        let deadline_ms = i64::try_from(remaining.as_millis()).unwrap_or(0);
-        if tables.is_empty() || owner.fencing_token <= 0 || deadline_ms <= 0 {
-            return Err(invariant(
-                "active table read acquisition needs tables, a positive fence, and a deadline",
-            ));
+    /// to this tenant or no catalog pointer. Returns
+    /// [`SqlError::InvariantViolation`] for an empty request or a result that
+    /// does not contain exactly one well-formed identity and pointer per
+    /// requested table. Returns [`SqlError`] when the statement fails.
+    pub async fn read(&mut self, tables: &[CutTableRef<'_>]) -> Result<Vec<TableCut>, SqlError> {
+        if tables.is_empty() {
+            return Err(invariant("an Oracle cut needs at least one table"));
         }
         let request = serde_json::Value::Array(
             tables
@@ -424,57 +403,35 @@ impl<'conn, 'tx> OracleActiveTableReads<'conn, 'tx> {
                 })
                 .collect(),
         );
-        let rows: Vec<AcquiredCutDbRow> = sqlx::query_as(
-            "SELECT * FROM vala.oracle_acquire_table_cut($1, $2, $3, $4, $5::jsonb)",
-        )
-        .bind(owner.query_id)
-        .bind(owner.node_id)
-        .bind(owner.fencing_token)
-        .bind(deadline_ms)
-        .bind(request)
-        .fetch_all(&mut **self.conn.transaction())
-        .await
-        .map_err(acquisition_error)?;
-        group_acquired_cut(self.conn.data_tenant_id(), tables, rows)
-    }
-
-    /// Deletes every active read this query holds and returns how many it
-    /// removed.
-    ///
-    /// Release is idempotent: a second call, or a call after Forge discarded
-    /// an abandoned row, removes nothing and succeeds.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError`] when the statement fails.
-    pub async fn release(&mut self, query_id: Uuid) -> Result<u64, SqlError> {
-        sqlx::query("DELETE FROM vala.oracle_active_table_reads WHERE query_id = $1")
-            .bind(query_id)
-            .execute(&mut **self.conn.transaction())
-            .await
-            .map(|done| done.rows_affected())
-            .map_err(SqlError::from)
+        let rows: Vec<CutDbRow> =
+            sqlx::query_as("SELECT * FROM vala.oracle_read_table_cut($1::uuid, $2::jsonb)")
+                .bind(self.data_tenant_id.as_uuid())
+                .bind(request)
+                .fetch_all(&mut *self.conn)
+                .await
+                .map_err(cut_error)?;
+        group_table_cut(self.data_tenant_id, tables, rows)
     }
 }
 
-/// Maps the acquisition function's not-found signal onto the typed absence.
+/// Maps the cut function's not-found signal onto the typed absence.
 ///
 /// The function raises `no_data_found` (SQLSTATE `P0002`) for a missing
-/// registration or catalog pointer so no partial claim set can commit; callers
-/// already treat [`SqlError::NoRows`] as the catalog's table-not-found.
-fn acquisition_error(error: sqlx::Error) -> SqlError {
+/// registration or catalog pointer; callers already treat
+/// [`SqlError::NoRows`] as the catalog's table-not-found.
+fn cut_error(error: sqlx::Error) -> SqlError {
     match &error {
         sqlx::Error::Database(db) if db.code().as_deref() == Some("P0002") => SqlError::NoRows,
         _ => SqlError::from(error),
     }
 }
 
-/// One flat result row of `vala.oracle_acquire_table_cut`.
+/// One flat result row of `vala.oracle_read_table_cut`.
 ///
 /// Every hot column comes from a left join, so each is nullable here; an
 /// all-null hot side means the table has no unresolved candidates.
 #[derive(sqlx::FromRow)]
-struct AcquiredCutDbRow {
+struct CutDbRow {
     /// First input position of the table this row belongs to.
     ordinal: i32,
     /// Registered table UID.
@@ -483,7 +440,7 @@ struct AcquiredCutDbRow {
     namespace_name: String,
     /// Registered table name.
     table_name: String,
-    /// Catalog pointer read under the authority lock.
+    /// Catalog pointer of the table's current metadata.
     metadata_location: String,
     /// Hot row identity; `None` exactly when the hot side is empty.
     id: Option<Uuid>,
@@ -525,7 +482,7 @@ struct AcquiredCutDbRow {
     created_at: Option<DateTime<Utc>>,
 }
 
-impl AcquiredCutDbRow {
+impl CutDbRow {
     /// Splits the hot side off one flat row.
     ///
     /// # Errors
@@ -555,10 +512,10 @@ impl AcquiredCutDbRow {
             return if empty {
                 Ok(None)
             } else {
-                Err(invariant("acquired cut returned a partially null hot row"))
+                Err(invariant("table cut returned a partially null hot row"))
             };
         };
-        let partial = || invariant("acquired cut returned a partially null hot row");
+        let partial = || invariant("table cut returned a partially null hot row");
         let row = HotFileRow {
             id,
             data_tenant_id: self.data_tenant_id.ok_or_else(partial)?,
@@ -584,14 +541,14 @@ impl AcquiredCutDbRow {
         };
         if row.file_size < 0 || row.row_count < 0 || row.committed_snapshot_id.is_some() {
             return Err(invariant(
-                "acquired cut returned a hot candidate with impossible metadata",
+                "table cut returned a hot candidate with impossible metadata",
             ));
         }
         Ok(Some(row))
     }
 }
 
-/// Groups the flat acquisition result into one validated cut per table.
+/// Groups the flat cut result into one validated cut per table.
 ///
 /// The grouping is complete or fails: every distinct requested table must
 /// appear exactly once with one stable identity and pointer, and no
@@ -601,20 +558,20 @@ impl AcquiredCutDbRow {
 ///
 /// Returns [`SqlError::InvariantViolation`] for a missing, duplicate,
 /// conflicting, unrequested, or malformed table result or hot row.
-fn group_acquired_cut(
+fn group_table_cut(
     tenant: DataTenantId,
-    tables: &[ActiveTableRef<'_>],
-    rows: Vec<AcquiredCutDbRow>,
-) -> Result<Vec<AcquiredTableCut>, SqlError> {
-    let mut expected: Vec<(i32, ActiveTableRef<'_>)> = Vec::with_capacity(tables.len());
+    tables: &[CutTableRef<'_>],
+    rows: Vec<CutDbRow>,
+) -> Result<Vec<TableCut>, SqlError> {
+    let mut expected: Vec<(i32, CutTableRef<'_>)> = Vec::with_capacity(tables.len());
     for (position, table) in tables.iter().enumerate() {
         if !expected.iter().any(|(_, seen)| seen == table) {
             let ordinal = i32::try_from(position + 1)
-                .map_err(|_| invariant("active table read request is too large"))?;
+                .map_err(|_| invariant("Oracle cut request is too large"))?;
             expected.push((ordinal, *table));
         }
     }
-    let mut cuts: Vec<(i32, AcquiredTableCut)> = Vec::with_capacity(expected.len());
+    let mut cuts: Vec<(i32, TableCut)> = Vec::with_capacity(expected.len());
     for mut row in rows {
         let hot = row.hot_file()?;
         if let Some((ordinal, cut)) = cuts.last_mut()
@@ -625,26 +582,22 @@ fn group_acquired_cut(
                 || cut.identity.table_name != row.table_name
                 || cut.metadata_location != row.metadata_location
             {
-                return Err(invariant(
-                    "acquired cut returned conflicting table identity",
-                ));
+                return Err(invariant("table cut returned conflicting table identity"));
             }
             match hot {
                 Some(hot) if !cut.hot_files.is_empty() => cut.hot_files.push(hot),
-                _ => return Err(invariant("acquired cut mixed empty and hot rows")),
+                _ => return Err(invariant("table cut mixed empty and hot rows")),
             }
             continue;
         }
         let Some((_, requested)) = expected.get(cuts.len()) else {
-            return Err(invariant("acquired cut returned an unrequested table"));
+            return Err(invariant("table cut returned an unrequested table"));
         };
         if expected[cuts.len()].0 != row.ordinal
             || requested.namespace_name != row.namespace_name
             || requested.table_name != row.table_name
         {
-            return Err(invariant(
-                "acquired cut returned tables out of request order",
-            ));
+            return Err(invariant("table cut returned tables out of request order"));
         }
         let identity = TableAuthorityIdentity {
             tenant,
@@ -656,7 +609,7 @@ fn group_acquired_cut(
         identity.validate(BIFROST_CATALOG_NAME)?;
         cuts.push((
             row.ordinal,
-            AcquiredTableCut {
+            TableCut {
                 identity,
                 metadata_location: row.metadata_location,
                 hot_files: hot.into_iter().collect(),
@@ -664,7 +617,7 @@ fn group_acquired_cut(
         ));
     }
     if cuts.len() != expected.len() {
-        return Err(invariant("acquired cut is missing a requested table"));
+        return Err(invariant("table cut is missing a requested table"));
     }
     Ok(cuts.into_iter().map(|(_, cut)| cut).collect())
 }

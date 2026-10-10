@@ -369,7 +369,7 @@ impl Deployment {
                     / elapsed,
                 mean_active_tasks: after.sum("bifrost_forge_task_duration_seconds_sum", &succeeded)
                     / elapsed,
-                cpu_share: resource.cores / worker.envelope().cpus(),
+                cpu_share: resource.cores / worker.cpus(),
             })
             .collect::<Vec<_>>();
         let rewrites = total("bifrost_forge_task_attempts_total", &succeeded);
@@ -406,7 +406,7 @@ impl Deployment {
                 / ForgeWorkerConfig::default().pull_interval.as_secs_f64(),
             leader_cpu_share: resources
                 .first()
-                .map_or(0.0, |leader| leader.cores / self.leader.envelope().cpus()),
+                .map_or(0.0, |leader| leader.cores / self.leader.cpus()),
             per_worker,
             resources,
             dependencies: self.dependencies.usage(

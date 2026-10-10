@@ -277,8 +277,7 @@ impl Forge {
             .map_err(ForgeError::Sql)?;
         let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
             .exclusive(key.tenant, &key.table_ref)
-            .await?
-            .ok_or_else(super::table_authority::active_read_refusal)?;
+            .await?;
         self.prepare_expiration(lease, key, authority, &exclusive, &claim_table, &detail)
             .await?;
         require_running(stop)?;
@@ -341,7 +340,7 @@ impl Forge {
 impl Forge {
     /// Gathers every non-catalog authority that protects a snapshot.
     ///
-    /// The three roots are read together, under the fence this pass already
+    /// The roots are read together, under the fence this pass already
     /// holds, because a decision made from two of them is not a smaller
     /// decision — it is an unsafe one. Watermarks are returned unvalidated;
     /// corroborating them against Iceberg belongs to the policy, which is the
@@ -391,6 +390,24 @@ impl Forge {
         let claimed_snapshot_ids = super::table_authority::TableAuthority::new(&mut conn)
             .claimed_snapshot_ids(key.tenant, &key.table_ref)
             .await?;
+        // Oracle readers record nothing; a snapshot replaced within the
+        // retention window may still be read and is kept. The observation
+        // commits with the other roots.
+        let current = table.metadata().current_snapshot_id();
+        let replaced = table
+            .metadata()
+            .snapshots()
+            .map(|snapshot| snapshot.snapshot_id())
+            .filter(|id| Some(*id) != current)
+            .collect::<Vec<_>>();
+        let retained_snapshot_ids = super::table_authority::TableAuthority::new(&mut conn)
+            .retained_supersessions(
+                key.tenant,
+                &key.table_ref,
+                &replaced,
+                self.core.config.snapshot_retention,
+            )
+            .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         if attempts_overflowed {
             return Err(ForgeError::SnapshotExpiry {
@@ -401,6 +418,7 @@ impl Forge {
             attempt_watermarks,
             lineage_snapshot_id: head_lineage_snapshot_id(table),
             claimed_snapshot_ids,
+            retained_snapshot_ids,
             destructive_maintenance,
         })
     }
@@ -1067,15 +1085,8 @@ impl Forge {
                     .await?
             }
             ForgeExpirationSettlement::Committed => {
-                let Some(files) = self
-                    .retry_committed_expiry(lease, key, table, &detail, stop)
+                self.retry_committed_expiry(lease, key, table, &detail, stop)
                     .await?
-                else {
-                    outcome.pending = 1;
-                    outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
-                    return Ok(outcome);
-                };
-                files
             }
         };
         let evidence = self
@@ -1101,9 +1112,6 @@ impl Forge {
     /// authority's connection commits only after that outcome, releasing the
     /// row before settlement takes it again.
     ///
-    /// Returns `None`, with nothing destroyed, while any reader holds the
-    /// table; the operation then stays Prepared for a later pass.
-    ///
     /// # Errors
     ///
     /// Returns SQL failures acquiring or committing the authority, and every
@@ -1115,26 +1123,22 @@ impl Forge {
         table: Table,
         detail: &AuditDetail,
         stop: &CancellationToken,
-    ) -> Result<Option<ExpiredFileSet>, ForgeError> {
+    ) -> Result<ExpiredFileSet, ForgeError> {
         let mut authority_conn = self
             .core
             .vala
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let Some(exclusive) = super::table_authority::TableAuthority::new(&mut authority_conn)
+        let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
             .exclusive(key.tenant, &key.table_ref)
-            .await?
-        else {
-            authority_conn.commit().await.map_err(ForgeError::Sql)?;
-            return Ok(None);
-        };
+            .await?;
         let files = self
             .complete_expiry(lease, key, &exclusive, table, detail, stop)
             .await;
         drop(exclusive);
         authority_conn.commit().await.map_err(ForgeError::Sql)?;
-        files.map(Some)
+        files
     }
 
     /// Counts the exact snapshots one settled expiration durably removed.

@@ -64,7 +64,7 @@ use vala_bifrost_redux::scribe::{
 use vala_bifrost_redux::storage::BifrostStorage;
 use vala_sql::OperatorPool;
 use vala_sql::queries::forge_tasks::ForgeTasks;
-use vala_sql::queries::oracle_reader_authority::{AcquiredTableCut, ActiveReadOwner};
+use vala_sql::queries::oracle_reader_authority::TableCut;
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_bench::BenchmarkRecorder;
@@ -817,105 +817,46 @@ pub(crate) struct PromotionIntegrationFixture {
 }
 
 impl PromotionIntegrationFixture {
-    /// Records one live Oracle query's active read on the fixture table.
-    ///
-    /// Goes through the production catalog acquisition, so the row is the
-    /// exact durable state a held query leaves and serializes with Forge on
-    /// the same table maintenance authority. The one-hour query deadline
-    /// keeps the row protective for the whole test.
+    /// Reads the fixture table's current cut through the production
+    /// statement a query runs.
     ///
     /// # Panics
-    /// Panics when the acquisition fails.
-    pub(crate) async fn hold_active_read(&self) -> Uuid {
-        let (query_id, acquisition) = self.spawn_active_read();
-        acquisition.await.expect("the active read task joins");
-        query_id
+    /// Panics when the cut read fails.
+    pub(crate) async fn read_cut(&self) -> TableCut {
+        self.catalog
+            .read_cut(self.tenant, std::slice::from_ref(&self.binding.table_ref))
+            .await
+            .expect("the registered table's cut reads")
+            .pop()
+            .expect("one table cut")
     }
 
-    /// Starts one Oracle query's production cut acquisition on its own task.
+    /// Backdates every recorded snapshot supersession of the fixture table by
+    /// `age`, so the next expiry pass sees them as that much older.
     ///
-    /// Returns the query id at once and the acquisition as a join handle, so
-    /// a scenario can race the acquisition against a live destructive Forge
-    /// owner: the statement waits on the table's maintenance authority until
-    /// that owner yields, then returns the pointer it read.
-    ///
-    /// # Panics
-    /// The spawned task panics when the acquisition fails or the one-hour
-    /// deadline has already passed; awaiting the handle surfaces that panic.
-    pub(crate) fn spawn_active_read(&self) -> (Uuid, JoinHandle<AcquiredTableCut>) {
-        let query_id = Uuid::now_v7();
-        let catalog = Arc::clone(&self.catalog);
-        let tenant = self.tenant;
-        let table = self.binding.table_ref.clone();
-        let acquisition = tokio::spawn(async move {
-            catalog
-                .acquire_active_cut(
-                    tenant,
-                    ActiveReadOwner {
-                        query_id,
-                        node_id: Uuid::now_v7(),
-                        fencing_token: 1,
-                    },
-                    std::time::Instant::now() + std::time::Duration::from_hours(1),
-                    std::slice::from_ref(&table),
-                )
-                .await
-                .expect("the registered table's active read commits")
-                .expect("an hour remains before the deadline")
-                .pop()
-                .expect("one acquired table")
-        });
-        (query_id, acquisition)
-    }
-
-    /// Waits until exactly one Oracle cut acquisition is blocked on a row lock.
-    ///
-    /// Observes `pg_stat_activity` rather than elapsed time, so a returning
-    /// call proves the acquisition statement reached `PostgreSQL` and is waiting
-    /// on the table's maintenance authority rather than merely not yet run.
-    /// The probe runs as the fixture superuser because `PostgreSQL` hides other
-    /// roles' wait state and statement text from the operator role.
+    /// Retention is measured in `PostgreSQL` time, which a test cannot advance;
+    /// moving the recorded observation is the equivalent. Runs as the fixture
+    /// superuser because only Forge's tenant role holds the table.
     ///
     /// # Panics
-    /// Panics when the superuser pool or the activity read fails, or no
-    /// acquisition blocks within thirty seconds.
-    pub(crate) async fn await_blocked_cut_acquisition(&self) {
-        let observer = self
+    /// Panics when the superuser pool or the update fails.
+    pub(crate) async fn age_supersessions(&self, age: Duration) {
+        let pool = self
             .database
             .superuser_pool()
             .await
             .expect("fixture superuser pool");
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let blocked: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM pg_stat_activity \
-                      WHERE datname = current_database() AND wait_event_type = 'Lock' \
-                        AND query LIKE '%oracle_acquire_table_cut%'",
-                )
-                .fetch_one(&observer)
-                .await
-                .expect("lock waits read");
-                if blocked == 1 {
-                    return;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        let millis = i64::try_from(age.as_millis()).expect("age fits in i64 milliseconds");
+        sqlx::query(
+            "UPDATE vala.forge_snapshot_supersessions \
+                SET observed_at = observed_at - $2 * interval '1 millisecond' \
+              WHERE data_tenant_id = $1",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(millis)
+        .execute(&pool)
         .await
-        .expect("the cut acquisition blocks on the table authority");
-    }
-
-    /// Releases one query's active reads through the production statement.
-    ///
-    /// # Panics
-    /// Panics when the release fails or removes no row.
-    pub(crate) async fn release_active_read(&self, query_id: Uuid) {
-        let released = self
-            .catalog
-            .release_active_reads(self.tenant, query_id)
-            .await
-            .expect("the active read releases");
-        assert_eq!(released, 1, "the query held exactly one table read");
+        .expect("supersessions backdate");
     }
 
     /// Reads the fixture table's maintenance-authority identity.
@@ -1103,7 +1044,13 @@ impl PromotionIntegrationFixture {
             storage,
             tenant,
             binding,
-            config: ForgeConfig::default(),
+            // No retention window: a replaced snapshot expires on the first
+            // pass, as every maintenance scenario expects. The retention
+            // scenarios restore the production window.
+            config: ForgeConfig {
+                snapshot_retention: Duration::ZERO,
+                ..ForgeConfig::default()
+            },
             forge_resources,
             forge_spill,
             scribe,

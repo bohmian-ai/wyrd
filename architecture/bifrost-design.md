@@ -805,22 +805,41 @@ HTTP queries bypass the server's global load-shed and request-concurrency
 layers so they reach this queue; gRPC reaches it directly.
 
 Snapshot preparation has no admission gate of its own. One tenant-scoped
-statement on the bounded runtime PostgreSQL pool resolves every referenced
-table, registers one active read per table under the table's maintenance
-authority, and returns each catalog metadata pointer with its hot rows. Oracle
+autocommit statement on the bounded runtime PostgreSQL pool, binding its own
+tenant, resolves every referenced table and returns each catalog metadata
+pointer with its hot rows. The statement is read-only: it takes no lock,
+writes no row, and nothing is released at the query's terminal. Each Oracle
+node caches the returned cuts per table and serves them only while it is
+listening on the `bifrost_cut` channel, which a `vala.file_list` trigger
+notifies in every committing transaction that changes a table's hot
+candidates; a lost listener clears the cache. Pointer moves that leave the
+candidates alone send nothing, because the older pointer returns the same
+rows. A cached cut serves a query only when it was read no earlier than the
+query deadline minus `max_query_deadline_ms`, so snapshot retention still
+covers it. Delivery follows commit, so the cache adds its notification
+latency to the publication race below. Oracle
 then reads the selected metadata documents directly and concurrently; a
 document missing after a catalog move reacquires the whole cut once, and a
-second `NotFound` is terminal. The active reads live until the leader settles
-every descendant fragment, and all of this waits within the leader deadline. `oracle_query_phase_seconds` times the
-leader's sequential, non-overlapping steps — `snapshot_pin` (covering every
-preparation substep above), `scribe_listing`, `provider_setup`,
-`physical_planning`, and `admission` — so they may be read as additive; total
-Oracle time is `oracle_query_duration_seconds`, not a phase.
+second `NotFound` is terminal. All of this waits within the leader deadline,
+which is capped at `max_query_deadline_ms` (default 6 h); Forge's snapshot
+retention, never a per-query record, keeps the pinned objects readable.
+
+Every query carries one execution profile, the analog of `ClickHouse`
+`ProfileEvents`. The leader's own steps — `cut_read`, `cut_materialize`,
+`scribe_listing`, `provider_setup`, `physical_planning`, `admission`, and
+`audit_bind` — are `DataFusion` `Time` metrics timed with
+the same scoped guards operators use, and every operator of the executed root
+contributes its own `DataFusion` metrics. The profile is emitted once, after
+the leader settles every descendant fragment, as `oracle_query_profile_nanoseconds_total{event}`,
+`oracle_query_profile_count_total{event}`, and `oracle_query_profiles_total`,
+with events named `Oracle.<step>` or `<operator>.<metric>`, plus one DEBUG
+event per query. Operator times sum across partitions, so they are not wall
+time; total Oracle time is `oracle_query_duration_seconds`.
 Remote peer work reuses one authenticated channel per ready peer incarnation and
 endpoint; a changed fence or endpoint connects anew and never inherits the
-prior peer's channel. Connect, fragment open, first remote frame, and terminal
-are timed as separate `peer_*` phases; they are per-fragment latencies that can
-overlap one another and the leader steps, so they are never summed with them.
+prior peer's channel. A live leaf profiles `fragment_open_time`, connect
+included, and `fragment_wait_time` spent awaiting remote frames; both sum
+across its partitions.
 
 An Analytical leader selects at most `max_workers_per_query` remote workers from
 the pinned eligible cut, rotating the starting position by the attempt identity
@@ -1109,27 +1128,33 @@ or contradictory lineage evidence fails closed.
 Data-file compaction, manifest rewriting, snapshot expiration, expired-object
 cleanup, and never-published orphan cleanup are separate protocols. The leader
 timer orders them per pass as manifest rewrite, snapshot expiry, then cleanup.
-Expiry has no age or retain-last window: a replaced snapshot is eligible as
-soon as no active Oracle read, in-flight compaction, unsettled promotion, or
-other authoritative root retains it. A table with an active read is skipped;
-snapshot expiration preserves active refs, unresolved attempts, reconciliation
+Expiry protects readers with a time window, as Iceberg, Trino, Delta, Paimon,
+and Snowflake do, and tracks no query. Forge records in Postgres when it first
+observes each retained snapshot as no longer current; a replaced snapshot is
+eligible once that observation is `snapshot_retention_secs` (default 6 h, never
+below the maximum query deadline) old and no in-flight compaction, unsettled
+promotion, or other authoritative root retains it. A query pins a snapshot
+while it is current, so the snapshot cannot expire before the query's deadline.
+The leader plans an expiry task only when some replaced snapshot is already
+past the window, so a quiet table is rechecked every pass and every planned
+task changes the table.
+Snapshot expiration preserves active refs, unresolved attempts, reconciliation
 evidence, and the lineage snapshot referenced by the branch head. Orphan GC deletes only
 objects proven unreferenced and outside every active or uncertain attempt.
-Committed Scribe hot objects in `file_list` that lack exact promotion evidence,
-and objects of a table with an active Oracle read, are hard GC roots even
-when no Iceberg snapshot references them. Once the last reader releases,
-expired-object cleanup deletes without an age floor and removes the matching
+Committed Scribe hot objects in `file_list` that lack exact promotion evidence
+are hard GC roots even when no Iceberg snapshot references them. Once its
+snapshots expire, expired-object cleanup deletes without a further age floor and removes the matching
 terminal `file_list` row in the same completion transaction.
 Every destructive effect holds the table's exclusive maintenance authority
 through its known outcome, and the Forge lease TTL bounds that hold: an
 object-store call still running at the bound is an uncertain effect left for
-idempotent replay, so a hung store never blocks the table's readers
-indefinitely. An Oracle cut that waits on the authority waits at most until
-its query deadline and then fails with the query timeout.
+idempotent replay. Oracle never takes the authority, so maintenance never
+waits on a query and a query never waits on maintenance.
 An open Scribe fragment retains its local Arrow batches and staged resources
 until its stream completes or drops. It names no Forge-collectable object and
 contributes no independent Forge GC root.
-No cleanup infers safety from age or path shape alone.
+No cleanup infers safety from path shape; only snapshot expiry and orphan GC
+use age.
 
 ## Resource and failure invariants
 
@@ -1210,7 +1235,10 @@ across a restart; durable batch, file, and task rows answer that question.
 - **Scribe.** `bifrost_scribe_ack_seconds` measures each ACK attempt.
   `bifrost_scribe_memtable_rows_inserted_total` counts rows the shard inserted
   into the live memtable in this process; an idempotent same-process retry adds
-  zero, and replay after restart counts again in the new process. Receipt
+  zero, and replay after restart counts again in the new process.
+  `bifrost_scribe_memtable_bytes_inserted_total` counts the same rows'
+  retained Arrow bytes, the in-memory size ingest throughput is measured in.
+  Receipt
   `accepted_rows` is a client contract, not a newly-stored-row measure.
   `bifrost_scribe_staging_live_members`, `_live_bytes`,
   `_oldest_member_timestamp_seconds`, and `_outstanding_claims` are published

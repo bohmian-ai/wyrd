@@ -1407,7 +1407,6 @@ impl TonicOraclePeerTransport {
         let channel = if let Some(channel) = cached {
             channel
         } else {
-            let started = std::time::Instant::now();
             let channel = self
                 .tls
                 .endpoint(address.clone())
@@ -1415,7 +1414,6 @@ impl TonicOraclePeerTransport {
                 .connect()
                 .await
                 .map_err(|_| DispatchError::Unavailable)?;
-            super::QueryPhase::PeerConnect.record(started);
             self.channels
                 .lock()
                 .map_err(|_| DispatchError::Terminal)?
@@ -1539,28 +1537,18 @@ impl TonicOraclePeerTransport {
         );
         let mut client = self.client(candidate).await?;
         let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
-        let opened = std::time::Instant::now();
-        let response = client
-            .execute_fragment(wire)
-            .await
-            .inspect(|_| super::QueryPhase::PeerOpen.record(opened))
-            .map_err(|status| {
-                span.record("outcome", "failed");
-                tracing::warn!(parent: &span, code = ?status.code(), "Oracle peer execute rejected");
-                if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
-                    live_execution_status_error(&status)
-                } else {
-                    execution_status_error(&status)
-                }
-            })?;
+        let response = client.execute_fragment(wire).await.map_err(|status| {
+            span.record("outcome", "failed");
+            tracing::warn!(parent: &span, code = ?status.code(), "Oracle peer execute rejected");
+            if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
+                live_execution_status_error(&status)
+            } else {
+                execution_status_error(&status)
+            }
+        })?;
         let mut stream = response.into_inner();
         let output = async_stream::stream! {
-            let streaming = std::time::Instant::now();
-            let mut first = true;
             while let Some(frame) = stream.next().await {
-                if std::mem::take(&mut first) {
-                    super::QueryPhase::PeerFirstFrame.record(streaming);
-                }
                 let frame = frame.map_err(|status| {
                     tracing::warn!(parent: &span, code = ?status.code(), message = status.message(), "Oracle peer worker stream failed");
                     stream_status_error(&status)
@@ -1574,7 +1562,6 @@ impl TonicOraclePeerTransport {
                 yield frame;
             }
             span.record("outcome", "success");
-            super::QueryPhase::PeerTerminal.record(streaming);
         };
         Ok(Box::pin(output))
     }

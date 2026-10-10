@@ -9,11 +9,15 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use datafusion::common::Statistics;
+use datafusion::common::stats::Precision;
+use datafusion::functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+use datafusion::logical_expr::Accumulator as _;
 use wyrd_spec::DataTenantId;
 
 use crate::contracts::ScribeError;
@@ -77,8 +81,8 @@ impl SealTriggerReason {
 /// ordering contract in `ShardOwner::retire_committed`.
 #[derive(Debug)]
 pub struct Memtable {
-    pub(crate) writable: Arc<Mutex<HashMap<SealKey, MemtableBucket>>>,
-    pub(crate) immutable: Arc<Mutex<HashMap<SealKey, Vec<ImmutableEntry>>>>,
+    pub(crate) writable: Arc<RwLock<HashMap<SealKey, MemtableBucket>>>,
+    pub(crate) immutable: Arc<RwLock<HashMap<SealKey, Vec<ImmutableEntry>>>>,
     next_seal_id: Arc<AtomicU64>,
     rotation_bytes: usize,
     /// Runtime active-generation max age consulted by the seal predicates.
@@ -300,8 +304,8 @@ impl Memtable {
     #[must_use]
     pub fn new_with_config(rotation_bytes: usize, seal_max_age: Duration) -> Self {
         Self {
-            writable: Arc::new(Mutex::new(HashMap::new())),
-            immutable: Arc::new(Mutex::new(HashMap::new())),
+            writable: Arc::new(RwLock::new(HashMap::new())),
+            immutable: Arc::new(RwLock::new(HashMap::new())),
             next_seal_id: Arc::new(AtomicU64::new(1)),
             rotation_bytes,
             seal_max_age,
@@ -321,7 +325,7 @@ impl Memtable {
         meta: ScribeAppendMeta,
         batch: RecordBatch,
     ) -> Result<(), ScribeError> {
-        let mut buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
+        let mut buckets = self.writable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
 
@@ -346,7 +350,7 @@ impl Memtable {
     ) -> Result<Option<u64>, ScribeError> {
         let writable = self
             .writable
-            .lock()
+            .read()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable writable lock poisoned: {error}"),
             })?;
@@ -370,7 +374,7 @@ impl Memtable {
 
         let immutable = self
             .immutable
-            .lock()
+            .read()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
@@ -428,6 +432,7 @@ impl Memtable {
         }
 
         let mut batches = Vec::with_capacity(replayed.data_records.len());
+        let mut statistics = Vec::with_capacity(replayed.data_records.len());
         let mut metas = Vec::with_capacity(replayed.append_metas.len());
         for (payload, replayed_meta) in replayed.data_records.iter().zip(&replayed.append_metas) {
             let reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(payload), None)
@@ -454,6 +459,7 @@ impl Memtable {
             })?;
             let rows_accepted = batch.num_rows();
             let (data_digest, data_len) = crate::scribe::preprocess::logical_data_identity(&batch)?;
+            statistics.push(batch_statistics(&batch));
             batches.push(batch);
             metas.push(ScribeAppendMeta {
                 batch_id: replayed_meta.batch_id,
@@ -490,6 +496,7 @@ impl Memtable {
             seal_key: replayed.seal_key.clone(),
             schema,
             batches,
+            statistics,
             metas,
             opened_at: Instant::now(),
             closed_at: Instant::now(),
@@ -506,7 +513,7 @@ impl Memtable {
             frozen.seal_id = self.allocate_seal_id(&frozen.seal_key)?;
         }
         frozen.shard_id = self.shard_id;
-        let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let mut immutable = self.immutable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         immutable
@@ -544,7 +551,7 @@ impl Memtable {
         &self,
         seal_key: &SealKey,
     ) -> Result<Option<SealTriggerReason>, ScribeError> {
-        let buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
+        let buckets = self.writable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
 
@@ -570,7 +577,7 @@ impl Memtable {
     ) -> Result<bool, ScribeError> {
         let buckets = self
             .writable
-            .lock()
+            .read()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable bucket lock poisoned: {error}"),
             })?;
@@ -596,13 +603,13 @@ impl Memtable {
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned or if
     /// the seal-key does not exist.
     pub fn freeze(&self, seal_key: &SealKey) -> Result<FrozenMemtable, ScribeError> {
-        let mut buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
+        let mut buckets = self.writable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
 
         let Some(bucket) = buckets.remove(seal_key) else {
             drop(buckets);
-            let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+            let immutable = self.immutable.read().map_err(|e| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {e}"),
             })?;
             return immutable
@@ -617,7 +624,7 @@ impl Memtable {
         let seal_id = self.allocate_seal_id(seal_key)?;
         let frozen = bucket.freeze(seal_id, self.shard_id);
 
-        let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let mut immutable = self.immutable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         immutable
@@ -641,13 +648,13 @@ impl Memtable {
     pub(crate) fn freeze_all_nonempty(&self) -> Result<Vec<FrozenMemtable>, ScribeError> {
         let mut writable = self
             .writable
-            .lock()
+            .write()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable writable lock poisoned: {error}"),
             })?;
         let mut immutable = self
             .immutable
-            .lock()
+            .write()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
@@ -675,7 +682,7 @@ impl Memtable {
     /// # Errors
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
     pub fn row_count(&self, seal_key: &SealKey) -> Result<usize, ScribeError> {
-        let buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
+        let buckets = self.writable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
 
@@ -690,7 +697,7 @@ impl Memtable {
     pub(crate) fn writable_bytes(&self, seal_key: &SealKey) -> Result<usize, ScribeError> {
         let buckets = self
             .writable
-            .lock()
+            .read()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable bucket lock poisoned: {error}"),
             })?;
@@ -715,7 +722,7 @@ impl Memtable {
     /// Returns [`ScribeError::Internal`] if the immutable-entry lock is
     /// poisoned.
     pub(crate) fn has_pending_frozen(&self, seal_key: &SealKey) -> Result<bool, ScribeError> {
-        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let immutable = self.immutable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         Ok(immutable
@@ -735,7 +742,7 @@ impl Memtable {
         &self,
         _shard: usize,
     ) -> Result<Vec<SealKey>, ScribeError> {
-        let buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
+        let buckets = self.writable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
         Ok(buckets.keys().cloned().collect())
@@ -757,7 +764,7 @@ impl Memtable {
         let matches = |key: &SealKey| key.tenant == tenant && key.table == *table;
         let mut keys = self
             .writable
-            .lock()
+            .read()
             .map_err(|e| ScribeError::Internal {
                 detail: format!("memtable bucket lock poisoned: {e}"),
             })?
@@ -765,7 +772,7 @@ impl Memtable {
             .filter(|key| matches(key))
             .cloned()
             .collect::<Vec<_>>();
-        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let immutable = self.immutable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         keys.extend(
@@ -794,7 +801,7 @@ impl Memtable {
     ) -> Result<Vec<SealKey>, ScribeError> {
         let buckets = self
             .writable
-            .lock()
+            .read()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable writable lock poisoned: {error}"),
             })?;
@@ -809,7 +816,7 @@ impl Memtable {
     pub(crate) fn pressure_candidates(&self) -> Result<Vec<PressureCandidate>, ScribeError> {
         let buckets = self
             .writable
-            .lock()
+            .read()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable writable lock poisoned: {error}"),
             })?;
@@ -905,6 +912,11 @@ impl Memtable {
     /// which would be wrong anyway because partition ordering is keyed on
     /// granularity before start.
     ///
+    /// The locks are held only while each selected bucket and generation is
+    /// captured as reference-counted batches and bounds; column selection and
+    /// projection run after both are released, so concurrent reads share the
+    /// read locks briefly and an insert never waits behind a projection.
+    ///
     /// # Errors
     ///
     /// Returns an internal error when locks, column selection, or Arrow
@@ -921,17 +933,17 @@ impl Memtable {
                 && seal_key.table == *table
                 && partitions.is_none_or(|range| range.contains(&seal_key.partition))
         };
-        let writable = self.writable.lock().map_err(|e| ScribeError::Internal {
+        let writable = self.writable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
-        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let immutable = self.immutable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
-        let mut batches = Vec::new();
+        let mut sources = Vec::new();
 
         for (seal_key, bucket) in writable.iter() {
             if selects(seal_key) {
-                bucket.append_readable_batches(required_columns, &mut batches)?;
+                sources.push(bucket.readable_source());
             }
         }
         for (seal_key, entries) in immutable.iter() {
@@ -946,13 +958,15 @@ impl Memtable {
                     if matches!(entry.state, ImmutableState::Durable { .. }) {
                         continue;
                     }
-                    entry.frozen.append_readable_batches(
-                        required_columns,
-                        self.ordinal(entry.seal_id),
-                        &mut batches,
-                    )?;
+                    sources.push(entry.frozen.readable_source(self.ordinal(entry.seal_id)));
                 }
             }
+        }
+        drop(immutable);
+        drop(writable);
+        let mut batches = Vec::new();
+        for source in sources {
+            source.project(required_columns, &mut batches)?;
         }
         Ok(batches)
     }
@@ -986,7 +1000,7 @@ impl Memtable {
         seal_id: u64,
         member: crate::scribe::assembly::StagedMemberId,
     ) -> Result<(), ScribeError> {
-        let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let mut immutable = self.immutable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         for entries in immutable.values_mut() {
@@ -1031,7 +1045,7 @@ impl Memtable {
     ///
     /// Returns [`ScribeError::Internal`] when the immutable-generation lock is poisoned.
     fn sweep_once_with_sizes(&self) -> Result<Vec<(SealKey, WalRange, usize)>, ScribeError> {
-        let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let mut immutable = self.immutable.write().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         let mut retired = Vec::new();
@@ -1087,7 +1101,7 @@ impl Memtable {
     ) -> Result<Option<CommittedRetirement>, ScribeError> {
         let immutable = self
             .immutable
-            .lock()
+            .read()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
@@ -1115,7 +1129,7 @@ impl Memtable {
     ) -> Result<WalRange, ScribeError> {
         let mut immutable = self
             .immutable
-            .lock()
+            .write()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
@@ -1153,7 +1167,7 @@ impl Memtable {
 
     /// Number of immutable generations currently retained.
     pub fn immutable_generation_count(&self) -> Result<usize, ScribeError> {
-        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let immutable = self.immutable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         Ok(immutable.values().map(Vec::len).sum())
@@ -1161,7 +1175,7 @@ impl Memtable {
 
     /// Number of immutable generations still pending post-commit.
     pub fn pending_generation_count(&self) -> Result<usize, ScribeError> {
-        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let immutable = self.immutable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         Ok(immutable
@@ -1175,7 +1189,7 @@ impl Memtable {
     pub(crate) fn discard_pending_generation(&self, seal_id: u64) -> Result<(), ScribeError> {
         let mut immutable = self
             .immutable
-            .lock()
+            .write()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
@@ -1206,7 +1220,7 @@ impl Memtable {
 
     /// Return aggregate writable and immutable state without exposing buckets.
     pub fn stats(&self) -> Result<MemtableStats, ScribeError> {
-        let writable = self.writable.lock().map_err(|e| ScribeError::Internal {
+        let writable = self.writable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable writable lock poisoned: {e}"),
         })?;
         let writable_rows = writable.values().map(|bucket| bucket.row_count).sum();
@@ -1217,7 +1231,7 @@ impl Memtable {
         let writable_buckets = writable.len();
         drop(writable);
 
-        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+        let immutable = self.immutable.read().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         let immutable_rows = immutable
@@ -1253,13 +1267,13 @@ impl Memtable {
     pub(crate) fn bucket_memory(&self) -> Result<Vec<BucketMemorySnapshot>, ScribeError> {
         let writable = self
             .writable
-            .lock()
+            .read()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable writable lock poisoned: {error}"),
             })?;
         let immutable = self
             .immutable
-            .lock()
+            .read()
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
@@ -1305,6 +1319,8 @@ pub(crate) struct MemtableBucket {
     seal_key: SealKey,
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
+    /// Exact column bounds of each batch, index-aligned with `batches`.
+    statistics: Vec<Arc<Statistics>>,
     metas: Vec<ScribeAppendMeta>,
     row_count: usize,
     bytes_accumulated: usize,
@@ -1319,6 +1335,7 @@ impl MemtableBucket {
             seal_key,
             schema,
             batches: Vec::new(),
+            statistics: Vec::new(),
             metas: Vec::new(),
             row_count: 0,
             bytes_accumulated: 0,
@@ -1327,9 +1344,14 @@ impl MemtableBucket {
         }
     }
 
+    /// Retains one append batch with its metadata and exact column bounds.
+    ///
+    /// The bounds are computed here, once per batch, so a live read prunes
+    /// the batch without scanning its rows.
     fn append(&mut self, meta: ScribeAppendMeta, batch: RecordBatch) {
         self.row_count += batch.num_rows();
         self.bytes_accumulated += estimate_batch_bytes(&batch);
+        self.statistics.push(batch_statistics(&batch));
         self.batches.push(batch);
         self.metas.push(meta);
         self.last_insert_at = Instant::now();
@@ -1382,6 +1404,7 @@ impl MemtableBucket {
             seal_key: self.seal_key,
             schema: self.schema,
             batches,
+            statistics: self.statistics,
             metas: self.metas,
             opened_at,
             closed_at,
@@ -1389,24 +1412,15 @@ impl MemtableBucket {
         }
     }
 
-    /// Appends this active bucket's shallow projected batches to `output`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the column-selection or Arrow projection error unchanged.
-    fn append_readable_batches(
-        &self,
-        required_columns: &[String],
-        output: &mut Vec<ReadableBatch>,
-    ) -> Result<(), ScribeError> {
-        let projection = projection_indices(&self.schema, required_columns)?;
-        append_projected_batches(
+    /// Captures this active bucket's batches for projection outside the lock.
+    fn readable_source(&self) -> ReadableSource {
+        ReadableSource::capture(
+            &self.schema,
             &self.batches,
+            &self.statistics,
             &self.metas,
             self.seal_key.partition,
             None,
-            &projection,
-            output,
         )
     }
 }
@@ -1531,10 +1545,12 @@ impl ImmutableEntry {
 pub struct ReadableBatch {
     /// Exact partition day owning the batch.
     pub partition_day: crate::catalog::layout::TimePartition,
-    /// WAL metadata for the append.
-    pub meta: ScribeAppendMeta,
+    /// Maximum WAL LSN of the append.
+    pub wal_lsn_max: crate::scribe::wal::WalLsn,
     /// Arrow rows for the append.
     pub batch: RecordBatch,
+    /// Exact column bounds of `batch`, in its projected column order.
+    pub statistics: Arc<Statistics>,
     /// Registry identity of the immutable generation serving the rows, or
     /// `None` for rows still in a writable bucket.
     ///
@@ -1591,6 +1607,11 @@ pub struct FrozenMemtable {
     pub schema: SchemaRef,
     /// Original append batches, preserved for LSN-granular live tail reads.
     pub batches: Vec<RecordBatch>,
+    /// Exact column bounds of each batch, index-aligned with `batches`.
+    ///
+    /// A batch without an entry, as in a hand-built test generation, reads
+    /// with unknown bounds and is never pruned.
+    pub statistics: Vec<Arc<Statistics>>,
     /// Per-append metadata derived from WAL record headers.
     pub metas: Vec<ScribeAppendMeta>,
     /// Monotonic time at which the active generation first received a row.
@@ -1608,63 +1629,143 @@ impl FrozenMemtable {
         self.batches.iter().map(RecordBatch::num_rows).sum()
     }
 
-    /// Appends this immutable generation through the bounded shallow collector.
+    /// Captures this immutable generation's batches for projection outside
+    /// the lock.
     ///
     /// Every batch is tagged with `generation`, the registry identity of this
     /// generation, so a caller can tell which generations the cut served and
     /// must not also read from their staged runs.
-    ///
-    /// # Errors
-    ///
-    /// Returns the column-selection or Arrow projection error unchanged.
-    fn append_readable_batches(
+    fn readable_source(
         &self,
-        required_columns: &[String],
         generation: crate::scribe::hot_source::GenerationOrdinal,
-        output: &mut Vec<ReadableBatch>,
-    ) -> Result<(), ScribeError> {
-        let projection = projection_indices(&self.schema, required_columns)?;
-        append_projected_batches(
+    ) -> ReadableSource {
+        ReadableSource::capture(
+            &self.schema,
             &self.batches,
+            &self.statistics,
             &self.metas,
             self.seal_key.partition,
             Some(generation),
-            &projection,
-            output,
         )
     }
 }
 
-/// Appends shallow projected batches, each referencing its source columns.
+/// One bucket's or generation's batches, captured under the memtable read
+/// locks and projected only after they are released.
 ///
-/// Each batch carries `generation`, the serving immutable generation or
-/// `None` for a writable bucket.
-///
-/// # Errors
-///
-/// Returns an internal error when Arrow projection fails.
-fn append_projected_batches(
-    batches: &[RecordBatch],
-    metas: &[ScribeAppendMeta],
+/// Capturing copies reference-counted batches and bounds and each append's
+/// WAL position, never row data, so the locks are held for a few pointer
+/// copies per batch.
+struct ReadableSource {
+    /// Arrow schema shared by every batch.
+    schema: SchemaRef,
+    /// The captured append batches.
+    batches: Vec<RecordBatch>,
+    /// Exact bounds of each batch, index-aligned with `batches`; a batch
+    /// without an entry reads with unknown bounds.
+    statistics: Vec<Arc<Statistics>>,
+    /// Maximum WAL LSN of each append, index-aligned with `batches`.
+    wal_lsns: Vec<crate::scribe::wal::WalLsn>,
+    /// Exact partition owning every batch.
     partition_day: crate::catalog::layout::TimePartition,
+    /// Serving immutable generation, or `None` for a writable bucket.
     generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
-    projection: &[usize],
-    output: &mut Vec<ReadableBatch>,
-) -> Result<(), ScribeError> {
-    for (batch, meta) in batches.iter().zip(metas) {
-        let batch = batch
-            .project(projection)
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("live-tail Arrow projection failed: {error}"),
-            })?;
-        output.push(ReadableBatch {
+}
+
+impl ReadableSource {
+    /// Captures `batches` and their bounds and WAL positions by reference.
+    fn capture(
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+        statistics: &[Arc<Statistics>],
+        metas: &[ScribeAppendMeta],
+        partition_day: crate::catalog::layout::TimePartition,
+        generation: Option<crate::scribe::hot_source::GenerationOrdinal>,
+    ) -> Self {
+        Self {
+            schema: Arc::clone(schema),
+            batches: batches.to_vec(),
+            statistics: statistics.to_vec(),
+            wal_lsns: metas.iter().map(|meta| meta.wal_lsn_max).collect(),
             partition_day,
-            meta: meta.clone(),
-            batch,
             generation,
-        });
+        }
     }
-    Ok(())
+
+    /// Appends each captured batch, projected to `required_columns`, to
+    /// `output`, with its bounds projected like its columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns the column-selection error unchanged, or an internal error
+    /// when Arrow projection fails.
+    fn project(
+        self,
+        required_columns: &[String],
+        output: &mut Vec<ReadableBatch>,
+    ) -> Result<(), ScribeError> {
+        let projection = projection_indices(&self.schema, required_columns)?;
+        for (index, (batch, wal_lsn_max)) in self.batches.iter().zip(self.wal_lsns).enumerate() {
+            let batch = batch
+                .project(&projection)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("live-tail Arrow projection failed: {error}"),
+                })?;
+            let statistics = Arc::new(self.statistics.get(index).map_or_else(
+                || Statistics::new_unknown(batch.schema_ref()),
+                |bounds| {
+                    Statistics {
+                        num_rows: bounds.num_rows,
+                        total_byte_size: Precision::Absent,
+                        column_statistics: projection
+                            .iter()
+                            .map(|column| bounds.column_statistics[*column].clone())
+                            .collect(),
+                    }
+                },
+            ));
+            output.push(ReadableBatch {
+                partition_day: self.partition_day,
+                wal_lsn_max,
+                batch,
+                statistics,
+                generation: self.generation,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Computes one append batch's exact row count and primitive-column bounds.
+///
+/// Only primitive columns (integers, floats, decimals, dates, times,
+/// timestamps) get a minimum and maximum: they cost one vectorized pass at
+/// insert, which a live read then saves on every query that can rule the
+/// batch out. Other columns, and a primitive column whose bound cannot be
+/// computed, stay unknown, which never prunes.
+fn batch_statistics(batch: &RecordBatch) -> Arc<Statistics> {
+    let mut statistics = Statistics::new_unknown(batch.schema_ref());
+    statistics.num_rows = Precision::Exact(batch.num_rows());
+    for (column, bounds) in batch
+        .columns()
+        .iter()
+        .zip(statistics.column_statistics.iter_mut())
+    {
+        bounds.null_count = Precision::Exact(column.null_count());
+        if !column.data_type().is_primitive() {
+            continue;
+        }
+        let values = std::slice::from_ref(column);
+        let min = MinAccumulator::try_new(column.data_type())
+            .and_then(|mut min| min.update_batch(values).and_then(|()| min.evaluate()));
+        let max = MaxAccumulator::try_new(column.data_type())
+            .and_then(|mut max| max.update_batch(values).and_then(|()| max.evaluate()));
+        if let (Ok(min), Ok(max)) = (min, max) {
+            bounds.min_value = Precision::Exact(min);
+            bounds.max_value = Precision::Exact(max);
+        }
+    }
+    Arc::new(statistics)
 }
 
 /// Resolve and validate the bounded projection requested by Oracle.
@@ -1720,6 +1821,44 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let array = Int64Array::from(vec![1i64; num_rows]);
         RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("batch")
+    }
+
+    /// An append batch's bounds are exact for a primitive column and unknown
+    /// for any other, so a string predicate never prunes on a guess.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a bound or the row count differs from the batch.
+    #[test]
+    fn batch_statistics_bound_primitive_columns_only() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![7, 3, 9])),
+                Arc::new(arrow::array::StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .expect("bounds fixture batch");
+
+        let statistics = batch_statistics(&batch);
+
+        let id = &statistics.column_statistics[0];
+        let payload = &statistics.column_statistics[1];
+        assert_eq!(statistics.num_rows, Precision::Exact(3));
+        assert_eq!(
+            id.min_value,
+            Precision::Exact(datafusion::common::ScalarValue::Int64(Some(3)))
+        );
+        assert_eq!(
+            id.max_value,
+            Precision::Exact(datafusion::common::ScalarValue::Int64(Some(9)))
+        );
+        assert_eq!(payload.min_value, Precision::Absent);
+        assert_eq!(payload.null_count, Precision::Exact(0));
     }
 
     fn make_test_meta(lsn: u64) -> ScribeAppendMeta {
@@ -1815,7 +1954,7 @@ mod tests {
                 .insert(key, make_test_meta(lsn), make_test_batch(1))
                 .expect("populate cohort member");
         }
-        memtable.writable.lock().expect("writable lock").insert(
+        memtable.writable.write().expect("writable lock").insert(
             empty.clone(),
             MemtableBucket::new(empty, make_test_batch(1).schema()),
         );
@@ -1879,7 +2018,7 @@ mod tests {
                 )
                 .expect("provider cut")
                 .iter()
-                .map(|batch| batch.meta.wal_lsn_max.as_u64())
+                .map(|batch| batch.wal_lsn_max.as_u64())
                 .collect::<std::collections::BTreeSet<_>>()
         };
 
@@ -2008,7 +2147,7 @@ mod tests {
             .readable_batches(crate::test_support::tenant(), &seal_key.table)
             .expect("readable")
             .into_iter()
-            .map(|batch| batch.meta.wal_lsn_max)
+            .map(|batch| batch.wal_lsn_max)
             .collect();
         assert_eq!(
             lsns,
@@ -2098,7 +2237,7 @@ mod tests {
             .insert(&seal_key, make_test_meta(1), make_test_batch(1))
             .expect("seed bucket");
         {
-            let mut buckets = memtable.writable.lock().expect("writable lock");
+            let mut buckets = memtable.writable.write().expect("writable lock");
             buckets
                 .get_mut(&seal_key)
                 .expect("seed bucket")
@@ -2115,7 +2254,7 @@ mod tests {
             seal_key.table.clone(),
             crate::test_support::day_partition(2026, 7, 16),
         );
-        memtable.writable.lock().expect("writable lock").insert(
+        memtable.writable.write().expect("writable lock").insert(
             empty_key.clone(),
             MemtableBucket::new(empty_key.clone(), incoming.schema()),
         );
@@ -2142,7 +2281,7 @@ mod tests {
             .insert(&seal_key, make_test_meta(0), batch)
             .expect("insert");
 
-        let mut buckets = memtable.writable.lock().expect("writable lock");
+        let mut buckets = memtable.writable.write().expect("writable lock");
         buckets.get_mut(&seal_key).expect("bucket").first_insert_at = Instant::now()
             .checked_sub(ACTIVE_GENERATION_MAX_AGE)
             .expect("test clock supports age offset");
@@ -2257,7 +2396,7 @@ mod tests {
             .insert(&second, make_test_meta(2), make_test_batch(1))
             .expect("second insert");
         {
-            let mut buckets = memtable.writable.lock().expect("writable lock");
+            let mut buckets = memtable.writable.write().expect("writable lock");
             buckets
                 .get_mut(&first)
                 .expect("first bucket")
@@ -2425,7 +2564,7 @@ mod tests {
         memtable
             .insert(&key, make_test_meta(1), make_test_batch(1))
             .expect("insert");
-        let buckets = memtable.writable.lock().expect("writable lock");
+        let buckets = memtable.writable.write().expect("writable lock");
         let bucket = buckets.get(&key).expect("bucket");
         let opened = bucket.first_insert_at;
         assert_eq!(

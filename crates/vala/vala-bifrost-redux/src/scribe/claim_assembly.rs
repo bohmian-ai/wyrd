@@ -352,6 +352,7 @@ mod tests {
             shard_id: usize::from(batch),
             schema,
             batches: vec![record],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),

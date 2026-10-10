@@ -2,7 +2,8 @@
 //!
 //! Every row is PASS, FAIL, or `-` (a sweep point that only locates
 //! saturation) with a one-line reason. Every row fails on any error, on peak
-//! server memory at or above [`MEMORY_CEILING_BYTES`], or on an OOM kill.
+//! server memory within [`MEMORY_HEADROOM_BYTES`] of the server's memory
+//! limit, or on an OOM kill.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -10,17 +11,16 @@ use std::path::Path;
 use crate::Result;
 use crate::run::{Measured, Overload, QUEUE_FULL, QUEUE_PLACES, Usage};
 use crate::workload::{Case, Fixture, Target};
-use wyrd_testing::release_server::{CPUS, MEMORY_BYTES};
 
-/// Peak server memory every step must stay below: the pod limit less the
-/// server's 1-GiB default headroom.
-const MEMORY_CEILING_BYTES: u64 = MEMORY_BYTES - (1 << 30);
+/// The server's 1-GiB default headroom: every step's peak server memory must
+/// stay below the server's memory limit less this.
+const MEMORY_HEADROOM_BYTES: u64 = 1 << 30;
 
 /// Durable acknowledged rows per second every write step must reach.
 const MIN_WRITE_ROWS_PER_SECOND: f64 = 200_000.0;
 
 /// The report table's header.
-const HEADER: &str = "| step | clients | rate | p50/p95/p99 ms | errors | server CPU | peak memory | seals | driver CPU | verdict | reason |\n|---|---|---|---|---|---|---|---|---|---|---|";
+const HEADER: &str = "| step | clients | rate | p50/p95/p99 ms | errors | server CPU | peak memory | driver CPU | verdict | reason |\n|---|---|---|---|---|---|---|---|---|---|";
 
 /// A row's judgement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,7 @@ struct Row {
     /// Error count and codes.
     errors: String,
     /// Server usage over the window.
-    usage: Option<(f64, u64, f64, f64)>,
+    usage: Option<(f64, u64, f64)>,
     /// Judgement.
     verdict: Verdict,
     /// Why.
@@ -58,9 +58,9 @@ impl Row {
     fn render(&self) -> String {
         let usage = self
             .usage
-            .map_or("- | - | - | -".to_owned(), |(cpu, peak, seals, driver)| {
+            .map_or("- | - | -".to_owned(), |(cpu, peak, driver)| {
                 format!(
-                    "{cpu:.2} cores | {:.2} GiB | {seals:.0} | {driver:.2} cores",
+                    "{cpu:.2} cores | {:.2} GiB | {driver:.2} cores",
                     peak as f64 / f64::from(1 << 30)
                 )
             });
@@ -80,6 +80,10 @@ impl Row {
 pub struct Report {
     /// Fixture the report describes.
     fixture: Fixture,
+    /// Which tier the reads hit and where the server ran.
+    label: String,
+    /// The server's memory limit, which sets the peak-memory ceiling.
+    memory_limit_bytes: u64,
     /// Rows so far.
     rows: Vec<Row>,
     /// One JSON line per judged step: its name, clients, and every latency.
@@ -87,15 +91,19 @@ pub struct Report {
 }
 
 impl Report {
-    /// Starts an empty report for `fixture` and prints the table header;
-    /// each row prints as it is judged.
-    pub fn new(fixture: Fixture) -> Self {
-        println!("{}\n\n{HEADER}", Self::title(fixture));
-        Self {
+    /// Starts an empty report for `fixture` titled with `label` (the tier
+    /// and host) on a server whose memory limit is `memory_limit_bytes`, and
+    /// prints the title and table header; each row prints as it is judged.
+    pub fn new(fixture: Fixture, label: String, memory_limit_bytes: u64) -> Self {
+        let report = Self {
             fixture,
+            label,
+            memory_limit_bytes,
             rows: Vec::new(),
             samples: String::new(),
-        }
+        };
+        println!("{}\n\n{HEADER}", report.title());
+        report
     }
 
     /// Adds a write step: it must durably acknowledge at least
@@ -103,10 +111,19 @@ impl Report {
     /// objects the table holds afterwards.
     pub fn write(&mut self, step: &str, measured: &Measured, files: u64, bytes: u64) {
         let rate = measured.rows as f64 / measured.usage.seconds.max(f64::EPSILON);
+        let megabytes = measured
+            .usage
+            .write
+            .get(crate::run::MEMTABLE_BYTES)
+            .copied()
+            .unwrap_or(0.0)
+            / 1e6;
         let shape = format!(
-            "{} rows in {:.1}s; {files} files, avg {:.1} MiB",
+            "{} rows in {:.1}s, {:.1} MB/s, {:.1} MB/s per server core; {files} files, avg {:.1} MiB",
             measured.rows,
             measured.usage.seconds,
+            megabytes / measured.usage.seconds.max(f64::EPSILON),
+            megabytes / measured.usage.server_cpu_seconds.max(f64::EPSILON),
             bytes as f64 / files.max(1) as f64 / f64::from(1 << 20),
         );
         let missed = (rate < MIN_WRITE_ROWS_PER_SECOND)
@@ -223,6 +240,25 @@ impl Report {
         self.rows.iter().all(|row| row.verdict != Verdict::Fail)
     }
 
+    /// Adds a tier check: `outcome` says where the table's rows were, or why
+    /// they were not in the tier the phase reads.
+    pub fn tier(&mut self, step: &str, outcome: std::result::Result<String, String>) {
+        let (verdict, reason) = match outcome {
+            Ok(reason) => (Verdict::Pass, reason),
+            Err(reason) => (Verdict::Fail, reason),
+        };
+        self.add(Row {
+            step: step.to_owned(),
+            clients: "-".to_owned(),
+            rate: "-".to_owned(),
+            latency: "-".to_owned(),
+            errors: "-".to_owned(),
+            usage: None,
+            verdict,
+            reason,
+        });
+    }
+
     /// Adds the shutdown step: after `SIGTERM` the server must exit cleanly
     /// within its grace period; `stopped` is its exit time or the failure.
     pub fn shutdown(&mut self, stopped: &Result<f64>) {
@@ -249,7 +285,7 @@ impl Report {
     ///
     /// Returns the file write failure.
     pub fn write_to(&self, output: &Path) -> Result<()> {
-        let mut text = format!("{}\n\n{HEADER}\n", Self::title(self.fixture));
+        let mut text = format!("{}\n\n{HEADER}\n", self.title());
         for row in &self.rows {
             let _ = writeln!(text, "{}", row.render());
         }
@@ -258,12 +294,12 @@ impl Report {
         Ok(())
     }
 
-    /// The report's title line.
-    fn title(fixture: Fixture) -> String {
+    /// The report's title line: the fixture's rows, the tier, and where the
+    /// server ran, so only reports from matching hosts are compared.
+    fn title(&self) -> String {
         format!(
-            "# Bifrost query capacity: {} rows, {CPUS} CPU / {} GiB",
-            fixture.rows,
-            MEMORY_BYTES >> 30
+            "# Bifrost query capacity: {} rows, {}",
+            self.fixture.rows, self.label
         )
     }
 
@@ -297,8 +333,13 @@ impl Report {
             Some(format!("{} errors", measured.error_count()))
         } else if usage_.oom_kills > 0 {
             Some(format!("{} OOM kills", usage_.oom_kills))
-        } else if usage_.peak_memory_bytes >= MEMORY_CEILING_BYTES {
-            Some(format!("peak memory >= {} GiB", MEMORY_CEILING_BYTES >> 30))
+        } else if usage_.peak_memory_bytes + MEMORY_HEADROOM_BYTES >= self.memory_limit_bytes {
+            Some(format!(
+                "peak memory >= {} GiB",
+                self.memory_limit_bytes
+                    .saturating_sub(MEMORY_HEADROOM_BYTES)
+                    >> 30
+            ))
         } else {
             missed
         };
@@ -337,15 +378,14 @@ impl Report {
     }
 }
 
-/// Server CPU cores, peak memory, seals, and driver CPU cores of a window;
+/// Server CPU cores, peak memory, and driver CPU cores of a window;
 /// `None` for a window that never opened.
-fn usage(usage: &Usage) -> Option<(f64, u64, f64, f64)> {
+fn usage(usage: &Usage) -> Option<(f64, u64, f64)> {
     let seconds = usage.seconds;
     (seconds > 0.0).then(|| {
         (
             usage.server_cpu_seconds / seconds,
             usage.peak_memory_bytes,
-            usage.seals,
             usage.driver_cpu_seconds / seconds,
         )
     })
@@ -467,7 +507,7 @@ mod tests {
     /// Panics when a verdict is wrong.
     #[test]
     fn sweep_and_errors_are_judged() {
-        let mut report = Report::new(Fixture::standard());
+        let mut report = Report::new(Fixture::standard(), "test host".to_owned(), 16 << 30);
         report.sweep(
             Case::Selective,
             &[point(1, 5, 150), point(16, 12, 1_300), point(64, 90, 1_280)],

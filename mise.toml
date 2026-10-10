@@ -505,8 +505,32 @@ description = "wyrd-testing `oracle` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all"
 
 [tasks."bench:bifrost:query-capacity"]
-description = "Opt-in benchmark: one release wyrd-server started through the local-development journey (migrate, serve, setup) in an 8-CPU/16-GiB systemd user scope, driven through the public Rust client: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --heavy` writes 100M rows and runs the broad window and full scan. Fails on any FAIL row. Linux with a delegating systemd user manager; part of no gate or verify lane."
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'cargo build --locked --release -p wyrd-server && cargo run --locked --release -p wyrd-testing --bin bifrost_query_capacity -- \"$@\"' _"
+description = "Opt-in benchmark: one release wyrd-server started through the local-development journey (migrate, serve, setup) on the whole host, Linux or macOS (the report title carries the host fingerprint; compare only matching hosts), driven through the public Rust client, once with the rows held in the memtable (hot) and once, under a fresh Postgres, with them published as Parquet (WYRD_MAX_FILE_RETENTION_TIME=30, waiting until nothing is in a memtable or staged), each checked and reported under target/bifrost-query-capacity/<mode>/<tier>/: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --heavy` writes 100M rows and runs the broad window and full scan on Parquet only. Always builds with frame pointers into target/profiling and records each query window of the server with perf under <tier>/profiles/, printing a per-query latency Pareto from the Oracle query profile and a CPU Pareto by crate. Fails on any FAIL row. Part of no gate or verify lane."
+run = '''
+bash -lc '
+set -uo pipefail
+target=target/profiling
+export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
+cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin bifrost_query_capacity --target-dir "$target" || exit 1
+tiers=(hot parquet)
+[[ " $* " == *" --heavy "* ]] && tiers=(parquet)
+status=0
+for tier in "${tiers[@]}"; do
+  scripts/postgres/with-test-postgres.sh -- "$target/release/bifrost_query_capacity" --tier "$tier" "$@" || status=1
+done
+exit "$status"' _
+'''
+
+[tasks."bench:bifrost:write-capacity"]
+description = "Opt-in benchmark: the query-capacity binary's --writes mode. One release wyrd-server with production Scribe settings (one shard, Parquet rotation and publication on) on the whole host, driven through the public Rust client: 10M events written per step at 1, 4, 16 and 64 writers into one table, each step recorded with perf under target/bifrost-query-capacity/writes/parquet/profiles/ and reported in retained Arrow MB/s, MB/s per server core and rows/s, with each write-path stage's mean time per batch, fsyncs per batch and a CPU Pareto by crate. Fails on a step under 200k rows/s. Part of no gate or verify lane."
+run = '''
+bash -lc '
+set -uo pipefail
+target=target/profiling
+export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
+cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin bifrost_query_capacity --target-dir "$target" || exit 1
+scripts/postgres/with-test-postgres.sh -- "$target/release/bifrost_query_capacity" --tier parquet --writes "$@"' _
+'''
 
 [tasks."bench:verification:capacity"]
 description = "Opt-in benchmark (REQ-171, AC-040): release cloud wyrd-server replicas in peer mode over the storage emulators' RustFS service and its provisioned test bucket, as the kind deployment runs them, each in an 8-CPU/16-GiB systemd user scope, started through the local-development journey. Open-loop public-client load over the PSI, SPC, Custom, assertion Eval and LLM-judge Eval reference workloads, queued, direct and combined, each kind alone and mixed, in 30 s steps of 10/25/50/100/200 per second on 1 and 2 replicas, plus a fairness step with 70 background tenants. Reconciles every request, checks overlap, cross-replica claims and fairness, and applies the direct-mode overhead objective; writes target/verification-capacity/. `-- --profile` builds a frame-pointer profiling binary into target/profiling and captures every step with perf as diagnostic evidence. Linux with a delegating systemd user manager; part of no gate or verify lane."
@@ -528,7 +552,7 @@ cargo run --locked --release -p wyrd-testing --bin verification_capacity -- "${b
 '''
 
 [tasks."bench:bifrost:ingest-capacity"]
-description = "Opt-in benchmark (AC-041): one release cloud wyrd-server over the storage emulators' RustFS service and its provisioned test bucket, in an 8-CPU/16-GiB systemd user scope, started through the local-development journey. One WyrdState emits open-loop Drift observations of 100 features: 500 obs/s for --seconds (default 60) with the default queue, judged on zero QUEUE_FULL, flat client bytes, drain within 1 s and exactly 100 durable rows per record_id; then a 1,000 obs/s step, a 50 ms acknowledgement-delay step and a --max-in-flight sweep (default 1,2,4,8), reported only. Writes target/bifrost-ingest-capacity/. Linux with a delegating systemd user manager; part of no gate or verify lane."
+description = "Opt-in benchmark (AC-041): one release cloud wyrd-server over the storage emulators' RustFS service and its provisioned test bucket, on the whole host (report.json's envelope carries the host fingerprint), started through the local-development journey. One WyrdState emits open-loop Drift observations of 100 features: 500 obs/s for --seconds (default 60) with the default queue, judged on zero QUEUE_FULL, flat client bytes, drain within 1 s and exactly 100 durable rows per record_id; then a 1,000 obs/s step, a 50 ms acknowledgement-delay step and a --max-in-flight sweep (default 1,2,4,8), reported only. Writes target/bifrost-ingest-capacity/. Part of no gate or verify lane."
 env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
 run = '''
 docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs

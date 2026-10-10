@@ -10,6 +10,7 @@
 pub const BIFROST_CATALOG_NAME: &str = "wyrd-redux";
 
 mod bifrost_catalog;
+mod cut_cache;
 mod error;
 pub mod event_time;
 mod iceberg_sql;
@@ -27,8 +28,8 @@ pub use bifrost_catalog::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{
-    inject_metadata_not_found_for_test, reset_active_cut_acquisitions_for_test,
-    reset_sealed_pin_count_for_test, sealed_pin_count_for_test,
+    inject_metadata_not_found_for_test, reset_cut_reads_for_test, reset_sealed_pin_count_for_test,
+    sealed_pin_count_for_test,
 };
 pub use error::BifrostCatalogError;
 pub use layout::{

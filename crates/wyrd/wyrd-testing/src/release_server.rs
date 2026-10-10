@@ -9,9 +9,10 @@
 //! The benchmarks add only what the guide leaves to the operator:
 //! `WYRD_STORAGE_URL`, which has no default, pointing at a `file://`
 //! directory; a working directory so the server's `.wyrd/` state lands in a
-//! temporary root; a systemd scope that gives the process its resource
-//! [`Envelope`], the 8-CPU/16-GiB pod envelope unless the benchmark names a
-//! smaller one; and any extra environment a benchmark names.
+//! temporary root; a [`Placement`] that runs the process on the whole
+//! [`Host`] (Linux or macOS) or in a systemd scope enforcing an [`Envelope`]
+//! (Linux, for multi-replica benchmarks whose replicas each get their own
+//! resources); and any extra environment a benchmark names.
 //! A further replica joins the same Postgres and store on its own ports, as
 //! the configuration guide's peer mode describes.
 //! The wrapper's test-fixture `WYRD_DB_MAX_CONNECTIONS` cap is removed, so
@@ -24,6 +25,8 @@ use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+pub(crate) mod os;
 
 use secrecy::SecretString;
 use tempfile::TempDir;
@@ -50,6 +53,62 @@ pub const CPUS: u64 = 8;
 
 /// Memory limit of the pod envelope, with no swap.
 pub const MEMORY_BYTES: u64 = 16 << 30;
+
+/// Where one server process runs and what bounds it.
+///
+/// A single-server benchmark runs on [`Placement::Host`], so it measures
+/// whatever machine runs it, Linux or macOS, and labels its report with that
+/// [`Host`]. A multi-replica benchmark gives each process a
+/// [`Placement::Scoped`] envelope so replicas cannot borrow each other's CPU
+/// or memory; that needs a delegating systemd user manager, so Linux only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// A plain child process with the whole host's CPU and memory.
+    Host,
+    /// A systemd user scope enforcing this envelope.
+    Scoped(Envelope),
+}
+
+/// The machine a benchmark ran on, which labels its report: results are
+/// comparable only between reports whose hosts match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Host {
+    /// CPU model name, or `unknown` when the OS reports none.
+    pub cpu_model: String,
+    /// CPUs this process may run on.
+    pub cpus: usize,
+    /// Physical memory in bytes.
+    pub memory_bytes: u64,
+    /// Operating system, as [`std::env::consts::OS`] names it.
+    pub os: &'static str,
+}
+
+impl Host {
+    /// Reads the running machine's CPU model, CPU count, and memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the CPU count or physical memory cannot be read.
+    pub fn detect() -> Result<Self> {
+        Ok(Self {
+            cpu_model: os::cpu_model(),
+            cpus: std::thread::available_parallelism()?.get(),
+            memory_bytes: os::memory_bytes()?,
+            os: std::env::consts::OS,
+        })
+    }
+
+    /// One-line fingerprint such as `AMD Ryzen 9 9950X, 32 CPU / 61 GiB, linux`.
+    pub fn describe(&self) -> String {
+        format!(
+            "{}, {} CPU / {} GiB, {}",
+            self.cpu_model,
+            self.cpus,
+            self.memory_bytes >> 30,
+            self.os
+        )
+    }
+}
 
 /// The CPU quota and memory limit one process's systemd scope enforces.
 ///
@@ -90,7 +149,7 @@ const STOP_GRACE: Duration = Duration::from_secs(45);
 /// Why starting, observing, or stopping the release server failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseServerError {
-    /// A process, file, or cgroup operation failed.
+    /// A process, file, cgroup, or OS probe operation failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// A `/readyz` or `/metrics` request failed.
@@ -139,8 +198,10 @@ pub struct LocalServer {
     root: TempDir,
     /// The serving process until it is reaped.
     child: Option<Child>,
-    /// The process's cgroup-v2 directory, where its envelope is enforced.
-    cgroup: PathBuf,
+    /// Where the process's CPU and memory are read from.
+    meter: Meter,
+    /// The machine the process runs on.
+    host: Host,
     /// Tenants in the order `setup` provisioned them; empty on a joined
     /// replica.
     tenants: Vec<SetupTenant>,
@@ -149,8 +210,17 @@ pub struct LocalServer {
     ordinal: u16,
     /// What the process runs, which decides its readiness probe.
     role: Role,
-    /// The CPU and memory limits its scope enforces.
-    envelope: Envelope,
+    /// Where the process runs and what bounds it.
+    placement: Placement,
+}
+
+/// Where a [`LocalServer`]'s CPU and memory are read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Meter {
+    /// The scope's cgroup-v2 directory: the whole scope's usage.
+    Cgroup(PathBuf),
+    /// The server process itself, read from the OS by PID.
+    Process(u32),
 }
 
 /// What a [`LocalServer`] process runs.
@@ -165,10 +235,10 @@ enum Role {
 }
 
 impl LocalServer {
-    /// Migrates and serves `binary` with `env` added in `envelope`, then runs
-    /// `setup` once per slug in `tenants`, returning once `/readyz` answers
-    /// 200, the cgroup enforces the envelope, and every tenant's credential
-    /// was printed.
+    /// Migrates and serves `binary` with `env` added at `placement`, then
+    /// runs `setup` once per slug in `tenants`, returning once `/readyz`
+    /// answers 200, a scoped cgroup enforces its envelope, and every tenant's
+    /// credential was printed.
     ///
     /// The first `setup` initializes the platform root and discloses its
     /// credential; later runs present it as `WYRD_PLATFORM_CREDENTIAL`, as
@@ -179,12 +249,13 @@ impl LocalServer {
     /// Returns an error when `WYRD_TEST_DATABASE_ADMIN_URL` is unset (the
     /// benchmark is not running under the Postgres wrapper), `migrate` or a
     /// `setup` fails or prints no credential, the server exits or never
-    /// becomes ready, or its cgroup does not enforce `envelope`.
+    /// becomes ready, the host cannot be read, or a scoped cgroup does not
+    /// enforce its envelope.
     pub async fn start(
         binary: &Path,
         tenants: &[&str],
         env: &[(&str, &str)],
-        envelope: Envelope,
+        placement: Placement,
     ) -> Result<Self> {
         let owner_url = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL")
             .map_err(|_| "WYRD_TEST_DATABASE_ADMIN_URL is unset; run through mise")?;
@@ -199,7 +270,7 @@ impl LocalServer {
                 .env("WYRD_DATABASE_URL", owner_url),
         )?;
         let mut server =
-            Self::serve(binary, root, &storage_url, 0, Role::Serving, env, envelope).await?;
+            Self::serve(binary, root, &storage_url, 0, Role::Serving, env, placement).await?;
 
         let operator =
             |program: &Path| operator(program, &workdir, &storage_url, 0, Role::Serving, env);
@@ -235,17 +306,18 @@ impl LocalServer {
     }
 
     /// Starts replica `ordinal` of this deployment: `binary` serving the same
-    /// Postgres and store from its own working directory and a scope of this
-    /// server's envelope, with every listener offset by `ordinal` strides. Nothing is migrated or set
-    /// up; the replica serves the tenants this server provisioned.
+    /// Postgres and store from its own working directory at this server's
+    /// placement, with every listener offset by `ordinal` strides. Nothing is
+    /// migrated or set up; the replica serves the tenants this server
+    /// provisioned.
     ///
     /// Several replicas need peer mode: give every replica, including this
     /// one, `WYRD_PEER_TLS_DIR` in `env`; its peer address is derived here.
     ///
     /// # Errors
     ///
-    /// Returns an error when the process exits or never becomes ready, or its
-    /// cgroup does not enforce the envelope.
+    /// Returns an error when the process exits or never becomes ready, or a
+    /// scoped cgroup does not enforce its envelope.
     pub async fn start_replica(
         &self,
         binary: &Path,
@@ -261,7 +333,7 @@ impl LocalServer {
             ordinal,
             Role::Serving,
             env,
-            self.envelope,
+            self.placement,
         )
         .await
     }
@@ -296,18 +368,24 @@ impl LocalServer {
             ordinal,
             Role::ForgeWorker,
             env,
-            envelope,
+            Placement::Scoped(envelope),
         )
         .await
     }
 
-    /// Serves `binary` as replica `ordinal` in `role` from `root` in a scope
-    /// of `envelope` and waits until it is ready.
+    /// Serves `binary` as replica `ordinal` in `role` from `root` at
+    /// `placement` and waits until it is ready.
+    ///
+    /// On the host, `binary` is spawned directly and metered by PID. Scoped,
+    /// it is spawned through `systemd-run --scope`, which execs it in place,
+    /// and metered by the scope's cgroup once that is confirmed to enforce
+    /// the envelope.
     ///
     /// # Errors
     ///
-    /// Returns an error when the process cannot spawn, exits, never becomes
-    /// ready, or its cgroup does not enforce the envelope.
+    /// Returns an error when the host cannot be read, the process cannot
+    /// spawn, exits, or never becomes ready, or a scoped cgroup does not
+    /// enforce its envelope.
     async fn serve(
         binary: &Path,
         root: TempDir,
@@ -315,39 +393,51 @@ impl LocalServer {
         ordinal: u16,
         role: Role,
         env: &[(&str, &str)],
-        envelope: Envelope,
+        placement: Placement,
     ) -> Result<Self> {
+        let host = Host::detect()?;
         let log = File::create(root.path().join("server.log"))?;
-        let child = operator(
-            Path::new("systemd-run"),
-            root.path(),
-            storage_url,
-            ordinal,
-            role,
-            env,
-        )
-        .args(["--user", "--scope", "--quiet", "--collect"])
-        .arg(format!("--property=CPUQuota={}%", envelope.cpu_percent))
-        .arg(format!("--property=MemoryMax={}", envelope.memory_bytes))
-        .arg("--property=MemorySwapMax=0")
-        .arg("--")
-        .arg(binary)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .spawn()?;
+        let mut command = match placement {
+            Placement::Host => operator(binary, root.path(), storage_url, ordinal, role, env),
+            Placement::Scoped(envelope) => {
+                let mut command = operator(
+                    Path::new("systemd-run"),
+                    root.path(),
+                    storage_url,
+                    ordinal,
+                    role,
+                    env,
+                );
+                command
+                    .args(["--user", "--scope", "--quiet", "--collect"])
+                    .arg(format!("--property=CPUQuota={}%", envelope.cpu_percent))
+                    .arg(format!("--property=MemoryMax={}", envelope.memory_bytes))
+                    .arg("--property=MemorySwapMax=0")
+                    .arg("--")
+                    .arg(binary);
+                command
+            }
+        };
+        let child = command
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .spawn()?;
         let mut server = Self {
-            cgroup: PathBuf::new(),
+            meter: Meter::Process(child.id()),
+            host,
             child: Some(child),
             root,
             tenants: Vec::new(),
             ordinal,
             role,
-            envelope,
+            placement,
         };
         server.await_ready().await?;
-        server.cgroup = server.find_cgroup()?;
-        server.confirm_envelope()?;
+        if let Placement::Scoped(envelope) = placement {
+            server.meter = Meter::Cgroup(server.find_cgroup()?);
+            server.confirm_envelope(envelope)?;
+        }
         Ok(server)
     }
 
@@ -361,9 +451,36 @@ impl LocalServer {
         self.ordinal
     }
 
-    /// The CPU and memory limits this process's scope enforces.
-    pub fn envelope(&self) -> Envelope {
-        self.envelope
+    /// CPUs this process may use: its envelope's quota when scoped, else the
+    /// host's.
+    pub fn cpus(&self) -> f64 {
+        match self.placement {
+            Placement::Host => self.host.cpus as f64,
+            Placement::Scoped(envelope) => envelope.cpus(),
+        }
+    }
+
+    /// Memory this process may use: its envelope's limit when scoped, else
+    /// the host's physical memory.
+    pub fn memory_limit_bytes(&self) -> u64 {
+        match self.placement {
+            Placement::Host => self.host.memory_bytes,
+            Placement::Scoped(envelope) => envelope.memory_bytes,
+        }
+    }
+
+    /// One-line label for a report: the host fingerprint, prefixed by the
+    /// envelope when the process is scoped.
+    pub fn describe(&self) -> String {
+        match self.placement {
+            Placement::Host => self.host.describe(),
+            Placement::Scoped(envelope) => format!(
+                "{} CPU / {} GiB scope on {}",
+                envelope.cpus(),
+                envelope.memory_bytes >> 30,
+                self.host.describe()
+            ),
+        }
     }
 
     /// The process's log, which [`LocalServer::stop`] later copies out; it
@@ -372,8 +489,8 @@ impl LocalServer {
         self.root.path().join("server.log")
     }
 
-    /// PID of the process `systemd-run --scope` executes in place, so the
-    /// serving `wyrd-server` itself; `None` once it was stopped.
+    /// PID of the serving `wyrd-server` itself (`systemd-run --scope` execs
+    /// it in place); `None` once it was stopped.
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(Child::id)
     }
@@ -418,33 +535,50 @@ impl LocalServer {
         Ok(Metrics::parse(&response.text().await?))
     }
 
-    /// Reads one `key value` line of a flat-keyed cgroup file such as
-    /// `cpu.stat` or `memory.events`; zero when absent.
-    pub fn cgroup_stat(&self, file: &str, key: &str) -> u64 {
-        std::fs::read_to_string(self.cgroup.join(file))
-            .unwrap_or_default()
-            .lines()
-            .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
-            .and_then(|value| value.trim().parse().ok())
-            .unwrap_or(0)
+    /// Microseconds of CPU the server has used so far: the scope's
+    /// `cpu.stat` `usage_usec` when scoped, else the process's user plus
+    /// system time; zero when unreadable.
+    pub fn cpu_usec(&self) -> u64 {
+        match &self.meter {
+            Meter::Cgroup(cgroup) => cgroup_stat(cgroup, "cpu.stat", "usage_usec"),
+            Meter::Process(pid) => os::process_cpu_usec(*pid),
+        }
     }
 
-    /// Starts a fresh memory-peak measurement for this cgroup.
+    /// OOM kills the scope has seen so far. Always zero on the host, where an
+    /// OOM kill ends the server and so fails the benchmark directly.
+    pub fn oom_kills(&self) -> u64 {
+        match &self.meter {
+            Meter::Cgroup(cgroup) => cgroup_stat(cgroup, "memory.events", "oom_kill"),
+            Meter::Process(_) => 0,
+        }
+    }
+
+    /// Starts a fresh memory-peak measurement window.
     ///
-    /// Writing to `memory.peak` resets the peak seen through that file
-    /// descriptor to current usage, so each measurement window gets its own
-    /// peak.
+    /// Scoped, writing to the cgroup's `memory.peak` resets the peak seen
+    /// through that descriptor. On a Linux host, the process's peak resident
+    /// set is reset instead. macOS keeps only a process's lifetime peak, so
+    /// there a window's peak is the peak since the server started.
     ///
     /// # Errors
     ///
-    /// Returns an error when the file cannot be opened or reset.
+    /// Returns an error when the peak cannot be reset.
     pub fn memory_peak(&self) -> Result<MemoryPeak> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.cgroup.join("memory.peak"))?;
-        file.write_all(b"reset\n")?;
-        Ok(MemoryPeak(file))
+        match &self.meter {
+            Meter::Cgroup(cgroup) => {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(cgroup.join("memory.peak"))?;
+                file.write_all(b"reset\n")?;
+                Ok(MemoryPeak::Cgroup(file))
+            }
+            Meter::Process(pid) => {
+                os::reset_peak_memory(*pid)?;
+                Ok(MemoryPeak::Process(*pid))
+            }
+        }
     }
 
     /// Sends `SIGTERM`, as `Ctrl-C` in the guide does, waits for a clean
@@ -545,15 +679,19 @@ impl LocalServer {
         Ok(Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
     }
 
-    /// Confirms `cpu.max` allows exactly the envelope's CPU percent and
-    /// `memory.max` equals its bytes.
+    /// Confirms the scope's `cpu.max` allows exactly `envelope`'s CPU
+    /// percent and its `memory.max` equals its bytes.
     ///
     /// # Errors
     ///
-    /// Returns an error when either differs, which means the systemd user
-    /// manager does not delegate the `cpu` and `memory` controllers.
-    fn confirm_envelope(&self) -> Result<()> {
-        let read = |file: &str| std::fs::read_to_string(self.cgroup.join(file)).unwrap_or_default();
+    /// Returns an error when the server is not metered by its cgroup, or
+    /// either limit differs, which means the systemd user manager does not
+    /// delegate the `cpu` and `memory` controllers.
+    fn confirm_envelope(&self, envelope: Envelope) -> Result<()> {
+        let Meter::Cgroup(cgroup) = &self.meter else {
+            return Err("a scoped wyrd-server is not metered by its cgroup".into());
+        };
+        let read = |file: &str| std::fs::read_to_string(cgroup.join(file)).unwrap_or_default();
         let (cpu, memory) = (read("cpu.max"), read("memory.max"));
         let mut fields = cpu
             .split_whitespace()
@@ -565,13 +703,13 @@ impl LocalServer {
         let Envelope {
             cpu_percent: expected_cpu,
             memory_bytes,
-        } = self.envelope;
+        } = envelope;
         if cpu_percent == expected_cpu && memory.trim() == memory_bytes.to_string() {
             return Ok(());
         }
         Err(format!(
             "cgroup {} enforces cpu.max `{}` memory.max `{}`, not {expected_cpu}% CPU and {memory_bytes} bytes",
-            self.cgroup.display(),
+            cgroup.display(),
             cpu.trim(),
             memory.trim()
         )
@@ -589,21 +727,44 @@ impl Drop for LocalServer {
     }
 }
 
-/// One open `memory.peak` descriptor whose peak was reset at open.
-pub struct MemoryPeak(File);
+/// One memory-peak window, reset when [`LocalServer::memory_peak`] opened it.
+pub enum MemoryPeak {
+    /// An open cgroup `memory.peak` descriptor.
+    Cgroup(File),
+    /// The server process, read from the OS by PID.
+    Process(u32),
+}
 
 impl MemoryPeak {
-    /// Peak cgroup memory in bytes since this descriptor was reset.
+    /// Peak memory in bytes since the window opened: the scope's peak when
+    /// scoped, else the process's peak resident set (lifetime peak on
+    /// macOS).
     ///
     /// # Errors
     ///
-    /// Returns an error when the file cannot be read or parsed.
-    pub fn read(mut self) -> Result<u64> {
-        let mut contents = String::new();
-        self.0.rewind()?;
-        self.0.read_to_string(&mut contents)?;
-        Ok(contents.trim().parse()?)
+    /// Returns an error when the peak cannot be read or parsed.
+    pub fn read(self) -> Result<u64> {
+        match self {
+            Self::Cgroup(mut file) => {
+                let mut contents = String::new();
+                file.rewind()?;
+                file.read_to_string(&mut contents)?;
+                Ok(contents.trim().parse()?)
+            }
+            Self::Process(pid) => Ok(os::peak_memory_bytes(pid)?),
+        }
     }
+}
+
+/// Reads one `key value` line of a flat-keyed cgroup file such as
+/// `cpu.stat` or `memory.events`; zero when absent.
+fn cgroup_stat(cgroup: &Path, file: &str, key: &str) -> u64 {
+    std::fs::read_to_string(cgroup.join(file))
+        .unwrap_or_default()
+        .lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix(' '))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 /// One `/metrics` scrape: every series and its value.
@@ -637,6 +798,25 @@ impl Metrics {
             })
             .map(|(_, value)| value)
             .sum()
+    }
+
+    /// Every series of `family`, summed by the value of its `label`, so one
+    /// scrape lists a labeled counter family without naming its members.
+    pub fn by_label(&self, family: &str, label: &str) -> BTreeMap<String, f64> {
+        let prefix = format!("{family}{{");
+        let key = format!("{label}=\"");
+        let mut values = BTreeMap::new();
+        for (series, value) in &self.0 {
+            let Some(value_of) = series
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split(&key).nth(1))
+                .and_then(|tail| tail.split('"').next())
+            else {
+                continue;
+            };
+            *values.entry(value_of.to_owned()).or_default() += value;
+        }
+        values
     }
 
     /// The cumulative `le` buckets of histogram `family`, summed across every
@@ -798,6 +978,24 @@ mod tests {
         assert_eq!(metrics.sum("oracle_queries_queued", &[]), 7.0);
         assert_eq!(metrics.sum("slots", &["kind=\"limit\""]), 8.0);
         assert_eq!(metrics.sum("absent", &[]), 0.0);
+    }
+
+    /// A labeled family groups by the label's value; a same-prefix family
+    /// stays out.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value is grouped under the wrong label value.
+    #[test]
+    fn metrics_by_label_groups_one_family() {
+        let metrics = Metrics::parse(
+            "p_total{event=\"Oracle.cut_read\"} 3\np_total{event=\"FilterExec.output_rows\",x=\"1\"} 4\n\
+             p_total{event=\"FilterExec.output_rows\",x=\"2\"} 1\np_total_extra{event=\"z\"} 9\n",
+        );
+        let grouped = metrics.by_label("p_total", "event");
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped.get("Oracle.cut_read"), Some(&3.0));
+        assert_eq!(grouped.get("FilterExec.output_rows"), Some(&5.0));
     }
 
     /// Histogram buckets sum across matching series in bound order, `+Inf`

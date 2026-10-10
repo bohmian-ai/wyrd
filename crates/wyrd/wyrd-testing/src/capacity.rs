@@ -148,7 +148,7 @@ impl ResourceWindow {
         for replica in replicas {
             opened.push((
                 replica.ordinal(),
-                replica.cgroup_stat("cpu.stat", "usage_usec"),
+                replica.cpu_usec(),
                 replica.memory_peak()?,
             ));
         }
@@ -163,12 +163,7 @@ impl ResourceWindow {
     /// `replicas` must be the same replicas, in the same order, as the open;
     /// a later call replaces the earlier reading.
     pub fn freeze<'a>(&mut self, replicas: impl IntoIterator<Item = &'a LocalServer>) {
-        self.frozen = Some(
-            replicas
-                .into_iter()
-                .map(|replica| replica.cgroup_stat("cpu.stat", "usage_usec"))
-                .collect(),
-        );
+        self.frozen = Some(replicas.into_iter().map(LocalServer::cpu_usec).collect());
     }
 
     /// Each replica's resources over `window_seconds`, using the frozen CPU
@@ -200,23 +195,10 @@ impl ResourceWindow {
     }
 }
 
-/// CPU seconds this process has used (user plus system), from
-/// `/proc/self/stat`; zero when unreadable.
+/// CPU seconds this process has used (user plus system); zero when
+/// unreadable.
 pub fn driver_cpu_seconds() -> f64 {
-    // ponytail: assumes USER_HZ = 100, true on every mainstream Linux build.
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-    // Fields after the parenthesized command; utime and stime are the 14th
-    // and 15th fields overall.
-    let fields: Vec<&str> = stat
-        .rsplit_once(')')
-        .map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
-    let ticks = |index: usize| {
-        fields
-            .get(index)
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(0.0)
-    };
-    (ticks(11) + ticks(12)) / 100.0
+    crate::release_server::os::self_cpu_seconds()
 }
 
 /// The release `wyrd-server` built beside the running benchmark binary.

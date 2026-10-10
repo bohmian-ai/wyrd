@@ -36,7 +36,7 @@ use datafusion::datasource::physical_plan::parquet::{
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource,
 };
-use datafusion::datasource::source::DataSourceExec;
+use datafusion::datasource::source::{DataSource, DataSourceExec};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::cache::cache_manager::FileMetadataCache;
@@ -977,8 +977,17 @@ pub(crate) enum HotObjects {
 ///
 /// The leader's hot files, a follower's hot assignment, and a Scribe
 /// follower's staged runs all use it. `DataFusion` owns the read, the footer
-/// cache, pruning, the row filter, splitting, and memory; Wyrd adds only the
-/// reader factory that proves every footer's tenant. Each file's row count,
+/// cache, pruning, the row filter, and memory; Wyrd adds only the reader
+/// factory that proves every footer's tenant.
+///
+/// The leaf splits its files itself, through the same
+/// `DataSource::repartitioned` call the optimizer makes, into the session's
+/// target partitions capped at `max_partitions`; Oracle sessions disable the
+/// optimizer's own file-scan split, which knows only the target. A caller passes the files' row groups when it knows them: a
+/// partition whose byte range holds no row group's midpoint reads nothing
+/// yet still opens the file and registers its metrics, and those
+/// registrations serialize every partition of the query on one lock. Files
+/// smaller than `repartition_file_min_size` are grouped whole. Each file's row count,
 /// when the manifest records one, is reported as inexact statistics so
 /// `DataFusion` decides splitting as it does for a listing table. Inexact,
 /// because an exact count lets `DataFusion` answer `count(*)` without opening
@@ -1001,6 +1010,7 @@ pub(super) fn hot_parquet_scan(
     tenant: DataTenantId,
     schema: &SchemaRef,
     options: &Arc<ConfigOptions>,
+    max_partitions: Option<usize>,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
     #[cfg(feature = "test-support")]
     iceberg_projection_probe::record(Some(
@@ -1054,7 +1064,12 @@ pub(super) fn hot_parquet_scan(
             Ok(partitioned)
         })
         .collect::<DataFusionResult<Vec<_>>>()?;
-    let mut groups = FileGroup::new(files).split_files(options.execution.target_partitions.max(1));
+    let partitions = max_partitions
+        .map_or(options.execution.target_partitions, |cap| {
+            cap.min(options.execution.target_partitions)
+        })
+        .max(1);
+    let mut groups = FileGroup::new(files).split_files(partitions);
     if groups.is_empty() {
         groups.push(FileGroup::new(Vec::new()));
     }
@@ -1072,7 +1087,15 @@ pub(super) fn hot_parquet_scan(
         .with_file_groups(groups)
         .with_statistics(statistics)
         .build();
-    Ok(DataSourceExec::from_data_source(config))
+    // The optimizer's own file-scan split, with the capped target.
+    let config = config
+        .repartitioned(
+            partitions,
+            options.optimizer.repartition_file_min_size,
+            None,
+        )?
+        .unwrap_or_else(|| Arc::new(config) as Arc<dyn DataSource>);
+    Ok(Arc::new(DataSourceExec::new(config)))
 }
 
 /// Lists the data files Iceberg plans for the pinned snapshot `scan` names,
@@ -1342,18 +1365,24 @@ impl OracleTableProvider {
     /// the page index again. Fetches run `meta_fetch_concurrency` at a time,
     /// as `DataFusion`'s do. A failed fetch is left to the scan, which reports
     /// it with its stale-object marker; a node without a cache does nothing.
-    async fn cache_footers(&self, files: &[HotFileSource], options: &ConfigOptions) {
-        let Some(cache) = self.objects.storage().metadata_cache() else {
-            return;
-        };
+    ///
+    /// Returns the files' total row groups, the most partitions the scan can
+    /// give work to, or `None` when any footer was not read.
+    async fn cache_footers(
+        &self,
+        files: &[HotFileSource],
+        options: &ConfigOptions,
+    ) -> Option<usize> {
+        let cache = self.objects.storage().metadata_cache()?;
         let fetches: Vec<_> = files
             .iter()
             .map(|file| self.cache_footer(file, cache, options))
             .collect();
-        let _ = futures_util::stream::iter(fetches)
+        futures_util::stream::iter(fetches)
             .buffer_unordered(options.execution.meta_fetch_concurrency.get())
-            .try_collect::<Vec<()>>()
-            .await;
+            .try_fold(0, |total, row_groups| async move { Ok(total + row_groups) })
+            .await
+            .ok()
     }
 
     /// Fetches one warehouse file's footer and page index through
@@ -1369,7 +1398,7 @@ impl OracleTableProvider {
         file: &HotFileSource,
         cache: &Arc<FileMetadataCache>,
         options: &ConfigOptions,
-    ) -> DataFusionResult<()> {
+    ) -> DataFusionResult<usize> {
         let path = self
             .objects
             .relativize(&file.location)
@@ -1381,7 +1410,7 @@ impl OracleTableProvider {
             .with_file_metadata_cache(Some(Arc::clone(cache)))
             .fetch_metadata()
             .await
-            .map(drop)
+            .map(|metadata| metadata.num_row_groups())
     }
 
     /// Builds this cut's persisted leaf: one `DataFusion` Parquet scan over
@@ -1414,7 +1443,9 @@ impl OracleTableProvider {
         // Only the files Iceberg kept: a hot file's event-time bounds are
         // first checked by the scan's file pruner, and fetching its footer
         // here would read a file that pruner then excludes.
-        self.cache_footers(&files, options).await;
+        let row_groups = self.cache_footers(&files, options).await;
+        // A hot file's row groups are unknown, so its scan keeps every partition.
+        let max_partitions = row_groups.filter(|_| self.hot_files.is_empty());
         files.extend(self.hot_files.iter().cloned());
         hot_parquet_scan(
             files,
@@ -1422,6 +1453,7 @@ impl OracleTableProvider {
             self.context.data_tenant_id,
             required_schema,
             options,
+            max_partitions,
         )
     }
 }
@@ -2297,6 +2329,7 @@ pub(super) mod tests {
             tenant,
             schema,
             &Arc::new(options.clone()),
+            None,
         )
         .expect("hot scan plans")
     }
@@ -2406,6 +2439,54 @@ pub(super) mod tests {
             actual.sort_unstable();
             assert_eq!(actual, expected, "{partitions} partitions");
         }
+    }
+
+    /// A hot scan given its row-group count splits into no more partitions
+    /// than that, and still reads every row exactly once.
+    ///
+    /// One file of six two-row groups is planned with sixteen target
+    /// partitions; without the cap the byte split would leave ten partitions
+    /// that open the file and read nothing.
+    ///
+    /// # Panics
+    /// Panics when the partition count exceeds the row groups or a row is
+    /// missing or read twice.
+    #[tokio::test]
+    async fn hot_parquet_scan_caps_partitions_at_row_groups() {
+        let root = tempfile::tempdir().expect("cap fixture directory");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let values: Vec<i64> = (0..11).collect();
+        let size = write_split_fixture(&root.path().join("large.parquet"), &schema, &values);
+        let mut options = crate::resources::OracleSessionShape::for_test().config_options();
+        options.execution.target_partitions = 16;
+        options.optimizer.repartition_file_min_size = 0;
+        let scan = hot_parquet_scan(
+            vec![split_file("large.parquet", size)],
+            HotObjects::Warehouse(warehouse_objects(root.path())),
+            *FIXTURE_TENANT,
+            &schema,
+            &Arc::new(options),
+            Some(6),
+        )
+        .expect("capped hot scan plans");
+
+        let partitions = scan.properties().partitioning.partition_count();
+        let context = Arc::new(TaskContext::default());
+        let mut actual = Vec::new();
+        for partition in 0..partitions {
+            let stream = scan
+                .execute(partition, Arc::clone(&context))
+                .expect("capped partition stream");
+            actual.extend(collect_int64(stream).await);
+        }
+        actual.sort_unstable();
+
+        assert_eq!(partitions, 6);
+        assert_eq!(actual, values);
     }
 
     /// A hot object whose footer is missing or names a foreign tenant fails

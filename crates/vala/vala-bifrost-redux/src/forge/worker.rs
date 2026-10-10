@@ -43,7 +43,7 @@ use super::expire::ExpiryTaskAuthority;
 use super::identity::task_table_binding;
 use super::leader::{ForgeCompactionDispatch, ForgeCompactionOutcome};
 use super::lease::{ForgeLease, forge_lease_key};
-use super::metrics::{ForgeCleanupRefusalStage, ForgeTaskResult, ForgeTelemetry};
+use super::metrics::{ForgeTaskResult, ForgeTelemetry};
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
@@ -8006,8 +8006,8 @@ impl ForgeWorker {
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "expired cleanup cursor named an absent candidate".to_owned(),
                 })?;
-            // The exclusive table authority is held from reader exclusion
-            // through this candidate's delete outcome, including a resumed
+            // The exclusive table authority is held through this
+            // candidate's delete outcome, including a resumed
             // preparation, and surrendered before settlement, which takes the
             // same row on its own connection.
             let mut authority_conn = self
@@ -8017,15 +8017,9 @@ impl ForgeWorker {
                 .tenant_conn(attempt.tenant)
                 .await
                 .map_err(ForgeError::Sql)?;
-            // No authority means an Oracle read holds the table. That is the
-            // typed refusal: nothing was written, and dropping the
-            // uncommitted authority connection takes no lock with it.
-            let Some(exclusive) = super::table_authority::TableAuthority::new(&mut authority_conn)
+            let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
                 .exclusive(attempt.tenant, &attempt.binding.table_ref)
-                .await?
-            else {
-                return Err(Self::preparation_refused(index, prepared));
-            };
+                .await?;
             if !prepared {
                 require_running(stop)?;
                 lease.require_fence(&self.forge.core.operator_pool).await?;
@@ -8081,36 +8075,6 @@ impl ForgeWorker {
             deleted_candidate_count: total,
             prepared_candidate_index: None,
         })
-    }
-
-    /// Maps an active read refusing one candidate's exclusive authority to its
-    /// outcome.
-    ///
-    /// The refusal precedes the candidate's preparation and delete and wrote
-    /// nothing, so the outcome depends only on what the durable row already
-    /// held. An unprepared index zero is the first preparation: the row is
-    /// still `running` with no evidence, so the claim is released through the
-    /// non-attempt-consuming [`ForgeError::Capacity`] path. A later index, or a
-    /// resumed candidate that is already `prepared`, means the row is already
-    /// `prepared`, which generic retry cannot settle. The exact frontier is
-    /// then retained as [`ForgeError::CleanupRetained`] for prepared-claim
-    /// replay.
-    ///
-    /// Each refusal is counted exactly once here, labelled by that outcome:
-    /// `prepare` for a released first preparation and `replay` for a frontier
-    /// retained for prepared-claim replay.
-    fn preparation_refused(index: u32, prepared: bool) -> ForgeError {
-        if index == 0 && !prepared {
-            ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Prepare);
-            return ForgeError::Capacity {
-                detail: "an Oracle query is still reading this table".to_owned(),
-            };
-        }
-        ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Replay);
-        ForgeError::CleanupRetained {
-            index,
-            transition: "forge.expired_cleanup.preparation_refused",
-        }
     }
 
     /// Proves one prepared candidate is still safe to delete right now.
@@ -9472,10 +9436,10 @@ mod tests {
         ForgeWorker::validate_payload(&claimed_task(
             ForgeTaskStrategy::SnapshotExpiry,
             serde_json::json!({
-                "kind": "maintenance",
-                "trigger_commit_count": 0,
-                "snapshot_expiry_due": true,
-                "reconciliation_due": false,
+            "kind": "maintenance",
+            "trigger_commit_count": 0,
+            "snapshot_expiry_due": true,
+            "reconciliation_due": false,
             }),
         ))
         .expect("snapshot expiration is an activated production route");

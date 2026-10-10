@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use tracing::Span;
 
-use super::planner::ActiveReadClaim;
+use super::profile::QueryProfile;
 use super::telemetry::AnalyticalAttemptOutcome;
 
 use super::*;
@@ -242,8 +242,8 @@ pub(super) struct QueryStreamInput {
     pub(super) gate_lifecycle: Option<Arc<QueryStreamLifecycle>>,
     /// Exactly-once owner-local registry settlement retained through terminal output.
     pub(super) running_query: Option<RunningQueryTerminalOwner>,
-    /// Active table reads released only after every descendant has joined.
-    pub(super) active_reads: Option<ActiveReadClaim>,
+    /// Query profile, emitted only after every descendant has joined.
+    pub(super) profile: Option<Arc<QueryProfile>>,
 }
 
 /// Exactly-once terminal owner for one inserted running-query entry.
@@ -330,8 +330,8 @@ struct FrameBuildInput {
     stream_telemetry_cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Exactly-once active-registry terminal owner.
     running_query: Option<RunningQueryTerminalOwner>,
-    /// Active table reads released only when this stream is finished.
-    active_reads: Option<ActiveReadClaim>,
+    /// Query profile, emitted only when this stream is finished.
+    profile: Option<Arc<QueryProfile>>,
 }
 
 /// Resolves the next event one frame loop iteration acts on.
@@ -407,15 +407,14 @@ fn encode_frame(
 /// batch is taken from the plan. On exhaustion, failure, or cancellation it
 /// drops the plan's batch stream and then settles through
 /// [`settle_and_finish_stream`], which releases admission, finishes the
-/// running-query registry entry, and awaits the active-read claim's release
-/// before the terminal frame is yielded.
+/// running-query registry entry, and emits the query profile before the
+/// terminal frame is yielded.
 ///
 /// A consumer that drops the stream at any await skips that settlement. The
-/// admission guard and the active-read claim are therefore moved into one
+/// admission guard and the profile are therefore moved into one
 /// [`LeaderStreamOwners`] value before the generator is built, whose `Drop`
-/// revokes the query's Analytical graph before starting the claim's release,
-/// so Forge can never destroy objects a still-running follower or local driver
-/// may read.
+/// revokes the query's Analytical graph before emitting the profile, so the
+/// profile always includes every operator's final metrics.
 fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
     let FrameBuildInput {
         query_class,
@@ -432,13 +431,13 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
         request_cancellation,
         stream_telemetry_cancelled,
         mut running_query,
-        active_reads,
+        profile,
     } = input;
     let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
     // Built before the generator, never inside it: a stream dropped before its
     // first poll drops only its captures, in an unspecified order, so the two
     // owners must already be one captured value whose `Drop` fixes the order.
-    let owners = LeaderStreamOwners::new(admitted, active_reads);
+    let owners = LeaderStreamOwners::new(admitted, profile);
     let frames = async_stream::stream! {
         let mut owners = owners;
         // Re-bound after `owners` on purpose. When a consumer walks away the
@@ -519,7 +518,7 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
             running_query: &mut running_query,
             query_class,
             row_count,
-            active_reads: &mut owners.active_reads,
+            profile: &mut owners.profile,
         })
         .await;
         yield Ok(QueryStreamFrame::Terminal(terminal));
@@ -532,32 +531,32 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
 /// A consumer may drop the frame stream at any await, including mid-settlement.
 /// The admission guard carries the query's Analytical graph lifecycle, whose
 /// drop revokes every follower grant and aborts every local driver before it
-/// returns; the active-read claim's drop starts its release. Releasing the
-/// claim first would let Forge destroy objects a still-running follower or
-/// local driver may read, so this value's `Drop` fixes the order explicitly
-/// instead of leaving it to generator-state drop order.
+/// returns; the profile's last drop emits it. Emitting the profile first would
+/// miss metrics a still-running follower or local driver adds, so this value's
+/// `Drop` fixes the order explicitly instead of leaving it to generator-state
+/// drop order.
 struct LeaderStreamOwners {
     /// Admission guard, and through it the Analytical graph lifecycle.
     admitted: Option<AdmittedQueryGuard>,
-    /// Active table reads, released only after `admitted` is gone.
-    active_reads: Option<ActiveReadClaim>,
+    /// Query profile, dropped only after `admitted` is gone.
+    profile: Option<Arc<QueryProfile>>,
 }
 
 impl LeaderStreamOwners {
-    /// Takes ownership of the stream's admission guard and active-read claim.
-    const fn new(admitted: AdmittedQueryGuard, active_reads: Option<ActiveReadClaim>) -> Self {
+    /// Takes ownership of the stream's admission guard and query profile.
+    const fn new(admitted: AdmittedQueryGuard, profile: Option<Arc<QueryProfile>>) -> Self {
         Self {
             admitted: Some(admitted),
-            active_reads,
+            profile,
         }
     }
 }
 
 impl Drop for LeaderStreamOwners {
-    /// Revokes the Analytical graph first, then starts the claim's release.
+    /// Revokes the Analytical graph first, then drops the profile.
     fn drop(&mut self) {
         drop(self.admitted.take());
-        drop(self.active_reads.take());
+        drop(self.profile.take());
     }
 }
 
@@ -636,12 +635,12 @@ struct StreamSettlementInputs<'a> {
     query_class: QueryClass,
     /// Rows emitted before the terminal, reported on every outcome.
     row_count: u64,
-    /// Active table reads released only once nothing can read again.
+    /// Query profile, dropped only once nothing can add metrics again.
     ///
     /// Borrowed from the stream's [`LeaderStreamOwners`] rather than moved, so
-    /// a settlement dropped mid-await leaves the claim where that owner's
-    /// `Drop` releases it after the Analytical graph is revoked.
-    active_reads: &'a mut Option<ActiveReadClaim>,
+    /// a settlement dropped mid-await leaves the profile where that owner's
+    /// `Drop` drops it after the Analytical graph is revoked.
+    profile: &'a mut Option<Arc<QueryProfile>>,
 }
 
 /// Settles every owner the drained stream holds and assembles its terminal.
@@ -667,7 +666,7 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         running_query,
         query_class,
         row_count,
-        active_reads,
+        profile,
     } = inputs;
     let outcome = candidate.outcome;
     let failed_outcome = settle_failed_cancellation(
@@ -706,12 +705,10 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
     if let Some(owner) = running_query {
         owner.finish(terminal.outcome);
     }
-    // Released only here. Every leader-local batch source was dropped by the
+    // Dropped only here. Every leader-local batch source was dropped by the
     // caller and the distributed and Analytical settlements have joined, so
-    // no descendant of this query can read its cut again.
-    if let Some(claim) = active_reads.take() {
-        claim.release().await;
-    }
+    // the profile's operator metrics are final.
+    drop(profile.take());
     terminal
 }
 
@@ -1476,7 +1473,7 @@ impl OracleQueryStream {
             scan_stats,
             gate_lifecycle,
             running_query,
-            active_reads,
+            profile,
         } = input;
         #[cfg(feature = "test-support")]
         let mut admitted = admitted;
@@ -1506,7 +1503,7 @@ impl OracleQueryStream {
             request_cancellation,
             stream_telemetry_cancelled,
             running_query,
-            active_reads,
+            profile,
         });
         let frames = polled_in_span(frames, span);
         let stream = Self::assemble(
@@ -2134,7 +2131,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            active_reads: None,
+            profile: None,
         });
         let mut terminal_seen = false;
         while let Some(Ok(frame)) = stream.frames.next().await {
@@ -2178,7 +2175,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            active_reads: None,
+            profile: None,
         });
         assert!(matches!(
             stream.frames.next().await,
@@ -2221,7 +2218,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            active_reads: None,
+            profile: None,
         });
         assert!(matches!(
             stream.frames.next().await,

@@ -124,7 +124,9 @@ class McpHostReport:
     """What ``mcp_install`` did to one host's configuration file."""
 
     @property
-    def host(self) -> Literal["codex", "claude-code", "copilot-cli", "vscode"]:
+    def host(
+        self,
+    ) -> Literal["codex", "claude-code", "copilot-cli", "vscode", "cursor", "pi", "hermes"]:
         """The ``--host`` value naming the host."""
         ...
     @property
@@ -284,14 +286,14 @@ def issue_key(
 def mcp_install(hosts: list[str], *, server: str | None = None) -> McpInstallReport:
     """Connect the named MCP hosts to Wyrd (``wyrd mcp install --host ...``).
 
-    Hosts are located from ``HOME``, ``CODEX_HOME``, ``COPILOT_HOME``, and
-    ``XDG_CONFIG_HOME``. A host that cannot be connected is reported in the
+    Hosts are located from ``HOME``, ``CODEX_HOME``, ``COPILOT_HOME``,
+    ``XDG_CONFIG_HOME``, ``PI_CODING_AGENT_DIR``, and ``HERMES_HOME``. A host that cannot be connected is reported in the
     result with its file left as it was, never raised. No credential is
     written.
 
     Args:
-        hosts: ``codex``, ``claude-code``, ``copilot-cli``, or ``vscode``;
-            repeats are installed once.
+        hosts: ``codex``, ``claude-code``, ``copilot-cli``, ``vscode``,
+            ``cursor``, ``pi``, or ``hermes``; repeats are installed once.
         server: The Wyrd server retained in each host's launch command.
             Omitted, the host follows the global client endpoint.
 

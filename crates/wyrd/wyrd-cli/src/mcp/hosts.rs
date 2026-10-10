@@ -9,6 +9,9 @@
 //! | Claude Code | `~/.claude.json` | `mcpServers.wyrd` |
 //! | Copilot CLI | `$COPILOT_HOME/mcp-config.json` (default `~/.copilot`) | `mcpServers.wyrd` |
 //! | VS Code | user-profile `Code/User/mcp.json` | `servers.wyrd` |
+//! | Cursor | `~/.cursor/mcp.json` | `mcpServers.wyrd` |
+//! | Pi | `$PI_CODING_AGENT_DIR/mcp.json` (default `~/.pi/agent`) | `mcpServers.wyrd` |
+//! | Hermes Agent | `$HERMES_HOME/config.yaml` (default `~/.hermes`) | `mcp_servers.wyrd` |
 //!
 //! Every entry launches `wyrd mcp proxy` and pins `WYRD_CONFIG_HOME` to the
 //! installer's Wyrd configuration directory: some hosts pass a reduced
@@ -48,15 +51,24 @@ pub enum McpHost {
     CopilotCli,
     /// GitHub Copilot in VS Code, user profile.
     Vscode,
+    /// Cursor, global scope.
+    Cursor,
+    /// Pi coding agent, user scope.
+    Pi,
+    /// Nous Research Hermes Agent, active profile.
+    Hermes,
 }
 
 impl McpHost {
     /// Every supported host, in the order detection reports them.
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 7] = [
         Self::Codex,
         Self::ClaudeCode,
         Self::CopilotCli,
         Self::Vscode,
+        Self::Cursor,
+        Self::Pi,
+        Self::Hermes,
     ];
 
     /// The `--host` value naming this host.
@@ -67,6 +79,9 @@ impl McpHost {
             Self::ClaudeCode => "claude-code",
             Self::CopilotCli => "copilot-cli",
             Self::Vscode => "vscode",
+            Self::Cursor => "cursor",
+            Self::Pi => "pi",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -77,6 +92,9 @@ impl McpHost {
             Self::ClaudeCode => "Claude Code",
             Self::CopilotCli => "GitHub Copilot CLI",
             Self::Vscode => "GitHub Copilot in VS Code",
+            Self::Cursor => "Cursor",
+            Self::Pi => "Pi",
+            Self::Hermes => "Hermes Agent",
         }
     }
 }
@@ -215,6 +233,10 @@ pub(super) struct HostInstaller {
     copilot_home: Option<PathBuf>,
     /// `XDG_CONFIG_HOME`, when set; locates VS Code's profile on Linux.
     xdg_config_home: Option<PathBuf>,
+    /// `PI_CODING_AGENT_DIR`, when set: Pi's agent directory itself.
+    pi_agent_dir: Option<PathBuf>,
+    /// `HERMES_HOME`, when set: the active Hermes profile directory.
+    hermes_home: Option<PathBuf>,
     /// Program the host launches.
     command: String,
     /// Arguments after the program: `mcp proxy`, plus `--server` when chosen.
@@ -245,6 +267,8 @@ impl HostInstaller {
             codex_home: var("CODEX_HOME").map(PathBuf::from),
             copilot_home: var("COPILOT_HOME").map(PathBuf::from),
             xdg_config_home: var("XDG_CONFIG_HOME").map(PathBuf::from),
+            pi_agent_dir: var("PI_CODING_AGENT_DIR").map(PathBuf::from),
+            hermes_home: var("HERMES_HOME").map(PathBuf::from),
             command,
             args: proxy_args(server),
             config_home: Environment::Process.config_dir(),
@@ -296,13 +320,28 @@ impl HostInstaller {
                 existing_dir(profile.map(|dir| dir.join("Code/User")))
                     .map(|dir| dir.join("mcp.json"))
             }
+            McpHost::Cursor => {
+                existing_dir(home.map(|home| home.join(".cursor"))).map(|dir| dir.join("mcp.json"))
+            }
+            McpHost::Pi => existing_dir(
+                self.pi_agent_dir
+                    .clone()
+                    .or_else(|| home.map(|home| home.join(".pi/agent"))),
+            )
+            .map(|dir| dir.join("mcp.json")),
+            McpHost::Hermes => existing_dir(
+                self.hermes_home
+                    .clone()
+                    .or_else(|| home.map(|home| home.join(".hermes"))),
+            )
+            .map(|dir| dir.join("config.yaml")),
         }
     }
 
     /// The `wyrd` entry this installer writes, as the host's JSON shape.
     ///
-    /// Codex's TOML table carries the same `command`, `args`, and `env`; the
-    /// JSON hosts add `type`, and Copilot CLI also needs `tools` to expose
+    /// Codex, Pi, and Hermes take only `command`, `args`, and `env`; the
+    /// other hosts add `type`, and Copilot CLI also needs `tools` to expose
     /// every tool.
     fn entry(&self, host: McpHost) -> Value {
         let env = self.config_home.as_ref().map_or_else(Map::new, |dir| {
@@ -312,7 +351,7 @@ impl HostInstaller {
             )])
         });
         let mut entry = json!({ "command": self.command, "args": self.args, "env": env });
-        if host != McpHost::Codex {
+        if !matches!(host, McpHost::Codex | McpHost::Pi | McpHost::Hermes) {
             entry["type"] = Value::from("stdio");
         }
         if host == McpHost::CopilotCli {
@@ -366,8 +405,11 @@ impl HostInstaller {
         let entry = self.entry(host);
         let edited = match host {
             McpHost::Codex => edit_toml(&text, entry),
+            McpHost::Hermes => edit_yaml(&text, entry),
             McpHost::Vscode => edit_json(&text, "servers", entry),
-            McpHost::ClaudeCode | McpHost::CopilotCli => edit_json(&text, "mcpServers", entry),
+            McpHost::ClaudeCode | McpHost::CopilotCli | McpHost::Cursor | McpHost::Pi => {
+                edit_json(&text, "mcpServers", entry)
+            }
         };
         match edited {
             Err(Edit::Unreadable(reason)) => Err(HostFailure::Unreadable(path, reason)),
@@ -505,6 +547,90 @@ fn edit_toml(text: &str, entry: Value) -> Result<(McpHostStatus, String), Edit> 
     Ok((change, document.to_string()))
 }
 
+/// Set `mcp_servers.wyrd` in Hermes's YAML and render the result.
+///
+/// No installed YAML library edits in place, so this edits lines: the entry
+/// is one JSON flow mapping (valid YAML) that replaces an existing `wyrd`
+/// child of the block-style `mcp_servers` mapping, is inserted as its first
+/// child, or is appended with a new `mcp_servers` block. Every other line,
+/// comments included, is kept. The result is parsed back and must equal the
+/// original document with only that entry set; anything else is refused.
+///
+/// # Errors
+/// Returns [`Edit::Unreadable`] when `text` is not YAML, `mcp_servers` is not
+/// a block mapping, or the line edit would change anything but the entry,
+/// and [`Edit::Conflict`] for a foreign entry.
+fn edit_yaml(text: &str, entry: Value) -> Result<(McpHostStatus, String), Edit> {
+    let parse = |text: &str| -> Result<Value, Edit> {
+        if text.trim().is_empty() {
+            return Ok(json!({}));
+        }
+        serde_yaml::from_str(text).map_err(|error| Edit::Unreadable(error.to_string()))
+    };
+    let mut expected = parse(text)?;
+    let servers = expected
+        .as_object_mut()
+        .ok_or_else(|| Edit::Unreadable("the top level is not a YAML mapping".to_owned()))?
+        .entry("mcp_servers")
+        .or_insert_with(|| json!({}));
+    if servers.is_null() {
+        *servers = json!({});
+    }
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| Edit::Unreadable("`mcp_servers` is not a mapping".to_owned()))?;
+    let change = classify(servers.get(ENTRY), &entry)?;
+    let flow = format!("{ENTRY}: {entry}");
+    servers.insert(ENTRY.to_owned(), entry);
+
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let is_content = |line: &str| !line.trim().is_empty() && !line.trim_start().starts_with('#');
+    match lines.iter().position(|line| {
+        line.strip_prefix("mcp_servers:")
+            .is_some_and(|rest| rest.trim().is_empty() || rest.trim_start().starts_with('#'))
+    }) {
+        None => lines.extend(["mcp_servers:".to_owned(), format!("  {flow}")]),
+        Some(header) => {
+            let block_end = lines[header + 1..]
+                .iter()
+                .position(|line| is_content(line) && indent_of(line) == 0)
+                .map_or(lines.len(), |offset| header + 1 + offset);
+            let child_indent = lines[header + 1..block_end]
+                .iter()
+                .find(|line| is_content(line))
+                .map_or(2, |line| indent_of(line));
+            let existing = (header + 1..block_end).find(|&index| {
+                indent_of(&lines[index]) == child_indent
+                    && lines[index].trim_start().starts_with(&format!("{ENTRY}:"))
+            });
+            let replacement = format!("{}{flow}", " ".repeat(child_indent));
+            match existing {
+                Some(start) => {
+                    let mut end = (start + 1..block_end)
+                        .find(|&index| {
+                            is_content(&lines[index]) && indent_of(&lines[index]) <= child_indent
+                        })
+                        .unwrap_or(block_end);
+                    while end > start + 1 && !is_content(&lines[end - 1]) {
+                        end -= 1;
+                    }
+                    lines.splice(start..end, [replacement]);
+                }
+                None => lines.insert(header + 1, replacement),
+            }
+        }
+    }
+    let mut rendered = lines.join("\n");
+    rendered.push('\n');
+    if parse(&rendered)? != expected {
+        return Err(Edit::Unreadable(
+            "the file's layout cannot be edited without changing other settings".to_owned(),
+        ));
+    }
+    Ok((change, rendered))
+}
+
 /// Atomically replace `path` with `contents`.
 ///
 /// The temporary file is created beside `path`, given the original's
@@ -604,6 +730,41 @@ mod tests {
         assert!(none.expect("empty").is_empty());
         let eof = prompt_selection(&detected, &mut "".as_bytes(), &mut Vec::new());
         assert_eq!(eof.expect_err("eof").kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// Hermes YAML keeps every comment and unrelated setting, replaces a
+    /// multi-line proxy entry in place, refuses a foreign `wyrd` entry, and
+    /// refuses a flow-style `mcp_servers` it cannot edit by line.
+    #[test]
+    fn yaml_edit_preserves_comments_and_replaces_proxy_entry() {
+        let entry = json!({ "command": "wyrd", "args": ["mcp", "proxy"], "env": {} });
+        let text = "# top\nmcp_servers:\n  wyrd:\n    command: old\n    args: [mcp, proxy]\n  # keep\n  other:\n    command: x\nmodel: m\n";
+        let (change, rendered) = edit_yaml(text, entry.clone()).expect("edits");
+        assert_eq!(change, McpHostStatus::Updated);
+        assert_eq!(
+            rendered,
+            format!(
+                "# top\nmcp_servers:\n  wyrd: {entry}\n  # keep\n  other:\n    command: x\nmodel: m\n"
+            )
+        );
+        let (change, appended) = edit_yaml("model: m\n", entry.clone()).expect("appends");
+        assert_eq!(change, McpHostStatus::Added);
+        assert_eq!(
+            appended,
+            format!("model: m\nmcp_servers:\n  wyrd: {entry}\n")
+        );
+        assert_eq!(
+            edit_yaml(&appended, entry.clone()).expect("repeat").0,
+            McpHostStatus::Unchanged
+        );
+        assert!(matches!(
+            edit_yaml("mcp_servers:\n  wyrd:\n    command: other\n", entry.clone()),
+            Err(Edit::Conflict)
+        ));
+        assert!(matches!(
+            edit_yaml("mcp_servers: {other: {command: x}}\n", entry),
+            Err(Edit::Unreadable(_))
+        ));
     }
 
     /// A JSON host keeps every unrelated key, refuses a foreign `wyrd`

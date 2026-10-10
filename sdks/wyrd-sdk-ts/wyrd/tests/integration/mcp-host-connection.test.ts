@@ -15,7 +15,7 @@ const test = serverTest().extend<{ hosts: Record<string, string> }>({
   hosts: async ({ server: _ }, use) => {
     const home = mkdtempSync(join(tmpdir(), "wyrd-ts-mcp-home-"));
     vi.stubEnv("HOME", home);
-    for (const name of ["XDG_CONFIG_HOME", "CODEX_HOME", "COPILOT_HOME"]) {
+    for (const name of ["XDG_CONFIG_HOME", "CODEX_HOME", "COPILOT_HOME", "PI_CODING_AGENT_DIR", "HERMES_HOME"]) {
       vi.stubEnv(name, undefined);
     }
     const hosts = {
@@ -90,7 +90,7 @@ test("invalid selections and servers raise without changing a host", ({ hosts })
   const before = snapshot(hosts);
 
   expect(() => cli.mcpInstall([])).toThrow(expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }));
-  expect(() => cli.mcpInstall(["cursor"])).toThrow(expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }));
+  expect(() => cli.mcpInstall(["not-a-host"])).toThrow(expect.objectContaining({ code: "WYRD_SPEC_400_VALIDATION" }));
   expect(() => cli.mcpInstall(["codex"], { server: "http://wyrd.example" })).toThrow(
     expect.objectContaining({ code: "WYRD_CLIENT_400_CONFIG_INVALID" }),
   );

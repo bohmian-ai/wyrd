@@ -28,7 +28,13 @@ def hosts(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Path]:
     """Every host's configuration file in an isolated home, each with an ``other`` entry."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("WYRD_CONFIG_HOME", str(tmp_path / "wyrd"))
-    for name in ("XDG_CONFIG_HOME", "CODEX_HOME", "COPILOT_HOME"):
+    for name in (
+        "XDG_CONFIG_HOME",
+        "CODEX_HOME",
+        "COPILOT_HOME",
+        "PI_CODING_AGENT_DIR",
+        "HERMES_HOME",
+    ):
         monkeypatch.delenv(name, raising=False)
     files = {
         "codex": tmp_path / ".codex/config.toml",
@@ -123,7 +129,7 @@ def test_external_server_preserves_global_endpoint(hosts: dict[str, Path]) -> No
     ("selection", "server", "code"),
     [
         ([], None, "WYRD_SPEC_400_VALIDATION"),
-        (["cursor"], None, "WYRD_SPEC_400_VALIDATION"),
+        (["not-a-host"], None, "WYRD_SPEC_400_VALIDATION"),
         (["codex"], "http://wyrd.example", "WYRD_CLIENT_400_CONFIG_INVALID"),
     ],
 )

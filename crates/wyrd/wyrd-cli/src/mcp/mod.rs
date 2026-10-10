@@ -26,8 +26,9 @@ use hosts::{HostInstaller, prompt_selection};
 /// `wyrd mcp` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum McpCommand {
-    /// Connect detected MCP hosts (Codex, Claude Code, Copilot CLI, VS Code)
-    /// to Wyrd. Interactive runs offer a multi-select; scripts pass --host.
+    /// Connect detected MCP hosts (Codex, Claude Code, Copilot CLI, VS Code,
+    /// Cursor, Pi, Hermes Agent) to Wyrd. Interactive runs offer a
+    /// multi-select; scripts pass --host.
     Install(InstallArgs),
     /// Serve Wyrd's MCP tools over stdio for a host, authenticating with the
     /// ordinary Wyrd client credentials. Hosts launch this; `install` writes it.
@@ -65,11 +66,13 @@ pub struct McpInstallReport {
 /// Write the Wyrd proxy entry into each of the named hosts' configurations.
 ///
 /// The in-process form of `wyrd mcp install --host ...`. `hosts` holds the
-/// `--host` values (`codex`, `claude-code`, `copilot-cli`, `vscode`). `server`
+/// `--host` values (`codex`, `claude-code`, `copilot-cli`, `vscode`,
+/// `cursor`, `pi`, `hermes`). `server`
 /// is validated with the shared client's endpoint rules before any host file
 /// is touched, then retained verbatim as the proxy's `--server`. Hosts are
 /// located from the process environment (`HOME`, `CODEX_HOME`,
-/// `COPILOT_HOME`, `XDG_CONFIG_HOME`), and repeated hosts are installed
+/// `COPILOT_HOME`, `XDG_CONFIG_HOME`, `PI_CODING_AGENT_DIR`, `HERMES_HOME`),
+/// and repeated hosts are installed
 /// once. Each host is installed independently: a host that cannot be
 /// connected is reported with its status and detail, leaves its file as it
 /// was, and never blocks another host. No credential is written.
@@ -90,7 +93,8 @@ pub fn install(
             McpHost::from_str(name, false).map_err(|_| WyrdCliError::InvalidArgument {
                 field: "hosts".to_owned(),
                 value: name.to_owned(),
-                expected: "codex, claude-code, copilot-cli, or vscode".to_owned(),
+                expected: "codex, claude-code, copilot-cli, vscode, cursor, pi, or hermes"
+                    .to_owned(),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;

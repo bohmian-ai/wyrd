@@ -72,7 +72,7 @@ export interface ProviderCredentialWrite {
 /** What {@link cli.mcpInstall} did to one host's configuration file. */
 export interface McpHostReport {
   /** The `--host` value naming the host, such as `claude-code`. */
-  readonly host: "codex" | "claude-code" | "copilot-cli" | "vscode";
+  readonly host: "codex" | "claude-code" | "copilot-cli" | "vscode" | "cursor" | "pi" | "hermes";
   /** Connected: `added`, `updated`, or `unchanged`; otherwise why the file was left as it was. */
   readonly status: "added" | "updated" | "unchanged" | "not_detected" | "conflict" | "unreadable" | "unwritable";
   /** The host's configuration file, or `null` when the host was not detected. */

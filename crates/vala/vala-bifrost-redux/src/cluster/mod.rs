@@ -505,6 +505,16 @@ impl ClusterRegistry {
         self.snapshot.load_full()
     }
 
+    /// Publishes `snapshot` as the live-role snapshot without reading
+    /// durable membership.
+    ///
+    /// Lets a database-free test route peer work to fixture endpoints. The
+    /// next refresh, which no such test runs, would replace it.
+    #[cfg(feature = "test-support")]
+    pub fn publish_snapshot_for_test(&self, snapshot: ClusterSnapshot) {
+        self.snapshot.store(Arc::new(snapshot));
+    }
+
     /// Refreshes both role projections from durable membership and publishes one snapshot.
     ///
     /// # Errors

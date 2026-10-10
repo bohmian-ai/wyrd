@@ -106,6 +106,7 @@ mod tests {
     use super::*;
     use crate::components::gateway::recording::RecordingScribe;
     use crate::scribe_outbox::ScribeSink;
+    use vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
     use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 
     /// Production peer audit stages exact system and verified-tenant identities.
@@ -187,9 +188,12 @@ mod tests {
             .await
             .expect("remove sentinel");
         assert!(
-            PostgresPeerSecurityAudit::try_new(&postgres, ScribeSink::outbox(None))
-                .await
-                .is_err(),
+            PostgresPeerSecurityAudit::try_new(
+                &postgres,
+                ScribeSink::outbox(None, BIFROST_INGEST_REQUEST_LIMIT_BYTES)
+            )
+            .await
+            .is_err(),
             "missing sentinel must prevent peer runtime construction"
         );
 
@@ -203,9 +207,12 @@ mod tests {
         .await
         .expect("stage incompatible sentinel");
         assert!(
-            PostgresPeerSecurityAudit::try_new(&postgres, ScribeSink::outbox(None))
-                .await
-                .is_err(),
+            PostgresPeerSecurityAudit::try_new(
+                &postgres,
+                ScribeSink::outbox(None, BIFROST_INGEST_REQUEST_LIMIT_BYTES)
+            )
+            .await
+            .is_err(),
             "incompatible sentinel must prevent peer runtime construction"
         );
     }

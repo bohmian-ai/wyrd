@@ -2192,9 +2192,15 @@ impl AppState {
         shutdown_token: CancellationToken,
     ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
-        let scribe_outbox = bifrost
-            .scribe_outbox()
-            .map_or_else(|| ScribeSink::outbox(None), Arc::clone);
+        let scribe_outbox = bifrost.scribe_outbox().map_or_else(
+            || {
+                ScribeSink::outbox(
+                    None,
+                    vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+                )
+            },
+            Arc::clone,
+        );
         Self {
             postgres,
             storage,

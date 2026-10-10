@@ -5,8 +5,11 @@
 //! return at once. The outbox writer hands each tenant's pending slice to
 //! [`ScribeSink`], which projects every write into its fixed destination rows,
 //! groups those rows by destination, encodes each group as Arrow IPC frames
-//! under content-derived batch ids, and submits the frames in-process to this
-//! pod's Scribe or over the peer plane to a live one. Scribe ingress alone
+//! under content-derived batch ids, splitting any frame larger than a quarter
+//! of the configured Scribe request ceiling by rows, and submits the frames
+//! in-process to this pod's Scribe or over the peer plane to a live one. A
+//! peer call that has not answered within [`PEER_SUBMIT_TIMEOUT`] fails as
+//! unavailable, so the retry rotates to the next ready Scribe. Scribe ingress alone
 //! admits, accounts, persists, and acknowledges them; nothing here reserves
 //! Scribe capacity.
 //!
@@ -23,6 +26,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::compute::concat_batches;
@@ -35,7 +39,6 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeError, ScribeIngressFrame};
 use vala_bifrost_redux::gate::attribution::native_card_uids;
-use vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::tables::audit::projection::project_audit_event;
@@ -66,13 +69,21 @@ pub type ScribeOutbox = Outbox<ScribeSink>;
 /// Most tenants whose slices are written at once.
 const SCRIBE_WRITERS: usize = 4;
 
-/// Largest in-memory size of the rows one frame carries.
+/// Longest a peer Scribe may take to acknowledge one frame.
 ///
-/// A tenant slice can hold a long outage's backlog, so each destination group
-/// is split into frames below Scribe's default request ceiling.
-// ponytail: a fixed quarter of the default ingest ceiling; derive it from the
-// configured Scribe limit if an operator ever lowers that ceiling below it.
-const FRAME_BUDGET_BYTES: usize = BIFROST_INGEST_REQUEST_LIMIT_BYTES / 4;
+/// Matches the other Bifrost peer call budgets. Expiry surfaces as
+/// `DeadlineExceeded`, which classifies as [`ScribeRefusal::Unavailable`].
+const PEER_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Frame budget for a Scribe request ceiling of `request_bytes`.
+///
+/// A tenant slice can hold a long outage's backlog, so each frame's rows, in
+/// memory and as encoded Arrow IPC, stay within a quarter of the ceiling. The
+/// quarter leaves room for IPC framing and keeps Scribe's decoded and expanded
+/// request bounds, which scale from the same ceiling, out of reach.
+const fn frame_budget(request_bytes: usize) -> usize {
+    request_bytes / 4
+}
 
 /// One logical write bound for Scribe, staged by its domain owner.
 ///
@@ -354,13 +365,17 @@ impl ScribeRefusal {
     /// The peer service projects Scribe errors through Gate's one ingest
     /// status mapping, so saturation arrives as `ResourceExhausted`, and a
     /// closed or failing writer, like an unreachable peer, as `Unavailable`
-    /// or `Internal`.
+    /// or `Internal`. A call that outlived its channel deadline arrives as
+    /// `Cancelled` from tonic's client timeout or `DeadlineExceeded` from the
+    /// peer, and is retried like an unreachable peer.
     fn from_code(code: Code) -> Self {
         match code {
             Code::ResourceExhausted => Self::Saturated,
-            Code::Unavailable | Code::Internal | Code::DeadlineExceeded | Code::Unknown => {
-                Self::Unavailable
-            }
+            Code::Unavailable
+            | Code::Internal
+            | Code::DeadlineExceeded
+            | Code::Cancelled
+            | Code::Unknown => Self::Unavailable,
             _ => Self::Rejected,
         }
     }
@@ -447,15 +462,20 @@ pub(crate) struct ScribePeers {
     /// node and dropped when the node leaves the roster. The lock is never
     /// held across an await.
     channels: Mutex<HashMap<NodeId, (String, Channel)>>,
+    /// Deadline of every call on a channel built here;
+    /// [`PEER_SUBMIT_TIMEOUT`] outside tests.
+    timeout: Duration,
 }
 
 impl ScribePeers {
-    /// Returns the channel of the Scribe that serves submission `attempt`.
+    /// Returns the channel of the Scribe that serves write `attempt`.
     ///
     /// Ready Scribes are ordered by node id and attempts rotate across them,
     /// so a retry after a refusal is redirected to the next Scribe. A cached
     /// channel is reused while its endpoint matches; otherwise a lazy channel
-    /// is built, so a connect failure surfaces on the RPC itself.
+    /// is built, so a connect failure surfaces on the RPC itself. Every call
+    /// on the channel carries [`Self::timeout`], so a silent peer cannot hold
+    /// a tenant's slice.
     ///
     /// # Errors
     ///
@@ -488,6 +508,7 @@ impl ScribePeers {
             .tls
             .endpoint(endpoint.to_owned())
             .map_err(|_| ScribeRefusal::Unavailable)?
+            .timeout(self.timeout)
             .connect_lazy();
         channels.insert(node_id, (endpoint.to_owned(), channel.clone()));
         Ok(channel)
@@ -498,7 +519,8 @@ impl ScribePeers {
     /// # Errors
     ///
     /// Returns the [`ScribeRefusal`] the peer's status code classifies, or
-    /// [`ScribeRefusal::Unavailable`] when no Scribe can be dialed.
+    /// [`ScribeRefusal::Unavailable`] when no Scribe can be dialed or it did
+    /// not answer before the channel's deadline.
     async fn submit(&self, batch: &ScribeBatch, attempt: usize) -> Result<(), ScribeRefusal> {
         let mut client = ScribeCapturePeerServiceClient::new(self.channel(attempt)?);
         client
@@ -541,6 +563,7 @@ impl ScribeRoute {
                 cluster: Arc::clone(cluster),
                 tls: tls.clone(),
                 channels: Mutex::new(HashMap::new()),
+                timeout: PEER_SUBMIT_TIMEOUT,
             })),
             (None, None) => None,
         }
@@ -567,30 +590,42 @@ impl ScribeRoute {
 pub struct ScribeSink {
     /// Submission route selected at boot; `None` reaches no Scribe.
     route: Option<ScribeRoute>,
-    /// Submissions so far; rotates peer Scribes across retries.
+    /// Write attempts so far; every frame of one attempt goes to the same
+    /// peer Scribe, and a retry rotates to the next.
     attempts: AtomicUsize,
+    /// Largest rows, in memory and encoded, one frame carries; see
+    /// [`frame_budget`].
+    frame_budget: usize,
 }
 
 impl ScribeSink {
     /// Starts an outbox submitting along `route`, or dropping every write
     /// when `route` is `None`.
+    ///
+    /// `request_bytes` is the deployment's configured Scribe request ceiling
+    /// (`scribe.ingest_request_bytes`), which every Scribe a frame can reach
+    /// enforces.
     #[must_use]
-    pub(crate) fn outbox(route: Option<ScribeRoute>) -> Arc<ScribeOutbox> {
+    pub(crate) fn outbox(route: Option<ScribeRoute>, request_bytes: usize) -> Arc<ScribeOutbox> {
         Outbox::new(
             Self {
                 route,
                 attempts: AtomicUsize::new(0),
+                frame_budget: frame_budget(request_bytes),
             },
             SCRIBE_WRITERS,
         )
     }
 
     /// Starts an outbox submitting in-process to `scribe`, standing in for a
-    /// pod's own Scribe.
+    /// pod's own Scribe at the default request ceiling.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn local_outbox(scribe: Arc<dyn Scribe>) -> Arc<ScribeOutbox> {
-        Self::outbox(Some(ScribeRoute::Local(scribe)))
+        Self::outbox(
+            Some(ScribeRoute::Local(scribe)),
+            vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+        )
     }
 
     /// Whether this sink reaches any Scribe, in-process or over the peer plane.
@@ -631,13 +666,17 @@ impl ScribeSink {
     /// Groups `items` into frames, in first-seen destination order.
     ///
     /// Rows join the latest frame they share a destination, attribution,
-    /// request, and schema with while it stays within [`FRAME_BUDGET_BYTES`],
-    /// and otherwise open a new one, so the frames of an identical slice are
+    /// request, and schema with while it stays within `budget` bytes in
+    /// memory, and otherwise open a new one, so the frames of an identical slice are
     /// identical. Gateway capture carries its admitting request, which Scribe
     /// stamps as `wyrd_request_id`, so captures group per request. Result summary frames are moved after every detail frame,
     /// so a visible summary's details were submitted first. Positions of
     /// writes that cannot be projected are added to `lost`.
-    fn frames<'a>(items: &'a [ScribeWrite], lost: &mut BTreeSet<usize>) -> Vec<Frame<'a>> {
+    fn frames<'a>(
+        items: &'a [ScribeWrite],
+        budget: usize,
+        lost: &mut BTreeSet<usize>,
+    ) -> Vec<Frame<'a>> {
         let mut frames: Vec<Frame<'a>> = Vec::new();
         for (index, item) in items.iter().enumerate() {
             let rows = match item.rows() {
@@ -658,7 +697,7 @@ impl ScribeSink {
                     .iter_mut()
                     .rev()
                     .find(|frame| frame.shares(&rows))
-                    .filter(|frame| frame.bytes + size <= FRAME_BUDGET_BYTES)
+                    .filter(|frame| frame.bytes + size <= budget)
                 {
                     Some(frame) => {
                         frame.batches.push(rows.batch);
@@ -680,8 +719,57 @@ impl ScribeSink {
         frames
     }
 
-    /// Encodes `frame` as one Arrow IPC stream of one batch under its
-    /// content-derived identity.
+    /// Encodes `frame` as Arrow IPC streams of at most `budget` bytes, each
+    /// under its content-derived identity, in row order.
+    ///
+    /// A single row larger than `budget` is still encoded alone; Scribe
+    /// decides whether its ceiling admits it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when the rows cannot be concatenated or encoded.
+    fn encode(
+        tenant: DataTenantId,
+        frame: &Frame<'_>,
+        budget: usize,
+    ) -> Result<Vec<ScribeBatch>, arrow::error::ArrowError> {
+        let rows = concat_batches(&frame.batches[0].schema(), &frame.batches)?;
+        let mut streams = Vec::new();
+        Self::split(&rows, budget, &mut streams)?;
+        Ok(streams
+            .into_iter()
+            .map(|ipc| Self::identify(tenant, frame, ipc))
+            .collect())
+    }
+
+    /// Appends `rows` to `streams` as one Arrow IPC stream, or, when that
+    /// stream exceeds `budget` bytes and holds more than one row, as the
+    /// streams of each half in turn.
+    ///
+    /// Halving depends only on the rows, so an identical slice always splits
+    /// into identical streams, whatever its row sizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Arrow error when the rows cannot be encoded.
+    fn split(
+        rows: &RecordBatch,
+        budget: usize,
+        streams: &mut Vec<Vec<u8>>,
+    ) -> Result<(), arrow::error::ArrowError> {
+        let mut writer = StreamWriter::try_new(Vec::new(), &rows.schema())?;
+        writer.write(rows)?;
+        let ipc = writer.into_inner()?;
+        let count = rows.num_rows();
+        if ipc.len() <= budget || count < 2 {
+            streams.push(ipc);
+            return Ok(());
+        }
+        Self::split(&rows.slice(0, count / 2), budget, streams)?;
+        Self::split(&rows.slice(count / 2, count - count / 2), budget, streams)
+    }
+
+    /// Wraps one encoded stream of `frame` under its content-derived identity.
     ///
     /// The batch id hashes the tenant, destination, attribution, request, and
     /// encoded rows, so a retry of the identical slice resubmits the same
@@ -690,18 +778,11 @@ impl ScribeSink {
     /// request id derived from the batch id, so it too is stable across
     /// retries. The digest carries `UUIDv7` version and variant bits.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns the Arrow error when the rows cannot be concatenated or encoded.
-    fn encode(
-        tenant: DataTenantId,
-        frame: &Frame<'_>,
-    ) -> Result<ScribeBatch, arrow::error::ArrowError> {
-        let schema = frame.batches[0].schema();
-        let rows = concat_batches(&schema, &frame.batches)?;
-        let mut writer = StreamWriter::try_new(Vec::new(), &schema)?;
-        writer.write(&rows)?;
-        let ipc = writer.into_inner()?;
+    /// Panics only if a `UUIDv7` batch id failed to parse as a request id,
+    /// which its construction rules out.
+    fn identify(tenant: DataTenantId, frame: &Frame<'_>, ipc: Vec<u8>) -> ScribeBatch {
         let mut digest = Sha256::new();
         digest.update(b"wyrd.scribe.outbox.batch-id.v1");
         digest.update(tenant.as_uuid().as_bytes());
@@ -723,14 +804,14 @@ impl ScribeSink {
         let request_id = frame.request.cloned().unwrap_or_else(|| {
             RequestId::parse(&batch_id.to_string()).expect("a UUIDv7 batch id is a request id")
         });
-        Ok(ScribeBatch {
+        ScribeBatch {
             tenant,
             table: frame.table,
             batch_id,
             request_id,
             ipc: Bytes::from(ipc),
             verifier: frame.attribution.cloned(),
-        })
+        }
     }
 }
 
@@ -741,8 +822,12 @@ impl OutboxSink for ScribeSink {
 
     /// Writes one tenant's slice as destination frames, in order.
     ///
-    /// Every frame is submitted even after a terminal refusal; a retryable
-    /// refusal stops the write so the outbox retries the identical slice.
+    /// Every frame of this attempt is submitted to the same Scribe, so a
+    /// retry after a peer refusal or timeout moves the whole slice to the
+    /// next ready one. A frame over the budget is submitted as its row-split
+    /// streams. Every
+    /// frame is submitted even after a terminal refusal; a retryable refusal
+    /// stops the write so the outbox retries the identical slice.
     /// Writes that were projected away or whose frame was refused terminally
     /// are counted lost once the slice completes, never on a retried
     /// attempt. A process that reaches no Scribe drops the whole slice.
@@ -765,26 +850,28 @@ impl OutboxSink for ScribeSink {
             tracing::warn!(outbox = Self::NAME, %tenant, lost = items.len(), "this process reaches no Scribe; writes are dropped");
             return Ok(());
         };
+        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
         let mut lost = BTreeSet::new();
-        for frame in Self::frames(items, &mut lost) {
-            let batch = match Self::encode(tenant, &frame) {
-                Ok(batch) => batch,
+        for frame in Self::frames(items, self.frame_budget, &mut lost) {
+            let batches = match Self::encode(tenant, &frame, self.frame_budget) {
+                Ok(batches) => batches,
                 Err(error) => {
                     tracing::warn!(outbox = Self::NAME, %tenant, table = frame.table.fqn(), %error, "a Scribe frame could not be encoded; its writes are dropped");
                     lost.extend(&frame.items);
                     continue;
                 }
             };
-            let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
-            match route.submit(&batch, attempt).await {
-                Ok(()) => {}
-                Err(ScribeRefusal::Rejected) => {
-                    tracing::error!(outbox = Self::NAME, %tenant, table = frame.table.fqn(), batch_id = %batch.batch_id, writes = frame.items.len(), "Scribe rejected a frame terminally; its writes are dropped");
-                    lost.extend(&frame.items);
-                }
-                Err(refusal) => {
-                    tracing::warn!(outbox = Self::NAME, %tenant, table = frame.table.fqn(), reason = refusal.reason(), "Scribe refused a frame; the slice will be retried");
-                    return Err(refusal);
+            for batch in batches {
+                match route.submit(&batch, attempt).await {
+                    Ok(()) => {}
+                    Err(ScribeRefusal::Rejected) => {
+                        tracing::error!(outbox = Self::NAME, %tenant, table = frame.table.fqn(), batch_id = %batch.batch_id, writes = frame.items.len(), "Scribe rejected a frame terminally; its writes are dropped");
+                        lost.extend(&frame.items);
+                    }
+                    Err(refusal) => {
+                        tracing::warn!(outbox = Self::NAME, %tenant, table = frame.table.fqn(), reason = refusal.reason(), "Scribe refused a frame; the slice will be retried");
+                        return Err(refusal);
+                    }
                 }
             }
         }
@@ -795,11 +882,20 @@ impl OutboxSink for ScribeSink {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use arrow::array::{Array as _, AsArray as _};
+    use arrow::ipc::reader::StreamReader;
     use chrono::Utc;
-    use vala_bifrost_redux::contracts::ScribeError;
+    use vala_bifrost_redux::catalog::{TableRef, TableUid};
+    use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
+    use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
+    use vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES;
+    use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
+    use vala_eval::executor::{EvalReport, TaskRunOutcome};
     use wyrd_runtime::audit::AuditStage;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::{
@@ -809,23 +905,30 @@ mod tests {
     use wyrd_spec::ids::{CardUid, VerificationResultId};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
-    use wyrd_spec::verification::DriftWindow;
+    use wyrd_spec::vala::api::{
+        AuditEvent, AuditOutcome, ClusterCapabilities, ClusterNodeKey, ClusterRole,
+        ClusterRoleLease, NodeId, ScribeCapabilitiesV1,
+    };
+    use wyrd_spec::vala::eval::ids::TaskId;
+    use wyrd_spec::vala::eval::operator::ComparisonOperator;
+    use wyrd_spec::vala::eval::result::AssertionResult;
+    use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
     use wyrd_sql::queries::verifier_runs::RunInput;
-    use wyrd_tonic::tonic::Code;
-
-    use uuid::Uuid;
-    use vala_bifrost_redux::cluster::ClusterRegistry;
-    use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
-    use vala_sql::ValaPostgres;
-    use wyrd_spec::vala::api::NodeId;
+    use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
+    use wyrd_tonic::tonic::{Code, Request, Response, Status};
+    use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_server::{
+        ScribeCapturePeerService, ScribeCapturePeerServiceServer,
+    };
+    use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, IngestCaptureResponse};
 
     use super::{
-        ScribeOutbox, ScribeRefusal, ScribeRoute, ScribeSink, ScribeWrite, VerifierAttribution,
+        Outbox, SCRIBE_WRITERS, ScribeOutbox, ScribePeers, ScribeRefusal, ScribeRoute, ScribeSink,
+        ScribeWrite, VerifierAttribution, frame_budget,
     };
     use crate::components::gateway::CallCapture;
     use crate::components::gateway::capture_tests::{facts, policy};
-    use crate::components::gateway::recording::RecordingScribe;
+    use crate::components::gateway::recording::{Received, RecordingScribe};
+    use crate::grpc::capture_peer::ScribeCapturePeerGrpc;
     use crate::verification::engines::VerifierReport;
     use crate::verification::results::{ResultPayloadBuilder, ResultRun};
 
@@ -1082,7 +1185,7 @@ mod tests {
     /// Panics when the outbox claims a route or does not settle.
     #[tokio::test]
     async fn an_unreachable_route_drops() {
-        let outbox = ScribeSink::outbox(None);
+        let outbox = ScribeSink::outbox(None, BIFROST_INGEST_REQUEST_LIMIT_BYTES);
         assert!(!outbox.sink().reaches_scribe());
         let tenant = DataTenantId::new_v7();
         outbox.stage(tenant, capture(tenant));
@@ -1103,8 +1206,8 @@ mod tests {
             .connect_lazy("postgres://unused.invalid/none")
             .expect("lazy pool builds without connecting");
         let cluster = Arc::new(ClusterRegistry::new(
-            ValaPostgres::from_pool(pool),
-            NodeId::new(Uuid::now_v7()),
+            vala_sql::postgres::ValaPostgres::from_pool(pool),
+            NodeId::new(uuid::Uuid::now_v7()),
         ));
         let tls = BifrostPeerTls::new(
             Vec::new(),
@@ -1114,7 +1217,7 @@ mod tests {
         );
         let route = ScribeRoute::select(None, &cluster, Some(&tls));
         assert!(matches!(route, Some(ScribeRoute::Peer(_))));
-        let outbox = ScribeSink::outbox(route);
+        let outbox = ScribeSink::outbox(route, BIFROST_INGEST_REQUEST_LIMIT_BYTES);
         assert!(outbox.sink().reaches_scribe());
         let tenant = DataTenantId::new_v7();
         outbox.stage(tenant, capture(tenant));
@@ -1126,8 +1229,458 @@ mod tests {
         );
     }
 
+    /// A Scribe request ceiling well below the default, so a modest Eval
+    /// detail payload needs several frames.
+    const SMALL_REQUEST_BYTES: usize = 64 * 1024;
+
+    /// Starts an outbox submitting along `route` under a `request_bytes`
+    /// Scribe ceiling.
+    fn route_outbox(route: ScribeRoute, request_bytes: usize) -> Arc<ScribeOutbox> {
+        Outbox::new(
+            ScribeSink {
+                route: Some(route),
+                attempts: AtomicUsize::new(0),
+                frame_budget: frame_budget(request_bytes),
+            },
+            SCRIBE_WRITERS,
+        )
+    }
+
+    /// One Eval judgment with `tasks` passed items, task ids `t0`, `t1`, ...,
+    /// each carrying an expected value of `expected_bytes` characters.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the payload does not build.
+    fn eval_result(
+        attribution: &VerifierAttribution,
+        tasks: usize,
+        expected_bytes: usize,
+    ) -> ScribeWrite {
+        let subject = CardUid::from_uuid(uuid::Uuid::now_v7()).expect("uid");
+        let now = Utc::now();
+        let input = RunInput::EvalRecord {
+            record_id: "record-1".to_owned(),
+            event_time: now,
+        };
+        let outcomes = (0..tasks)
+            .map(|task| {
+                TaskRunOutcome::Ran(Box::new(AssertionResult {
+                    task_id: TaskId::new(format!("t{task}")).expect("task id"),
+                    passed: true,
+                    actual: None,
+                    expected: serde_json::Value::String("x".repeat(expected_bytes)),
+                    operator: ComparisonOperator::Equals,
+                    message: None,
+                    stage: 0,
+                    started_at: now,
+                    duration_ms: 1,
+                }))
+            })
+            .collect();
+        let payload = ResultPayloadBuilder::new(
+            ResultRun {
+                run_id: None,
+                verifier_version: "1.0.0",
+                subject_card_uid: &subject,
+                owner_card_uid: None,
+                binding_id: None,
+                trigger: None,
+                input: &input,
+            },
+            attribution
+                .verifier
+                .uid
+                .as_ref()
+                .expect("the fixture Verifier carries its UID"),
+            VerificationResultId::new_v7(),
+            now,
+            now,
+            now,
+        )
+        .build(&VerifierReport::Eval {
+            report: EvalReport { outcomes },
+            verdict: VerificationVerdict::Passed,
+            run_id: None,
+        })
+        .expect("an Eval result builds");
+        ScribeWrite::Result {
+            payload,
+            attribution: attribution.clone(),
+        }
+    }
+
+    /// A fresh attribution under the test Verifier.
+    fn attribution() -> VerifierAttribution {
+        VerifierAttribution {
+            verifier: verifier(),
+            principal: PrincipalId::new(uuid::Uuid::now_v7()),
+        }
+    }
+
+    /// Each distinct acknowledged frame once, in first-acknowledged order,
+    /// as Scribe's batch-id dedup would retain them.
+    fn retained(received: Vec<Received>) -> Vec<Received> {
+        let mut seen = HashSet::new();
+        received
+            .into_iter()
+            .filter(|frame| seen.insert(frame.batch_id))
+            .collect()
+    }
+
+    /// The task ids of every Eval item row in `frames`, in order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an item frame does not decode.
+    fn item_task_ids(frames: &[Received]) -> Vec<String> {
+        frames
+            .iter()
+            .filter(|frame| frame.table == "vala.eval.result_items")
+            .flat_map(|frame| {
+                StreamReader::try_new(std::io::Cursor::new(frame.ipc.clone()), None)
+                    .expect("an item frame opens")
+                    .flat_map(|batch| {
+                        let batch = batch.expect("an item batch decodes");
+                        let ids = batch
+                            .column_by_name("task_id")
+                            .expect("task_id column")
+                            .as_string::<i32>()
+                            .clone();
+                        (0..ids.len())
+                            .map(|row| ids.value(row).to_owned())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Asserts `frames` carry every one of `tasks` item rows exactly once and
+    /// in order, in more than one item frame within the small ceiling's
+    /// budget, and end with the one summary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a row is missing, repeated, misordered, or a frame is over
+    /// budget or out of order.
+    fn assert_bounded_detail(frames: &[Received], tasks: usize) {
+        let tables = frames
+            .iter()
+            .map(|frame| frame.table.as_str())
+            .collect::<Vec<_>>();
+        let (summary, items) = tables.split_last().expect("frames were written");
+        assert_eq!(*summary, "vala.verification.results", "the summary is last");
+        assert!(
+            items.len() > 1 && items.iter().all(|table| *table == "vala.eval.result_items"),
+            "the detail splits into several item frames before the summary: {tables:?}"
+        );
+        let budget = frame_budget(SMALL_REQUEST_BYTES);
+        assert!(
+            frames.iter().all(|frame| frame.ipc.len() <= budget),
+            "every frame fits the budget"
+        );
+        let expected = (0..tasks)
+            .map(|task| format!("t{task}"))
+            .collect::<Vec<_>>();
+        assert_eq!(item_task_ids(frames), expected, "every row once, in order");
+    }
+
+    /// A Scribe that acknowledges through `inner` but reports the
+    /// `lose`-th submission (zero-based) as failed, as when its ACK is lost.
+    struct LostAck {
+        /// Records every acknowledged frame.
+        inner: Arc<RecordingScribe>,
+        /// Submission whose ACK is lost.
+        lose: usize,
+        /// Submissions so far.
+        seen: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Scribe for LostAck {
+        /// Always ready.
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        /// Acknowledges `frame` through the recording Scribe, then reports
+        /// the scripted submission as unavailable.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`ScribeError::IngressClosed`] for the lost submission and
+        /// the recording Scribe's refusal otherwise.
+        async fn ingest_frame(
+            &self,
+            frame: ScribeIngressFrame,
+        ) -> Result<FrameAdmission, ScribeError> {
+            let admission = self.inner.ingest_frame(frame).await?;
+            if self.seen.fetch_add(1, Ordering::Relaxed) == self.lose {
+                return Err(ScribeError::IngressClosed);
+            }
+            Ok(admission)
+        }
+
+        /// Resolves through the recording Scribe.
+        ///
+        /// # Errors
+        ///
+        /// Returns the recording Scribe's resolution error.
+        async fn resolve_write_table(
+            &self,
+            tenant: DataTenantId,
+            table: &TableRef,
+        ) -> Result<TableUid, ScribeError> {
+            self.inner.resolve_write_table(tenant, table).await
+        }
+    }
+
+    /// Proves a multi-row Eval detail larger than one frame under a lowered
+    /// Scribe ceiling reaches the local Scribe as bounded frames carrying
+    /// every row once, in order, before the summary, and that after a lost
+    /// ACK the identical slice resubmits identical frame ids.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a frame is over budget, a row is lost or repeated, or the
+    /// retry changes a frame's identity.
+    #[tokio::test]
+    async fn an_oversized_detail_reaches_scribe_in_bounded_frames_that_replay_identically() {
+        let recording = Arc::new(RecordingScribe::default());
+        let scribe = LostAck {
+            inner: Arc::clone(&recording),
+            lose: 1,
+            seen: AtomicUsize::new(0),
+        };
+        let outbox = route_outbox(ScribeRoute::Local(Arc::new(scribe)), SMALL_REQUEST_BYTES);
+        outbox.stage(
+            DataTenantId::new_v7(),
+            eval_result(&attribution(), 64, 1024),
+        );
+        settle(&outbox).await;
+
+        let submitted = recording.submitted();
+        assert_eq!(
+            submitted[2..4],
+            submitted[..2],
+            "the retry resubmits the identical frames"
+        );
+        let frames = retained(recording.received());
+        assert_eq!(
+            frames.len(),
+            submitted.len() - 2,
+            "every frame after the retry is new"
+        );
+        assert_bounded_detail(&frames, 64);
+    }
+
+    /// Proves a single detail row larger than the budget is still submitted
+    /// alone and whole, and a terminal Scribe size refusal consumes it
+    /// without retry while the summary is written.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row is split, retried, or the summary is missing.
+    #[tokio::test]
+    async fn an_unsplittable_row_is_submitted_whole_and_terminal_refusal_consumes_it() {
+        let scribe = Arc::new(RecordingScribe::default());
+        scribe.refuse_next(ScribeError::PayloadTooLarge {
+            bytes: SMALL_REQUEST_BYTES + 1,
+            limit: SMALL_REQUEST_BYTES,
+        });
+        let outbox = route_outbox(
+            ScribeRoute::Local(Arc::clone(&scribe) as _),
+            SMALL_REQUEST_BYTES,
+        );
+        outbox.stage(
+            DataTenantId::new_v7(),
+            eval_result(&attribution(), 1, SMALL_REQUEST_BYTES),
+        );
+        settle(&outbox).await;
+
+        assert_eq!(scribe.attempts(), 2, "one item frame and one summary");
+        let tables = scribe
+            .received()
+            .iter()
+            .map(|frame| frame.table.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(tables, ["vala.verification.results"]);
+    }
+
+    /// A peer Scribe that accepts every capture call and never answers,
+    /// recording the batch id it holds.
+    #[derive(Clone, Default)]
+    struct SilentPeer {
+        /// Batch ids of every call received.
+        held: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[wyrd_tonic::tonic::async_trait]
+    impl ScribeCapturePeerService for SilentPeer {
+        /// Records the call's batch id and never returns.
+        ///
+        /// # Errors
+        ///
+        /// Never returns.
+        async fn ingest_capture(
+            &self,
+            request: Request<IngestCaptureRequest>,
+        ) -> Result<Response<IngestCaptureResponse>, Status> {
+            self.held
+                .lock()
+                .expect("held")
+                .push(request.into_inner().batch_id);
+            std::future::pending().await
+        }
+    }
+
+    /// Serves `service` over mutual TLS under `ca` and `leaf` on a loopback
+    /// port, returning its address.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the listener or TLS server cannot start.
+    async fn serve_peer<S>(
+        ca: &BifrostPeerCa,
+        leaf: &wyrd_testing::bifrost::peer_ca::BifrostPeerLeaf,
+        service: ScribeCapturePeerServiceServer<S>,
+    ) -> String
+    where
+        S: ScribeCapturePeerService,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("peer listener binds");
+        let port = listener.local_addr().expect("listener address").port();
+        let incoming = async_stream::stream! {
+            loop {
+                yield listener.accept().await.map(|(stream, _)| stream);
+            }
+        };
+        let server = wyrd_tonic::server::mutual_tls_server(
+            wyrd_tonic::server::MutualTlsServerConfig::from_pem(
+                leaf.certificate_pem().as_bytes(),
+                leaf.private_key_pem().as_bytes(),
+                ca.ca_certificate_pem().as_bytes(),
+            ),
+        )
+        .expect("mutual TLS server builds");
+        tokio::spawn(
+            server
+                .clone()
+                .add_service(service)
+                .serve_with_incoming(incoming),
+        );
+        format!("https://127.0.0.1:{port}")
+    }
+
+    /// A ready Scribe lease for `node` answering at `address`.
+    fn scribe_lease(node: u128, address: String) -> ClusterRoleLease {
+        let now = Utc::now();
+        ClusterRoleLease {
+            key: ClusterNodeKey {
+                node_id: NodeId::new(uuid::Uuid::from_u128(node)),
+                role: ClusterRole::Scribe,
+            },
+            address,
+            fencing_token: 1,
+            capability_version: 1,
+            capabilities: ClusterCapabilities::ScribeV1(ScribeCapabilitiesV1 {
+                tail_protocol_version: 1,
+            }),
+            ready: true,
+            started_at: now,
+            heartbeat_at: now,
+        }
+    }
+
+    /// Proves a silent peer cannot hold a tenant: the first ready Scribe
+    /// accepts every call and never answers, each held frame times out and
+    /// its slice is retried under the same batch ids on the next ready
+    /// Scribe, where an oversized Eval detail arrives as bounded frames with
+    /// every row once and another tenant's capture is written too.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a held frame is not retried under its id, a row is lost
+    /// or repeated, a frame is over budget, or the other tenant's capture is
+    /// missing.
+    #[tokio::test]
+    async fn a_silent_peer_times_out_and_the_slice_retries_on_the_next_scribe() {
+        let ca = BifrostPeerCa::generate("scribe.peer.test").expect("peer CA");
+        let leaf = ca.issue_leaf("scribe").expect("peer leaf");
+        let silent = SilentPeer::default();
+        let silent_address = serve_peer(
+            &ca,
+            &leaf,
+            ScribeCapturePeerServiceServer::new(silent.clone()),
+        )
+        .await;
+        let recording = Arc::new(RecordingScribe::default());
+        let ready_address = serve_peer(
+            &ca,
+            &leaf,
+            ScribeCapturePeerGrpc::new(Arc::clone(&recording) as _).into_server(),
+        )
+        .await;
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused.invalid/unused")
+            .expect("a lazy pool never connects");
+        let cluster = ClusterRegistry::new(
+            vala_sql::postgres::ValaPostgres::from_pool(pool),
+            NodeId::new(uuid::Uuid::now_v7()),
+        );
+        cluster.publish_snapshot_for_test(ClusterSnapshot::new(vec![
+            scribe_lease(1, silent_address),
+            scribe_lease(2, ready_address),
+        ]));
+        let peers = ScribePeers {
+            cluster: Arc::new(cluster),
+            tls: BifrostPeerTls::new(
+                ca.ca_certificate_pem().as_bytes().to_vec(),
+                ca.server_name().to_owned(),
+                leaf.certificate_pem().as_bytes().to_vec(),
+                secrecy::SecretString::from(leaf.private_key_pem().to_owned()),
+            ),
+            channels: Mutex::new(HashMap::new()),
+            timeout: Duration::from_millis(300),
+        };
+        let outbox = route_outbox(ScribeRoute::Peer(peers), SMALL_REQUEST_BYTES);
+        let tenant = DataTenantId::new_v7();
+        let other = DataTenantId::new_v7();
+        outbox.stage(tenant, eval_result(&attribution(), 64, 1024));
+        outbox.stage(other, capture(other));
+        settle(&outbox).await;
+
+        let held = silent.held.lock().expect("held").clone();
+        assert!(!held.is_empty(), "the silent peer held a frame");
+        let received = recording.received();
+        let acknowledged = received
+            .iter()
+            .map(|frame| frame.batch_id.to_string())
+            .collect::<HashSet<_>>();
+        assert!(
+            held.iter().all(|id| acknowledged.contains(id)),
+            "every held frame is retried under its batch id on the ready Scribe"
+        );
+        let (mine, others): (Vec<_>, Vec<_>) = retained(received)
+            .into_iter()
+            .partition(|frame| frame.tenant == tenant);
+        assert_bounded_detail(&mine, 64);
+        assert_eq!(
+            others
+                .iter()
+                .map(|frame| frame.table.as_str())
+                .collect::<Vec<_>>(),
+            ["vala.gateway.calls", "vala.traces.spans"],
+            "the other tenant's capture is written"
+        );
+    }
+
     /// Proves in-process refusals and peer status codes classify into the
-    /// same retryable and terminal refusals.
+    /// same retryable and terminal refusals, and an expired peer call, by
+    /// either deadline code, retries.
     ///
     /// # Panics
     ///
@@ -1156,9 +1709,8 @@ mod tests {
             let status = vala_bifrost_redux::gate::IngestError::from_scribe(error).into_status();
             assert_eq!(ScribeRefusal::from_code(status.code()), refusal, "{status}");
         }
-        assert_eq!(
-            ScribeRefusal::from_code(Code::DeadlineExceeded),
-            ScribeRefusal::Unavailable
-        );
+        for code in [Code::DeadlineExceeded, Code::Cancelled] {
+            assert_eq!(ScribeRefusal::from_code(code), ScribeRefusal::Unavailable);
+        }
     }
 }

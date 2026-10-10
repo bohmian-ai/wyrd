@@ -1059,13 +1059,16 @@ pub async fn compose_bifrost(
     let membership_poller = Arc::clone(&cluster_registry).start_snapshot_poller();
     // The one process Scribe outbox: Gate, Oracle, peer security, every
     // request-path decision, gateway capture, and Verifier results stage on
-    // it. It submits to the local Scribe, else to a peer Scribe.
-    let scribe_outbox =
-        crate::scribe_outbox::ScribeSink::outbox(crate::scribe_outbox::ScribeRoute::select(
+    // it. It submits to the local Scribe, else to a peer Scribe, in frames
+    // that fit the configured Scribe request ceiling.
+    let scribe_outbox = crate::scribe_outbox::ScribeSink::outbox(
+        crate::scribe_outbox::ScribeRoute::select(
             scribe.as_ref().map(|parts| &parts.scribe),
             &cluster_registry,
             peer_tls.as_ref(),
-        ));
+        ),
+        scribe_config.ingest_request_bytes,
+    );
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
             crate::oracle::PostgresPeerSecurityAudit::try_new(

@@ -725,6 +725,12 @@ pub struct ResourceSnapshot {
     pub oracle_analytical_queries: u32,
     /// Aggregate memory retained specifically by Oracle query owners.
     pub oracle_query_memory_used_bytes: usize,
+    /// Share of [`Self::infallible_headroom_bytes`] Oracle pools hold.
+    ///
+    /// Oracle shutdown adds this to the governed Oracle query bytes so a
+    /// child holding only infallible overshoot still delays its drain, while
+    /// headroom other roles hold never does.
+    pub oracle_infallible_headroom_bytes: usize,
     /// Bytes `DataFusion`'s infallible growth path holds above the shared cap.
     ///
     /// These are real, retained bytes accounted as server headroom rather than
@@ -824,6 +830,8 @@ struct ResourceState {
     /// Live Analytical queries and follower graphs; each holds one slot unit.
     oracle_analytical_queries: u32,
     oracle_query_memory_used_bytes: usize,
+    /// Oracle-held share of `infallible_headroom_bytes`.
+    oracle_infallible_headroom_bytes: usize,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     scribe_shard_bytes: BTreeMap<usize, usize>,
     /// Advances only when Oracle slot units return to the ledger.
@@ -2213,6 +2221,7 @@ impl BifrostResourceGovernor {
             oracle_interactive_queries: state.oracle_interactive_queries,
             oracle_analytical_queries: state.oracle_analytical_queries,
             oracle_query_memory_used_bytes: state.oracle_query_memory_used_bytes,
+            oracle_infallible_headroom_bytes: state.oracle_infallible_headroom_bytes,
             infallible_headroom_bytes: state.infallible_headroom_bytes,
             oracle_query_active: state.oracle_active_queries() > 0,
         })
@@ -2702,6 +2711,10 @@ impl BifrostResourceGovernor {
                 .oracle_query_memory_used_bytes
                 .checked_add(governed)
                 .ok_or_else(accounting_overflow)?;
+            state.oracle_infallible_headroom_bytes = state
+                .oracle_infallible_headroom_bytes
+                .checked_add(headroom)
+                .ok_or_else(accounting_overflow)?;
             record_oracle_memory(&state);
         }
         Ok(GovernedMemoryCharge {
@@ -2731,7 +2744,8 @@ impl BifrostResourceGovernor {
         }
         let mut state = self.lock_state()?;
         let query_underflow = holder == MemoryHolder::Oracle
-            && state.oracle_query_memory_used_bytes < charge.governed_bytes;
+            && (state.oracle_query_memory_used_bytes < charge.governed_bytes
+                || state.oracle_infallible_headroom_bytes < charge.headroom_bytes);
         if state.infallible_headroom_bytes < charge.headroom_bytes || query_underflow {
             return Err(self.poison_locked(&mut state, "pool memory release underflow"));
         }
@@ -2739,6 +2753,7 @@ impl BifrostResourceGovernor {
         state.infallible_headroom_bytes -= charge.headroom_bytes;
         if holder == MemoryHolder::Oracle {
             state.oracle_query_memory_used_bytes -= charge.governed_bytes;
+            state.oracle_infallible_headroom_bytes -= charge.headroom_bytes;
             record_oracle_memory(&state);
         }
         Ok(())
@@ -5486,6 +5501,7 @@ mod tests {
                 oracle_interactive_queries: 0,
                 oracle_analytical_queries: 0,
                 oracle_query_memory_used_bytes: 0,
+                oracle_infallible_headroom_bytes: 0,
                 infallible_headroom_bytes: 0,
                 oracle_query_active: false,
             }

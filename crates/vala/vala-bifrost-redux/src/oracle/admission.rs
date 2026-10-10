@@ -777,16 +777,19 @@ impl OracleAdmission {
 
     /// Returns the query-memory bytes Oracle executions hold in the shared pool.
     ///
-    /// Reads the governor's Oracle query attribution, which every Oracle pool
-    /// view charges on growth and returns on shrink, so Forge, Scribe ingest,
-    /// and transport bytes on the same pod are excluded. An untrustworthy
+    /// Sums the governor's Oracle query attribution and the Oracle share of
+    /// infallible headroom, both of which every Oracle pool view charges on
+    /// growth and returns on shrink, so Forge, Scribe ingest, and transport
+    /// bytes on the same pod are excluded. An untrustworthy
     /// (poisoned) ledger reads as fully held so shutdown never reports clean.
     fn oracle_memory_reserved(&self) -> usize {
         self.shared
             .resources
             .snapshot()
             .map_or(usize::MAX, |snapshot| {
-                snapshot.oracle_query_memory_used_bytes
+                snapshot
+                    .oracle_query_memory_used_bytes
+                    .saturating_add(snapshot.oracle_infallible_headroom_bytes)
             })
     }
 
@@ -2569,6 +2572,87 @@ pub(in crate::oracle) mod tests {
                 .memory_pool(),
         );
         child.try_grow(4096).expect("Oracle child bytes reserve");
+        drop(admitted);
+
+        let residual = owner.shutdown(Instant::now()).await;
+        assert_eq!(residual.active_queries, 0);
+        assert_eq!(residual.reserved_memory_bytes, 4096);
+
+        let late = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            drop(child);
+        });
+        let clean = owner
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await;
+        late.await.expect("child release task");
+        assert_eq!(clean.reserved_memory_bytes, 0);
+        assert!(
+            forge.size() > 0,
+            "Forge bytes stay live through Oracle drain"
+        );
+    }
+
+    /// Oracle shutdown waits for, and reports, a torn-down Oracle child that
+    /// holds only infallible headroom after its slot returns, while Forge
+    /// bytes that fill the governed root never delay the drain.
+    ///
+    /// # Panics
+    /// Panics when the child's growth is governed rather than headroom, when
+    /// shutdown reports clean while the child holds headroom, or when the
+    /// late release does not finish the drain while Forge bytes stay live.
+    #[tokio::test]
+    async fn oracle_shutdown_drains_oracle_infallible_headroom() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let runtime = crate::resources::BifrostRuntimeResources::composed_for_test(
+            64 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [
+                crate::resources::BifrostRole::Oracle,
+                crate::resources::BifrostRole::Forge,
+            ],
+        );
+        let oracle = runtime.oracle().expect("Oracle capability");
+        let owner = Arc::new(
+            OracleAdmission::with_config(
+                oracle_role(),
+                true,
+                OracleAdmissionConfig::default(),
+                oracle.clone(),
+            )
+            .expect("the test admission owner starts"),
+        );
+        let admitted = owner
+            .admit(PreparedAdmission {
+                tenant: DataTenantId::new_v7(),
+                query_class: QueryClass::Interactive,
+                local_ratio: 0.0,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("query admission");
+        let before = oracle.snapshot().expect("admitted snapshot");
+        let forge = MemoryConsumer::new("forge-rewrite").register(
+            &runtime
+                .forge()
+                .expect("Forge capability")
+                .rewrite_memory_pool(),
+        );
+        forge
+            .try_grow(before.plan.managed_memory_bytes - before.governed_memory_used_bytes)
+            .expect("Forge fills the governed root");
+        let child = MemoryConsumer::new("oracle-child").register(
+            admitted
+                .execution()
+                .expect("admitted query execution")
+                .memory_pool(),
+        );
+        child.grow(4096);
+        let grown = oracle.snapshot().expect("headroom snapshot");
+        assert_eq!(grown.oracle_query_memory_used_bytes, 0);
+        assert_eq!(grown.oracle_infallible_headroom_bytes, 4096);
         drop(admitted);
 
         let residual = owner.shutdown(Instant::now()).await;

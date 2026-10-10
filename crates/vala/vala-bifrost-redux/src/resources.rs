@@ -337,13 +337,35 @@ fn record_oracle_capacity(state: &ResourceState, plan: &ResourcePlan, split: Ora
 /// both read from the same locked state. Because the infallible share is real
 /// memory the process holds, `memory_used` may exceed `memory_limit`.
 fn record_oracle_memory(state: &ResourceState) {
-    metrics::gauge!("bifrost_oracle_local_bytes", "kind" => "memory_used").set(
-        state
-            .oracle_query_memory_used_bytes
-            .saturating_add(state.infallible_headroom_bytes)
-            .to_f64()
-            .unwrap_or(f64::MAX),
-    );
+    record_oracle_memory_used(state.oracle_memory_used());
+}
+
+/// Sets `memory_used` to `bytes` read from [`ResourceState::oracle_memory_used`].
+///
+/// The per-growth pool path reads the value under the state lock and emits it
+/// here after releasing that lock, so the metrics registry lookup is never
+/// inside the governor's critical section. Two racing growths may set the
+/// gauge out of order; the next growth or release corrects it.
+fn record_oracle_memory_used(bytes: usize) {
+    metrics::gauge!("bifrost_oracle_local_bytes", "kind" => "memory_used")
+        .set(bytes.to_f64().unwrap_or(f64::MAX));
+}
+
+/// Publishes what [`BifrostResourceGovernor::charge_locked`] records for one
+/// charge outcome: `acquired` with the new held bytes, `refused` with the
+/// unchanged held bytes on a cap refusal, and nothing for a poison error.
+fn record_charge_outcome(
+    holder: MemoryHolder,
+    charged: &Result<usize, BifrostResourceError>,
+    held: usize,
+) {
+    match charged {
+        Ok(next) => record_memory_transition(holder.label(), "acquired", *next),
+        Err(BifrostResourceError::Occupied { .. }) => {
+            record_memory_transition(holder.label(), "refused", held);
+        }
+        Err(_) => {}
+    }
 }
 
 /// Name prefix of the scratch directory one assembly claim merges into.
@@ -842,6 +864,13 @@ impl ResourceState {
     const fn oracle_active_queries(&self) -> u32 {
         self.oracle_interactive_queries
             .saturating_add(self.oracle_analytical_queries)
+    }
+
+    /// Returns Oracle query memory: governed query bytes plus infallible
+    /// headroom, the value the `memory_used` gauge reports.
+    const fn oracle_memory_used(&self) -> usize {
+        self.oracle_query_memory_used_bytes
+            .saturating_add(self.infallible_headroom_bytes)
     }
 
     /// Returns bytes held by one holder.
@@ -2569,12 +2598,34 @@ impl BifrostResourceGovernor {
         holder: MemoryHolder,
         bytes: usize,
     ) -> Result<(), BifrostResourceError> {
+        let charged = self.apply_charge_locked(state, holder, bytes);
+        record_charge_outcome(holder, &charged, state.held(holder));
+        charged.map(|_| ())
+    }
+
+    /// Applies [`Self::charge_locked`]'s cap check and charge without
+    /// emitting metrics, returning `holder`'s held bytes after the charge.
+    ///
+    /// The hot `DataFusion` pool path uses it so metric emission happens after
+    /// the state lock is released; [`record_charge_outcome`] emits what
+    /// [`Self::charge_locked`] would have.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Occupied`] without mutation when the
+    /// shared cap cannot cover `bytes`, and an overflow poison error when the
+    /// checked addition fails.
+    fn apply_charge_locked(
+        &self,
+        state: &mut ResourceState,
+        holder: MemoryHolder,
+        bytes: usize,
+    ) -> Result<usize, BifrostResourceError> {
         let next_total = state
             .governed_total()
             .checked_add(bytes)
             .ok_or_else(accounting_overflow)?;
         if next_total > self.plan().managed_memory_bytes {
-            record_memory_transition(holder.label(), "refused", state.held(holder));
             return Err(BifrostResourceError::Occupied {
                 detail: format!(
                     "{} memory request exceeds the shared Bifrost cap",
@@ -2587,8 +2638,7 @@ impl BifrostResourceGovernor {
             .checked_add(bytes)
             .ok_or_else(accounting_overflow)?;
         state.held_bytes[holder as usize] = next;
-        record_memory_transition(holder.label(), "acquired", next);
-        Ok(())
+        Ok(next)
     }
 
     /// Returns `bytes` held by `holder`.
@@ -2603,12 +2653,29 @@ impl BifrostResourceGovernor {
         holder: MemoryHolder,
         bytes: usize,
     ) -> Result<(), BifrostResourceError> {
+        let next = self.apply_release_locked(state, holder, bytes)?;
+        record_memory_transition(holder.label(), "released", next);
+        Ok(())
+    }
+
+    /// Applies [`Self::release_locked`] without emitting metrics, returning
+    /// `holder`'s held bytes after the release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Poisoned`] and poisons resource health
+    /// when `holder` does not hold `bytes`.
+    fn apply_release_locked(
+        &self,
+        state: &mut ResourceState,
+        holder: MemoryHolder,
+        bytes: usize,
+    ) -> Result<usize, BifrostResourceError> {
         let Some(next) = state.held(holder).checked_sub(bytes) else {
             return Err(self.poison_locked(state, "shared memory release underflow"));
         };
         state.held_bytes[holder as usize] = next;
-        record_memory_transition(holder.label(), "released", next);
-        Ok(())
+        Ok(next)
     }
 
     /// Charges one `DataFusion` pool growth fallibly against the shared cap.
@@ -2628,15 +2695,24 @@ impl BifrostResourceGovernor {
         bytes: usize,
     ) -> Result<GovernedMemoryCharge, BifrostResourceError> {
         let mut state = self.lock_state()?;
-        self.charge_locked(&mut state, holder, bytes)?;
-        if holder == MemoryHolder::Oracle {
-            state.oracle_query_memory_used_bytes = state
-                .oracle_query_memory_used_bytes
-                .checked_add(bytes)
-                .ok_or_else(accounting_overflow)?;
-            record_oracle_memory(&state);
+        let charged = self.apply_charge_locked(&mut state, holder, bytes);
+        let held = state.held(holder);
+        let oracle_used = match &charged {
+            Ok(_) if holder == MemoryHolder::Oracle => {
+                state.oracle_query_memory_used_bytes = state
+                    .oracle_query_memory_used_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(accounting_overflow)?;
+                Some(state.oracle_memory_used())
+            }
+            _ => None,
+        };
+        drop(state);
+        record_charge_outcome(holder, &charged, held);
+        if let Some(used) = oracle_used {
+            record_oracle_memory_used(used);
         }
-        Ok(GovernedMemoryCharge {
+        charged.map(|_| GovernedMemoryCharge {
             governed_bytes: bytes,
             headroom_bytes: 0,
         })
@@ -2686,7 +2762,9 @@ impl BifrostResourceGovernor {
                 .oracle_query_memory_used_bytes
                 .checked_add(governed)
                 .ok_or_else(accounting_overflow)?;
-            record_oracle_memory(&state);
+            let used = state.oracle_memory_used();
+            drop(state);
+            record_oracle_memory_used(used);
         }
         Ok(GovernedMemoryCharge {
             governed_bytes: governed,
@@ -2719,11 +2797,16 @@ impl BifrostResourceGovernor {
         if state.infallible_headroom_bytes < charge.headroom_bytes || query_underflow {
             return Err(self.poison_locked(&mut state, "pool memory release underflow"));
         }
-        self.release_locked(&mut state, holder, charge.governed_bytes)?;
+        let held = self.apply_release_locked(&mut state, holder, charge.governed_bytes)?;
         state.infallible_headroom_bytes -= charge.headroom_bytes;
-        if holder == MemoryHolder::Oracle {
+        let oracle_used = (holder == MemoryHolder::Oracle).then(|| {
             state.oracle_query_memory_used_bytes -= charge.governed_bytes;
-            record_oracle_memory(&state);
+            state.oracle_memory_used()
+        });
+        drop(state);
+        record_memory_transition(holder.label(), "released", held);
+        if let Some(used) = oracle_used {
+            record_oracle_memory_used(used);
         }
         Ok(())
     }
@@ -3347,13 +3430,14 @@ pub(crate) struct GovernedMemoryRoot {
     /// Process ledger charged in lockstep with that pool.
     governor: BifrostResourceGovernor,
     /// Cooperative maximum: the shared Bifrost cap.
-    limit_bytes: usize,
-    /// Serializes whole operations so the two ledgers cannot interleave.
     ///
-    /// Held first and for the duration of one operation. The governor's and the
-    /// pool's own locks are taken and released inside it, never together, so no
-    /// lock order exists to invert.
-    operation: Mutex<()>,
+    /// No root-wide lock serializes operations: each view's ledger lock makes
+    /// one query's ledger, governor, and pool steps atomic for that query, and
+    /// the governor and the pool each guard their own state. Operations of
+    /// different queries may interleave between those steps; the only effect
+    /// is that a charge another query is about to roll back can refuse a
+    /// concurrent growth near the cap, which `DataFusion` handles by spilling.
+    limit_bytes: usize,
 }
 
 impl GovernedMemoryRoot {
@@ -3364,7 +3448,6 @@ impl GovernedMemoryRoot {
             pool: tracked_pool(limit_bytes),
             governor,
             limit_bytes,
-            operation: Mutex::new(()),
         }
     }
 
@@ -3402,15 +3485,6 @@ impl GovernedMemoryRoot {
         })
     }
 
-    /// Locks one whole operation, refusing rather than panicking on poison.
-    fn lock_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, DataFusionError> {
-        self.operation.lock().map_err(|_| {
-            DataFusionError::ResourcesExhausted(
-                "Oracle shared memory root lock is poisoned".to_owned(),
-            )
-        })
-    }
-
     /// Grows one consumer fallibly through query, governor, and pool in order.
     ///
     /// Refusal happens before any mutation when the query ceiling cannot cover
@@ -3428,7 +3502,6 @@ impl GovernedMemoryRoot {
         reservation: &MemoryReservation,
         additional: usize,
     ) -> Result<(), DataFusionError> {
-        let _operation = self.lock_operation()?;
         let mut ledger = view.lock_ledger()?;
         let next_total = ledger.total.checked_add(additional).ok_or_else(|| {
             DataFusionError::ResourcesExhausted("Oracle query memory overflowed".to_owned())
@@ -3468,9 +3541,6 @@ impl GovernedMemoryRoot {
     /// is refused any further fallible growth and gives its headroom back first
     /// on shrink.
     fn grow(&self, view: &GovernedMemoryView, reservation: &MemoryReservation, additional: usize) {
-        let Ok(_operation) = self.lock_operation() else {
-            return;
-        };
         let Ok(mut ledger) = view.lock_ledger() else {
             return;
         };
@@ -3498,9 +3568,6 @@ impl GovernedMemoryRoot {
     /// released before governed bytes so an overshooting consumer gives back
     /// its overshoot first.
     fn shrink(&self, view: &GovernedMemoryView, reservation: &MemoryReservation, shrink: usize) {
-        let Ok(_operation) = self.lock_operation() else {
-            return;
-        };
         let Ok(mut ledger) = view.lock_ledger() else {
             return;
         };

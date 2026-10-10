@@ -1,0 +1,29 @@
+# TASK-003 R2 behavior review
+
+**Result: FAIL** — the Oracle behavior is closed, but the required Forge startup recovery proof does not exercise live child work.
+
+## Subject and coverage
+
+Base `7f79fb3417db651adedac194ada8908f0a0372d7`; candidate `e2d324a916cfff25e2d362c7d7d2ab1c6aec74d9`. I read the approved spec, original TASK-003 r4, R1/R2 remediation packets and prior verdicts, repository rules, the cumulative diff, and the R2 diff. `.codegraph/` is absent. The R2 runtime owners are `resources.rs` and `oracle/admission.rs` for memory drain; `forge/worker.rs` and `vala-sql/forge_tasks.rs` for restart recovery. The cumulative gateway, outbox, Service/Verifier, three example/SDK journeys, SQL bootstrap, and documentation paths were considered against the original task. No source was edited and I did not rerun the recorded lanes.
+
+## Acceptance matrix
+
+| Requirement, criterion, constraint, or non-goal | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Declared Service table, optional bindings, direct and continuous result correlation | Cumulative Card registration, verification, result projection, and outbox diff; prior R1 closure reports | Recorded task gate and focused tests | PASS |
+| Gateway paired Run/Card UID authorization, captured UID, no CardRef alias | Cumulative gateway ingress, invocation and capture path; R2 changes none of these | Recorded gateway integration and SDK journeys | PASS |
+| Support-desk `deploy` checks exact Prompt gateway provider/model pair | All three example deployments compare `openai/gpt-4o`; three journeys exercise `anthropic/gpt-4o` collision | Recorded Rust, Python, TS journey runs | PASS; FIND-1 stays closed |
+| Oracle shutdown drains its own governed and infallible child memory, excluding other roles | `ResourceState` attributes Oracle headroom on growth and release; `OracleAdmission::oracle_memory_reserved` sums both Oracle fields; `shutdown` arms admission and resource wakeups before each predicate | `oracle_shutdown_drains_oracle_infallible_headroom` and `oracle_shutdown_drains_only_oracle_memory` recorded green | PASS; FIND-2 closed |
+| Forge restart only immediately reclaims same-owner unexpired attempts after prior invocation joined its work | `ForgeLoopQuiescence::enter` atomically reads prior state and marks current invocation live before `start_and_drain`; child stop-token drop guard spans startup and event loop; startup passes its predecessor decision to both claimed/running and Prepared SQL paths | Quiescence unit, Prepared SQL integration, and interrupted-startup integration tests recorded green | PASS in source, but see focused-proof failure below |
+| R2 requires focused proof of startup interruption **with live plan or heartbeat** before same-owner restart | `execute_claim` can spawn a plan runner and `reconcile_prepared_attempt` can spawn a heartbeat in startup; these are the risk paths whose cancellation/reclaim ordering matters | `interrupted_startup_waits_for_its_prepared_lease` aborts at `hold_after_claims_for_test`, before `reconcile_prepared_attempt` spawns its heartbeat; it checks unchanged expiry over two seconds, then forces expiry | **FAIL; FIND-7 proof remains open** |
+| Clean joined Forge predecessor fast-reclaims; expired attempt recovers | `enter` returns `Some(owner)` after `joined`; `reclaim_expired_attempts` and `claim_prepared_for_reconciliation` use that option; interrupted test forces expiry and observes settlement | Recorded quiescence unit, SQL selectors, and interrupted-startup integration | PASS |
+| Late Scribe delivery, roles rerun SQL errors, Card UID docs, and required Rust docs | Previously validated source remains; R2 adds rustdoc to Forge quiescence tuple field | Recorded R1 lanes, `fmt`, lints, docs/roles checks | PASS; FIND-3, -4, -5, -6, -8 closed |
+| No second governor, persistent Forge fence, supervisor-policy change, CardRef alias, or new result sink | R2 diff changes only the existing governor, worker, SQL claim, tests, and review packet | Diff inspection | PASS |
+
+## Proposed finding
+
+### BEH-R2-1 — MISSING — required live-child restart proof (prior FIND-TASK-003-7)
+
+**Obligation:** TASK-003-R2 says to interrupt startup recovery with live child work and prove a same-owner restart does not self-reclaim its unexpired attempt while that plan or heartbeat is live. **Location:** `crates/vala/vala-bifrost-redux/tests/integration/forge/production_routes.rs:1112-1204`; production paths `forge/worker.rs:2173-2204,4003-4050,4590-4670,6205-6250,8377-8440` and `vala-sql/src/queries/forge_tasks.rs:439-467,888-910`. **Evidence:** the test pauses immediately after SQL claims a Prepared row, then aborts startup. It never reaches the heartbeat spawn or a plan runner. The worker code appears to preserve the intended invariant, but this proof cannot distinguish a restart that safely waits for old child work from one that only waits when no child exists. **Consequence:** the concrete overlap failure diagnosed in R1 remains untested; a regression in stop-token propagation or immediate reclaim after a live child would leave the task's requested recovery proof unsatisfied. **Correction:** use the existing worker test observation seam to interrupt startup after a plan or reconciliation heartbeat is live, retain the same owner across restart, and assert that the unexpired attempt is not reclaimed until the old work stops or its lease expires. Keep the existing Prepared-claim test for the earlier window; do not add a new harness or production mechanism solely for this proof.
+
+The two-second observation window in the current test is not itself a finding: it watches several scheduled 250 ms recovery passes and compares the durable expiry before and after. Its limitation is that the held work is only the SQL claim, not a spawned child. I found no source-supported behavior defect in the R2 Oracle counter or the guarded startup path.

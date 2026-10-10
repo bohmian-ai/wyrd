@@ -1,6 +1,6 @@
 ---
 id: SPEC-local-server-bootstrap
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -136,8 +136,9 @@ configuration; this change adds no login or credential format.
 
 - **REQ-011 — Independent installation.** `wyrd mcp install` detects
   supported local hosts and asks which to configure in a multi-select prompt.
-  Initial variants are Codex CLI/IDE, Claude Code, GitHub Copilot CLI, and
-  GitHub Copilot in VS Code. Unavailable variants are reported and not edited.
+  Initial variants are Codex CLI/IDE, Claude Code, GitHub Copilot CLI,
+  GitHub Copilot in VS Code, Cursor, Pi, and Hermes Agent. Unavailable
+  variants are reported and not edited.
   Scripts and agents can select named hosts non-interactively; a non-interactive
   run selects no host implicitly.
 - **REQ-012 — Minimal host changes.** Only selected host configurations
@@ -320,3 +321,4 @@ None.
 | 2 | approved | Latest-release local journey, reusable MCP setup, saved client configuration, and explicit database fallback/security decision; approved by the owner. |
 | 3 | approved | Externally supplied credentials and pool-scoped RLS replace named serving roles and the shared-admin RLS tradeoff (REQ-016, INV-002, D-001, AC-003, AC-008); approved by the owner. |
 | 4 | approved | An unset `WYRD_STORAGE_URL` selects created local storage at `.wyrd/storage` instead of failing (journey step 2, REQ-007, AC-007); approved by the owner. |
+| 5 | approved | Cursor, Pi, and Hermes Agent join the initial MCP host variants (REQ-011); approved by the owner. |

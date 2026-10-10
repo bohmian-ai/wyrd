@@ -55,7 +55,9 @@ pub(crate) fn wyrd(home: &Path) -> Command {
         .env("WYRD_CONFIG_HOME", home.join("wyrd"))
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("CODEX_HOME")
-        .env_remove("COPILOT_HOME");
+        .env_remove("COPILOT_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("HERMES_HOME");
     for variable in AMBIENT {
         command.env_remove(variable);
     }
@@ -309,10 +311,17 @@ struct HostFiles {
     copilot: PathBuf,
     /// VS Code user `mcp.json`.
     vscode: PathBuf,
+    /// Cursor `~/.cursor/mcp.json`.
+    cursor: PathBuf,
+    /// Pi `~/.pi/agent/mcp.json`.
+    pi: PathBuf,
+    /// Hermes Agent `~/.hermes/config.yaml`.
+    hermes: PathBuf,
 }
 
 impl HostFiles {
-    /// Detect all four hosts under `home`, each with an unrelated entry.
+    /// Detect every supported host under `home`, each with an unrelated
+    /// entry.
     ///
     /// # Panics
     /// Panics when a fixture directory or file cannot be written.
@@ -322,6 +331,9 @@ impl HostFiles {
             home.join(".claude"),
             home.join(".copilot"),
             vscode_profile(home),
+            home.join(".cursor"),
+            home.join(".pi/agent"),
+            home.join(".hermes"),
         ] {
             fs::create_dir_all(dir).expect("host directory");
         }
@@ -330,6 +342,9 @@ impl HostFiles {
             claude: home.join(".claude.json"),
             copilot: home.join(".copilot/mcp-config.json"),
             vscode: vscode_profile(home).join("mcp.json"),
+            cursor: home.join(".cursor/mcp.json"),
+            pi: home.join(".pi/agent/mcp.json"),
+            hermes: home.join(".hermes/config.yaml"),
         };
         let write = |path: &Path, text: &str| fs::write(path, text).expect("host file");
         write(
@@ -348,6 +363,15 @@ impl HostFiles {
             &files.vscode,
             r#"{"servers":{"other":{"command":"other"}}}"#,
         );
+        write(
+            &files.cursor,
+            r#"{"mcpServers":{"other":{"type":"stdio","command":"other"}}}"#,
+        );
+        write(&files.pi, r#"{"mcpServers":{"other":{"command":"other"}}}"#);
+        write(
+            &files.hermes,
+            "# Hermes settings\nmodel: hermes-4\nmcp_servers:\n  # keep me\n  other:\n    command: other\nterminal:\n  backend: local\n",
+        );
         files
     }
 
@@ -355,8 +379,17 @@ impl HostFiles {
     ///
     /// # Panics
     /// Panics when a file cannot be read.
-    fn snapshot(&self) -> [String; 4] {
-        [&self.codex, &self.claude, &self.copilot, &self.vscode].map(|path| {
+    fn snapshot(&self) -> [String; 7] {
+        [
+            &self.codex,
+            &self.claude,
+            &self.copilot,
+            &self.vscode,
+            &self.cursor,
+            &self.pi,
+            &self.hermes,
+        ]
+        .map(|path| {
             fs::read_to_string(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
         })
     }
@@ -414,9 +447,8 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     let problem = cli_problem(&stderr);
     assert_eq!(problem["code"], "WYRD_CLI_400_MCP_HOST_SELECTION");
     assert!(
-        problem["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("codex, claude-code, copilot-cli, vscode")),
+        problem["message"].as_str().is_some_and(|message| message
+            .contains("codex, claude-code, copilot-cli, vscode, cursor, pi, hermes")),
         "the refusal names the detected hosts: {problem}"
     );
     assert_eq!(files.snapshot(), original, "no host changes implicitly");
@@ -426,8 +458,7 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     assert_eq!(code, Some(0), "selected hosts install: {stdout}{stderr}");
     assert!(stdout.contains("codex: added") && stdout.contains("claude-code: added"));
     let first = files.snapshot();
-    assert_eq!(first[2], original[2], "Copilot CLI was not selected");
-    assert_eq!(first[3], original[3], "VS Code was not selected");
+    assert_eq!(first[2..], original[2..], "unselected hosts are unchanged");
     for text in &first {
         assert!(
             !text.contains(SENTINEL_KEY),
@@ -502,6 +533,64 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     assert_eq!(copilot_entry["type"], "stdio");
     assert_eq!(copilot_entry["tools"], json!(["*"]));
     assert_eq!(copilot_entry["args"], json!(["mcp", "proxy"]));
+
+    let (code, stdout, stderr) = install(
+        home.path(),
+        &["--host", "cursor", "--host", "pi", "--host", "hermes"],
+    )
+    .await;
+    assert_eq!(code, Some(0), "{stdout}{stderr}");
+    assert!(
+        stdout.contains("cursor: added")
+            && stdout.contains("pi: added")
+            && stdout.contains("hermes: added"),
+        "{stdout}"
+    );
+    let cursor = json_file(&files.cursor);
+    assert_eq!(cursor["mcpServers"]["other"]["command"], "other");
+    assert_eq!(cursor["mcpServers"]["wyrd"]["type"], "stdio");
+    assert_eq!(
+        cursor["mcpServers"]["wyrd"]["args"],
+        json!(["mcp", "proxy"])
+    );
+    let pi = json_file(&files.pi);
+    assert_eq!(pi["mcpServers"]["other"]["command"], "other");
+    let pi_entry = &pi["mcpServers"]["wyrd"];
+    assert_eq!(pi_entry["args"], json!(["mcp", "proxy"]));
+    assert_eq!(pi_entry["env"]["WYRD_CONFIG_HOME"], config_home.as_str());
+    let hermes_text = fs::read_to_string(&files.hermes).expect("Hermes config");
+    assert!(
+        hermes_text.starts_with("# Hermes settings\nmodel: hermes-4\nmcp_servers:\n")
+            && hermes_text.contains("  # keep me\n  other:\n    command: other\n")
+            && hermes_text.ends_with("terminal:\n  backend: local\n"),
+        "Hermes comments and settings survive: {hermes_text}"
+    );
+    let hermes: Value = serde_yaml::from_str(&hermes_text).expect("Hermes config stays YAML");
+    assert_eq!(hermes["mcp_servers"]["other"]["command"], "other");
+    assert_eq!(
+        hermes["mcp_servers"]["wyrd"]["args"],
+        json!(["mcp", "proxy"])
+    );
+    assert_eq!(
+        hermes["mcp_servers"]["wyrd"]["env"]["WYRD_CONFIG_HOME"],
+        config_home.as_str()
+    );
+    for (entry, host) in [(&cursor["mcpServers"]["wyrd"], "Cursor"), (pi_entry, "Pi")] {
+        assert_eq!(
+            entry["env"]["WYRD_CONFIG_HOME"],
+            config_home.as_str(),
+            "{host}"
+        );
+    }
+    let settled = files.snapshot();
+    let (code, stdout, _) = install(
+        home.path(),
+        &["--host", "cursor", "--host", "pi", "--host", "hermes"],
+    )
+    .await;
+    assert_eq!(code, Some(0));
+    assert!(stdout.contains("hermes: unchanged"), "{stdout}");
+    assert_eq!(files.snapshot(), settled, "a repeat rewrites nothing");
 
     let before = files.snapshot();
     let codex_dir = home.path().join(".codex");

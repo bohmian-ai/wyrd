@@ -1,6 +1,6 @@
 ---
 id: TASK-003
-spec: SPEC-local-server-bootstrap@2
+spec: SPEC-local-server-bootstrap@5
 depends_on: []
 maps: [REQ-001, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, INV-001, INV-003, INV-004, AC-005, AC-006, AC-008]
 ---
@@ -19,8 +19,9 @@ resolved by the existing client each time the host connects.
 | CLI host setup | `wyrd_cli::Cli/Command`, `WyrdCliError` | Installed Python/TypeScript CLI entries and tests | No host detection, selection, or scoped config edit | Add `wyrd mcp install` and `wyrd mcp proxy` under the existing CLI | No separate package CLI |
 | Endpoint/credential selection | `ClientConfig::from_global_with_overrides`, `SavedLogins` | `wyrd auth login --server --tenant`, MCP transport tests | External host must retain its URL while the global endpoint stays unchanged | Use explicit endpoint override and existing credential chain | No profile or MCP secret store |
 
-The supported variants are Codex CLI/IDE, Claude Code, Copilot CLI, and
-Copilot in VS Code. Treat Copilot CLI and VS Code as separate configurations.
+The supported variants are Codex CLI/IDE, Claude Code, Copilot CLI,
+Copilot in VS Code, Cursor, Pi, and Hermes Agent. Treat Copilot CLI and VS
+Code as separate configurations.
 Preserve unrelated host settings. Do not create a second MCP tool catalog,
 credential source, token cache, or auth header implementation.
 
@@ -55,7 +56,7 @@ decisions, which remain in the shared client.
 
 ### Scenario 2 — Selective host installation
 
-**Behavior.** Detection offers the four host variants; only user-selected
+**Behavior.** Detection offers the seven host variants; only user-selected
 hosts change. Non-interactive use requires named selections. Repetition
 does not duplicate Wyrd entries, unrelated entries survive, and conflicts
 or unwritable configs report per-host failure. (REQ-011, REQ-012, INV-004)
@@ -140,6 +141,6 @@ credential or permission contract different from the approved shared path.
 
 ## Authority Links
 
-`changes/active/local-server-bootstrap/spec.md` revision 2;
+`changes/active/local-server-bootstrap/spec.md` revision 5;
 `AGENTS.md` §§2, 9, 11; `architecture/references/languages/agent-harness.md`;
 `architecture/wyrd-security-posture.md`.

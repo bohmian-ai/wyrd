@@ -741,24 +741,38 @@ fn prepare_slice(
     })
 }
 
-/// Encodes one current day as an Arrow IPC stream in one exact allocation.
+/// Encodes one current day as a ZSTD level-1 Arrow IPC stream.
 ///
-/// Arrow's public stream writer runs twice: once over a byte counter to size
-/// the output, then into a `Vec` reserved at exactly that size, so the WAL
-/// payload never reallocates and every WAL reader decodes it with Arrow's
-/// standard `StreamReader`.
+/// The payload is written into one allocation sized to the bound admission
+/// reserved ([`crate::scribe::material_plan::wal_payload_bound`]), then shrunk
+/// to its compressed length so the WAL does not retain the uncompressed
+/// capacity. Every WAL reader decodes it with Arrow's standard `StreamReader`.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when either Arrow pass fails or the write
-/// pass emits a different length than the count pass.
+/// Returns [`ScribeError::Internal`] when the bound or either Arrow step fails,
+/// or the payload exceeds its reserved bound.
 fn encode_ipc(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
-    let encoded_bytes = crate::scribe::material_plan::count_ipc_bytes(rows)?;
-    let mut payload = Vec::with_capacity(encoded_bytes);
-    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut payload, &rows.schema())
+    let bound = crate::scribe::material_plan::wal_payload_bound(rows)?;
+    let options = arrow::ipc::writer::IpcWriteOptions::default()
+        .try_with_compression(Some(crate::scribe::material_plan::WAL_IPC_COMPRESSION))
+        .and_then(|options| {
+            options.try_with_compression_level(Some(
+                crate::scribe::material_plan::WAL_IPC_COMPRESSION_LEVEL,
+            ))
+        })
         .map_err(|error| ScribeError::Internal {
-            detail: format!("Arrow IPC encode init failed: {error}"),
+            detail: format!("Arrow IPC compression unavailable: {error}"),
         })?;
+    let mut payload = Vec::with_capacity(bound);
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new_with_options(
+        &mut payload,
+        &rows.schema(),
+        options,
+    )
+    .map_err(|error| ScribeError::Internal {
+        detail: format!("Arrow IPC encode init failed: {error}"),
+    })?;
     writer.write(rows).map_err(|error| ScribeError::Internal {
         detail: format!("Arrow IPC encode failed: {error}"),
     })?;
@@ -766,11 +780,12 @@ fn encode_ipc(rows: &RecordBatch) -> Result<Bytes, ScribeError> {
         detail: format!("Arrow IPC encode finish failed: {error}"),
     })?;
     drop(writer);
-    if payload.len() != encoded_bytes {
+    if payload.len() > bound {
         return Err(ScribeError::Internal {
-            detail: "Arrow IPC encode diverged from its counted length".to_owned(),
+            detail: "Arrow IPC encode exceeded its reserved bound".to_owned(),
         });
     }
+    payload.shrink_to_fit();
     Ok(Bytes::from(payload))
 }
 
@@ -1142,13 +1157,17 @@ mod tests {
         assert_ne!(first, changed);
     }
 
-    /// The WAL payload is one exact-size Arrow stream that Arrow reads back.
+    /// The WAL payload is an Arrow stream within its bound that Arrow reads back.
     ///
     /// Covers a nested Map column with a null map and a null value so the
     /// encoder is proven on the shapes the removed hand-written encoder needed
     /// per-type code for.
+    ///
+    /// # Panics
+    /// Panics when encoding fails, the payload exceeds its bound, or the
+    /// decoded batch differs.
     #[test]
-    fn wal_payload_is_an_exact_arrow_stream_that_round_trips() {
+    fn wal_payload_round_trips_within_its_bound() {
         let mut builder = arrow::array::MapBuilder::new(
             None,
             arrow::array::StringBuilder::new(),
@@ -1170,14 +1189,74 @@ mod tests {
 
         let payload = encode_ipc(&batch).expect("encodes");
 
-        assert_eq!(
-            payload.len(),
-            crate::scribe::material_plan::count_ipc_bytes(&batch).expect("counts")
+        assert!(
+            payload.len()
+                <= crate::scribe::material_plan::wal_payload_bound(&batch).expect("bounds")
         );
         let mut reader =
             arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(payload), None)
                 .expect("valid stream");
         assert_eq!(reader.next().expect("one batch").expect("decodes"), batch);
         assert!(reader.next().is_none());
+    }
+
+    /// Incompressible buffers stay within the reserved bound; compressible
+    /// ones shrink.
+    ///
+    /// Random binary values and random integers make Arrow fall back to
+    /// uncompressed buffers, the worst case the bound covers; a dictionary
+    /// column adds a second compressed message. A constant column must
+    /// compress below the uncompressed stream.
+    ///
+    /// # Panics
+    /// Panics when encoding fails, the payload exceeds its bound, the decoded
+    /// batch differs, or the constant column does not compress.
+    #[test]
+    fn wal_payload_bound_covers_incompressible_data() {
+        use arrow::array::{BinaryArray, DictionaryArray};
+        use arrow::datatypes::Int32Type;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let values = (0..4_096)
+            .map(|_| {
+                (0..rng.gen_range(1..96))
+                    .map(|_| rng.r#gen::<u8>())
+                    .collect::<Vec<u8>>()
+            })
+            .collect::<Vec<_>>();
+        let random = BinaryArray::from_iter_values(values.iter());
+        let integers = Int64Array::from_iter_values((0..4_096).map(|_| rng.r#gen::<i64>()));
+        let dictionary: DictionaryArray<Int32Type> =
+            (0..4_096).map(|index| ["x", "y", "z"][index % 3]).collect();
+        let batch = RecordBatch::try_from_iter(vec![
+            ("random", Arc::new(random) as ArrayRef),
+            ("integers", Arc::new(integers) as ArrayRef),
+            ("dictionary", Arc::new(dictionary) as ArrayRef),
+        ])
+        .expect("incompressible batch");
+
+        let payload = encode_ipc(&batch).expect("encodes");
+        assert!(
+            payload.len()
+                <= crate::scribe::material_plan::wal_payload_bound(&batch).expect("bounds")
+        );
+        let mut reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(payload), None)
+                .expect("valid stream");
+        assert_eq!(reader.next().expect("one batch").expect("decodes"), batch);
+
+        let constant = RecordBatch::try_from_iter(vec![(
+            "constant",
+            Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(42, 4_096))) as ArrayRef,
+        )])
+        .expect("constant batch");
+        let mut uncompressed = Vec::new();
+        let mut writer =
+            StreamWriter::try_new(&mut uncompressed, &constant.schema()).expect("writer");
+        writer.write(&constant).expect("writes");
+        writer.finish().expect("finishes");
+        drop(writer);
+        assert!(encode_ipc(&constant).expect("encodes").len() < uncompressed.len());
     }
 }

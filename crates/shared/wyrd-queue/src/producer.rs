@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
@@ -462,9 +462,9 @@ impl Producer {
 
     /// Admits one row without waiting.
     ///
-    /// `card_ref` is optional because Card correlation is: an omitted value
-    /// becomes a null in the sealed batch's `card_ref` column, which the server
-    /// stores against the authenticated principal with a null `card_uid`.
+    /// `card_uid` is optional because Card correlation is: an omitted value
+    /// becomes a null in the sealed batch's `card_uid` column, which the server
+    /// stores against the authenticated principal with no Card.
     /// `event_time_micros` is the writer's `wyrd_event_time` stamp, as
     /// [`Self::enqueue_rows`] describes.
     ///
@@ -474,11 +474,11 @@ impl Producer {
     pub fn enqueue(
         &self,
         json: Vec<u8>,
-        card_ref: Option<CardRef>,
+        card_uid: Option<CardUid>,
         run_id: Option<RunId>,
         event_time_micros: Option<i64>,
     ) -> Result<(), WyrdQueueError> {
-        self.enqueue_rows(vec![json], card_ref, run_id, event_time_micros)
+        self.enqueue_rows(vec![json], card_uid, run_id, event_time_micros)
     }
 
     /// Admits every row of one logical record, or none of them, without waiting.
@@ -503,7 +503,7 @@ impl Producer {
     pub fn enqueue_rows(
         &self,
         rows: Vec<Vec<u8>>,
-        card_ref: Option<CardRef>,
+        card_uid: Option<CardUid>,
         run_id: Option<RunId>,
         event_time_micros: Option<i64>,
     ) -> Result<(), WyrdQueueError> {
@@ -521,7 +521,7 @@ impl Producer {
                 entry.push(Row {
                     _guard: self.budget.reserve(charge)?,
                     json,
-                    card_ref: card_ref.clone(),
+                    card_uid: card_uid.clone(),
                     run_id: run_id.clone(),
                     event_time_micros,
                 });
@@ -981,7 +981,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
     use tokio::sync::Notify;
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::ids::CardUid;
     use wyrd_spec::request_id::RequestId;
 
     use super::ClientByteBudget;
@@ -995,9 +995,11 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
-    /// Builds the card correlation carried by a queue row.
-    fn card() -> CardRef {
-        "prod/Service/queue@1.0.0".parse().expect("valid test card")
+    /// Builds the Card UID correlation carried by a queue row.
+    fn card() -> CardUid {
+        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22"
+            .parse()
+            .expect("valid test card uid")
     }
 
     /// Builds `count` single-column JSON rows with sequential ids.

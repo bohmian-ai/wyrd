@@ -300,7 +300,7 @@ async fn gateway_commands_manage_redacted_tenant_configuration() {
     );
 
     let reader = server
-        .bootstrap_user("cli-gateway-reader", &["reader"])
+        .bootstrap_user("cli-gateway-reader", &[])
         .await
         .expect("reader bootstraps");
     let denied = problem(&gateway(

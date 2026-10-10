@@ -5,9 +5,7 @@
 //! administered limit refuses the next call before any dispatch, and a caller
 //! that goes away mid-call still leaves settled accounting behind.
 //!
-//! Shutdown drain is a journey here: a call whose invocation audit append is
-//! still pending when graceful shutdown begins drains inside the production
-//! deadline. A draining server's `503` refusal is not observable through the
+//! A draining server's `503` refusal is not observable through the
 //! public surface — the listener is shut down gracefully, so the connection is
 //! simply refused. That refusal, and the terminal error frame an open stream
 //! receives on drain, are proven in-process by
@@ -17,11 +15,8 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sqlx::PgPool;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, ResponseTemplate};
-use wyrd_spec::ids::DataTenantId;
-use wyrd_sql::TenantConn;
 
 use crate::harness::{Journey, openai_code, refusal, tokens};
 
@@ -254,126 +249,5 @@ async fn a_cancelled_call_is_still_settled_and_the_server_keeps_serving() {
     assert_eq!(
         answered.json::<Value>().await.expect("answer json"),
         completion()
-    );
-}
-
-/// Reads the outcome of every `gateway.invoke` audit decision staged for
-/// `tenant`, oldest first.
-///
-/// Uses its own short transaction on the same database the server audits into,
-/// so it observes only committed rows: an append still holding its transaction
-/// open is invisible here, which is what makes a pending append observable as
-/// an absent row rather than as a blocked read.
-///
-/// # Panics
-/// Panics when the tenant transaction cannot be opened or the read fails.
-async fn invoke_decisions(pool: &PgPool, tenant: DataTenantId) -> Vec<String> {
-    let mut conn = TenantConn::acquire(pool, tenant)
-        .await
-        .expect("vala tenant conn");
-    let rows = sqlx::query_scalar::<_, String>(
-        "SELECT outcome FROM vala.audit_staging \
-          WHERE operation = 'gateway.invoke' ORDER BY seq",
-    )
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("audit rows");
-    conn.commit().await.expect("audit read commits");
-    rows
-}
-
-/// Proves that graceful shutdown drains an invocation audit decision that is
-/// still pending when it begins.
-///
-/// The tenant's audit chain head is held under `FOR UPDATE` by this test, which
-/// is exactly what the audit outbox's batch commit takes, so the call's staged
-/// decision blocks on it. The caller's completion still arrives — audit is
-/// non-blocking — and the decision row is absent while the lock is held.
-/// Production shutdown then runs: `BoundServer::run` drains the audit outbox
-/// inside `shutdown.drain_ms`, so releasing the lock after the listener has
-/// stopped accepting leaves the commit to finish inside that budget, and the
-/// row is present once shutdown returns.
-///
-/// # Panics
-/// Panics when the call, the lock, the drain, or an audit expectation fails.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires the repository-managed Postgres journey lifecycle"]
-async fn a_pending_invocation_audit_append_drains_before_shutdown_completes() {
-    let mut journey = Journey::start().await;
-    Mock::given(method("POST"))
-        .and(path("/drain/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(completion()))
-        .mount(&journey.upstream)
-        .await;
-    deploy_compatible(&journey, "acme-drain", "m", "/drain").await;
-
-    // Owned pool: the held transaction must outlive the `&mut` borrow the
-    // in-place teardown below takes on the server.
-    let pool = journey.server.pg_fixture().vala_postgres().pool().clone();
-    let tenant = journey.server.data_tenant_id();
-    // Commit the deployment's own decisions before the head is held, so only
-    // the call's decision is left pending behind it.
-    journey
-        .server
-        .wait_oracle_audit_staged(Duration::from_secs(30))
-        .await
-        .expect("setup decisions commit");
-    let mut head = TenantConn::acquire(&pool, tenant)
-        .await
-        .expect("vala tenant conn");
-    sqlx::query("SELECT last_seq FROM vala.audit_chain_head FOR UPDATE")
-        .fetch_one(&mut **head.transaction())
-        .await
-        .expect("the tenant chain head is held");
-    let before = invoke_decisions(&pool, tenant).await.len();
-
-    let bearer = vec![("authorization", format!("Bearer {}", journey.caller))];
-    let answered = journey.post("/v1/chat/completions", &bearer, &chat()).await;
-    assert_eq!(
-        answered.status().as_u16(),
-        200,
-        "the call never waits for its own audit append"
-    );
-    assert_eq!(
-        answered.json::<Value>().await.expect("answer json"),
-        completion(),
-        "the provider response completed while the append was pending"
-    );
-    assert_eq!(
-        invoke_decisions(&pool, tenant).await.len(),
-        before,
-        "the append is pending while the chain head is held"
-    );
-
-    let (http, base) = (journey.http.clone(), journey.base.clone());
-    let release = async {
-        // Readiness stops being advertised as the first step of production
-        // shutdown, so an unready or refused probe means the drain has begun.
-        tokio::time::timeout(Duration::from_secs(30), async {
-            while http
-                .get(format!("{base}/readyz"))
-                .send()
-                .await
-                .is_ok_and(|ready| ready.status().is_success())
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("shutdown begins");
-        assert_eq!(
-            invoke_decisions(&pool, tenant).await.len(),
-            before,
-            "the append is still pending when shutdown begins"
-        );
-        head.commit().await.expect("the chain head releases");
-    };
-    let (drained, ()) = tokio::join!(journey.server.cancel_and_join_for_test(), release);
-    drained.expect("the pending append drains inside the shutdown deadline");
-
-    assert_eq!(
-        invoke_decisions(&pool, tenant).await.len(),
-        before + 1,
-        "the decision committed before shutdown completed"
     );
 }

@@ -178,16 +178,23 @@ impl NativeWyrdTestServer {
 
     /// Mint an API key for a principal holding exactly `permissions`.
     ///
-    /// `permissions` are `resource:action` strings. This is the door a journey
-    /// uses to prove an access gate from the caller's side: it seeds one role
-    /// carrying only those grants and bootstraps a service onto it.
+    /// Each permission is either a `resource:action` string, which grants every
+    /// object of that operation, or an object in the persisted typed
+    /// permission projection (`resource`, `action`, `scope`), which expresses
+    /// object scope such as one Verifier. This is the door a journey uses to
+    /// prove an access gate from the caller's side: it seeds one role carrying
+    /// only those grants and bootstraps a service onto it.
     ///
     /// # Errors
     ///
     /// Returns a napi error for an unparsable permission, or when the harness
     /// is closed or role seeding or bootstrapping fails.
     #[napi]
-    pub fn scoped_api_key(&self, role: String, permissions: Vec<String>) -> Result<String> {
+    pub fn scoped_api_key(
+        &self,
+        role: String,
+        permissions: Vec<serde_json::Value>,
+    ) -> Result<String> {
         let result = self.scoped_api_key_borrowed(&role, &permissions);
         drop(role);
         drop(permissions);
@@ -202,7 +209,11 @@ impl NativeWyrdTestServer {
     /// Returns a napi error for an unparsable permission, or when the harness
     /// lock is poisoned, the server is closed, or seeding or bootstrapping
     /// fails.
-    fn scoped_api_key_borrowed(&self, role: &str, permissions: &[String]) -> Result<String> {
+    fn scoped_api_key_borrowed(
+        &self,
+        role: &str,
+        permissions: &[serde_json::Value],
+    ) -> Result<String> {
         let guard = self
             .server
             .lock()
@@ -212,12 +223,17 @@ impl NativeWyrdTestServer {
             .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
         let parsed = permissions
             .iter()
-            .map(|value| {
-                value.parse::<wyrd_runtime::Permission>().map_err(|_| {
-                    napi::Error::from_reason(format!(
-                        "`{value}` is not a resource:action permission"
-                    ))
-                })
+            .map(|value| match value {
+                serde_json::Value::String(token) => {
+                    token.parse::<wyrd_runtime::Permission>().map_err(|_| {
+                        napi::Error::from_reason(format!(
+                            "`{token}` is not a resource:action permission"
+                        ))
+                    })
+                }
+                typed => serde_json::from_value(typed.clone()).map_err(|error| {
+                    napi::Error::from_reason(format!("invalid permission {typed}: {error}"))
+                }),
             })
             .collect::<Result<Vec<_>>>()?;
         let bootstrap = wyrd_runtime::runtime()
@@ -292,6 +308,33 @@ impl NativeWyrdTestServer {
         result
     }
 
+    /// Sign in a fixture-tenant user holding identity-provider `roles` and
+    /// return the user's principal id.
+    ///
+    /// The roles are recorded as a login would record them, so a journey can
+    /// prove a direct grant coexists with them.
+    ///
+    /// # Arguments
+    ///
+    /// * `roles` - The role names the identity provider grants.
+    /// * `name` - The user's name; the email is `<name>@test.wyrd`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or bootstrapping fails.
+    #[napi]
+    pub fn bootstrap_user(&self, roles: Vec<String>, name: String) -> Result<String> {
+        let result = self.with_server(|server| {
+            let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+            let bootstrap = wyrd_runtime::runtime()
+                .block_on(server.bootstrap_user(&name, &roles))
+                .map_err(reason)?;
+            Ok(bootstrap.id().to_string())
+        });
+        drop((roles, name));
+        result
+    }
+
     /// Bootstrap a service principal holding `roles` in tenant `tenant_id` and
     /// return its API key.
     ///
@@ -328,6 +371,22 @@ impl NativeWyrdTestServer {
         });
         drop((tenant_id, roles, name));
         result
+    }
+
+    /// Issue a key for the fixture tenant's unbound administrator: the key
+    /// `wyrd setup` prints, bound to no Card.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or issuing fails.
+    #[napi]
+    pub fn tenant_admin_key(&self) -> Result<String> {
+        self.with_server(|server| {
+            let key = wyrd_runtime::runtime()
+                .block_on(server.tenant_admin_key())
+                .map_err(reason)?;
+            Ok(secrecy::ExposeSecret::expose_secret(&key).to_owned())
+        })
     }
 
     /// Run `call` against the open harness while holding its lock.
@@ -476,26 +535,28 @@ impl NativeWyrdTestServer {
 }
 
 /// Test-only capabilities a story's server starts with; every field is
-/// optional and defaults to off, except `auditPublication`.
+/// optional and defaults to off.
 #[napi(object)]
 pub struct NativeTestServerOptions {
     /// Roots built-in gateway adapters at a local mock upstream; its `/v1`
     /// segment also serves the verification runtime's `OpenAI` Eval judge,
     /// which calls `<providerBaseUrl>/v1/chat/completions`.
     pub provider_base_url: Option<String>,
-    /// `false` keeps staged audit rows for assertions; defaults to `true`.
-    pub audit_publication: Option<bool>,
     /// `true` runs Drift baseline fitting and Verifier runs.
     pub verification_runtime: Option<bool>,
     /// `true` serves the public origin the identity lane's Keycloak clients
     /// register, for saved user login journeys.
     pub human_sso: Option<bool>,
+    /// Access-token lifetime in seconds, verified with no clock-skew
+    /// allowance, so a journey can outlive one token; omitted keeps the
+    /// production lifetime.
+    pub access_ttl_seconds: Option<u32>,
 }
 
 /// Starts a real bound Wyrd test server and mints an admin access token.
 ///
 /// `options` selects the test-only capabilities; omitted, the server keeps
-/// its default upstreams, publishes audit, and runs no verification runtime.
+/// its default upstreams and runs no verification runtime.
 ///
 /// # Errors
 ///
@@ -506,9 +567,9 @@ pub fn start_test_server(
 ) -> napi::Result<NativeWyrdTestServer> {
     let options = options.unwrap_or(NativeTestServerOptions {
         provider_base_url: None,
-        audit_publication: None,
         verification_runtime: None,
         human_sso: None,
+        access_ttl_seconds: None,
     });
     let provider_root = options
         .provider_base_url
@@ -521,9 +582,9 @@ pub fn start_test_server(
         .transpose()?;
     wyrd_runtime::runtime().block_on(Box::pin(start_test_server_async(
         provider_root,
-        options.audit_publication.unwrap_or(true),
         options.verification_runtime.unwrap_or(false),
         options.human_sso.unwrap_or(false),
+        options.access_ttl_seconds,
     )))
 }
 
@@ -534,16 +595,20 @@ pub fn start_test_server(
 /// Returns a napi error when any server setup step fails.
 async fn start_test_server_async(
     provider_root: Option<url::Url>,
-    audit_publication: bool,
     verification_runtime: bool,
     human_sso: bool,
+    access_ttl_seconds: Option<u32>,
 ) -> napi::Result<NativeWyrdTestServer> {
     let mut builder = WyrdTestServer::builder();
+    if let Some(seconds) = access_ttl_seconds {
+        builder = builder
+            .with_access_ttl(chrono::Duration::seconds(i64::from(seconds)))
+            .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
+                allowed_clock_skew: Duration::ZERO,
+            });
+    }
     if human_sso {
         builder = builder.with_public_origin(url::Url::parse(HUMAN_PUBLIC_ORIGIN).map_err(reason)?);
-    }
-    if !audit_publication {
-        builder = builder.without_audit_publication_for_test();
     }
     if verification_runtime {
         builder = builder.with_verification_runtime_for_test();

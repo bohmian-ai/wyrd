@@ -19,6 +19,12 @@
       "subGroups": []
     },
     {
+      "id": "grp-wyrd-editors",
+      "name": "wyrd-editors",
+      "path": "/wyrd-editors",
+      "subGroups": []
+    },
+    {
       "id": "grp-wyrd-viewers",
       "name": "wyrd-viewers",
       "path": "/wyrd-viewers",

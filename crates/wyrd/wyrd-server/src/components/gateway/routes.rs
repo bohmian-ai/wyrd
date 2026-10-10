@@ -41,7 +41,9 @@ use wyrd_storage::StorageError;
 
 use super::batches::{BatchAnswer, GatewayBatches};
 use super::capture::object_path;
-use super::ingress::{FALLBACK_HEADER_DOC, requested_fallback};
+use super::ingress::{
+    CARD_UID_HEADER_DOC, FALLBACK_HEADER_DOC, RUN_HEADER_DOC, requested_fallback, requested_subject,
+};
 use super::invocation::{
     GatewayCallRequest, GatewayCallResponse, GatewayInvocation, invalid_request,
 };
@@ -832,7 +834,11 @@ pub(crate) async fn get_capture(
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
-    params(("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC)),
+    params(
+        ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
     request_body(content = GatewayChatCompletionsRequest, description = "OpenAI-compatible chat completion request whose `model` is an exact `<provider>/<model>` projection"),
     responses(
         (status = 200, description = "Chat completion response as JSON, or server-sent events when `stream` is true", content(
@@ -877,7 +883,11 @@ pub(crate) async fn chat_completions(
 #[utoipa::path(
     post,
     path = "/v1/responses",
-    params(("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC)),
+    params(
+        ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
     request_body(content = GatewayResponsesRequest, description = "OpenAI-compatible Responses request whose `model` is an exact `<provider>/<model>` projection"),
     responses(
         (status = 200, description = "Response object as JSON, or server-sent events when `stream` is true", content(
@@ -1324,18 +1334,19 @@ pub(crate) async fn models(
 /// terminal error aborts the response. The request-id middleware correlates
 /// every response through the `wyrd-request-id` header.
 ///
-/// `fallback_headers` are the request headers of a route that accepts the
-/// `wyrd-gateway-fallback` override; routes that do not pass `None` and keep
-/// tenant fallback policy.
+/// `headers` are the request headers of a route that accepts the
+/// `wyrd-gateway-fallback` override and the `wyrd-run-id`/`wyrd-card-uid`
+/// attribution; routes that do not pass `None`, keeping tenant fallback
+/// policy and recording an uncorrelated call.
 async fn openai_call(
     state: &AppState,
     caller: Result<Caller, WyrdErrorResponse>,
     request: Result<(Value, Option<MediaRequest>), WyrdError>,
     operation: GatewayOperation,
-    fallback_headers: Option<&HeaderMap>,
+    headers: Option<&HeaderMap>,
 ) -> Response {
     let result = match caller {
-        Ok(caller) => invoke_openai(state, &caller, request, operation, fallback_headers).await,
+        Ok(caller) => invoke_openai(state, &caller, request, operation, headers).await,
         Err(WyrdErrorResponse(error)) => Err(error),
     };
     match result {
@@ -1762,14 +1773,15 @@ async fn form_body(
 /// # Errors
 /// Returns the decoding error of `request`, `GatewayInvalidRequest` for a
 /// `model` that is not an exact projection, every error of
-/// [`requested_fallback`] for `fallback_headers`, and every error of
+/// [`requested_fallback`] and [`requested_subject`] for `headers`, and every
+/// error of
 /// [`GatewayInvocation::invoke`].
 async fn invoke_openai(
     state: &AppState,
     caller: &Caller,
     request: Result<(Value, Option<MediaRequest>), WyrdError>,
     operation: GatewayOperation,
-    fallback_headers: Option<&HeaderMap>,
+    headers: Option<&HeaderMap>,
 ) -> Result<GatewayCallResponse, WyrdError> {
     let (body, media) = request?;
     let model = body
@@ -1778,9 +1790,12 @@ async fn invoke_openai(
         .ok_or_else(|| GatewayContractError::new("model", "must be <provider>/<model>"))
         .and_then(ModelRef::from_projection)
         .map_err(invalid_request)?;
-    let fallback = match fallback_headers {
-        Some(headers) => requested_fallback(headers, &model)?,
-        None => None,
+    let (fallback, subject) = match headers {
+        Some(headers) => (
+            requested_fallback(headers, &model)?,
+            requested_subject(headers)?,
+        ),
+        None => (None, None),
     };
     let usage_bound = usage_bound(operation, &body);
     GatewayInvocation::new(state)
@@ -1798,6 +1813,7 @@ async fn invoke_openai(
                 deployment: None,
                 usage_bound,
                 timeout: PUBLIC_CALL_TIMEOUT,
+                subject,
             },
         )
         .await

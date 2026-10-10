@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
@@ -86,6 +87,8 @@ pub struct PyWyrdState {
     models: BTreeMap<String, Py<ModelCard>>,
     /// Loaded Data holders by exact `CardRef`.
     data: BTreeMap<String, Py<DataCard>>,
+    /// The tracer provider `start_telemetry` installed, flushed by `shutdown`.
+    telemetry: OnceLock<Py<PyAny>>,
 }
 
 #[pymethods]
@@ -156,7 +159,41 @@ impl PyWyrdState {
             prompts: hydrated.prompts,
             models: hydrated.models,
             data: hydrated.data,
+            telemetry: OnceLock::new(),
         })
+    }
+
+    /// Install the global OpenTelemetry tracer provider exporting spans to
+    /// this state's server as the state's client.
+    ///
+    /// Delegates to `wyrd.otel._start_telemetry`: the stock OTLP/HTTP span
+    /// exporter refreshes the client's token on every export, and spans
+    /// started inside `with state.run(...)` carry that Run and Card. A second
+    /// call is idempotent; `shutdown` flushes only this provider.
+    ///
+    /// # Errors
+    ///
+    /// Raises `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when the application
+    /// already installed its own tracer provider, `ImportError` naming the
+    /// `otel` extra when it is not installed, and the credential error when
+    /// the state's client cannot resolve.
+    fn start_telemetry(&self, py: Python<'_>) -> CardPyResult<()> {
+        if self.telemetry.get().is_some() {
+            return Ok(());
+        }
+        let client =
+            PyWyrdClient::from_native(self.inner.client().map_err(WyrdPyError::from)?.clone());
+        let provider = py
+            .import("wyrd.otel")?
+            .call_method1("_start_telemetry", (client,))?;
+        if provider.is_none() {
+            return Err(WyrdPyError::from(WyrdError::SdkTelemetryProviderExists {
+                message: "an OpenTelemetry tracer provider is already installed".to_owned(),
+                details: serde_json::json!({}),
+            }));
+        }
+        let _ = self.telemetry.set(provider.unbind());
+        Ok(())
     }
 
     /// Connect this state's one Bifrost writer, as the state's client, and
@@ -233,12 +270,17 @@ impl PyWyrdState {
     /// observation: queue admission is not a durable acknowledgement, so an
     /// abrupt exit before this returns can lose pending rows. After an ambiguous
     /// failure, retry `shutdown()` on the same state rather than replacing the
-    /// writer.
+    /// writer. A tracer provider `start_telemetry` installed is flushed first;
+    /// an application's own provider is never touched.
     ///
     /// # Errors
     ///
-    /// Raises the first producer or sink failure from the drain.
+    /// Raises the provider's own exception when it fails to flush, then the
+    /// first producer or sink failure from the drain.
     fn shutdown(&self, py: Python<'_>) -> CardPyResult<()> {
+        if let Some(provider) = self.telemetry.get() {
+            provider.call_method0(py, "force_flush")?;
+        }
         py.detach(|| wyrd_runtime::runtime().block_on(self.inner.shutdown()))
             .map_err(WyrdPyError::from)
     }
@@ -420,6 +462,9 @@ impl PyWyrdState {
         for value in self.data.values() {
             visit.call(value)?;
         }
+        if let Some(provider) = self.telemetry.get() {
+            visit.call(provider)?;
+        }
         Ok(())
     }
 
@@ -430,6 +475,7 @@ impl PyWyrdState {
         self.prompts.clear();
         self.models.clear();
         self.data.clear();
+        self.telemetry.take();
     }
 }
 

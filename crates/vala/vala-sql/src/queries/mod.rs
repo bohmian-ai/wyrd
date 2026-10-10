@@ -8,7 +8,6 @@
 //! are propagated after commit through the future outbox path.
 
 pub mod anchors;
-pub mod audit_staging;
 pub mod cluster_nodes;
 pub mod file_list;
 pub mod forge_catalog_operator;

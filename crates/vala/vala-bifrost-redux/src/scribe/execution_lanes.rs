@@ -27,10 +27,10 @@ use crate::scribe::wal::{
 };
 use std::str::FromStr;
 use wyrd_runtime::Principal;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
 use crate::tables::CorrelationPolicy;
@@ -218,6 +218,7 @@ impl ScribeIngressCpuPool {
     ) -> Result<RecordBatch, ScribeError> {
         let IngressDecodeInputs {
             principal,
+            card_scope,
             expected_schema_fingerprint,
             request_id,
             receipt_micros,
@@ -250,6 +251,7 @@ impl ScribeIngressCpuPool {
                     payload,
                     &DecodeContext {
                         principal: &principal,
+                        card_scope: card_scope.as_deref(),
                         expected_schema_fingerprint,
                         request_id: &request_id,
                         window,
@@ -463,8 +465,11 @@ pub(crate) fn decode_native_batch(
 /// The lane moves these into its worker, so they are owned rather than the
 /// borrowed [`DecodeContext`] the decode itself assembles from them.
 pub(crate) struct IngressDecodeInputs {
-    /// Authenticated principal used for scope checks and managed columns.
+    /// Authenticated principal stamped as the writer.
     pub(crate) principal: Principal,
+    /// Card UIDs every row's `card_uid` is authorized against: the frame's
+    /// attributed UIDs, or the principal's signed scope.
+    pub(crate) card_scope: Option<Vec<CardUid>>,
     /// Catalog fingerprint required of the caller-owned source schema.
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
@@ -489,8 +494,11 @@ pub(crate) struct IngressDecodeInputs {
 /// request; every batch of one request stamps the same request identity and
 /// admission instant.
 pub(crate) struct DecodeContext<'a> {
-    /// Authenticated principal used for scope checks and managed columns.
+    /// Authenticated principal stamped as the writer.
     pub(crate) principal: &'a Principal,
+    /// Card UIDs every row's `card_uid` is authorized against: the frame's
+    /// attributed UIDs, or the principal's signed scope.
+    pub(crate) card_scope: Option<&'a [CardUid]>,
     /// Catalog fingerprint required of the caller-owned source schema.
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
@@ -535,7 +543,7 @@ fn decode_rows(
     for field in rows.schema().fields() {
         // Duplicate names are refused for every table kind — built-in, dynamic,
         // and pre-declared — before fingerprint, correlation, or stamping work.
-        // `card_ref` is a permitted client correlation column, so a duplicate
+        // `card_uid` is a permitted client correlation column, so a duplicate
         // pair is removed wholesale by projection while name lookup only ever
         // resolves the first occurrence; an authorized first value would
         // otherwise hide a second, unauthorized assertion.
@@ -544,12 +552,13 @@ fn decode_rows(
         }
         // A caller MAY supply `wyrd_event_time` as the authoritative event
         // time; it is then validated and preserved in
-        // `stamp_correlation_columns`. `run_id` is caller correlation that this
-        // function relinquishes and restamps exactly once in its slot. Every
+        // `stamp_correlation_columns`. `run_id` and `card_uid` are caller
+        // correlation that this function relinquishes and restamps exactly
+        // once in their slots, `card_uid` only after authorizing it. Every
         // other managed column is unconditionally server-owned, so supplying
         // one is a refusal rather than an override.
         let name = field.name().as_str();
-        if is_managed_column(name) && name != WYRD_EVENT_TIME && name != RUN_ID {
+        if is_managed_column(name) && ![WYRD_EVENT_TIME, RUN_ID, CARD_UID].contains(&name) {
             return Err(ScribeError::InvalidFrame);
         }
     }
@@ -565,7 +574,6 @@ fn decode_rows(
     {
         enforce_canonical_source_contract(rows, definition)?;
     }
-    validate_card_scope(rows, context.principal)?;
     let stamped = stamp_correlation_columns(rows, context)?;
     match context.registered_schema {
         Some(registered) => crate::tables::stamp_registered_field_ids(&stamped, registered)
@@ -579,7 +587,7 @@ fn decode_rows(
 /// Enforces one canonical built-in's exact user contract before stamping.
 ///
 /// The caller of a canonical signal table owns exactly the table's declared
-/// ledger plus the permitted correlation columns (`card_ref`, `run_id`, and an
+/// ledger plus the permitted correlation columns (`card_uid`, `run_id`, and an
 /// optional `wyrd_event_time`). This rejects any unknown `wyrd_*` field, runs
 /// the table's own registered value validator over
 /// the remaining user block, and then requires that block to match
@@ -607,7 +615,7 @@ fn enforce_canonical_source_contract(
             return Err(ScribeError::InvalidFrame);
         }
     }
-    let permitted = [CARD_REF, RUN_ID, WYRD_EVENT_TIME];
+    let permitted = [CARD_UID, RUN_ID, WYRD_EVENT_TIME];
     let mut fields = Vec::with_capacity(schema.fields().len());
     let mut columns = Vec::with_capacity(schema.fields().len());
     for (index, field) in schema.fields().iter().enumerate() {
@@ -686,10 +694,8 @@ fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
         .fields()
         .iter()
         .filter(|field| {
-            !matches!(
-                field.name().as_str(),
-                CARD_REF | CARD_UID | PRINCIPAL_ID | "run_id"
-            ) && !field.name().starts_with("wyrd_")
+            !matches!(field.name().as_str(), CARD_UID | PRINCIPAL_ID | "run_id")
+                && !field.name().starts_with("wyrd_")
         })
         .map(|field| field.as_ref().clone())
         .collect();
@@ -715,44 +721,48 @@ pub(crate) fn current_receipt_micros() -> Result<i64, ScribeError> {
         })
 }
 
-/// Authorize every client-supplied `card_ref` against the principal's scope.
+/// Authorize every client-supplied `card_uid` against the writer's Card scope.
 ///
-/// A batch without the column carries no Card correlation and is admitted
-/// unchanged. Within the column, a null is a valid uncorrelated row; a present
-/// value must parse under the `CardRef` grammar and name an identity the
-/// principal's verified signed [`CardRefScope`](wyrd_spec::reference::CardRefScope)
-/// authorizes. Authorization is decided for the whole batch before any row is
-/// admitted, so a single denied row refuses the frame.
+/// A batch without the column carries no Card correlation. Within the column,
+/// a null is a valid uncorrelated row; a present value must parse as a
+/// [`CardUid`] carried by a member of `scope`. `scope` is a Card-bound
+/// principal's verified signed scope, whose members the mint resolved with
+/// registry UIDs, or the registry-resolved Cards Gate attached for an unbound
+/// writer, so a Card that is unregistered, of a non-observation kind, or
+/// outside the signed scope is refused alike. Authorization is decided for the
+/// whole batch before any row is admitted, so a single denied row refuses the
+/// frame. Returns one canonical UID text per row, in row order, which is what
+/// `card_uid` stores; the check performs no IO.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::CardScopeDenied`] when the column is not UTF-8, or
-/// when a row supplies a present value and the principal carries no signed
-/// scope, the value is malformed, or the value lies outside the signed scope.
-/// A batch whose correlation column is entirely null needs no scope.
-fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), ScribeError> {
-    let Some(column) = rows.column_by_name(CARD_REF) else {
-        return Ok(());
+/// when a row supplies a present value and there is no scope, the value is not
+/// a UID, or no scope member carries it. A batch whose correlation column is
+/// entirely null needs no scope.
+fn authorized_card_uids(
+    rows: &RecordBatch,
+    scope: Option<&[CardUid]>,
+) -> Result<Vec<Option<String>>, ScribeError> {
+    let Some(column) = rows.column_by_name(CARD_UID) else {
+        return Ok(vec![None; rows.num_rows()]);
     };
-    let cards = column
+    let uids = column
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or(ScribeError::CardScopeDenied)?;
-    for index in 0..cards.len() {
-        if cards.is_null(index) {
-            // An absent correlation is a valid row: it simply carries no Card.
-            continue;
-        }
-        let scope = principal
-            .card_ref_scope()
-            .ok_or(ScribeError::CardScopeDenied)?;
-        let raw = cards.value(index);
-        let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardScopeDenied)?;
-        if !scope.authorizes(&card) {
-            return Err(ScribeError::CardScopeDenied);
-        }
-    }
-    Ok(())
+    uids.iter()
+        .map(|uid| {
+            uid.map(|raw| {
+                let uid = CardUid::from_str(raw).map_err(|_| ScribeError::CardScopeDenied)?;
+                if !scope.is_some_and(|scope| scope.contains(&uid)) {
+                    return Err(ScribeError::CardScopeDenied);
+                }
+                Ok(uid.to_string())
+            })
+            .transpose()
+        })
+        .collect()
 }
 
 /// Lifts a caller-supplied `run_id` column out of a payload, if it carries one.
@@ -808,15 +818,16 @@ fn caller_run_id_column(rows: &RecordBatch) -> Result<Option<ArrayRef>, ScribeEr
 /// correlation values unchanged.
 ///
 /// The `window` check and both time columns use the one admission instant in
-/// `context`, read once per batch at admission.
+/// `context`, read once per batch at admission. Each row's `card_uid` is
+/// authorized against `context.card_scope` before anything is stamped.
 ///
 /// # Errors
 /// Returns [`ScribeError::InvalidFrame`] when a native payload supplies a
 /// `wyrd_event_time` column that is not exactly `Timestamp(Microsecond, UTC)`,
 /// contains any null, or is duplicated. Returns [`ScribeError::EventTimeOutOfRange`]
 /// when a present `wyrd_event_time` value (either mode) falls outside the
-/// acceptance `window`. Returns a typed Scribe error when correlation resolution,
-/// timestamp construction, managed-array construction, or final batch validation
+/// acceptance `window`. Returns [`ScribeError::CardScopeDenied`] when a row's
+/// `card_uid` is not authorized, and a typed Scribe error when timestamp construction, managed-array construction, or final batch validation
 /// fails.
 fn stamp_correlation_columns(
     rows: &RecordBatch,
@@ -831,6 +842,7 @@ fn stamp_correlation_columns(
     } = context;
     let (principal, request_id, window) = (*principal, *request_id, *window);
     let receipt_micros = *receipt_micros;
+    let card_uids = authorized_card_uids(rows, context.card_scope)?;
     // Type/null/duplicate checks come first (T38). A malformed column stays
     // `InvalidFrame` regardless of window membership.
     validate_native_event_time(rows)?;
@@ -870,6 +882,7 @@ fn stamp_correlation_columns(
         rows,
         &ManagedValues {
             principal,
+            card_uid: Arc::new(StringArray::from(card_uids)),
             request_id,
             receipt_micros,
             caller_run_id,
@@ -1046,10 +1059,10 @@ fn enforce_event_time_window(
 /// excluded: when the caller supplied a valid value it is reinserted verbatim
 /// in its slot, and when it is absent the server stamps the admission instant
 /// there. `run_id` is excluded for the same reason, so the canonical nullable
-/// physical column is stamped exactly once. `card_ref` is a Gate input that
-/// resolves to `card_uid` and is never stored.
+/// physical column is stamped exactly once, and `card_uid` is excluded so only
+/// its authorized value is stamped.
 fn is_server_owned(name: &str) -> bool {
-    name == CARD_REF || is_managed_column(name)
+    is_managed_column(name)
 }
 
 /// Returns the caller's user fields, in order, without server-owned columns.
@@ -1073,74 +1086,6 @@ fn user_columns(rows: &RecordBatch) -> Vec<ArrayRef> {
         .collect()
 }
 
-/// Resolves row card references against the principal's signed Card scope.
-///
-/// A null row reference resolves to no UID and needs no signed scope, so an
-/// entirely uncorrelated batch resolves without consulting the principal. A
-/// present reference is matched by exact identity — kind, space, name, and
-/// version — against the authenticated principal's verified signed
-/// [`CardRefScope`](wyrd_spec::reference::CardRefScope), and only the UID the
-/// mint signed onto that same member is stamped. Root and secondary members
-/// each stamp their own UID; the principal's root is never substituted for
-/// another identity, and a client-supplied UID is never trusted. Resolution is
-/// decided entirely from signed claims, so it performs no registry IO.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::CardUnresolved`] when the card column has the wrong
-/// type, or when a row supplies a present reference and the principal carries
-/// no signed scope, the reference is malformed, its identity lies outside the
-/// signed scope, or the matching signed member carries no UID.
-pub(crate) fn resolve_card_uids(
-    rows: &RecordBatch,
-    principal: &Principal,
-    row_count: usize,
-) -> Result<Vec<Option<String>>, ScribeError> {
-    let Some(index) = rows.schema().index_of(CARD_REF).ok() else {
-        return Ok(vec![None; row_count]);
-    };
-    let cards = rows
-        .column(index)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or(ScribeError::CardUnresolved)?;
-    let mut resolved = Vec::with_capacity(row_count);
-    for row in 0..row_count {
-        resolved.push({
-            if cards.is_null(row) {
-                None
-            } else {
-                let scope = principal
-                    .card_ref_scope()
-                    .ok_or(ScribeError::CardUnresolved)?;
-                let raw = cards.value(row);
-                let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardUnresolved)?;
-                if !scope.authorizes(&card) {
-                    return Err(ScribeError::CardUnresolved);
-                }
-                let member = scope
-                    .as_slice()
-                    .iter()
-                    .find(|member| member.same_identity(&card))
-                    .ok_or(ScribeError::CardUnresolved)?;
-                Some(
-                    member
-                        .uid
-                        .as_ref()
-                        .ok_or(ScribeError::CardUnresolved)?
-                        .to_string(),
-                )
-            }
-        });
-    }
-    if resolved.capacity() != row_count {
-        return Err(ScribeError::Internal {
-            detail: "card UID projection exceeded exact row capacity".to_owned(),
-        });
-    }
-    Ok(resolved)
-}
-
 /// Reports whether this write appends the universal correlation envelope.
 ///
 /// The envelope is the default: a dynamic table has no declaration to consult
@@ -1156,8 +1101,10 @@ fn correlation_envelope_applies(context: &DecodeContext<'_>) -> bool {
 
 /// The per-batch values the managed columns are stamped from.
 struct ManagedValues<'a> {
-    /// Authenticated writer stamped as `principal_id` and used to resolve Cards.
+    /// Authenticated writer stamped as `principal_id`.
     principal: &'a Principal,
+    /// Authorized `card_uid` of each row, in row order.
+    card_uid: ArrayRef,
     /// Request identity stamped as `wyrd_request_id`.
     request_id: &'a RequestId,
     /// Admission instant stamped as `wyrd_ingested_at`.
@@ -1178,9 +1125,8 @@ struct ManagedValues<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::CardUnresolved`] when a `card_ref` cannot be resolved
-/// against the principal's signed scope, and [`ScribeError::Internal`] when a
-/// declared managed column has no stamping rule here.
+/// Returns [`ScribeError::Internal`] when a declared managed column has no
+/// stamping rule here.
 fn managed_arrays(
     rows: &RecordBatch,
     values: &ManagedValues<'_>,
@@ -1199,11 +1145,7 @@ fn managed_arrays(
                     || Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef,
                     Arc::clone,
                 ),
-                CARD_UID => Arc::new(StringArray::from(resolve_card_uids(
-                    rows,
-                    values.principal,
-                    row_count,
-                )?)),
+                CARD_UID => Arc::clone(&values.card_uid),
                 PRINCIPAL_ID => Arc::new(StringArray::from(vec![
                     values.principal.id.to_string();
                     row_count
@@ -2132,7 +2074,7 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::managed_columns::{
-        CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+        CARD_UID, PRINCIPAL_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
@@ -2165,15 +2107,17 @@ mod tests {
 
     /// Build the default stamping context these unit cases decode under.
     ///
-    /// Every field but the principal and request identity is the production
-    /// default.
+    /// Every field but the principal, its Card UID scope, and the request
+    /// identity is the production default.
     fn stamping_context<'a>(
         principal: &'a Principal,
+        card_scope: Option<&'a [CardUid]>,
         request_id: &'a RequestId,
     ) -> super::DecodeContext<'a> {
         super::DecodeContext {
             definition: None,
             principal,
+            card_scope,
             expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
             request_id,
             window: EventTimeWindow::default(),
@@ -2203,9 +2147,11 @@ mod tests {
             vec![Field::new("value", DataType::Int64, false)],
             vec![Arc::clone(&value)],
         );
-        let stamped =
-            stamp_correlation_columns(&rows, &stamping_context(&principal(), &RequestId::now_v7()))
-                .expect("stamp");
+        let stamped = stamp_correlation_columns(
+            &rows,
+            &stamping_context(&principal(), None, &RequestId::now_v7()),
+        )
+        .expect("stamp");
         let value_index = stamped.schema().index_of("value").expect("value column");
         assert!(Arc::ptr_eq(&value, stamped.column(value_index)));
     }
@@ -2224,9 +2170,11 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64]))],
         );
 
-        let stamped =
-            stamp_correlation_columns(&rows, &stamping_context(&principal(), &RequestId::now_v7()))
-                .expect("stamp native batch");
+        let stamped = stamp_correlation_columns(
+            &rows,
+            &stamping_context(&principal(), None, &RequestId::now_v7()),
+        )
+        .expect("stamp native batch");
 
         let run_id = stamped.schema().index_of("run_id").expect("run_id field");
         assert!(stamped.schema().field(run_id).is_nullable());
@@ -2259,7 +2207,7 @@ mod tests {
         );
         let principal = principal();
         let request_id = RequestId::now_v7();
-        let mut context = stamping_context(&principal, &request_id);
+        let mut context = stamping_context(&principal, None, &request_id);
         context.receipt_micros = ADMITTED_AT;
 
         let stamped = stamp_correlation_columns(&rows, &context).expect("stamp");
@@ -2652,6 +2600,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal()
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2697,6 +2649,10 @@ mod tests {
             payload,
             &DecodeContext {
                 principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(schema),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2730,12 +2686,12 @@ mod tests {
             vec![
                 Field::new("value", DataType::Int64, false),
                 Field::new("run_id", DataType::Utf8, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
                 Arc::new(StringArray::from(vec!["client-run"])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card)])),
             ],
         );
         let native = decode_native(
@@ -2793,7 +2749,7 @@ mod tests {
         assert!(matches!(dup_err, ScribeError::InvalidFrame));
     }
 
-    /// A `card_ref` value outside the service principal's own Card scope is refused
+    /// A `card_uid` value outside the service principal's own Card scope is refused
     /// during decode, before any writer admission sees the frame.
     ///
     /// # Panics
@@ -2802,7 +2758,7 @@ mod tests {
     /// other than `CardScopeDenied`.
     #[test]
     fn card_scope_rejects_before_writer_admission() {
-        let card = CardRef::from_str("prod/Service/billing@1.0.0").expect("card");
+        let card = resolved_card("prod/Service/billing@1.0.0");
         let principal = Principal::new(
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::Service {
@@ -2814,9 +2770,9 @@ mod tests {
             PermissionSet::new(),
         );
         let rows = batch(
-            vec![Field::new(CARD_REF, DataType::Utf8, false)],
+            vec![Field::new(CARD_UID, DataType::Utf8, false)],
             vec![Arc::new(StringArray::from(vec![
-                "prod/Service/other@1.0.0",
+                Uuid::now_v7().to_string(),
             ]))],
         );
         let error = decode(
@@ -2825,6 +2781,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2843,7 +2803,7 @@ mod tests {
     /// A duplicated Arrow column name is refused before any correlation or
     /// managed-column work, on a dynamic table with no built-in definition.
     ///
-    /// `card_ref` is a permitted client correlation column rather than a
+    /// `card_uid` is a permitted client correlation column rather than a
     /// server-owned one, so a duplicate pair is removed wholesale by the later
     /// projection while name lookup only ever sees the first occurrence. An
     /// authorized (here null) first column could therefore hide a second,
@@ -2857,12 +2817,12 @@ mod tests {
     fn duplicate_arrow_column_names_fail_closed_for_dynamic_tables() {
         let rows = batch(
             vec![
-                Field::new(CARD_REF, DataType::Utf8, true),
-                Field::new(CARD_REF, DataType::Utf8, true),
+                Field::new(CARD_UID, DataType::Utf8, true),
+                Field::new(CARD_UID, DataType::Utf8, true),
             ],
             vec![
                 Arc::new(StringArray::from(vec![None::<&str>])),
-                Arc::new(StringArray::from(vec![Some("prod/Service/other@1.0.0")])),
+                Arc::new(StringArray::from(vec![Some(Uuid::now_v7().to_string())])),
             ],
         );
         let error = decode(
@@ -2871,6 +2831,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal()
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2909,6 +2873,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal()
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2961,6 +2929,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal()
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -2976,6 +2948,17 @@ mod tests {
         assert!(decoded.schema().index_of(WYRD_EVENT_TIME).is_ok());
         assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
         assert!(decoded.schema().index_of(WYRD_REQUEST_ID).is_ok());
+    }
+
+    /// The signed UID text of a resolved scope member, as a writer sends it.
+    ///
+    /// # Panics
+    /// Panics when `card` carries no UID.
+    fn uid_text(card: &CardRef) -> String {
+        card.uid
+            .as_ref()
+            .expect("resolved card carries a UID")
+            .to_string()
     }
 
     /// Builds a card-scoped service principal used by native ingest arms.
@@ -3061,12 +3044,12 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
                 event_field,
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
-                Arc::new(StringArray::from(vec![card.to_string(), card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card), uid_text(&card)])),
                 event_array,
             ],
         );
@@ -3074,6 +3057,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3104,17 +3091,21 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card)])),
             ],
         );
         let decoded = decode(
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3160,6 +3151,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal()
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3196,12 +3191,12 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
                 event_field,
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card)])),
                 event_array,
             ],
         );
@@ -3209,6 +3204,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3261,23 +3260,23 @@ mod tests {
         let rows_with = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
                 event_field,
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
-                Arc::new(StringArray::from(vec![card.to_string(), card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card), uid_text(&card)])),
                 event_array,
             ],
         );
         let rows_without = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
-                Arc::new(StringArray::from(vec![card.to_string(), card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card), uid_text(&card)])),
             ],
         );
         assert_eq!(
@@ -3290,6 +3289,10 @@ mod tests {
             ipc_payload(&rows_with),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows_with.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3332,17 +3335,21 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card)])),
             ],
         );
         let decoded = decode(
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3375,12 +3382,12 @@ mod tests {
     #[test]
     fn native_event_time_physical_type_is_validated() {
         let (principal, card) = scoped_service_principal();
-        let card_column = || Arc::new(StringArray::from(vec![card.to_string()])) as ArrayRef;
+        let card_column = || Arc::new(StringArray::from(vec![uid_text(&card)])) as ArrayRef;
 
         let wrong_type = batch(
             vec![
                 Field::new(WYRD_EVENT_TIME, DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
             ],
             vec![Arc::new(Int64Array::from(vec![1_i64])), card_column()],
         );
@@ -3391,7 +3398,7 @@ mod tests {
                     DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
                     false,
                 ),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(
@@ -3407,7 +3414,7 @@ mod tests {
                     DataType::Timestamp(TimeUnit::Microsecond, None),
                     false,
                 ),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(TimestampMicrosecondArray::from(vec![1_i64])),
@@ -3421,7 +3428,7 @@ mod tests {
                     DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                     true,
                 ),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
             ],
             vec![
                 Arc::new(TimestampMicrosecondArray::from(vec![None::<i64>]).with_timezone("UTC")),
@@ -3434,7 +3441,7 @@ mod tests {
             vec![
                 dup_field_a,
                 dup_field_b,
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
             ],
             vec![dup_array_a, dup_array_b, card_column()],
         );
@@ -3450,6 +3457,10 @@ mod tests {
                 ipc_payload(&rows),
                 &DecodeContext {
                     principal: &principal,
+                    card_scope: principal
+                        .card_ref_scope()
+                        .map(CardRefScope::uids)
+                        .as_deref(),
                     expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                     request_id: &RequestId::now_v7(),
                     window: EventTimeWindow::default(),
@@ -3502,12 +3513,12 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
                 event_field,
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card)])),
                 event_array,
             ],
         );
@@ -3515,6 +3526,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3549,12 +3564,12 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
                 event_field,
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card)])),
                 event_array,
             ],
         );
@@ -3562,6 +3577,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window,
@@ -3588,12 +3607,12 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
                 event_field,
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card)])),
                 event_array,
             ],
         );
@@ -3601,6 +3620,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window,
@@ -3628,12 +3651,12 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
                 event_field,
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card)])),
                 event_array,
             ],
         );
@@ -3641,6 +3664,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3678,12 +3705,12 @@ mod tests {
         let rows = batch(
             vec![
                 Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
+                Field::new(CARD_UID, DataType::Utf8, false),
                 event_field,
             ],
             vec![
                 Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
+                Arc::new(StringArray::from(vec![uid_text(&card)])),
                 event_array,
             ],
         );
@@ -3691,6 +3718,10 @@ mod tests {
             ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal,
+                card_scope: principal
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3732,6 +3763,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal()
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3771,6 +3806,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal()
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: EventTimeWindow::default(),
@@ -3816,6 +3855,10 @@ mod tests {
             ])),
             &DecodeContext {
                 principal: &principal(),
+                card_scope: principal()
+                    .card_ref_scope()
+                    .map(CardRefScope::uids)
+                    .as_deref(),
                 expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                 request_id: &RequestId::now_v7(),
                 window: tight_window,
@@ -3885,17 +3928,21 @@ mod tests {
             let rows = batch(
                 vec![
                     Field::new(reserved, DataType::Utf8, false),
-                    Field::new(CARD_REF, DataType::Utf8, false),
+                    Field::new(CARD_UID, DataType::Utf8, false),
                 ],
                 vec![
                     Arc::new(StringArray::from(vec!["caller"])),
-                    Arc::new(StringArray::from(vec![card.to_string()])),
+                    Arc::new(StringArray::from(vec![uid_text(&card)])),
                 ],
             );
             let error = decode(
                 ipc_payload(&rows),
                 &DecodeContext {
                     principal: &principal,
+                    card_scope: principal
+                        .card_ref_scope()
+                        .map(CardRefScope::uids)
+                        .as_deref(),
                     expected_schema_fingerprint: source_schema_fingerprint(rows.schema().as_ref()),
                     request_id: &RequestId::now_v7(),
                     window: EventTimeWindow::default(),
@@ -3963,10 +4010,10 @@ mod tests {
         )
     }
 
-    /// How a single-row fixture carries its optional `card_ref` correlation.
+    /// How a single-row fixture carries its optional `card_uid` correlation.
     #[derive(Debug, Clone, Copy)]
-    enum SuppliedCardRef<'a> {
-        /// The batch has no `card_ref` column at all.
+    enum SuppliedCardUid<'a> {
+        /// The batch has no `card_uid` column at all.
         Absent,
         /// The batch has the column and the row's value is null.
         Null,
@@ -3974,29 +4021,36 @@ mod tests {
         Text(&'a str),
     }
 
-    /// Stamp one single-row batch carrying the supplied optional `card_ref`.
-    fn stamp_card_ref(
+    /// Stamp one single-row batch carrying the supplied optional `card_uid`.
+    ///
+    /// # Errors
+    /// Returns the stamping refusal, `CardScopeDenied` for an unauthorized UID.
+    fn stamp_card_uid(
         principal: &Principal,
-        card_ref: SuppliedCardRef<'_>,
+        card_uid: SuppliedCardUid<'_>,
     ) -> Result<RecordBatch, ScribeError> {
         let mut fields = vec![Field::new("value", DataType::Int64, false)];
         let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1_i64]))];
-        let value = match card_ref {
-            SuppliedCardRef::Absent => None,
-            SuppliedCardRef::Null => Some(None),
-            SuppliedCardRef::Text(text) => Some(Some(text)),
+        let value = match card_uid {
+            SuppliedCardUid::Absent => None,
+            SuppliedCardUid::Null => Some(None),
+            SuppliedCardUid::Text(text) => Some(Some(text)),
         };
         if let Some(value) = value {
-            fields.push(Field::new(CARD_REF, DataType::Utf8, true));
+            fields.push(Field::new(CARD_UID, DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(vec![value])));
         }
+        let scope = principal.card_ref_scope().map(CardRefScope::uids);
         stamp_correlation_columns(
             &batch(fields, columns),
-            &stamping_context(principal, &RequestId::now_v7()),
+            &stamping_context(principal, scope.as_deref(), &RequestId::now_v7()),
         )
     }
 
     /// Read the single stamped `card_uid` value of a one-row batch.
+    ///
+    /// # Panics
+    /// Panics when the batch has no `Utf8` `card_uid` column.
     fn stamped_card_uid(stamped: &RecordBatch) -> Option<String> {
         let index = stamped
             .schema()
@@ -4010,17 +4064,16 @@ mod tests {
         (!uids.is_null(0)).then(|| uids.value(0).to_owned())
     }
 
-    /// Optional and scoped Card correlation stamps only signed, trusted UIDs.
+    /// Optional and scoped Card correlation stamps only signed UIDs.
     ///
     /// # Panics
     ///
     /// Panics when an absent or null correlation does not stamp a null
-    /// `card_uid`, when a scoped member does not stamp its own signed UID, when
-    /// a client-supplied UID displaces the signed one, when the principal's
-    /// root is substituted for an unrelated Card, or when a UID-less,
-    /// malformed, or out-of-scope assertion is admitted.
+    /// `card_uid`, when a scoped member's signed UID is not stamped unchanged,
+    /// or when a UID outside the scope, a UID-less membership's reference text,
+    /// or malformed text is admitted.
     #[test]
-    fn optional_and_scoped_card_correlations_stamp_trusted_uids() {
+    fn optional_and_scoped_card_correlations_stamp_signed_uids() {
         let root = resolved_card("prod/Service/checkout@1.0.0");
         let secondary = resolved_card("prod/Agent/planner@2.0.0");
         let principal = scoped_principal(
@@ -4029,10 +4082,10 @@ mod tests {
         );
 
         for (label, supplied) in [
-            ("absent", SuppliedCardRef::Absent),
-            ("explicit null", SuppliedCardRef::Null),
+            ("absent", SuppliedCardUid::Absent),
+            ("explicit null", SuppliedCardUid::Null),
         ] {
-            let stamped = stamp_card_ref(&principal, supplied)
+            let stamped = stamp_card_uid(&principal, supplied)
                 .unwrap_or_else(|_| panic!("{label} correlation is admitted"));
             assert_eq!(
                 stamped_card_uid(&stamped),
@@ -4056,30 +4109,15 @@ mod tests {
         }
 
         for member in [&root, &secondary] {
-            let identity = CardRef {
-                uid: None,
-                ..member.clone()
-            };
-            let stamped = stamp_card_ref(&principal, SuppliedCardRef::Text(&identity.to_string()))
+            let uid = uid_text(member);
+            let stamped = stamp_card_uid(&principal, SuppliedCardUid::Text(&uid))
                 .expect("a signed scope member is admitted");
             assert_eq!(
-                stamped_card_uid(&stamped).as_deref(),
-                member.uid.as_ref().map(CardUid::as_str),
-                "{identity} stamps its own signed UID, never the root's"
+                stamped_card_uid(&stamped),
+                Some(uid),
+                "{member} stamps its own signed UID, never the root's"
             );
         }
-
-        let forged = CardRef {
-            uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("forged uid")),
-            ..secondary.clone()
-        };
-        let stamped = stamp_card_ref(&principal, SuppliedCardRef::Text(&forged.to_string()))
-            .expect("a client UID does not change the signed identity");
-        assert_eq!(
-            stamped_card_uid(&stamped).as_deref(),
-            secondary.uid.as_ref().map(CardUid::as_str),
-            "the signed UID wins over the client-supplied one"
-        );
 
         let unsigned = CardRef::from_str("prod/Service/unsigned@1.0.0").expect("card");
         let unsigned_principal = scoped_principal(
@@ -4088,25 +4126,25 @@ mod tests {
         );
         for (label, principal, supplied) in [
             (
-                "a UID-less signed membership",
+                "a UID-less signed membership's reference",
                 &unsigned_principal,
                 unsigned.to_string(),
             ),
             (
                 "malformed correlation text",
                 &principal,
-                "not-a-card-ref".to_owned(),
+                "not-a-card-uid".to_owned(),
             ),
             (
-                "an out-of-scope identity",
+                "a UID outside the scope",
                 &principal,
-                "prod/Service/other@1.0.0".to_owned(),
+                Uuid::now_v7().to_string(),
             ),
         ] {
-            let error = stamp_card_ref(principal, SuppliedCardRef::Text(&supplied))
+            let error = stamp_card_uid(principal, SuppliedCardUid::Text(&supplied))
                 .expect_err("{label} fails closed");
             assert!(
-                matches!(error, ScribeError::CardUnresolved),
+                matches!(error, ScribeError::CardScopeDenied),
                 "{label} fails closed without registry IO"
             );
         }
@@ -4122,8 +4160,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the signed Verifier is refused or stamps a UID other than
-    /// its signed one, or when a different Verifier is admitted by either the
-    /// admission scope check or the stamping resolution.
+    /// its signed one, or when a different Verifier's UID is admitted.
     #[test]
     fn system_writer_correlates_only_its_signed_verifier() {
         let verifier = resolved_card("prod/Verifier/drift@1.0.0");
@@ -4136,31 +4173,16 @@ mod tests {
             Vec::new(),
             PermissionSet::new(),
         );
-        let identity = CardRef {
-            uid: None,
-            ..verifier.clone()
-        }
-        .to_string();
+        let uid = uid_text(&verifier);
 
-        let stamped = stamp_card_ref(&principal, SuppliedCardRef::Text(&identity))
+        let stamped = stamp_card_uid(&principal, SuppliedCardUid::Text(&uid))
             .expect("the signed Verifier is admitted");
-        assert_eq!(
-            stamped_card_uid(&stamped).as_deref(),
-            verifier.uid.as_ref().map(CardUid::as_str),
-        );
+        assert_eq!(stamped_card_uid(&stamped), Some(uid));
 
-        let forged = "prod/Verifier/other@1.0.0";
-        let rows = batch(
-            vec![Field::new(CARD_REF, DataType::Utf8, true)],
-            vec![Arc::new(StringArray::from(vec![Some(forged)]))],
-        );
+        let forged = uid_text(&resolved_card("prod/Verifier/other@1.0.0"));
         assert!(matches!(
-            super::validate_card_scope(&rows, &principal),
+            stamp_card_uid(&principal, SuppliedCardUid::Text(&forged)),
             Err(ScribeError::CardScopeDenied)
-        ));
-        assert!(matches!(
-            stamp_card_ref(&principal, SuppliedCardRef::Text(forged)),
-            Err(ScribeError::CardUnresolved)
         ));
     }
 }

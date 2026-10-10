@@ -10,7 +10,8 @@ state outside the owning capability.
 Every procedure starts by recording the incident ID, artifact and release
 manifest, redacted configuration fingerprint, affected roles and tenants,
 current readiness matrix, database recovery point, object-store version cut,
-audit-chain head, and assigned incident/evidence owners.
+`outbox_pending{outbox="scribe"}` and `outbox_events_lost_total{outbox="scribe"}`
+values, and assigned incident/evidence owners.
 
 ## Credential or signing-key compromise
 
@@ -64,23 +65,22 @@ accepts the identified exposure window. Otherwise remain fenced.
 ### Verify and reconcile
 
 1. Verify release-manifest and migration-registry digests, schema owners,
-   grants, RLS policies, system tenant, role separation, and audit hash chains.
+   grants, RLS policies, system tenant, and role separation.
 2. Walk every retained Iceberg ref and prove that referenced metadata,
    manifests, data files, and delete files exist with the expected identity.
-3. Reconcile `vala.audit_staging` with retained `vala.system.audit_log` rows.
-4. Attach Scribe volumes to their recorded node identities; replay WAL and
+3. Attach Scribe volumes to their recorded node identities; replay WAL and
    staged manifests and reconcile publication operations without admission.
-5. Reconcile Forge tasks, attempts, operation IDs, uncertain commits,
+4. Reconcile Forge tasks, attempts, operation IDs, uncertain commits,
    retention watermarks, and cleanup cursors from catalog evidence.
-6. Rebuild only disposable indexes and caches.
+5. Rebuild only disposable indexes and caches.
 
 ### Go/no-go
 
 Run tenant-isolation, credential, append/replay, live-tail, pinned-query,
 Forge-reconciliation, audit, and Rust/Python/TypeScript/MCP journeys. Admit one
 role at a time only when its readiness dependencies pass and the recovered cut
-meets the declared RPO/RTO. Any unexplained catalog/object mismatch, broken
-audit chain, cross-tenant evidence, or ambiguous publication is a no-go.
+meets the declared RPO/RTO. Any unexplained catalog/object mismatch,
+cross-tenant evidence, or ambiguous publication is a no-go.
 
 ## Scribe node or volume loss
 
@@ -113,26 +113,26 @@ capacity is healthy, and append/replay/live-tail journeys pass. Missing
 acknowledged authority, contradictory lineage, tenant mismatch, or corrupt
 non-tail WAL is a no-go and invokes full restore or incident escalation.
 
-## Audit commit or Oracle peer failure
+## Scribe outbox or Oracle peer failure
 
-### Audit commit path
+### Scribe outbox path
 
-1. A rising `outbox_write_failures_total{outbox="audit"}` means authorization
-   decisions are not reaching `vala.audit_staging`. Requests keep succeeding.
-   The failed decisions stay queued and are retried with backoff, so
-   `outbox_pending{outbox="audit"}` grows while the failure lasts. Restore
-   Postgres or tenant connection capacity; the logged error names the tenant
-   and the failure.
-2. Once Postgres recovers, the queued decisions commit exactly once and the
-   pending gauge returns toward zero. A commit that returned an error is
-   resolved from Postgres transaction status before any retry, so a committed
-   batch is never written twice.
-3. Decisions are lost only at abrupt process loss, when graceful shutdown
-   reaches its deadline with them unwritten, or when Postgres no longer holds
-   the status of a failed commit. Each is counted in
-   `outbox_events_lost_total{outbox="audit"}`; record a nonzero count with its
-   window from the shutdown log as an audit gap. Avoid restarting a replica
-   whose audit outbox is still pending while Postgres is unavailable.
+1. A rising `outbox_write_failures_total{outbox="scribe"}` means audit
+   decisions, gateway captures, or Verifier results are not reaching Scribe.
+   Requests, gateway calls, and run settlement keep succeeding. The writer
+   resubmits the identical slice after each retryable failure, so
+   `outbox_pending{outbox="scribe"}` grows while the failure lasts. Restore the
+   local Scribe or the peer-plane path to a Scribe pod; the logged error names
+   the tenant and the failure.
+2. Once Scribe recovers, the resubmitted slices land and the pending gauge
+   returns toward zero. Scribe's batch-id fence absorbs a slice whose earlier
+   acknowledgement was lost, so it is never retained twice.
+3. A terminal rejection is logged, counted in
+   `outbox_events_lost_total{outbox="scribe"}`, and consumed. Writes Scribe has
+   not acknowledged are also lost on abrupt process death or when graceful
+   shutdown reaches its deadline; the shutdown loss is counted. Record a
+   nonzero count with its window as an audit gap. Avoid restarting a replica
+   whose Scribe outbox is still pending while Scribe is unavailable.
 
 ### Peer path
 
@@ -152,17 +152,6 @@ Oracle is ready only when query resources
 release exactly once, peer trust is current, and cancellation, peer-loss, and
 terminal-stream journeys pass. A skipped audit frame or stream interpreted as
 success after terminal failure is a no-go.
-
-## Audit publication or retirement failure
-
-1. Stop staging retirement and preserve the affected tenant-scoped rows.
-2. Determine whether each event is absent from or already durably present in
-   `vala.system.audit_log`.
-3. Retry publication with the same idempotency identity.
-4. Delete only staging rows whose corresponding audit-log publication is
-   durable.
-
-Audit retirement is a no-go while publication remains ambiguous.
 
 ## Forge ambiguous commit or lease loss
 

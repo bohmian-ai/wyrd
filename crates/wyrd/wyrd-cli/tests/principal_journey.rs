@@ -161,7 +161,7 @@ async fn principal_revoke_cli_journey() {
         .expect("admin bootstraps");
     let admin_token = machine_token(&server, &admin).await;
     let target = server
-        .bootstrap_service("cli-revoke-target", &["reader"])
+        .bootstrap_service("cli-revoke-target", &["viewer"])
         .await
         .expect("target bootstraps");
     let target_token = machine_token(&server, &target).await;
@@ -218,12 +218,12 @@ async fn principal_revoke_cli_journey() {
 async fn principal_revoke_cli_journey_refuses_an_unprivileged_caller() {
     let (server, base_url, shutdown, serve_handle) = start_served("principal revoke denial").await;
     let caller = server
-        .bootstrap_service("cli-revoke-unprivileged", &["reader"])
+        .bootstrap_service("cli-revoke-unprivileged", &["viewer"])
         .await
         .expect("unprivileged caller bootstraps");
     let caller_token = machine_token(&server, &caller).await;
     let target = server
-        .bootstrap_service("cli-revoke-denied-target", &["reader"])
+        .bootstrap_service("cli-revoke-denied-target", &["viewer"])
         .await
         .expect("target bootstraps");
     let target_token = machine_token(&server, &target).await;

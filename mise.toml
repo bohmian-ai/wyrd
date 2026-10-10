@@ -149,7 +149,8 @@ cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^exchange_api_key::pg_te
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^revoke::pg_tests::/)'
 cargo nextest run --locked -p wyrd-auth --lib -E 'test(/^refresh::pg_tests::/)'
 cargo nextest run --locked -p wyrd-server --lib -E 'test(/^components::admin::routes::pg_tests::/)'
-cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^pg_openapi_contract::/)'
+cargo nextest run --locked -p wyrd-server --test integration -E 'test(/^(pg_openapi_contract|pg_principal_roles)::/)'
+cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^principal_roles::/)'
 """
 
 [tasks."test:cli:journey"]
@@ -446,8 +447,8 @@ description = "Tier-1 journeys: the scoped observation surface over one WyrdStat
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:observe:inner'"
 [tasks."test:bifrost:journey:observe:inner"]
 hide = true
-description = "wyrd-sdk-rust observe_a_run, query_bifrost, and otel_export stories"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export)::/)'"
+description = "wyrd-sdk-rust observe_a_run, query_bifrost, otel_export, local_development, and support_desk stories"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development|support_desk)::/)'"
 
 [tasks."test:bifrost:journey:drift"]
 description = "Tier-1 journeys: Verifiers judge in real time, and a failed scheduled drift run alerts its Operator"
@@ -596,7 +597,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -607,7 +608,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
+run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/local-development.test.ts tests/integration/support-desk.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
 
 [tasks."verify:bifrost"]
 description = "Complete Bifrost change gate: fmt, Clippy, dependency and tenant-isolation checks, plus every Bifrost test tier and language surface."
@@ -624,7 +625,7 @@ depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typechec
 description = """Complete Rust SDK gate: fmt, Clippy, the wyrd-sdk-rust unit tests and every story journey on one
 Postgres lifecycle, plus the shared identity journeys (see verify:python-sdk)."""
 depends = ["check", "test:identity:journey"]
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^saved_user_auth::/)'\""
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/)'\""
 
 [tasks."verify:typescript-sdk"]
 description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit
@@ -751,6 +752,7 @@ def create_user(username, email, password, group_path, realm=REALM):
 
 create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins")
 create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
+create_user("carol", "carol@wyrd.test", "carol-password", "wyrd-editors")
 # The second provider's alice shares the first's email: a provider switch must
 # still make her a separate Wyrd user.
 create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins", realm="wyrd-test-2")
@@ -789,11 +791,12 @@ saved_login_journey() {
   case "$1" in
     cli) rust_journey wyrd-cli cli "$name" ;;
     rust)
-      # The story module is the journey: its six tests, one per saved-login outcome.
-      expr="test(/^$name::/)"
+      # The story modules are the journey: six saved-login outcomes plus the
+      # signed-in development workflow.
+      expr="test(/^($name|signed_in_development)::/)"
       count="$(cargo nextest list --locked -p wyrd-sdk-rust --test integration --run-ignored=all --message-format oneline -E "$expr" | grep -c . || true)"
-      if [ "$count" != 6 ]; then
-        echo "wyrd-sdk-rust journey $name selects $count tests; expected exactly 6" >&2
+      if [ "$count" != 7 ]; then
+        echo "wyrd-sdk-rust journey $name selects $count tests; expected exactly 7" >&2
         exit 1
       fi
       cargo nextest run --locked -p wyrd-sdk-rust --test integration --run-ignored=all -E "$expr"
@@ -801,26 +804,28 @@ saved_login_journey() {
     client) rust_journey wyrd-client integration "pg_auth_e2e_against_fixture::$name" ;;
     python)
       mise run py:setup
-      # The story file is the journey: its six tests, one per saved-login outcome.
-      selector="tests/integration/test_$name.py"
-      count="$(cd sdks/wyrd-sdk-python && uv run python -m pytest -q --collect-only -m identity "$selector" | grep -c "::test_" || true)"
-      if [ "$count" != 6 ]; then
-        echo "Python journey $selector selects $count tests; expected exactly 6" >&2
+      # The story files are the journey: six saved-login outcomes plus the
+      # signed-in development workflow.
+      selector="tests/integration/test_$name.py tests/integration/test_signed_in_development.py"
+      count="$(cd sdks/wyrd-sdk-python && uv run python -m pytest -q --collect-only -m identity $selector | grep -c "::test_" || true)"
+      if [ "$count" != 7 ]; then
+        echo "Python journey $selector selects $count tests; expected exactly 7" >&2
         exit 1
       fi
-      (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity "$selector")
+      (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity $selector)
       ;;
     typescript)
       mise run ts:build
       mise run ts:build:testing
-      # The story file is the journey: its six tests, one per saved-login outcome.
-      journey=tests/integration/saved-user-auth.test.ts
-      count="$(cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest list "$journey" | grep -c . || true)"
-      if [ "$count" != 6 ]; then
-        echo "TypeScript journey $journey selects $count tests; expected exactly 6" >&2
+      # The story files are the journey: six saved-login outcomes plus the
+      # signed-in development workflow.
+      journey="tests/integration/saved-user-auth.test.ts tests/integration/signed-in-development.test.ts"
+      count="$(cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest list $journey | grep -c . || true)"
+      if [ "$count" != 7 ]; then
+        echo "TypeScript journey $journey selects $count tests; expected exactly 7" >&2
         exit 1
       fi
-      (cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run "$journey")
+      (cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run $journey)
       ;;
   esac
 }
@@ -1263,6 +1268,22 @@ dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_gateway.py"
 
+[tasks."examples:python:support-desk"]
+description = "Run the support desk example against WYRD_SERVER_URL (Python)"
+dir = "sdks/wyrd-sdk-python"
+depends = ["py:setup"]
+run = "uv run python ../../examples/support-desk/python/support_desk.py"
+
+[tasks."examples:rust:support-desk"]
+description = "Run the support desk example against WYRD_SERVER_URL (Rust)"
+run = "cargo run -p wyrd-rust-examples --bin support_desk"
+
+[tasks."examples:typescript:support-desk"]
+description = "Run the support desk example against WYRD_SERVER_URL (TypeScript)"
+dir = "examples/support-desk/typescript"
+depends = ["ts:build"]
+run = "pnpm start"
+
 [tasks."examples:rust:smoke"]
 hide = true
 description = "Run the credential-free Rust agent smoke example"
@@ -1583,9 +1604,9 @@ seeds a tenant, mints a key, and drives @wyrd/sdk against it, tearing down via s
 in finally — symmetric with the Python journey.
 """
 dir = "sdks/wyrd-sdk-ts/wyrd"
-# The saved user login journey needs the identity lane's Keycloak; only
-# test:identity:journey runs it.
-run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-user-auth.test.ts"
+# The saved user login journeys need the identity lane's Keycloak; only
+# test:identity:journey runs them.
+run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-user-auth.test.ts --exclude tests/integration/signed-in-development.test.ts"
 
 [tasks."gate"]
 description = "Full repository aggregate for nightly, release, mixed, global, and unclassified changes. Run as `mise run -c gate` to finish every lane and report all failures; without -c mise stops at the first failed lane."

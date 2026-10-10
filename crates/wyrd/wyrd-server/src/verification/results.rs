@@ -5,8 +5,10 @@
 //! `vala.eval.result_items`, taken from the tables' own declarations so the
 //! payload can never drift from the registered contract. Every batch also
 //! carries the three correlation columns Scribe admits from a native payload:
-//! `card_ref` (the Verifier, resolved against the frame principal's Verifier scope),
-//! `run_id` (the Verifier run), and `wyrd_event_time` (the one server-chosen
+//! `card_uid` (the Verifier, authorized against the frame principal's Verifier scope),
+//! `run_id` (the application Run judged, null when none, as for scheduled
+//! Drift), and
+//! `wyrd_event_time` (the one server-chosen
 //! event time shared by the summary and every detail row).
 
 use std::collections::HashMap;
@@ -18,14 +20,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::error::ArrowError;
-use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
-use uuid::Uuid;
-use wyrd_spec::DataTenantId;
-use wyrd_spec::request_id::RequestId;
 
-use crate::components::gateway::{CaptureBatch, CaptureTable, VerifierAttribution};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Error as JsonError;
@@ -33,8 +29,9 @@ use vala_bifrost_redux::tables::verification::ResultsTable;
 use vala_bifrost_redux::tables::{DomainTable, ResultFeaturesTable, ResultItemsTable};
 use vala_drift::{DriftReport, DriftVerdict};
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
-use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
-use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
+use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
+use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::vala::managed_columns::{CARD_UID, RUN_ID, WYRD_EVENT_TIME};
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput};
 
@@ -96,8 +93,8 @@ pub struct ResultBatch {
 /// Every batch of one result, in required write order.
 ///
 /// Non-empty detail batches precede the summary; a result with no detail rows
-/// holds only the summary. Built once per publication attempt and reused
-/// verbatim, so an unacknowledged retry resends identical rows.
+/// holds only the summary. Built once and staged on the Scribe outbox, which
+/// resends identical rows on every retry.
 #[derive(Debug, Clone)]
 pub struct ResultPayload {
     /// The result identity every row carries.
@@ -126,47 +123,6 @@ impl ResultPayload {
     pub fn batches(&self) -> &[ResultBatch] {
         &self.batches
     }
-
-    /// Encodes every batch, in write order, as one Arrow IPC stream bound for
-    /// `tenant` under `attribution`, each under a fresh `UUIDv7` batch id.
-    ///
-    /// The encoded batches are what the capture writer submits; resubmitting
-    /// the same encoded batch reuses its bytes and id, so Scribe's batch-id
-    /// dedup absorbs a write that was durable but unacknowledged.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ResultPayloadError::Arrow`] when a batch cannot be encoded,
-    /// and [`ResultPayloadError::ColumnMismatch`] when a batch names a table
-    /// outside the three result tables.
-    pub(crate) fn encode(
-        &self,
-        tenant: DataTenantId,
-        attribution: &VerifierAttribution,
-    ) -> Result<Vec<CaptureBatch>, ResultPayloadError> {
-        let request_id = RequestId::now_v7();
-        self.batches
-            .iter()
-            .map(|batch| {
-                let table = CaptureTable::from_fqn(&batch.table)
-                    .filter(|table| table.is_result())
-                    .ok_or_else(|| ResultPayloadError::ColumnMismatch {
-                        column: batch.table.clone(),
-                        problem: "unexpected",
-                    })?;
-                let mut writer = StreamWriter::try_new(Vec::new(), batch.batch.schema().as_ref())?;
-                writer.write(&batch.batch)?;
-                Ok(CaptureBatch {
-                    tenant,
-                    table,
-                    batch_id: Uuid::now_v7(),
-                    request_id: request_id.clone(),
-                    ipc: Bytes::from(writer.into_inner()?),
-                    verifier: Some(attribution.clone()),
-                })
-            })
-            .collect()
-    }
 }
 
 /// The frozen identities and input of the run a result belongs to.
@@ -175,8 +131,10 @@ impl ResultPayload {
 /// separated from the lease so the mapping can be exercised without a claim.
 #[derive(Debug, Clone, Copy)]
 pub struct ResultRun<'a> {
-    /// The Verifier run, stored as the managed `run_id`.
-    pub run_id: VerificationRunId,
+    /// The application Run judged, stored as the managed `run_id`: the
+    /// observed record's Run for continuous Eval, the caller's Run for a
+    /// direct execution, and `None` when there is none, as for scheduled Drift.
+    pub run_id: Option<&'a RunId>,
     /// Exact Verifier Card version used.
     pub verifier_version: &'a str,
     /// Verified subject Card.
@@ -191,11 +149,13 @@ pub struct ResultRun<'a> {
     pub input: &'a RunInput,
 }
 
-impl<'a> From<&'a ClaimedRun> for ResultRun<'a> {
-    /// Borrow the result-relevant identities of a claimed run.
-    fn from(run: &'a ClaimedRun) -> Self {
+impl<'a> ResultRun<'a> {
+    /// Borrow the result-relevant identities of a claimed run judged for the
+    /// application Run `run_id`.
+    #[must_use]
+    pub fn claimed(run: &'a ClaimedRun, run_id: Option<&'a RunId>) -> Self {
         Self {
-            run_id: run.lease.run_id,
+            run_id,
             verifier_version: &run.verifier_version,
             subject_card_uid: &run.subject_card_uid,
             owner_card_uid: run.owner_card_uid.as_ref(),
@@ -215,8 +175,8 @@ impl<'a> From<&'a ClaimedRun> for ResultRun<'a> {
 pub struct ResultPayloadBuilder<'a> {
     /// The run whose frozen identities and input the rows record.
     run: ResultRun<'a>,
-    /// Verifier `CardRef` text without a UID, authorized by Scribe against scope.
-    verifier_ref: &'a str,
+    /// The Verifier's UID, authorized by Scribe against the frame's Card scope.
+    verifier_uid: &'a CardUid,
     /// The new result's identity.
     result_id: VerificationResultId,
     /// The one event time shared by every row of this result.
@@ -236,7 +196,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     #[must_use]
     pub fn new(
         run: ResultRun<'a>,
-        verifier_ref: &'a str,
+        verifier_uid: &'a CardUid,
         result_id: VerificationResultId,
         event_time: DateTime<Utc>,
         started_at: DateTime<Utc>,
@@ -244,7 +204,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     ) -> Self {
         Self {
             run,
-            verifier_ref,
+            verifier_uid,
             result_id,
             event_time,
             started_at,
@@ -257,7 +217,9 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Drift writes one `result_features` row per scored feature and records
     /// the report (or null when unscored) as `details`; Eval writes one
     /// `result_items` row per task outcome and records the workflow summary
-    /// as `details`. A report with no detail rows writes only the summary.
+    /// as `details`; a task writes only the summary, sourced from the
+    /// synthetic record, with its one `AssertionResult` as `details`. A report
+    /// with no detail rows writes only the summary.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::InputMismatch`] when the report's
@@ -287,6 +249,11 @@ impl<'a> ResultPayloadBuilder<'a> {
                 let details = canonical_json(&report.workflow_summary())?;
                 (None, Some(record_id.as_str()), Some(details))
             }
+            (VerifierReport::Task(result), RunInput::EvalRecord { record_id, .. }) => (
+                None,
+                Some(record_id.as_str()),
+                Some(canonical_json(result)?),
+            ),
             _ => return Err(ResultPayloadError::InputMismatch { implementation }),
         };
         let summary = self.summary(implementation, verdict, window, record_id, details)?;
@@ -547,7 +514,7 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Every authored column must fill exactly one of `fields` by name; the
     /// arrays are placed in the order of `fields`, never in authoring order,
     /// so a reordered declaration keeps each value under its own name. The
-    /// schema is `fields` followed by `card_ref`, `run_id`, and
+    /// schema is `fields` followed by `card_uid`, `run_id`, and
     /// `wyrd_event_time`, each repeated for the authored row count.
     ///
     /// # Errors
@@ -587,7 +554,7 @@ impl<'a> ResultPayloadBuilder<'a> {
             });
         }
         fields.extend([
-            Field::new(CARD_REF, DataType::Utf8, true),
+            Field::new(CARD_UID, DataType::Utf8, true),
             Field::new(RUN_ID, DataType::Utf8, true),
             Field::new(
                 WYRD_EVENT_TIME,
@@ -595,9 +562,12 @@ impl<'a> ResultPayloadBuilder<'a> {
                 false,
             ),
         ]);
-        arrays.push(text(std::iter::repeat_n(Some(self.verifier_ref), rows)));
         arrays.push(text(std::iter::repeat_n(
-            Some(self.run.run_id.to_string()),
+            Some(self.verifier_uid.as_str()),
+            rows,
+        )));
+        arrays.push(text(std::iter::repeat_n(
+            self.run.run_id.map(RunId::as_str),
             rows,
         )));
         arrays.push(timestamps(std::iter::repeat_n(Some(self.event_time), rows)));
@@ -760,12 +730,14 @@ mod tests {
 
     /// Owned identities of one binding run, borrowed as a [`ResultRun`].
     struct TestRun {
-        /// The Verifier run.
-        run_id: VerificationRunId,
+        /// The application Run judged.
+        run_id: RunId,
         /// Subject Card.
         subject: CardUid,
         /// Binding owner Card.
         owner: CardUid,
+        /// The Verifier the result is written under.
+        verifier: CardUid,
         /// Binding identity.
         binding: BindingId,
         /// Frozen inline Trigger.
@@ -778,7 +750,7 @@ mod tests {
         /// Borrow this run as the builder's view.
         fn view(&self) -> ResultRun<'_> {
             ResultRun {
-                run_id: self.run_id,
+                run_id: Some(&self.run_id),
                 verifier_version: "1.2.0",
                 subject_card_uid: &self.subject,
                 owner_card_uid: Some(&self.owner),
@@ -805,9 +777,10 @@ mod tests {
     /// A binding run over `input`.
     fn run(input: RunInput) -> TestRun {
         TestRun {
-            run_id: VerificationRunId::new_v7(),
+            run_id: RunId::new(),
             subject: uid(),
             owner: uid(),
+            verifier: uid(),
             binding: BindingId::new_v7(),
             trigger: FrozenTarget::Digest("sha256:t".to_owned()),
             input,
@@ -834,7 +807,7 @@ mod tests {
     fn builder(run: &TestRun) -> ResultPayloadBuilder<'_> {
         ResultPayloadBuilder::new(
             run.view(),
-            "prod/Verifier/check@1.2.0",
+            &run.verifier,
             VerificationResultId::new_v7(),
             at(30),
             at(10),
@@ -937,10 +910,13 @@ mod tests {
                     cell(batch, "result_id", row).as_deref(),
                     Some(result_id.as_str())
                 );
-                assert_eq!(cell(batch, RUN_ID, row), Some(run.run_id.to_string()));
                 assert_eq!(
-                    cell(batch, CARD_REF, row).as_deref(),
-                    Some("prod/Verifier/check@1.2.0")
+                    cell(batch, RUN_ID, row).as_deref(),
+                    Some(run.run_id.as_str())
+                );
+                assert_eq!(
+                    cell(batch, CARD_UID, row).as_deref(),
+                    Some(run.verifier.as_str())
                 );
             }
         }
@@ -1020,6 +996,7 @@ mod tests {
             &VerifierReport::Eval {
                 report,
                 verdict: VerificationVerdict::Passed,
+                run_id: None,
             },
         );
         let tables: Vec<_> = payload.batches().iter().map(|b| b.table.as_str()).collect();
@@ -1066,6 +1043,7 @@ mod tests {
             &VerifierReport::Eval {
                 report: EvalReport::default(),
                 verdict: VerificationVerdict::Inconclusive,
+                run_id: None,
             },
         );
         assert_eq!(payload.batches().len(), 1);
@@ -1076,13 +1054,95 @@ mod tests {
         );
     }
 
+    /// A direct task judgment writes exactly one `vala.verification.results`
+    /// row and no detail row: the task verdict, exact Verifier version and
+    /// subject, null binding facts and window, the application Run's record as
+    /// source, the execution interval, and its one `AssertionResult` as details.
+    #[test]
+    fn direct_task_writes_one_summary_row() {
+        let subject = uid();
+        let verifier = uid();
+        let application = RunId::new();
+        let input = RunInput::EvalRecord {
+            record_id: application.as_str().to_owned(),
+            event_time: at(10),
+        };
+        let result = AssertionResult {
+            task_id: TaskId::new("no-refund-promise").expect("task id"),
+            passed: false,
+            actual: Some(serde_json::json!("we will refund you")),
+            expected: serde_json::json!("refund"),
+            operator: ComparisonOperator::NotContains,
+            message: None,
+            stage: 0,
+            started_at: at(11),
+            duration_ms: 3,
+        };
+        let payload = ResultPayloadBuilder::new(
+            ResultRun {
+                run_id: Some(&application),
+                verifier_version: "1.0.0",
+                subject_card_uid: &subject,
+                owner_card_uid: None,
+                binding_id: None,
+                trigger: None,
+                input: &input,
+            },
+            &verifier,
+            VerificationResultId::new_v7(),
+            at(20),
+            at(10),
+            at(20),
+        )
+        .build(&VerifierReport::Task(Box::new(result.clone())))
+        .expect("a task report maps");
+        assert_eq!(payload.verdict(), VerificationVerdict::Failed);
+        let [only] = payload.batches() else {
+            panic!("a task writes exactly one batch");
+        };
+        assert_eq!(only.table, "vala.verification.results");
+        let row = &only.batch;
+        assert_eq!(row.num_rows(), 1);
+        for (column, expected) in [
+            ("result_id", Some(payload.result_id().to_string())),
+            ("implementation", Some("task".to_owned())),
+            ("execution_status", Some("completed".to_owned())),
+            ("verdict", Some("failed".to_owned())),
+            ("verifier_version", Some("1.0.0".to_owned())),
+            ("subject_card_uid", Some(subject.to_string())),
+            ("owner_card_uid", None),
+            ("binding_id", None),
+            ("trigger_identity", None),
+            ("source_record_id", Some(application.as_str().to_owned())),
+            (RUN_ID, Some(application.as_str().to_owned())),
+            (CARD_UID, Some(verifier.to_string())),
+        ] {
+            assert_eq!(cell(row, column, 0), expected, "{column}");
+        }
+        let times = |column: &str| {
+            let array = row
+                .column_by_name(column)
+                .unwrap_or_else(|| panic!("{column} column exists"))
+                .as_primitive::<TimestampMicrosecondType>();
+            array.is_valid(0).then(|| array.value(0))
+        };
+        assert_eq!(times("window_start"), None);
+        assert_eq!(times("window_end"), None);
+        assert_eq!(times("started_at"), Some(at(10).timestamp_micros()));
+        assert_eq!(times("ended_at"), Some(at(20).timestamp_micros()));
+        assert_eq!(
+            cell(row, "details", 0),
+            Some(canonical_json(&result).expect("result encodes"))
+        );
+    }
+
     /// A report whose implementation cannot consume the run's input is refused.
     #[test]
     fn mismatched_report_and_input_is_refused() {
         let run = eval_run();
         let error = ResultPayloadBuilder::new(
             run.view(),
-            "prod/Verifier/check@1.2.0",
+            &run.verifier,
             VerificationResultId::new_v7(),
             at(30),
             at(10),
@@ -1123,7 +1183,7 @@ mod tests {
         let expected: Vec<_> = reversed
             .iter()
             .map(|field| field.name().clone())
-            .chain([CARD_REF, RUN_ID, WYRD_EVENT_TIME].map(str::to_owned))
+            .chain([CARD_UID, RUN_ID, WYRD_EVENT_TIME].map(str::to_owned))
             .collect();
         assert_eq!(order, expected);
         for field in ResultsTable::arrow_fields() {

@@ -109,19 +109,18 @@ Dependency rules below are enforced by `check:deps`:
   that evaluates a principal's permission is recorded — allowed and denied
   alike — with the principal, permission, resource, and outcome. Correlate
   related rows with request and typed domain identifiers.
-- Every audited decision is staged on the one process audit outbox once the
-  decision is known, outside the operation's transaction. The operation never
-  waits for, or is refused by, the audit commit. Engine-internal transitions
-  that evaluate no permission are lineage, not audit.
-- The outbox commits through the canonical hash-chained staging append and
-  retries a failed commit without dropping it, only after Postgres transaction
-  status confirms the commit aborted, so a retry never stages a decision
-  twice. Abrupt process loss, a graceful shutdown that reaches its deadline,
-  or a failed commit whose status Postgres no longer holds can lose a
-  decision; no other audit table, WAL, relay, or log sink exists.
-- `vala.audit_staging` is transient write-ahead state; retained history is
-  `vala.system.audit_log`. Staged rows are garbage-collected once the per-tenant
-  watermark has advanced past them.
+- Every audited decision is staged in memory on the one process Scribe outbox
+  once the decision is known, outside the operation's transaction. The
+  operation never waits for, or is refused by, the audit write. Engine-internal
+  transitions that evaluate no permission are lineage, not audit.
+- The outbox writer submits each tenant slice to Scribe with a content-derived
+  batch id. A retryable failure resubmits the identical slice, which Scribe's
+  batch-id fence absorbs; a terminal rejection is logged, counted, and
+  consumed. Writes Scribe has not acknowledged are lost on abrupt process death
+  or an expired shutdown deadline; observable loss is counted and never changes
+  the originating operation.
+- Retained history is `vala.system.audit_log`; no audit staging table,
+  publisher, WAL, relay, or log sink exists.
 
 ## External Network Safety
 
@@ -159,7 +158,7 @@ replicas remain one logical surface behind one gateway.
 
 - One JWT can carry multiple component cards (nested service).
 - Each observation row carries server-stamped `principal_id`; optional per-row
-  `card_ref` is server-authorized when present, and `run_id` remains opaque.
+  `card_uid` is server-authorized when present, and `run_id` remains opaque.
 - Run IDs are opaque client-side execution records, not server-persisted.
 - See `architecture/wyrd-design.md` §Observation identity.
 

@@ -17,7 +17,7 @@
       ]
     },
     "metadata": {
-      "description": "String metadata carried verbatim through every schema conversion.\n\nTwo keys are meaningful to Bifrost: [`PARQUET_FIELD_ID_KEY`] holds the stored stable field id as decimal text, and [`INPUT_CLASS_KEY`] marks a declaration that is a write-time input rather than a stored column.",
+      "description": "String metadata carried verbatim through every schema conversion.\n\n[`PARQUET_FIELD_ID_KEY`] is meaningful to Bifrost: it holds the stored stable field id as decimal text.",
       "type": "object",
       "additionalProperties": {
         "type": "string"
@@ -342,7 +342,7 @@
           ]
         },
         "metadata": {
-          "description": "String metadata carried verbatim through every schema conversion.\n\nTwo keys are meaningful to Bifrost: [`PARQUET_FIELD_ID_KEY`] holds the stored stable field id as decimal text, and [`INPUT_CLASS_KEY`] marks a declaration that is a write-time input rather than a stored column.",
+          "description": "String metadata carried verbatim through every schema conversion.\n\n[`PARQUET_FIELD_ID_KEY`] is meaningful to Bifrost: it holds the stored stable field id as decimal text.",
           "type": "object",
           "additionalProperties": {
             "type": "string"

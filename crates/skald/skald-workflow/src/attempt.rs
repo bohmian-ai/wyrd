@@ -133,7 +133,7 @@ impl AttemptOutcome {
 /// deadline codes. Everything else — auth, permission, binding, route, tool,
 /// callback, session, journal, max-iteration, and invariant failures — is
 /// terminal.
-pub(crate) fn agent_error_retryable(error: &AgentError) -> bool {
+pub fn agent_error_retryable(error: &AgentError) -> bool {
     match error {
         AgentError::Provider(SkaldRuntimeError::Provider { source, .. }) => {
             provider_error_retryable(source)

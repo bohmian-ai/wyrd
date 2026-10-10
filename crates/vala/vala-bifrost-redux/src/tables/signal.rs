@@ -21,9 +21,9 @@ use crate::tables::TableError;
 use crate::tables::fields::{self, CanonicalField, CanonicalType};
 use std::str::FromStr;
 use std::sync::Arc;
-use wyrd_spec::reference::{CardRef, CardRefScope};
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
-use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID};
+use wyrd_spec::vala::managed_columns::{CARD_UID, RUN_ID};
 use wyrd_tonic::otlp::common::v1::any_value::Value;
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
@@ -274,19 +274,18 @@ pub fn last_attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a K
 
 /// Record-level `OTLP` attribute carrying optional Card correlation.
 ///
-/// The value uses the existing compact [`CardRef`] grammar. A supplied `#uid`
-/// suffix parses as syntax but is untrusted: Scribe authorizes and resolves by
-/// `(kind, space, name, version)` identity against the signed scope alone.
-pub const CARD_REF_ATTRIBUTE: &str = "wyrd.card_ref";
+/// The value is the observed Card's UID. Gate and Scribe store it only once it
+/// is confirmed to be carried by a member of the request's Card scope.
+pub const CARD_UID_ATTRIBUTE: &str = "wyrd.card_uid";
 
 /// Record-level `OTLP` attribute carrying optional run correlation.
 pub const RUN_ID_ATTRIBUTE: &str = "wyrd.run_id";
 
-/// Stable rejection reason for a wrongly typed or malformed `wyrd.card_ref`.
-const CARD_REF_REJECTION: &str = "wyrd.card_ref is not a valid card correlation";
+/// Stable rejection reason for a wrongly typed or malformed `wyrd.card_uid`.
+const CARD_UID_REJECTION: &str = "wyrd.card_uid is not a valid card correlation";
 
-/// Stable rejection reason for a `wyrd.card_ref` the principal cannot assert.
-const CARD_REF_UNAUTHORIZED: &str = "wyrd.card_ref is outside the signed Card scope";
+/// Stable rejection reason for a `wyrd.card_uid` the principal cannot assert.
+const CARD_UID_UNAUTHORIZED: &str = "wyrd.card_uid is outside the principal's Card scope";
 
 /// Stable rejection reason for a wrongly typed `wyrd.run_id`.
 const RUN_ID_REJECTION: &str = "wyrd.run_id is not a valid run correlation";
@@ -302,8 +301,8 @@ const RUN_ID_REJECTION: &str = "wyrd.run_id is not a valid run correlation";
 /// removes a source entry.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RecordCorrelation {
-    /// Client-supplied Card reference text, when present and valid.
-    pub card_ref: Option<String>,
+    /// Authorized Card UID text, canonically formatted, when present.
+    pub card_uid: Option<String>,
     /// Client-supplied run identifier text, when present and valid.
     pub run_id: Option<String>,
 }
@@ -311,33 +310,38 @@ pub struct RecordCorrelation {
 impl RecordCorrelation {
     /// Extract both optional correlations from one record's attributes.
     ///
-    /// `card_scope` is the authenticated principal's verified signed Card
-    /// scope, borrowed from the request that carried this record. It is checked
-    /// here, per record, so one unauthorized reference rejects only its own
-    /// OTLP record instead of failing the whole canonical batch later in
-    /// Scribe. The check is decided entirely from the signed claims and
-    /// performs no registry, database, or cache lookup.
+    /// `card_scope` is the request's Card scope: a Card-bound principal's
+    /// verified signed scope, or, for an unbound principal, the registered
+    /// observation-target Cards Gate resolved for this export. It is checked
+    /// here, per record, so one unauthorized UID rejects only its own OTLP
+    /// record instead of failing the whole canonical batch later in Scribe.
+    /// The check itself performs no registry, database, or cache lookup, and
+    /// mirrors Scribe's own, so a record accepted here is not refused again
+    /// when Scribe re-validates the assembled canonical batch.
     ///
     /// # Errors
     ///
-    /// Returns the stable rejection reason when the final `wyrd.card_ref`
-    /// occurrence is not a string or does not parse as a [`CardRef`], when a
-    /// parsed reference is not authorized by `card_scope` or its matching
-    /// signed member carries no UID, or when the final `wyrd.run_id`
+    /// Returns the stable rejection reason when the final `wyrd.card_uid`
+    /// occurrence is not a string or not a [`CardUid`], when `card_scope` does
+    /// not carry that UID, or when the final `wyrd.run_id`
     /// occurrence is not a string. [`RunId`] adopts any string, so a run
     /// identifier has no further grammar to fail.
     pub fn extract(
         attributes: &[KeyValue],
-        card_scope: Option<&CardRefScope>,
+        card_scope: Option<&[CardUid]>,
     ) -> Result<Self, &'static str> {
-        let card_ref = correlation_text(attributes, CARD_REF_ATTRIBUTE, CARD_REF_REJECTION)?;
-        if let Some(text) = card_ref {
-            let card = CardRef::from_str(text).map_err(|_| CARD_REF_REJECTION)?;
-            authorize_card_ref(&card, card_scope)?;
-        }
+        let card_uid = correlation_text(attributes, CARD_UID_ATTRIBUTE, CARD_UID_REJECTION)?
+            .map(|text| {
+                let uid = CardUid::from_str(text).map_err(|_| CARD_UID_REJECTION)?;
+                if !card_scope.is_some_and(|scope| scope.contains(&uid)) {
+                    return Err(CARD_UID_UNAUTHORIZED);
+                }
+                Ok::<_, &'static str>(uid.to_string())
+            })
+            .transpose()?;
         let run_id = correlation_text(attributes, RUN_ID_ATTRIBUTE, RUN_ID_REJECTION)?;
         Ok(Self {
-            card_ref: card_ref.map(str::to_owned),
+            card_uid,
             run_id: run_id
                 .map(|text| RunId::from_string(text.to_owned()))
                 .map(|run| run.as_str().to_owned()),
@@ -345,35 +349,16 @@ impl RecordCorrelation {
     }
 }
 
-/// Confirm one parsed record reference lies within the signed Card scope.
+/// The final `wyrd.card_uid` text of one record, when it is a string.
 ///
-/// This mirrors Scribe's own authorization exactly — identity match on
-/// `(kind, space, name, version)` plus a UID the mint signed onto that same
-/// member — so a record accepted here cannot be refused again when Scribe
-/// re-validates the assembled canonical batch. Scribe keeps that whole-frame
-/// check as defense in depth; this one exists only so a rejection stays
-/// per-record.
-///
-/// # Errors
-///
-/// Returns [`CARD_REF_UNAUTHORIZED`] when the principal carries no signed
-/// scope, the reference lies outside it, or the matching signed member carries
-/// no UID.
-fn authorize_card_ref(
-    card: &CardRef,
-    card_scope: Option<&CardRefScope>,
-) -> Result<(), &'static str> {
-    let scope = card_scope.ok_or(CARD_REF_UNAUTHORIZED)?;
-    if !scope.authorizes(card) {
-        return Err(CARD_REF_UNAUTHORIZED);
-    }
-    scope
-        .as_slice()
-        .iter()
-        .find(|member| member.same_identity(card))
-        .and_then(|member| member.uid.as_ref())
-        .ok_or(CARD_REF_UNAUTHORIZED)?;
-    Ok(())
+/// Gate reads this to learn which Cards an unbound writer's export names
+/// before projection; a wrongly typed occurrence yields nothing here and is
+/// rejected by [`RecordCorrelation::extract`] on its own record.
+#[must_use]
+pub fn card_uid_text(attributes: &[KeyValue]) -> Option<&str> {
+    correlation_text(attributes, CARD_UID_ATTRIBUTE, CARD_UID_REJECTION)
+        .ok()
+        .flatten()
 }
 
 /// Read the final occurrence of one correlation attribute as text.
@@ -398,14 +383,14 @@ fn correlation_text<'a>(
 
 /// The two nullable correlation fields every canonical signal projection appends.
 ///
-/// They are not ledger fields and carry no sensitivity tag: Scribe strips `card_ref`
-/// and relinquishes `run_id` before stamping the canonical envelope, and the
+/// They are not ledger fields and carry no sensitivity tag: Scribe relinquishes
+/// `card_uid` and `run_id` before stamping the canonical envelope, and the
 /// source schema fingerprint excludes both, so appending them here cannot
 /// perturb a table's catalog or canonical physical identity.
 #[must_use]
 pub fn correlation_fields() -> [Field; 2] {
     [
-        Field::new(CARD_REF, DataType::Utf8, true),
+        Field::new(CARD_UID, DataType::Utf8, true),
         Field::new(RUN_ID, DataType::Utf8, true),
     ]
 }
@@ -848,35 +833,26 @@ fn canonical_binary_verifier(name: &str) -> fn(&[u8]) -> Result<(), &'static str
 /// The one signed-scope fixture the three signal correlation tests share.
 ///
 /// Each signal asserts the same four record shapes — missing, in-scope,
-/// out-of-scope, and in-scope-but-UID-less — so they must agree on exactly one
-/// scope. Keeping it beside the check it exercises means a change to the
+/// out-of-scope, and a Card reference instead of a UID — so they must agree on
+/// exactly one scope. Keeping it beside the check it exercises means a change to the
 /// authorization rule has one fixture to update rather than three.
 #[cfg(test)]
 pub(crate) mod correlation_fixture {
-    use super::{CardRef, CardRefScope, FromStr};
+    use super::FromStr;
+    use wyrd_spec::ids::CardUid;
 
-    /// A signed scope member whose mint-resolved UID makes it assertable.
-    pub(crate) const IN_SCOPE: &str = "prod/Service/checkout@1.0.0";
+    /// The UID of a signed scope member, which makes it assertable.
+    pub(crate) const IN_SCOPE: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22";
 
-    /// A Card the principal's signed scope does not name at all.
-    pub(crate) const OUT_OF_SCOPE: &str = "prod/Service/foreign@1.0.0";
+    /// A UID the principal's signed scope does not carry at all.
+    pub(crate) const OUT_OF_SCOPE: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b33";
 
-    /// A signed scope member the mint could not resolve to a UID.
-    pub(crate) const WITHOUT_UID: &str = "prod/Service/unresolved@1.0.0";
+    /// The signed member's Card reference text, which is not a UID.
+    pub(crate) const REFERENCE_TEXT: &str = "prod/Service/checkout@1.0.0";
 
-    /// Build the shared scope: a UID-bearing root plus one UID-less member.
-    pub(crate) fn scope() -> CardRefScope {
-        let root = CardRef {
-            uid: Some(
-                wyrd_spec::ids::CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22")
-                    .expect("fixture card uid"),
-            ),
-            ..CardRef::from_str(IN_SCOPE).expect("fixture card ref")
-        };
-        CardRefScope::from_root_and_members(
-            &root,
-            [CardRef::from_str(WITHOUT_UID).expect("fixture card ref")],
-        )
+    /// Build the shared scope: the one in-scope Card UID.
+    pub(crate) fn scope() -> Vec<CardUid> {
+        vec![CardUid::from_str(IN_SCOPE).expect("fixture card uid")]
     }
 }
 

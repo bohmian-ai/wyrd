@@ -229,8 +229,9 @@ Follow `AGENTS.md` and the applicable language references. In particular:
   `OperatorPool`; a `TenantConn` callee never commits or rolls back;
 - rely on Postgres RLS rather than duplicating tenant predicates on
   tenant-scoped queries;
-- append audit at each independently durable transition, preserving Oracle's
-  WAL-before-rows exception and Forge's fenced operator capability;
+- stage one audit event per evaluated permission decision on the process
+  Scribe outbox, and record engine transitions such as Forge's fenced
+  operator work as lineage, never audit;
 - resolve, screen, and pin user- or tenant-supplied URL destinations before
   server-side fetches so DNS rebinding cannot bypass SSRF policy.
 

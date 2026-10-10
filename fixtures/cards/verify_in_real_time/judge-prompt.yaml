@@ -8,7 +8,7 @@ spec:
   request:
     provider: open_ai_chat_completion
     body:
-      model: gpt-test
+      model: gpt-4o
       messages:
         - role: user
           content: Grade the answer ${answer}.
@@ -22,7 +22,7 @@ spec:
               passed: {type: boolean}
             required: [passed]
             additionalProperties: false
-  model: gpt-test
+  model: gpt-4o
   variables: [answer]
   media_variables: []
   response_type:

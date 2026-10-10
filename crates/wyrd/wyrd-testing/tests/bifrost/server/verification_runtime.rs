@@ -22,9 +22,13 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use secrecy::ExposeSecret;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::catalog::{TableRef, TableUid};
+use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
+use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
 use wyrd_client::Bifrost;
 use wyrd_server::query::scheduled::ScheduledQueryCaller;
+use wyrd_server::scribe_outbox::{ScribeSink, ScribeWrite, VerifierAttribution};
 use wyrd_server::verification::VerificationRuntime;
 use wyrd_server::verification::engines::{EngineOutcome, VerifierReport};
 use wyrd_server::verification::health::RuntimeCapability;
@@ -32,12 +36,12 @@ use wyrd_server::verification::results::{ResultPayloadBuilder, ResultRun};
 use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
-use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
+use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
+    CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
 };
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::RunInput;
@@ -54,7 +58,7 @@ const WAIT: Duration = Duration::from_mins(1);
 const DAY: Duration = Duration::from_hours(24);
 
 /// A runner on a node without local Scribe publishes a binding-created Drift
-/// result through the gateway capture writer's peer ingest RPC and completes
+/// result through the Scribe outbox's peer ingest RPC and completes
 /// the run. Its summary and both feature rows are queryable through the
 /// Oracle and carry the exact tenant SYSTEM principal, Verifier, subject,
 /// owner, binding, run, result, and one shared event time.
@@ -110,11 +114,11 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     let task = tokio::spawn(runtime.run(stop.clone()));
 
     let deadline = tokio::time::Instant::now() + WAIT;
-    let (run, row) = loop {
+    let row = loop {
         if let Some(run) = seed.runs().await?.first().copied() {
             let row = seed.run(run).await?;
             if row.status != "pending" && row.status != "running" {
-                break (run, row);
+                break row;
             }
         }
         if tokio::time::Instant::now() >= deadline {
@@ -128,12 +132,22 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
         return Err(format!("the run settled {row:?}").into());
     };
 
+    // The runner stages its result on its own outbox after settling the run;
+    // it reaches the peer Scribe only once that outbox drains.
+    let unwritten = oracle
+        .state()
+        .scribe_outbox
+        .settle(std::time::Instant::now() + WAIT)
+        .await;
+    if unwritten != 0 {
+        return Err(format!("{unwritten} results never reached the peer Scribe").into());
+    }
     scribe.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
     let system = seed.system_principal();
     let identity = |alias: &str| {
         format!(
-            "{alias}{RUN_ID} = '{run}' AND {alias}result_id = '{result}' \
+            "{alias}{RUN_ID} IS NULL AND {alias}result_id = '{result}' \
              AND {alias}{PRINCIPAL_ID} = '{system}' AND {alias}{CARD_UID} = '{verifier}' \
              AND {alias}subject_card_uid = '{subject}' AND {alias}owner_card_uid = '{owner}' \
              AND {alias}binding_id = '{binding}'"
@@ -141,7 +155,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
     };
     let checks = [
         (
-            format!("SELECT result_id FROM vala.verification.results WHERE {RUN_ID} = '{run}'"),
+            format!("SELECT result_id FROM vala.verification.results WHERE result_id = '{result}'"),
             1,
             "one published summary for the run",
         ),
@@ -154,7 +168,9 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
             "the summary carries every exact identity",
         ),
         (
-            format!("SELECT result_id FROM vala.drift.result_features WHERE {RUN_ID} = '{run}'"),
+            format!(
+                "SELECT result_id FROM vala.drift.result_features WHERE result_id = '{result}'"
+            ),
             2,
             "two published feature rows for the run",
         ),
@@ -162,7 +178,7 @@ async fn runner_without_local_scribe_publishes_through_a_peer_scribe()
             format!(
                 "SELECT f.result_id FROM vala.drift.result_features f \
                  JOIN vala.verification.results r \
-                   ON f.result_id = r.result_id AND f.{RUN_ID} = r.{RUN_ID} \
+                   ON f.result_id = r.result_id \
                   AND f.{WYRD_EVENT_TIME} = r.{WYRD_EVENT_TIME} \
                   AND f.{PRINCIPAL_ID} = r.{PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
                  WHERE {}",
@@ -230,7 +246,7 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
         .await?;
     // The runner node hosts no Oracle, so the peer that serves the read
     // stages its decision; the cluster barrier drains every Oracle first.
-    cluster.await_audit_published(tenant).await?;
+    cluster.await_audit_retained().await?;
     let reads = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
 
     let runtime = VerificationRuntime::builder(scribe.state())
@@ -254,7 +270,7 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
     if row.status != "completed" || row.result_id.is_none() || row.attempts != 1 {
         return Err(format!("the forwarded Drift run settled {row:?}").into());
     }
-    cluster.await_audit_published(tenant).await?;
+    cluster.await_audit_retained().await?;
     let after = audit_rows(scribe, tenant, "bifrost.query.read_decision").await?;
     if after != reads + 1 {
         return Err(format!("expected one audited peer read, counted {}", after - reads).into());
@@ -346,15 +362,11 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         Some(api_key.expose_secret()),
         scribe.grpc_url().as_deref(),
     )?;
-    let uidless = CardRef {
-        uid: None,
-        ..subject_ref.clone()
-    };
     Bifrost::connect(&writer)
         .await?
         .write_batch(
             "vala.drift.observations",
-            &observation_batch(&record, &uidless.to_string())?,
+            &observation_batch(&record, &subject)?,
         )
         .await?;
     seed.activate(client).await?;
@@ -462,14 +474,14 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     Ok(())
 }
 
-/// One Drift observation `record` of `card_ref`: a drifting `score` and a
+/// One Drift observation `record` of the Card `card_uid`: a drifting `score` and a
 /// `latency` feature, as the SDK's tall projection writes them, with a
 /// client-owned `wyrd_event_time` [`EVENT_TIME_LEAD`] before the client's
 /// clock.
 ///
 /// # Errors
 /// Returns an Arrow error when the batch cannot be assembled.
-fn observation_batch(record: &str, card_ref: &str) -> Result<RecordBatch, ServerJourneyError> {
+fn observation_batch(record: &str, card_uid: &CardUid) -> Result<RecordBatch, ServerJourneyError> {
     let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
     let schema = Arc::new(Schema::new(vec![
         Field::new("record_id", DataType::Utf8, false),
@@ -478,7 +490,7 @@ fn observation_batch(record: &str, card_ref: &str) -> Result<RecordBatch, Server
         Field::new("str_value", DataType::Utf8, true),
         Field::new("session_id", DataType::Utf8, true),
         Field::new("created_at", utc(), false),
-        Field::new(CARD_REF, DataType::Utf8, true),
+        Field::new(CARD_UID, DataType::Utf8, true),
         Field::new(WYRD_EVENT_TIME, utc(), false),
     ]));
     let now = Utc::now().timestamp_micros();
@@ -492,7 +504,10 @@ fn observation_batch(record: &str, card_ref: &str) -> Result<RecordBatch, Server
             Arc::new(StringArray::from(vec![None::<&str>, None])),
             Arc::new(StringArray::from(vec![None::<&str>, None])),
             Arc::new(TimestampMicrosecondArray::from(vec![now, now]).with_timezone("UTC")),
-            Arc::new(StringArray::from(vec![card_ref, card_ref])),
+            Arc::new(StringArray::from(vec![
+                card_uid.as_str(),
+                card_uid.as_str(),
+            ])),
             Arc::new(
                 TimestampMicrosecondArray::from(vec![event_time, event_time]).with_timezone("UTC"),
             ),
@@ -706,8 +721,8 @@ impl<'a> ResultLayoutJourney<'a> {
     }
 
     /// Publish one result with `event_time` through the production payload
-    /// builder and the internal result writer, and flush it into its own
-    /// file; returns its `result_id`.
+    /// builder and a Scribe outbox, and flush it into its own file; returns
+    /// its `result_id`.
     ///
     /// With `straddle`, Scribe's receipt clock moves one day ahead after the
     /// detail batch is acknowledged and before the summary is sent, so the
@@ -715,7 +730,8 @@ impl<'a> ResultLayoutJourney<'a> {
     /// before returning.
     ///
     /// # Errors
-    /// Returns a payload, write, or flush error.
+    /// Returns a payload or flush error, or an error when the outbox loses
+    /// the staged result.
     async fn publish(
         &self,
         event_time: DateTime<Utc>,
@@ -750,19 +766,19 @@ impl<'a> ResultLayoutJourney<'a> {
                         }],
                     },
                     verdict: VerificationVerdict::Inconclusive,
+                    run_id: None,
                 },
             ),
         };
         let result = VerificationResultId::new_v7();
-        let run_id = VerificationRunId::new_v7();
-        let verifier_ref = CardRef {
-            uid: None,
-            ..self.verifier.clone()
-        }
-        .to_string();
+        let verifier_uid = self
+            .verifier
+            .uid
+            .as_ref()
+            .ok_or("the Verifier has no UID")?;
         let payload = ResultPayloadBuilder::new(
             ResultRun {
-                run_id,
+                run_id: None,
                 verifier_version: "1.0.0",
                 subject_card_uid: &self.subject,
                 owner_card_uid: Some(&self.subject),
@@ -770,7 +786,7 @@ impl<'a> ResultLayoutJourney<'a> {
                 trigger: None,
                 input: &input,
             },
-            &verifier_ref,
+            verifier_uid,
             result,
             event_time,
             event_time,
@@ -781,23 +797,26 @@ impl<'a> ResultLayoutJourney<'a> {
             .server
             .bifrost_scribe()
             .ok_or("the mixed node owns no Scribe")?;
-        let summary = payload.batches().len() - 1;
-        self.server
-            .state()
-            .gateway_capture
-            .write_result_payload_for_test(
-                &payload,
-                self.tenant,
-                run_id,
-                &self.verifier,
-                self.system,
-                |index| {
-                    if straddle && index == summary {
-                        scribe.shift_receipt_clock_for_test(DAY);
-                    }
+        let outbox = ScribeSink::local_outbox(Arc::new(StraddleScribe {
+            inner: Arc::clone(&scribe),
+            straddle,
+        }));
+        outbox.stage(
+            self.tenant,
+            ScribeWrite::Result {
+                payload,
+                attribution: VerifierAttribution {
+                    verifier: self.verifier.clone(),
+                    principal: self.system,
                 },
-            )
-            .await?;
+            },
+        );
+        let lost = outbox
+            .shutdown(std::time::Instant::now() + Duration::from_secs(30))
+            .await;
+        if lost != 0 {
+            return Err("the staged result was never written".into());
+        }
         scribe.shift_receipt_clock_for_test(Duration::ZERO);
         self.server.flush_bifrost().await?;
         Ok(result)
@@ -906,6 +925,48 @@ impl<'a> ResultLayoutJourney<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// Scribe decorator that moves the receipt clock one day ahead just before
+/// the summary frame, so a straddling result's detail and summary ACKs fall
+/// on different UTC receipt days.
+struct StraddleScribe {
+    /// The mixed node's real Scribe.
+    inner: Arc<ScribeImpl>,
+    /// Whether to shift the receipt clock before the summary.
+    straddle: bool,
+}
+
+#[async_trait::async_trait]
+impl Scribe for StraddleScribe {
+    /// Mirrors the real Scribe's readiness.
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    /// Shifts the receipt clock before a straddled summary, then forwards
+    /// `frame`.
+    ///
+    /// # Errors
+    /// Returns the real Scribe's outcome.
+    async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
+        if self.straddle && frame.table.fqn() == "vala.verification.results" {
+            self.inner.shift_receipt_clock_for_test(DAY);
+        }
+        self.inner.ingest_frame(frame).await
+    }
+
+    /// Forwards table resolution to the real Scribe.
+    ///
+    /// # Errors
+    /// Returns the real Scribe's resolution error.
+    async fn resolve_write_table(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+    ) -> Result<TableUid, ScribeError> {
+        self.inner.resolve_write_table(tenant, table).await
     }
 }
 

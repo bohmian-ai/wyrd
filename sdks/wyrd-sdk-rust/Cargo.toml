@@ -17,16 +17,45 @@ path = "src/lib.rs"
 # the same implementation the executable renders. Never enabled by a
 # production build.
 testing = ["dep:wyrd-cli"]
+# Stock OpenTelemetry OTLP/HTTP exporters authenticated by a `WyrdClient`,
+# and `start_telemetry`'s `tracing` pipeline over them (`wyrd_sdk::otel`).
+otel = [
+    "dep:async-trait",
+    "dep:opentelemetry",
+    "dep:opentelemetry-http",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry_sdk",
+    "dep:reqwest",
+    "dep:serde_json",
+    "dep:tokio",
+    "dep:tracing",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
 
 [dependencies]
+async-trait = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-http = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true, features = ["http-proto", "logs"] }
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 wyrd-cli = { workspace = true, optional = true }
 wyrd-client = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]
 workspace-hack.workspace = true
+# Short access-token lifetimes for the signed-in expiry story.
+chrono = { workspace = true }
+wyrd-auth-verify = { workspace = true }
 # The journeys run the in-process CLI commands, `wyrd_sdk::cli`.
-wyrd-sdk-rust = { path = ".", features = ["testing"] }
+wyrd-sdk-rust = { path = ".", features = ["otel", "testing"] }
 # Reads the Arrow batches a streamed Bifrost query yields.
 arrow = { workspace = true }
 # The stock OpenTelemetry exporter the OTLP export story configures from
@@ -34,6 +63,8 @@ arrow = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
+# The spans the local-development story starts inside a `Run::scope`.
+tracing = { workspace = true }
 # The OpenAI-compatible Chat Completions caller of the gateway inference story.
 reqwest = { workspace = true }
 secrecy = { workspace = true }

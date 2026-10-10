@@ -1,0 +1,24 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: answer-quality
+  version: 1.0.0
+  space: default
+spec:
+  description: An LLM judge grades every observed answer.
+  implementation:
+    kind: eval
+    spec:
+      pass_gate: {kind: all_pass}
+      tasks:
+        judge:
+          kind: llm_judge
+          id: judge
+          judge_ref:
+            prompt: ./judge-prompt.yaml
+            tool_names: []
+            run_config: {max_iterations: 1}
+          context_path: $.answer
+          operator: equals
+          expected: {passed: true}
+          max_retries: 0

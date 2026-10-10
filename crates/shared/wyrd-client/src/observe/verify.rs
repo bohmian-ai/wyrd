@@ -4,8 +4,8 @@
 //! graph. This module turns the caller's input into the wire input the
 //! Verifier's kind takes, in the same forms `observe.eval` and
 //! `observe.drift` accept, and owns the one transport call to
-//! `POST /v1/verification/execute`. It records nothing: no observation, run,
-//! dispatch, or Bifrost write.
+//! `POST /v1/verification/execute`. It writes no observation, run, or
+//! dispatch; the server records the judgment as one result of the Run.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -33,7 +33,9 @@ type DriftColumns = BTreeMap<String, Vec<Option<DriftSample>>>;
 
 /// Build the wire input a Verifier of `implementation`'s kind judges.
 ///
-/// An Eval Verifier takes one context object with optional media. A Drift
+/// An Eval Verifier takes one context object with optional media, and a task
+/// Verifier takes the context its one check judges, also with optional media.
+/// A Drift
 /// Verifier takes a non-empty sequence of flat feature rows, each validated as
 /// `observe.drift` validates one observation, and receives them as one column
 /// per feature; a feature a row omits is a null sample in that row, which the
@@ -57,6 +59,18 @@ pub(crate) fn direct_input(
                 ));
             };
             Ok(DirectVerificationInput::EvalRecord {
+                context,
+                media: (!media.is_empty()).then_some(media),
+            })
+        }
+        VerifierImplementation::Task(_) => {
+            let Value::Object(context) = input else {
+                return Err(invalid_observation(
+                    "a task Verifier judges one context object",
+                    json!({ "received": shape(&input) }),
+                ));
+            };
+            Ok(DirectVerificationInput::TaskContext {
                 context,
                 media: (!media.is_empty()).then_some(media),
             })
@@ -155,8 +169,8 @@ fn shape(value: &Value) -> &'static str {
 /// # Errors
 /// Returns `WYRD_VERIFICATION_413_INPUT_TOO_LARGE` locally when the input
 /// exceeds a wire bound, and otherwise the server's refusal: malformed,
-/// incompatible, or unsupported input, a caller without `evals:run` or scope
-/// over the subject, an unknown Card, an unready or legacy baseline, a failing
+/// incompatible, or unsupported input, a caller without `verifier:run` on the
+/// Verifier, an unknown Card, an unready or legacy baseline, a failing
 /// judge provider, the deadline, or a transport failure.
 ///
 /// # Cancellation

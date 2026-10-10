@@ -355,6 +355,7 @@ impl Lane {
                     verifier_uid: verifier.clone(),
                     subject_card_uid: subject.clone(),
                     input: kind.input(0, failing),
+                    run_id: None,
                 };
                 Request::Execute(Arc::new([build(false), build(true)]))
             }

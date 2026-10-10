@@ -232,7 +232,7 @@ Observability code is explicit about:
 - Ingestion vs query responsibilities
 
 Every observation row carries server-stamped `principal_id`. Optional per-row
-`card_ref` is server-authorized when present; `run_id` remains opaque.
+`card_uid` is server-authorized when present; `run_id` remains opaque.
 
 Evaluation code keeps deterministic assertions deterministic.
 Model-based judging is isolated from assertion logic and tested with mock
@@ -249,28 +249,23 @@ maintenance, Oracle reader protection) are lineage in their own operational
 tables and are never audit.
 
 Permissions block; audits do not. Every audited decision, on every surface,
-is staged on the one process audit outbox once the decision is known, outside
-the operation's transaction, and the operation proceeds or refuses without
-waiting for the commit. No request is refused or delayed by an audit write. A
+is staged in memory on the one process Scribe outbox once the decision is
+known, outside the operation's transaction, and the operation proceeds or
+refuses without waiting for the write. No request is refused or delayed by an audit write. A
 workflow that evaluates permission more than once stages each evaluation. Do
 not create parallel audit writers.
 
-The outbox commits each tenant's decisions in order through the canonical
-append. A failed commit is retried at the front of its tenant's queue with
-backoff, never dropped, and only after Postgres transaction status confirms
-the earlier commit aborted, so a retry never stages a decision twice. A
-decision is lost only at abrupt process loss, when graceful shutdown reaches
-its deadline with it unwritten, or when Postgres no longer holds the status of
-its failed commit; no other audit table, WAL, relay, or log sink exists to
-prevent that.
+The outbox's one background writer groups each tenant slice by destination,
+encodes Arrow frames with content-derived batch ids, and submits them to the
+local Scribe or to a Scribe pod over the peer plane. A retryable failure
+resubmits the identical slice, which Scribe's durable batch-id fence absorbs;
+a terminal rejection is logged, counted, and consumed. Writes Scribe has not
+acknowledged are lost on abrupt process death or an expired shutdown deadline;
+observable loss is counted and never changes the originating operation.
 
-`vala.audit_staging` is transient write-ahead state with no external consumer.
-Contiguous, tenant-scoped ranges are projected idempotently into retained
-`vala.system.audit_log` history. Ranges are read by a per-tenant watermark
-rather than claimed, and staged rows are garbage-collected once the watermark
-has advanced past them; a replayed range is absorbed by Scribe's durable
-batch-id dedup fence. Staging and the retained log are not competing
-historical authorities.
+Retained audit history is `vala.system.audit_log`. A row carries only decision
+content, ordered by decision time; no audit staging table, publisher, WAL,
+relay, or log sink exists.
 
 ## Verification Pattern
 

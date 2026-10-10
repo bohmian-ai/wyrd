@@ -709,6 +709,7 @@ impl ScribeImpl {
         Scribe::ingest_frame(
             self,
             ScribeIngressFrame {
+                attributed_cards: None,
                 authenticated_tenant: frame.principal.tenant_id,
                 principal: frame.principal,
                 table: frame.table,
@@ -1855,7 +1856,6 @@ impl Scribe for ScribeImpl {
                     | ScribeError::FingerprintMismatch { .. }
                     | ScribeError::TableNotFound { .. }
                     | ScribeError::CardScopeDenied
-                    | ScribeError::CardUnresolved
                     | ScribeError::StreamMismatch { .. } => Some("invalid"),
                     ScribeError::IngressClosed
                     | ScribeError::IngestBusy { .. }
@@ -2228,7 +2228,8 @@ mod telemetry_tests {
 }
 
 impl ScribeImpl {
-    /// Reports the pod's staged backlog from the staging owner.
+    /// Reports the staged backlog of one logical table, or of the whole pod
+    /// when `table_name` is `None`, from the staging owner.
     ///
     /// Live members are every durable staged member not yet retired, ready
     /// or claimed; outstanding claims are taken and not yet settled. A pod
@@ -2239,11 +2240,14 @@ impl ScribeImpl {
     /// Returns [`ScribeError::Internal`] when the staging assembler lock is
     /// poisoned.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn staging_backlog_for_test(&self) -> Result<StagingBacklog, ScribeError> {
+    pub fn staging_backlog_for_test(
+        &self,
+        table_name: Option<&str>,
+    ) -> Result<StagingBacklog, ScribeError> {
         self.persistence
             .as_ref()
             .map_or(Ok(StagingBacklog::default()), |persistence| {
-                persistence.staging_backlog_for_test()
+                persistence.staging_backlog_for_test(table_name)
             })
     }
 

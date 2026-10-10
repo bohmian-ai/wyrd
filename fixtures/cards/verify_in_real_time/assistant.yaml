@@ -14,6 +14,8 @@ spec:
           runs_on: {kind: observations_ready}
         - verifier: ./answer-is-judged.yaml
           runs_on: {kind: observations_ready}
+        - verifier: ./answer-check.yaml
+        - verifier: ./answer-graded.yaml
     - alias: model
       ref:
         kind: Model

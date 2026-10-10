@@ -1,14 +1,14 @@
 //! Private tonic adapter for server-internal writes submitted by a pod without
-//! Scribe: gateway capture and Verifier results.
+//! Scribe: audit decisions, gateway capture, and Verifier results.
 //!
 //! Mounted only on the mutually authenticated peer listener of a pod that runs
 //! Scribe, so every caller already presented the cluster `wyrd-peer`
 //! certificate. That admits a trusted cluster process, not a tenant: the
 //! request names its tenant and destination explicitly and carries no token.
-//! The service accepts only the two capture destinations and the three
-//! Verifier result tables, a result batch only with its run attribution, and
-//! never a reserved system tenant, then submits through the same frame the
-//! in-process writer uses.
+//! The service accepts only the audit log, the two capture destinations, and
+//! the three Verifier result tables, a result batch only with its Verifier
+//! attribution, and the reserved system tenant only for audit history, then
+//! submits through the same frame the in-process Scribe outbox route uses.
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use wyrd_tonic::wyrd::v1::scribe_capture_peer_service_server::{
 };
 use wyrd_tonic::wyrd::v1::{IngestCaptureRequest, IngestCaptureResponse};
 
-use crate::components::gateway::{CaptureBatch, CaptureTable, VerifierAttribution};
+use crate::scribe_outbox::{ScribeBatch, ScribeTable, VerifierAttribution};
 
 /// Private gRPC adapter writing peer-submitted capture into this pod's Scribe.
 pub struct ScribeCapturePeerGrpc {
@@ -49,24 +49,25 @@ impl ScribeCapturePeerGrpc {
     ///
     /// Returns `InvalidArgument` for a malformed tenant, batch, request id, or
     /// Verifier attribution, and `PermissionDenied` for the reserved system
-    /// tenant, any table other than the five server-internal destinations, a
-    /// result batch without attribution, or a capture batch with one.
-    fn batch(request: IngestCaptureRequest) -> Result<CaptureBatch, Status> {
+    /// tenant outside audit history, any table other than the six
+    /// server-internal destinations, a result batch without attribution, or an
+    /// audit or capture batch with one.
+    fn batch(request: IngestCaptureRequest) -> Result<ScribeBatch, Status> {
         let tenant = request
             .tenant_id
             .parse::<DataTenantId>()
             .map_err(|_| Status::invalid_argument("capture tenant_id is not a tenant id"))?;
-        if tenant == DataTenantId::SYSTEM_OWNER {
-            return Err(Status::permission_denied(
-                "capture never writes the reserved system tenant",
-            ));
-        }
-        let table = CaptureTable::from_fqn(&request.table).ok_or_else(|| {
+        let table = ScribeTable::from_fqn(&request.table).ok_or_else(|| {
             Status::permission_denied(format!(
-                "the peer writer accepts only the gateway capture and Verifier result tables, not {}",
+                "the peer writer accepts only the audit, gateway capture, and Verifier result tables, not {}",
                 request.table
             ))
         })?;
+        if tenant == DataTenantId::SYSTEM_OWNER && table != ScribeTable::AuditLog {
+            return Err(Status::permission_denied(
+                "only audit history writes the reserved system tenant",
+            ));
+        }
         let verifier = match (table.is_result(), &request.verifier) {
             (true, Some(wire)) => {
                 Some(VerifierAttribution::from_wire(wire).map_err(Status::invalid_argument)?)
@@ -74,12 +75,12 @@ impl ScribeCapturePeerGrpc {
             (false, None) => None,
             (true, None) => {
                 return Err(Status::permission_denied(
-                    "a Verifier result batch must name its run, Verifier, and SYSTEM principal",
+                    "a Verifier result batch must name its Verifier and SYSTEM principal",
                 ));
             }
             (false, Some(_)) => {
                 return Err(Status::permission_denied(
-                    "a gateway capture batch carries no Verifier attribution",
+                    "an audit or gateway capture batch carries no Verifier attribution",
                 ));
             }
         };
@@ -91,7 +92,7 @@ impl ScribeCapturePeerGrpc {
             .request_id
             .parse::<RequestId>()
             .map_err(|_| Status::invalid_argument("capture request_id is invalid"))?;
-        Ok(CaptureBatch {
+        Ok(ScribeBatch {
             tenant,
             table,
             batch_id,
@@ -138,7 +139,7 @@ mod tests {
     use crate::components::gateway::recording::RecordingScribe;
 
     /// A well-formed request for `tenant` naming `table`, attributed to a
-    /// Verifier run exactly when `table` is a result table.
+    /// Verifier exactly when `table` is a result table.
     fn request(tenant: DataTenantId, table: &str) -> IngestCaptureRequest {
         let result = table.starts_with("vala.verification.")
             || table.ends_with(".result_features")
@@ -156,18 +157,18 @@ mod tests {
     /// A well-formed Verifier result attribution.
     fn attribution() -> VerifierResultAttribution {
         VerifierResultAttribution {
-            run_id: uuid::Uuid::now_v7().to_string(),
             verifier_ref: "default/Verifier/drift-check@1.0.0".to_owned(),
             verifier_uid: uuid::Uuid::now_v7().to_string(),
             principal_id: uuid::Uuid::now_v7().to_string(),
         }
     }
 
-    /// Proves the peer service accepts exactly the two capture destinations
-    /// without attribution and the three Verifier result tables with it, and
-    /// refuses the reserved system tenant, every other table, a result batch
-    /// without its run attribution, a capture batch with one, a reference to a
-    /// non-Verifier Card, and malformed ids, all before any Scribe work.
+    /// Proves the peer service accepts exactly the audit log (for a tenant or
+    /// the system owner) and the two capture destinations without attribution
+    /// and the three Verifier result tables with it, and refuses the reserved
+    /// system tenant elsewhere, every other table, a result batch without its
+    /// attribution, a capture batch with one, a reference to a non-Verifier
+    /// Card, and malformed ids, all before any Scribe work.
     ///
     /// # Panics
     ///
@@ -175,7 +176,12 @@ mod tests {
     #[test]
     fn requests_are_confined_to_tenant_capture_destinations() {
         let tenant = DataTenantId::new_v7();
-        for table in ["vala.gateway.calls", "vala.traces.spans"] {
+        for (tenant, table) in [
+            (tenant, "vala.system.audit_log"),
+            (DataTenantId::SYSTEM_OWNER, "vala.system.audit_log"),
+            (tenant, "vala.gateway.calls"),
+            (tenant, "vala.traces.spans"),
+        ] {
             let batch = ScribeCapturePeerGrpc::batch(request(tenant, table)).expect("accepted");
             assert_eq!((batch.tenant, batch.table.fqn()), (tenant, table));
             assert!(batch.verifier.is_none());
@@ -190,7 +196,6 @@ mod tests {
             let batch = ScribeCapturePeerGrpc::batch(wire).expect("accepted");
             assert_eq!((batch.tenant, batch.table.fqn()), (tenant, table));
             let attribution = batch.verifier.expect("result batches carry attribution");
-            assert_eq!(attribution.run_id.to_string(), sent.run_id);
             assert_eq!(attribution.principal.to_string(), sent.principal_id);
             assert_eq!(
                 attribution.verifier.uid.map(|uid| uid.to_string()),
@@ -207,7 +212,10 @@ mod tests {
                 Code::PermissionDenied,
             ),
             (
-                request(tenant, "vala.system.audit_log"),
+                IngestCaptureRequest {
+                    verifier: Some(attribution()),
+                    ..request(tenant, "vala.system.audit_log")
+                },
                 Code::PermissionDenied,
             ),
             (

@@ -22,13 +22,15 @@ mod service;
 mod workflow;
 
 pub use batches::{BatchAnswer, GatewayBatches};
-pub use capture::GatewayCapture;
+pub use capture::CallCapture;
+pub(crate) use capture::CaptureDrop;
 #[cfg(test)]
-pub(crate) use capture::recording;
-pub(crate) use capture::{CaptureBatch, CaptureTable, VerifierAttribution};
+pub(crate) use capture::{recording, tests as capture_tests};
 pub use ingress::gateway_ingress_router;
 pub(crate) use invocation::unconnected_engine;
-pub use invocation::{GatewayCallRequest, GatewayCallResponse, GatewayInvocation};
+pub use invocation::{
+    GatewayCallRequest, GatewayCallResponse, GatewayCallSubject, GatewayInvocation,
+};
 pub use routes::gateway_router;
 pub use service::GatewayAdministration;
 pub(crate) use service::invalid;

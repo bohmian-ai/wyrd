@@ -3897,9 +3897,31 @@ export interface ServiceSpec {
    */
   readonly service_type?: string | null;
   /**
+   * Bifrost dataset tables this Service writes.
+   *
+   * Registration validates and ensures each one in `vala.datasets` before the Service becomes active; removing the Service never drops them.
+   */
+  readonly tables?: readonly ServiceTable[];
+  /**
    * Continuous verification bindings owned by this Service as a whole.
    */
   readonly verified_by?: readonly VerificationBinding[];
+}
+
+/**
+ * One Bifrost dataset table a Service declares.
+ *
+ * `schema` is a JSON Schema object in the subset Bifrost table registration accepts (a Pydantic `model_json_schema()` shape); an existing table of the same name must carry the same fields.
+ */
+export interface ServiceTable {
+  /**
+   * Dataset table name inside `vala.datasets`.
+   */
+  readonly name: string;
+  /**
+   * JSON Schema object describing the table's user fields, whose `properties` order is the table's column order.
+   */
+  readonly schema: unknown;
 }
 
 /**
@@ -4049,6 +4071,87 @@ export type TaskId = string;
 export type TaskType = "BinaryClassification" | "MultiClassClassification" | "Regression" | "Clustering" | "AnomalyDetection" | "Forecasting" | "Generation" | "Other";
 
 /**
+ * The body of a `task` Verifier: exactly one check, judged directly.
+ *
+ * A real-time assertion or LLM judge is not an Eval workflow, so it carries no task map, dataset, sampling, pass gate, or task graph. Its one `kind`-tagged definition sits directly under `implementation.spec` and reuses the existing assertion and LLM-judge payloads. Deserialization refuses `depends_on` and `condition`, which have no meaning for one check, and any unknown field such as a nested `task:` wrapper.
+ */
+export type TaskVerifierSpec = TaskVerifierSpecAssertion | TaskVerifierSpecLlmJudge;
+
+/**
+ * Programmatic assertion against the supplied context.
+ */
+export interface TaskVerifierSpecAssertion {
+  /**
+   * Optional gate evaluated before the task runs.
+   */
+  readonly condition?: EvalCondition | null;
+  /**
+   * Path to the single value to assert against.
+   */
+  readonly context_path?: JsonPath | null;
+  /**
+   * IDs of upstream tasks that must complete before this task runs.
+   */
+  readonly depends_on?: readonly TaskId[];
+  /**
+   * Right-hand side of the comparison.
+   */
+  readonly expected: unknown;
+  /**
+   * Unique identifier within the enclosing eval task map.
+   */
+  readonly id: TaskId;
+  /**
+   * Path to an array the runtime iterates and asserts per item.
+   */
+  readonly item_context_path?: JsonPath | null;
+  readonly kind: "assertion";
+  /**
+   * Comparison applied to the observed value and expected value.
+   */
+  readonly operator: ComparisonOperator;
+}
+
+/**
+ * LLM-as-judge evaluation of the supplied context.
+ */
+export interface TaskVerifierSpecLlmJudge {
+  /**
+   * Optional gate evaluated before the task runs.
+   */
+  readonly condition?: EvalCondition | null;
+  /**
+   * Optional JSONPath selecting the context passed to the judge.
+   */
+  readonly context_path?: JsonPath | null;
+  /**
+   * IDs of upstream tasks that must complete before this task runs.
+   */
+  readonly depends_on?: readonly TaskId[];
+  /**
+   * Right-hand side of the comparison.
+   */
+  readonly expected: unknown;
+  /**
+   * Unique identifier within the enclosing eval task map.
+   */
+  readonly id: TaskId;
+  /**
+   * Reference to or inline definition of an Agent card.
+   */
+  readonly judge_ref: InlineableRef_for_AgentSpec;
+  readonly kind: "llm_judge";
+  /**
+   * Maximum retries on transient runtime failures.
+   */
+  readonly max_retries?: number;
+  /**
+   * Comparison applied to the judge response and expected value.
+   */
+  readonly operator: ComparisonOperator;
+}
+
+/**
  * Config for the Tensorflow model interface.
  */
 export interface TensorflowMeta {
@@ -4183,8 +4286,10 @@ export interface VerificationBinding {
   readonly on_failure?: readonly InlineableRef_for_OperatorSpec[];
   /**
    * When the bound Verifier runs, inline or as a referenced Trigger Card.
+   *
+   * Absent means explicit-only: the binding attaches the Verifier to its subject for direct invocation and nothing activates it.
    */
-  readonly runs_on: InlineableRef_for_TriggerSpec;
+  readonly runs_on?: InlineableRef_for_TriggerSpec | null;
   /**
    * The exact Verifier Card this subject is verified by.
    */
@@ -4228,7 +4333,7 @@ export interface VerificationStatus {
  *
  * Adjacently tagged so that `implementation.kind` selects the variant and the variant's own typed body lives under `implementation.spec`. An unknown `kind` fails deserialization before validation or persistence, so a future implementation cannot be authored until its variant ships.
  */
-export type VerifierImplementation = VerifierImplementationDrift | VerifierImplementationEval;
+export type VerifierImplementation = VerifierImplementationDrift | VerifierImplementationEval | VerifierImplementationTask;
 
 /**
  * Continuous distribution or metric drift over observed records.
@@ -4244,6 +4349,14 @@ export interface VerifierImplementationDrift {
 export interface VerifierImplementationEval {
   readonly kind: "eval";
   readonly spec: EvalSpec;
+}
+
+/**
+ * One direct assertion or LLM judge over supplied JSON context.
+ */
+export interface VerifierImplementationTask {
+  readonly kind: "task";
+  readonly spec: TaskVerifierSpec;
 }
 
 /**

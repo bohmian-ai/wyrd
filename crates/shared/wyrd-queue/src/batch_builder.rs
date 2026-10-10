@@ -2,7 +2,7 @@
 //!
 //! The Wyrd-native `DynamicBatchBuilder` analog, minus server-stamped column
 //! injection. The client batch carries **user columns plus the two per-row
-//! correlation columns `card_ref` and `run_id`** (both client-supplied), then
+//! correlation columns `card_uid` and `run_id`** (both client-supplied), then
 //! the non-null `wyrd_event_time` when the rows carry one; the server stamps
 //! the per-request system columns and, for a batch without event time, its
 //! receipt instant. Rows are appended as deferred `serde_json::Value`
@@ -19,15 +19,13 @@ use arrow::array::{
 use arrow::ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde_json::{Map, Value};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
+use wyrd_spec::vala::managed_columns::{CARD_UID, WYRD_EVENT_TIME};
 
 use crate::error::WyrdQueueError;
 
-/// Reserved per-row correlation column carrying the client's card reference.
-pub const CARD_REF_COLUMN: &str = "card_ref";
 /// Reserved per-row correlation column carrying the client's run identifier.
 pub const RUN_ID_COLUMN: &str = "run_id";
 const RESERVED_PREFIX: &str = "wyrd_";
@@ -36,15 +34,15 @@ const RESERVED_PREFIX: &str = "wyrd_";
 /// or one of the two correlation columns presented as a payload key).
 #[must_use]
 pub fn is_reserved_column(name: &str) -> bool {
-    name.starts_with(RESERVED_PREFIX) || name == CARD_REF_COLUMN || name == RUN_ID_COLUMN
+    name.starts_with(RESERVED_PREFIX) || name == CARD_UID || name == RUN_ID_COLUMN
 }
 
 /// One appended row: its user payload, correlation, and event time.
 struct BuiltRow {
     /// The user columns, without the reserved event-time key.
     obj: Map<String, Value>,
-    /// The serialized Card correlation, or `None` for an uncorrelated row.
-    card_ref: Option<String>,
+    /// The correlated Card's UID text, or `None` for an uncorrelated row.
+    card_uid: Option<String>,
     /// The run correlation, or `None` when the row belongs to no run.
     run_id: Option<String>,
     /// Microseconds since the Unix epoch, UTC: the payload's own
@@ -111,9 +109,11 @@ impl BatchBuilder {
 
     /// Append one serialized JSON row plus its per-row correlation and event time.
     ///
-    /// `card_ref` is optional: Card correlation is an optional property of a
+    /// `card_uid` is optional: Card correlation is an optional property of a
     /// row, so `None` is sent as a null correlation value and the server stores
-    /// the row under its authenticated principal with no `card_uid`.
+    /// the row under its authenticated principal with no `card_uid`. A present
+    /// UID is stored only after the server confirms the writer may correlate
+    /// to it.
     /// `event_time_micros` (microseconds since the Unix epoch, UTC) is the
     /// writer's stamp and becomes the row's `wyrd_event_time`, unless the
     /// payload carries its own non-null `wyrd_event_time` RFC 3339 string,
@@ -125,12 +125,12 @@ impl BatchBuilder {
     /// - [`WyrdQueueError::SchemaParse`] if `json` is not a JSON object, or its
     ///   `wyrd_event_time` is not an RFC 3339 timestamp string.
     /// - [`WyrdQueueError::ReservedColumn`] if the row carries any other
-    ///   `wyrd_*` key or a `card_ref`/`run_id` key (those are supplied via the
+    ///   `wyrd_*` key or a `card_uid`/`run_id` key (those are supplied via the
     ///   arguments, never the payload).
     pub fn append_json_row(
         &mut self,
         json: &str,
-        card_ref: Option<&CardRef>,
+        card_uid: Option<&CardUid>,
         run_id: Option<&RunId>,
         event_time_micros: Option<i64>,
     ) -> Result<(), WyrdQueueError> {
@@ -160,7 +160,7 @@ impl BatchBuilder {
         }
         self.rows.push(BuiltRow {
             obj,
-            card_ref: card_ref.map(ToString::to_string),
+            card_uid: card_uid.map(|uid| uid.as_str().to_owned()),
             run_id: run_id.map(|r| r.as_str().to_owned()),
             event_time,
         });
@@ -188,11 +188,11 @@ impl BatchBuilder {
             columns.push(build_column(field, &self.rows)?);
         }
         // Reserved correlation columns: both nullable Utf8, because a row may
-        // legitimately carry no Card reference and no run.
+        // legitimately carry no Card and no run.
         columns.push(Arc::new(
             self.rows
                 .iter()
-                .map(|r| r.card_ref.clone())
+                .map(|r| r.card_uid.clone())
                 .collect::<StringArray>(),
         ));
         columns.push(Arc::new(
@@ -232,7 +232,7 @@ impl BatchBuilder {
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        fields.push(Field::new(CARD_REF_COLUMN, DataType::Utf8, true));
+        fields.push(Field::new(CARD_UID, DataType::Utf8, true));
         fields.push(Field::new(RUN_ID_COLUMN, DataType::Utf8, true));
         if self.carries_event_time() {
             fields.push(Field::new(
@@ -534,7 +534,7 @@ fn parse_fraction_micros(frac: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod batch_builder_tests {
-    //! `BatchBuilder` proof: user cols + `card_ref`/`run_id`, reserved/type-mismatch
+    //! `BatchBuilder` proof: user cols + `card_uid`/`run_id`, reserved/type-mismatch
     //! rejection, and Arrow IPC round-trip.
 
     use std::sync::Arc;
@@ -543,7 +543,7 @@ mod batch_builder_tests {
     use arrow::array::{Array, FixedSizeBinaryArray, Int64Array, StringArray};
     use arrow::ipc::reader::StreamReader;
     use arrow_schema::{DataType, Field, Schema};
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::ids::CardUid;
     use wyrd_spec::vala::ids::RunId;
 
     fn user_schema() -> Arc<Schema> {
@@ -553,10 +553,11 @@ mod batch_builder_tests {
         ]))
     }
 
-    fn card(name: &str) -> CardRef {
-        format!("prod/Service/{name}@1.0.0")
+    /// The fixed Card UID whose final hex digit is `last`.
+    fn card(last: char) -> CardUid {
+        format!("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b2{last}")
             .parse()
-            .expect("valid card ref")
+            .expect("valid card uid")
     }
 
     #[test]
@@ -565,18 +566,13 @@ mod batch_builder_tests {
         builder
             .append_json_row(
                 r#"{"id": 1, "name": "a"}"#,
-                Some(&card("alpha")),
+                Some(&card('1')),
                 Some(&RunId::from_string("run-1".to_owned())),
                 None,
             )
             .expect("row appends");
         builder
-            .append_json_row(
-                r#"{"id": 2, "name": null}"#,
-                Some(&card("beta")),
-                None,
-                None,
-            )
+            .append_json_row(r#"{"id": 2, "name": null}"#, Some(&card('2')), None, None)
             .expect("row appends");
         builder
             .append_json_row(r#"{"id": 3, "name": "c"}"#, None, None, None)
@@ -584,15 +580,15 @@ mod batch_builder_tests {
 
         let batch = builder.finish().expect("finish");
 
-        // user columns + card_ref + run_id; unstamped rows carry no event time
+        // user columns + card_uid + run_id; unstamped rows carry no event time
         assert_eq!(batch.num_columns(), 4);
         assert_eq!(batch.num_rows(), 3);
         let schema = batch.schema();
-        assert_eq!(schema.field(2).name(), "card_ref");
+        assert_eq!(schema.field(2).name(), "card_uid");
         assert_eq!(schema.field(3).name(), "run_id");
         assert!(
             schema.field(2).is_nullable(),
-            "card_ref is nullable: Card correlation is optional"
+            "card_uid is nullable: Card correlation is optional"
         );
         assert!(schema.field(3).is_nullable(), "run_id is nullable");
 
@@ -612,14 +608,14 @@ mod batch_builder_tests {
         assert_eq!(names.value(0), "a");
         assert!(names.is_null(1), "explicit null preserved");
 
-        let card_refs = batch
+        let card_uids = batch
             .column(2)
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("utf8");
-        assert_eq!(card_refs.value(0), "prod/Service/alpha@1.0.0");
-        assert_eq!(card_refs.value(1), "prod/Service/beta@1.0.0");
-        assert!(card_refs.is_null(2), "omitted card_ref is null");
+        assert_eq!(card_uids.value(0), card('1').as_str());
+        assert_eq!(card_uids.value(1), card('2').as_str());
+        assert!(card_uids.is_null(2), "omitted card_uid is null");
 
         let run_ids = batch
             .column(3)
@@ -637,8 +633,8 @@ mod batch_builder_tests {
 
         let err = builder
             .append_json_row(
-                r#"{"id": 1, "card_ref": "x"}"#,
-                Some(&card("alpha")),
+                r#"{"id": 1, "card_uid": "x"}"#,
+                Some(&card('1')),
                 None,
                 None,
             )
@@ -646,12 +642,7 @@ mod batch_builder_tests {
         assert_eq!(err.code(), "WYRD_VALA_400_BIFROST_RESERVED_COLUMN");
 
         let err = builder
-            .append_json_row(
-                r#"{"id": 1, "wyrd_ts": 1}"#,
-                Some(&card("alpha")),
-                None,
-                None,
-            )
+            .append_json_row(r#"{"id": 1, "wyrd_ts": 1}"#, Some(&card('1')), None, None)
             .unwrap_err();
         assert_eq!(err.code(), "WYRD_VALA_400_BIFROST_RESERVED_COLUMN");
     }
@@ -719,7 +710,7 @@ mod batch_builder_tests {
         builder
             .append_json_row(
                 r#"{"id": "not-an-int", "name": "a"}"#,
-                Some(&card("alpha")),
+                Some(&card('1')),
                 None,
                 None,
             )
@@ -733,7 +724,7 @@ mod batch_builder_tests {
     fn non_nullable_absent_value_fails() {
         let mut builder = BatchBuilder::new(user_schema());
         builder
-            .append_json_row(r#"{"name": "a"}"#, Some(&card("alpha")), None, None)
+            .append_json_row(r#"{"name": "a"}"#, Some(&card('1')), None, None)
             .expect("appends deferred");
 
         let err = builder.finish().unwrap_err();
@@ -746,7 +737,7 @@ mod batch_builder_tests {
         builder
             .append_json_row(
                 r#"{"id": 7, "name": "seven"}"#,
-                Some(&card("alpha")),
+                Some(&card('1')),
                 None,
                 None,
             )

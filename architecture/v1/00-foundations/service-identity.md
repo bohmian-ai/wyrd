@@ -41,6 +41,6 @@ create or elevate a platform principal, and the platform connection's absence or
 outage never blocks administration through the global administrative credential.
 
 Credential issuance, token exchange, and every platform or tenant authorization
-decision stage a durable audit row through the one canonical append, in the same
-transaction that made the decision. Fire-and-forget audit emission is not part
-of this foundation.
+decision stage one audit event on the process Scribe outbox once the decision is
+known, outside the decision's transaction. The decision never waits for, or is
+reversed by, the audit write.

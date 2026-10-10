@@ -24,6 +24,12 @@ pub struct PyWyrdClient {
 }
 
 impl PyWyrdClient {
+    /// Wrap a Rust client another boundary type already holds, such as the
+    /// client a `WyrdState` resolved, so Python helpers can authenticate as it.
+    pub(crate) const fn from_native(inner: WyrdClient) -> Self {
+        Self { inner }
+    }
+
     /// Borrow the wrapped Rust client so another boundary type, such as the
     /// Bifrost facade, can compose it without re-resolving a credential.
     pub(crate) const fn inner(&self) -> &WyrdClient {

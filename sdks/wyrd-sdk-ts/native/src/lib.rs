@@ -10,6 +10,8 @@ pub mod cli;
 pub mod client;
 pub mod gateway;
 pub mod operators;
+/// The napi projection of the tenant principal handle.
+pub mod principals;
 pub mod workflow;
 
 use std::result::Result as StdResult;
@@ -743,16 +745,16 @@ impl NativeBifrost {
     /// # Errors
     ///
     /// Returns a napi error only when the outcome cannot be encoded; an invalid
-    /// card reference, no-active-table, and queue-full refusals are returned in
+    /// Card UID, no-active-table, and queue-full refusals are returned in
     /// [`NativeLifecycleResult`].
     #[napi]
     pub fn insert(
         &self,
         row: String,
-        card_ref: Option<String>,
+        card_uid: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
-        let inserted = correlation(card_ref.as_deref(), run_id)
+        let inserted = correlation(card_uid.as_deref(), run_id)
             .and_then(|correlation| self.client.insert(row.into_bytes(), correlation));
         match inserted {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
@@ -839,7 +841,7 @@ impl NativeBifrost {
     /// # Errors
     ///
     /// Returns a napi error only when the outcome cannot be encoded; an
-    /// unparsable or unmappable schema and an invalid card reference are
+    /// unparsable or unmappable schema and an invalid Card UID are
     /// returned in [`NativeLifecycleResult`].
     #[napi]
     pub fn record(
@@ -847,11 +849,11 @@ impl NativeBifrost {
         table: String,
         schema_json: String,
         row: String,
-        card_ref: Option<String>,
+        card_uid: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
         let recorded = telemetry_schema(&schema_json).and_then(|schema| {
-            let correlation = correlation(card_ref.as_deref(), run_id)?;
+            let correlation = correlation(card_uid.as_deref(), run_id)?;
             wyrd_client::bifrost::observe::record(
                 &self.client,
                 &table,
@@ -1190,17 +1192,17 @@ fn telemetry_schema(schema_json: &str) -> StdResult<SchemaRef, BifrostClientErro
 ///
 /// # Errors
 ///
-/// Returns the shared validation refusal when `card_ref` is not one parsable
-/// Card reference.
+/// Returns the shared validation refusal when `card_uid` is not one parsable
+/// Card UID.
 fn correlation(
-    card_ref: Option<&str>,
+    card_uid: Option<&str>,
     run_id: Option<String>,
 ) -> StdResult<Correlation, BifrostClientError> {
     Ok(Correlation {
-        card_ref: card_ref
+        card_uid: card_uid
             .map(str::parse)
             .transpose()
-            .map_err(|error| validation_error(format!("invalid cardRef: {error}"), "cardRef"))?,
+            .map_err(|error| validation_error(format!("invalid cardUid: {error}"), "cardUid"))?,
         run_id: run_id.map(RunId::from_string),
     })
 }

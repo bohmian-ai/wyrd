@@ -7,21 +7,29 @@
 //! `bifrost_query:read` grants scoped by registered table UID to exactly the
 //! tables the run reads. No token is minted or verified; Oracle's table
 //! authorization enforces and audits every read under it like any caller's.
+//!
+//! LLM judge calls are not reads: [`writer_caller`] recovers the observation
+//! writer's own current authority for them, never the SYSTEM principal's.
+
+use std::sync::Arc;
 
 use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
 use vala_sql::queries::olap_catalog::get_by_fqn;
+use wyrd_auth::issuance::IssuanceError;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_runtime::{
     Action, BifrostPermissionScope, BifrostTableScope, Permission, PermissionScope,
 };
 use wyrd_spec::DataTenantId;
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuthMethod;
 use wyrd_spec::vala::error::BifrostError;
 
+use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::state::AppState;
 
 /// Why a SYSTEM read authority cannot be built for a run.
@@ -162,4 +170,48 @@ impl SystemReadAuthority {
     pub fn into_context(self) -> AuthorizedQueryContext {
         self.context
     }
+}
+
+/// Recover the current authority of `principal`, the stored writer of one
+/// observation, as the caller its queued LLM judge calls run under.
+///
+/// The writer is resolved through the tenant issuer's
+/// [`recover`](wyrd_auth::issuance::TenantTokenIssuer::recover) with its
+/// current roles, permissions, and Card scope, so the gateway authorizes,
+/// accounts, captures, and audits each judge call as that writer's own.
+/// Nothing is cached, presented, or minted.
+///
+/// # Errors
+/// Returns [`WyrdError::CredentialRevoked`] when the writer is missing or
+/// not active, [`WyrdError::Internal`] when `principal` is not a principal
+/// id or no issuer is configured, and the issuer's store-unavailable error
+/// when the tenant store cannot be read.
+pub async fn writer_caller(
+    state: &AppState,
+    tenant: DataTenantId,
+    principal: &str,
+) -> Result<Caller, WyrdError> {
+    let internal = |message: &str| WyrdError::Internal {
+        message: message.to_owned(),
+        details: serde_json::json!({}),
+    };
+    let principal = uuid::Uuid::parse_str(principal)
+        .map_err(|_| internal("the observation writer is not a principal id"))?;
+    let issuer = state
+        .auth
+        .tenant_issuer(&state.scribe_outbox)
+        .ok_or_else(|| internal("no tenant token issuer is configured"))?;
+    let mut conn = state
+        .postgres
+        .tenant_conn(tenant)
+        .await
+        .map_err(|error| WyrdError::from(IssuanceError::Store(error)))?;
+    let verified = issuer.recover(&mut conn, principal).await?;
+    conn.commit()
+        .await
+        .map_err(|error| WyrdError::from(IssuanceError::Store(error)))?;
+    Ok(Caller::from_authenticated(
+        &AuthenticatedPrincipal::from_verified(Arc::new(verified)),
+        RequestId::now_v7(),
+    ))
 }

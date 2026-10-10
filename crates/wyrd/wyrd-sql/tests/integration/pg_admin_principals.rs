@@ -23,7 +23,7 @@ mod pg_tests {
         ApiKeyStatus, api_key_by_prefix, api_key_status_by_prefix, credential_belongs_to,
         delete_service_account, insert_api_key, insert_refresh_token, insert_role,
         insert_service_account, insert_user, list_api_key_metadata, list_service_account_roles,
-        list_user_roles, provision_system_principal, replace_user_roles,
+        list_user_roles, provision_system_principal, replace_idp_user_roles,
         service_account_by_card_ref, service_account_by_id, suspend_service_account_principal,
         system_principal_id, tenant_admin_principal_id,
     };
@@ -707,7 +707,7 @@ mod pg_tests {
         insert_role(&mut conn, role_a, "rls-probe", &permissions, false)
             .await
             .expect("A role inserts");
-        replace_user_roles(&mut conn, user, &["rls-probe"])
+        replace_idp_user_roles(&mut conn, user, &["rls-probe"])
             .await
             .expect("A replaces roles against its own role");
         assert_eq!(
@@ -739,7 +739,7 @@ mod pg_tests {
                 .await
                 .expect("A binding reads");
         assert_eq!(bound, role_a, "the shared role name binds A's role only");
-        replace_user_roles(&mut conn, user, &[])
+        replace_idp_user_roles(&mut conn, user, &[])
             .await
             .expect("A clears roles");
         assert!(

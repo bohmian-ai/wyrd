@@ -70,8 +70,9 @@ pub struct WyrdGatewayCall {
     pub fallback: Option<GatewayFallbackOverride>,
     /// Remaining time the call may take; the caller enforces it.
     pub timeout: Duration,
-    /// Run, step, and attempt that made the call.
-    pub correlation: WorkflowGatewayCorrelation,
+    /// Run, step, and attempt that made the call; `None` outside a Workflow
+    /// run.
+    pub correlation: Option<WorkflowGatewayCorrelation>,
 }
 
 /// Narrow seam to the execution environment's governed Wyrd gateway.
@@ -413,7 +414,7 @@ impl StepRoute {
                 model: model.clone(),
                 deadline: context.deadline,
                 cancellation: context.cancellation,
-                correlation: context.correlation,
+                correlation: Some(context.correlation),
                 provider: context.provider,
             }),
             Self::External { client } => Arc::new(ExternalGatewayProvider {
@@ -424,6 +425,32 @@ impl StepRoute {
         };
         Some(ProviderRegistry::new().with(adapter))
     }
+}
+
+/// Build a provider registry serving `prompt`'s model calls through `caller`
+/// outside any Workflow run.
+///
+/// It holds the same one gateway adapter a `wyrd_gateway` step attempt uses,
+/// keyed by the Prompt's provider, with no fallback, deadline, cancellation,
+/// or run correlation; each call carries [`DEFAULT_GATEWAY_CALL_TIMEOUT`].
+/// Returns `None` when the Prompt's provider and model are not a gateway
+/// model identity.
+#[must_use]
+pub fn wyrd_gateway_registry(
+    caller: Arc<dyn WyrdGatewayCaller>,
+    prompt: &Prompt,
+) -> Option<ProviderRegistry> {
+    let provider = prompt.provider();
+    let model = gateway_model(&provider, &prompt.model)?;
+    Some(ProviderRegistry::new().with(Arc::new(WyrdGatewayProvider {
+        caller,
+        fallback: None,
+        model,
+        deadline: None,
+        cancellation: CancellationToken::new(),
+        correlation: None,
+        provider,
+    })))
 }
 
 /// Return true when `request`'s native dialect is the one `protocol` accepts.
@@ -551,8 +578,8 @@ struct WyrdGatewayProvider {
     deadline: Option<Instant>,
     /// Run cancellation forwarded to the caller.
     cancellation: CancellationToken,
-    /// Attempt correlation.
-    correlation: WorkflowGatewayCorrelation,
+    /// Attempt correlation; `None` outside a Workflow run.
+    correlation: Option<WorkflowGatewayCorrelation>,
     /// Provider name the adapter registers under.
     provider: ProviderName,
 }

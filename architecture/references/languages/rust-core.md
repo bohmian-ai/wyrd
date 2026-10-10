@@ -597,12 +597,14 @@ atomically.
 
 Audit follows evaluated permission decisions. Stage exactly one allowed or
 denied event for every verdict a receiving boundary reaches on the process
-audit outbox (`AuditOutbox::stage`), never inside the operation's transaction.
+Scribe outbox (`AppState::scribe_outbox`; lower crates stage through
+`wyrd_runtime::audit::AuditStage`), never inside the operation's transaction.
 Authorization still completes before protected work, but the operation never
-waits for, or is reversed by, the audit commit; the outbox retries a failed
-commit and counts it in `outbox_write_failures_total{outbox="audit"}`. A transition that
-evaluates no permission — a Scribe batch commit, Forge maintenance, audit
-publication, a reconciliation or storage lifecycle step — records lineage in
+waits for, or is reversed by, the audit write; the outbox resubmits the
+identical slice after a retryable failure and counts it in
+`outbox_write_failures_total{outbox="scribe"}`. A transition that
+evaluates no permission — a Scribe batch commit, Forge maintenance, a
+reconciliation or storage lifecycle step — records lineage in
 its own operational table and structured tracing, never canonical audit. Forge operator lineage remains behind
 its fenced, tenant-bound capability.
 

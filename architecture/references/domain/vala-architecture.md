@@ -48,7 +48,7 @@ Wyrd-owned analytical storage and is not a Card kind.
   publication, leases and fences, reconciliation, retention, cleanup, and
   maintenance telemetry.
 - **Postgres** owns catalog pointers, tenant-scoped control state, leases,
-  operation identities, and staged audit rows. It does not store
+  and operation identities. It does not store
   analytical payload bytes.
 - **Object storage** owns immutable Parquet and Iceberg metadata objects. A
   path or prefix is never an authorization boundary.
@@ -75,7 +75,7 @@ semantics.
   mismatch, contradictory durable evidence, or ambiguous publication fails
   closed without discarding the last valid authority.
 - Audit cardinality follows evaluated permission decisions: one event per
-  received verdict, staged on the process audit outbox without delaying the
+  received verdict, staged on the process Scribe outbox without delaying the
   result or refusal. No surface has an audit exception or a local audit WAL.
   Engine-internal transitions record lineage in their own operational tables
   instead of audit.

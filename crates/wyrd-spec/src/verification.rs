@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::PrincipalId;
 use crate::card::drift::{DriftMethod, DriftProfile};
 use crate::card::operator::VerifierCounts;
-use crate::card::verifier::VerifierImplementation;
+use crate::card::verifier::{VerifierImplementation, VerifierTask};
 use crate::error::WyrdError;
 use crate::ids::{
     BindingId, CardUid, FeatureName, OperatorDispatchId, VerificationExecutionId,
@@ -29,6 +29,7 @@ use crate::vala::eval::EvalTask;
 use crate::vala::eval::ids::TaskId;
 use crate::vala::eval::media::MediaRef;
 use crate::vala::eval::result::AssertionResult;
+use crate::vala::ids::RunId;
 
 /// Longest manual Drift window a caller may request: 31 days.
 ///
@@ -428,12 +429,17 @@ pub enum VerifierKind {
     EvalLlmJudge,
     /// A supported non-judge Eval graph with trace or agent assertions.
     EvalOther,
+    /// A task Verifier running one record assertion.
+    TaskAssertion,
+    /// A task Verifier running one LLM judge.
+    TaskLlmJudge,
     /// An execution whose exact spec could not be resolved or classified.
     Unknown,
 }
 
 impl VerifierKind {
-    /// Classify `implementation` by its Drift profile or its Eval task graph.
+    /// Classify `implementation` by its Drift profile, its Eval task graph, or
+    /// its one task.
     ///
     /// A Drift spec without a profile cannot be classified and is
     /// [`Unknown`](Self::Unknown); an empty Eval graph is
@@ -462,6 +468,10 @@ impl VerifierKind {
                     Self::EvalOther
                 }
             }
+            VerifierImplementation::Task(spec) => match spec.definition {
+                VerifierTask::Assertion(_) => Self::TaskAssertion,
+                VerifierTask::LlmJudge(_) => Self::TaskLlmJudge,
+            },
         }
     }
 
@@ -498,6 +508,16 @@ pub enum DirectVerificationInput {
         #[cfg_attr(feature = "server", schema(value_type = Option<Vec<Object>>))]
         media: Option<Vec<MediaRef>>,
     },
+    /// The context one task Verifier checks.
+    TaskContext {
+        /// The context the assertion selects from or the judge receives.
+        #[cfg_attr(feature = "server", schema(value_type = Object))]
+        context: serde_json::Map<String, serde_json::Value>,
+        /// Media a judge Prompt binds, by object-storage reference.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "server", schema(value_type = Option<Vec<Object>>))]
+        media: Option<Vec<MediaRef>>,
+    },
     /// Feature samples for a Drift Verifier, one column per feature.
     DriftSamples {
         /// Feature name to its samples in observation order.
@@ -516,6 +536,11 @@ pub struct ExecuteVerificationRequest {
     pub subject_card_uid: CardUid,
     /// The supplied input.
     pub input: DirectVerificationInput,
+    /// The caller's application Run the judgment belongs to, recorded as the
+    /// result's `run_id` and source record; omitted when the caller has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    pub run_id: Option<RunId>,
 }
 
 impl ExecuteVerificationRequest {
@@ -540,8 +565,8 @@ impl ExecuteVerificationRequest {
     /// # Errors
     /// Returns [`WyrdError::VerificationInputTooLarge`] for more than
     /// [`MAX_DRIFT_SAMPLE_COLUMNS`] columns, a column over
-    /// [`MAX_DRIFT_SAMPLE_VALUES`] values, or a context over
-    /// [`MAX_EVAL_CONTEXT_BYTES`] serialized bytes.
+    /// [`MAX_DRIFT_SAMPLE_VALUES`] values, or an `eval_record` or
+    /// `task_context` context over [`MAX_EVAL_CONTEXT_BYTES`] serialized bytes.
     pub fn validate(&self) -> Result<(), WyrdError> {
         let too_large = |message: String| WyrdError::VerificationInputTooLarge {
             message,
@@ -571,6 +596,14 @@ impl ExecuteVerificationRequest {
                     )));
                 }
             }
+            DirectVerificationInput::TaskContext { context, .. } => {
+                let bytes = serde_json::to_vec(context).map_or(usize::MAX, |body| body.len());
+                if bytes > MAX_EVAL_CONTEXT_BYTES {
+                    return Err(too_large(format!(
+                        "task_context.context may be at most {MAX_EVAL_CONTEXT_BYTES} bytes"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -578,7 +611,8 @@ impl ExecuteVerificationRequest {
 
 /// The engine report of a direct execution, by implementation.
 ///
-/// Serialized as `{ "drift": DriftReport }` or `{ "eval": EvalReport }`.
+/// Serialized as `{ "drift": DriftReport }`, `{ "eval": EvalReport }`, or
+/// `{ "task": { "result": AssertionResult } }`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -587,6 +621,13 @@ pub enum VerificationExecutionDetail {
     Drift(DriftReport),
     /// The ran and skipped tasks of an Eval Verifier.
     Eval(EvalReport),
+    /// The one check result of a task Verifier.
+    Task {
+        /// The assertion or judge result of the one check, boxed because it
+        /// is far larger than the other variants.
+        #[cfg_attr(feature = "server", schema(value_type = Object))]
+        result: Box<AssertionResult>,
+    },
 }
 
 /// The verdict of one Drift feature or of a whole Drift report.
@@ -695,8 +736,10 @@ pub struct Judgment {
     pub verdict: VerificationVerdict,
     /// Bounded human-readable summary of the verdict.
     pub summary: String,
-    /// Count-only rollup of the judgment.
-    pub counts: VerifierCounts,
+    /// Count-only rollup of a Drift or Eval judgment; absent for a task
+    /// Verifier, whose one check is fully described by `verdict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counts: Option<VerifierCounts>,
     /// The engine report.
     pub detail: VerificationExecutionDetail,
 }

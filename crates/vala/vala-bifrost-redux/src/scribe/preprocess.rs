@@ -81,6 +81,9 @@ pub(crate) struct NativeAdmittedRows {
     pub(crate) bytes: Bytes,
     /// Authenticated principal used for managed correlation columns.
     pub(crate) principal: Principal,
+    /// Card UIDs every row's `card_uid` is authorized against: the frame's
+    /// attributed UIDs, or the principal's signed scope.
+    pub(crate) card_scope: Option<Vec<wyrd_spec::ids::CardUid>>,
     /// Catalog fingerprint validated independently for every source batch.
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Request identity stamped into every source batch.
@@ -395,6 +398,7 @@ fn stamp_native_source(
         rows,
         &crate::scribe::execution_lanes::DecodeContext {
             principal: &source.principal,
+            card_scope: source.card_scope.as_deref(),
             expected_schema_fingerprint: source.expected_schema_fingerprint,
             request_id: &source.request_id,
             window: source.event_time_window,
@@ -976,6 +980,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         NativeAdmittedRows {
             definition: None,
+            card_scope: None,
             registered_schema: None,
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,

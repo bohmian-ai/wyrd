@@ -158,6 +158,12 @@ pub struct CommitUncertaintyCatalog {
 /// all real worker processes without sharing a runtime catalog handle.
 #[derive(Debug)]
 pub(crate) struct CommitUncertaintyControls {
+    /// Table every control below applies to; `None` applies them to all.
+    ///
+    /// Every audited request writes the tenant's `audit_log` through Scribe,
+    /// so Forge commits that table beside a journey's own. A targeted journey
+    /// passes every other table's catalog calls straight through.
+    target_table: std::sync::Mutex<Option<TableIdent>>,
     /// Counts all delegated commit attempts across process-local wrappers.
     update_attempts: AtomicUsize,
     /// Arms one injected failure before the next delegated table load.
@@ -282,6 +288,7 @@ impl CommitUncertaintyControls {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
+            target_table: std::sync::Mutex::new(None),
             update_attempts: AtomicUsize::new(0),
             fail_next_load_table: AtomicBool::new(false),
             load_table_calls: AtomicUsize::new(0),
@@ -310,7 +317,23 @@ impl CommitUncertaintyControls {
     }
 }
 
+impl CommitUncertaintyControls {
+    /// Returns whether the controls apply to catalog calls on `table`.
+    fn targets(&self, table: &TableIdent) -> bool {
+        self.target_table.lock().map_or(true, |target| {
+            target.as_ref().is_none_or(|target| target == table)
+        })
+    }
+}
+
 impl CommitUncertaintyCatalog {
+    /// Applies every control to `table` alone and passes other tables through.
+    pub fn target_table(&self, table: TableIdent) {
+        if let Ok(mut target) = self.controls.target_table.lock() {
+            *target = Some(table);
+        }
+    }
+
     /// Fail the next delegated table load exactly once.
     ///
     /// Recovery reloads the table a retained `Prepared` attempt named before it
@@ -574,6 +597,9 @@ impl Catalog for CommitUncertaintyCatalog {
     }
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+        if !self.controls.targets(table) {
+            return self.inner.load_table(table).await;
+        }
         self.controls
             .load_table_calls
             .fetch_add(1, Ordering::AcqRel);
@@ -615,6 +641,9 @@ impl Catalog for CommitUncertaintyCatalog {
     }
 
     async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
+        if !self.controls.targets(commit.identifier()) {
+            return self.inner.update_table(commit).await;
+        }
         self.controls.update_attempts.fetch_add(1, Ordering::AcqRel);
         if self
             .controls

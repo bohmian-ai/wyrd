@@ -87,7 +87,7 @@ mod tests {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: PrincipalKind::User,
             tenant_id: wyrd_spec::DataTenantId::new_v7(),
-            roles: vec![RoleRef::new("runtime_admin").expect("static role is valid")],
+            roles: vec![RoleRef::new("editor").expect("static role is valid")],
             effective_permissions: PermissionSet::from_iter(permissions),
             credential_id: None,
         }

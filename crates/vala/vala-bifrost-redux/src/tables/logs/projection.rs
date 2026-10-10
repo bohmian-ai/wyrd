@@ -26,7 +26,7 @@ use crate::tables::signal::{
     projected_signal_schema, span_id_bytes, trace_id_bytes, u32_as_i64_column, utf8_column,
     utf8_opt_column,
 };
-use wyrd_spec::reference::CardRefScope;
+use wyrd_spec::ids::CardUid;
 
 /// Largest accepted severity text, in bytes.
 const MAX_SEVERITY_TEXT_BYTES: usize = 64;
@@ -49,7 +49,7 @@ const MAX_EVENT_NAME_BYTES: usize = 256;
 /// be assembled into the canonical Arrow batch.
 pub fn project_resource_logs(
     resource_logs: &[ResourceLogs],
-    card_scope: Option<&CardRefScope>,
+    card_scope: Option<&[CardUid]>,
     output_limit_bytes: usize,
 ) -> Result<(RecordBatch, LogsOutcome), TableError> {
     let mut columns = LogColumns::default();
@@ -134,7 +134,7 @@ struct LogColumns {
     scope_attributes: Vec<Vec<u8>>,
     scope_dropped_attributes_count: Vec<u32>,
     scope_schema_url: Vec<String>,
-    card_ref: Vec<Option<String>>,
+    card_uid: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
 
@@ -144,7 +144,7 @@ impl LogColumns {
     /// # Errors
     ///
     /// Returns the stable rejection reason for an invalid correlation
-    /// identifier, a malformed or wrong-typed `wyrd.card_ref` / `wyrd.run_id`
+    /// identifier, a malformed or wrong-typed `wyrd.card_uid` / `wyrd.run_id`
     /// record attribute, an over-long severity text or event name, or a body or
     /// attribute payload beyond the configured material limits. Nothing is
     /// appended when an error is returned.
@@ -157,7 +157,7 @@ impl LogColumns {
         record: &LogRecord,
         resource: &ResourceEnvelope,
         scope: &ScopeEnvelope,
-        card_scope: Option<&CardRefScope>,
+        card_scope: Option<&[CardUid]>,
     ) -> Result<usize, &'static str> {
         if record.severity_text.len() > MAX_SEVERITY_TEXT_BYTES {
             return Err("log severity_text exceeds the accepted length");
@@ -193,7 +193,7 @@ impl LogColumns {
             + record.event_name.len()
             + body.as_ref().map_or(0, Vec::len)
             + attributes.len()
-            + correlation.card_ref.as_ref().map_or(0, String::len)
+            + correlation.card_uid.as_ref().map_or(0, String::len)
             + correlation.run_id.as_ref().map_or(0, String::len);
 
         self.time_unix_nano.push(time_unix_nano);
@@ -228,7 +228,7 @@ impl LogColumns {
             .push(scope.dropped_attributes_count);
         self.scope_schema_url.push(scope.schema_url.clone());
 
-        self.card_ref.push(correlation.card_ref);
+        self.card_uid.push(correlation.card_uid);
         self.run_id.push(correlation.run_id);
 
         self.rows += 1;
@@ -238,7 +238,7 @@ impl LogColumns {
     /// Assemble the accepted rows into the projected log batch.
     ///
     /// The batch carries the canonical ledger columns plus the two nullable
-    /// `card_ref` and `run_id` correlation columns Scribe consumes.
+    /// `card_uid` and `run_id` correlation columns Scribe consumes.
     ///
     /// # Errors
     ///
@@ -273,7 +273,7 @@ impl LogColumns {
             binary_column(&self.scope_attributes),
             u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(self.scope_schema_url),
-            utf8_opt_column(self.card_ref),
+            utf8_opt_column(self.card_uid),
             utf8_opt_column(self.run_id),
         ];
         RecordBatch::try_new(projected_signal_schema(LOG_FIELDS), columns)

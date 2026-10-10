@@ -53,12 +53,33 @@ class Run:
         """
         ...
 
+    def invoke(self, variables: dict[str, str] | None = None) -> str:
+        """Invoke this view's tool-free Agent once through the Wyrd gateway.
+
+        The call carries this run and the Agent Card as gateway correlation
+        and runs as the state's client.
+
+        Args:
+            variables: the Agent Prompt's string variables.
+
+        Returns:
+            The Agent's final text.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_400_CARD_KIND_MISMATCH`` for a view that is
+                not an Agent and ``WYRD_AGENT_422_VALIDATION`` for an Agent with
+                tools or a non-gateway Prompt model, both before any IO;
+                otherwise the gateway's own refusal, such as
+                ``WYRD_PERMISSION_403_DENIED_RBAC``.
+        """
+        ...
+
     def __enter__(self) -> Run:
         """Enter this view's ambient OpenTelemetry span correlation.
 
         Best-effort and execution-local: attaches this view's exact Card
-        reference and
-        ``run_id`` as ``wyrd.card_ref`` / ``wyrd.run_id`` to the active
+        UID and
+        ``run_id`` as ``wyrd.card_uid`` / ``wyrd.run_id`` to the active
         recording span and to every span started inside the block on a
         provider holding the Wyrd processor (the global provider is installed
         automatically; see ``wyrd.otel.install_run_correlation``). Never raises
@@ -116,6 +137,8 @@ class Judgment:
         "eval_assertion",
         "eval_llm_judge",
         "eval_other",
+        "task_assertion",
+        "task_llm_judge",
         "unknown",
     ]:
         """The Verifier classification: method family and profile."""
@@ -132,13 +155,13 @@ class Judgment:
         ...
 
     @property
-    def counts(self) -> dict[str, Any]:
-        """Count-only rollup of the judgment as its wire mapping."""
+    def counts(self) -> dict[str, Any] | None:
+        """Count-only rollup of a Drift or Eval judgment; ``None`` for a task Verifier."""
         ...
 
     @property
     def detail(self) -> dict[str, Any]:
-        """The engine report: ``{"drift": {...}}`` or ``{"eval": {...}}``."""
+        """The engine report: ``{"drift": ...}``, ``{"eval": ...}``, or ``{"task": {"result": ...}}``."""
         ...
 
 class Observe:
@@ -284,7 +307,7 @@ def record(
         schema: the table's JSON Schema mapping, or a Pydantic model class
             whose ``model_json_schema()`` is used.
         row: the row as a mapping or a Pydantic model instance.
-        correlation: optional ``card_ref`` (``space/Kind/name@version``) and
+        correlation: optional ``card_uid`` (a registered Card UID) and
             ``run_id`` stamped on the row. Omitted, the row is uncorrelated.
 
     Returns:
@@ -293,7 +316,7 @@ def record(
     Raises:
         WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` for a schema with no
             mappable columns, as ``TableConfig.from_json_schema`` raises;
-            ``WYRD_SPEC_400_VALIDATION`` for an invalid ``card_ref``.
+            ``WYRD_SPEC_400_VALIDATION`` for an invalid ``card_uid``.
     """
     ...
 

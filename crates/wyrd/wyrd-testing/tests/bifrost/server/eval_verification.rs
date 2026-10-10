@@ -41,6 +41,7 @@ use wyrd_server::query::scheduled::ScheduledQueryCaller;
 use wyrd_server::verification::{RuntimeLimits, VerificationRuntime};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_spec::vala::managed_columns::CARD_UID;
 use wyrd_storage::tenant_path;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::WyrdTestServer;
@@ -68,8 +69,8 @@ const MISSING_TRACE: &str = "6c9f000809149214e37ac744924fd71d";
 /// Name of the one span exported under [`LANDED_TRACE`].
 const SPAN_NAME: &str = "judge-call";
 
-/// Write the Service graph: two Agents, five Eval Verifiers, the judge Prompt,
-/// and one Operator. Returns the Service path.
+/// Write the Service graph: two Agents, five Eval Verifiers, one explicit-only
+/// task Verifier, the judge Prompt, and one Operator. Returns the Service path.
 ///
 /// The judge Prompt is native OpenAI Chat with a JSON-schema response and one
 /// `${media:shot}` placeholder, built through Skald rather than hand-written.
@@ -152,8 +153,12 @@ fn write_graph(root: &Path) -> PathBuf {
             ),
         ),
         (
+            "task.yaml",
+            "apiVersion: wyrd/v1\nkind: Verifier\nmetadata:\n  name: eval-task\n  version: 1.0.0\n  space: default\nspec:\n  implementation:\n    kind: task\n    spec: {kind: assertion, id: x_is_one, context_path: $.x, operator: equals, expected: 1}\n".to_owned(),
+        ),
+        (
             "service.yaml",
-            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: eval-service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./gated.yaml\n          runs_on: {kind: observations_ready}\n          on_failure: [./operator.yaml]\n        - verifier: ./ungated.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./skipped.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./sampled.yaml\n          runs_on: {kind: observations_ready}\n    - alias: traced\n      ref: ./traced-agent.yaml\n      verified_by:\n        - verifier: ./traced.yaml\n          runs_on: {kind: observations_ready}\n".to_owned(),
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: eval-service\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: agent\n      ref: ./agent.yaml\n      verified_by:\n        - verifier: ./gated.yaml\n          runs_on: {kind: observations_ready}\n          on_failure: [./operator.yaml]\n        - verifier: ./ungated.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./skipped.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./sampled.yaml\n          runs_on: {kind: observations_ready}\n        - verifier: ./task.yaml\n    - alias: traced\n      ref: ./traced-agent.yaml\n      verified_by:\n        - verifier: ./traced.yaml\n          runs_on: {kind: observations_ready}\n".to_owned(),
         ),
     ];
     for (name, body) in files {
@@ -258,18 +263,31 @@ async fn start_state(bundle: &Path, client: &WyrdClient) -> WyrdState {
     state
 }
 
-/// Compose and spawn a verification runtime with fast bounds and the local
-/// provider; returns its stop token and task.
+/// Role granting exactly the gateway invoke scope the judge Prompt's
+/// `openai` provider needs; the observation writer holds it to judge.
+const JUDGE_ROLE: &str = "eval_judge_invoker";
+
+/// Boot a bound server whose gateway serves every model call, LLM judges
+/// included, from the local `provider`.
+///
+/// # Errors
+/// Returns the server start error.
+async fn gateway_server(provider: &MockServer) -> Result<WyrdTestServer, ServerJourneyError> {
+    let root = url::Url::parse(&provider.uri())?;
+    Ok(Box::pin(
+        WyrdTestServer::builder()
+            .with_gateway_provider_root_for_test(root)
+            .start_bound(),
+    )
+    .await?)
+}
+
+/// Compose and spawn a verification runtime with fast bounds; its judges
+/// call the server's gateway. Returns its stop token and task.
 ///
 /// # Panics
 /// Panics when the runtime does not compose.
-fn spawn_runtime(server: &WyrdTestServer, provider: &str) -> (CancellationToken, JoinHandle<()>) {
-    let providers = skald_runtime::ProviderRegistry::for_provider(
-        &skald_spec::ProviderName::OpenAi,
-        provider,
-        Some("journey-key"),
-    )
-    .expect("the local provider registers");
+fn spawn_runtime(server: &WyrdTestServer) -> (CancellationToken, JoinHandle<()>) {
     let runtime = VerificationRuntime::builder(server.state())
         .limits(RuntimeLimits {
             lease: Duration::from_mins(1),
@@ -281,7 +299,6 @@ fn spawn_runtime(server: &WyrdTestServer, provider: &str) -> (CancellationToken,
             trace_deadline: Duration::from_secs(20),
             ..RuntimeLimits::default()
         })
-        .providers(Arc::new(providers))
         .build()
         .expect("the runtime composes");
     let stop = CancellationToken::new();
@@ -513,8 +530,9 @@ async fn assert_unresulted(
         server,
         tenant,
         format!(
-            "SELECT result_id FROM vala.verification.results WHERE run_id = '{}'",
-            run.run
+            "SELECT result_id FROM vala.verification.results \
+             WHERE {CARD_UID} = '{}' AND source_record_id = '{}'",
+            run.verifier_uid, run.record_id
         ),
     )
     .await?;
@@ -643,7 +661,8 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
     let root = tempfile::tempdir()?;
     let service = write_graph(root.path());
     let bundle = root.path().join("bundle");
-    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let provider = MockServer::start().await;
+    let server = Box::pin(gateway_server(&provider)).await?;
     let tenant = server.data_tenant_id();
     let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
     let admin = api_key(
@@ -651,17 +670,20 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
             .bootstrap_service("eval_journey_admin", &["admin"])
             .await?,
     );
-    let receipt = register(&connect(&server, &admin), &service, &bundle).await;
+    let admin_client = connect(&server, &admin);
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    let receipt = register(&admin_client, &service, &bundle).await;
     let writer = api_key(
         server
-            .credential_registered_service(&receipt.root, &[])
+            .credential_registered_service(&receipt.root, &[JUDGE_ROLE])
             .await?,
     );
     let client = connect(&server, &writer);
 
-    let provider = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "chatcmpl_eval", "object": "chat.completion", "created": 1_700_000_000,
             "model": "gpt-test",
@@ -753,7 +775,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
     // Runs enqueued while no runtime runs are durable and complete once one
     // starts; this is the restart-recovery path.
     let queued = enqueued(&seed, 28).await?;
-    let (stop, task) = spawn_runtime(&server, &provider.uri());
+    let (stop, task) = spawn_runtime(&server);
     let runs = settle(&seed, queued).await?;
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
@@ -822,6 +844,21 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         if errored.state.error_code.as_deref() != Some("eval_execution_failed") {
             return Err(format!("the error is not an execution failure: {errored:?}").into());
         }
+    }
+    // Every result, sampled out or scored, records the application Run that
+    // wrote its observation, never the Verifier run.
+    let correlated = texts(
+        &query(
+            &server,
+            tenant,
+            "SELECT DISTINCT run_id FROM vala.verification.results".to_owned(),
+        )
+        .await?,
+    )?;
+    if correlated != [Some(run.run_id().as_str().to_owned())] {
+        return Err(
+            format!("results are not correlated to the application Run: {correlated:?}").into(),
+        );
     }
 
     // The frozen record identity and the committed event time of the row.
@@ -933,7 +970,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
     );
     state.shutdown().await?;
     server.flush_bifrost().await?;
-    let (stop, task) = spawn_runtime(&server, &provider.uri());
+    let (stop, task) = spawn_runtime(&server);
     let landed = record_id(&server, tenant, "landed").await?;
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
@@ -1006,7 +1043,7 @@ fn answered_observation(
                 "created_at": at.to_rfc3339(),
             })
             .to_string(),
-            Some(subject),
+            subject.uid.as_ref(),
             None,
             Some(at.timestamp_micros()),
         )
@@ -1421,10 +1458,14 @@ struct TraceJourney {
     client: WyrdClient,
     /// Bearer token of the admin principal that exports spans.
     token: String,
+    /// Local `OpenAI`-compatible upstream the server's gateway serves judges
+    /// from.
+    provider: MockServer,
 }
 
 impl TraceJourney {
-    /// Boot a bound server and register [`write_trace_graph`] through the SDK.
+    /// Boot a bound server whose gateway is rooted at a fresh local provider
+    /// and register [`write_trace_graph`] through the SDK.
     ///
     /// # Errors
     /// Returns server, registration, credential, or fixture errors.
@@ -1432,7 +1473,8 @@ impl TraceJourney {
         let root = tempfile::tempdir()?;
         let service = write_trace_graph(root.path());
         let bundle = root.path().join("bundle");
-        let server = Box::pin(WyrdTestServer::start_bound()).await?;
+        let provider = MockServer::start().await;
+        let server = Box::pin(gateway_server(&provider)).await?;
         let tenant = server.data_tenant_id();
         let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
         let admin = api_key(
@@ -1440,10 +1482,14 @@ impl TraceJourney {
                 .bootstrap_service("eval_trace_admin", &["admin"])
                 .await?,
         );
-        let receipt = register(&connect(&server, &admin), &service, &bundle).await;
+        let admin_client = connect(&server, &admin);
+        server
+            .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+            .await?;
+        let receipt = register(&admin_client, &service, &bundle).await;
         let writer = api_key(
             server
-                .credential_registered_service(&receipt.root, &[])
+                .credential_registered_service(&receipt.root, &[JUDGE_ROLE])
                 .await?,
         );
         let client = connect(&server, &writer);
@@ -1458,6 +1504,7 @@ impl TraceJourney {
             bundle,
             client,
             token,
+            provider,
         })
     }
 
@@ -1487,12 +1534,8 @@ impl TraceJourney {
     ///
     /// # Errors
     /// Returns a settle timeout or the runtime task's failure.
-    async fn run_to(
-        &self,
-        provider: &str,
-        count: usize,
-    ) -> Result<Vec<ObservationRun>, ServerJourneyError> {
-        let (stop, task) = spawn_runtime(&self.server, provider);
+    async fn run_to(&self, count: usize) -> Result<Vec<ObservationRun>, ServerJourneyError> {
+        let (stop, task) = spawn_runtime(&self.server);
         let runs = settle(&self.seed, count).await;
         stop.cancel();
         tokio::time::timeout(WAIT, task).await??;
@@ -1566,7 +1609,7 @@ fn stamped_observation(
                 "created_at": at.to_rfc3339(),
             })
             .to_string(),
-            Some(subject),
+            subject.uid.as_ref(),
             None,
             Some(at.timestamp_micros()),
         )
@@ -1586,7 +1629,7 @@ async fn system_reads(
     server: &WyrdTestServer,
     tenant: DataTenantId,
 ) -> Result<Vec<String>, ServerJourneyError> {
-    server.await_audit_published(tenant).await?;
+    server.await_audit_retained().await?;
     Ok(server
         .retained_audit_records(
             tenant,
@@ -1686,8 +1729,7 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
         .await?;
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
 
-    let provider = MockServer::start().await;
-    let runs = journey.run_to(&provider.uri(), 3).await?;
+    let runs = journey.run_to(3).await?;
     let evidence = record_id(&journey.server, journey.tenant, "evidence-1").await?;
     for record in [&past, &future] {
         let outside = run_of(&runs, "eval-trace-evidence", record)?;
@@ -1725,7 +1767,7 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
             &[(json!({ "marker": "evidence-2" }), None)],
         )
         .await?;
-    let runs = journey.run_to(&provider.uri(), 4).await?;
+    let runs = journey.run_to(4).await?;
     let again = record_id(&journey.server, journey.tenant, "evidence-2").await?;
     let rerun = run_of(&runs, "eval-trace-evidence", &again)?;
     assert_completed(&journey.server, journey.tenant, rerun, "passed", (6, 0), 0).await?;
@@ -1807,9 +1849,9 @@ async fn continuous_eval_refuses_a_trace_over_the_span_ceiling() -> Result<(), S
         )
         .await?;
 
-    let provider = MockServer::start().await;
+    let provider = &journey.provider;
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "id": "chatcmpl_eval", "object": "chat.completion", "created": 1_700_000_000,
             "model": "gpt-test",
@@ -1817,9 +1859,9 @@ async fn continuous_eval_refuses_a_trace_over_the_span_ceiling() -> Result<(), S
                 "message": { "role": "assistant", "content": "{\"passed\":true}" } }],
             "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
         })))
-        .mount(&provider)
+        .mount(provider)
         .await;
-    let runs = journey.run_to(&provider.uri(), 2).await?;
+    let runs = journey.run_to(2).await?;
     let ceiling = record_id(&journey.server, journey.tenant, "ceiling").await?;
     let overflow = record_id(&journey.server, journey.tenant, "overflow").await?;
     assert_completed(
@@ -1949,8 +1991,7 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
     ) {
         return Err(format!("a tenant without a System principal resolved {missing:?}").into());
     }
-    let provider = MockServer::start().await;
-    let runs = journey.run_to(&provider.uri(), 1).await?;
+    let runs = journey.run_to(1).await?;
     let record = record_id(server, tenant, "authority").await?;
     let refused = run_of(&runs, "eval-trace-evidence", &record)?;
     // No run has published yet, so the results table does not even exist.
@@ -2017,7 +2058,7 @@ async fn continuous_eval_read_authority_fails_closed() -> Result<(), ServerJourn
     }
 
     // Under-scoped: outside the scope, and narrowed away from an input.
-    server.await_audit_published(tenant).await?;
+    server.await_audit_retained().await?;
     let outside = read_as(
         server,
         context.clone(),
@@ -2115,7 +2156,8 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     let root = tempfile::tempdir()?;
     let service = write_graph(root.path());
     let bundle = root.path().join("bundle");
-    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let provider = MockServer::start().await;
+    let server = Box::pin(gateway_server(&provider)).await?;
     let tenant = server.data_tenant_id();
     let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
     let admin = api_key(
@@ -2123,16 +2165,19 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
             .bootstrap_service("eval_errors_admin", &["admin"])
             .await?,
     );
-    let receipt = register(&connect(&server, &admin), &service, &bundle).await;
+    let admin_client = connect(&server, &admin);
+    server
+        .deploy_gateway_model_for_test("gpt-test", JUDGE_ROLE)
+        .await?;
+    let receipt = register(&admin_client, &service, &bundle).await;
     let writer = api_key(
         server
-            .credential_registered_service(&receipt.root, &[])
+            .credential_registered_service(&receipt.root, &[JUDGE_ROLE])
             .await?,
     );
     let client = connect(&server, &writer);
-    let provider = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(400).set_body_json(json!({
             "error": { "message": PROVIDER_SENTINEL, "type": "invalid_request_error" }
         })))
@@ -2167,7 +2212,7 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     state.shutdown().await?;
     server.flush_bifrost().await?;
     let queued = enqueued(&seed, 2 * AGENT_BINDINGS).await?;
-    let (stop, task) = spawn_runtime(&server, &provider.uri());
+    let (stop, task) = spawn_runtime(&server);
     settle(&seed, queued).await?;
     stop.cancel();
     tokio::time::timeout(WAIT, task).await??;
@@ -2211,7 +2256,7 @@ async fn continuous_eval_failures_publish_only_stable_errors() -> Result<(), Ser
     )
     .execute(&superuser)
     .await?;
-    let (stop, task) = spawn_runtime(&server, &provider.uri());
+    let (stop, task) = spawn_runtime(&server);
     let unclaimed = unclaimed_while_cards_fail(&superuser).await;
     sqlx::query("DROP POLICY eval_errors_refuse ON wyrd.cards")
         .execute(&superuser)
@@ -2433,9 +2478,123 @@ async fn eval_runs_follow_the_writing_owner() -> Result<(), ServerJourneyError> 
     server.flush_bifrost().await?;
     let from_b = record_id(&server, tenant, "from-b").await?;
     let runs = owned_runs(&server, &superuser, 2).await?;
-    let expected = vec![(owner_a, from_a), ("eval-owner-b".to_owned(), from_b)];
+    let owner_b = "eval-owner-b".to_owned();
+    let expected = vec![(owner_a.clone(), from_a), (owner_b.clone(), from_b)];
     if runs != expected {
         return Err(format!("expected one run per writer's own binding, read {runs:?}").into());
+    }
+
+    // The unbound administrator owns no binding, so its record about M runs
+    // every owner's binding of M.
+    let unbound = connect(&server, server.tenant_admin_key().await?.expose_secret());
+    emit_as(&unbound, &bundle_a, "from-admin").await?;
+    server.flush_bifrost().await?;
+    let from_admin = record_id(&server, tenant, "from-admin").await?;
+    let runs = owned_runs(&server, &superuser, 4).await?;
+    for owner in [owner_a, owner_b] {
+        if !runs.contains(&(owner.clone(), from_admin.clone())) {
+            return Err(format!("the unbound record ran no binding of {owner}: {runs:?}").into());
+        }
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// A direct task judgment through `observe.verify` records exactly one
+/// `vala.verification.results` row correlated to the caller's application
+/// Run, with no detail row, no verifier run, and no dispatch.
+///
+/// The row carries `result_id = execution_id`, the task verdict, the exact
+/// Verifier version and subject, null binding facts and window, the Run as
+/// both `run_id` and `source_record_id`, the execution interval, and the
+/// canonical `AssertionResult` as `details`.
+///
+/// # Errors
+/// Returns server, registration, query, or fixture errors, or a description of
+/// the first recorded value that does not match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn direct_task_judgment_records_one_correlated_result() -> Result<(), ServerJourneyError> {
+    let root = tempfile::tempdir()?;
+    let service = write_graph(root.path());
+    let bundle = root.path().join("bundle");
+    let server = Box::pin(WyrdTestServer::start_bound()).await?;
+    let tenant = server.data_tenant_id();
+    let seed = VerificationFixture::provision(server.state().postgres.wyrd(), tenant).await?;
+    let admin = connect(
+        &server,
+        &api_key(
+            server
+                .bootstrap_service("direct_task_admin", &["admin"])
+                .await?,
+        ),
+    );
+    register(&admin, &service, &bundle).await;
+    let state = WyrdState::from_path_with_client(&bundle, admin.clone())?;
+    let run = state.run();
+    let agent = run.for_card("agent")?;
+    let judgment = agent
+        .observe()
+        .verify("eval-task", &json!({ "x": 2 }))
+        .await?;
+    server.flush_bifrost().await?;
+
+    let result = judgment.execution_id.as_uuid();
+    let cell =
+        async |column: &str, table: &str| -> Result<Vec<Option<String>>, ServerJourneyError> {
+            texts(
+                &query(
+                    &server,
+                    tenant,
+                    format!("SELECT {column} FROM {table} WHERE result_id = '{result}'"),
+                )
+                .await?,
+            )
+        };
+    let application = Some(run.run_id().as_str().to_owned());
+    let subject = agent.subject().uid.as_ref().map(ToString::to_string);
+    for (column, expected) in [
+        ("implementation", Some("task".to_owned())),
+        ("execution_status", Some("completed".to_owned())),
+        ("verdict", Some("failed".to_owned())),
+        ("verifier_version", Some("1.0.0".to_owned())),
+        ("subject_card_uid", subject),
+        ("owner_card_uid", None),
+        ("binding_id", None),
+        ("trigger_identity", None),
+        ("CAST(window_start AS VARCHAR)", None),
+        ("source_record_id", application.clone()),
+        ("run_id", application),
+    ] {
+        let read = cell(column, "vala.verification.results").await?;
+        if read != [expected.clone()] {
+            return Err(format!("{column}: expected [{expected:?}], read {read:?}").into());
+        }
+    }
+    let details = cell("details", "vala.verification.results").await?;
+    let [Some(details)] = details.as_slice() else {
+        return Err(format!("expected one details payload, read {details:?}").into());
+    };
+    let details: Value = serde_json::from_str(details)?;
+    if details["task_id"] != "x_is_one" || details["passed"] != false || details["actual"] != 2 {
+        return Err(format!("details are not the AssertionResult: {details}").into());
+    }
+    let intervals = cell(
+        "CAST(started_at <= ended_at AS VARCHAR)",
+        "vala.verification.results",
+    )
+    .await?;
+    if intervals != [Some("true".to_owned())] {
+        return Err(format!("the execution interval is not ordered: {intervals:?}").into());
+    }
+    if !cell("result_id", "vala.eval.result_items")
+        .await?
+        .is_empty()
+    {
+        return Err("a direct task wrote a detail row".into());
+    }
+    if !seed.observation_runs().await?.is_empty() {
+        return Err("a direct task created a verifier run".into());
     }
     server.shutdown().await?;
     Ok(())

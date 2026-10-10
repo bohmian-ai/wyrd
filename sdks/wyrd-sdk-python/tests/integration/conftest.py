@@ -35,6 +35,7 @@ from .support import (
     register,
     service_key,
 )
+from .test_local_development import configure_gateway
 
 if TYPE_CHECKING:
     from wyrd.operators import OperatorConnectionView
@@ -54,6 +55,20 @@ JUDGE_VERDICT = {
     "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
 }
 """The local LLM judge's answer: the graded answer passes."""
+
+
+@pytest.fixture
+def fresh_tracer_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset OpenTelemetry's once-only global tracer provider for one test.
+
+    The API lets a process install its global provider once; restoring the two
+    module globals afterwards keeps each telemetry test's install its own.
+    """
+    from opentelemetry import trace
+    from opentelemetry.util._once import Once
+
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", None)
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER_SET_ONCE", Once())
 
 
 @pytest.fixture(scope="session")
@@ -110,16 +125,20 @@ def other_tenant(wyrd_server: WyrdTestServer) -> str:
 
 
 @pytest.fixture(scope="session")
-def reader_key(wyrd_server: WyrdTestServer) -> str:
-    """An API key whose principal may read but holds no write or ``evals:run`` grant."""
-    return wyrd_server.bootstrap_service(["reader"], name="reader")
+def viewer_key(wyrd_server: WyrdTestServer) -> str:
+    """An API key whose principal may read but holds no write or ``verifier:run`` grant."""
+    return wyrd_server.bootstrap_service(["viewer"], name="viewer")
 
 
 @pytest.fixture(scope="session")
 def assistant_bundle(
     wyrd_server: WyrdTestServer, cards: Cards, tmp_path_factory: pytest.TempPathFactory
 ) -> Path:
-    """The ``assistant`` Service, registered with a fitted latency baseline and downloaded."""
+    """The ``assistant`` Service, registered with a fitted latency baseline and downloaded.
+
+    Its LLM judges call the gateway, so the judge model is deployed there first.
+    """
+    configure_gateway(WyrdClient())
     register(cards, "cards/latency_baseline/latency-baseline.yaml")
     register(cards, "cards/verify_in_real_time/latency-model.yaml")
     registered = register(cards, "cards/verify_in_real_time/assistant.yaml")

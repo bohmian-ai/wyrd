@@ -9,11 +9,13 @@
 //! its own items.
 //!
 //! A failed write is never dropped. A write that returns an error or panics
-//! puts its items back at the front of that tenant's queue, ahead of anything
-//! that arrived meanwhile, and the tenant is retried after a backoff that
-//! starts at [`INITIAL_BACKOFF`] and doubles up to [`MAX_BACKOFF`]; other
-//! tenants keep writing. Because a write may be retried after an unknown
-//! commit outcome, every sink write must be safe to repeat.
+//! keeps its exact items as that tenant's next write, apart from anything that
+//! arrived meanwhile, and the tenant is retried after a backoff that starts at
+//! [`INITIAL_BACKOFF`] and doubles up to [`MAX_BACKOFF`]; other tenants keep
+//! writing. Later arrivals wait for the write after the retry succeeds, so a
+//! sink deriving identity from its slice presents the same identity on every
+//! attempt. Because a write may be retried after an unknown commit outcome,
+//! every sink write must be safe to repeat.
 //!
 //! The queue has no count limit and nothing is preallocated. Items are lost
 //! only when the process stops abruptly, when graceful shutdown reaches its
@@ -24,7 +26,6 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::fmt::Display;
 use std::future::{Future, pending, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -49,9 +50,9 @@ pub const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 /// One destination an outbox writes to.
 ///
-/// Implementations make exactly one durable call per write: everything a
-/// tenant has queued, in one transaction, all or nothing. The outbox owns
-/// queueing, grouping, concurrency, retry, and shutdown.
+/// Implementations write everything a tenant has queued in one call: in one
+/// transaction, or as idempotent writes whose repeat is absorbed. The outbox
+/// owns queueing, grouping, concurrency, retry, and shutdown.
 pub trait OutboxSink: Send + Sync + 'static {
     /// The item callers stage.
     type Item: Send + 'static;
@@ -96,6 +97,8 @@ pub struct Outbox<S: OutboxSink> {
     abandon: CancellationToken,
     /// Tracks the writer so shutdown can wait for it.
     writer: TaskTracker,
+    /// The sink the writer submits through, shared for inspection.
+    sink: Arc<S>,
 }
 
 impl<S: OutboxSink> Outbox<S> {
@@ -115,11 +118,13 @@ impl<S: OutboxSink> Outbox<S> {
         let idle = Arc::new(Notify::new());
         let abandon = CancellationToken::new();
         let writer = TaskTracker::new();
+        let sink = Arc::new(sink);
         writer.spawn(
             OutboxWriter {
-                sink: Arc::new(sink),
+                sink: Arc::clone(&sink),
                 requests,
                 waiting: HashMap::new(),
+                failed: HashMap::new(),
                 writing: JoinSet::new(),
                 in_flight: HashMap::new(),
                 retry_at: HashMap::new(),
@@ -137,7 +142,14 @@ impl<S: OutboxSink> Outbox<S> {
             idle,
             abandon,
             writer,
+            sink,
         })
+    }
+
+    /// Borrows the sink this outbox writes through.
+    #[must_use]
+    pub fn sink(&self) -> &S {
+        &self.sink
     }
 
     /// Queues one item for `tenant` without waiting and never fails.
@@ -246,6 +258,9 @@ struct OutboxWriter<S: OutboxSink> {
     requests: mpsc::UnboundedReceiver<(DataTenantId, S::Item)>,
     /// Received items per tenant, in arrival order, not being written.
     waiting: HashMap<DataTenantId, Vec<S::Item>>,
+    /// The exact slice of each tenant whose last write failed; it is that
+    /// tenant's next write, unmerged with `waiting`.
+    failed: HashMap<DataTenantId, Vec<S::Item>>,
     /// In-flight tenant writes.
     writing: JoinSet<Written<S>>,
     /// Tenant and item count of each in-flight write, keyed by its task.
@@ -275,7 +290,8 @@ impl<S: OutboxSink> OutboxWriter<S> {
         let mut open = true;
         loop {
             self.dispatch();
-            if !open && self.waiting.is_empty() && self.writing.is_empty() {
+            if !open && self.waiting.is_empty() && self.failed.is_empty() && self.writing.is_empty()
+            {
                 return;
             }
             let retry = self.next_retry();
@@ -303,7 +319,8 @@ impl<S: OutboxSink> OutboxWriter<S> {
 
     /// Starts one write for each tenant that has items waiting, has no write
     /// in flight, and is not backing off, while fewer than `concurrency` writes
-    /// run. A write takes the tenant's whole backlog.
+    /// run. A tenant with a failed slice writes exactly that slice again;
+    /// otherwise a write takes the tenant's whole backlog.
     ///
     /// The write task keeps its items through a panicking sink, including a
     /// panic while rendering the sink's error, and returns them with the panic
@@ -313,6 +330,11 @@ impl<S: OutboxSink> OutboxWriter<S> {
         let ready: Vec<DataTenantId> = self
             .waiting
             .keys()
+            .chain(
+                self.failed
+                    .keys()
+                    .filter(|tenant| !self.waiting.contains_key(*tenant)),
+            )
             .filter(|tenant| self.is_ready(**tenant, now))
             .copied()
             .collect();
@@ -320,7 +342,11 @@ impl<S: OutboxSink> OutboxWriter<S> {
             if self.writing.len() >= self.concurrency {
                 return;
             }
-            let Some(items) = self.waiting.remove(&tenant) else {
+            let Some(items) = self
+                .failed
+                .remove(&tenant)
+                .or_else(|| self.waiting.remove(&tenant))
+            else {
                 continue;
             };
             let count = items.len();
@@ -368,7 +394,7 @@ impl<S: OutboxSink> OutboxWriter<S> {
         let now = Instant::now();
         self.retry_at
             .iter()
-            .filter(|(tenant, (at, _))| *at > now && self.waiting.contains_key(*tenant))
+            .filter(|(tenant, (at, _))| *at > now && self.failed.contains_key(*tenant))
             .map(|(_, (at, _))| *at)
             .min()
     }
@@ -376,9 +402,9 @@ impl<S: OutboxSink> OutboxWriter<S> {
     /// Settles one finished write.
     ///
     /// Success clears the tenant's backoff and releases its items. Failure,
-    /// including a contained sink panic, puts the items back at the front of
-    /// the tenant's backlog, doubles its backoff, and counts and logs the
-    /// attempt. A task that failed to join lost its items, which are counted
+    /// including a contained sink panic, keeps the items as the tenant's next
+    /// write, unmerged with later arrivals, doubles its backoff, and counts
+    /// and logs the attempt. A task that failed to join lost its items, which are counted
     /// lost; with sink panics contained that needs a panic that escapes
     /// containment, such as one raised while dropping a panic payload.
     fn finish(&mut self, done: Result<(Id, Written<S>), JoinError>) {
@@ -419,15 +445,7 @@ impl<S: OutboxSink> OutboxWriter<S> {
             retry_in_ms = backoff.as_millis(),
             "outbox write failed; retrying"
         );
-        match self.waiting.entry(tenant) {
-            Entry::Occupied(mut queued) => {
-                let later = std::mem::replace(queued.get_mut(), items);
-                queued.get_mut().extend(later);
-            }
-            Entry::Vacant(slot) => {
-                slot.insert(items);
-            }
-        }
+        self.failed.insert(tenant, items);
     }
 
     /// Releases `count` written or lost items from the pending total and wakes
@@ -470,8 +488,13 @@ fn panic_message(panic: &(dyn Any + Send)) -> &str {
         .unwrap_or("non-string panic payload")
 }
 
-/// Counts `count` items of outbox `S` as lost.
-fn count_lost<S: OutboxSink>(count: usize) {
+/// Counts `count` items of outbox `S` as lost in
+/// `outbox_events_lost_total{outbox}`.
+///
+/// The outbox counts shutdown and late-staging loss itself; a sink calls this
+/// for items it consumes without writing, such as a terminal rejection that a
+/// retry could never cure.
+pub fn count_lost<S: OutboxSink>(count: usize) {
     metrics::counter!("outbox_events_lost_total", "outbox" => S::NAME).increment(count as u64);
 }
 
@@ -526,6 +549,8 @@ mod tests {
         display_panicking: HashSet<DataTenantId>,
         /// Failed write attempts.
         failures: usize,
+        /// Every write attempt's tenant and slice, in attempt order.
+        attempts: Vec<(DataTenantId, Vec<u32>)>,
     }
 
     /// Failure the memory sink reports for an injected write failure.
@@ -588,6 +613,7 @@ mod tests {
             let panics = self.lock().panicking.remove(&tenant);
             assert!(!panics, "injected sink panic");
             let mut state = self.lock();
+            state.attempts.push((tenant, items.to_vec()));
             if state.display_panicking.remove(&tenant) {
                 state.failures += 1;
                 return Err(MemoryError {
@@ -743,6 +769,39 @@ mod tests {
             "retried items commit once, ahead of later items"
         );
         assert_eq!(outbox.pending(), 0);
+    }
+
+    /// A retry writes exactly the failed slice: every attempt sees the same
+    /// items, and an item staged after the failure is written separately once
+    /// the retry succeeds, so a sink deriving identity from its slice presents
+    /// one identity across attempts.
+    #[tokio::test]
+    async fn a_retry_writes_the_identical_failed_slice_without_later_items() {
+        let (outbox, state) = outbox(4);
+        let tenant = DataTenantId::new_v7();
+        state.lock().expect("unpoisoned").failing.insert(tenant);
+        outbox.stage(tenant, 1_u32);
+        outbox.stage(tenant, 2_u32);
+        await_failures(&state, 1).await;
+        outbox.stage(tenant, 3_u32);
+        await_failures(&state, 2).await;
+        state.lock().expect("unpoisoned").failing.clear();
+
+        assert_eq!(outbox.settle(within(10)).await, 0, "the retry drains");
+        let state = state.lock().expect("unpoisoned");
+        let (last, retries) = state
+            .attempts
+            .split_last()
+            .expect("the later item was written");
+        assert_eq!(last, &(tenant, vec![3]), "the later item is its own write");
+        assert!(retries.len() >= 3, "two failures and one successful retry");
+        assert!(
+            retries
+                .iter()
+                .all(|attempt| attempt == &(tenant, vec![1, 2])),
+            "every retry is the identical failed slice: {retries:?}"
+        );
+        assert_eq!(state.written.get(&tenant), Some(&vec![1, 2, 3]));
     }
 
     /// A tenant whose writes keep failing does not delay another tenant.

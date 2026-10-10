@@ -40,12 +40,9 @@ pub enum IngestError {
         /// Fully-qualified table name the caller attempted to write.
         table: String,
     },
-    /// A per-row `card_ref` outside the principal's card scope (or null/absent).
-    #[error("card_ref {card_ref} outside principal card scope")]
-    CardScopeDenied {
-        /// Canonical string form of the refused card reference.
-        card_ref: String,
-    },
+    /// A per-row `card_uid` outside the principal's card scope.
+    #[error("Card outside principal card scope")]
+    CardScopeDenied,
     /// A per-row `card_ref` was present but could not be resolved to a `card_uid`
     /// by the server (unknown card, cross-tenant, or uid not available). Fail-closed
     /// (M-11): an authenticated write with an unresolvable `card_ref` is always rejected.
@@ -175,7 +172,7 @@ impl IngestError {
         Some(match self {
             Self::RbacDenied { .. }
             | Self::ReservedBuiltinWriteDenied { .. }
-            | Self::CardScopeDenied { .. }
+            | Self::CardScopeDenied
             | Self::CardUnresolved { .. } => "permission",
             Self::PayloadTooLarge { .. } => "payload_limit",
             Self::RequestValidation(_) | Self::Decode(_) | Self::EventTimeOutOfRange { .. } => {
@@ -228,10 +225,7 @@ impl IngestError {
                 }
                 .into()
             }
-            Self::CardScopeDenied { card_ref } => BifrostError::CardScopeDenied {
-                card_ref: card_ref.clone(),
-            }
-            .into(),
+            Self::CardScopeDenied => BifrostError::CardScopeDenied.into(),
             Self::CardUnresolved { card_ref } => BifrostError::CardUnresolved {
                 card_ref: card_ref.clone(),
             }
@@ -311,12 +305,7 @@ impl IngestError {
                 past_bound_micros,
                 future_bound_micros,
             },
-            crate::contracts::ScribeError::CardScopeDenied => Self::CardScopeDenied {
-                card_ref: "<server-validation>".to_owned(),
-            },
-            crate::contracts::ScribeError::CardUnresolved => Self::CardUnresolved {
-                card_ref: "<server-validation>".to_owned(),
-            },
+            crate::contracts::ScribeError::CardScopeDenied => Self::CardScopeDenied,
             crate::contracts::ScribeError::IngressClosed => Self::IngressClosed,
             crate::contracts::ScribeError::WalDiskFull => Self::WalDiskFull,
             other => {
@@ -477,9 +466,7 @@ mod tests {
                 Code::PermissionDenied,
             ),
             (
-                IngestError::CardScopeDenied {
-                    card_ref: "c".to_owned(),
-                },
+                IngestError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
                 403,
                 Code::PermissionDenied,
@@ -697,11 +684,6 @@ mod tests {
             (
                 ScribeError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
-                "vala.traces.spans",
-            ),
-            (
-                ScribeError::CardUnresolved,
-                "WYRD_VALA_403_CARD_UNRESOLVED",
                 "vala.traces.spans",
             ),
             (

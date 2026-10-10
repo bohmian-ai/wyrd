@@ -39,9 +39,9 @@ use wyrd_sql::{OperatorPool, SqlError, TenantConn};
 
 use crate::components::auth::PlatformCaller;
 use crate::components::platform::builtins::BuiltinTables;
+use crate::scribe_outbox::ScribeOutbox;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 use std::sync::Arc;
-use vala_sql::audit_outbox::AuditOutbox;
 
 /// Role a tenant administrative principal is granted at provisioning.
 ///
@@ -107,7 +107,7 @@ pub struct TenantProvisioning {
     /// cannot open a transaction against a tenant its caller did not name.
     operator: OperatorPool,
     /// Process audit outbox every platform decision is staged on.
-    audit: Arc<AuditOutbox>,
+    audit: Arc<ScribeOutbox>,
     /// Built-in table inventory every tenant receives before promotion.
     builtins: BuiltinTables,
 }
@@ -126,7 +126,7 @@ impl TenantProvisioning {
     #[must_use]
     pub const fn new(
         operator: OperatorPool,
-        audit: Arc<AuditOutbox>,
+        audit: Arc<ScribeOutbox>,
         builtins: BuiltinTables,
     ) -> Self {
         Self {
@@ -163,7 +163,7 @@ impl TenantProvisioning {
         let data_tenant_id = DataTenantId::new_v7();
 
         // The handle must outlive the transaction it lends out.
-        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit) as _);
         let mut conn = authz
             .authorize(
                 &caller.context,
@@ -368,7 +368,7 @@ impl TenantProvisioning {
         suspended: bool,
     ) -> Result<(), ProvisionError> {
         // The handle must outlive the transaction it lends out.
-        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit) as _);
         let mut decision = authz
             .authorize(
                 &caller.context,
@@ -414,7 +414,7 @@ impl TenantProvisioning {
         caller: &PlatformCaller,
         resource: &str,
     ) -> Result<(), ProvisionError> {
-        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit) as _);
         let decision = authz
             .authorize(
                 &caller.context,

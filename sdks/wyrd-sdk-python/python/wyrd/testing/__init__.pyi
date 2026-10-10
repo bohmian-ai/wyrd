@@ -24,12 +24,6 @@ class WyrdTestServer:
     removes them) on exit. Use ``mutate_env=False`` when running parallel test
     suites that manage these vars externally.
 
-    ``cleanup`` is reserved for a future teardown-skip feature; currently ignored
-    (the server and embedded Postgres are always cleaned up on exit).
-
-    ``audit_publication=False`` keeps the server's audit publisher from retiring
-    staged audit rows, for a journey that counts staged decisions.
-
     ``verification_runtime=True`` composes the verification runtime, so Drift
     baselines fit and verification runs execute in the background.
     ``provider_base_url``, when set, makes the gateway dispatch over HTTP with
@@ -45,30 +39,27 @@ class WyrdTestServer:
 
     ``human_sso=True`` serves the public origin the identity lane's Keycloak
     clients register, so saved user login journeys can sign in against it.
+
+    ``access_ttl_seconds`` mints access tokens of that lifetime, verified with
+    no clock-skew allowance, so a journey can outlive its first token.
     """
 
     def __init__(
         self,
-        cleanup: bool = True,
         mutate_env: bool = True,
-        audit_publication: bool = True,
         verification_runtime: bool = False,
         provider_base_url: str | None = None,
         live_providers: bool = False,
         human_sso: bool = False,
+        access_ttl_seconds: int | None = None,
     ) -> None:
         """Create an unstarted server; entering the ``with`` block boots it.
 
         Args:
-            cleanup: reserved for a future teardown-skip feature and currently
-                ignored; the server and embedded Postgres are always cleaned up.
             mutate_env: when true, entering sets ``WYRD_SERVER_URL``,
                 ``WYRD_GRPC_URL``, and ``WYRD_API_KEY`` for the block and
                 exiting restores the original values (or removes them). Pass
                 false for parallel suites that manage these variables.
-            audit_publication: false keeps the audit publisher from retiring
-                staged audit rows, for a journey that counts staged decisions
-                such as ``table_describe_count()``.
             verification_runtime: true composes the verification runtime, so
                 Drift baselines fit and verification runs execute in the
                 background.
@@ -84,12 +75,26 @@ class WyrdTestServer:
             human_sso: true serves the public origin the identity lane's
                 Keycloak clients register, so saved user login journeys can
                 sign in against it.
+            access_ttl_seconds: the access-token lifetime in seconds, verified
+                with no clock-skew allowance; omitted keeps the production
+                lifetime.
 
         Raises:
             WyrdError: ``WYRD_TESTING_500_HARNESS_START`` when
                 ``provider_base_url`` is not an absolute URL or is combined
                 with ``live_providers``.
 
+        """
+        ...
+
+    def tenant_admin_key(self) -> str:
+        """Issue a key for the tenant's unbound administrator, the key ``wyrd setup`` prints.
+
+        Returns:
+            A new API key of the administrator, which is bound to no Card.
+
+        Raises:
+            WyrdError: The harness error outside the context manager.
         """
         ...
 
@@ -140,6 +145,23 @@ class WyrdTestServer:
     @property
     def tenant_id(self) -> str:
         """Fixture tenant UUID string."""
+        ...
+
+    def bootstrap_user(self, roles: list[str], name: str) -> str:
+        """Sign in a fixture-tenant user holding identity-provider ``roles``.
+
+        Args:
+            roles: Role names recorded as the identity provider's, as a login
+                records them.
+            name: the user's name; the email is ``<name>@test.wyrd``.
+
+        Returns:
+            The user's principal id.
+
+        Raises:
+            WyrdError: Outside the context manager, or when bootstrap fails.
+
+        """
         ...
 
     def bootstrap_service(self, roles: list[str], name: str = "svc") -> str:

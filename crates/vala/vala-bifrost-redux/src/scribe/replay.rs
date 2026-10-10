@@ -1971,6 +1971,7 @@ mod tests {
         rows: arrow::record_batch::RecordBatch,
     ) -> crate::contracts::ScribeIngressFrame {
         crate::contracts::ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal,
             table,

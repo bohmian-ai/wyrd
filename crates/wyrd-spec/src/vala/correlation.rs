@@ -1,7 +1,7 @@
 //! Observation correlation — the reserved server-stamped column names.
 //!
 //! The principal comes from the verified JWT and the card from the run's
-//! server-authorized `card_ref`, so a client never forges its own identity.
+//! server-authorized `card_uid`, so a client never forges its own identity.
 //! Observation fact tables (traces, metrics, logs, genai, eval, drift) carry the
 //! universal correlation set (`run_id`, `card_uid`, `principal_id`).
 //!
@@ -11,13 +11,13 @@
 /// Reserved observation-table column names for the server-stamped correlation block.
 ///
 /// The identity axis is server-stamped at ingest: principal from the verified
-/// JWT, card uid resolved from the run's server-authorized `card_ref`. `run_id`
+/// JWT, card uid confirmed against the writer's Card scope. `run_id`
 /// and `data_tenant_id` are already covered by the run envelope and Bifrost
 /// system columns respectively.
 pub struct CorrelationColumns;
 
 impl CorrelationColumns {
-    /// Resolved card uid column (resolved by server from wire `card_ref`).
+    /// Card uid column (confirmed by the server against the writer's scope).
     pub const CARD_UID: &'static str = "card_uid";
     /// Resolved principal id column.
     pub const PRINCIPAL_ID: &'static str = "principal_id";

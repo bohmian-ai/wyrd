@@ -99,10 +99,10 @@ def test_anthropic_refusals_never_reach_the_provider(
 ) -> None:
     server, upstream = anthropic_gateway
     token = server.access_token()
-    reader_key = server.bootstrap_service(["reader"], name="native-reader")
+    viewer_key = server.bootstrap_service(["viewer"], name="native-reader")
 
     with pytest.raises(anthropic.PermissionDeniedError) as denied:
-        anthropic_client(server, access_token(server, reader_key)).messages.create(
+        anthropic_client(server, access_token(server, viewer_key)).messages.create(
             model="claude-sonnet-5", max_tokens=16, messages=MESSAGES
         )
     ambiguous_client = anthropic_client(
@@ -168,9 +168,9 @@ def test_gemini_refusals_never_reach_the_provider(
 ) -> None:
     server, upstream = gemini_gateway
     token = server.access_token()
-    reader_key = server.bootstrap_service(["reader"], name="native-reader")
+    viewer_key = server.bootstrap_service(["viewer"], name="native-reader")
 
-    reader = gemini_client(server, access_token(server, reader_key))
+    reader = gemini_client(server, access_token(server, viewer_key))
     ambiguous_client = gemini_client(server, token, Authorization=f"Bearer {token}")
     with pytest.raises(genai_errors.ClientError) as denied:
         reader.models.generate_content(model="gemini-2.5-flash", contents="hi")

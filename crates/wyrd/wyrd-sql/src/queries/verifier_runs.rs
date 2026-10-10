@@ -27,7 +27,6 @@ use wyrd_spec::card::operator::{MAX_SUMMARY_CHARS, VerifierCounts};
 use wyrd_spec::ids::{
     BindingId, CardUid, OperatorDispatchId, VerificationResultId, VerificationRunId,
 };
-use wyrd_spec::reference::CardRef;
 use wyrd_spec::verification::{
     DriftWindow, FrozenTarget, OperatorDispatchState, VerificationBindingStatus, VerificationError,
     VerificationRunStatus, VerificationRunTarget, VerificationVerdict, VerifierReadiness,
@@ -123,11 +122,14 @@ const LOCK_OBSERVATION_BINDING_SQL: &str = r"
 /// the same order and one simply waits for the other instead of forming a
 /// cycle.
 const LOCK_OBSERVATION_SUBJECTS_SQL: &str = r"
-    SELECT binding_id, subject_card_uid, owner_card_uid
-      FROM wyrd.verification_bindings
-     WHERE activation = 'observations_ready'
-       AND (subject_card_uid, owner_card_uid) IN (SELECT * FROM unnest($1::uuid[], $2::uuid[]))
-     ORDER BY binding_id
+    SELECT b.binding_id, b.subject_card_uid, b.owner_card_uid
+      FROM wyrd.verification_bindings b
+     WHERE b.activation = 'observations_ready'
+       AND EXISTS (SELECT 1
+                     FROM unnest($1::uuid[], $2::uuid[]) AS u(subject, writer)
+                    WHERE u.subject = b.subject_card_uid
+                      AND (u.writer IS NULL OR u.writer = b.owner_card_uid))
+     ORDER BY b.binding_id
        FOR NO KEY UPDATE
 ";
 
@@ -199,9 +201,9 @@ const KEYED_RUN_SQL: &str = r"
        AND idempotency_key = $2
 ";
 
-/// Read the subject Card a binding verifies.
-const BINDING_SUBJECT_SQL: &str = r"
-    SELECT subject_card_uid
+/// Read the Verifier and subject Card of one binding.
+const BINDING_TARGET_SQL: &str = r"
+    SELECT verifier_uid, subject_card_uid
       FROM wyrd.verification_bindings
      WHERE binding_id = $1
 ";
@@ -245,8 +247,7 @@ const ADVANCE_CURSOR_SQL: &str = r"
 /// Settle every expired lease that has no attempt left as `errored`.
 ///
 /// Expiry is decided and stamped by PostgreSQL, so a lease written by one pod
-/// is never judged against another pod's clock. A run with a stored result is
-/// never exhausted: its result is decided, and the next claimant writes it.
+/// is never judged against another pod's clock.
 const EXHAUST_EXPIRED_SQL: &str = r"
     UPDATE wyrd.verifier_runs r
        SET status = 'errored', error = $1, lease_expires_at = NULL,
@@ -255,7 +256,6 @@ const EXHAUST_EXPIRED_SQL: &str = r"
      WHERE r.status = 'running'
        AND r.lease_expires_at <= statement_timestamp()
        AND r.attempts >= r.max_attempts
-       AND NOT EXISTS (SELECT 1 FROM wyrd.verifier_run_results s WHERE s.run_id = r.run_id)
 ";
 
 /// Claim the oldest due, retry-due, or lease-expired run under a fresh lease.
@@ -299,39 +299,6 @@ const CLAIM_RUN_SQL: &str = r"
                 WHERE c.card_uid = r.verifier_uid) AS verifier_status,
               (SELECT b.fitted FROM wyrd.drift_baselines b
                 WHERE b.verifier_uid = r.verifier_uid AND b.state = 'ready') AS fitted_baseline
-";
-
-/// Read a run's stored result, in its table write order.
-const STAGED_RESULT_SQL: &str = r"
-    SELECT result_id, event_time, verdict, summary, counts, verifier,
-           tables, batch_ids, payloads
-      FROM wyrd.verifier_run_results
-     WHERE run_id = $1
-";
-
-/// Lock a run still held by this lease token, so a concurrent reclaim either
-/// commits first (and this finds nothing) or waits for the caller's store.
-const LOCK_HELD_RUN_SQL: &str = r"
-    SELECT data_tenant_id
-      FROM wyrd.verifier_runs
-     WHERE run_id = $1 AND lease_token = $2 AND status = 'running'
-       FOR UPDATE
-";
-
-/// Store a held run's decided result; a result already stored for the run is
-/// kept, because only the claimant that stored it could have decided it.
-const STORE_RESULT_SQL: &str = r"
-    INSERT INTO wyrd.verifier_run_results (
-        run_id, data_tenant_id, result_id, event_time, verdict, summary,
-        counts, verifier, tables, batch_ids, payloads
-    )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    ON CONFLICT (run_id) DO NOTHING
-";
-
-/// Delete a settled run's stored result.
-const DELETE_STAGED_SQL: &str = r"
-    DELETE FROM wyrd.verifier_run_results WHERE run_id = $1
 ";
 
 /// Renew every listed lease still held, on the database clock.
@@ -710,6 +677,18 @@ pub struct RequestKey<'a> {
     pub request_sha256: &'a [u8],
 }
 
+/// The exact Cards one manual run target selects.
+///
+/// Read by [`VerifierRunQueue::target_cards`] so authorization can check the
+/// Verifier permission and the caller's subject scope before enqueue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetCards {
+    /// The Verifier the run would execute.
+    pub verifier: CardUid,
+    /// The subject Card the run would verify.
+    pub subject: CardUid,
+}
+
 /// Result of [`VerifierRunQueue::enqueue_manual`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualEnqueueOutcome {
@@ -829,42 +808,6 @@ pub struct ClaimedRun {
     /// The Verifier's ready fitted Drift baseline, read in the claim
     /// transaction; `None` when it has none.
     pub fitted_baseline: Option<Value>,
-    /// The run's result when an earlier claimant already decided and stored
-    /// it; such a run is never executed again, only written.
-    pub staged: Option<StagedResult>,
-}
-
-/// A run's decided result as stored before any of it reaches Bifrost.
-///
-/// Every write of the run, by any claimant, submits exactly these batches;
-/// completion freezes exactly this verdict, summary, and count.
-#[derive(Debug, Clone, PartialEq)]
-pub struct StagedResult {
-    /// The result identity every row carries and the run completes with.
-    pub result_id: VerificationResultId,
-    /// The result's producer event time.
-    pub event_time: DateTime<Utc>,
-    /// The common verdict.
-    pub verdict: VerificationVerdict,
-    /// Bounded summary frozen into failure dispatches.
-    pub summary: String,
-    /// The result's counts frozen into failure dispatches.
-    pub counts: VerifierCounts,
-    /// The exact Verifier the rows are attributed to.
-    pub verifier: CardRef,
-    /// Encoded batches in write order: details, then the summary.
-    pub batches: Vec<StagedBatch>,
-}
-
-/// One encoded result batch of a [`StagedResult`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedBatch {
-    /// Fully qualified result table.
-    pub table: String,
-    /// Identity Scribe's batch fence deduplicates on.
-    pub batch_id: Uuid,
-    /// The batch as one Arrow IPC stream.
-    pub ipc: Vec<u8>,
 }
 
 /// Outcome of a token-fenced settlement.
@@ -906,8 +849,10 @@ pub struct ObservationRecord {
     /// Subject Card the observation was emitted for.
     pub subject: CardUid,
     /// Card the writing principal is bound to; only `observations_ready`
-    /// bindings whose exact owner is this Card take a run of it.
-    pub writer: CardUid,
+    /// bindings whose exact owner is this Card take a run of it. `None` is a
+    /// writer bound to no Card, whose record activates every
+    /// `observations_ready` binding of its subject.
+    pub writer: Option<CardUid>,
     /// Logical input record ID, unique per binding's runs.
     pub record_id: String,
     /// Committed observation's server event time, frozen on the run.
@@ -1103,33 +1048,41 @@ impl VerifierRunQueue {
         })
     }
 
-    /// Return the subject Card a manual target would verify.
+    /// Return the Verifier and subject Card a manual target selects.
     ///
-    /// A direct target names its subject; a binding target verifies its
-    /// projected subject. An unknown or other-tenant binding is `Ok(None)`.
-    /// Authorization reads this before enqueue to check a Card-bound caller's
-    /// scope over the exact subject.
+    /// A direct target names both; a binding target selects its projected
+    /// Verifier and subject. An unknown or other-tenant binding is `Ok(None)`.
+    /// Authorization reads this before enqueue to check `verifier:run` on the
+    /// exact Verifier and a Card-bound caller's scope over the exact subject.
     ///
     /// # Errors
     /// Returns the database error when the binding read fails, or a decode
-    /// error when the stored subject is malformed.
-    pub async fn target_subject(
+    /// error when a stored identity is malformed.
+    pub async fn target_cards(
         &self,
         conn: &mut TenantConn<'_>,
         target: &VerificationRunTarget,
-    ) -> Result<Option<CardUid>, SqlxError> {
+    ) -> Result<Option<TargetCards>, SqlxError> {
         match target {
             VerificationRunTarget::Verifier {
-                subject_card_uid, ..
-            } => Ok(Some(subject_card_uid.clone())),
+                verifier_uid,
+                subject_card_uid,
+            } => Ok(Some(TargetCards {
+                verifier: verifier_uid.clone(),
+                subject: subject_card_uid.clone(),
+            })),
             VerificationRunTarget::Binding { binding_id } => {
-                let subject: Option<Uuid> = sqlx::query_scalar(BINDING_SUBJECT_SQL)
+                let row: Option<(Uuid, Uuid)> = sqlx::query_as(BINDING_TARGET_SQL)
                     .bind(binding_id.as_uuid())
                     .fetch_optional(&mut **conn.transaction())
                     .await?;
-                subject
-                    .map(|uid| stored(CardUid::from_uuid(uid)))
-                    .transpose()
+                row.map(|(verifier, subject)| {
+                    Ok(TargetCards {
+                        verifier: stored(CardUid::from_uuid(verifier))?,
+                        subject: stored(CardUid::from_uuid(subject))?,
+                    })
+                })
+                .transpose()
             }
         }
     }
@@ -1381,66 +1334,8 @@ impl VerifierRunQueue {
             .bind(lease_for.num_milliseconds())
             .fetch_optional(&mut **conn.transaction())
             .await?;
-        let Some(mut claimed) = row
-            .map(|row| row.into_claimed(LeaseToken(token)))
-            .transpose()?
-        else {
-            return Ok(None);
-        };
-        let staged: Option<StagedResultRow> = sqlx::query_as(STAGED_RESULT_SQL)
-            .bind(claimed.lease.run_id.as_uuid())
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        claimed.staged = staged.map(StagedResultRow::into_staged).transpose()?;
-        Ok(Some(claimed))
-    }
-
-    /// Store `staged` as the decided result of the run `lease` holds.
-    ///
-    /// Locks the run while this token still holds it, so a concurrent reclaim
-    /// either commits first, and this stores nothing, or waits until the
-    /// caller's transaction ends. A result already stored for the run is
-    /// kept: only the claimant that stored it could have decided it, so a
-    /// repeated store after an unacknowledged commit is [`Settlement::Applied`].
-    /// The caller commits before writing any batch to Bifrost.
-    ///
-    /// # Errors
-    /// Returns the database error when a statement fails, or an encoding error
-    /// when the verdict, counts, or Verifier reference cannot be serialized.
-    #[tracing::instrument(skip(self, conn, staged), fields(operation = "verification.runs.store_result", run_id = %lease.run_id))]
-    pub async fn store_result(
-        &self,
-        conn: &mut TenantConn<'_>,
-        lease: RunLease,
-        staged: &StagedResult,
-    ) -> Result<Settlement, SqlxError> {
-        let tenant: Option<Uuid> = sqlx::query_scalar(LOCK_HELD_RUN_SQL)
-            .bind(lease.run_id.as_uuid())
-            .bind(lease.token.0)
-            .fetch_optional(&mut **conn.transaction())
-            .await?;
-        let Some(tenant) = tenant else {
-            return Ok(Settlement::StaleLease);
-        };
-        let batches = &staged.batches;
-        let tables: Vec<&str> = batches.iter().map(|batch| batch.table.as_str()).collect();
-        let batch_ids: Vec<Uuid> = batches.iter().map(|batch| batch.batch_id).collect();
-        let payloads: Vec<&[u8]> = batches.iter().map(|batch| batch.ipc.as_slice()).collect();
-        sqlx::query(STORE_RESULT_SQL)
-            .bind(lease.run_id.as_uuid())
-            .bind(tenant)
-            .bind(staged.result_id.as_uuid())
-            .bind(staged.event_time)
-            .bind(Json(staged.verdict))
-            .bind(&staged.summary)
-            .bind(Json(staged.counts))
-            .bind(Json(&staged.verifier))
-            .bind(tables)
-            .bind(batch_ids)
-            .bind(payloads)
-            .execute(&mut **conn.transaction())
-            .await?;
-        Ok(Settlement::Applied)
+        row.map(|row| row.into_claimed(LeaseToken(token)))
+            .transpose()
     }
 
     /// Renew, on the database clock, every lease in `tokens` still held.
@@ -1473,24 +1368,7 @@ impl VerifierRunQueue {
         Ok(held.into_iter().map(LeaseToken).collect())
     }
 
-    /// Delete the stored result of the run `lease` names, in the caller's
-    /// settlement transaction.
-    ///
-    /// # Errors
-    /// Returns the database error when the delete fails.
-    async fn delete_staged(
-        &self,
-        conn: &mut TenantConn<'_>,
-        lease: RunLease,
-    ) -> Result<(), SqlxError> {
-        sqlx::query(DELETE_STAGED_SQL)
-            .bind(lease.run_id.as_uuid())
-            .execute(&mut **conn.transaction())
-            .await?;
-        Ok(())
-    }
-
-    /// Settle a claimed run `completed`, pointing at its acknowledged result.
+    /// Settle a claimed run `completed`, pointing at its staged result.
     ///
     /// Only the current lease holder can complete; re-completing with the same
     /// token and result is an idempotent [`Settlement::Applied`]. For a
@@ -1527,7 +1405,6 @@ impl VerifierRunQueue {
         let Some((binding_id, Json(operators))) = settled else {
             return Ok(Settlement::StaleLease);
         };
-        self.delete_staged(conn, lease).await?;
         if verdict == VerificationVerdict::Failed && binding_id.is_some() {
             let summary: String = summary.chars().take(MAX_SUMMARY_CHARS).collect();
             for operator in &operators {
@@ -1612,11 +1489,7 @@ impl VerifierRunQueue {
             .bind(Json(error))
             .execute(&mut **conn.transaction())
             .await?;
-        let settled = settlement(result.rows_affected());
-        if settled == Settlement::Applied {
-            self.delete_staged(conn, lease).await?;
-        }
-        Ok(settled)
+        Ok(settlement(result.rows_affected()))
     }
 
     /// Requeue a claimed run whose required trace has not landed yet.
@@ -1661,17 +1534,18 @@ impl VerifierRunQueue {
         )
     }
 
-    /// Enqueue one Eval run per `observations_ready` binding the writer owns
-    /// on each record's subject, for every record of a batch, in one insert
-    /// statement.
+    /// Enqueue one Eval run per `observations_ready` binding the writer
+    /// activates on each record's subject, for every record of a batch, in
+    /// one insert statement.
     ///
     /// Called after the observations are durably committed, never inside
     /// their ingest transaction. One statement locks and lists, in binding
-    /// order, every `observations_ready` binding whose subject and exact
-    /// owner Card match a record's subject and writer, so concurrent
-    /// batches touching the same bindings serialize instead of deadlocking
-    /// and another owner's binding on the same subject takes no run
-    /// (REQ-108). Each such binding whose Verifier, subject, and
+    /// order, every `observations_ready` binding whose subject matches a
+    /// record's subject and whose exact owner Card is the record's writer,
+    /// or any owner when the writer is bound to no Card. Concurrent batches
+    /// touching the same bindings therefore serialize instead of
+    /// deadlocking, and a Card-bound writer never activates another owner's
+    /// binding on the same subject. Each such binding whose Verifier, subject, and
     /// implementation accept an Eval record contributes one row per matching
     /// record; one
     /// [`INSERT_OBSERVATION_RUNS_SQL`] then writes them all. A record that
@@ -1692,9 +1566,14 @@ impl VerifierRunQueue {
         conn: &mut TenantConn<'_>,
         records: &[ObservationRecord],
     ) -> Result<u64, SqlxError> {
-        let (subjects, writers): (Vec<Uuid>, Vec<Uuid>) = records
+        let (subjects, writers): (Vec<Uuid>, Vec<Option<Uuid>>) = records
             .iter()
-            .map(|record| (record.subject.as_uuid(), record.writer.as_uuid()))
+            .map(|record| {
+                (
+                    record.subject.as_uuid(),
+                    record.writer.as_ref().map(CardUid::as_uuid),
+                )
+            })
             .unzip();
         let bindings: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(LOCK_OBSERVATION_SUBJECTS_SQL)
             .bind(subjects)
@@ -1711,7 +1590,11 @@ impl VerifierRunQueue {
                 continue;
             }
             for record in records.iter().filter(|record| {
-                record.subject.as_uuid() == subject && record.writer.as_uuid() == writer
+                record.subject.as_uuid() == subject
+                    && record
+                        .writer
+                        .as_ref()
+                        .is_none_or(|bound| bound.as_uuid() == writer)
             }) {
                 run_ids.push(VerificationRunId::new_v7().as_uuid());
                 binding_ids.push(binding);
@@ -1736,8 +1619,8 @@ impl VerifierRunQueue {
     /// Whether `binding`'s target accepts an Eval record now: Verifier ready,
     /// subject available, Eval implementation.
     ///
-    /// No owner activity is read: the record's writer is bound to the
-    /// binding's owner and has just authenticated (REQ-108).
+    /// No owner activity is read: the record's writer has just authenticated
+    /// and was authorized to attribute the record to its subject.
     ///
     /// # Errors
     /// Returns the database error when a read fails, or a decode error when
@@ -2043,58 +1926,6 @@ struct ClaimedRunRow {
     fitted_baseline: Option<Json<Value>>,
 }
 
-/// One stored result row from [`STAGED_RESULT_SQL`].
-#[derive(sqlx::FromRow)]
-struct StagedResultRow {
-    /// Result identity.
-    result_id: Uuid,
-    /// Result event time.
-    event_time: DateTime<Utc>,
-    /// Common verdict.
-    verdict: Json<VerificationVerdict>,
-    /// Bounded summary.
-    summary: String,
-    /// Result counts.
-    counts: Json<VerifierCounts>,
-    /// Attributed Verifier.
-    verifier: Json<CardRef>,
-    /// Result tables in write order.
-    tables: Vec<String>,
-    /// Batch identities in write order.
-    batch_ids: Vec<Uuid>,
-    /// Arrow IPC streams in write order.
-    payloads: Vec<Vec<u8>>,
-}
-
-impl StagedResultRow {
-    /// Convert the stored columns into a [`StagedResult`].
-    ///
-    /// # Errors
-    /// Returns [`SqlxError::Decode`] when the result ID is not `UUIDv7`.
-    fn into_staged(self) -> Result<StagedResult, SqlxError> {
-        let batches = self
-            .tables
-            .into_iter()
-            .zip(self.batch_ids)
-            .zip(self.payloads)
-            .map(|((table, batch_id), ipc)| StagedBatch {
-                table,
-                batch_id,
-                ipc,
-            })
-            .collect();
-        Ok(StagedResult {
-            result_id: stored(VerificationResultId::new(self.result_id))?,
-            event_time: self.event_time,
-            verdict: self.verdict.0,
-            summary: self.summary,
-            counts: self.counts.0,
-            verifier: self.verifier.0,
-            batches,
-        })
-    }
-}
-
 impl ClaimedRunRow {
     /// Convert raw columns into a typed claim holding `token`.
     ///
@@ -2163,7 +1994,6 @@ impl ClaimedRunRow {
                 .verifier_status
                 .is_some_and(|status| status != "deleted"),
             fitted_baseline: self.fitted_baseline.map(|Json(fitted)| fitted),
-            staged: None,
         })
     }
 }

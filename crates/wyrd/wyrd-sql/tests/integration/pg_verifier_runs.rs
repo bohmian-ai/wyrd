@@ -34,8 +34,7 @@ use wyrd_sql::queries::verification::{
 use wyrd_sql::queries::verifier_runs::{
     ClaimedRun, EnqueueOutcome, EnqueueRefusal, ManualEnqueueOutcome, ObservationRecord,
     QueueCounts, RequestKey, RetryOutcome, RunInput, RunOrigin, RunRequest, ScheduleOutcome,
-    ScheduleSkip, Settlement, StagedBatch, StagedResult, TerminalStatus, TraceWaitOutcome,
-    VerifierRunQueue,
+    ScheduleSkip, Settlement, TargetCards, TerminalStatus, TraceWaitOutcome, VerifierRunQueue,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -584,9 +583,9 @@ async fn enqueue_refuses_unrunnable_targets_without_writing() {
 
 /// A keyed manual request replays its run for the same digest, refuses a
 /// different digest under the same key, and scopes keys to the requester; a
-/// refused keyed request leaves the key unused. `target_subject` resolves a
-/// binding's subject, echoes a direct subject, and answers `None` for an
-/// unknown binding.
+/// refused keyed request leaves the key unused. `target_cards` resolves a
+/// binding's Verifier and subject, echoes a direct target's, and answers
+/// `None` for an unknown binding.
 ///
 /// # Panics
 /// Panics when any keyed outcome, stored key, run count, or subject differs.
@@ -670,10 +669,13 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
 
     assert_eq!(
         queue
-            .target_subject(&mut conn, &target)
+            .target_cards(&mut conn, &target)
             .await
-            .expect("binding subject reads"),
-        Some(owner.clone())
+            .expect("binding target reads"),
+        Some(TargetCards {
+            verifier: custom.clone(),
+            subject: owner.clone(),
+        })
     );
     let direct = VerificationRunTarget::Verifier {
         verifier_uid: custom.clone(),
@@ -681,17 +683,20 @@ async fn manual_idempotency_keys_replay_conflict_and_scope_to_requester() {
     };
     assert_eq!(
         queue
-            .target_subject(&mut conn, &direct)
+            .target_cards(&mut conn, &direct)
             .await
-            .expect("direct subject answers"),
-        Some(owner)
+            .expect("direct target answers"),
+        Some(TargetCards {
+            verifier: custom,
+            subject: owner,
+        })
     );
     let unknown = VerificationRunTarget::Binding {
         binding_id: BindingId::new_v7(),
     };
     assert_eq!(
         queue
-            .target_subject(&mut conn, &unknown)
+            .target_cards(&mut conn, &unknown)
             .await
             .expect("unknown binding answers"),
         None
@@ -1094,134 +1099,6 @@ async fn scheduler_skips_inactive_unready_and_missed_occurrences() {
         assert_next_daily_boundary(cursor(&mut conn, binding).await, due);
     }
     assert_eq!(run_count(&mut conn).await, 0);
-}
-
-/// A two-batch staged result of `verifier`: a detail batch, then the summary.
-///
-/// # Panics
-/// Never in practice: the static Card name and version are valid.
-fn staged_result(verifier: &CardUid) -> StagedResult {
-    StagedResult {
-        result_id: VerificationResultId::new_v7(),
-        event_time: Utc.with_ymd_and_hms(2026, 10, 3, 12, 0, 0).unwrap(),
-        verdict: VerificationVerdict::Failed,
-        summary: "1 of 3 features drifted".to_owned(),
-        counts: DRIFT_COUNTS,
-        verifier: wyrd_spec::reference::CardRef {
-            kind: CardKind::Verifier,
-            name: wyrd_spec::ids::CardName::new("drift").expect("static Card name"),
-            version: "1.0.0".parse().expect("static version"),
-            space: Some(wyrd_spec::ids::SpaceName::new("default").expect("static space")),
-            uid: Some(verifier.clone()),
-        },
-        batches: vec![
-            StagedBatch {
-                table: "vala.drift.result_features".to_owned(),
-                batch_id: Uuid::now_v7(),
-                ipc: vec![1, 2, 3],
-            },
-            StagedBatch {
-                table: "vala.verification.results".to_owned(),
-                batch_id: Uuid::now_v7(),
-                ipc: vec![4, 5],
-            },
-        ],
-    }
-}
-
-/// Stored results visible to the tenant.
-///
-/// # Panics
-/// Panics when the count cannot be read.
-async fn staged_count(conn: &mut TenantConn<'_>) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM wyrd.verifier_run_results")
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("staged results count")
-}
-
-/// Only the current lease holder stores a run's result; a stale token stores
-/// nothing. Every later claim of the run returns the stored result byte for
-/// byte, an expired final attempt with a stored result is reclaimed rather
-/// than exhausted, and the settlement that completes the run deletes it.
-///
-/// # Panics
-/// Panics when a stale token stores, a reclaim misses or alters the stored
-/// result, the run is exhausted, or completion leaves the result stored.
-#[tokio::test]
-async fn stored_results_are_lease_fenced_and_deleted_at_settle() {
-    let fixture = PgFixture::start().await.expect("fixture starts");
-    let actor = actor(fixture.data_tenant_id());
-    let queue = VerifierRunQueue::default();
-    let mut conn = fixture
-        .tenant_conn()
-        .await
-        .expect("tenant connection opens");
-    let (owner, _) = register_service(&mut conn, &actor, "svc").await;
-    let verifier = register_verifier(&mut conn, &actor, "drift", custom_drift()).await;
-    let binding = bind(&mut conn, &owner, &verifier, daily(), Vec::new()).await;
-    let run = enqueued(
-        queue
-            .enqueue(&mut conn, &manual_binding(&actor, binding))
-            .await
-            .expect("run enqueues"),
-    );
-    let staged = staged_result(&verifier);
-
-    let first = claim(&queue, &mut conn).await;
-    assert_eq!(first.staged, None, "a fresh run has no stored result");
-    assert!(
-        first.verifier_present,
-        "the claim reports the live Verifier"
-    );
-    expire_deadlines(&mut conn, run).await;
-    let holder = claim(&queue, &mut conn).await;
-    assert_eq!(
-        queue
-            .store_result(&mut conn, first.lease, &staged_result(&verifier))
-            .await
-            .expect("stale store answers"),
-        Settlement::StaleLease,
-        "a reclaimed token stores nothing"
-    );
-    assert_eq!(staged_count(&mut conn).await, 0);
-    for _ in 0..2 {
-        assert_eq!(
-            queue
-                .store_result(&mut conn, holder.lease, &staged)
-                .await
-                .expect("store answers"),
-            Settlement::Applied,
-            "the holder stores, and a repeated store keeps the same result"
-        );
-    }
-    assert_eq!(staged_count(&mut conn).await, 1);
-
-    sqlx::query("UPDATE wyrd.verifier_runs SET attempts = max_attempts WHERE run_id = $1")
-        .bind(run.as_uuid())
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("attempts spent");
-    expire_deadlines(&mut conn, run).await;
-    let replay = claim(&queue, &mut conn).await;
-    assert_eq!(replay.lease.run_id, run, "a decided run is not exhausted");
-    assert_eq!(replay.staged.as_ref(), Some(&staged));
-
-    assert_eq!(
-        queue
-            .complete(
-                &mut conn,
-                replay.lease,
-                staged.result_id,
-                staged.verdict,
-                &staged.summary,
-                staged.counts,
-            )
-            .await
-            .expect("completion answers"),
-        Settlement::Applied
-    );
-    assert_eq!(staged_count(&mut conn).await, 0, "completion deletes it");
 }
 
 /// The stored lease expiry of `run`.
@@ -1845,7 +1722,7 @@ async fn claim_reports_postgres_measured_queue_wait_and_age() {
 fn record(subject: &CardUid, writer: &CardUid, record_id: &str) -> ObservationRecord {
     ObservationRecord {
         subject: subject.clone(),
-        writer: writer.clone(),
+        writer: Some(writer.clone()),
         record_id: record_id.to_owned(),
         event_time: at(22, 11, 59),
     }
@@ -2055,12 +1932,14 @@ async fn frames_naming_subjects_in_opposite_orders_serialize() {
     assert_eq!(run_count(&mut conn).await, 4);
 }
 
-/// An Eval record runs only the bindings its writer owns (REQ-108).
+/// An Eval record of a Card-bound writer runs only the bindings its writer
+/// owns, while an unbound writer's record runs every binding of its subject.
 ///
 /// Services A and B each own an `observations_ready` binding on A's Card. A
 /// record A writes runs A's binding and never B's: not while B is active, and
 /// not when the record is retried after B authenticates again. A record B
-/// writes on the same subject runs B's binding and not A's.
+/// writes on the same subject runs B's binding and not A's. A record written
+/// by a principal bound to no Card runs both.
 ///
 /// # Panics
 /// Panics when a binding takes a run of a record its owner did not write, or
@@ -2146,6 +2025,27 @@ async fn observation_runs_follow_the_writer() {
         ordinals(&mut conn, b_binding).await,
         numbered(&[("b-1", 1)]),
         "B never takes a run of A's record"
+    );
+
+    let unbound = ObservationRecord {
+        writer: None,
+        ..record(&a, &a, "u-1")
+    };
+    assert_eq!(
+        queue
+            .enqueue_observation_batch(&mut conn, &[unbound])
+            .await
+            .expect("an unbound writer's record enqueues"),
+        2,
+        "a writer bound to no Card activates every binding of the subject"
+    );
+    assert_eq!(
+        ordinals(&mut conn, a_binding).await,
+        numbered(&[("a-1", 1), ("a-2", 2), ("u-1", 3)])
+    );
+    assert_eq!(
+        ordinals(&mut conn, b_binding).await,
+        numbered(&[("b-1", 1), ("u-1", 2)])
     );
 }
 

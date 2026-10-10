@@ -11,10 +11,10 @@
 //! platform principal that recovers a tenant still cannot read or write
 //! anything inside it.
 
+use crate::scribe_outbox::ScribeOutbox;
 use secrecy::ExposeSecret;
 use std::sync::Arc;
 use uuid::Uuid;
-use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth::platform_authz::{PlatformAuthorization, tenant_resource};
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
@@ -44,7 +44,7 @@ pub struct TenantRecovery {
     /// recovery cannot reach a tenant its caller did not name.
     operator: OperatorPool,
     /// Process audit outbox the recovery decision is staged on.
-    audit: Arc<AuditOutbox>,
+    audit: Arc<ScribeOutbox>,
 }
 
 impl Debug for TenantRecovery {
@@ -58,7 +58,7 @@ impl TenantRecovery {
     /// Bind recovery to the platform boundary it owns and the process audit
     /// outbox its decision is staged on.
     #[must_use]
-    pub const fn new(operator: OperatorPool, audit: Arc<AuditOutbox>) -> Self {
+    pub const fn new(operator: OperatorPool, audit: Arc<ScribeOutbox>) -> Self {
         Self { operator, audit }
     }
 
@@ -85,7 +85,7 @@ impl TenantRecovery {
         tenant_id: DataTenantId,
         mut conn: TenantConn<'_>,
     ) -> Result<ProvisionedTenantAdmin, ProvisionError> {
-        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit));
+        let authz = PlatformAuthorization::new(self.operator.clone(), Arc::clone(&self.audit) as _);
         let decision = authz
             .authorize(
                 &caller.context,

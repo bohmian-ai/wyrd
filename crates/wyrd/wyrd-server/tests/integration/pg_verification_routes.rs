@@ -14,6 +14,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
 use uuid::Uuid;
+use wyrd_runtime::Permission;
 use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{BindingId, CardUid, DataTenantId};
@@ -295,53 +296,47 @@ async fn start_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(Strin
     decisions(server, "verification.run.start", principal).await
 }
 
-/// List `principal`'s `verification.execute` decisions as (permission,
-/// outcome) once the non-blocking audit outbox has committed every staged
-/// decision.
+/// List `principal`'s `verification.execute` decisions as (permission, outcome).
 ///
 /// # Panics
-/// Panics when the outbox does not drain within ten seconds or the audit rows
-/// cannot be read.
+/// Panics when the retained audit history cannot be read.
 async fn execute_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while server.state().audit_outbox.pending() != 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "audit outbox drains"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
     decisions(server, "verification.execute", principal).await
 }
 
-/// List `principal`'s staged `operation` decisions as (permission, outcome).
+/// List `principal`'s retained `operation` decisions as (permission, outcome),
+/// sorted by outcome.
 ///
 /// # Panics
-/// Panics when the audit rows cannot be read.
+/// Panics when the Scribe outbox does not settle or retained audit history
+/// cannot be read.
 async fn decisions(
     server: &WyrdTestServer,
     operation: &str,
     principal: Uuid,
 ) -> Vec<(String, String)> {
     server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await_audit_retained()
         .await
-        .expect("audit outbox settles");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
+        .expect("audit is retained");
+    let mut rows: Vec<(String, String)> = server
+        .retained_audit_records(
+            server.data_tenant_id(),
+            "permission, outcome",
+            &format!("operation = '{operation}' AND audit_principal_id = '{principal}'"),
+        )
         .await
-        .expect("tenant connection opens");
-    let rows = sqlx::query_as(
-        "SELECT permission, outcome FROM vala.audit_staging \
-          WHERE operation = $1 AND principal_id = $2 \
-          ORDER BY outcome",
-    )
-    .bind(operation)
-    .bind(principal)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("audit rows read");
-    conn.commit().await.expect("audit read commits");
+        .expect("retained audit reads")
+        .into_iter()
+        .map(|record| {
+            let mut fields = record.into_iter().map(Option::unwrap_or_default);
+            (
+                fields.next().unwrap_or_default(),
+                fields.next().unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort_by(|left, right| left.1.cmp(&right.1));
     rows
 }
 
@@ -359,7 +354,7 @@ async fn manual_runs_enqueue_replay_and_read_back() {
         .expect("test server starts");
     let tenant = server.data_tenant_id();
     let fixture = Fixture::seed(&server, tenant).await;
-    let (requester, jwt) = user(&server, "vr-writer", &["writer"]).await;
+    let (requester, jwt) = user(&server, "vr-writer", &["editor"]).await;
 
     let binding_body = run_body(binding_target(fixture.ready_binding));
     let (status, bound) = post_run(&server, &jwt, &binding_body, Some("vr-retry-0001")).await;
@@ -438,15 +433,16 @@ async fn manual_runs_enqueue_replay_and_read_back() {
     assert!(
         decisions
             .iter()
-            .all(|decision| decision == &("evals:run".to_owned(), "allowed".to_owned()))
+            .all(|decision| decision == &("verifier:run".to_owned(), "allowed".to_owned()))
     );
     server.shutdown().await.expect("test server shuts down");
 }
 
 /// Invalid bodies, windows, and targets, unknown and unready bindings, a
-/// caller without `evals:run`, and a Card-bound caller without scope over the
-/// subject are all refused with stable codes before any run exists; the two
-/// authorization refusals each audit exactly one denial.
+/// caller without `verifier:run`, a caller holding only `evals:run` (the
+/// binding is no grant), and a Card-bound caller without scope over the
+/// subject are all refused with stable codes before any run exists; each
+/// authorization refusal audits exactly one `verifier:run` denial.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
@@ -458,7 +454,7 @@ async fn manual_run_refusals_fail_before_enqueue() {
         .expect("test server starts");
     let tenant = server.data_tenant_id();
     let fixture = Fixture::seed(&server, tenant).await;
-    let (_, jwt) = user(&server, "vr-refused-writer", &["writer"]).await;
+    let (_, jwt) = user(&server, "vr-refused-writer", &["editor"]).await;
 
     let cases = [
         (
@@ -532,18 +528,31 @@ async fn manual_run_refusals_fail_before_enqueue() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(problem["code"], "WYRD_SPEC_400_VALIDATION");
 
-    let (reader, reader_jwt) = user(&server, "vr-reader", &["reader"]).await;
+    let (reader, reader_jwt) = user(&server, "vr-reader", &["viewer"]).await;
     let bound = run_body(binding_target(fixture.ready_binding));
     let (status, problem) = post_run(&server, &reader_jwt, &bound, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
         start_decisions(&server, reader).await,
-        vec![("evals:run".to_owned(), "denied".to_owned())]
+        vec![("verifier:run".to_owned(), "denied".to_owned())]
+    );
+    server
+        .seed_role("vr_evals_only", &[Permission::eval_run()])
+        .await
+        .expect("role seeds");
+    let (evals_only, evals_only_jwt) =
+        user(&server, "vr-evals-only-user", &["vr_evals_only"]).await;
+    let (status, problem) = post_run(&server, &evals_only_jwt, &bound, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
+    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    assert_eq!(
+        start_decisions(&server, evals_only).await,
+        vec![("verifier:run".to_owned(), "denied".to_owned())]
     );
 
     let machine = server
-        .bootstrap_service("vr-foreign-service", &["writer"])
+        .bootstrap_service("vr-foreign-service", &["editor"])
         .await
         .expect("card-bound service bootstraps");
     let machine_token = machine_jwt(&server, &machine).await;
@@ -552,7 +561,7 @@ async fn manual_run_refusals_fail_before_enqueue() {
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
         start_decisions(&server, machine.id().as_uuid()).await,
-        vec![("evals:run".to_owned(), "denied".to_owned())]
+        vec![("verifier:run".to_owned(), "denied".to_owned())]
     );
 
     let (status, problem) = get(
@@ -583,7 +592,7 @@ async fn status_reads_audit_cards_read_decisions() {
         .await
         .expect("test server starts");
     let fixture = Fixture::seed(&server, server.data_tenant_id()).await;
-    let (_, writer) = user(&server, "vr-status-writer", &["writer"]).await;
+    let (_, writer) = user(&server, "vr-status-writer", &["editor"]).await;
     let (status, run) = post_run(
         &server,
         &writer,
@@ -598,7 +607,7 @@ async fn status_reads_audit_cards_read_decisions() {
         run["run_id"].as_str().expect("run_id is a string")
     );
 
-    let (reader, reader_jwt) = user(&server, "vr-status-reader", &["reader"]).await;
+    let (reader, reader_jwt) = user(&server, "vr-status-reader", &["viewer"]).await;
     for uri in [&binding_uri, &run_uri] {
         let (status, body) = get(&server, &reader_jwt, uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
@@ -613,7 +622,7 @@ async fn status_reads_audit_cards_read_decisions() {
         allowed
     );
 
-    let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &["runtime_admin"]).await;
+    let (outsider, outsider_jwt) = user(&server, "vr-status-outsider", &[]).await;
     for uri in [&binding_uri, &run_uri] {
         let (status, problem) = get(&server, &outsider_jwt, uri).await;
         assert_eq!(
@@ -650,7 +659,7 @@ async fn verification_state_is_tenant_isolated() {
         .expect("test server starts");
     let tenant = server.data_tenant_id();
     let fixture = Fixture::seed(&server, tenant).await;
-    let (_, jwt) = user(&server, "vr-home-writer", &["writer"]).await;
+    let (_, jwt) = user(&server, "vr-home-writer", &["editor"]).await;
     let (status, run) = post_run(
         &server,
         &jwt,
@@ -880,6 +889,14 @@ fn eval_assertion_spec() -> Value {
     } } })
 }
 
+/// A task Verifier spec whose one assertion requires `$.x` to equal `1`.
+fn task_assertion_spec() -> Value {
+    json!({ "implementation": { "kind": "task", "spec": {
+        "kind": "assertion", "id": "x_is_one", "context_path": "$.x",
+        "operator": "equals", "expected": 1
+    } } })
+}
+
 /// A direct execution body judging `subject` with `verifier` over `input`.
 fn execute_body(verifier: &CardUid, subject: &CardUid, input: Value) -> Value {
     json!({ "verifier_uid": verifier, "subject_card_uid": subject, "input": input })
@@ -926,6 +943,8 @@ struct Direct {
     eval: CardUid,
     /// Eval Verifier with a trace assertion direct execution cannot run.
     traced: CardUid,
+    /// Task Verifier with one `equals` assertion on `$.x`.
+    task: CardUid,
 }
 
 impl Direct {
@@ -975,14 +994,19 @@ impl Direct {
                 )
                 .await
                 .expect("traced Eval Verifier registers"),
+            task: fixture
+                .verifier("vx-task", &task_assertion_spec())
+                .await
+                .expect("task Verifier registers"),
         }
     }
 }
 
-/// Direct execution judges Custom and PSI Drift samples and an Eval record
-/// inline, returning the exact identities, verdict, counts, and detail;
+/// Direct execution judges Custom and PSI Drift samples, an Eval record, and
+/// a task Verifier's context inline, returning the exact identities, verdict,
+/// and detail, with counts for Drift and Eval and none for a task;
 /// unscoreable (null) samples are `inconclusive`. Nothing is enqueued and each
-/// request audits exactly one allowed `evals:run` decision.
+/// request audits exactly one allowed `verifier:run` decision.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
@@ -993,7 +1017,7 @@ async fn direct_execution_judges_inline_without_runs() {
         .await
         .expect("test server starts");
     let direct = Direct::seed(&server).await;
-    let (caller, jwt) = user(&server, "vx-writer", &["writer"]).await;
+    let (caller, jwt) = user(&server, "vx-writer", &["editor"]).await;
 
     let spread: Vec<f64> = (0..1000).map(f64::from).collect();
     let skewed = vec![990.0; 500];
@@ -1040,6 +1064,18 @@ async fn direct_execution_judges_inline_without_runs() {
             "failed",
             "eval",
         ),
+        (
+            direct.task.clone(),
+            json!({ "kind": "task_context", "context": { "x": 1 } }),
+            "passed",
+            "task",
+        ),
+        (
+            direct.task.clone(),
+            json!({ "kind": "task_context", "context": { "x": 2 } }),
+            "failed",
+            "task",
+        ),
     ];
     let requests = cases.len();
     for (verifier, input, verdict, kind) in cases {
@@ -1055,6 +1091,11 @@ async fn direct_execution_judges_inline_without_runs() {
         );
         assert!(response["execution_id"].is_string());
         assert!(response["summary"].is_string());
+        assert_eq!(
+            response.get("counts").is_some(),
+            kind != "task",
+            "{body} -> {response}"
+        );
     }
     assert_eq!(run_count(&server, server.data_tenant_id()).await, 0);
     let decisions = execute_decisions(&server, caller).await;
@@ -1062,15 +1103,17 @@ async fn direct_execution_judges_inline_without_runs() {
     assert!(
         decisions
             .iter()
-            .all(|decision| decision == &("evals:run".to_owned(), "allowed".to_owned()))
+            .all(|decision| decision == &("verifier:run".to_owned(), "allowed".to_owned()))
     );
     server.shutdown().await.expect("test server shuts down");
 }
 
 /// Malformed, oversized, unknown, unready, legacy, incompatible, and
-/// unsupported executions are refused with stable codes, and a caller without
-/// `evals:run` or without scope over the subject is refused with one audited
-/// denial; nothing is ever enqueued.
+/// unsupported executions are refused with stable codes. A caller without
+/// `verifier:run`, holding only `evals:run`, or granted only an unrelated
+/// Verifier UID is refused with one audited denial, while a Card-bound
+/// principal granted exactly that Verifier UID is allowed whatever its
+/// observation scope; nothing is ever enqueued.
 ///
 /// # Panics
 /// Panics when the server fails to start, a fixture write fails, a route fails
@@ -1081,7 +1124,7 @@ async fn direct_execution_refusals_are_stable() {
         .await
         .expect("test server starts");
     let direct = Direct::seed(&server).await;
-    let (_, jwt) = user(&server, "vx-refused-writer", &["writer"]).await;
+    let (_, jwt) = user(&server, "vx-refused-writer", &["editor"]).await;
     let service = &direct.service;
     let record = json!({ "kind": "eval_record", "context": { "x": 1 } });
     let wide: serde_json::Map<String, Value> =
@@ -1186,6 +1229,21 @@ async fn direct_execution_refusals_are_stable() {
             StatusCode::UNPROCESSABLE_ENTITY,
             "WYRD_VERIFICATION_422_INPUT_UNSUPPORTED",
         ),
+        (
+            execute_body(&direct.task, service, record.clone()).to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
+        ),
+        (
+            execute_body(
+                &direct.task,
+                service,
+                json!({ "kind": "task_context", "context": { "y": 1 } }),
+            )
+            .to_string(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "WYRD_VERIFICATION_422_INPUT_INCOMPATIBLE",
+        ),
     ];
     for (body, status, code) in cases {
         let (actual, problem) = post_execute(&server, &jwt, body.clone()).await;
@@ -1198,124 +1256,64 @@ async fn direct_execution_refusals_are_stable() {
     }
 
     let allowed = execute_body(&direct.eval, service, record).to_string();
-    let (reader, reader_jwt) = user(&server, "vx-reader", &["reader"]).await;
+    let (reader, reader_jwt) = user(&server, "vx-reader", &["viewer"]).await;
     let (status, problem) = post_execute(&server, &reader_jwt, allowed.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
     assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
     assert_eq!(
         execute_decisions(&server, reader).await,
-        vec![("evals:run".to_owned(), "denied".to_owned())]
+        vec![("verifier:run".to_owned(), "denied".to_owned())]
     );
+    for (role, permission) in [
+        ("vx_evals_only", Permission::eval_run()),
+        (
+            "vx_other_verifier",
+            Permission::verifier_run(direct.task.clone()),
+        ),
+    ] {
+        server
+            .seed_role(role, &[Permission::card_read(), permission])
+            .await
+            .expect("role seeds");
+        let (denied, denied_jwt) = user(&server, &format!("{role}-user"), &[role]).await;
+        let (status, problem) = post_execute(&server, &denied_jwt, allowed.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{role}: {problem}");
+        assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert_eq!(
+            execute_decisions(&server, denied).await,
+            vec![("verifier:run".to_owned(), "denied".to_owned())],
+            "{role}"
+        );
+    }
+    server
+        .seed_role(
+            "vx_exact_verifier",
+            &[Permission::verifier_run(direct.eval.clone())],
+        )
+        .await
+        .expect("role seeds");
     let machine = server
-        .bootstrap_service("vx-foreign-service", &["writer"])
+        .bootstrap_service("vx-foreign-service", &["vx_exact_verifier"])
         .await
         .expect("card-bound service bootstraps");
     let machine_token = machine_jwt(&server, &machine).await;
-    let (status, problem) = post_execute(&server, &machine_token, allowed).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
-    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
+    let (status, judged) = post_execute(&server, &machine_token, allowed).await;
+    assert_eq!(status, StatusCode::OK, "{judged}");
+    assert_eq!(judged["verdict"], "passed", "{judged}");
     assert_eq!(
         execute_decisions(&server, machine.id().as_uuid()).await,
-        vec![("evals:run".to_owned(), "denied".to_owned())]
+        vec![("verifier:run".to_owned(), "allowed".to_owned())]
     );
     assert_eq!(run_count(&server, server.data_tenant_id()).await, 0);
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// A direct execution whose decision cannot be audited still executes: audit
-/// is non-blocking, so the allowed caller gets its judgment and the Card-bound
-/// caller without subject scope gets its permission refusal. Neither decision
-/// reaches staging while audit fails; both are retried and commit exactly once
-/// when it recovers.
-///
-/// # Panics
-/// Panics when the server fails to start, a fixture write fails, the failure
-/// trigger cannot be installed or dropped, a route fails to respond, or any
-/// status, code, or audit expectation fails.
-#[tokio::test(flavor = "current_thread")]
-async fn direct_execution_does_not_wait_on_audit() {
-    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let direct = Direct::seed(&server).await;
-    let (caller, jwt) = user(&server, "vx-audit-writer", &["writer"]).await;
-    let machine = server
-        .bootstrap_service("vx-audit-foreign-service", &["writer"])
-        .await
-        .expect("card-bound service bootstraps");
-    let machine_token = machine_jwt(&server, &machine).await;
-    let superuser = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
-    for statement in [
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_execute_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'verification.execute' THEN
-               RAISE EXCEPTION 'injected execute audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;",
-        r"CREATE TRIGGER test_fail_execute_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_execute_audit()",
-    ] {
-        sqlx::query(statement)
-            .execute(&superuser)
-            .await
-            .expect("failure trigger installs");
-    }
-
-    let body = execute_body(
-        &direct.eval,
-        &direct.service,
-        json!({ "kind": "eval_record", "context": { "x": 1 } }),
-    )
-    .to_string();
-    let (status, judged) = post_execute(&server, &jwt, body.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{judged}");
-    assert_eq!(judged["verdict"], "passed", "{judged}");
-    let (status, problem) = post_execute(&server, &machine_token, body).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{problem}");
-    assert_eq!(problem["code"], "WYRD_PERMISSION_403_DENIED_RBAC");
-    failures
-        .await_failure(std::time::Duration::from_secs(30))
-        .await
-        .expect("the failed audit write is counted");
-    let staged: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging WHERE operation = 'verification.execute'",
-    )
-    .fetch_one(&superuser)
-    .await
-    .expect("staging reads");
-    assert_eq!(staged, 0, "no decision is staged while audit fails");
-
-    sqlx::query("DROP TRIGGER test_fail_execute_audit ON vala.audit_staging")
-        .execute(&superuser)
-        .await
-        .expect("failure trigger drops");
-    assert_eq!(
-        execute_decisions(&server, caller).await,
-        vec![("evals:run".to_owned(), "allowed".to_owned())],
-        "the allowance commits exactly once after recovery"
-    );
-    assert_eq!(
-        execute_decisions(&server, machine.id().as_uuid()).await,
-        vec![("evals:run".to_owned(), "denied".to_owned())],
-        "the denial commits exactly once after recovery"
-    );
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// An Eval Verifier whose one gated task asks an inline OpenAI judge to grade
-/// `$.answer`, with no task-level retries.
+/// An `llm_judge` check asking an inline OpenAI judge to grade `$.answer`,
+/// with no retries; the Eval and task judge Verifiers both carry it.
 ///
 /// # Panics
 /// Panics when the judge prompt cannot be built.
-fn judge_spec() -> Value {
+fn judge_check() -> Value {
     let prompt = skald_prompt::openai_chat(
         "gpt-test",
         skald_prompt::OpenAiChatOptions {
@@ -1337,21 +1335,18 @@ fn judge_spec() -> Value {
         },
     )
     .expect("the judge prompt builds");
-    json!({ "implementation": { "kind": "eval", "spec": {
-        "pass_gate": { "kind": "all_pass" },
-        "tasks": { "judge": {
-            "kind": "llm_judge", "id": "judge",
-            "judge_ref": { "prompt": prompt.into_native(), "tool_names": [],
-                           "run_config": { "max_iterations": 1 } },
-            "context_path": "$.answer", "operator": "equals",
-            "expected": { "passed": true }, "max_retries": 0
-        } }
-    } } })
+    json!({
+        "kind": "llm_judge", "id": "judge",
+        "judge_ref": { "prompt": prompt.into_native(), "tool_names": [],
+                       "run_config": { "max_iterations": 1 } },
+        "context_path": "$.answer", "operator": "equals",
+        "expected": { "passed": true }, "max_retries": 0
+    })
 }
 
-/// A direct Eval execution calls the configured judge provider and returns
-/// its graded verdict; when the provider fails, the execution is refused with
-/// the stable dependency code and no provider detail.
+/// Direct Eval and task executions call the configured judge provider and
+/// return its graded verdict; when the provider fails, the execution is
+/// refused with the stable dependency code and no provider detail.
 ///
 /// # Panics
 /// Panics when the mock provider or server fails to start, a fixture write
@@ -1359,10 +1354,7 @@ fn judge_spec() -> Value {
 /// expectation fails.
 #[tokio::test(flavor = "current_thread")]
 async fn direct_execution_calls_the_judge_provider() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let provider = MockServer::start().await;
+    let provider = wiremock::MockServer::start().await;
     let server = WyrdTestServer::builder()
         .with_gateway_provider_root_for_test(
             url::Url::parse(&provider.uri()).expect("mock URL parses"),
@@ -1378,21 +1370,103 @@ async fn direct_execution_calls_the_judge_provider() {
         json!({}),
     )
     .await;
-    let judge = server
+    let fixture = server
         .verification_fixture()
         .await
-        .expect("verification fixture provisions")
-        .verifier("vx-judge", &judge_spec())
+        .expect("verification fixture provisions");
+    let eval = fixture
+        .verifier(
+            "vx-judge",
+            &json!({ "implementation": { "kind": "eval", "spec": {
+                "pass_gate": { "kind": "all_pass" },
+                "tasks": { "judge": judge_check() }
+            } } }),
+        )
         .await
-        .expect("judge Verifier registers");
-    let (_, jwt) = user(&server, "vx-judge-writer", &["writer"]).await;
-    let body = execute_body(
-        &judge,
-        &service,
-        json!({ "kind": "eval_record", "context": { "answer": "yes" } }),
-    )
-    .to_string();
+        .expect("Eval judge Verifier registers");
+    let task = fixture
+        .verifier(
+            "vx-task-judge",
+            &json!({ "implementation": { "kind": "task", "spec": judge_check() } }),
+        )
+        .await
+        .expect("task judge Verifier registers");
+    let bodies = [(eval, "eval_record"), (task, "task_context")].map(|(judge, kind)| {
+        execute_body(
+            &judge,
+            &service,
+            json!({ "kind": kind, "context": { "answer": "yes" } }),
+        )
+        .to_string()
+    });
+    server
+        .seed_role(
+            "vx_judge_runner",
+            &[Permission::card_read(), Permission::verifier_run_any()],
+        )
+        .await
+        .expect("runner role seeds");
+    let (_, unprivileged) = user(&server, "vx-judge-unprivileged", &["vx_judge_runner"]).await;
+    let (_, jwt) = user(&server, "vx-judge-writer", &["editor"]).await;
+    for body in &bodies {
+        refused_before_upstream(&server, &provider, &jwt, body.clone()).await;
+    }
+    server
+        .deploy_gateway_model_for_test("gpt-test", "vx_judge_invoker")
+        .await
+        .expect("judge model deploys");
+    for body in &bodies {
+        refused_before_upstream(&server, &provider, &unprivileged, body.clone()).await;
+        judged_by_provider(&server, &provider, &jwt, body.clone()).await;
+    }
+    for body in bodies {
+        provider_failure_withheld(&server, &provider, &jwt, body).await;
+    }
+    server.shutdown().await.expect("test server shuts down");
+}
 
+/// Executes `body` as a caller the gateway refuses (no deployment, or no
+/// invoke grant), asserting the stable dependency refusal and that the
+/// provider was never called.
+///
+/// # Panics
+/// Panics when the route fails to respond or the status, code, or provider
+/// call count differs from the expectation.
+async fn refused_before_upstream(
+    server: &WyrdTestServer,
+    provider: &wiremock::MockServer,
+    jwt: &str,
+    body: String,
+) {
+    provider.reset().await;
+    let (status, problem) = post_execute(server, jwt, body).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{problem}");
+    assert_eq!(problem["code"], "WYRD_VERIFICATION_502_DEPENDENCY_FAILED");
+    assert!(
+        provider
+            .received_requests()
+            .await
+            .is_none_or(|requests| requests.is_empty()),
+        "the gateway refused before upstream IO"
+    );
+}
+
+/// Executes `body` once against a provider grading it passed, asserting the
+/// verdict and exactly one provider call.
+///
+/// # Panics
+/// Panics when the route fails to respond or the status, verdict, or
+/// provider call count differs from the expectation.
+async fn judged_by_provider(
+    server: &WyrdTestServer,
+    provider: &wiremock::MockServer,
+    jwt: &str,
+    body: String,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    provider.reset().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1403,12 +1477,30 @@ async fn direct_execution_calls_the_judge_provider() {
             "usage": { "prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8 }
         })))
         .expect(1)
-        .mount(&provider)
+        .mount(provider)
         .await;
-    let (status, response) = post_execute(&server, &jwt, body.clone()).await;
+    let (status, response) = post_execute(server, jwt, body).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["verdict"], "passed", "{response}");
     provider.verify().await;
+}
+
+/// Executes `body` against a failing provider, asserting the stable,
+/// detail-free dependency refusal. The first failure also removes the
+/// deployment from gateway selection, so a later call is refused before
+/// upstream IO with the same refusal.
+///
+/// # Panics
+/// Panics when the route fails to respond or the status or code differs, or
+/// the refusal leaks provider detail.
+async fn provider_failure_withheld(
+    server: &WyrdTestServer,
+    provider: &wiremock::MockServer,
+    jwt: &str,
+    body: String,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
 
     provider.reset().await;
     Mock::given(method("POST"))
@@ -1416,11 +1508,10 @@ async fn direct_execution_calls_the_judge_provider() {
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
             "error": { "message": "provider-secret-detail", "type": "server_error" }
         })))
-        .mount(&provider)
+        .mount(provider)
         .await;
-    let (status, problem) = post_execute(&server, &jwt, body).await;
+    let (status, problem) = post_execute(server, jwt, body).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{problem}");
     assert_eq!(problem["code"], "WYRD_VERIFICATION_502_DEPENDENCY_FAILED");
     assert!(!problem.to_string().contains("provider-secret-detail"));
-    server.shutdown().await.expect("test server shuts down");
 }

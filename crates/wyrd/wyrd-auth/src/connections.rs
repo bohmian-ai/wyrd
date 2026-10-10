@@ -8,7 +8,7 @@
 //!
 //! Every mutation opens one tenant transaction, takes the tenant's connection
 //! slot lock, stages the caller's already-evaluated canonical audit decision on
-//! the process audit outbox, validates against the locked state, and writes.
+//! the process audit stage, validates against the locked state, and writes.
 //! Staging never waits for, or fails on, the audit commit. Provider network
 //! IO (discovery and the signing-key check that begin a candidate test) runs
 //! before any transaction and outside any lock.
@@ -56,7 +56,7 @@ use wyrd_sql::queries::auth::{
 use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanConnectionRow};
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
-use vala_sql::audit_outbox::AuditOutbox;
+use wyrd_runtime::audit::AuditStage;
 
 use crate::audit::{principal_event, principal_kind_tag};
 use crate::error::{relying_party_error, store_error};
@@ -101,8 +101,8 @@ pub struct HumanConnections {
     relying_party: RelyingParty,
     /// `{public_origin}/auth/callback`, or `None` without a public origin.
     callback_url: Option<Url>,
-    /// Process audit outbox every connection decision is staged on.
-    audit: Arc<AuditOutbox>,
+    /// Process audit stage every connection decision is staged on.
+    audit: Arc<dyn AuditStage>,
 }
 
 impl Debug for HumanConnections {
@@ -148,7 +148,7 @@ pub struct ActiveHumanConnection {
 
 impl HumanConnections {
     /// Build the owner over the runtime store, keyring, screened HTTP, public
-    /// origin, and the process audit outbox its decisions are staged on.
+    /// origin, and the process audit stage its decisions are staged on.
     ///
     /// The callback URL is `{public_origin}/auth/callback`; it is `None` when
     /// the deployment configures no public origin, in which case staging,
@@ -159,7 +159,7 @@ impl HumanConnections {
         keyring: Option<Arc<SealingKeyring>>,
         http: ScreenedHttp,
         public_origin: Option<&Url>,
-        audit: Arc<AuditOutbox>,
+        audit: Arc<dyn AuditStage>,
     ) -> Self {
         Self {
             postgres,
@@ -517,7 +517,7 @@ impl HumanConnections {
     /// retired and the candidate promoted, in the same transaction; sessions
     /// bound to the retired revision stop renewing once it commits.
     ///
-    /// Two decisions are staged on the audit outbox: the bearer caller's
+    /// Two decisions are staged on the audit stage: the bearer caller's
     /// `decision`, staged when the lock is taken, and — whenever the
     /// recovery key resolves to an active principal — that principal's own
     /// Allowed or Denied decision on `identity_connections:write`, staged
@@ -552,7 +552,7 @@ impl HumanConnections {
         {
             return commit_refusal(conn, not_tested("the candidate has no current test")).await;
         }
-        if !recovery_key_authorizes(&mut conn, &self.audit, &recovery_key, decision).await? {
+        if !recovery_key_authorizes(&mut conn, &*self.audit, &recovery_key, decision).await? {
             return commit_refusal(
                 conn,
                 conflict(
@@ -702,7 +702,7 @@ impl HumanConnections {
     }
 
     /// Open a tenant transaction, take the slot lock, and stage `decision` on
-    /// the audit outbox.
+    /// the audit stage.
     ///
     /// # Errors
     /// Returns the store error when the transaction or lock fails.
@@ -846,7 +846,7 @@ async fn tester_authorized(
 /// and [`WyrdError::Internal`] when verification cannot run.
 async fn recovery_key_authorizes(
     conn: &mut TenantConn<'_>,
-    audit: &AuditOutbox,
+    audit: &dyn AuditStage,
     presented: &SecretString,
     bearer: &AuditEvent,
 ) -> Result<bool, WyrdError> {

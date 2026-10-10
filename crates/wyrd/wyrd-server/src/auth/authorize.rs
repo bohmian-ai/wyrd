@@ -334,7 +334,7 @@ mod pg_tests {
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             crate::test_support::test_catalog().await,
         );
-        let audit = Arc::clone(&state.audit_outbox);
+        let audit = Arc::clone(&state.scribe_outbox);
         state.with_auth(ServerAuth {
             human_connections: Some(HumanConnections::new(
                 fixture.wyrd_postgres().clone(),

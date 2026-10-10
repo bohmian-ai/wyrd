@@ -14,6 +14,7 @@
 
 pub mod drift;
 pub mod eval;
+mod invoke;
 pub mod lifecycle;
 #[cfg(test)]
 mod tests;
@@ -23,6 +24,7 @@ use arrow_schema::DataType;
 use serde::Serialize;
 use serde_json::{Value, json};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::media::MediaRef;
 use wyrd_spec::vala::ids::{RunId, SessionId};
@@ -41,6 +43,23 @@ pub use lifecycle::{DRIFT_OBSERVATIONS_TABLE, EVAL_OBSERVATIONS_TABLE};
 /// here fails the call before admission instead of spending a describe and a
 /// queue slot on a table Gate would reject.
 const DATASETS_PREFIX: &str = "vala.datasets.";
+
+tokio::task_local! {
+    /// The `(card_uid, run_id)` text of the innermost [`Run::scope`] the
+    /// current task runs in, which a telemetry span processor stamps on spans.
+    static RUN_SCOPE: (String, String);
+}
+
+/// The `(card_uid, run_id)` text of the innermost [`Run::scope`] the current
+/// task runs in, or `None` outside every scope.
+///
+/// A telemetry span processor reads this when a span starts so the span
+/// carries the record-level `wyrd.card_uid` and `wyrd.run_id` attributes
+/// Bifrost extracts.
+#[must_use]
+pub fn current_run_scope() -> Option<(String, String)> {
+    RUN_SCOPE.try_with(Clone::clone).ok()
+}
 
 /// One application invocation, optionally scoped to a registered Card.
 ///
@@ -64,6 +83,23 @@ pub struct Run {
 }
 
 impl Run {
+    /// Run `future` inside this view's scope, so spans its task starts carry
+    /// this run and Card once `wyrd_sdk::otel::start_telemetry` installed
+    /// telemetry.
+    ///
+    /// The scope is a Tokio task-local: it follows `future` across awaits but
+    /// not into tasks it spawns, and an inner scope shadows an outer one until
+    /// it completes. No IO happens here.
+    pub fn scope<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        RUN_SCOPE.scope(
+            (
+                self.subject_uid().as_str().to_owned(),
+                self.run_id.as_str().to_owned(),
+            ),
+            future,
+        )
+    }
+
     /// Open a run over `state` whose first view observes `subject`, opened
     /// as `alias`.
     ///
@@ -129,12 +165,26 @@ impl Run {
         Observe { run: self }
     }
 
-    /// This view's row correlation: subject Card plus invocation.
+    /// This view's row correlation: the subject Card's UID plus invocation.
     fn correlation(&self) -> Correlation {
         Correlation {
-            card_ref: Some(self.subject.clone()),
+            card_uid: Some(self.subject_uid().clone()),
             run_id: Some(self.run_id.clone()),
         }
+    }
+
+    /// The UID of the Card this view observes: every observation's
+    /// `card_uid` correlation and the `wyrd.card_uid` its spans carry.
+    ///
+    /// # Panics
+    /// Never for a loaded [`WyrdState`]: a hydrated bundle refuses any Card
+    /// without a UID at load, and every subject is resolved from that bundle.
+    #[must_use]
+    pub fn subject_uid(&self) -> &CardUid {
+        self.subject
+            .uid
+            .as_ref()
+            .expect("every hydrated Card carries its UID")
     }
 }
 
@@ -332,9 +382,10 @@ impl Observe<'_> {
     /// to this view's subject in the hydrated graph; the subject is always
     /// this view's. An Eval Verifier takes one context object, in the forms
     /// [`Observe::eval`] accepts; a Drift Verifier takes a non-empty sequence
-    /// of feature rows, in the forms [`Observe::drift`] accepts. It judges
-    /// only: no observation, run, Operator dispatch, or Bifrost write, and
-    /// Bifrost need not be started. A `failed` verdict is a normal return.
+    /// of feature rows, in the forms [`Observe::drift`] accepts. It creates
+    /// no observation, run, or Operator dispatch, and Bifrost need not be
+    /// started; the server records the judgment as one result correlated to
+    /// this Run. A `failed` verdict is a normal return.
     ///
     /// # Arguments
     /// * `verifier` - The `metadata.name` of a Verifier bound to this view's subject.
@@ -427,6 +478,7 @@ impl Observe<'_> {
             verifier_uid: bound.verifier_uid,
             subject_card_uid: bound.subject_uid,
             input: verify::direct_input(bound.implementation, input, media)?,
+            run_id: Some(self.run.run_id.clone()),
         };
         verify::execute(state.client()?, &request).await
     }

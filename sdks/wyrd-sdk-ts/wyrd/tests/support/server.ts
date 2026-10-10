@@ -37,6 +37,8 @@ export interface ServerOptions {
   readonly verificationRuntime?: boolean;
   /** Accept human single sign-on, so saved user logins can authenticate. */
   readonly humanSso?: boolean;
+  /** Access-token lifetime in seconds, verified with no clock-skew allowance. */
+  readonly accessTtlSeconds?: number;
 }
 
 /**
@@ -79,6 +81,7 @@ export function serverTest(options: ServerOptions = {}) {
           providerBaseUrl: options.provider && provider.url,
           verificationRuntime: options.verificationRuntime,
           humanSso: options.humanSso,
+          accessTtlSeconds: options.accessTtlSeconds,
         });
         deploy(server);
         await use(server);

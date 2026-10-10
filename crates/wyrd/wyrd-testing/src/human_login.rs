@@ -64,7 +64,7 @@ impl HumanSso {
 
     /// Stage, test, and activate the public Keycloak `wyrd-human` connection
     /// for the tenant `admin_key` belongs to, mapping `wyrd-admins` to
-    /// `admin` and `wyrd-viewers` to `reader`.
+    /// `admin`, `wyrd-editors` to `editor`, and `wyrd-viewers` to `viewer`.
     ///
     /// The candidate test is a real sign-in as Keycloak's `alice`;
     /// `admin_key` is both the caller and the activation recovery key.
@@ -83,7 +83,11 @@ impl HumanSso {
                     "client_id": "wyrd-human",
                     "client_auth": "Public",
                     "claim_mapping": { "subject": "sub", "email": "email", "groups": "groups" },
-                    "group_role_map": { "wyrd-admins": ["admin"], "wyrd-viewers": ["reader"] },
+                    "group_role_map": {
+                        "wyrd-admins": ["admin"],
+                        "wyrd-editors": ["editor"],
+                        "wyrd-viewers": ["viewer"],
+                    },
                 }),
             )
             .await;

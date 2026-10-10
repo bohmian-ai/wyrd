@@ -67,10 +67,10 @@ Required, non-null `principal_id` identifies the authenticated publisher. None
 participates in row identity.
 
 For OTLP records, table-owned projection reads correlation only from the final
-record-level `wyrd.card_ref` and `wyrd.run_id` attributes, retaining all source
-attributes losslessly. The values use the existing `CardRef` and `RunId` text
-grammars. Any client Card UID is ignored; Scribe stamps only the UID from the
-verified principal scope.
+record-level `wyrd.card_uid` and `wyrd.run_id` attributes, retaining all source
+attributes losslessly. The values use the `CardUid` and `RunId` text grammars.
+Scribe stores a client Card UID only when the verified principal scope, or for
+a principal bound to no Card the tenant registry, confirms it.
 
 Identity is batch-level. The batch identity is the client-generated UUIDv7
 `wyrd_batch_id` request field; it is not stored on rows. Within a
@@ -627,15 +627,16 @@ stability; pruning, vectorization, layout, and IO efficiency determine latency.
 
 ### Read audit and terminal contract
 
-Oracle read decisions use the one process audit outbox. After admission the
-read-decision event is staged without waiting; the outbox writer commits it to
-the canonical tenant hash-chain staging table in a per-tenant batch, and the
-`AuditPublisher` retains it like every other event. Rows are not held for that
-commit; a failed commit is logged, counted through
-`outbox_write_failures_total{outbox="audit"}`, and retried until it lands. The
-`outbox_pending{outbox="audit"}` gauge reports decisions the process still owns
-before their commit or counted loss, and shutdown drains the outbox to its
-deadline. One logical query produces one read-audit event; distributed stages
+Oracle read decisions use the one process Scribe outbox. After admission the
+read-decision event is staged without waiting; the outbox writer submits it to
+Scribe as a `vala.system.audit_log` row in a per-tenant batch, like every other
+audit event. Rows are not held for that write; a retryable failure is logged,
+counted through `outbox_write_failures_total{outbox="scribe"}`, and retried with
+the identical batch, and a terminal rejection is logged, counted through
+`outbox_events_lost_total{outbox="scribe"}`, and consumed. The
+`outbox_pending{outbox="scribe"}` gauge reports writes the process still owns
+before Scribe acknowledges them or their loss is counted, and shutdown drains
+the outbox to its deadline. One logical query produces one read-audit event; distributed stages
 produce none. An Interactive event records `Local` execution on one node; an
 Analytical event records `Distributed` execution over every Oracle in the
 frozen participant cut, leader included, with the followers as its workers.
@@ -653,37 +654,21 @@ through the success terminal of the one public query operation. The public
 query deadline range is `1..=u32::MAX` milliseconds across Rust, HTTP, gRPC,
 Python, TypeScript, and MCP.
 
-The tenant hash-chain `vala.audit_staging` is transient transactional
-write-ahead state, not retained audit history, and has no external consumer.
-Contiguous tenant-scoped ranges are read by a per-tenant
-watermark and projected idempotently through the owning local Scribe and the
-Forge publication path into the tenant-qualified `vala.system.audit_log` Bifrost
-table. That table is the authoritative retained audit history. The publisher
-runs only in a process that owns a local Scribe and calls it directly; Gate
-holds no retained-audit path.
-
-Publication progress is exactly two values per tenant: the monotonic published
-watermark, and at most one nullable in-flight upper bound. A publisher freezes
-that bound from the bounded staging prefix under tenant serialization and
-releases the transaction before any Scribe IO, so the audit-chain append lock is
-never held across publication. Every competing replica and every restarted
-publisher reuses the frozen bound verbatim, so all of them project the same
-rows and derive the same batch identity; rows appended above the bound wait for
-the next batch. The watermark alone would not be enough: a staging tail that
-grows mid-flight would give two publishers two overlapping ranges and therefore
-two distinct identities for the same content, which no dedup fence can absorb.
-
-A staged row is garbage-collected once the watermark has advanced past it. One
-tenant transaction advances the watermark, clears the matching in-flight bound,
-and deletes through the watermark together; a stale completion neither moves the
-watermark backwards nor clears a newer bound. A crash between publication and
-that settlement replays the identical frozen range, which Scribe's durable
-batch-id dedup fence absorbs, so recovery retries without duplicating the
-retained event. The audit writer stages each decision once: when a commit
-returns an error it resolves the transaction's outcome from Postgres
-(`pg_xact_status`) and retries only an aborted write, so retained history holds
-one row per decision and readers do no deduplication. No legacy direct-Iceberg relay or separate `platform.audit_log`
-may become a second historical authority.
+`vala.system.audit_log` is the authoritative retained audit history. Every
+audit event is staged in memory on the process Scribe outbox, whose one
+background writer groups a tenant slice by destination, encodes one Arrow
+frame per group with a batch id derived from its content, and submits it to
+the local Scribe or, from a pod without Scribe, to a Scribe pod over the
+mutually authenticated peer plane. Audit frames are submitted under the
+platform audit principal, the one principal Scribe admits for the reserved
+system owner's audit history. A retryable failure resubmits the identical
+slice, so Scribe's durable batch-id fence absorbs a write whose
+acknowledgement was lost; later arrivals wait for the next slice. A row carries
+only decision content: there is no chain, sequence, or publication progress,
+and readers order by decision time. Writes Scribe has not acknowledged are lost
+on abrupt process death or an expired shutdown deadline; observable loss is
+counted. No PostgreSQL audit staging, publisher, direct-Iceberg relay, or
+separate `platform.audit_log` may become a second historical authority.
 
 Audit events are appended only where an authorization decision was made. Scribe
 batch commits and Forge maintenance transitions evaluate no permission and are
@@ -943,10 +928,10 @@ No cleanup infers safety from age or path shape alone.
   principal's permission records exactly one allowed or denied event.
   Permissions are blocking; audits are non-blocking: the check completes before
   the operation proceeds or refuses, and the event is staged on the shared
-  audit outbox without the operation waiting for its commit, and no
-  operation holds rows for that commit or fails because of it.
-- Engine-internal transitions — Scribe batch commits, Forge maintenance, audit
-  publication, reconciliation, storage lifecycle — evaluate no permission. They
+  Scribe outbox without the operation waiting for its write, and no
+  operation holds rows for that write or fails because of it.
+- Engine-internal transitions — Scribe batch commits, Forge maintenance,
+  reconciliation, storage lifecycle — evaluate no permission. They
   record lineage in their own operational tables and structured diagnostics,
   never canonical audit.
 - Operator-level Forge lineage uses the tenant-bound fenced capability defined by

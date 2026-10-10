@@ -15,9 +15,9 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use secrecy::SecretString;
 use uuid::Uuid;
-use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_issue::IssuingKey;
 use wyrd_auth_verify::{PLATFORM_TOKEN_SCOPE, PlatformAccessTokenClaims};
+use wyrd_runtime::audit::AuditStage;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
@@ -111,8 +111,8 @@ pub struct PlatformSessions {
     issuing_key: Arc<IssuingKey>,
     /// Lifetime minted sessions carry.
     ttl: Duration,
-    /// Process audit outbox each platform grant is staged on.
-    audit: Arc<AuditOutbox>,
+    /// Process audit stage each platform grant is staged on.
+    audit: Arc<dyn AuditStage>,
 }
 
 impl Debug for PlatformSessions {
@@ -127,9 +127,13 @@ impl Debug for PlatformSessions {
 
 impl PlatformSessions {
     /// Bind session minting and verification to one boundary and key, staging
-    /// every grant on the process audit outbox.
+    /// every grant on the process audit stage.
     #[must_use]
-    pub fn new(pool: OperatorPool, issuing_key: Arc<IssuingKey>, audit: Arc<AuditOutbox>) -> Self {
+    pub fn new(
+        pool: OperatorPool,
+        issuing_key: Arc<IssuingKey>,
+        audit: Arc<dyn AuditStage>,
+    ) -> Self {
         Self {
             pool,
             issuing_key,
@@ -264,7 +268,7 @@ impl PlatformSessions {
     /// Both platform grants — credential exchange and federated issuance —
     /// converge here, so the record cannot be present on one path and missing
     /// on the other. It is staged under the `wyrd-system` sentinel tenant on
-    /// the process audit outbox once the grant committed; it never waits for,
+    /// the process audit stage once the grant committed; it never waits for,
     /// or refuses the grant on, its own commit.
     ///
     /// `principal_kind` is the kind the directory stores for this principal,
@@ -399,7 +403,7 @@ impl PlatformSessions {
 
 #[cfg(test)]
 mod pg_tests {
-    //! Durable proof that every platform grant is recorded on the audit outbox.
+    //! Durable proof that every platform grant is recorded on the audit stage.
     //!
     //! A platform session is the most privileged bearer the deployment issues.
     //! Both ways of obtaining one — spending a credential and federated login —
@@ -414,13 +418,13 @@ mod pg_tests {
     use wyrd_auth_verify::Kid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_sql::queries::platform::identity::insert_platform_identity_tx;
     use wyrd_sql::queries::platform::principals::insert_platform_principal;
 
     use super::PlatformSessions;
     use crate::audit::TOKEN_EXCHANGE_OPERATION;
-    use crate::audit::test_outbox::{assert_retrying, drain, outbox};
+    use crate::audit::test_audit::RecordedAudit;
     use crate::platform_credentials::issue_platform_credential;
 
     /// The issuer these tests register federated identities against.
@@ -505,30 +509,29 @@ mod pg_tests {
         .expect("pre-registration reads")
     }
 
-    /// Read the grant records staged for `principal` and the kind and
-    /// credential each one names.
-    ///
-    /// Staging is written by the platform transaction and read back here as the
-    /// superuser, because `wyrd_platform_admin` is granted append-only access to
-    /// `vala.audit_staging` and cannot select from it.
-    async fn staged_grant_attribution(
-        fixture: &PgFixture,
+    /// The system owner's grant records staged on `audit` for `principal`,
+    /// with the kind and credential each one names.
+    fn staged_grant_attribution(
+        audit: &RecordedAudit,
         principal: Uuid,
     ) -> Vec<(String, Option<Uuid>)> {
-        let admin = fixture.superuser_pool().expect("superuser pool");
-        sqlx::query_as::<_, (String, Option<Uuid>)>(
-            "SELECT principal_kind, credential_id FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
-        )
-        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-        .bind(TOKEN_EXCHANGE_OPERATION)
-        .bind(principal)
-        .fetch_all(&admin)
-        .await
-        .expect("grant record query runs")
+        audit
+            .operation(TOKEN_EXCHANGE_OPERATION)
+            .into_iter()
+            .filter(|(tenant, event)| {
+                *tenant == DataTenantId::SYSTEM_OWNER
+                    && event.principal_id == PrincipalId::new(principal)
+            })
+            .map(|(_, event)| {
+                (
+                    event.principal_kind.as_str().to_owned(),
+                    event.credential_id,
+                )
+            })
+            .collect()
     }
 
-    /// Spending a credential commits one grant record naming that credential
+    /// Spending a credential stages one grant record naming that credential
     /// and the kind the directory stores for its owner.
     ///
     /// # Panics
@@ -540,19 +543,18 @@ mod pg_tests {
         let principal = seed_principal(&fixture, "exchange-audited").await;
         let secret = issue_credential(&fixture, principal).await;
 
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let session = PlatformSessions::new(
             fixture.operator_pool().clone(),
             issuing_key(),
-            Arc::clone(&audit),
+            Arc::clone(&audit) as _,
         )
         .exchange(&secret, "req-platform-exchange")
         .await
         .expect("the credential exchanges");
-        drain(&audit).await;
 
-        let grants = staged_grant_attribution(&fixture, principal).await;
-        assert_eq!(grants.len(), 1, "exactly one grant record is committed");
+        let grants = staged_grant_attribution(&audit, principal);
+        assert_eq!(grants.len(), 1, "exactly one grant record is staged");
         assert_eq!(
             grants[0],
             ("global_admin".to_owned(), Some(session.credential_id)),
@@ -574,11 +576,11 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let principal =
             seed_registered_human(&fixture, "federated-human", "admin@example.test").await;
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let sessions = PlatformSessions::new(
             fixture.operator_pool().clone(),
             issuing_key(),
-            Arc::clone(&audit),
+            Arc::clone(&audit) as _,
         );
 
         let token = sessions
@@ -591,86 +593,18 @@ mod pg_tests {
             .await
             .expect("the first login is granted a session");
         assert!(!token.expose_secret().is_empty());
-        drain(&audit).await;
 
         assert_eq!(
             pinned_subject(&fixture, principal).await.as_deref(),
             Some("subject-1"),
             "the login pins the subject exactly once"
         );
-        let grants = staged_grant_attribution(&fixture, principal).await;
-        assert_eq!(grants.len(), 1, "exactly one grant record is committed");
+        let grants = staged_grant_attribution(&audit, principal);
+        assert_eq!(grants.len(), 1, "exactly one grant record is staged");
         assert_eq!(
             grants[0],
             ("user".to_owned(), None),
             "the grant names the stored kind and no credential, because none was presented"
-        );
-    }
-
-    /// An audit store that refuses the commit still serves the session:
-    /// permissions block, audits do not.
-    ///
-    /// The credential is verified and its last-used touch commits with the
-    /// grant; the grant record is staged afterwards, its failed commit is
-    /// retried rather than returned, and it commits exactly once when the
-    /// audit store recovers.
-    ///
-    /// # Panics
-    /// Panics when the exchange is refused, when a grant record reaches
-    /// staging while its insert privilege is revoked or not exactly once after
-    /// it returns, or when the credential's use is not recorded.
-    #[tokio::test]
-    async fn an_unrecordable_grant_still_returns_the_session() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let principal = seed_principal(&fixture, "audit-refused").await;
-        let secret = issue_credential(&fixture, principal).await;
-
-        let admin = fixture.superuser_pool().expect("superuser pool");
-        sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_app")
-            .execute(&admin)
-            .await
-            .expect("append privilege revoked");
-
-        let audit = outbox(&fixture);
-        let result = PlatformSessions::new(
-            fixture.operator_pool().clone(),
-            issuing_key(),
-            Arc::clone(&audit),
-        )
-        .exchange(&secret, "req-platform-unauditable")
-        .await;
-        assert!(
-            result.is_ok(),
-            "an audit failure never refuses a platform grant, got: {result:?}"
-        );
-        assert_retrying(&audit, 1).await;
-        assert!(
-            staged_grant_attribution(&fixture, principal)
-                .await
-                .is_empty(),
-            "the refused commit leaves no grant record"
-        );
-
-        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
-            .execute(&admin)
-            .await
-            .expect("append privilege restored");
-        drain(&audit).await;
-        assert_eq!(
-            staged_grant_attribution(&fixture, principal).await.len(),
-            1,
-            "the retried grant record commits exactly once"
-        );
-        let touched: Option<Option<chrono::DateTime<chrono::Utc>>> = sqlx::query_scalar(
-            "SELECT last_used_at FROM platform.credentials WHERE principal_id = $1",
-        )
-        .bind(principal)
-        .fetch_optional(&admin)
-        .await
-        .expect("credential metadata reads back");
-        assert!(
-            matches!(touched, Some(Some(_))),
-            "the served grant records the credential's use"
         );
     }
 }

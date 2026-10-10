@@ -1,8 +1,36 @@
-//! Audit envelope construction shell.
+//! Audit envelope construction shell and the audit staging seam.
 
+use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::api::AuditEvent;
 use wyrd_spec::{
     actor::Actor, redaction::RedactionPolicy, request_id::RequestId, trace::TraceContext,
 };
+
+use crate::outbox::{Outbox, OutboxSink};
+
+/// Non-blocking handoff every audited surface stages its decisions through.
+///
+/// Permissions block; audits do not. A surface evaluates its permission,
+/// enforces the verdict, and stages the decision here, which only queues it:
+/// no request waits for, or is refused by, the audit write. The server
+/// implements it with its one Scribe outbox; lower crates hold it as
+/// `dyn AuditStage` so they never name the server's sink.
+pub trait AuditStage: Send + Sync {
+    /// Queues `event` for `tenant` and returns at once; never fails.
+    fn stage(&self, tenant: DataTenantId, event: AuditEvent);
+}
+
+impl<S> AuditStage for Outbox<S>
+where
+    S: OutboxSink,
+    S::Item: From<AuditEvent>,
+{
+    /// Stages `event` on this outbox through its ordinary non-blocking
+    /// [`Outbox::stage`].
+    fn stage(&self, tenant: DataTenantId, event: AuditEvent) {
+        Self::stage(self, tenant, event);
+    }
+}
 
 /// Inputs required to prepare an audit envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]

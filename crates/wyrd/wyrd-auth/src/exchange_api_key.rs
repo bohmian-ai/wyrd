@@ -244,7 +244,7 @@ impl DelegateToken {
     /// Both tokens are verified locally for the connection's tenant, so a
     /// cross-tenant pair fails verification; unverifiable or malformed
     /// identity input is refused before any decision and records nothing.
-    /// Exactly one canonical audit event is then staged on the process outbox:
+    /// Exactly one canonical audit event is then staged on the process audit stage:
     /// an exchange that mints stages the issuer's token-exchange event; an
     /// issuance refusal stages an allowed event with no effect and rolls its
     /// transaction back.
@@ -318,7 +318,7 @@ impl DelegateToken {
     /// only for an issuance refusal. Like every delegated request, the row is
     /// recorded under the subject with the full actor chain, targets the
     /// requested audience, and attaches the credential that authenticated the
-    /// actor. It is staged on the process outbox without waiting; the
+    /// actor. It is staged on the process audit stage without waiting; the
     /// refusal's own transaction is rolled back.
     fn record_refusal(
         &self,
@@ -568,11 +568,10 @@ pub(crate) mod pg_tests {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
-    use wyrd_spec::vala::api::AuditDetail;
+    use wyrd_spec::vala::api::{AuditDetail, AuditOutcome};
     use wyrd_sql::TenantConn;
 
-    use crate::audit::test_outbox::{assert_retrying, drain, outbox};
-    use vala_sql::audit_outbox::AuditOutbox;
+    use crate::audit::test_audit::RecordedAudit;
     use wyrd_sql::queries::auth::{ApiKeyStatus, grant_role_to_service_account, insert_role};
 
     use super::{DelegateError, DelegateToken, ExchangeApiKey, ExchangeError};
@@ -616,16 +615,16 @@ pub(crate) mod pg_tests {
     ///
     /// The test owns `audit` and drains it before its fixture drops, so no audit
     /// commit is still logging in when the fixture drops its database.
-    fn test_issuer(audit: &Arc<AuditOutbox>) -> TenantTokenIssuer {
+    fn test_issuer(audit: &Arc<RecordedAudit>) -> TenantTokenIssuer {
         TenantTokenIssuer::new(
             test_issuing_key(),
             TokenExchangeSettings::default(),
-            Arc::clone(audit),
+            Arc::clone(audit) as _,
         )
     }
 
     /// The API-key exchange under test, staging its audit on `audit`.
-    fn exchange_service(audit: &Arc<AuditOutbox>) -> ExchangeApiKey {
+    fn exchange_service(audit: &Arc<RecordedAudit>) -> ExchangeApiKey {
         ExchangeApiKey {
             issuer: test_issuer(audit),
         }
@@ -636,7 +635,7 @@ pub(crate) mod pg_tests {
     ///
     /// # Panics
     /// Panics when the static test public key or key id fails to load.
-    fn delegate_service(audit: &Arc<AuditOutbox>) -> DelegateToken {
+    fn delegate_service(audit: &Arc<RecordedAudit>) -> DelegateToken {
         let public_key = public_key_from_pem(PUBLIC_KEY_PEM).expect("test public key loads");
         let mut decoding_keys = HashMap::new();
         decoding_keys.insert(Kid::new("k1").expect("kid is valid"), Arc::new(public_key));
@@ -899,36 +898,28 @@ pub(crate) mod pg_tests {
         (api_key_id, key.secret)
     }
 
-    /// Count the direct grant records staged for a principal, and read the
-    /// credential the single record names.
+    /// Count the direct grant records staged on `audit` for a principal, and
+    /// read the credential the first record names.
     ///
-    /// A direct grant evaluates no dynamic permission, so only rows whose
-    /// permission is the operation itself are counted; a direct row carrying
-    /// any other permission leaves the count at zero.
-    ///
-    /// # Panics
-    /// Panics when the staging query fails.
-    async fn staged_exchange(
-        conn: &mut TenantConn<'_>,
+    /// A direct grant evaluates no dynamic permission, so only records whose
+    /// permission is the operation itself are counted; a direct record
+    /// carrying any other permission leaves the count at zero.
+    fn staged_exchange(
+        audit: &RecordedAudit,
         tenant: DataTenantId,
         principal_id: Uuid,
-    ) -> (i64, Option<Uuid>) {
-        let rows: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
-            "SELECT principal_id, credential_id FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND operation = $2 AND permission = $2
-                AND principal_id = $3",
-        )
-        .bind(tenant.as_uuid())
-        .bind(TOKEN_EXCHANGE_OPERATION)
-        .bind(principal_id)
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("grant record query runs");
-        let credential = rows.first().and_then(|(_, credential)| *credential);
-        (
-            i64::try_from(rows.len()).expect("a test never stages more rows than an i64 holds"),
-            credential,
-        )
+    ) -> (usize, Option<Uuid>) {
+        let records: Vec<_> = audit
+            .operation(TOKEN_EXCHANGE_OPERATION)
+            .into_iter()
+            .filter(|(staged, event)| {
+                *staged == tenant
+                    && event.permission == TOKEN_EXCHANGE_OPERATION
+                    && event.principal_id.as_uuid() == principal_id
+            })
+            .collect();
+        let credential = records.first().and_then(|(_, event)| event.credential_id);
+        (records.len(), credential)
     }
 
     /// A Card-free tenant grant is recorded and names the key that bought it.
@@ -944,7 +935,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn a_card_free_exchange_commits_one_attributed_grant_record() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
 
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
@@ -969,16 +960,14 @@ pub(crate) mod pg_tests {
             .execute(&mut conn, secret, "req-cardfree-grant")
             .await
             .expect("a card-free administrator exchanges its credential");
-        drain(service.issuer.audit()).await;
 
-        let (count, credential) = staged_exchange(&mut conn, tenant, admin_id).await;
+        let (count, credential) = staged_exchange(&audit, tenant, admin_id);
         assert_eq!(count, 1, "exactly one grant record is staged");
         assert_eq!(
             credential,
             Some(api_key_id),
             "the grant names the api key that was spent"
         );
-        drain(&audit).await;
     }
 
     /// A Card-bound tenant grant records the exchange and the scope mint.
@@ -993,7 +982,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn a_card_bound_exchange_records_the_grant_and_the_scope_mint() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
 
@@ -1007,9 +996,8 @@ pub(crate) mod pg_tests {
             .execute(&mut conn, secret, "req-cardbound-grant")
             .await
             .expect("a card-bound service exchanges its credential");
-        drain(service.issuer.audit()).await;
 
-        let (count, credential) = staged_exchange(&mut conn, tenant, sa_id).await;
+        let (count, credential) = staged_exchange(&audit, tenant, sa_id);
         assert_eq!(count, 1, "exactly one grant record is staged");
         assert_eq!(
             credential,
@@ -1017,21 +1005,15 @@ pub(crate) mod pg_tests {
             "the grant names the api key that was spent"
         );
 
-        let mints: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND operation = $2 AND principal_id = $3",
-        )
-        .bind(tenant.as_uuid())
-        .bind(CARD_SCOPE_MINT_OPERATION)
-        .bind(sa_id)
-        .fetch_one(&mut **conn.transaction())
-        .await
-        .expect("scope mint query runs");
+        let mints = audit
+            .operation(CARD_SCOPE_MINT_OPERATION)
+            .iter()
+            .filter(|(staged, event)| *staged == tenant && event.principal_id.as_uuid() == sa_id)
+            .count();
         assert_eq!(
             mints, 1,
             "the distinct scope-mint decision is still recorded on its own"
         );
-        drain(&audit).await;
     }
 
     /// A machine exchange returns access only and writes no refresh row.
@@ -1043,7 +1025,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn api_key_exchange_issues_no_refresh_token_or_row() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
 
@@ -1086,7 +1068,6 @@ pub(crate) mod pg_tests {
         .await
         .expect("refresh row count runs");
         assert_eq!(rows, 0, "an api-key exchange stores no refresh row");
-        drain(&audit).await;
     }
 
     /// Every invalid API-key condition renders the same public problem.
@@ -1242,7 +1223,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn every_invalid_api_key_is_refused_identically() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
 
@@ -1321,7 +1302,6 @@ pub(crate) mod pg_tests {
             expected,
             "the unadmitted-tenant refusal is distinguishable"
         );
-        drain(&audit).await;
     }
 
     #[test]
@@ -1342,7 +1322,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn cross_tenant_key_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant_a = fixture.data_tenant_id();
         let tenant_b = DataTenantId::new_v7();
 
@@ -1361,13 +1341,12 @@ pub(crate) mod pg_tests {
             .await;
 
         assert!(matches!(result, Err(ExchangeError::CrossTenant)));
-        drain(&audit).await;
     }
 
     #[tokio::test]
     async fn revoked_key_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
         let key = WyrdApiKey::generate(tenant);
@@ -1398,13 +1377,12 @@ pub(crate) mod pg_tests {
             .await;
 
         assert!(matches!(result, Err(ExchangeError::NotFound)));
-        drain(&audit).await;
     }
 
     #[tokio::test]
     async fn hash_mismatch_rejected() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let card_ref = test_service_card_ref();
         let key = WyrdApiKey::generate(tenant);
@@ -1433,7 +1411,6 @@ pub(crate) mod pg_tests {
             .await;
 
         assert!(matches!(result, Err(ExchangeError::HashMismatch)));
-        drain(&audit).await;
     }
 
     /// Card name of the seeded actor.
@@ -1480,23 +1457,22 @@ pub(crate) mod pg_tests {
         )
     }
 
-    /// Exchange `subject` and `actor` tokens for a Bifrost token, then commit
-    /// every audit decision the exchange staged.
+    /// Exchange `subject` and `actor` tokens for a Bifrost token, staging
+    /// every audit decision on `audit`.
     ///
     /// # Errors
     /// Returns the [`DelegateError`] the exchange refuses with, unchanged.
     ///
     /// # Panics
-    /// Panics when the tenant connection cannot be opened or the staged
-    /// decisions do not drain.
+    /// Panics when the tenant connection cannot be opened.
     async fn exchange(
         fixture: &PgFixture,
+        audit: &Arc<RecordedAudit>,
         subject: String,
         actor: String,
     ) -> Result<super::ExchangedToken, DelegateError> {
         let conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let service = delegate_service(&outbox(fixture));
-        let result = service
+        delegate_service(audit)
             .execute(
                 conn,
                 SecretString::from(subject),
@@ -1504,45 +1480,42 @@ pub(crate) mod pg_tests {
                 TokenAudience::Bifrost,
                 &Uuid::now_v7().to_string(),
             )
-            .await;
-        drain(service.issuer.audit()).await;
-        result
+            .await
     }
 
-    /// Committed Bifrost exchange decisions `(outcome, permission, principal,
-    /// credential, detail)`, oldest first.
+    /// Bifrost exchange decisions staged on `audit` as `(outcome, permission,
+    /// principal, credential, detail)`, oldest first.
     ///
     /// # Panics
-    /// Panics when the query fails or a staged detail does not decode.
-    async fn exchange_decisions(
-        fixture: &PgFixture,
-    ) -> Vec<(String, String, Uuid, Option<Uuid>, AuditDetail)> {
-        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
-        let rows: Vec<(String, String, Uuid, Option<Uuid>, String)> = sqlx::query_as(
-            "SELECT outcome, permission, principal_id, credential_id, detail
-               FROM vala.audit_staging
-              WHERE operation = $1 AND resource = 'bifrost' ORDER BY seq",
-        )
-        .bind(TOKEN_EXCHANGE_OPERATION)
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("decision query runs");
-        rows.into_iter()
-            .map(|(outcome, permission, principal, credential, detail)| {
-                let detail = serde_json::from_str(&detail).expect("detail decodes");
-                (outcome, permission, principal, credential, detail)
+    /// Panics when a staged decision carries no detail.
+    fn exchange_decisions(
+        audit: &RecordedAudit,
+    ) -> Vec<(AuditOutcome, String, Uuid, Option<Uuid>, AuditDetail)> {
+        audit
+            .operation(TOKEN_EXCHANGE_OPERATION)
+            .into_iter()
+            .filter(|(_, event)| event.resource == "bifrost")
+            .map(|(_, event)| {
+                (
+                    event.outcome,
+                    event.permission,
+                    event.principal_id.as_uuid(),
+                    event.credential_id,
+                    event
+                        .detail
+                        .expect("an exchange decision carries its detail"),
+                )
             })
             .collect()
     }
 
-    /// `(outcome, permission)` of the committed Bifrost exchange decisions,
-    /// oldest first.
+    /// `(outcome, permission)` of the Bifrost exchange decisions staged on
+    /// `audit`, oldest first.
     ///
     /// # Panics
     /// Panics when `exchange_decisions` does.
-    async fn exchange_outcomes(fixture: &PgFixture) -> Vec<(String, String)> {
-        exchange_decisions(fixture)
-            .await
+    fn exchange_outcomes(audit: &RecordedAudit) -> Vec<(AuditOutcome, String)> {
+        exchange_decisions(audit)
             .into_iter()
             .map(|(outcome, permission, ..)| (outcome, permission))
             .collect()
@@ -1558,10 +1531,12 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn an_allowed_exchange_for_a_missing_actor_commits_one_allowed_decision() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
 
         let result = exchange(
             &fixture,
+            &audit,
             subject_token(tenant, PermissionSet::new()),
             actor_token(Uuid::new_v4(), tenant),
         )
@@ -1572,8 +1547,8 @@ pub(crate) mod pg_tests {
             "{result:?}"
         );
         assert_eq!(
-            exchange_outcomes(&fixture).await,
-            [("allowed".to_owned(), TOKEN_EXCHANGE_OPERATION.to_owned())],
+            exchange_outcomes(&audit),
+            [(AuditOutcome::Allowed, TOKEN_EXCHANGE_OPERATION.to_owned())],
             "one allowance names the token-exchange operation"
         );
     }
@@ -1587,6 +1562,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn invalid_or_malformed_identity_input_records_no_decision() {
         let fixture = PgFixture::start().await.expect("fixture starts");
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let actor = seed_actor(&fixture, serde_json::json!([])).await;
         let subject = subject_token(tenant, PermissionSet::new());
@@ -1625,7 +1601,7 @@ pub(crate) mod pg_tests {
             ("self exchange", subject.clone(), subject),
         ];
         for (label, subject, actor) in cases {
-            let result = exchange(&fixture, subject, actor).await;
+            let result = exchange(&fixture, &audit, subject, actor).await;
             let refused_early = match label {
                 "invalid subject" => matches!(result, Err(DelegateError::InvalidSubjectToken(_))),
                 "invalid actor" => matches!(result, Err(DelegateError::InvalidActorToken(_))),
@@ -1640,7 +1616,7 @@ pub(crate) mod pg_tests {
                 "{label} must be refused early, got {result:?}"
             );
         }
-        assert!(exchange_outcomes(&fixture).await.is_empty());
+        assert!(exchange_outcomes(&audit).is_empty());
     }
 
     /// A successful exchange names the subject as principal and the actor as
@@ -1656,7 +1632,7 @@ pub(crate) mod pg_tests {
     #[tokio::test]
     async fn an_exchange_names_subject_and_actor_and_carries_only_the_intersection() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let table = Uuid::from_u128(0x51);
         let actor = seed_actor(
@@ -1697,7 +1673,7 @@ pub(crate) mod pg_tests {
                 act: None,
             })),
         );
-        let exchanged = exchange(&fixture, subject, actor_token(actor, tenant))
+        let exchanged = exchange(&fixture, &audit, subject, actor_token(actor, tenant))
             .await
             .expect("exchange succeeds");
 
@@ -1728,11 +1704,11 @@ pub(crate) mod pg_tests {
         assert_eq!(delegated.principal.credential_id, None);
         assert!(exchanged.refresh_token.is_none());
 
-        let decisions = exchange_decisions(&fixture).await;
+        let decisions = exchange_decisions(&audit);
         let [(outcome, permission, principal, credential, detail)] = decisions.as_slice() else {
             panic!("exactly one decision commits, got {decisions:?}");
         };
-        assert_eq!(outcome, "allowed");
+        assert_eq!(*outcome, AuditOutcome::Allowed);
         assert_eq!(permission, TOKEN_EXCHANGE_OPERATION);
         assert_eq!(*principal, subject_id);
         assert_eq!(*credential, Some(ACTOR_CREDENTIAL));
@@ -1746,55 +1722,5 @@ pub(crate) mod pg_tests {
         };
         assert_eq!(subject_principal_id.as_uuid(), subject_id);
         assert_eq!(actor_principal_id.as_uuid(), actor);
-        drain(&audit).await;
-    }
-
-    /// An audit store that refuses the commit never refuses the exchange:
-    /// permissions block, audits do not. The token is issued, no decision
-    /// reaches staging while the store refuses, and the retried decision
-    /// commits exactly once when it recovers.
-    ///
-    /// # Panics
-    /// Panics when the append privilege cannot be revoked or restored, the
-    /// exchange is refused, a decision commits while the store refuses, or
-    /// the allowance does not commit exactly once after recovery.
-    #[tokio::test]
-    async fn a_refused_exchange_audit_still_issues_the_token() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let tenant = fixture.data_tenant_id();
-        let actor = seed_actor(&fixture, serde_json::json!([])).await;
-        let admin = fixture.superuser_pool().expect("superuser pool");
-        sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_app")
-            .execute(&admin)
-            .await
-            .expect("append privilege revoked");
-
-        let audit = outbox(&fixture);
-        let result = delegate_service(&audit)
-            .execute(
-                fixture.tenant_conn().await.expect("tenant conn opens"),
-                SecretString::from(subject_token(tenant, PermissionSet::new())),
-                SecretString::from(actor_token(actor, tenant)),
-                TokenAudience::Bifrost,
-                &Uuid::now_v7().to_string(),
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "an audit failure never refuses an exchange, got: {result:?}"
-        );
-        assert_retrying(&audit, 1).await;
-        assert!(exchange_outcomes(&fixture).await.is_empty());
-
-        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
-            .execute(&admin)
-            .await
-            .expect("append privilege restored");
-        drain(&audit).await;
-        assert_eq!(
-            exchange_outcomes(&fixture).await,
-            [("allowed".to_owned(), TOKEN_EXCHANGE_OPERATION.to_owned())],
-            "the retried allowance commits exactly once"
-        );
     }
 }

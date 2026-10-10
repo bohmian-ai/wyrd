@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::WyrdClient;
 use arrow_schema::SchemaRef;
 use serde::{Deserialize, Serialize};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::vala::api::{
     BifrostTableDescription, CompactionTypeWire, FieldSpec, PhysicalLayoutWire,
     RegisterTableRequest, RegisterTableResponse,
@@ -43,7 +43,7 @@ pub struct ResolvedTable {
 /// [`TableConfig::resolved`] is `None`.
 ///
 /// The declared schema holds **user columns only**. Correlation inputs
-/// (`card_ref`, `run_id`) and managed columns (`wyrd_*`) are appended by the
+/// (`card_uid`, `run_id`) and managed columns (`wyrd_*`) are appended by the
 /// producer and the server respectively, so declaring one here is a reserved
 /// name error rather than a way to control it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +83,7 @@ impl TableConfig {
     /// Returns [`BifrostClientError::Queue`] with code `WYRD_VALA_400_SCHEMA_PARSE`
     /// when `fqn` is not `<namespace>.<name>`, and
     /// `WYRD_VALA_400_BIFROST_RESERVED_COLUMN` when a column uses a reserved
-    /// `wyrd_*`, `card_ref`, or `run_id` name.
+    /// `wyrd_*`, `card_uid`, or `run_id` name.
     pub fn from_arrow(fqn: &str, schema: SchemaRef) -> Result<Self, BifrostClientError> {
         let (namespace, name) = split_fqn(fqn)?;
         reject_reserved_columns(&schema)?;
@@ -442,8 +442,9 @@ impl WriterTable {
 /// default is a valid write rather than a degraded one.
 #[derive(Debug, Clone, Default)]
 pub struct Correlation {
-    /// The Card this row belongs to, resolved server-side to a `card_uid`.
-    pub card_ref: Option<CardRef>,
+    /// The UID of the Card this row belongs to, which the server stores as
+    /// `card_uid` once it confirms the writer may correlate to that Card.
+    pub card_uid: Option<CardUid>,
     /// The run that produced this row.
     pub run_id: Option<RunId>,
 }

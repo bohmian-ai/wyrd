@@ -472,7 +472,7 @@ impl ClaimPublisher {
         )
         .await?;
         #[cfg(any(test, feature = "test-support"))]
-        if self.reconciler.fail_claim_retirement() {
+        if self.reconciler.fail_claim_retirement(&key.table().name) {
             return Err(ScribeError::Internal {
                 detail: format!(
                     "test failure retiring claim {claim_id} after its members recorded the commit"

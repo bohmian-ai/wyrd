@@ -226,7 +226,6 @@ impl VerificationRuntime {
         VerificationRuntimeBuilder {
             state,
             limits: RuntimeLimits::default(),
-            providers: None,
             endpoints: ProviderEndpoints::default(),
             #[cfg(feature = "test-support")]
             publication_fault: None,
@@ -303,12 +302,10 @@ impl VerificationRuntime {
 /// Composes a [`VerificationRuntime`] from server state and wiring choices.
 pub struct VerificationRuntimeBuilder<'a> {
     /// Server state supplying the Wyrd Postgres owner, the operator pool,
-    /// the capture writer, and health.
+    /// the Scribe outbox, and health.
     state: &'a AppState,
     /// Runtime bounds.
     limits: RuntimeLimits,
-    /// Model providers Eval judges call; the state's judge providers when `None`.
-    providers: Option<Arc<skald_runtime::ProviderRegistry>>,
     /// Slack and PagerDuty endpoints Operators deliver to.
     endpoints: ProviderEndpoints,
     /// Test-only publication faults.
@@ -327,14 +324,6 @@ impl VerificationRuntimeBuilder<'_> {
     #[must_use]
     pub fn limits(mut self, limits: RuntimeLimits) -> Self {
         self.limits = limits;
-        self
-    }
-
-    /// Judge Eval runs through `providers` instead of the state's
-    /// [`judge_providers`](AppState::judge_providers).
-    #[must_use]
-    pub fn providers(mut self, providers: Arc<skald_runtime::ProviderRegistry>) -> Self {
-        self.providers = Some(providers);
         self
     }
 
@@ -375,7 +364,7 @@ impl VerificationRuntimeBuilder<'_> {
     ///
     /// The scheduler and the Drift baseline fitter need the operator pool;
     /// the fitter also reads Data Card artifacts from server storage. The
-    /// runner additionally needs the process's capture writer to reach a
+    /// runner additionally needs the process's Scribe outbox to reach a
     /// Scribe, in-process or over the peer plane, and reads its inputs through
     /// the ordinary query service, local or peer-forwarded; without a
     /// reachable Scribe it is not composed and therefore not required, so
@@ -431,30 +420,21 @@ impl VerificationRuntimeBuilder<'_> {
             Capability::Fitter(Arc::new(fitter)),
             Capability::OperatorWorker(Arc::new(worker)),
         ];
-        let writer = Arc::clone(&self.state.gateway_capture);
+        let outbox = Arc::clone(&self.state.scribe_outbox);
         #[cfg(feature = "test-support")]
-        let writer = match (self.publication_fault, self.state.bifrost.scribe()) {
-            (Some(fault), Some(scribe)) => {
-                Arc::new(crate::components::gateway::GatewayCapture::local(Arc::new(
-                    fault.wrap(Arc::clone(scribe.scribe()) as _),
-                )))
-            }
-            _ => writer,
+        let outbox = match (self.publication_fault, self.state.bifrost.scribe()) {
+            (Some(fault), Some(scribe)) => fault.outbox(Arc::clone(scribe.scribe()) as _),
+            _ => outbox,
         };
-        if writer.reaches_scribe() {
+        if outbox.sink().reaches_scribe() {
             let runner = VerifierRunner::new(
                 postgres.clone(),
                 operator,
                 queue,
-                writer,
+                outbox,
                 VerifierEngines::new(
                     DriftEngine::new(self.state.clone(), self.limits.execution_timeout),
-                    self::eval::EvalEngine::new(
-                        self.state.clone(),
-                        self.providers
-                            .unwrap_or_else(|| Arc::clone(&self.state.judge_providers)),
-                        self.limits.trace_deadline,
-                    ),
+                    self::eval::EvalEngine::new(self.state.clone(), self.limits.trace_deadline),
                 ),
                 self.limits,
             );

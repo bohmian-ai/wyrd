@@ -17,7 +17,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefParseError};
 
-use crate::client::NativeWyrdClient;
+use crate::client::{NativeWyrdClient, NativeWyrdClientResult};
 use crate::workflow::{NativeWorkflowLoad, parse_workflow_selector};
 use crate::{NativeLifecycleResult, NativeTableConfig, NativeWyrdError};
 
@@ -237,8 +237,32 @@ pub fn open_wyrd_state(path: String) -> NativeWyrdState {
     }
 }
 
+/// The catalog refusal `WyrdState.startTelemetry` throws when a global tracer
+/// provider is already registered, so its title and remediation come from the
+/// one Rust catalog.
+#[napi]
+pub fn telemetry_provider_exists() -> NativeWyrdError {
+    NativeWyrdError::from_wyrd(&WyrdError::SdkTelemetryProviderExists {
+        message: "an OpenTelemetry tracer provider is already installed".to_owned(),
+        details: serde_json::json!({}),
+    })
+}
+
 #[napi]
 impl NativeWyrdState {
+    /// The client this state's server calls run as, resolving the ambient one
+    /// once on first use, so a telemetry exporter authenticates as the state.
+    #[napi]
+    pub fn client(&self) -> NativeWyrdClientResult {
+        match &self.state {
+            Ok(state) => NativeWyrdClientResult::from_outcome(state.client().cloned()),
+            Err(error) => NativeWyrdClientResult {
+                client: None,
+                error: Some(NativeWyrdError::from_wyrd(error)),
+            },
+        }
+    }
+
     /// Returns the exact root Card reference.
     ///
     /// # Errors
@@ -571,6 +595,13 @@ impl NativeRun {
         self.run.alias().to_owned()
     }
 
+    /// The UID of this view's subject Card, which `Run.scope` stamps on
+    /// spans as `wyrd.card_uid`.
+    #[napi(getter)]
+    pub fn subject_uid(&self) -> String {
+        self.run.subject_uid().as_str().to_owned()
+    }
+
     /// An immutable sibling view scoped to a registered alias.
     #[napi]
     pub fn for_card(&self, alias: String) -> NativeRunOpen {
@@ -666,6 +697,39 @@ impl NativeRun {
             )
             .await,
         )
+    }
+
+    /// Invokes this view's tool-free Agent once through the Wyrd gateway with
+    /// the string variables of `variables_json` and returns its final text.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the outcome cannot be projected; a
+    /// non-Agent view, an Agent with tools, malformed variables, and the
+    /// gateway's refusals are returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn invoke(&self, variables_json: Option<String>) -> Result<NativeLifecycleResult> {
+        let variables: std::collections::BTreeMap<String, String> = match variables_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+        {
+            Ok(variables) => variables.unwrap_or_default(),
+            Err(error) => {
+                return Ok(NativeLifecycleResult::from_wyrd(&WyrdError::Validation {
+                    message: format!("variables are invalid: {error}"),
+                    details: serde_json::json!({
+                        "field": "variables",
+                        "reason": error.to_string(),
+                    }),
+                }));
+            }
+        };
+        let pairs: Vec<(&str, &str)> = variables
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        NativeLifecycleResult::outcome(Box::pin(self.run.invoke(&pairs)).await)
     }
 
     /// Emits one row into a registered `vala.datasets` table.

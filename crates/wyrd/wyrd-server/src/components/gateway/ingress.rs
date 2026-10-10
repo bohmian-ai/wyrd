@@ -25,12 +25,16 @@ use wyrd_spec::gateway::native::{
     GatewayGeminiGenerateContentRequest, GatewayGeminiGenerateContentResponse, GoogleErrorEnvelope,
 };
 use wyrd_spec::gateway::{
-    FALLBACK_HEADER, GatewayContractError, GatewayFallbackOverride, GatewayOperation,
-    GatewayUsageAmount, ModelRef,
+    CARD_UID_HEADER, FALLBACK_HEADER, GatewayContractError, GatewayFallbackOverride,
+    GatewayOperation, GatewayUsageAmount, MAX_RUN_HEADER_BYTES, ModelRef, RUN_HEADER,
 };
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::{ModelId, ProviderId};
+use wyrd_spec::vala::ids::RunId;
 
-use super::invocation::{GatewayCallRequest, GatewayInvocation, invalid_request};
+use super::invocation::{
+    GatewayCallRequest, GatewayCallSubject, GatewayInvocation, invalid_request,
+};
 use super::routes::{self, PUBLIC_CALL_TIMEOUT, openai_error, relay, token_bound, typed_body};
 use crate::components::auth::Caller;
 use crate::components::auth::token_extract::{
@@ -224,10 +228,77 @@ pub(super) fn requested_fallback(
         .map_err(invalid_request)
 }
 
+/// OpenAPI description of the optional `wyrd-run-id` request header.
+pub(super) const RUN_HEADER_DOC: &str = "Optional application Run the call belongs to: 1 to 128 \
+    bytes of visible ASCII, sent together with `wyrd-card-uid`. A repeated, empty, oversized, \
+    or unpaired value is refused before dispatch with WYRD_GATEWAY_400_INVALID_REQUEST naming \
+    the header. The header never reaches a provider.";
+
+/// OpenAPI description of the optional `wyrd-card-uid` request header.
+pub(super) const CARD_UID_HEADER_DOC: &str = "Optional Card the call is attributed to, as its \
+    Card UID, sent together with `wyrd-run-id`. A malformed or unpaired value is refused with \
+    WYRD_GATEWAY_400_INVALID_REQUEST; a UID outside the caller's signed Card scope, or, for a \
+    caller bound to no Card, one naming no registered observation-target Card of the tenant, \
+    with WYRD_VALA_403_BIFROST_CARD_SCOPE. Every refusal precedes dispatch. The header never \
+    reaches a provider.";
+
+/// Reads the optional Run and Card attribution of a call from its paired
+/// `wyrd-run-id` and `wyrd-card-uid` headers.
+///
+/// Both headers are consumed here and never reach a provider; their joint
+/// absence leaves the call uncorrelated. The Card is only parsed here;
+/// admission authorizes it against the caller.
+///
+/// # Errors
+/// Returns `GatewayInvalidRequest` naming the offending header when either
+/// repeats or is not visible ASCII, appears without the other, the Run is
+/// empty or longer than [`MAX_RUN_HEADER_BYTES`], or the Card is not a Card
+/// UID.
+pub(super) fn requested_subject(
+    headers: &HeaderMap,
+) -> Result<Option<GatewayCallSubject>, WyrdError> {
+    let invalid = |field, reason| invalid_request(GatewayContractError::new(field, reason));
+    let single = |name: &'static str| {
+        let mut values = headers.get_all(name).iter();
+        let value = values.next();
+        if values.next().is_some() {
+            return Err(invalid(name, "must appear at most once"));
+        }
+        value
+            .map(|value| {
+                value
+                    .to_str()
+                    .map_err(|_| invalid(name, "must be visible ASCII"))
+            })
+            .transpose()
+    };
+    match (single(RUN_HEADER)?, single(CARD_UID_HEADER)?) {
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(invalid(CARD_UID_HEADER, "must accompany wyrd-run-id")),
+        (None, Some(_)) => Err(invalid(RUN_HEADER, "must accompany wyrd-card-uid")),
+        (Some(run), Some(card)) => {
+            if run.is_empty() || run.len() > MAX_RUN_HEADER_BYTES {
+                return Err(invalid(RUN_HEADER, "must be 1 to 128 bytes"));
+            }
+            let card_uid = card
+                .parse::<CardUid>()
+                .map_err(|_| invalid(CARD_UID_HEADER, "must be a Card UID"))?;
+            Ok(Some(GatewayCallSubject {
+                run_id: RunId::from_string(run.to_owned()),
+                card_uid,
+            }))
+        }
+    }
+}
+
 #[utoipa::path(
     post,
     path = "/v1/messages",
-    params(("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC)),
+    params(
+        ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
+    ),
     request_body(content = GatewayAnthropicMessagesRequest, description = "Anthropic Messages request whose `model` is an exact Anthropic model id; the Wyrd access token travels in `x-api-key` or an `Authorization` bearer"),
     responses(
         (status = 200, description = "Anthropic message as JSON, or Anthropic server-sent events when `stream` is true", content(
@@ -288,6 +359,7 @@ pub(crate) async fn anthropic_messages(
                     batch: None,
                     deployment: None,
                     timeout: PUBLIC_CALL_TIMEOUT,
+                    subject: requested_subject(&headers)?,
                 })
             });
             match call {
@@ -308,7 +380,9 @@ pub(crate) async fn anthropic_messages(
     params(
         ("target" = String, Path, description = "`<model>:generateContent`, or `<model>:streamGenerateContent` with `alt=sse`, where `<model>` is an exact Gemini model id"),
         ("alt" = Option<String>, Query, description = "`sse` for streamGenerateContent; `json` or absent for generateContent"),
-        ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC)
+        ("wyrd-gateway-fallback" = Option<String>, Header, description = FALLBACK_HEADER_DOC),
+        ("wyrd-run-id" = Option<String>, Header, description = RUN_HEADER_DOC),
+        ("wyrd-card-uid" = Option<String>, Header, description = CARD_UID_HEADER_DOC)
     ),
     request_body(content = GatewayGeminiGenerateContentRequest, description = "Gemini GenerateContent request; the Wyrd access token travels in `x-goog-api-key` or an `Authorization` bearer"),
     responses(
@@ -369,7 +443,8 @@ pub(crate) async fn gemini_generate_content(
 /// `generateContent` or `streamGenerateContent`, `alt` when it repeats or the
 /// response format does not match the method, `model` for an invalid model id,
 /// `body` or the missing member for a body that is not a `GenerateContent`
-/// request, and every error of [`requested_fallback`].
+/// request, and every error of [`requested_fallback`] and
+/// [`requested_subject`].
 fn gemini_call(
     target: &str,
     query: Option<&str>,
@@ -422,6 +497,7 @@ fn gemini_call(
         batch: None,
         deployment: None,
         timeout: PUBLIC_CALL_TIMEOUT,
+        subject: requested_subject(headers)?,
     })
 }
 
@@ -450,4 +526,78 @@ pub(super) fn google_usage_bound(body: &Value) -> Option<Vec<GatewayUsageAmount>
     let output = field("maxOutputTokens", "max_output_tokens")?
         .checked_mul(field("candidateCount", "candidate_count").unwrap_or(1))?;
     token_bound(body, Some(output))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure decoding of the paired Run and Card attribution headers.
+
+    use super::*;
+
+    /// Headers holding each `(name, value)` pair in order.
+    ///
+    /// # Panics
+    /// Panics when a value is not a valid header value.
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(*name, value.parse().expect("header value"));
+        }
+        headers
+    }
+
+    /// Absent headers leave a call uncorrelated, a valid pair decodes to its
+    /// Run and Card, and every repeated, unpaired, empty, oversized, or
+    /// malformed value is refused naming the offending header.
+    ///
+    /// # Panics
+    /// Panics when a header set decodes differently than documented.
+    #[test]
+    fn subject_headers_decode_only_as_a_valid_pair() {
+        let card = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00";
+        assert!(
+            requested_subject(&HeaderMap::new())
+                .expect("absent")
+                .is_none()
+        );
+        let subject =
+            requested_subject(&headers(&[(RUN_HEADER, "run-1"), (CARD_UID_HEADER, card)]))
+                .expect("a valid pair")
+                .expect("a subject");
+        assert_eq!(subject.run_id.as_str(), "run-1");
+        assert_eq!(subject.card_uid.as_str(), card);
+        let long = "r".repeat(MAX_RUN_HEADER_BYTES + 1);
+        for (pairs, field) in [
+            (vec![(RUN_HEADER, "run-1")], CARD_UID_HEADER),
+            (vec![(CARD_UID_HEADER, card)], RUN_HEADER),
+            (vec![(RUN_HEADER, ""), (CARD_UID_HEADER, card)], RUN_HEADER),
+            (
+                vec![(RUN_HEADER, long.as_str()), (CARD_UID_HEADER, card)],
+                RUN_HEADER,
+            ),
+            (
+                vec![
+                    (RUN_HEADER, "run-1"),
+                    (CARD_UID_HEADER, "prod/Agent/support-agent@1.0.0"),
+                ],
+                CARD_UID_HEADER,
+            ),
+            (
+                vec![
+                    (RUN_HEADER, "a"),
+                    (RUN_HEADER, "b"),
+                    (CARD_UID_HEADER, card),
+                ],
+                RUN_HEADER,
+            ),
+        ] {
+            let error = requested_subject(&headers(&pairs)).expect_err("refused");
+            assert_eq!(error.code(), "WYRD_GATEWAY_400_INVALID_REQUEST");
+            assert_eq!(
+                error.as_problem_json()["details"]["field"],
+                field,
+                "{pairs:?}"
+            );
+        }
+    }
 }

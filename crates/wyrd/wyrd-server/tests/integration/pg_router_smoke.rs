@@ -603,11 +603,11 @@ async fn production_valid_target_serves_token_exchange_without_preview() {
         .expect("real verifier, audit, and signing key are production-valid");
 
     let subject = server
-        .bootstrap_service("production-subject", &["writer"])
+        .bootstrap_service("production-subject", &["editor"])
         .await
         .expect("subject bootstraps");
     let actor = server
-        .bootstrap_service("production-actor", &["writer"])
+        .bootstrap_service("production-actor", &["editor"])
         .await
         .expect("actor bootstraps");
     let subject_jwt = server

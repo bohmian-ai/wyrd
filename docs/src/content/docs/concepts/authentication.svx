@@ -121,8 +121,8 @@ connection can authenticate the login. The form endpoints (`/auth/token`,
 5. The web app redeems the code at `POST /auth/token` with
    `grant_type=authorization_code`, its `client_secret_basic` credentials, the
    same `redirect_uri`, and the `code_verifier`. The server issues **access +
-   refresh** tokens in the same transaction as the canonical audit event; if
-   the audit write fails, nothing is issued. A wrong, expired, or reused code, a
+   refresh** tokens and stages the decision's audit event without waiting for
+   its write; an audit write failure never blocks issuance. A wrong, expired, or reused code, a
    PKCE mismatch, or another `redirect_uri` → `invalid_grant`; a wrong client
    secret → `401 invalid_client`. No token ever appears in a URL.
 

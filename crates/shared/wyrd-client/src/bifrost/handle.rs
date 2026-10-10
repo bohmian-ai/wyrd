@@ -14,7 +14,7 @@ use wyrd_queue::{
     BatchSink, ClientByteBudget, ClientByteGuard, Producer, QueueConfig, SealedBatchSender,
     WyrdQueueError,
 };
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 #[cfg(feature = "internal")]
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
@@ -169,7 +169,7 @@ impl WriterPool {
     /// later calls reuse the pooled producer, so the schema a table was first
     /// registered under is the one its batches are sealed with.
     ///
-    /// Both correlation fields are optional. An omitted `card_ref` becomes a
+    /// Both correlation fields are optional. An omitted `card_uid` becomes a
     /// null in the sealed batch, which the server stores against the
     /// authenticated principal with a null `card_uid`. The row carries no
     /// writer event time, as [`Self::insert_rows`] describes for `None`.
@@ -188,10 +188,10 @@ impl WriterPool {
         table: &str,
         schema: &SchemaRef,
         json: Vec<u8>,
-        card_ref: Option<CardRef>,
+        card_uid: Option<CardUid>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.insert_rows(table, schema, vec![json], card_ref, run_id, None)
+        self.insert_rows(table, schema, vec![json], card_uid, run_id, None)
     }
 
     /// Enqueue every row of one logical record, or none of them, propagating
@@ -219,12 +219,12 @@ impl WriterPool {
         table: &str,
         schema: &SchemaRef,
         rows: Vec<Vec<u8>>,
-        card_ref: Option<CardRef>,
+        card_uid: Option<CardUid>,
         run_id: Option<RunId>,
         event_time_micros: Option<i64>,
     ) -> Result<(), WyrdQueueError> {
         self.producer_for(table, schema)?
-            .enqueue_rows(rows, card_ref, run_id, event_time_micros)
+            .enqueue_rows(rows, card_uid, run_id, event_time_micros)
     }
 
     /// Enqueue one owned Arrow batch for `table` without awaiting publication.

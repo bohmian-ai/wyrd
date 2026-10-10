@@ -20,6 +20,7 @@ mod otlp_metrics_json;
 mod otlp_trace_json;
 pub mod postgres;
 pub mod query;
+pub mod scribe_outbox;
 pub mod state;
 pub mod verification;
 

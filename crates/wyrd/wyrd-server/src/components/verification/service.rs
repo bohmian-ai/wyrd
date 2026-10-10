@@ -5,24 +5,32 @@
 //! [`Caller`] and typed input, so authorization, audit, tenancy, idempotency,
 //! and error mapping have exactly one implementation.
 
+use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
-use wyrd_runtime::Permission;
+use wyrd_runtime::{CardAttribution, Permission};
+use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::card::verifier::VerifierImplementation;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::VerificationResultId;
 use wyrd_spec::ids::{
     BindingId, CardUid, IdempotencyKey, VerificationExecutionId, VerificationRunId,
 };
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::AuditOutcome;
+use wyrd_spec::vala::ids::RunId;
+use wyrd_spec::verification::DriftWindow;
 use wyrd_spec::verification::{
     ExecuteVerificationRequest, Judgment, StartVerificationRunRequest, VerificationBindingStatus,
     VerificationRunInput, VerificationRunStatus, VerificationRunTarget, VerifierKind,
     VerifierReadiness,
 };
+use wyrd_sql::queries::auth::system_principal_id;
 use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_sql::queries::verifier_runs::RunInput;
 use wyrd_sql::queries::verifier_runs::{
     EnqueueRefusal, ManualEnqueueOutcome, RequestKey, VerifierRunQueue,
 };
@@ -32,8 +40,11 @@ use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::http::middleware::edge_timeout::EdgeTimer;
+use crate::scribe_outbox::{ScribeWrite, VerifierAttribution};
 use crate::state::{AppState, registry_db_error};
 use crate::verification::direct::{self, DirectExecutor, EXECUTION_DEADLINE};
+use crate::verification::engines::VerifierReport;
+use crate::verification::results::{ResultPayloadBuilder, ResultRun};
 use crate::verification::telemetry::{ExecutionMode, ExecutionTelemetry, Phase};
 
 /// Audit operation of a binding status read.
@@ -56,6 +67,8 @@ struct DirectTarget {
     implementation: VerifierImplementation,
     /// Exact subject reference.
     subject: CardRef,
+    /// The tenant's active SYSTEM principal the result is attributed to.
+    system_principal: Option<PrincipalId>,
 }
 
 /// The exact reference of a stored Card row.
@@ -257,11 +270,14 @@ impl<'a> VerificationControl<'a> {
 
     /// Durably enqueue one manual Drift run for the authenticated caller.
     ///
-    /// Validates the window, then evaluates `evals:run`. In one tenant
-    /// transaction it then checks a Card-bound caller's signed scope over the
-    /// exact subject and enqueues the run with the caller as requester —
-    /// never as a binding owner. The single allow or deny decision is staged
-    /// on [`AppState::audit_outbox`] as soon as it is known, so the enqueue
+    /// Validates the window, then in one tenant transaction reads the Verifier
+    /// and subject the target selects, evaluates `verifier:run` on that exact
+    /// Verifier (a binding is never an implicit grant; an unknown binding
+    /// requires `verifier:run` on every Verifier), checks a Card-bound
+    /// caller's signed scope over the exact subject, and enqueues the run with
+    /// the caller as requester — never as a binding owner. The single allow or
+    /// deny decision is staged
+    /// on [`AppState::scribe_outbox`] as soon as it is known, so the enqueue
     /// transaction never touches the tenant audit chain and the request never
     /// waits for the audit commit. A request carrying `key` replays the
     /// requester's earlier run for the same body and is refused for a
@@ -269,8 +285,9 @@ impl<'a> VerificationControl<'a> {
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationInvalidWindow`] for an invalid window,
-    /// [`WyrdError::PermissionDeniedRbac`] without `evals:run` or subject
-    /// scope, [`WyrdError::VerificationBindingNotFound`] for an unknown
+    /// [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on the
+    /// selected Verifier or subject scope,
+    /// [`WyrdError::VerificationBindingNotFound`] for an unknown
     /// binding, [`WyrdError::VerificationInvalidTarget`] for an unrunnable
     /// target, [`WyrdError::VerificationNotReady`] for an unfitted baseline,
     /// [`WyrdError::RegistryIdempotencyConflict`] when `key` was used for a
@@ -284,29 +301,56 @@ impl<'a> VerificationControl<'a> {
     ) -> Result<VerificationRunId, WyrdError> {
         request.validate()?;
         let resource = target_resource(&request.target);
-        if let Err(reason) = self
-            .state
-            .authz
-            .permission_check
-            .check(&caller.principal, &Permission::eval_run())
-            .into_result()
-        {
-            self.stage_decision(caller, START_RUN, &resource, AuditOutcome::Denied);
-            return Err(permission_deny_reason_to_wyrd(reason));
-        }
         let mut conn = self
             .state
             .registry_tenant_conn(caller.data_tenant_id)
             .await?;
-        if !self
-            .subject_in_scope(&mut conn, caller, &request.target)
-            .await?
+        let cards = self
+            .queue
+            .target_cards(&mut conn, &request.target)
+            .await
+            .map_err(registry_db_error)?;
+        let required = cards
+            .as_ref()
+            .map_or_else(Permission::verifier_run_any, |cards| {
+                Permission::verifier_run(cards.verifier.clone())
+            });
+        if let Err(reason) = self
+            .state
+            .authz
+            .permission_check
+            .check(&caller.principal, &required)
+            .into_result()
         {
             drop(conn);
-            self.stage_decision(caller, START_RUN, &resource, AuditOutcome::Denied);
+            self.stage_decision(
+                caller,
+                START_RUN,
+                &resource,
+                &required,
+                AuditOutcome::Denied,
+            );
+            return Err(permission_deny_reason_to_wyrd(reason));
+        }
+        let subject = cards.map(|cards| cards.subject);
+        if !Self::subject_in_scope(&mut conn, caller, subject.as_ref()).await? {
+            drop(conn);
+            self.stage_decision(
+                caller,
+                START_RUN,
+                &resource,
+                &required,
+                AuditOutcome::Denied,
+            );
             return Err(Self::scope_denied(&resource));
         }
-        self.stage_decision(caller, START_RUN, &resource, AuditOutcome::Allowed);
+        self.stage_decision(
+            caller,
+            START_RUN,
+            &resource,
+            &required,
+            AuditOutcome::Allowed,
+        );
         let digest = serde_json::to_vec(request)
             .map(|body| Sha256::digest(body).to_vec())
             .map_err(registry_db_error)?;
@@ -341,10 +385,12 @@ impl<'a> VerificationControl<'a> {
 
     /// Execute one exact Verifier over supplied input and return its judgment.
     ///
-    /// Checks input bounds, then evaluates `evals:run`, then resolves both
-    /// Cards and checks a Card-bound caller's signed scope over the exact
-    /// subject. Permission blocks; audit does not: the single allow or deny
-    /// decision is staged on [`AppState::audit_outbox`] and the request never
+    /// Checks input bounds, then evaluates `verifier:run` on the requested
+    /// Verifier UID, then resolves both Cards in the caller's tenant; an
+    /// unknown, inactive, or foreign-tenant Card is not found. The caller's
+    /// observation-attribution Card scope does not gate a direct execution.
+    /// Permission blocks; audit does not: the single allow or deny
+    /// decision is staged on [`AppState::scribe_outbox`] and the request never
     /// waits for its commit. The engine runs under [`EXECUTION_DEADLINE`] as
     /// a `direct` execution on its own telemetry; nothing else is persisted.
     /// Dropping the future cancels the execution. An HTTP caller passes its
@@ -354,8 +400,8 @@ impl<'a> VerificationControl<'a> {
     ///
     /// # Errors
     /// Returns [`WyrdError::VerificationInputTooLarge`] for an exceeded bound,
-    /// [`WyrdError::PermissionDeniedRbac`] without `evals:run` or subject
-    /// scope, [`WyrdError::VerificationTargetNotFound`] for an unknown,
+    /// [`WyrdError::PermissionDeniedRbac`] without `verifier:run` on the
+    /// Verifier, [`WyrdError::VerificationTargetNotFound`] for an unknown,
     /// inactive, or non-Verifier target,
     /// [`WyrdError::VerificationExecutionTimedOut`] past the deadline, a
     /// registry unavailability error when a read fails, and every engine
@@ -379,21 +425,23 @@ impl<'a> VerificationControl<'a> {
             "verifier:{}/subject:{}/execution:{execution_id}",
             request.verifier_uid, request.subject_card_uid
         );
+        let required = Permission::verifier_run(request.verifier_uid.clone());
         if let Err(reason) = self
             .state
             .authz
             .permission_check
-            .check(&caller.principal, &Permission::eval_run())
+            .check(&caller.principal, &required)
             .into_result()
         {
-            self.stage_decision(caller, EXECUTE, &resource, AuditOutcome::Denied);
+            self.stage_decision(caller, EXECUTE, &resource, &required, AuditOutcome::Denied);
             return Err(permission_deny_reason_to_wyrd(reason));
         }
+        self.stage_decision(caller, EXECUTE, &resource, &required, AuditOutcome::Allowed);
         let telemetry = ExecutionTelemetry::start(ExecutionMode::Direct);
         let target = telemetry
             .phase(
                 Phase::Load,
-                self.resolve_direct(caller, request, &resource)
+                self.resolve_direct(caller, request)
                     .instrument(tracing::info_span!("verification.load")),
             )
             .await?;
@@ -402,13 +450,14 @@ impl<'a> VerificationControl<'a> {
         }
         let kind = VerifierKind::of(&target.implementation);
         telemetry.classify(kind);
+        let started_at = Utc::now();
         let executed = telemetry
             .phase(
                 Phase::Engine,
                 tokio::time::timeout(
                     EXECUTION_DEADLINE,
                     DirectExecutor::new(self.state).execute(
-                        caller.data_tenant_id,
+                        caller,
                         execution_id,
                         &request.verifier_uid,
                         &target.implementation,
@@ -433,6 +482,14 @@ impl<'a> VerificationControl<'a> {
         span.record("outcome", outcome);
         telemetry.finish(outcome, outcome != "completed");
         let report = result?;
+        self.stage_result(
+            caller.data_tenant_id,
+            execution_id,
+            request.run_id.as_ref(),
+            &target,
+            &report,
+            started_at,
+        );
         Ok(Judgment {
             execution_id,
             verifier: target.verifier,
@@ -445,24 +502,103 @@ impl<'a> VerificationControl<'a> {
         })
     }
 
-    /// Resolve a direct execution's Cards, check subject scope, and stage
-    /// its decision.
+    /// Stage a completed direct execution's result on the Scribe outbox.
     ///
-    /// Reads both Cards in one read-only tenant transaction. A Card-bound
-    /// caller without signed scope over the exact subject stages a denial;
-    /// every other caller stages the allowed decision before the target is
-    /// judged usable, so an unknown target still records who asked.
+    /// The result takes the execution's identity, so the response's
+    /// `execution_id` is the `result_id` of its rows. It is attributed to the
+    /// tenant SYSTEM principal and the exact Verifier exactly like a queued
+    /// result, carries the caller's application Run `run_id` when supplied,
+    /// and has no owner, binding, or Trigger. A Drift result records the
+    /// execution interval as its window; an Eval or task result records the
+    /// application Run's record (the `execution_id` when no Run is supplied)
+    /// as its source. The verdict is already decided, so a
+    /// missing SYSTEM principal or an unbuildable payload is logged and the
+    /// result is not recorded.
+    fn stage_result(
+        &self,
+        tenant: DataTenantId,
+        execution_id: VerificationExecutionId,
+        run_id: Option<&RunId>,
+        target: &DirectTarget,
+        report: &VerifierReport,
+        started_at: DateTime<Utc>,
+    ) {
+        let Some(principal) = target.system_principal else {
+            tracing::warn!(%execution_id, "the tenant has no SYSTEM principal; the direct result is not recorded");
+            return;
+        };
+        let (Some(subject), Some(verifier), Ok(result_id)) = (
+            target.subject.uid.as_ref(),
+            target.verifier.uid.as_ref(),
+            VerificationResultId::new(execution_id.as_uuid()),
+        ) else {
+            return;
+        };
+        let ended_at = Utc::now();
+        let input = match &target.implementation {
+            VerifierImplementation::Drift(_) => RunInput::DriftWindow(DriftWindow {
+                start: started_at,
+                end: ended_at,
+            }),
+            VerifierImplementation::Eval(_) | VerifierImplementation::Task(_) => {
+                RunInput::EvalRecord {
+                    record_id: run_id.map_or_else(
+                        || execution_id.as_uuid().to_string(),
+                        |run| run.as_str().to_owned(),
+                    ),
+                    event_time: started_at,
+                }
+            }
+        };
+        let verifier_version = target.verifier.version.to_string();
+        let built = ResultPayloadBuilder::new(
+            ResultRun {
+                run_id,
+                verifier_version: &verifier_version,
+                subject_card_uid: subject,
+                owner_card_uid: None,
+                binding_id: None,
+                trigger: None,
+                input: &input,
+            },
+            verifier,
+            result_id,
+            ended_at,
+            started_at,
+            ended_at,
+        )
+        .build(report);
+        match built {
+            Ok(payload) => self.state.scribe_outbox.stage(
+                tenant,
+                ScribeWrite::Result {
+                    payload,
+                    attribution: VerifierAttribution {
+                        verifier: target.verifier.clone(),
+                        principal,
+                    },
+                },
+            ),
+            Err(error) => {
+                tracing::warn!(%execution_id, %error, "the direct result cannot be encoded; it is not recorded");
+            }
+        }
+    }
+
+    /// Resolve a direct execution's Verifier and subject Cards.
+    ///
+    /// Reads both Cards in one read-only tenant transaction, so a Card of
+    /// another tenant is invisible. Both must be active and the target must
+    /// be a Verifier Card.
     ///
     /// # Errors
-    /// Returns a registry error when a read fails,
-    /// [`WyrdError::PermissionDeniedRbac`] without subject scope, and
+    /// Returns a registry error when a read fails and
     /// [`WyrdError::VerificationTargetNotFound`] for an unknown, inactive, or
     /// non-Verifier target.
     async fn resolve_direct(
         &self,
         caller: &Caller,
         request: &ExecuteVerificationRequest,
-        resource: &str,
     ) -> Result<DirectTarget, WyrdError> {
         let mut conn = self
             .state
@@ -470,15 +606,11 @@ impl<'a> VerificationControl<'a> {
             .await?;
         let verifier = Self::card(&mut conn, &request.verifier_uid).await?;
         let subject = Self::card(&mut conn, &request.subject_card_uid).await?;
+        let system_principal = system_principal_id(&mut conn)
+            .await
+            .map_err(registry_db_error)?
+            .map(PrincipalId::new);
         drop(conn);
-        if let Some(subject) = &subject
-            && caller.principal.card_ref().is_some()
-            && !caller.principal.authorizes_card(&exact_ref(subject))
-        {
-            self.stage_decision(caller, EXECUTE, resource, AuditOutcome::Denied);
-            return Err(Self::scope_denied(resource));
-        }
-        self.stage_decision(caller, EXECUTE, resource, AuditOutcome::Allowed);
         match (verifier, subject) {
             (Some(verifier), Some(subject)) if available(&verifier) && available(&subject) => {
                 let reference = exact_ref(&verifier);
@@ -487,6 +619,7 @@ impl<'a> VerificationControl<'a> {
                         verifier: reference,
                         implementation: spec.implementation,
                         subject: exact_ref(&subject),
+                        system_principal,
                     }),
                     _ => Err(Self::target_not_found(request)),
                 }
@@ -495,9 +628,10 @@ impl<'a> VerificationControl<'a> {
         }
     }
 
-    /// Stage one `evals:run` decision for `operation` on the process audit
+    /// Stage one decision on `required` for `operation` on the process Scribe
     /// outbox without waiting for its commit.
     ///
+    /// The recorded permission is the exact `verifier:run` grant evaluated.
     /// A decision the outbox cannot commit is logged and counted by the
     /// writer, never returned: audit does not block a run start or execution.
     fn stage_decision(
@@ -505,17 +639,12 @@ impl<'a> VerificationControl<'a> {
         caller: &Caller,
         operation: &str,
         resource: &str,
+        required: &Permission,
         outcome: AuditOutcome,
     ) {
-        self.state.audit_outbox.stage(
+        self.state.scribe_outbox.stage(
             caller.data_tenant_id,
-            audit::audit_event(
-                caller,
-                operation,
-                resource,
-                &Permission::eval_run().to_string(),
-                outcome,
-            ),
+            audit::audit_event(caller, operation, resource, &required.to_string(), outcome),
         );
     }
 
@@ -554,7 +683,7 @@ impl<'a> VerificationControl<'a> {
         }
     }
 
-    /// Whether the caller may request verification of the target's subject.
+    /// Whether the caller may request verification of `subject`.
     ///
     /// Users, tenant administrators, and Card-free services act on RBAC alone.
     /// A Card-bound principal must hold signed scope over the exact subject
@@ -564,23 +693,17 @@ impl<'a> VerificationControl<'a> {
     /// # Errors
     /// Returns a registry unavailability error when a read fails.
     async fn subject_in_scope(
-        &self,
         conn: &mut TenantConn<'_>,
         caller: &Caller,
-        target: &VerificationRunTarget,
+        subject: Option<&CardUid>,
     ) -> Result<bool, WyrdError> {
-        if caller.principal.card_ref().is_none() {
+        if caller.principal.card_attribution() == CardAttribution::AnyRegistered {
             return Ok(true);
         }
-        let Some(subject) = self
-            .queue
-            .target_subject(conn, target)
-            .await
-            .map_err(registry_db_error)?
-        else {
+        let Some(subject) = subject else {
             return Ok(true);
         };
-        let row = match get_card_by_uid(conn, &subject).await {
+        let row = match get_card_by_uid(conn, subject).await {
             Ok(row) => row,
             Err(WyrdError::RegistryCardNotFound { .. }) => return Ok(true),
             Err(error) => return Err(error),

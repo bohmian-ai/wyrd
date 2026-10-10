@@ -1068,12 +1068,11 @@ const AUDIT_STAGED_BUDGET: Duration = Duration::from_secs(30);
 
 /// Capture durable Forge and Oracle owner counts for one phase boundary.
 ///
-/// Before reading the counts, this polls every pod's in-flight Oracle audit
-/// outbox commits (`audit_pending`) until none remain, so no read decision is
-/// still on its way to being staged. The read-decision totals then come from
-/// each tenant's retained history rather than from transient staging, which the
-/// publisher is entitled to drain between two checkpoints: a published row
-/// stays counted, so a phase delta measures the phase rather than the sweep.
+/// Before reading the counts, this polls every pod's in-flight Scribe outbox
+/// writes (`scribe_pending`) until none remain, so no read decision is still
+/// on its way to retained history. The read-decision totals then come from
+/// each tenant's retained history, where a row stays counted, so a phase
+/// delta measures the phase.
 ///
 /// # Errors
 /// Returns [`ClusterLoadError::Cluster`] when the shared database inspection
@@ -1123,13 +1122,13 @@ async fn await_read_audit_convergence(
             .oracle_inspection()
             .await
             .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
-        if inspection.audit_pending == 0 {
+        if inspection.scribe_pending == 0 {
             return Ok(inspection);
         }
         if Instant::now() >= deadline {
             return Err(ClusterLoadError::Assertion(format!(
                 "read-audit commits did not finish: {} pending after {:?}",
-                inspection.audit_pending, AUDIT_STAGED_BUDGET,
+                inspection.scribe_pending, AUDIT_STAGED_BUDGET,
             )));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

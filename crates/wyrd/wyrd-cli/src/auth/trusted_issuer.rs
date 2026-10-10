@@ -60,7 +60,8 @@ pub struct AddArgs {
     /// Optional claim path that yields the principal groups.
     #[arg(long, value_name = "CLAIM")]
     pub claim_groups: Option<String>,
-    /// Role granted to every principal from this issuer. Repeatable.
+    /// Role granted to every principal from this issuer. Repeatable; omitted,
+    /// the server grants `viewer`.
     #[arg(long = "default-role", value_name = "ROLE")]
     pub default_roles: Vec<String>,
     /// Map an issuer group to a Wyrd role, as `group=role`. Repeatable; the same
@@ -157,7 +158,7 @@ async fn add(args: AddArgs) -> Result<ExitCode, WyrdCliError> {
                     groups: args.claim_groups,
                 },
                 group_role_map,
-                default_roles: args.default_roles,
+                default_roles: (!args.default_roles.is_empty()).then_some(args.default_roles),
                 principal_kind,
                 jwks_ttl_secs: args.jwks_ttl_secs,
             }),
@@ -581,13 +582,13 @@ mod tests {
             "--claim-groups",
             "groups",
             "--default-role",
-            "reader",
+            "viewer",
             "--default-role",
-            "writer",
+            "editor",
             "--group-role",
-            "dev=reader",
+            "dev=viewer",
             "--group-role",
-            "dev=writer",
+            "dev=editor",
             "--group-role",
             "ops=admin",
             "--principal-kind",
@@ -600,9 +601,9 @@ mod tests {
             TrustedIssuerCommand::Add(args) => {
                 assert_eq!(args.claim_email.as_deref(), Some("email"));
                 assert_eq!(args.claim_groups.as_deref(), Some("groups"));
-                assert_eq!(args.default_roles, vec!["reader", "writer"]);
+                assert_eq!(args.default_roles, vec!["viewer", "editor"]);
                 let map = super::parse_group_roles(&args.group_roles).expect("group roles parse");
-                assert_eq!(map["dev"], vec!["reader", "writer"]);
+                assert_eq!(map["dev"], vec!["viewer", "editor"]);
                 assert_eq!(map["ops"], vec!["admin"]);
             }
             _ => panic!("expected Add"),
@@ -612,7 +613,7 @@ mod tests {
     #[test]
     fn group_roles_reject_missing_equals() {
         assert!(super::parse_group_roles(&["devreader".to_owned()]).is_err());
-        assert!(super::parse_group_roles(&["=reader".to_owned()]).is_err());
+        assert!(super::parse_group_roles(&["=viewer".to_owned()]).is_err());
         assert!(super::parse_group_roles(&["dev=".to_owned()]).is_err());
     }
 

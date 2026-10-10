@@ -73,16 +73,19 @@ export declare class NativeWyrdTestServer {
   /**
    * Mint an API key for a principal holding exactly `permissions`.
    *
-   * `permissions` are `resource:action` strings. This is the door a journey
-   * uses to prove an access gate from the caller's side: it seeds one role
-   * carrying only those grants and bootstraps a service onto it.
+   * Each permission is either a `resource:action` string, which grants every
+   * object of that operation, or an object in the persisted typed
+   * permission projection (`resource`, `action`, `scope`), which expresses
+   * object scope such as one Verifier. This is the door a journey uses to
+   * prove an access gate from the caller's side: it seeds one role carrying
+   * only those grants and bootstraps a service onto it.
    *
    * # Errors
    *
    * Returns a napi error for an unparsable permission, or when the harness
    * is closed or role seeding or bootstrapping fails.
    */
-  scopedApiKey(role: string, permissions: Array<string>): string
+  scopedApiKey(role: string, permissions: Array<any>): string
   /**
    * Provision a second active tenant so a journey can prove cross-tenant
    * isolation, returning its tenant ID.
@@ -114,6 +117,23 @@ export declare class NativeWyrdTestServer {
    */
   bootstrapService(roles: Array<string>, name: string): string
   /**
+   * Sign in a fixture-tenant user holding identity-provider `roles` and
+   * return the user's principal id.
+   *
+   * The roles are recorded as a login would record them, so a journey can
+   * prove a direct grant coexists with them.
+   *
+   * # Arguments
+   *
+   * * `roles` - The role names the identity provider grants.
+   * * `name` - The user's name; the email is `<name>@test.wyrd`.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or bootstrapping fails.
+   */
+  bootstrapUser(roles: Array<string>, name: string): string
+  /**
    * Bootstrap a service principal holding `roles` in tenant `tenant_id` and
    * return its API key.
    *
@@ -126,6 +146,15 @@ export declare class NativeWyrdTestServer {
    * is closed, or bootstrapping fails.
    */
   bootstrapServiceInTenant(tenantId: string, roles: Array<string>, name: string): string
+  /**
+   * Issue a key for the fixture tenant's unbound administrator: the key
+   * `wyrd setup` prints, bound to no Card.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or issuing fails.
+   */
+  tenantAdminKey(): string
   /**
    * Activate the identity lane's Keycloak sign-in for one tenant and
    * return its id: the fixture tenant when `tenantSlug` is absent, else a
@@ -219,26 +248,6 @@ export declare function cliDeleteProviderCredential(name: string, connection?: N
  * client, and server failures are returned in the outcome.
  */
 export declare function cliGet(selector: NativeCardSelector, outputDir: string, metadataOnly?: boolean | undefined | null, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
-
-/**
- * Grants a Role to the principal bound to one exact Card
- * (`wyrd auth grant-role`).
- *
- * Requires a tenant administrator; the grant takes effect at the principal's
- * next key exchange.
- *
- * # Arguments
- *
- * * `options` - The bound Card's coordinates and the Role to grant.
- * * `connection` - The explicit client the command runs as, or `None` for
- *   the ambient credential chain.
- *
- * # Errors
- *
- * Returns a napi error only when the response cannot be serialized;
- * coordinate, client, and server failures are returned in the outcome.
- */
-export declare function cliGrantRole(options: NativeGrantRole, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
 
 /**
  * Issues an API key bound to one exact Card (`wyrd auth issue-key`).
@@ -341,20 +350,6 @@ export interface NativeCliOutcome {
   problemJson?: string
 }
 
-/** Options for `grantRole`: the bound Card and the Role to grant it. */
-export interface NativeGrantRole {
-  /** Card kind, `Service` or `Agent`. */
-  kind: string
-  /** Card name. */
-  name: string
-  /** Exact Card version. */
-  version: string
-  /** Card space. */
-  space: string
-  /** Built-in or tenant Role name, such as `workload`. */
-  role: string
-}
-
 /** Options for `issueKey`: the bound Card and the key's label and lifetime. */
 export interface NativeIssueKey {
   /** Card kind, such as `Service` or `Agent`. */
@@ -373,7 +368,7 @@ export interface NativeIssueKey {
 
 /**
  * Test-only capabilities a story's server starts with; every field is
- * optional and defaults to off, except `auditPublication`.
+ * optional and defaults to off.
  */
 export interface NativeTestServerOptions {
   /**
@@ -382,8 +377,6 @@ export interface NativeTestServerOptions {
    * which calls `<providerBaseUrl>/v1/chat/completions`.
    */
   providerBaseUrl?: string
-  /** `false` keeps staged audit rows for assertions; defaults to `true`. */
-  auditPublication?: boolean
   /** `true` runs Drift baseline fitting and Verifier runs. */
   verificationRuntime?: boolean
   /**
@@ -391,13 +384,19 @@ export interface NativeTestServerOptions {
    * register, for saved user login journeys.
    */
   humanSso?: boolean
+  /**
+   * Access-token lifetime in seconds, verified with no clock-skew
+   * allowance, so a journey can outlive one token; omitted keeps the
+   * production lifetime.
+   */
+  accessTtlSeconds?: number
 }
 
 /**
  * Starts a real bound Wyrd test server and mints an admin access token.
  *
  * `options` selects the test-only capabilities; omitted, the server keeps
- * its default upstreams, publishes audit, and runs no verification runtime.
+ * its default upstreams and runs no verification runtime.
  *
  * # Errors
  *

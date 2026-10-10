@@ -261,6 +261,8 @@ mod pg_tests {
     use wyrd_spec::vala::api::{CompactionTypeWire, DataTypeSpec, FieldSpec, TimeGranularityWire};
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
+    use crate::components::gateway::recording::{AuditDecision, RecordingScribe};
+
     async fn test_state() -> AppState {
         let root = tempfile::tempdir().expect("temp dir");
         let storage = StorageHandle::from_settings(StorageSettings {
@@ -316,45 +318,42 @@ mod pg_tests {
         }
     }
 
-    /// Read the caller's own audit-staging rows for one resource.
+    /// The caller's own recorded audit decisions for one resource, in
+    /// arrival order.
     ///
-    /// The rows are fetched through the canonical tenant-scoped reader, then
-    /// narrowed to the caller's request ID so an assertion sees exactly the
-    /// events the operation under test staged, independent of anything else
-    /// the shared test tenant has recorded for the same resource. The state's
-    /// audit outbox settles first, so every staged decision is read.
+    /// Narrowed to the caller's tenant and request ID so an assertion sees
+    /// exactly the decisions the operation under test staged. The state's
+    /// Scribe outbox settles into `scribe` first, so every staged decision is
+    /// read.
     ///
     /// # Panics
-    /// Panics when the outbox does not settle or the read fails.
+    /// Panics when the outbox does not settle.
     async fn audit_rows_for(
         state: &AppState,
+        scribe: &RecordingScribe,
         caller: &Caller,
         resource: &str,
-    ) -> Vec<vala_sql::row_types::audit_staging::AuditStagingRow> {
+    ) -> Vec<AuditDecision> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.audit_outbox.settle(deadline).await,
+            state.scribe_outbox.settle(deadline).await,
             0,
             "audit settles"
         );
-        let mut conn =
-            vala_sql::TenantConn::acquire(state.postgres.vala_pool(), caller.data_tenant_id)
-                .await
-                .expect("tenant connection");
-        let rows = vala_sql::queries::audit_staging::list_audit_events_for_resource(
-            &mut conn, resource, 0, 100,
-        )
-        .await
-        .expect("audit page");
-        conn.commit().await.expect("audit read commits");
-        rows.into_iter()
-            .filter(|row| row.request_id == caller.request_id.as_str())
+        scribe
+            .audit_decisions()
+            .into_iter()
+            .filter(|row| {
+                row.tenant == caller.data_tenant_id
+                    && row.resource == resource
+                    && row.request_id == caller.request_id.as_str()
+            })
             .collect()
     }
 
-    /// Assert one row carries the canonical RBAC-denial attribution.
+    /// Assert one decision carries the canonical RBAC-denial attribution.
     fn assert_read_denial_row(
-        row: &vala_sql::row_types::audit_staging::AuditStagingRow,
+        row: &AuditDecision,
         operation: &str,
         resource: &str,
         caller: &Caller,
@@ -367,7 +366,7 @@ mod pg_tests {
             "denial attributes the required read permission"
         );
         assert_eq!(row.outcome, "denied");
-        assert_eq!(row.principal_id, caller.principal.id.as_uuid());
+        assert_eq!(row.audit_principal_id, caller.principal.id.as_uuid());
         assert_eq!(row.request_id, caller.request_id.as_str());
     }
 
@@ -591,7 +590,7 @@ mod pg_tests {
     #[test]
     fn bifrost_tables_register_pre_commit_failure_records_one_verdict() {
         wyrd_runtime::runtime().block_on(async {
-            let state = test_state().await;
+            let (state, scribe) = RecordingScribe::attach(test_state().await);
             let caller = caller_with([Permission::bifrost_table_write()]);
             let name = unique_name();
             let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
@@ -605,7 +604,8 @@ mod pg_tests {
                 .await
                 .expect_err("an undeclarable layout is refused");
 
-            let rows = audit_rows_for(&state, &caller, &format!("vala.datasets.{name}")).await;
+            let rows =
+                audit_rows_for(&state, &scribe, &caller, &format!("vala.datasets.{name}")).await;
             assert_eq!(rows.len(), 1, "one received verdict, one row");
             assert_eq!(rows[0].outcome, "allowed");
         });
@@ -624,7 +624,7 @@ mod pg_tests {
     #[test]
     fn bifrost_tables_concurrent_same_fqn_register_records_each_verdict() {
         wyrd_runtime::runtime().block_on(async {
-            let state = test_state().await;
+            let (state, scribe) = RecordingScribe::attach(test_state().await);
             let first_caller = caller_with([Permission::bifrost_table_write()]);
             let second_caller = caller_with([Permission::bifrost_table_write()]);
             let name = unique_name();
@@ -642,7 +642,7 @@ mod pg_tests {
 
             let resource = format!("vala.datasets.{name}");
             for caller in [&first_caller, &second_caller] {
-                let rows = audit_rows_for(&state, caller, &resource).await;
+                let rows = audit_rows_for(&state, &scribe, caller, &resource).await;
                 assert_eq!(rows.len(), 1, "each request records one verdict");
                 assert_eq!(rows[0].outcome, "allowed");
             }
@@ -709,7 +709,7 @@ mod pg_tests {
     #[test]
     fn bifrost_tables_list_and_describe_reflect_registration() {
         wyrd_runtime::runtime().block_on(async {
-            let state = test_state().await;
+            let (state, scribe) = RecordingScribe::attach(test_state().await);
             let caller = caller_with([
                 Permission::bifrost_table_write(),
                 Permission::bifrost_table_read(),
@@ -749,7 +749,7 @@ mod pg_tests {
                 "describe surfaces the user field"
             );
 
-            let list_rows = audit_rows_for(&state, &caller, "bifrost.tables").await;
+            let list_rows = audit_rows_for(&state, &scribe, &caller, "bifrost.tables").await;
             assert_eq!(
                 list_rows.len(),
                 1,
@@ -758,7 +758,7 @@ mod pg_tests {
             assert_eq!(list_rows[0].operation, "vala.bifrost.list");
             assert_eq!(list_rows[0].outcome, "allowed");
             let table_rows =
-                audit_rows_for(&state, &caller, &format!("vala.datasets.{name}")).await;
+                audit_rows_for(&state, &scribe, &caller, &format!("vala.datasets.{name}")).await;
             let operations: Vec<&str> = table_rows
                 .iter()
                 .map(|row| row.operation.as_str())
@@ -779,14 +779,14 @@ mod pg_tests {
     #[test]
     fn bifrost_tables_list_requires_read_permission() {
         wyrd_runtime::runtime().block_on(async {
-            let state = test_state().await;
+            let (state, scribe) = RecordingScribe::attach(test_state().await);
             let caller = caller_with([]);
             let err = list_tables(&state, caller.clone())
                 .await
                 .expect_err("no read permission is denied");
             assert_eq!(err.status(), 403);
 
-            let rows = audit_rows_for(&state, &caller, "bifrost.tables").await;
+            let rows = audit_rows_for(&state, &scribe, &caller, "bifrost.tables").await;
             assert_eq!(rows.len(), 1, "denied list appends exactly one audit row");
             assert_read_denial_row(&rows[0], "vala.bifrost.list", "bifrost.tables", &caller);
         });
@@ -796,7 +796,7 @@ mod pg_tests {
     #[test]
     fn bifrost_tables_describe_requires_read_permission() {
         wyrd_runtime::runtime().block_on(async {
-            let state = test_state().await;
+            let (state, scribe) = RecordingScribe::attach(test_state().await);
             let caller = caller_with([]);
             let name = unique_name();
             let err = describe_table(
@@ -810,7 +810,7 @@ mod pg_tests {
             assert_eq!(err.status(), 403);
 
             let resource = format!("vala.datasets.{name}");
-            let rows = audit_rows_for(&state, &caller, &resource).await;
+            let rows = audit_rows_for(&state, &scribe, &caller, &resource).await;
             assert_eq!(
                 rows.len(),
                 1,

@@ -273,19 +273,19 @@ pub enum BifrostError {
     )]
     TenantBindingMissing,
 
-    /// The client-supplied `card_ref` is not within the authenticated
-    /// principal's card scope, so the tagged write is refused.
-    #[error("card_ref outside principal card scope: {card_ref}")]
+    /// The Card the caller attributed a write or call to is not within the
+    /// authenticated principal's card scope, so it is refused.
+    ///
+    /// Gateway calls and observation writes share this denial; the caller
+    /// already holds the `card_ref` or `card_uid` it sent.
+    #[error("Card outside principal card scope")]
     #[wyrd_error(
         code = "WYRD_VALA_403_BIFROST_CARD_SCOPE",
         status = 403,
-        title = "card_ref outside principal card scope",
-        remediation = "Supply a card_ref the authenticated principal is authorized to tag, or add the target card to the Service card's components."
+        title = "Card outside principal card scope",
+        remediation = "Attribute the write or call to a Card the authenticated principal is authorized to tag, or add the target Card to the Service card's components."
     )]
-    CardScopeDenied {
-        /// Canonical string form of the card reference that was refused.
-        card_ref: String,
-    },
+    CardScopeDenied,
 
     /// A card reference could not be resolved to a tenant-local card UID.
     #[error("card_ref cannot be resolved: {card_ref}")]

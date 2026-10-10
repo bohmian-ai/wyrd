@@ -1095,6 +1095,111 @@ async fn worker_prepared_recovery_observes_one_ownership_episode() {
     );
 }
 
+/// A worker aborted during startup recovery cannot let its same-owner restart
+/// take the Prepared claim it left unexpired; the claim is recovered once its
+/// lease lapses.
+///
+/// The abort lands while startup holds a fresh durable Prepared claim, before
+/// that invocation could mark itself joined. The restart shares the worker's
+/// quiescence, so the old lease must be honored for several recovery passes
+/// and then taken through ordinary expiry recovery.
+///
+/// # Panics
+/// Panics when the restart renews the unexpired claim, becomes ready while it
+/// is unresolved, or fails to reconcile it after the lease lapses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn interrupted_startup_waits_for_its_prepared_lease() {
+    let fixture = PromotionIntegrationFixture::start("interrupted_startup").await;
+    let observer = ForgeWorkerCompletionObserver::default();
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        store,
+        ForgeClock::system(),
+        observer.clone(),
+        ForgeSchedulerTrigger::default(),
+    );
+    let stop = CancellationToken::new();
+    let promotion = owed_promotion(&fixture, &forge).await;
+    enqueue(&fixture, &promotion).await;
+    fixture.prepare_recovery_episode(&forge, &stop).await;
+    observer.hold_after_claims_for_test(1);
+    let worker = ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7())
+        .expect("recovering worker");
+    let owner = worker.owner_for_test();
+    let restarted = worker.clone();
+    let mut interrupted = AbortOnDropHandle::new(tokio::spawn(
+        worker.run(stop.clone(), ForgeRoleReadiness::default()),
+    ));
+    timeout(OWNERSHIP_BOUND, observer.wait_for_claims_for_test())
+        .await
+        .expect("startup claims the Prepared attempt");
+    interrupted.abort();
+    assert!(
+        (&mut interrupted)
+            .await
+            .expect_err("aborted startup")
+            .is_cancelled()
+    );
+    observer.release_claims_for_test();
+    let held: (String, Uuid, bool, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "SELECT state,claimed_by,claim_expires_at>now(),claim_expires_at FROM vala.forge_tasks",
+    )
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("interrupted claim");
+    assert_eq!(
+        (held.0.as_str(), held.1, held.2),
+        ("prepared", owner, true),
+        "the aborted startup leaves its own unexpired Prepared claim"
+    );
+
+    let readiness = ForgeRoleReadiness::default();
+    let mut work =
+        AbortOnDropHandle::new(tokio::spawn(restarted.run(stop.clone(), readiness.clone())));
+    // Startup paces recovery passes 250ms apart; eight passes would each have
+    // renewed the claim if the interrupted invocation still authorized it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let honored: (String, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT state,claim_expires_at FROM vala.forge_tasks")
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("honored claim");
+    assert_eq!(
+        honored,
+        ("prepared".to_owned(), held.3),
+        "the restart must not renew a claim its interrupted predecessor holds"
+    );
+    assert!(
+        !readiness.is_ready(),
+        "unresolved recovery keeps readiness down"
+    );
+
+    let admin = fixture
+        .database
+        .superuser_pool()
+        .expect("fixture administrator");
+    sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=now()-interval '1 hour'")
+        .execute(&admin)
+        .await
+        .expect("lapse the interrupted lease");
+    timeout(OWNERSHIP_BOUND, observer.wait_for_at_least(1))
+        .await
+        .expect("the lapsed Prepared attempt is reconciled");
+    let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("recovered state");
+    assert_eq!(state, "succeeded");
+    stop.cancel();
+    timeout(OWNERSHIP_BOUND, &mut work)
+        .await
+        .expect("restart drains")
+        .expect("restart join")
+        .expect("restart stops cleanly");
+}
+
 /// Shutdown before execution balances ownership and reports the durable Retryable
 /// release, even though that transition clears the attempt identity.
 ///

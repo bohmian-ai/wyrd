@@ -12,13 +12,14 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// `vala.verification.results` — exactly one row per completed Verifier run.
 ///
-/// Drift and Eval share this table so a dashboard reads one verdict surface
-/// regardless of implementation; `implementation` selects which detail table
-/// and which `details` payload shape applies. Only `completed` runs appear:
+/// Drift, Eval, and task Verifiers share this table so a dashboard reads one
+/// verdict surface regardless of implementation; `implementation` selects
+/// which detail table and which `details` payload shape applies. Only `completed` runs appear:
 /// errored, timed-out, and still-running executions have no row here, so the
 /// presence of a row is itself the statement that the run produced a verdict.
-/// `details` is the one implementation-specific summary — a `DriftReport` or an
-/// `EvalWorkflowSummary` — and is null only for a completed Drift execution
+/// `details` is the one implementation-specific summary — a `DriftReport`, an
+/// `EvalWorkflowSummary`, or a task's one `AssertionResult`, which has no
+/// detail table — and is null only for a completed Drift execution
 /// that could not score valid input, which is recorded rather than fabricated.
 /// The managed `run_id` is the Verifier run and the managed `card_uid` is the
 /// Verifier Card; the verified subject and binding owner are separate payload

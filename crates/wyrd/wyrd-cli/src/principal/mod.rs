@@ -1,3 +1,5 @@
+/// `wyrd principal list`, `roles`, `grant-role`, and `revoke-role`.
+pub mod assignment;
 pub mod credential;
 pub mod revoke;
 
@@ -18,6 +20,11 @@ pub enum PrincipalCommand {
     /// Create principals and administer their credentials.
     #[command(subcommand)]
     Credential(credential::CredentialCommand),
+    /// List the tenant's assignable users, services, and agents.
+    List(assignment::ListArgs),
+    /// List, grant, and revoke a principal's Roles.
+    #[command(subcommand)]
+    Role(assignment::RoleCommand),
 }
 
 /// Route a `wyrd principal` invocation to the subcommand that owns it.
@@ -28,5 +35,7 @@ pub async fn dispatch(command: PrincipalCommand) -> Result<ExitCode, WyrdCliErro
     match command {
         PrincipalCommand::Revoke(args) => revoke::dispatch(args).await,
         PrincipalCommand::Credential(command) => credential::dispatch(command).await,
+        PrincipalCommand::List(args) => assignment::list(args).await,
+        PrincipalCommand::Role(command) => assignment::dispatch(command).await,
     }
 }

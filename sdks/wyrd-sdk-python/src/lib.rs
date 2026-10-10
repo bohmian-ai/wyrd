@@ -17,6 +17,9 @@ mod observe;
 #[cfg(feature = "python")]
 mod operators;
 #[cfg(feature = "python")]
+/// `wyrd.principals`: the Python projection of the tenant principal handle.
+mod principals;
+#[cfg(feature = "python")]
 mod state;
 #[cfg(feature = "testing")]
 mod testing;
@@ -134,6 +137,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     operators::register(&operators)?;
     m.add_submodule(&operators)?;
     register_submodule(py, "wyrd._wyrd.operators", &operators)?;
+
+    let principals = PyModule::new(py, "principals")?;
+    principals::register(&principals)?;
+    m.add_submodule(&principals)?;
+    register_submodule(py, "wyrd._wyrd.principals", &principals)?;
 
     #[cfg(feature = "testing")]
     {

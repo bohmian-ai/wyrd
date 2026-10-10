@@ -209,6 +209,49 @@ fn checkpoint(
         .expect("production telemetry checkpoint")
 }
 
+/// Settles the Scribe outbox and returns the rows the pod's writable memtable holds.
+///
+/// Every audited call stages an `audit_log` decision that the outbox inserts
+/// through this same Scribe a moment later. Settling at both edges of a window
+/// keeps each decision inside the window whose call staged it, so the
+/// process-wide insertion counter reconciles with the memtable owner's growth:
+/// the case's own rows plus the audit rows its calls produced.
+///
+/// # Panics
+///
+/// Panics when the outbox does not settle or the memtable is not inspectable.
+async fn settled_writable_rows(server: &WyrdTestServer) -> usize {
+    server
+        .await_audit_retained()
+        .await
+        .expect("staged audit decisions settle");
+    server
+        .bifrost_scribe()
+        .expect("the server owns a Scribe")
+        .memtable_stats()
+        .expect("memtable stats")
+        .writable_rows
+}
+
+/// Counts the tenant's committed `audit_log` hot files and their bytes.
+///
+/// Publication drives every due claim, so the process-wide publication
+/// counters also count the audit claims committed beside the case's table.
+///
+/// # Panics
+///
+/// Panics when the committed files are not inspectable.
+async fn audit_files(server: &WyrdTestServer, tenant: wyrd_spec::DataTenantId) -> (usize, u64) {
+    let files = server
+        .published_hot_files_for_test(tenant, BifrostNamespace::Audit.as_str(), "audit_log")
+        .await
+        .expect("published audit files are inspectable");
+    (
+        files.len(),
+        files.iter().map(|file| file.file_size).sum::<u64>(),
+    )
+}
+
 /// Polls the staging owner until publication has settled, or the deadline passes.
 ///
 /// Settled means no claim is outstanding, no staged member survives its
@@ -224,7 +267,7 @@ async fn await_settled(server: &WyrdTestServer, telemetry: &BifrostTelemetryCapt
     let deadline = tokio::time::Instant::now() + SETTLEMENT_DEADLINE;
     loop {
         let backlog = server
-            .scribe_staging_backlog_for_test()
+            .scribe_staging_backlog_for_test(None)
             .expect("the pod's staged backlog is inspectable");
         let lanes: Vec<_> = telemetry
             .snapshot()
@@ -266,7 +309,7 @@ fn scrape_staging(
     let samples = telemetry.snapshot().expect("production metrics render");
     let scraped = STAGING_GAUGES.map(|family| gauge(&samples, family));
     let owner = server
-        .scribe_staging_backlog_for_test()
+        .scribe_staging_backlog_for_test(None)
         .expect("the pod's staged backlog is inspectable");
     let expected = [
         Some(owner.live_members as f64),
@@ -316,13 +359,9 @@ fn scrape_staging(
     reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
 )]
 async fn staged_backlog_survives_abrupt_restart() {
-    // The insertion counter is pod-wide, so the tenant's audit table must not
-    // insert rows inside the resend window.
-    let mut cluster = WyrdTestCluster::start_spec(
-        BifrostClusterSpec::one_mixed().without_audit_publication_for_test(),
-    )
-    .await
-    .expect("the one-pod mixed cluster starts");
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
     let telemetry = cluster.telemetry().clone();
     let tenant = cluster.data_tenant_id();
     let name = unique_table("staged_restart");
@@ -382,20 +421,25 @@ async fn staged_backlog_survives_abrupt_restart() {
         "the restored pod serves every acknowledged row before publication"
     );
 
+    let rows_before = settled_writable_rows(server).await;
     let resend = checkpoint(&telemetry);
     append_values(&client, &table, batch_id, &rows)
         .await
         .expect("a resent acknowledged batch is acknowledged");
+    let audit_rows = settled_writable_rows(server).await - rows_before;
     let resent = telemetry.delta_since(&resend).expect("resend window");
     let inserted = delta_value(
         &resent,
         "bifrost_scribe_memtable_rows_inserted_total",
         BifrostMetricKind::Counter,
     );
-    eprintln!("evidence staged_backlog phase=resend rows_inserted_delta={inserted}");
+    eprintln!(
+        "evidence staged_backlog phase=resend rows_inserted_delta={inserted} \
+         memtable_rows_delta={audit_rows}"
+    );
     assert_eq!(
-        inserted, 0.0,
-        "a resent batch does not claim a second insertion"
+        inserted, audit_rows as f64,
+        "a resent batch inserts nothing: the window inserts only its audit rows"
     );
 
     server
@@ -442,8 +486,10 @@ async fn staged_backlog_survives_abrupt_restart() {
 /// - a WAL sync fault fails the client write with one correlated failure event
 ///   on its failed write trace, a failed fsync sample, and no insertion.
 ///
-/// Audit publication is disabled so the process-wide Scribe counters move only
-/// with this case's own writes.
+/// The Scribe counters are process-wide and every audited call inserts an
+/// `audit_log` row through the same Scribe, so each window settles the outbox
+/// at both edges and reconciles the counters with the memtable owner's growth;
+/// the case's own rows are proven by the strict read and the committed files.
 ///
 /// # Panics
 ///
@@ -460,7 +506,6 @@ async fn scribe_hot_path_telemetry_reconciles() {
     let (_telemetry_guard, telemetry) =
         shared_process_telemetry_for_test().expect("process production telemetry");
     let server = WyrdTestServer::builder()
-        .without_audit_publication_for_test()
         .start_bound()
         .await
         .expect("the Scribe production harness starts");
@@ -473,11 +518,12 @@ async fn scribe_hot_path_telemetry_reconciles() {
 
     // Idle: the staging owner holds nothing.
     let idle = server
-        .scribe_staging_backlog_for_test()
+        .scribe_staging_backlog_for_test(None)
         .expect("the pod's staged backlog is inspectable");
     assert_eq!((idle.live_members, idle.outstanding_claims), (0, 0));
 
     // Write: four acknowledged batches.
+    let rows_before = settled_writable_rows(&server).await;
     let write = checkpoint(&telemetry);
     let expected: Vec<i64> = (0..64).collect();
     let mut batches = Vec::new();
@@ -488,6 +534,7 @@ async fn scribe_hot_path_telemetry_reconciles() {
             .unwrap_or_else(|error| panic!("append {batch_id} is acknowledged: {error:?}"));
         batches.push(batch_id);
     }
+    let inserted_rows = settled_writable_rows(&server).await - rows_before;
     let written = telemetry.delta_since(&write).expect("write window");
     eprintln!(
         "evidence write acknowledged_batches=4 acknowledged_rows=64 samples: {}",
@@ -499,17 +546,21 @@ async fn scribe_hot_path_telemetry_reconciles() {
             "bifrost_scribe_memtable_rows_inserted_total",
             BifrostMetricKind::Counter
         ),
-        64.0,
-        "the shard owner counts exactly the acknowledged rows as newly inserted"
+        inserted_rows as f64,
+        "the shard owner counts exactly the rows the memtable newly holds"
     );
-    assert_eq!(
-        delta_value(
-            &written,
-            "bifrost_scribe_ack_seconds",
-            BifrostMetricKind::HistogramCount
-        ),
-        4.0,
-        "each acknowledged batch is one ACK attempt"
+    let audit_rows = inserted_rows
+        .checked_sub(64)
+        .expect("the memtable holds at least the 64 acknowledged rows");
+    let acks = delta_value(
+        &written,
+        "bifrost_scribe_ack_seconds",
+        BifrostMetricKind::HistogramCount,
+    );
+    assert!(
+        acks >= 4.0 && acks - 4.0 <= audit_rows as f64,
+        "each acknowledged batch is one ACK attempt, and every other ACK is an \
+         audit append of at least one row: acks={acks} audit_rows={audit_rows}"
     );
     assert!(
         labelled_delta(
@@ -551,23 +602,25 @@ async fn scribe_hot_path_telemetry_reconciles() {
     assert_no_routine_info(&written, "a successful write");
 
     // Retry: the same batch is acknowledged again and inserts nothing.
+    let rows_before = settled_writable_rows(&server).await;
     let retry = checkpoint(&telemetry);
     append_values(&client, &table, batches[0], &expected[..16])
         .await
         .expect("a same-batch retry is acknowledged");
+    let audit_rows = settled_writable_rows(&server).await - rows_before;
     let retried = telemetry.delta_since(&retry).expect("retry window");
     eprintln!(
         "evidence retry acknowledged_batches=1 new_rows=0 samples: {}",
         retried.evidence(&WRITE_FAMILIES)
     );
-    assert_eq!(
-        delta_value(
-            &retried,
-            "bifrost_scribe_ack_seconds",
-            BifrostMetricKind::HistogramCount
-        ),
-        1.0,
-        "the retry is a successful ACK attempt"
+    let acks = delta_value(
+        &retried,
+        "bifrost_scribe_ack_seconds",
+        BifrostMetricKind::HistogramCount,
+    );
+    assert!(
+        acks >= 1.0 && acks - 1.0 <= audit_rows as f64,
+        "the retry is a successful ACK attempt: acks={acks} audit_rows={audit_rows}"
     );
     assert_eq!(
         delta_value(
@@ -575,16 +628,13 @@ async fn scribe_hot_path_telemetry_reconciles() {
             "bifrost_scribe_memtable_rows_inserted_total",
             BifrostMetricKind::Counter
         ),
-        0.0,
-        "a replayed batch must not claim a second insertion"
+        audit_rows as f64,
+        "a replayed batch must not claim a second insertion: only audit rows are new"
     );
     assert_eq!(
-        scribe
-            .memtable_stats()
-            .expect("memtable stats")
-            .writable_rows,
-        64,
-        "the memtable owner holds each acknowledged row once"
+        sorted_values(&client, &table).await,
+        expected,
+        "the table holds each acknowledged row once"
     );
 
     // Freeze, publication not yet requested: the staged backlog is visible
@@ -620,7 +670,7 @@ async fn scribe_hot_path_telemetry_reconciles() {
         frozen.evidence(&MEMORY_FAMILIES)
     );
     let staged = server
-        .scribe_staging_backlog_for_test()
+        .scribe_staging_backlog_for_test(None)
         .expect("the pod's staged backlog is inspectable");
     assert!(
         staged.live_members > 0 && staged.live_bytes > 0,
@@ -653,6 +703,7 @@ async fn scribe_hot_path_telemetry_reconciles() {
     );
 
     // Publish: committed output counters equal the committed hot files.
+    let (audit_files_before, audit_bytes_before) = audit_files(&server, tenant).await;
     let publish = checkpoint(&telemetry);
     server
         .flush_bifrost()
@@ -660,6 +711,7 @@ async fn scribe_hot_path_telemetry_reconciles() {
         .expect("the staged members publish");
     await_settled(&server, &telemetry).await;
     let published_window = telemetry.delta_since(&publish).expect("publish window");
+    let (audit_files_after, audit_bytes_after) = audit_files(&server, tenant).await;
     let files = server
         .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), &name)
         .await
@@ -682,8 +734,8 @@ async fn scribe_hot_path_telemetry_reconciles() {
             "bifrost_scribe_publication_files_total",
             BifrostMetricKind::Counter
         ),
-        files.len() as f64,
-        "committed publication files equal the committed hot files"
+        (files.len() + audit_files_after - audit_files_before) as f64,
+        "committed publication files equal the table's and audit_log's committed hot files"
     );
     assert_eq!(
         delta_value(
@@ -691,8 +743,9 @@ async fn scribe_hot_path_telemetry_reconciles() {
             "bifrost_scribe_publication_bytes_total",
             BifrostMetricKind::Counter
         ),
-        files.iter().map(|file| file.file_size).sum::<u64>() as f64,
-        "committed publication bytes equal the committed hot-file sizes"
+        (files.iter().map(|file| file.file_size).sum::<u64>() + audit_bytes_after
+            - audit_bytes_before) as f64,
+        "committed publication bytes equal the table's and audit_log's hot-file sizes"
     );
     assert!(
         delta_value(
@@ -729,6 +782,7 @@ async fn scribe_hot_path_telemetry_reconciles() {
 
     // Controlled failure: a WAL sync fault fails the write with one correlated
     // failure event, a failed fsync sample, and no insertion.
+    settled_writable_rows(&server).await;
     let failure = checkpoint(&telemetry);
     server
         .trip_bifrost_wal_sync_fault_for_test()

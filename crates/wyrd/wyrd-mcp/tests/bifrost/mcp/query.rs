@@ -135,7 +135,7 @@ mod pg_tests {
 
         // A delegated token that lacks the permission is refused before any row.
         let underprivileged = server
-            .bootstrap_service("mcp-delegation-reader", &["reader"])
+            .bootstrap_service("mcp-delegation-reader", &[])
             .await?;
         let reader_jwt = server
             .exchange_api_key(underprivileged.api_key().ok_or("a service carries a key")?)

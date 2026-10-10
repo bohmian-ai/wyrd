@@ -122,7 +122,8 @@ async fn platform_token(
         return Err(OAuthError::from(not_configured().0));
     };
 
-    let sessions = PlatformSessions::new(operator, issuing_key, Arc::clone(&state.audit_outbox));
+    let sessions =
+        PlatformSessions::new(operator, issuing_key, Arc::clone(&state.scribe_outbox) as _);
     let presented = SecretString::from(subject_token.expose().to_owned());
     match sessions.exchange(&presented, request_id.as_str()).await {
         Ok(session) => Ok(no_store(
@@ -186,7 +187,7 @@ async fn recover_tenant_admin(
     let Some(operator) = state.postgres.operator_pool() else {
         return Err(not_configured());
     };
-    let recovery = TenantRecovery::new(operator, Arc::clone(&state.audit_outbox));
+    let recovery = TenantRecovery::new(operator, Arc::clone(&state.scribe_outbox));
     let conn = state
         .postgres
         .tenant_conn(request.tenant_id)
@@ -406,7 +407,7 @@ fn directory(state: &AppState) -> Result<TenantProvisioning, WyrdErrorResponse> 
     let catalog = state.bifrost.catalog().ok_or_else(not_configured)?;
     Ok(TenantProvisioning::new(
         operator,
-        Arc::clone(&state.audit_outbox),
+        Arc::clone(&state.scribe_outbox),
         BuiltinTables::new(Arc::clone(catalog)),
     ))
 }

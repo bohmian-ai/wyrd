@@ -1,5 +1,8 @@
 //! Bifrost Gate — the server-independent auth, transport-limit, and routing boundary.
 
+/// Registry resolution of the Cards an unbound writer may attribute
+/// evidence to, shared by ingest and OTLP admission.
+pub mod attribution;
 pub mod auth;
 pub mod error;
 pub mod limits;
@@ -14,6 +17,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 use wyrd_auth_verify::VerifiedToken;
 use wyrd_runtime::PermissionCheck;
+use wyrd_runtime::audit::AuditStage;
 use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
@@ -40,9 +44,9 @@ use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity
 use crate::tables::{
     CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, TableError,
 };
-use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::reference::CardRefScope;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome, BifrostQueryRequest};
 use wyrd_spec::vala::error::BifrostError;
 
@@ -260,16 +264,16 @@ pub fn initialize_gate_metrics() {
 /// decision that fails to commit is retried by the outbox and never refuses or
 /// delays the write.
 ///
-/// [`Gate`] is parameterized over the sink, so the server composes the process
-/// [`AuditOutbox`] and crate-local tests compose their recording double, both
+/// [`Gate`] is parameterized over the sink, so the server composes its process
+/// [`AuditStage`] and crate-local tests compose their recording double, both
 /// statically.
 pub trait GateAudit: Send + Sync {
     /// Stages one `bifrost_record:write` decision for `auth` on `resource`.
     fn stage_write_decision(&self, auth: &AuthContext, resource: &str, outcome: AuditOutcome);
 }
 
-impl GateAudit for AuditOutbox {
-    /// Stages the decision on the caller's tenant chain.
+impl<T: AuditStage> GateAudit for T {
+    /// Stages the decision for the caller's tenant.
     ///
     /// The row is attributed to the verified principal — the subject a
     /// delegated token acts for — and, when the token carries a non-empty
@@ -311,7 +315,8 @@ impl GateAudit for AuditOutbox {
 pub trait ObservationAck: Send + Sync {
     /// Accepts one acknowledged `vala.eval.observations` frame.
     ///
-    /// `frame` is the exact Arrow IPC payload Scribe admitted and
+    /// `frame` is the exact Arrow IPC payload Scribe admitted, whose
+    /// `card_uid` values Scribe authorized and stored unchanged, and
     /// `receipt_micros` the receipt instant it stamped on rows without a
     /// caller `wyrd_event_time`.
     fn acknowledged(&self, auth: &AuthContext, frame: bytes::Bytes, receipt_micros: i64);
@@ -332,6 +337,9 @@ pub struct Gate<A: GateAudit + 'static> {
     query: Option<Arc<dyn OracleQueryDispatch>>,
     /// Post-acknowledgement hook for Eval observation frames, when composed.
     observations: Option<Arc<dyn ObservationAck>>,
+    /// Tenant registry resolving unbound writers' Card attribution, when
+    /// composed; without it an unbound writer's `card_uid` is refused.
+    cards: Option<attribution::CardRegistry>,
     /// Non-blocking sink for write-authorization decisions.
     ///
     /// Absent only where no Scribe is attached: a Gate that cannot write also
@@ -358,6 +366,7 @@ impl<A: GateAudit + 'static> Clone for Gate<A> {
             scribe: self.scribe.clone(),
             query: self.query.clone(),
             observations: self.observations.clone(),
+            cards: self.cards.clone(),
             audit: self.audit.clone(),
             limits: self.limits,
             auth: self.auth.clone(),
@@ -413,6 +422,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             scribe: Some(scribe),
             query: None,
             observations: None,
+            cards: None,
             audit: None,
             limits,
             auth,
@@ -432,6 +442,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             scribe: Some(scribe),
             query: None,
             observations: None,
+            cards: None,
             audit: None,
             limits,
             auth,
@@ -451,6 +462,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             scribe: None,
             query: None,
             observations: None,
+            cards: None,
             audit: None,
             limits,
             auth,
@@ -474,6 +486,34 @@ impl<A: GateAudit + 'static> Gate<A> {
     pub fn with_observation_ack(mut self, observations: Arc<dyn ObservationAck>) -> Self {
         self.observations = Some(observations);
         self
+    }
+
+    /// Attaches the tenant registry unbound writers' Card attribution
+    /// resolves against.
+    #[must_use]
+    pub fn with_card_registry(mut self, cards: attribution::CardRegistry) -> Self {
+        self.cards = Some(cards);
+        self
+    }
+
+    /// Resolves the Cards an unbound writer attributes one frame to.
+    ///
+    /// `cards` collects the frame's distinct Card UIDs; it runs only when a
+    /// registry is composed and the principal is unbound. `None` leaves the
+    /// principal's signed scope in force.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry's validation or unavailability error.
+    async fn attributed_cards(
+        &self,
+        auth: &AuthContext,
+        cards: impl FnOnce() -> Vec<wyrd_spec::ids::CardUid>,
+    ) -> Result<Option<Vec<wyrd_spec::ids::CardUid>>, IngestError> {
+        match &self.cards {
+            Some(registry) => registry.attributed_cards(auth, cards).await,
+            None => Ok(None),
+        }
     }
 
     /// Attaches the sink every write decision is staged on.
@@ -783,9 +823,13 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.ensure_open()?;
         self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Traces, "spans"))
             .await?;
+        let attributed = self
+            .attributed_cards(auth, || attribution::span_card_uids(&decoded.request))
+            .await?
+            .or_else(|| auth.principal.card_ref_scope().map(CardRefScope::uids));
         let (batch, outcome) = crate::tables::traces::project_resource_spans(
             &decoded.request.resource_spans,
-            auth.principal.card_ref_scope(),
+            attributed.as_deref(),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("trace", &error))?;
@@ -798,6 +842,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             decoded.wire_bytes,
             batch,
             decoded.owner,
+            attributed,
         )
         .await?;
         Ok(outcome)
@@ -817,9 +862,13 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.ensure_open()?;
         self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Metrics, "points"))
             .await?;
+        let attributed = self
+            .attributed_cards(auth, || attribution::metric_card_uids(&decoded.request))
+            .await?
+            .or_else(|| auth.principal.card_ref_scope().map(CardRefScope::uids));
         let (batch, outcome) = crate::tables::metrics::project_resource_metrics(
             &decoded.request.resource_metrics,
-            auth.principal.card_ref_scope(),
+            attributed.as_deref(),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("metric", &error))?;
@@ -832,6 +881,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             decoded.wire_bytes,
             batch,
             decoded.owner,
+            attributed,
         )
         .await?;
         Ok(outcome)
@@ -851,9 +901,13 @@ impl<A: GateAudit + 'static> Gate<A> {
         self.ensure_open()?;
         self.authorize_record_write(auth, &TableRef::new(BifrostNamespace::Logs, "records"))
             .await?;
+        let attributed = self
+            .attributed_cards(auth, || attribution::log_card_uids(&decoded.request))
+            .await?
+            .or_else(|| auth.principal.card_ref_scope().map(CardRefScope::uids));
         let (batch, outcome) = crate::tables::logs::project_resource_logs(
             &decoded.request.resource_logs,
-            auth.principal.card_ref_scope(),
+            attributed.as_deref(),
             self.limits.expanded_bytes(),
         )
         .map_err(|error| projection_error("log", &error))?;
@@ -866,6 +920,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             decoded.wire_bytes,
             batch,
             decoded.owner,
+            attributed,
         )
         .await?;
         Ok(outcome)
@@ -902,6 +957,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         measured_wire_bytes: usize,
         batch: RecordBatch,
         owner: Option<OtlpDecodeOwner>,
+        attributed_cards: Option<Vec<wyrd_spec::ids::CardUid>>,
     ) -> Result<(), IngestError> {
         self.ensure_open()?;
         if measured_wire_bytes > self.limits.max_frame_bytes {
@@ -923,6 +979,7 @@ impl<A: GateAudit + 'static> Gate<A> {
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
                 authenticated_tenant: auth.tenant,
+                attributed_cards,
                 table,
                 expected_schema_fingerprint: None,
                 request_id: auth.request_id.clone(),
@@ -991,6 +1048,9 @@ impl<A: GateAudit + 'static> Gate<A> {
         }
         let table = TableRef::new(namespace, name);
         self.authorize_record_write(auth, &table).await?;
+        let attributed_cards = self
+            .attributed_cards(auth, || attribution::native_card_uids(&frame.arrow_ipc))
+            .await?;
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let observed = self
             .observations
@@ -1003,6 +1063,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
             authenticated_tenant: auth.tenant,
+            attributed_cards,
             table,
             expected_schema_fingerprint: None,
             request_id: auth.request_id.clone(),
@@ -1505,8 +1566,8 @@ mod tests {
         calls: Arc<AtomicUsize>,
         /// Row count of every canonical batch Gate handed to Scribe, in order.
         rows: Arc<Mutex<Vec<usize>>>,
-        /// `card_ref` value of every handed row, in accepted order.
-        card_refs: Arc<Mutex<Vec<Option<String>>>>,
+        /// `card_uid` value of every handed row, in accepted order.
+        card_uids: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl CountingScribe {
@@ -1515,7 +1576,7 @@ mod tests {
             Self {
                 calls,
                 rows: Arc::new(Mutex::new(Vec::new())),
-                card_refs: Arc::new(Mutex::new(Vec::new())),
+                card_uids: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1548,26 +1609,26 @@ mod tests {
                 .lock()
                 .expect("row log is not poisoned")
                 .extend(canonical.batches.iter().map(RecordBatch::num_rows));
-            let scope = frame.principal.card_ref_scope();
-            let mut handed = self.card_refs.lock().expect("card log is not poisoned");
+            let scope = frame.attributed_cards.as_deref();
+            let mut handed = self.card_uids.lock().expect("card log is not poisoned");
             for batch in &canonical.batches {
                 let column = batch
-                    .column_by_name("card_ref")
+                    .column_by_name("card_uid")
                     .expect("a canonical signal batch carries its correlation column")
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
-                    .expect("card_ref is Utf8");
+                    .expect("card_uid is Utf8");
                 for row in 0..column.len() {
                     if column.is_null(row) {
                         handed.push(None);
                         continue;
                     }
                     let raw = column.value(row);
-                    let card = wyrd_spec::reference::CardRef::from_str(raw)
-                        .expect("Gate must only hand Scribe parseable references");
+                    let uid = wyrd_spec::ids::CardUid::from_str(raw)
+                        .expect("Gate must only hand Scribe parseable UIDs");
                     assert!(
-                        scope.is_some_and(|scope| scope.authorizes(&card)),
-                        "Gate must not hand Scribe a reference outside the signed scope"
+                        scope.is_some_and(|scope| scope.contains(&uid)),
+                        "Gate must not hand Scribe a UID outside the signed scope"
                     );
                     handed.push(Some(raw.to_owned()));
                 }
@@ -1711,16 +1772,21 @@ mod tests {
     /// One authenticated context whose principal carries the shared signed scope.
     ///
     /// Card correlation is only assertable from a signed scope, so a Gate test
-    /// that exercises `wyrd.card_ref` needs a service principal rather than the
+    /// that exercises `wyrd.card_uid` needs a service principal rather than the
     /// plain user `auth_context` builds.
     fn scoped_auth_context() -> AuthContext {
         let tenant = DataTenantId::new_v7();
-        let scope = crate::tables::signal::correlation_fixture::scope();
+        let card = wyrd_spec::reference::CardRef {
+            uid: crate::tables::signal::correlation_fixture::scope().pop(),
+            ..crate::tables::signal::correlation_fixture::REFERENCE_TEXT
+                .parse()
+                .expect("fixture card ref")
+        };
         let principal = Principal::new(
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::Service {
-                card_ref: Some(scope.as_slice()[0].clone()),
-                card_ref_scope: scope,
+                card_ref_scope: wyrd_spec::reference::CardRefScope::own(&card),
+                card_ref: Some(card),
             },
             tenant,
             Vec::new(),
@@ -1734,18 +1800,18 @@ mod tests {
         }
     }
 
-    /// One valid span carrying `card_ref` as its record correlation attribute.
+    /// One valid span carrying `card_uid` as its record correlation attribute.
     fn span_resource_with_card(
         index: u8,
-        card_ref: &str,
+        card_uid: &str,
     ) -> wyrd_tonic::otlp::trace::v1::ResourceSpans {
         let mut resource = span_resource(index, true);
         resource.scope_spans[0].spans[0].attributes =
             vec![wyrd_tonic::otlp::common::v1::KeyValue {
-                key: "wyrd.card_ref".to_owned(),
+                key: "wyrd.card_uid".to_owned(),
                 value: Some(wyrd_tonic::otlp::common::v1::AnyValue {
                     value: Some(wyrd_tonic::otlp::common::v1::any_value::Value::StringValue(
-                        card_ref.to_owned(),
+                        card_uid.to_owned(),
                     )),
                 }),
             }];
@@ -2009,12 +2075,11 @@ mod tests {
     ///
     /// Scribe receives one canonical batch whose row count equals the accepted
     /// span count, so the ordinals it stamps form one contiguous range starting
-    /// at zero with no gap left by a rejected span. A span whose `wyrd.card_ref`
-    /// lies outside the principal's signed scope, or names a signed member the
-    /// mint left without a UID, is one more rejected sibling rather than a
+    /// at zero with no gap left by a rejected span. A span whose `wyrd.card_uid`
+    /// lies outside the principal's signed scope, or carries a Card reference
+    /// instead of a UID, is one more rejected sibling rather than a
     /// whole-request refusal: its valid siblings still store, and the returned
-    /// partial-success counts stay exact. Scribe stamps `card_uid` from the
-    /// matching signed member alone, which its own resolution tests pin.
+    /// partial-success counts stay exact.
     #[tokio::test]
     async fn mixed_otlp_projection_assigns_only_accepted_contiguous_ordinals() {
         use crate::tables::signal::correlation_fixture;
@@ -2022,7 +2087,7 @@ mod tests {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         let scribe = Arc::new(CountingScribe::new(Arc::clone(&scribe_calls)));
         let rows = Arc::clone(&scribe.rows);
-        let card_refs = Arc::clone(&scribe.card_refs);
+        let card_uids = Arc::clone(&scribe.card_uids);
         let gate = Gate::<RecordingAudit>::with_test_scribe(
             scribe,
             test_interceptor(),
@@ -2039,7 +2104,7 @@ mod tests {
                         span_resource(2, false),
                         span_resource_with_card(3, correlation_fixture::IN_SCOPE),
                         span_resource_with_card(4, correlation_fixture::OUT_OF_SCOPE),
-                        span_resource_with_card(5, correlation_fixture::WITHOUT_UID),
+                        span_resource_with_card(5, correlation_fixture::REFERENCE_TEXT),
                         span_resource(6, true),
                     ],
                 }),
@@ -2050,13 +2115,13 @@ mod tests {
         assert_eq!(
             (outcome.accepted_spans, outcome.rejected_spans),
             (3, 3),
-            "an unauthorized reference rejects only its own span"
+            "an unauthorized correlation rejects only its own span"
         );
         assert!(outcome.rejection_message.is_some());
         assert_eq!(scribe_calls.load(Ordering::Relaxed), 1);
         assert_eq!(*rows.lock().expect("row log is not poisoned"), vec![3]);
         assert_eq!(
-            *card_refs.lock().expect("card log is not poisoned"),
+            *card_uids.lock().expect("card log is not poisoned"),
             vec![None, Some(correlation_fixture::IN_SCOPE.to_owned()), None,],
             "only accepted rows reach Scribe, in request order"
         );

@@ -147,7 +147,7 @@ impl<'a> QueryAuthority<'a> {
 
     /// Stages one decision row for this operation on the process audit outbox.
     fn stage(&self, outcome: AuditOutcome) {
-        self.state.audit_outbox.stage(
+        self.state.scribe_outbox.stage(
             self.caller.data_tenant_id,
             audit::audit_event(
                 self.caller,

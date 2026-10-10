@@ -179,26 +179,6 @@ mod pg_tests {
             row.0
         }
 
-        /// Counts audit rows for one tenant through a tenant transaction.
-        ///
-        /// # Panics
-        ///
-        /// Panics when the fixture cannot acquire, query, or commit the tenant
-        /// transaction.
-        async fn count_audit(pool: &PgPool, tenant: DataTenantId) -> i64 {
-            let mut conn = TenantConn::acquire(pool, tenant)
-                .await
-                .expect("tenant connection for audit count");
-            let row: (i64,) =
-                sqlx::query_as("SELECT count(*) FROM vala.audit_staging WHERE data_tenant_id = $1")
-                    .bind(tenant.as_uuid())
-                    .fetch_one(&mut **conn.transaction())
-                    .await
-                    .expect("audit count query");
-            conn.commit().await.expect("audit count commit");
-            row.0
-        }
-
         /// Minimal persisted state used to assert transition and rollback effects.
         #[derive(Debug, PartialEq, Eq)]
         struct StateSnapshot {
@@ -636,11 +616,6 @@ mod pg_tests {
                 3,
                 "one resource carries one durable row per attempt identity"
             );
-            assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
         }
 
         // -----------------------------------------------------------------------
@@ -754,11 +729,6 @@ mod pg_tests {
                 }
             );
             assert_eq!(count_state(pool, tenant).await, 1);
-            assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
         }
 
         // -----------------------------------------------------------------------
@@ -836,11 +806,6 @@ mod pg_tests {
                 }
             );
             assert_eq!(count_state(pool, tenant).await, 1);
-            assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
         }
 
         // -----------------------------------------------------------------------
@@ -910,11 +875,6 @@ mod pg_tests {
                 ));
             }
             assert_eq!(count_state(pool, tenant).await, 2);
-            assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
         }
 
         // -----------------------------------------------------------------------
@@ -955,8 +915,8 @@ mod pg_tests {
         /// fence and lineage contract as every other Forge family.
         ///
         /// A Prepared row persists, the Committed transition persists the
-        /// promotion snapshot, and neither evaluates a principal permission, so
-        /// neither appends audit. The negative arms prove the fence is real
+        /// promotion snapshot, and neither evaluates a principal permission.
+        /// The negative arms prove the fence is real
         /// rather than incidental: a promotion detail presented under the wrong
         /// family, a terminal event whose digest no longer matches the prepared
         /// file set, and an event carrying no typed detail at all each fail
@@ -1073,22 +1033,15 @@ mod pg_tests {
             );
 
             assert_eq!(count_state(pool, tenant).await, 1);
-            assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
         }
 
         // -----------------------------------------------------------------------
         // Self-contained operation state
         // -----------------------------------------------------------------------
 
-        /// Seeds one `vala.forge_operation_state` row directly, with no staged
-        /// audit row of any kind.
+        /// Seeds one `vala.forge_operation_state` row directly.
         ///
-        /// Forge transitions evaluate no principal permission and therefore
-        /// append no audit. This helper reproduces the state a Forge worker
+        /// This helper reproduces the state a Forge worker
         /// legitimately restarts into, which no public writer can otherwise
         /// create.
         ///
@@ -1134,10 +1087,8 @@ mod pg_tests {
         ///
         /// Orphan collection is the one destructive family whose recovery
         /// authority is reached only through this projection: an orphan batch
-        /// leaves no catalog trace, so a reader that needed a staged audit row
-        /// to still exist would lose the batch whenever delivery was relayed or
-        /// pruned away. This proves the family lists, settles, and snapshots on
-        /// its own durable state, and that no transition appends audit.
+        /// leaves no catalog trace. This proves the family lists, settles, and
+        /// snapshots on its own durable state.
         ///
         /// # Panics
         ///
@@ -1204,11 +1155,6 @@ mod pg_tests {
                     panic!("expected terminal application, got {other:?}")
                 }
             };
-            assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
             assert_eq!(
                 state_snapshot(pool, tenant, ForgeOperationFamily::OrphanGc, operation_id).await,
                 StateSnapshot {
@@ -1464,14 +1410,12 @@ mod pg_tests {
         ///
         /// `vala.forge_operation_state` is the sole Forge recovery authority:
         /// it stores the complete typed prepared and current details. Forge
-        /// transitions evaluate no principal permission, so they append no
-        /// audit, and recovery must never depend on `vala.audit_staging`, which
-        /// is transient write-ahead state with its own retention.
+        /// transitions evaluate no principal permission, so they record no
+        /// audit, and recovery depends on nothing outside this projection.
         ///
-        /// The seeded rows carry complete valid state with no staged audit row.
-        /// Reads, Prepared replay, and terminal settlement must all succeed on
-        /// that state alone, none of them may append audit, and contradictory
-        /// stored state must still fail closed.
+        /// The seeded rows carry complete valid state and nothing else. Reads,
+        /// Prepared replay, and terminal settlement must all succeed on that
+        /// state alone, and contradictory stored state must still fail closed.
         ///
         /// # Panics
         ///
@@ -1525,12 +1469,6 @@ mod pg_tests {
             )
             .await;
 
-            assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
-
             let open = list_open(pool, tenant, ForgeOperationFamily::SnapshotExpire)
                 .await
                 .expect("open listing must not require an audit delivery row");
@@ -1573,11 +1511,6 @@ mod pg_tests {
                 matches!(replay, ForgeOperationTransition::AlreadyApplied),
                 "Prepared replay returns the stored prepared sequence, got {replay:?}"
             );
-            assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
 
             // Terminal settlement writes lineage only.
             let committed_event = event(
@@ -1605,11 +1538,6 @@ mod pg_tests {
                 }
             };
             assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
-            assert_eq!(
                 state_snapshot(
                     pool,
                     tenant,
@@ -1635,11 +1563,6 @@ mod pg_tests {
             assert!(
                 matches!(terminal_replay, ForgeOperationTransition::AlreadyApplied),
                 "terminal replay returns the stored terminal sequence, got {terminal_replay:?}"
-            );
-            assert_eq!(
-                count_audit(pool, tenant).await,
-                0,
-                "Forge transitions append no audit"
             );
 
             assert_orphan_gc_recovery_is_outbox_independent(pool, tenant).await;
@@ -1833,18 +1756,16 @@ mod pg_tests {
         ///
         /// Captured as one tuple so a corruption case can compare the complete
         /// state before and after the refusal instead of asserting each fact
-        /// separately: total claim rows, the operation phase, the task state,
-        /// and the audit chain length.
+        /// separately: total claim rows, the operation phase, and the task state.
         ///
         /// # Panics
         ///
         /// Panics when any inspection query fails.
         async fn durable_expiration_state(
             superuser: &PgPool,
-            tenant: DataTenantId,
             operation_id: Uuid,
             task_id: Uuid,
-        ) -> (i64, Option<String>, String, i64) {
+        ) -> (i64, Option<String>, String) {
             let claims: i64 =
                 sqlx::query_scalar("SELECT count(*) FROM vala.forge_snapshot_expiration_claims")
                     .fetch_one(superuser)
@@ -1857,12 +1778,7 @@ mod pg_tests {
             .fetch_optional(superuser)
             .await
             .expect("operation phase");
-            (
-                claims,
-                phase,
-                task_state_of(superuser, task_id).await,
-                count_audit(superuser, tenant).await,
-            )
+            (claims, phase, task_state_of(superuser, task_id).await)
         }
 
         /// Proves the claim table matches its migration and that preparation,
@@ -2000,11 +1916,6 @@ mod pg_tests {
                 "prepared",
                 "task advanced with the claims"
             );
-            assert_eq!(
-                count_audit(&superuser, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
 
             // Replaying the identical preparation writes nothing.
             let replay = prepare_expiration_exclusively(
@@ -2019,11 +1930,6 @@ mod pg_tests {
             assert!(
                 matches!(replay, ForgeOperationTransition::AlreadyApplied),
                 "identical preparation replay is idempotent: {replay:?}"
-            );
-            assert_eq!(
-                count_audit(&superuser, tenant).await,
-                0,
-                "Forge transitions append no audit"
             );
 
             // A second table-local operation cannot claim the same snapshot.
@@ -2095,11 +2001,6 @@ mod pg_tests {
                 ForgeExpirationResetOutcome::AlreadyApplied,
                 "identical reset replay writes nothing"
             );
-            assert_eq!(
-                count_audit(&superuser, tenant).await,
-                0,
-                "Forge transitions append no audit"
-            );
 
             // --- settlement resolves a fresh preparation -------------------
             let settle_authority = ForgeExpirationAuthority {
@@ -2168,8 +2069,7 @@ mod pg_tests {
             // Claim rows are immutable historical evidence. A takeover changes
             // current execution authority, never preparation identity, so any
             // divergence must refuse reconciliation input, reset, and
-            // settlement without touching claims, operation state, the task,
-            // or the audit chain.
+            // settlement without touching claims, operation state, or the task.
             let settle_reset_request = ForgeExpirationResetRequest {
                 authority: &settle_authority,
                 table: &table,
@@ -2344,7 +2244,6 @@ mod pg_tests {
                     .unwrap_or_else(|error| panic!("corrupt {label}: {error}"));
                 let before = durable_expiration_state(
                     &superuser,
-                    tenant,
                     settle_operation,
                     settle_authority.task_id,
                 )
@@ -2381,13 +2280,12 @@ mod pg_tests {
                 assert_eq!(
                     durable_expiration_state(
                         &superuser,
-                        tenant,
                         settle_operation,
                         settle_authority.task_id,
                     )
                     .await,
                     before,
-                    "a refused {label} leaves claims, operation, task, and audit unchanged"
+                    "a refused {label} leaves claims, operation, and task unchanged"
                 );
 
                 sqlx::query(AssertSqlSafe(restore.as_str()))

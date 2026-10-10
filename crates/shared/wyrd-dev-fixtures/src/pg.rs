@@ -206,46 +206,6 @@ impl PgFixture {
         Ok((wyrd, vala))
     }
 
-    /// Makes every insert into `vala.audit_staging` fail until
-    /// [`Self::restore_audit_staging`].
-    ///
-    /// Audit outbox tests use this to stand in for an unavailable database:
-    /// each attempt to commit staged audit fails and is retried, while the rest
-    /// of the database keeps serving the audited operation itself.
-    ///
-    /// # Errors
-    /// Returns [`FixtureError`] when the trigger cannot be installed.
-    pub async fn fail_audit_staging(&self) -> Result<(), FixtureError> {
-        sqlx::raw_sql(
-            r"CREATE OR REPLACE FUNCTION vala.test_fail_audit_staging()
-               RETURNS trigger LANGUAGE plpgsql AS $$
-               BEGIN
-                 RAISE EXCEPTION 'injected audit staging failure';
-               END;
-               $$;
-             CREATE TRIGGER test_fail_audit_staging
-               BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_audit_staging();",
-        )
-        .execute(&self.assertion_pool)
-        .await
-        .map_err(SqlError::from)?;
-        Ok(())
-    }
-
-    /// Lets inserts into `vala.audit_staging` succeed again after
-    /// [`Self::fail_audit_staging`].
-    ///
-    /// # Errors
-    /// Returns [`FixtureError`] when the trigger cannot be dropped.
-    pub async fn restore_audit_staging(&self) -> Result<(), FixtureError> {
-        sqlx::raw_sql("DROP TRIGGER IF EXISTS test_fail_audit_staging ON vala.audit_staging")
-            .execute(&self.assertion_pool)
-            .await
-            .map_err(SqlError::from)?;
-        Ok(())
-    }
-
     /// Borrow the runtime `wyrd_app` pool.
     #[must_use]
     pub fn app_pool(&self) -> &PgPool {

@@ -1,6 +1,27 @@
 from typing import Literal, TypedDict
 
+import httpx
+import httpx2
+
 from ..client import WyrdClient
+
+class GatewayAuth(httpx.Auth, httpx2.Auth):
+    """Authenticate a stock ``httpx`` or ``httpx2`` client to the Wyrd Gateway.
+
+    The OpenAI and Anthropic SDKs build on ``httpx2`` and google-genai on
+    ``httpx``; one instance serves either. Each request carries
+    ``Authorization: Bearer <token>`` from ``client.access_token()``, asked for
+    on that request, so a long-lived client keeps working after any one access
+    token expires. Needs the ``gateway`` extra (``pip install 'wyrd[gateway]'``).
+    """
+
+    def __init__(self, client: WyrdClient) -> None:
+        """Authenticate as ``client``.
+
+        Args:
+            client: The client whose access token every request carries.
+        """
+        ...
 
 GatewayOperation = Literal[
     "chat_completions", "responses", "embeddings", "images", "audio", "batches"
@@ -584,6 +605,7 @@ __all__ = [
     "FallbackRule",
     "FallbackScope",
     "Gateway",
+    "GatewayAuth",
     "GatewayBudget",
     "GatewayBudgetPeriod",
     "GatewayCaptureMode",

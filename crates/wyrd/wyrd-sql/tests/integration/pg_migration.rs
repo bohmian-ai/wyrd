@@ -574,7 +574,7 @@ mod pg_tests {
                 "https://legacy-idp.example.com/roles",
                 "SecretBasic",
                 Some(secret),
-                serde_json::json!(["writer"]),
+                serde_json::json!(["editor"]),
             )
             .await;
             assert_preflight_refuses(pool, tenant, secret, "default roles").await;
@@ -696,8 +696,8 @@ mod pg_tests {
         assert_regclass_exists(pool, "platform.principals", true).await;
         assert_regclass_exists(pool, "platform.credentials", true).await;
         assert_regclass_exists(pool, "platform.principal_grants", true).await;
-        // The greenfield baseline has one audit authority: the tenant
-        // `vala.audit_staging` chain published into `vala.system.audit_log`.
+        // The greenfield baseline has one audit authority: the tenant's
+        // retained Bifrost table `vala.system.audit_log`.
         assert_regclass_exists(pool, "platform.audit_log", false).await;
         assert_regclass_exists(pool, "wyrd.auth_users", true).await;
         assert_regclass_exists(pool, "wyrd.auth_user_identities", true).await;

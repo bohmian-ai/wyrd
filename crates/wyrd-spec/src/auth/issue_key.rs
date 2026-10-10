@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::SecretBearer;
+use crate::auth::{PrincipalId, SecretBearer};
 use crate::reference::CardRef;
 
 /// Body of `POST /auth/issue-key`.
@@ -30,6 +30,9 @@ pub struct IssueKeyResponse {
     /// Credential id of the issued API key; the same UUID the credential
     /// list, revoke path, and audit rows name.
     pub key_id: Uuid,
+    /// Principal the key authenticates: the Card's projected Service or Agent
+    /// principal, the id its Role assignments are addressed by.
+    pub principal_id: PrincipalId,
     /// Plaintext API key, returned exactly once.
     pub key: SecretBearer,
     /// Log-safe prefix used for lookup.

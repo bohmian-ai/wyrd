@@ -215,13 +215,11 @@ impl CloseoutJourney {
         let profile = GeometryProfile::selected();
         // The one worker drains only the journey's tables, so the tenant's audit
         // table cannot take a slot a geometry or competing-table plan is owed.
-        let mut spec = BifrostClusterSpec::dedicated_forge_workers()
-            .with_scribe_geometry_for_test(
-                vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
-                    .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
-                    .expect("the selected staging target is a valid geometry"),
-            )
-            .without_audit_publication_for_test();
+        let mut spec = BifrostClusterSpec::dedicated_forge_workers().with_scribe_geometry_for_test(
+            vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
+                .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
+                .expect("the selected staging target is a valid geometry"),
+        );
         let coordinator_node = spec.nodes[3].node_id;
         let scribe_node = spec.nodes[0].node_id;
         let oracle_node = spec.nodes[2].node_id;
@@ -2357,11 +2355,24 @@ impl LeaderJourney {
         })
         .await
         .expect("hot objects are promoted by a coordinator");
-        assert!(
-            self.observer.returned_errors().is_empty(),
-            "{:?}",
-            self.observer.returned_errors()
-        );
+        let failures = self.failures();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// Returns every attempt error except a stopping node's pre-effect
+    /// [`ForgeError::Shutdown`].
+    ///
+    /// A node the journey stops seals the tenant's `audit_log` rows during its
+    /// drain, so it can be promoting that table as it stops. The attempt it
+    /// abandons before any durable effect is released for a successor, which
+    /// is a clean stop rather than a failure.
+    fn failures(&self) -> Vec<String> {
+        let shutdown = ForgeError::Shutdown.to_string();
+        self.observer
+            .returned_errors()
+            .into_iter()
+            .filter(|error| *error != shutdown)
+            .collect()
     }
 
     /// Builds the leader's key for one journey table.
@@ -2369,12 +2380,20 @@ impl LeaderJourney {
     /// # Panics
     /// Panics if the journey table name is not a valid Forge table identity.
     fn key(&self, table: &JourneyTable) -> ForgeTableKey {
+        self.key_in(BifrostNamespace::Datasets, &table.name)
+    }
+
+    /// Builds the leader's key for one table of the journey tenant.
+    ///
+    /// # Panics
+    /// Panics if the name is not a valid Forge table identity.
+    fn key_in(&self, namespace: BifrostNamespace, name: &str) -> ForgeTableKey {
         ForgeTableKey {
             tenant: self.tenant,
             table: vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
                 vala_bifrost_redux::catalog::BIFROST_CATALOG_NAME,
-                BifrostNamespace::Datasets.as_str(),
-                &table.name,
+                namespace.as_str(),
+                name,
             )
             .expect("table identity"),
         }
@@ -2440,10 +2459,22 @@ async fn one_leader_failover_volatile_state() {
         successor.fencing_token() > first_token,
         "a new term is minted"
     );
+    // The stopped leader drained its audit rows, so the successor may already
+    // track the audit table from a commit it observed itself; nothing else.
+    assert!(
+        successor.schedule().track_for_test(&key).is_none(),
+        "the successor inherits no pending count"
+    );
+    let audit = usize::from(
+        successor
+            .schedule()
+            .track_for_test(&journey.key_in(BifrostNamespace::Audit, "audit_log"))
+            .is_some(),
+    );
     assert_eq!(
         successor.schedule().sizes_for_test(),
-        (0, 0, 0),
-        "the successor starts with no tracks or maintenance membership"
+        (audit, audit, 0),
+        "the successor starts with no inherited tracks or maintenance membership"
     );
 
     // The successor counts only commits it observes, through the local route.
@@ -2710,8 +2741,7 @@ async fn revoked_term_stops_promotion_dispatch_and_maintenance() {
 #[tokio::test]
 #[ignore = "requires Postgres and two replicas"]
 async fn restart_recovers_hot_promotion_with_empty_schedule() {
-    // The tenant's audit table would otherwise join the recovered membership.
-    let mut spec = BifrostClusterSpec::two_mixed().without_audit_publication_for_test();
+    let mut spec = BifrostClusterSpec::two_mixed();
     spec.nodes[1].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
     let (leader, scribe) = (spec.nodes[0].node_id, spec.nodes[1].node_id);
     let mut journey = LeaderJourney::start(spec, false).await;
@@ -2774,10 +2804,17 @@ async fn restart_recovers_hot_promotion_with_empty_schedule() {
         Some(1),
         "the recovered promotion is the only counted commit"
     );
+    // The stopping leader's drain sealed the tenant's audit_log rows, so the
+    // new term's sweep may promote that debt too; it uses no rewrite setting.
+    let audit = usize::from(
+        term.schedule()
+            .track_for_test(&journey.key_in(BifrostNamespace::Audit, "audit_log"))
+            .is_some(),
+    );
     assert_eq!(
         term.schedule().sizes_for_test(),
-        (1, 1, 1),
-        "membership holds only the recovered table"
+        (1 + audit, 1 + audit, 1),
+        "membership holds only the recovered table and the audit debt it swept"
     );
     journey.cluster.shutdown().await.expect("cluster drains");
 }
@@ -2947,11 +2984,8 @@ async fn empty_maintenance_restart_protects_orphans() {
     .await
     .expect("forge_tasks inspection");
     assert_eq!(unsettled, 0, "every maintenance attempt settled");
-    assert!(
-        journey.observer.returned_errors().is_empty(),
-        "{:?}",
-        journey.observer.returned_errors()
-    );
+    let failures = journey.failures();
+    assert!(failures.is_empty(), "{failures:?}");
     journey.cluster.shutdown().await.expect("cluster drains");
 }
 
@@ -3147,10 +3181,7 @@ async fn compactors_pull_oldest_due_with_capacity() {
         2,
         "both replicas' workers executed pulled work"
     );
-    assert!(
-        journey.observer.returned_errors().is_empty(),
-        "{:?}",
-        journey.observer.returned_errors()
-    );
+    let failures = journey.failures();
+    assert!(failures.is_empty(), "{failures:?}");
     journey.cluster.shutdown().await.expect("cluster drains");
 }

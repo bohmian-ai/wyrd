@@ -135,33 +135,37 @@ async fn stored_row(
     row
 }
 
-/// `principal`'s decisions for `operation` as (permission, outcome).
+/// `principal`'s retained decisions for `operation` as (permission,
+/// outcome), sorted by outcome, once every decision staged so far is retained.
 ///
 /// # Panics
-/// Panics when the audit rows cannot be read.
+/// Panics when audit retention does not settle or the audit rows cannot be read.
 async fn decisions(
     server: &WyrdTestServer,
     principal: Uuid,
     operation: &str,
 ) -> Vec<(String, String)> {
     server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        .await_audit_retained()
         .await
-        .expect("audit outbox settles");
-    let mut conn = server
-        .tenant_conn_for(server.data_tenant_id())
+        .expect("audit retention settles");
+    let mut rows: Vec<(String, String)> = server
+        .retained_audit_records(
+            server.data_tenant_id(),
+            "permission, outcome",
+            &format!("operation = '{operation}' AND audit_principal_id = '{principal}'"),
+        )
         .await
-        .expect("tenant connection opens");
-    let rows = sqlx::query_as(
-        "SELECT permission, outcome FROM vala.audit_staging \
-          WHERE operation = $1 AND principal_id = $2 ORDER BY outcome",
-    )
-    .bind(operation)
-    .bind(principal)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("audit rows read");
-    conn.commit().await.expect("audit read commits");
+        .expect("audit rows read")
+        .into_iter()
+        .map(|row| {
+            (
+                row[0].clone().unwrap_or_default(),
+                row[1].clone().unwrap_or_default(),
+            )
+        })
+        .collect();
+    rows.sort_by(|left, right| left.1.cmp(&right.1));
     rows
 }
 
@@ -487,11 +491,17 @@ async fn read_write_separation_and_tenant_isolation() {
         vec![("operators:read".to_owned(), "allowed".to_owned())]
     );
 
-    let (_, writer) = user(&server, "oc-writer", &["writer"]).await;
+    custom_role(
+        &server,
+        "cards_reader",
+        json!([{ "resource": "cards", "action": "read", "scope": "all" }]),
+    )
+    .await;
+    let (_, outsider) = user(&server, "oc-outsider", &["cards_reader"]).await;
     assert_eq!(
         call(
             &server,
-            &writer,
+            &outsider,
             Method::GET,
             "/v1/operator-connections",
             None
@@ -503,7 +513,7 @@ async fn read_write_separation_and_tenant_isolation() {
     assert_eq!(
         call(
             &server,
-            &writer,
+            &outsider,
             Method::POST,
             "/v1/operator-connections",
             Some(&creates()[0])

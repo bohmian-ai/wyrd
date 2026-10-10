@@ -138,7 +138,7 @@ def test_openai_client_receives_stable_refusals_without_dispatch_or_leakage(
     server, upstream = backends
     token = server.access_token()
     client = openai_client(server, token)
-    reader = access_token(server, server.bootstrap_service(["reader"], name="openai-reader"))
+    reader = access_token(server, server.bootstrap_service(["viewer"], name="openai-reader"))
 
     with pytest.raises(openai.PermissionDeniedError) as denied:
         openai_client(server, reader).chat.completions.create(

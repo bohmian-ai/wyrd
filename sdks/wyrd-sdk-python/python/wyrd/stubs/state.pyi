@@ -197,6 +197,23 @@ class WyrdState:
         """
         ...
 
+    def start_telemetry(self) -> None:
+        """Install the global tracer provider exporting spans as this state's client.
+
+        Spans export through the stock OTLP/HTTP exporter, which asks the
+        client for a fresh access token on every export; spans started inside
+        ``with state.run(...)`` carry that Run and Card. A second call is
+        idempotent, and ``shutdown`` flushes only the provider installed here.
+        Needs the ``otel`` extra.
+
+        Raises:
+            WyrdError: ``WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS`` when the
+                application already installed its own tracer provider; add
+                ``wyrd.otel.span_exporter`` to it instead.
+            ImportError: naming the ``otel`` extra when it is not installed.
+        """
+        ...
+
     def run(self, alias: str | None = None) -> Run:
         """Open one invocation whose first view observes ``alias``.
 
@@ -238,7 +255,8 @@ class WyrdState:
         abrupt exit before this returns can lose pending rows. After an
         ambiguous failure, retry ``shutdown()`` on the same state rather than
         replacing the writer. A successfully shut-down state stays closed;
-        create a new ``WyrdState`` to start again.
+        create a new ``WyrdState`` to start again. A tracer provider
+        ``start_telemetry`` installed is flushed first.
 
         Raises:
             WyrdError: The first producer or sink failure from the drain.

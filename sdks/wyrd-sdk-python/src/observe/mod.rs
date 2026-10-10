@@ -197,10 +197,10 @@ impl PyRun {
 
     /// Enter this view's ambient OpenTelemetry span correlation.
     ///
-    /// Delegates to `wyrd.otel`, which pushes this view's exact `CardRef` and
+    /// Delegates to `wyrd.otel`, which pushes this view's exact Card UID and
     /// `run_id` onto the scope stack held in Python's execution-local
     /// OpenTelemetry context value, stamps an already-active recording span
-    /// that does not yet carry `wyrd.card_ref`, and ensures the global provider
+    /// that does not yet carry `wyrd.card_uid`, and ensures the global provider
     /// has the Wyrd span processor. No scope state is stored on this immutable
     /// view, so one run may be entered by nested or concurrent scopes.
     /// Telemetry is optional: any failure, including a missing `opentelemetry`
@@ -211,7 +211,10 @@ impl PyRun {
         let _ = slf.py().import("wyrd.otel").and_then(|otel| {
             otel.call_method1(
                 "_enter_run",
-                (run.inner.subject().to_string(), run.inner.run_id().as_str()),
+                (
+                    run.inner.subject_uid().as_str(),
+                    run.inner.run_id().as_str(),
+                ),
             )
         });
         slf
@@ -219,7 +222,7 @@ impl PyRun {
 
     /// Restore the correlation that was ambient before the matching entry.
     ///
-    /// Passes this view's `CardRef` and `run_id` to `wyrd.otel`, which pops the
+    /// Passes this view's subject Card UID and `run_id` to `wyrd.otel`, which pops the
     /// current execution context's innermost scope only when it equals that
     /// pair; a mismatched or failing exit changes nothing. Failures are
     /// swallowed, and the method always returns `False` so an exception raised
@@ -239,10 +242,39 @@ impl PyRun {
         let _ = slf.py().import("wyrd.otel").and_then(|otel| {
             otel.call_method1(
                 "_exit_run",
-                (run.inner.subject().to_string(), run.inner.run_id().as_str()),
+                (
+                    run.inner.subject_uid().as_str(),
+                    run.inner.run_id().as_str(),
+                ),
             )
         });
         false
+    }
+
+    /// Invoke this view's tool-free Agent once through the Wyrd gateway with
+    /// string `variables` and return its final text.
+    ///
+    /// The call carries this run and the Agent Card as gateway correlation;
+    /// the GIL is released while it runs.
+    ///
+    /// # Errors
+    /// Raises `WYRD_SDK_400_CARD_KIND_MISMATCH` when this view is not an
+    /// Agent and `WYRD_AGENT_422_VALIDATION` for an Agent with tools or a
+    /// non-gateway Prompt model, both before any IO; otherwise the gateway's
+    /// own refusal, such as `WYRD_PERMISSION_403_DENIED_RBAC`.
+    #[pyo3(signature = (variables=None))]
+    fn invoke(
+        &self,
+        py: Python<'_>,
+        variables: Option<std::collections::BTreeMap<String, String>>,
+    ) -> WyrdPyResult<String> {
+        let variables = variables.unwrap_or_default();
+        let pairs: Vec<(&str, &str)> = variables
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        py.detach(|| wyrd_runtime::runtime().block_on(self.inner.invoke(&pairs)))
+            .map_err(WyrdPyError::from)
     }
 
     /// The emit surface for this view.
@@ -454,7 +486,8 @@ impl PyJudgment {
         &self.inner.summary
     }
 
-    /// Count-only rollup of the judgment as its wire mapping.
+    /// Count-only rollup of a Drift or Eval judgment as its wire mapping;
+    /// `None` for a task Verifier.
     ///
     /// # Errors
     /// Raises an internal error when the rollup cannot be converted.
@@ -466,7 +499,8 @@ impl PyJudgment {
         )?)
     }
 
-    /// The engine report as its wire mapping: `{"drift": ...}` or `{"eval": ...}`.
+    /// The engine report as its wire mapping: `{"drift": ...}`, `{"eval": ...}`,
+    /// or `{"task": {"result": ...}}`.
     ///
     /// # Errors
     /// Raises an internal error when the report cannot be converted.

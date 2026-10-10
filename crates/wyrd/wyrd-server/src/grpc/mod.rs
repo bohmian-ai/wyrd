@@ -12,7 +12,7 @@ pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
-mod capture_peer;
+pub(crate) mod capture_peer;
 mod forge_peer;
 mod otlp;
 #[cfg(debug_assertions)]
@@ -428,8 +428,11 @@ pub fn build_peer_grpc(
                 transport.clone(),
             ))
             .add_service(GrpcTransportAdmissionService::new_peer(
+                // A peer outbox frame is bounded by the same configured
+                // request ceiling as public ingest, not tonic's default.
                 capture_peer::ScribeCapturePeerGrpc::new(Arc::clone(scribe.scribe()) as _)
-                    .into_server(),
+                    .into_server()
+                    .max_decoding_message_size(transport.message_limit_bytes()),
                 transport.clone(),
             )),
         None => router,

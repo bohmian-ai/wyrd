@@ -183,7 +183,7 @@ fn invocable(caller: &Caller) -> Option<(Vec<String>, Vec<String>)> {
             PermissionScope::Gateway(GatewayAccess::Model { provider, model }) => {
                 models.push(format!("{}/{}", provider.as_str(), model.as_str()));
             }
-            PermissionScope::Bifrost(_) => {}
+            PermissionScope::Bifrost(_) | PermissionScope::Verifier(_) => {}
         }
     }
     Some((providers, models))
@@ -209,6 +209,7 @@ fn request(
         stream: false,
         usage_bound: None,
         timeout: BATCH_CALL_TIMEOUT,
+        subject: None,
     }
 }
 

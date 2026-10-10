@@ -24,11 +24,13 @@ const {
   openWyrdState,
   tableConfigFromArrowIpc,
   tableConfigFromJsonSchema,
+  telemetryProviderExists,
   workflowFromYaml,
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
 type NativeCards = import("../index.cjs").NativeCards;
 type NativeOperatorConnections = import("../index.cjs").NativeOperatorConnections;
+type NativePrincipals = import("../index.cjs").NativePrincipals;
 type NativeGateway = import("../index.cjs").NativeGateway;
 type NativeWyrdClient = import("../index.cjs").NativeWyrdClient;
 type NativeWyrdState = import("../index.cjs").NativeWyrdState;
@@ -507,7 +509,7 @@ export interface TableLayout {
 
 /** Optional per-row correlation; an omitted field is a null on the wire. */
 export interface Correlation {
-  cardRef?: string;
+  cardUid?: string;
   runId?: string;
 }
 
@@ -899,12 +901,12 @@ export class Bifrost {
    * saturated queue throws the stable refusal rather than dropping the row.
    *
    * @param row - One row object matching the active table's columns.
-   * @param correlation - Optional `cardRef` and `runId` stamped on the row.
+   * @param correlation - Optional `cardUid` and `runId` stamped on the row.
    * @throws {@link WyrdError} with no active table, for a malformed
-   * `cardRef`, or when the queue is full.
+   * `cardUid`, or when the queue is full.
    */
   insert(row: Readonly<Record<string, unknown>>, correlation: Correlation = {}): void {
-    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardRef, correlation.runId));
+    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardUid, correlation.runId));
   }
 
   /**
@@ -1204,11 +1206,11 @@ export type TokenAudience = "wyrd" | "bifrost";
  * @param schema - The table's JSON Schema, or a schema that emits one, mapped
  * to the Arrow schema of the row.
  * @param row - One row object matching `schema`.
- * @param correlation - Optional `cardRef` and `runId` stamped on the row;
+ * @param correlation - Optional `cardUid` and `runId` stamped on the row;
  * omitted, the row is uncorrelated.
  * @throws {@link WyrdError} `WYRD_VALA_400_SCHEMA_PARSE` for a schema that
  * does not map to Arrow, or `WYRD_SPEC_400_VALIDATION` for unparsable schema
- * text or a malformed `cardRef`.
+ * text or a malformed `cardUid`.
  */
 export function record(
   bifrost: Bifrost,
@@ -1222,7 +1224,7 @@ export function record(
       table,
       jsonSchemaText(schema),
       JSON.stringify(row),
-      correlation.cardRef,
+      correlation.cardUid,
       correlation.runId,
     ),
   );
@@ -1265,6 +1267,11 @@ export class WyrdClient {
 
   private constructor(native: NativeWyrdClient) {
     this.#native = native;
+  }
+
+  /** @internal Wrap a native client another handle resolved, such as a state's. */
+  static fromNative(native: NativeWyrdClient): WyrdClient {
+    return new WyrdClient(native);
   }
 
   /**
@@ -1700,10 +1707,13 @@ export interface Judgment {
     | "eval_assertion"
     | "eval_llm_judge"
     | "eval_other"
+    | "task_assertion"
+    | "task_llm_judge"
     | "unknown";
   readonly verdict: "passed" | "failed" | "inconclusive";
   readonly summary: string;
-  readonly counts:
+  /** Count-only rollup of a Drift or Eval judgment; absent for a task Verifier. */
+  readonly counts?:
     | { readonly implementation: "drift"; readonly drifted_features: number; readonly total_features: number }
     | {
         readonly implementation: "eval";
@@ -1712,8 +1722,8 @@ export interface Judgment {
         readonly total_tasks: number;
         readonly pass_rate_percent: number;
       };
-  /** `{ drift: DriftReport }` or `{ eval: { results, skipped } }`. */
-  readonly detail: { readonly drift: unknown } | { readonly eval: unknown };
+  /** `{ drift: DriftReport }`, `{ eval: { results, skipped } }`, or `{ task: { result } }`. */
+  readonly detail: { readonly drift: unknown } | { readonly eval: unknown } | { readonly task: unknown };
 }
 
 /** The provider an Operator connection authenticates to. */
@@ -1895,6 +1905,220 @@ export class OperatorConnections {
   }
 }
 
+/** The kind of an assignable principal. */
+export type PrincipalKind = "user" | "service" | "agent";
+
+/** Where a Role assignment comes from: login's identity provider, or a direct grant. */
+export type RoleSource = "idp" | "direct";
+
+/** One Role a principal holds and its source. */
+export type RoleAssignment = { readonly role: string; readonly source: RoleSource };
+
+/** A principal's Role assignments, ordered by Role and then source. */
+export type PrincipalRoles = {
+  readonly principal_id: string;
+  readonly kind: PrincipalKind;
+  readonly roles: readonly RoleAssignment[];
+};
+
+/**
+ * The outcome of a direct grant or revoke: `changed` is false when the
+ * assignment already matched, and `roles` is the complete resulting set.
+ */
+export type RoleAssignmentChange = PrincipalRoles & {
+  readonly role: string;
+  readonly changed: boolean;
+};
+
+/**
+ * One assignable principal; users carry `email`, Services and Agents `name`,
+ * and Card-bound Services and Agents `card_ref`. `card_ref` is null for users
+ * and unbound Services.
+ */
+export type PrincipalSummary = {
+  readonly principal_id: string;
+  readonly kind: PrincipalKind;
+  readonly status: "active" | "suspended";
+  readonly email: string | null;
+  readonly name: string | null;
+  readonly card_ref: CardRef | null;
+};
+
+/** One page of principals; `next` is the following page's `after`, or null on the last page. */
+export type PrincipalPage = {
+  readonly principals: readonly PrincipalSummary[];
+  readonly next: string | null;
+};
+
+/** Exact-match discovery filters and keyset position. */
+export type PrincipalQuery = {
+  readonly kind?: PrincipalKind;
+  readonly email?: string;
+  readonly name?: string;
+  /** Page size from 1 to 200; omitted, 100. */
+  readonly limit?: number;
+  readonly after?: string;
+};
+
+/** Create an unbound Service principal holding `roles`. */
+export type CreateServicePrincipalRequest = {
+  readonly name: string;
+  readonly roles: readonly string[];
+  readonly description?: string;
+};
+
+/** The created principal and its first plaintext credential, returned once. */
+export type CreateServicePrincipalResponse = { readonly principal_id: string; readonly credential: string };
+
+/** A newly issued credential and its plaintext secret, returned once. */
+export type IssuedCredential = { readonly id: string; readonly credential: string };
+
+/** Credential metadata; the secret is never returned. */
+export type CredentialMetadata = {
+  readonly id: string;
+  readonly prefix: string;
+  readonly created_at: string;
+  readonly expires_at: string | null;
+  readonly revoked_at: string | null;
+  readonly last_used_at: string | null;
+};
+
+/** A principal's credentials. */
+export type CredentialList = { readonly credentials: readonly CredentialMetadata[] };
+
+/** Revoke a principal of `principal_kind` for an audited `reason`. */
+export type RevokePrincipalRequest = { readonly principal_kind: PrincipalKind; readonly reason: string };
+
+/**
+ * Tenant principal client over the shared Rust handle: Service principals,
+ * their credentials, discovery, and direct Role assignment.
+ *
+ * A Role change reaches the principal at its next token; tokens already
+ * issued keep their Roles. Failures throw a structured {@link WyrdError}.
+ */
+export class Principals {
+  readonly #native: NativePrincipals;
+
+  private constructor(native: NativePrincipals) {
+    this.#native = native;
+  }
+
+  /**
+   * Build a principal client without performing IO.
+   *
+   * @param options - `client` to call the server as; omitted, the ambient
+   * client is resolved.
+   * @returns The principal client.
+   * @throws {@link WyrdError} when the ambient client cannot be resolved.
+   */
+  static connect(options: ClientOptions = {}): Principals {
+    return new Principals(wyrdClientNative(clientOf(options)).principals());
+  }
+
+  /**
+   * Create an unbound Service principal; requires `service_accounts:write`.
+   *
+   * @param request - The principal's name, Roles, and optional description.
+   * @returns The principal id and its first credential.
+   * @throws {@link WyrdError} for a malformed request or a transport or authorization failure.
+   */
+  async createServicePrincipal(request: CreateServicePrincipalRequest): Promise<CreateServicePrincipalResponse> {
+    return lifecycleValue(await this.#native.createServicePrincipal(JSON.stringify(request)));
+  }
+
+  /**
+   * Issue one more credential; requires `service_accounts:write`.
+   *
+   * @param principalId - The Service or Agent principal.
+   * @returns The credential and its plaintext secret.
+   * @throws {@link WyrdError} for an unknown principal or a transport or authorization failure.
+   */
+  async issueCredential(principalId: string): Promise<IssuedCredential> {
+    return lifecycleValue(await this.#native.issueCredential(principalId));
+  }
+
+  /**
+   * List a principal's credential metadata; requires `service_accounts:write`.
+   *
+   * @param principalId - The principal whose credentials to list.
+   * @returns The credentials, without secrets.
+   * @throws {@link WyrdError} for an unknown principal or a transport or authorization failure.
+   */
+  async listCredentials(principalId: string): Promise<CredentialList> {
+    return lifecycleValue(await this.#native.listCredentials(principalId));
+  }
+
+  /**
+   * Revoke one credential of a principal; requires `service_accounts:write`.
+   *
+   * @param principalId - The credential's principal.
+   * @param credentialId - The credential to revoke.
+   * @throws {@link WyrdError} when the credential is not the principal's, or a transport or authorization failure.
+   */
+  async revokeCredential(principalId: string, credentialId: string): Promise<void> {
+    lifecycleValue<null>(await this.#native.revokeCredential(principalId, credentialId));
+  }
+
+  /**
+   * Revoke a principal and every credential it holds.
+   *
+   * @param principalId - The principal to revoke.
+   * @param request - Its kind and the audited reason.
+   * @throws {@link WyrdError} for an unknown principal or a transport or authorization failure.
+   */
+  async revokePrincipal(principalId: string, request: RevokePrincipalRequest): Promise<void> {
+    lifecycleValue<null>(await this.#native.revokePrincipal(principalId, JSON.stringify(request)));
+  }
+
+  /**
+   * One page of assignable principals ordered by id; requires `service_accounts:write`.
+   *
+   * @param query - Exact filters, page size, and the previous page's `next`.
+   * @returns The page.
+   * @throws {@link WyrdError} for an invalid filter or a transport or authorization failure.
+   */
+  async list(query: PrincipalQuery = {}): Promise<PrincipalPage> {
+    return lifecycleValue(await this.#native.list(JSON.stringify(query)));
+  }
+
+  /**
+   * A principal's Role assignments; requires `service_accounts:write`.
+   *
+   * @param principalId - The principal to read.
+   * @returns Its assignments ordered by Role and source.
+   * @throws {@link WyrdError} for a principal that is not assignable, or a transport or authorization failure.
+   */
+  async roles(principalId: string): Promise<PrincipalRoles> {
+    return lifecycleValue(await this.#native.roles(principalId));
+  }
+
+  /**
+   * Idempotently grant a direct Role; requires tenant administration.
+   *
+   * @param principalId - The principal to grant to.
+   * @param role - The Role name.
+   * @returns Whether the call changed anything and the resulting assignments.
+   * @throws {@link WyrdError} for an unknown Role, a principal that is not
+   * assignable, or a transport or authorization failure.
+   */
+  async grantRole(principalId: string, role: string): Promise<RoleAssignmentChange> {
+    return lifecycleValue(await this.#native.grantRole(principalId, role));
+  }
+
+  /**
+   * Idempotently revoke a direct Role; identity-provider assignments stay.
+   *
+   * @param principalId - The principal to revoke from.
+   * @param role - The Role name.
+   * @returns Whether the call changed anything and the resulting assignments.
+   * @throws {@link WyrdError} for an unknown Role, a principal that is not
+   * assignable, or a transport or authorization failure.
+   */
+  async revokeRole(principalId: string, role: string): Promise<RoleAssignmentChange> {
+    return lifecycleValue(await this.#native.revokeRole(principalId, role));
+  }
+}
+
 /** One media item an Eval observation names for its judge Prompt. */
 export type EvalMediaRef = {
   /** The `${media:id}` binding slot this artifact fills in the judge Prompt. */
@@ -2028,6 +2252,16 @@ let otelApi: typeof import("@opentelemetry/api") | null | undefined;
  * no installed API, no active span, or an invalid context supplies nothing.
  */
 function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string } {
+  const api = otel();
+  const spanContext = api?.trace.getActiveSpan()?.spanContext();
+  if (spanContext === undefined || !api?.isSpanContextValid(spanContext)) {
+    return {};
+  }
+  return { traceId: spanContext.traceId, spanId: spanContext.spanId };
+}
+
+/** The application's `@opentelemetry/api`, or `null` when it is not installed. */
+function otel(): typeof import("@opentelemetry/api") | null {
   if (otelApi === undefined) {
     try {
       otelApi = require("@opentelemetry/api") as typeof import("@opentelemetry/api");
@@ -2035,11 +2269,7 @@ function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string 
       otelApi = null;
     }
   }
-  const spanContext = otelApi?.trace.getActiveSpan()?.spanContext();
-  if (spanContext === undefined || !otelApi?.isSpanContextValid(spanContext)) {
-    return {};
-  }
-  return { traceId: spanContext.traceId, spanId: spanContext.spanId };
+  return otelApi;
 }
 
 /** The closed own-key set of one {@link EvalMediaRef}. */
@@ -2229,6 +2459,41 @@ export class Run {
   forCard(alias: string): Run {
     return Run.fromOpen(this.#native.forCard(alias));
   }
+
+  /**
+   * Invoke this view's tool-free Agent once through the Wyrd gateway and
+   * return its final text. The call carries this run and the Agent Card as
+   * gateway correlation and runs as the state's client.
+   *
+   * @param variables - The Agent Prompt's string variables.
+   * @returns The Agent's final text.
+   * @throws a {@link WyrdError}: `WYRD_SDK_400_CARD_KIND_MISMATCH` for a view
+   * that is not an Agent and `WYRD_AGENT_422_VALIDATION` for an Agent with
+   * tools or a non-gateway Prompt model, both before any IO; otherwise the
+   * gateway's own refusal, such as `WYRD_PERMISSION_403_DENIED_RBAC`.
+   */
+  async invoke(variables: Readonly<Record<string, string>> = {}): Promise<string> {
+    return lifecycleValue<string>(await this.#native.invoke(strictJson("variables", variables)));
+  }
+
+  /**
+   * Run `fn` inside this view's scope: spans started in it, across awaits,
+   * carry this run and Card once {@link WyrdState.startTelemetry} installed
+   * telemetry. Without `@opentelemetry/api` it only calls `fn`.
+   *
+   * @param fn - The work to scope.
+   * @returns What `fn` returns.
+   */
+  scope<T>(fn: () => T): T {
+    const api = otel();
+    if (api === null) {
+      return fn();
+    }
+    const scoped = api.context
+      .active()
+      .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subjectUid, this.#native.runId]);
+    return api.context.with(scoped, fn);
+  }
 }
 
 /**
@@ -2240,6 +2505,8 @@ export class Run {
  */
 export class WyrdState {
   readonly #native: NativeWyrdState;
+  /** The tracer provider {@link WyrdState.startTelemetry} installed. */
+  #telemetry: { forceFlush(): Promise<void> } | undefined;
 
   private constructor(native: NativeWyrdState) {
     this.#native = native;
@@ -2402,6 +2669,37 @@ export class WyrdState {
   }
 
   /**
+   * Install the global OpenTelemetry tracer provider exporting spans to this
+   * state's server as the state's client.
+   *
+   * Spans export through the stock OTLP/HTTP exporter `spanExporter` builds, which
+   * asks the client for a fresh access token on every export; spans started
+   * inside {@link Run.scope} carry that run and Card. Node's `AsyncLocalStorage`
+   * context manager is registered unless the application registered one. A
+   * second call is idempotent, and {@link WyrdState.shutdown} flushes only
+   * this provider. Needs the optional `@opentelemetry/api`,
+   * `@opentelemetry/context-async-hooks`, `@opentelemetry/sdk-trace-base`, and
+   * `@opentelemetry/exporter-trace-otlp-proto` peers.
+   *
+   * @throws a {@link WyrdError}: `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when
+   * a global tracer provider is already registered (add `spanExporter` to it
+   * instead), or the credential error when the state's client cannot resolve.
+   */
+  async startTelemetry(): Promise<void> {
+    if (this.#telemetry !== undefined) {
+      return;
+    }
+    const native = this.#native.client();
+    const client = WyrdClient.fromNative(nativeHandle(native.client, native.error));
+    const { startTelemetry } = await import("./otel.js");
+    const provider = startTelemetry(client);
+    if (provider === undefined) {
+      throw projectedError(telemetryProviderExists());
+    }
+    this.#telemetry = provider;
+  }
+
+  /**
    * Open one invocation over this state, targeting `alias` or the root Service.
    *
    * Local only: no network IO and no server-side Run resource. `alias`
@@ -2435,11 +2733,13 @@ export class WyrdState {
    * admission is not a durable acknowledgement, so an abrupt exit before it
    * resolves can lose pending rows. After an ambiguous failure, retry
    * `shutdown()` on the same state rather than replacing the writer; a
-   * successfully closed state stays closed.
+   * successfully closed state stays closed. A tracer provider
+   * {@link WyrdState.startTelemetry} installed is flushed first.
    *
    * @throws a {@link WyrdError} for the first producer or sink failure.
    */
   async shutdown(): Promise<void> {
+    await this.#telemetry?.forceFlush();
     lifecycleValue<null>(await this.#native.shutdown());
   }
 }
@@ -2600,6 +2900,26 @@ export interface GatewayCapturePolicyWrite {
 /** Versioned capture policy as stored by the server. */
 export interface GatewayCapturePolicy extends GatewayCapturePolicyWrite {
   readonly version: number;
+}
+
+/**
+ * A `fetch` that authenticates every request to the Wyrd Gateway as `client`.
+ *
+ * Hand it to a stock client, such as
+ * `new OpenAI({ baseURL: \`${client.serverUrl}/v1\`, apiKey: "wyrd", fetch: gatewayFetch(client) })`.
+ * Each request asks `client` for its current access token and sends it as
+ * `Authorization: Bearer <token>`, so a long-lived client keeps working after
+ * any one access token expires.
+ *
+ * @param client - The client whose access token every request carries.
+ * @returns The authenticating `fetch`.
+ */
+export function gatewayFetch(client: WyrdClient): typeof fetch {
+  return async (input, init) => {
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    headers.set("authorization", `Bearer ${await client.accessToken()}`);
+    return fetch(input, { ...init, headers });
+  };
 }
 
 /**

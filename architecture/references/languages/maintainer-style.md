@@ -11,7 +11,7 @@ an agent happened to place them.
 
 ```text
 src/
-  utils.rs       # register_card, publish_audit, flush_observations
+  utils.rs       # register_card, stage_audit, flush_observations
   helpers.rs     # more steps of the same workflows
 ```
 
@@ -21,8 +21,8 @@ Good: modules follow the capability; the public handle exposes its operations.
 src/
   cards/
     handle.rs    # Cards::register, Cards::get
-  audit/
-    publisher.rs # AuditPublisher::publish
+  outbox/
+    writer.rs    # Outbox::stage
 ```
 
 Keep a small private helper beside its caller. Create another module only when

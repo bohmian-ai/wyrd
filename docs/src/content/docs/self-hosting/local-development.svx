@@ -132,6 +132,65 @@ YAML
 ./target/debug/wyrd list --kind Prompt      # read it back
 ```
 
+## 6. The whole workflow with the admin key
+
+The setup admin key is enough for every step: it is bound to no Card, so it
+can register Cards, call the Gateway, and attribute evidence to any registered
+Card in the tenant. You issue no Card key and flush nothing; acknowledged
+evidence is queryable at once. With `pip install 'wyrd[otel,gateway]' openai`
+and the shell above:
+
+```python
+import openai
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from wyrd import otel
+from wyrd.bifrost import Bifrost
+from wyrd.cards import CardRef, Cards
+from wyrd.client import WyrdClient
+from wyrd.gateway import GatewayAuth
+from wyrd.state import WyrdState
+
+client = WyrdClient()                       # WYRD_SERVER_URL and WYRD_API_KEY
+cards = Cards(client)
+cards.register_from_path("assistant.yaml")  # a Service and the Cards it binds
+bundle = cards.hydrate(CardRef("Service", "assistant", "1.0.0"), "bundle").destination
+state = WyrdState.from_path(bundle, client)
+state.start_bifrost()
+
+# The stock OpenAI client asks for a fresh access token on every request.
+gateway = openai.OpenAI(
+    base_url=f"{client.server_url}/v1",
+    api_key="wyrd",
+    http_client=openai.DefaultHttpxClient(auth=GatewayAuth(client)),
+)
+answer = gateway.chat.completions.create(
+    model="openai/gpt-4o", messages=[{"role": "user", "content": "hi"}]
+)
+
+run = state.run("agent")
+run.observe.verify("answer-is-yes", {"answer": "yes"})
+
+traces = TracerProvider()
+traces.add_span_processor(BatchSpanProcessor(otel.span_exporter(client)))
+with traces.get_tracer("assistant").start_as_current_span("answer") as span:
+    span.set_attribute("wyrd.card_uid", str(state.card_ref("agent").uid))
+    span.set_attribute("wyrd.run_id", run.run_id)
+traces.force_flush()
+state.shutdown()
+
+Bifrost(client=client).sql(
+    "SELECT name, card_uid FROM vala.traces.spans WHERE run_id = $1", [run.run_id]
+)
+```
+
+The Gateway call needs a provider credential and deployment first; see
+[Administer the Gateway](/how-to/administer-the-gateway/). The same workflow runs as a person: after
+`wyrd auth login`, unset `WYRD_API_KEY` and `WyrdClient()` uses the saved
+login, refreshing it as each access token expires. The Rust (`otel` feature,
+`wyrd_sdk::otel`) and TypeScript (`@wyrd/sdk/otel`, `gatewayFetch`) SDKs
+provide the same adapters.
+
 ## Restart persistence
 
 Stop the server (`Ctrl-C`) and start it again with the same environment. The

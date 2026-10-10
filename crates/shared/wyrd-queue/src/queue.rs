@@ -12,7 +12,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use tokio::time::Instant;
 use uuid::Uuid;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::ids::RunId;
 
@@ -38,7 +38,7 @@ pub struct Row {
     /// Card correlation is optional on the wire: an absent value stores the
     /// row against the authenticated principal with a null `card_uid`, so the
     /// buffered row carries the caller's choice rather than forcing one.
-    pub card_ref: Option<CardRef>,
+    pub card_uid: Option<CardUid>,
     /// The optional per-row run correlation field.
     pub run_id: Option<RunId>,
     /// The writer's `wyrd_event_time` stamp, in microseconds since the Unix
@@ -416,7 +416,7 @@ impl RecordQueue {
             })?;
             builder.append_json_row(
                 json,
-                row.card_ref.as_ref(),
+                row.card_uid.as_ref(),
                 row.run_id.as_ref(),
                 row.event_time_micros,
             )?;
@@ -696,7 +696,11 @@ mod tests {
         Row {
             _guard: budget.reserve(json.capacity()).expect("row bytes fit"),
             json,
-            card_ref: Some("prod/Service/queue@1.0.0".parse().expect("valid test card")),
+            card_uid: Some(
+                "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22"
+                    .parse()
+                    .expect("valid test card uid"),
+            ),
             run_id: None,
             event_time_micros: None,
         }

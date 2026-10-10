@@ -347,6 +347,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let frame = |request_id: &RequestId, payload: IngressPayload| {
         let principal = principal(tenant);
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal,
             table: table.clone(),
@@ -450,6 +451,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let admission = Scribe::ingest_frame(
         &scribe,
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal,
             table: table.clone(),
@@ -536,6 +538,7 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     let pointer_admission = Scribe::ingest_frame(
         &scribe,
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal: pointer_principal,
             table: pointer_table.clone(),
@@ -569,6 +572,7 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     let cross_day_admission = Scribe::ingest_frame(
         &scribe,
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal: cross_day_principal,
             table: day_table.clone(),
@@ -758,6 +762,7 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
     let error = Scribe::ingest_frame(
         &scribe,
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal,
             table,

@@ -333,6 +333,19 @@ impl CardRefScope {
     pub fn authorizes(&self, card: &CardRef) -> bool {
         self.0.iter().any(|member| member.same_identity(card))
     }
+
+    /// The resolved UIDs of this scope's members, in member order.
+    ///
+    /// This is the set a row's `card_uid` correlation is authorized against:
+    /// the UIDs the mint signed onto the scope. A member without a resolved
+    /// UID contributes none, so no row can correlate to it.
+    #[must_use]
+    pub fn uids(&self) -> Vec<CardUid> {
+        self.0
+            .iter()
+            .filter_map(|member| member.uid.clone())
+            .collect()
+    }
 }
 
 /// Serializes as a JSON array of `Display` strings (`"space/Kind/name@version"`).
@@ -842,7 +855,9 @@ mod tests {
     fn path_binding(dir: &str) -> crate::card::verifier::VerificationBinding {
         crate::card::verifier::VerificationBinding {
             verifier: Ref::Path(PathBuf::from(format!("{dir}/verifier.yaml"))),
-            runs_on: InlineableRef::Path(PathBuf::from(format!("{dir}/trigger.yaml"))),
+            runs_on: Some(InlineableRef::Path(PathBuf::from(format!(
+                "{dir}/trigger.yaml"
+            )))),
             on_failure: vec![InlineableRef::Path(PathBuf::from(format!(
                 "{dir}/operator.yaml"
             )))],

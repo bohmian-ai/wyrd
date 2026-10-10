@@ -3,7 +3,7 @@
 use chrono::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use uuid::Uuid;
-use vala_sql::audit_outbox::AuditOutbox;
+use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{Permission, Principal, PrincipalId};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{IssueKeyRequest, IssueKeyResponse, SecretBearer};
@@ -125,6 +125,7 @@ impl IssueApiKey {
         Ok(IssuedApiKey {
             response: IssueKeyResponse {
                 key_id: api_key_id,
+                principal_id: PrincipalId::new(row.id),
                 key: SecretBearer::new(plaintext.secret.expose_secret().to_owned()),
                 prefix,
                 card_ref: request.card_ref,
@@ -136,7 +137,7 @@ impl IssueApiKey {
         })
     }
 
-    /// Stage the credential-issuance audit event on the process outbox.
+    /// Stage the credential-issuance audit event on the process audit stage.
     ///
     /// The event names the target card as its resource and `service_accounts`
     /// write as its permission, and records the key id and expiry — never the
@@ -144,7 +145,7 @@ impl IssueApiKey {
     /// the issuance.
     pub fn audit(
         &self,
-        audit: &AuditOutbox,
+        audit: &dyn AuditStage,
         tenant: DataTenantId,
         issued: &IssuedApiKey,
         actor: &Principal,

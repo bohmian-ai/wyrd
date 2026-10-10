@@ -1,0 +1,11 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: ask-service
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent
+      ref: ./ask-agent.yaml

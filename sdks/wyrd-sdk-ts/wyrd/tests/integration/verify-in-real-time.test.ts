@@ -7,6 +7,7 @@ import { expect, vi } from "vitest";
 import { Bifrost, Cards, WyrdClient, WyrdState } from "@wyrd/sdk";
 import { cli } from "@wyrd/testing";
 
+import { configureGateway } from "../support/local-development.js";
 import { type RegisteredRef, fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 120_000 });
@@ -16,7 +17,7 @@ const JUDGE_PASSES = {
   id: "chatcmpl-judge",
   object: "chat.completion",
   created: 1,
-  model: "gpt-test",
+  model: "gpt-4o",
   choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: '{"passed":true}' } }],
   usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
 };
@@ -27,6 +28,14 @@ const HEALTHY_LATENCIES = Array.from({ length: 100 }, (_, row) => ({ latency: (r
 /** One hundred latencies all at the slow end of the baseline. */
 const SLOW_LATENCIES = Array.from({ length: 100 }, () => ({ latency: 99 }));
 
+/** The stable refusal for a caller no grant authorizes. */
+const DENIED = { code: "WYRD_PERMISSION_403_DENIED_RBAC" };
+
+/** The `verifier:run` grant on exactly `verifier`. */
+function verifierRun(verifier: RegisteredRef): object {
+  return { resource: "verifier", action: "run", scope: { verifier: verifier.uid } };
+}
+
 /** The key `issueKey` mints for a registered Service, with no Role grant. */
 async function serviceKey(name: string): Promise<string> {
   const issued = await cli.issueKey({ kind: "Service", name, version: "1.0.0", space: "default" });
@@ -35,12 +44,18 @@ async function serviceKey(name: string): Promise<string> {
 
 /**
  * The assistant Service, registered after its latency baseline and Model,
- * and the unfitted assistant whose `tier-drift` baseline never fits. Each test
+ * and the unfitted assistant whose `tier-drift` baseline never fits, after the
+ * judge model is deployed on the gateway its LLM judges call. Each test
  * gets a fresh offline state that verifies as its Service's own principal,
  * through a key `issueKey` minted with no Role grant.
  */
 const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }), verificationRuntime: true }).extend<{
-  assistant: { readonly bundle: string; readonly latencyDrift: RegisteredRef };
+  assistant: {
+    readonly bundle: string;
+    readonly latencyDrift: RegisteredRef;
+    readonly answerIsYes: RegisteredRef;
+    readonly answerCheck: RegisteredRef;
+  };
   unfittedBundle: { readonly bundle: string; readonly key: string };
   unfitted: WyrdState;
   assistantKey: string;
@@ -48,13 +63,19 @@ const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }),
 }>({
   assistant: [
     async ({ server: _ }, use) => {
+      await configureGateway(WyrdClient.connect());
       const cards = Cards.connect();
       await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
       await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));
       const receipt = await cards.registerFromPath(fixture("cards/verify_in_real_time/assistant.yaml"));
       const bundle = mkdtempSync(join(tmpdir(), "wyrd-ts-assistant-"));
       await cards.hydrate(receipt.root, bundle);
-      await use({ bundle, latencyDrift: registered(receipt, "latency-drift") });
+      await use({
+        bundle,
+        latencyDrift: registered(receipt, "latency-drift"),
+        answerIsYes: registered(receipt, "answer-is-yes"),
+        answerCheck: registered(receipt, "answer-check"),
+      });
     },
     { scope: "file" },
   ],
@@ -102,6 +123,29 @@ test("agent answer fails its verifier", async ({ state }) => {
   expect(judgment).toMatchObject({ passed: false, verdict: "failed", kind: "eval_assertion" });
 });
 
+test("agent answer is judged by its task check", async ({ state }) => {
+  const run = state.run("agent");
+  for (const [answer, verdict] of [
+    ["yes", "passed"],
+    ["no", "failed"],
+  ] as const) {
+    const judgment = await run.observe.verify("answer-check", { answer });
+
+    expect(judgment).toMatchObject({ verdict, kind: "task_assertion", verifier: { name: "answer-check" } });
+    expect(judgment.counts).toBeUndefined();
+  }
+});
+
+test("graded answer passes the task llm judge", async ({ provider, state }) => {
+  const judgment = await state.run("agent").observe.verify("answer-graded", { answer: "yes" });
+
+  expect(judgment).toMatchObject({ passed: true, kind: "task_llm_judge" });
+  expect(judgment.counts).toBeUndefined();
+  const [graded] = await provider.requests(1);
+  expect(graded?.path).toBe("/v1/chat/completions");
+  expect(graded?.body).toContain("Grade the answer yes.");
+});
+
 test("judged answer passes the llm judge", async ({ provider, state }) => {
   const judgment = await state.run("agent").observe.verify("answer-is-judged", { answer: "yes" });
 
@@ -144,13 +188,24 @@ test("input of the wrong shape fails locally", async ({ state }) => {
   });
 });
 
-test("caller without evals run is refused", async ({ server, assistant }) => {
-  const workload = WyrdClient.connect({ credential: server.bootstrapService(["workload"], "workload_only") });
-  const state = WyrdState.fromPath(assistant.bundle, { client: workload });
+test("caller without the verifier grant is refused", async ({ server, assistant }) => {
+  const keys = [
+    server.scopedApiKey("ts_evals_only", ["evals:run"]),
+    server.scopedApiKey("ts_other_verifier", [verifierRun(assistant.answerIsYes)]),
+  ];
+  for (const credential of keys) {
+    const state = WyrdState.fromPath(assistant.bundle, { client: WyrdClient.connect({ credential }) });
 
-  await expect(state.run("agent").observe.verify("answer-is-yes", { answer: "yes" })).rejects.toMatchObject({
-    code: "WYRD_PERMISSION_403_DENIED_RBAC",
-  });
+    await expect(state.run("agent").observe.verify("answer-check", { answer: "yes" })).rejects.toMatchObject(DENIED);
+  }
+});
+
+test("exact verifier grant verifies only that verifier", async ({ server, assistant }) => {
+  const credential = server.scopedApiKey("ts_exact_verifier", [verifierRun(assistant.answerCheck)]);
+  const run = WyrdState.fromPath(assistant.bundle, { client: WyrdClient.connect({ credential }) }).run("agent");
+
+  expect(await run.observe.verify("answer-check", { answer: "yes" })).toMatchObject({ passed: true });
+  await expect(run.observe.verify("answer-is-yes", { answer: "yes" })).rejects.toMatchObject(DENIED);
 });
 
 test("another tenant cannot verify the assistant", async ({ server, assistant }) => {
@@ -158,11 +213,13 @@ test("another tenant cannot verify the assistant", async ({ server, assistant })
   const other = WyrdClient.connect({
     credential: server.bootstrapServiceInTenant(otherTenant, ["admin"], "other-service"),
   });
-  const state = WyrdState.fromPath(assistant.bundle, { client: other });
+  const run = WyrdState.fromPath(assistant.bundle, { client: other }).run("agent");
 
-  await expect(state.run("agent").observe.verify("answer-is-yes", { answer: "yes" })).rejects.toMatchObject({
-    code: "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
-  });
+  for (const verifier of ["answer-is-yes", "answer-check"]) {
+    await expect(run.observe.verify(verifier, { answer: "yes" })).rejects.toMatchObject({
+      code: "WYRD_VERIFICATION_404_TARGET_NOT_FOUND",
+    });
+  }
 });
 
 test("verify records no observation", async ({ server, state }) => {

@@ -154,6 +154,7 @@ async fn ingest_as(
     Scribe::ingest_frame(
         scribe,
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: principal.tenant_id,
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
@@ -188,6 +189,7 @@ async fn ingest_value(
     Scribe::ingest_frame(
         scribe,
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
@@ -222,6 +224,7 @@ async fn ingest_measured(
     Scribe::ingest_frame(
         scribe,
         ScribeIngressFrame {
+            attributed_cards: None,
             authenticated_tenant: tenant,
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),

@@ -88,7 +88,7 @@ async fn issue_credential(
     let Path(principal_id) = principal_id.map_err(|rejection| path_rejection(&rejection))?;
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
     let mut decision = authorize(
         &authz,
         &caller,
@@ -146,7 +146,7 @@ async fn list_credentials(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
-        &state.audit_outbox,
+        &state.scribe_outbox,
         &caller,
         &Permission::platform_credential_read(),
         &platform_principal_resource(principal_id),
@@ -213,7 +213,7 @@ async fn revoke_credential(
         ids.map_err(|rejection| path_rejection(&rejection))?;
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
     let mut decision = authorize(
         &authz,
         &caller,

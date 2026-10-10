@@ -136,7 +136,7 @@ async fn admin_manages_redacted_connections() {
     deployment.shutdown().await;
 }
 
-/// A writer without `operators:*` cannot list connections.
+/// A Card writer without `operators:*` cannot list connections.
 ///
 /// # Panics
 /// Panics when the listing succeeds or is refused with another code.
@@ -145,7 +145,11 @@ async fn admin_manages_redacted_connections() {
 async fn writer_is_refused() {
     let deployment = Deployment::start().await;
     let writer = OperatorConnections::with_client(
-        deployment.client(&deployment.key("card_writer", &["writer"]).await),
+        deployment.client(
+            &deployment
+                .scoped_key("card_writer", &["cards:read", "cards:write"])
+                .await,
+        ),
     );
 
     let refused = writer.list().await.expect_err("a writer cannot list");

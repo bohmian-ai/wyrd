@@ -101,12 +101,8 @@ fn publish_env(py: Python<'_>, key: &str, value: Option<&str>) -> WyrdPyResult<(
     reason = "preserve the established Python test-harness constructor flags"
 )]
 pub struct WyrdTestServer {
-    /// Retained from the Python constructor signature; teardown always runs.
-    cleanup: bool,
     /// Whether entering publishes the `WYRD_*` endpoint variables.
     mutate_env: bool,
-    /// Whether the audit publisher runs during the fixture.
-    audit_publication: bool,
     /// Whether the verification runtime is composed during the fixture.
     verification_runtime: bool,
     /// Root every built-in gateway adapter targets; `None` keeps a gateway
@@ -118,6 +114,10 @@ pub struct WyrdTestServer {
     /// Whether the server answers at the public origin the Keycloak fixture
     /// clients register, so human sign-ins can complete against it.
     human_sso: bool,
+    /// Access-token lifetime in seconds, verified with no clock-skew
+    /// allowance, for a journey that outlives its first token; `None` keeps
+    /// the production lifetime.
+    access_ttl_seconds: Option<i64>,
     /// Bound HTTP base URL while entered.
     base_url: Option<String>,
     /// Bound gRPC endpoint while entered.
@@ -148,25 +148,25 @@ impl WyrdTestServer {
     /// built-in adapter at its real provider endpoint, which only the opt-in
     /// live smoke lane asks for. `human_sso` serves the public origin the
     /// identity lane's Keycloak clients register, for saved user login
-    /// journeys.
+    /// journeys. `access_ttl_seconds` mints access tokens of that lifetime,
+    /// verified with no clock-skew allowance, so a journey can outlive one.
     ///
     /// # Errors
     /// Raises the harness error when `provider_base_url` is not an absolute
     /// URL, or when it is combined with `live_providers`.
     #[new]
-    #[pyo3(signature = (cleanup = true, mutate_env = true, audit_publication = true, verification_runtime = false, provider_base_url = None, live_providers = false, human_sso = false))]
+    #[pyo3(signature = (mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, human_sso = false, access_ttl_seconds = None))]
     #[allow(
         clippy::fn_params_excessive_bools,
         reason = "PyO3 projects the existing Python test-harness flags directly"
     )]
     fn __new__(
-        cleanup: bool,
         mutate_env: bool,
-        audit_publication: bool,
         verification_runtime: bool,
         provider_base_url: Option<&str>,
         live_providers: bool,
         human_sso: bool,
+        access_ttl_seconds: Option<i64>,
     ) -> WyrdPyResult<Self> {
         if live_providers && provider_base_url.is_some() {
             return Err(harness_error(
@@ -180,13 +180,12 @@ impl WyrdTestServer {
             })
             .transpose()?;
         Ok(Self {
-            cleanup,
             mutate_env,
-            audit_publication,
             verification_runtime,
             provider_base_url,
             live_providers,
             human_sso,
+            access_ttl_seconds,
             base_url: None,
             grpc_url: None,
             api_key: None,
@@ -206,15 +205,12 @@ impl WyrdTestServer {
     fn __enter__(mut slf: PyRefMut<'_, Self>) -> WyrdPyResult<PyRefMut<'_, Self>> {
         let root = slf.provider_base_url.clone();
         let live_providers = slf.live_providers;
-        let audit_publication = slf.audit_publication;
         let verification_runtime = slf.verification_runtime;
         let human_sso = slf.human_sso;
+        let access_ttl_seconds = slf.access_ttl_seconds;
         let (server, api_key) = wyrd_runtime::runtime()
             .block_on(async {
                 let mut builder = TestServer::builder();
-                if !audit_publication {
-                    builder = builder.without_audit_publication_for_test();
-                }
                 if verification_runtime {
                     builder = builder.with_verification_runtime_for_test();
                 }
@@ -222,6 +218,13 @@ impl WyrdTestServer {
                     builder = builder.with_public_origin(
                         Url::parse(HUMAN_PUBLIC_ORIGIN).expect("the fixture origin is a URL"),
                     );
+                }
+                if let Some(seconds) = access_ttl_seconds {
+                    builder = builder
+                        .with_access_ttl(chrono::Duration::seconds(seconds))
+                        .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
+                            allowed_clock_skew: std::time::Duration::ZERO,
+                        });
                 }
                 if let Some(root) = root {
                     builder = builder.with_gateway_provider_root_for_test(root);
@@ -282,12 +285,6 @@ impl WyrdTestServer {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             snapshot.restore(py)?;
-        }
-        if !self.cleanup {
-            tracing::warn!(
-                "WyrdTestServer: cleanup=false is not yet implemented; \
-                 the server and embedded Postgres will still be cleaned up"
-            );
         }
         if let Some(server) = self.server.take() {
             wyrd_runtime::runtime().block_on(async {
@@ -372,6 +369,42 @@ impl WyrdTestServer {
             bootstrap,
             "expected Machine bootstrap from bootstrap_service",
         )
+    }
+
+    /// Issue a key for the tenant's unbound administrator, the key `wyrd
+    /// setup` prints.
+    ///
+    /// Must be called inside the context manager.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or the
+    /// key cannot be issued.
+    fn tenant_admin_key(&self) -> WyrdPyResult<String> {
+        let server = self.started()?;
+        let key = wyrd_runtime::runtime()
+            .block_on(server.tenant_admin_key())
+            .map_err(py_error)?;
+        Ok(key.expose_secret().to_owned())
+    }
+
+    /// Bootstrap a signed-in user holding identity-provider `roles`,
+    /// returning the user's principal id.
+    ///
+    /// The roles are recorded as a login would record them, so a journey can
+    /// prove a direct grant coexists with them. Must be called inside the
+    /// context manager.
+    ///
+    /// # Errors
+    /// Raises a Wyrd Python error when the context manager is inactive or
+    /// bootstrap fails.
+    #[pyo3(signature = (roles, name))]
+    fn bootstrap_user(&self, roles: Vec<String>, name: &str) -> WyrdPyResult<String> {
+        let server = self.started()?;
+        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+        let bootstrap = wyrd_runtime::runtime()
+            .block_on(server.bootstrap_user(name, &roles))
+            .map_err(py_error)?;
+        Ok(bootstrap.id().to_string())
     }
 
     /// Issue an API key for the principal projected by a registered Service Card.
@@ -578,8 +611,8 @@ impl WyrdTestServer {
     }
 
     /// Stage, test, and activate the identity lane's Keycloak sign-in for the
-    /// tenant `admin_key` administers, mapping `wyrd-admins` to `admin` and
-    /// `wyrd-viewers` to `reader`.
+    /// tenant `admin_key` administers, mapping `wyrd-admins` to `admin`,
+    /// `wyrd-editors` to `editor`, and `wyrd-viewers` to `viewer`.
     ///
     /// Needs `human_sso=True` and the identity lane's Keycloak.
     ///

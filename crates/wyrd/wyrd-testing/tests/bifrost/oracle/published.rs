@@ -87,9 +87,7 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     // the 30 s leader term outlasts for these few-second phases.
     let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         // The tenant's audit table must not take the one parked promotion.
-        BifrostClusterSpec::one_mixed()
-            .with_metadata_cache_mode(ScribeCacheMode::Enabled)
-            .without_audit_publication_for_test(),
+        BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
         ForgeConfig::default(),
         false,
         true,

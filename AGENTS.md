@@ -129,28 +129,26 @@ Locked cross-cutting decisions that any contributor must honor:
 - Audit records authorization decisions, not engine mechanics. Permissions
   are blocking; audits are non-blocking. Every permission check completes
   before the operation proceeds or refuses, and its decision is staged on the
-  non-blocking audit outbox without the request waiting for the commit; a
-  failed commit is logged and counted and never fails the operation. Every
+  non-blocking Scribe outbox without the request waiting for the write; a
+  failed write is logged and counted and never fails the operation. Every
   audited surface follows this rule; no error exists to report an audit
   write failure. Engine-internal transitions —
   Scribe batch commits, Forge maintenance — evaluate no permission and are
   recorded as lineage in their own operational tables, never as audit.
-- There is one audit write path and one publisher. Every audit event is
-  committed to `vala.audit_staging` through the canonical append, and only the
-  `AuditPublisher` moves staged rows into `vala.system.audit_log` via Scribe.
-  The process audit outbox is the only caller of that append; no other audit
-  table, WAL, relay, or log sink exists.
+- There is one write path for every server-internal Scribe write. Audit
+  decisions, gateway captures, and Verifier results are staged in memory on the
+  process `ScribeOutbox` (`Outbox<ScribeSink>`); its one background writer
+  batches each tenant slice by destination into Arrow frames with
+  content-derived batch ids and submits them to the local or peer Scribe.
+  Retained audit history is `vala.system.audit_log`; no audit staging table,
+  publisher, WAL, relay, or log sink exists. A retryable failure resubmits the
+  identical slice, which Scribe's batch-id fence absorbs; a terminal rejection
+  is logged, counted, and consumed. Writes Scribe has not acknowledged are lost
+  on abrupt process death or an expired shutdown deadline; observable loss is
+  counted and never changes the originating operation.
 - Bifrost clients use `wyrd_client::Bifrost` over the crate's shared HTTP and
   gRPC transport. Rust, Python, and TypeScript project that same facade. Gate, Scribe,
   Oracle, and Forge remain server owners and never become client types.
-- `vala.audit_staging` is transient write-ahead state with no external
-  consumer. Retained audit history lives in `vala.system.audit_log`.
-  Publication progress is a per-tenant monotonic watermark plus at most one
-  frozen in-flight upper bound; no lease, claim, or owner token exists. Every
-  competing or restarted publisher reuses that bound, so the replayed range and
-  its derived batch identity are identical and Scribe's durable batch-id dedup
-  fence absorbs it. Staged rows are garbage-collected once the watermark has
-  advanced past them, in the same transaction that clears the matching bound.
 
 ## 3. Ownership Boundaries
 

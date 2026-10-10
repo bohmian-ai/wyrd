@@ -174,10 +174,10 @@ def test_uncorrelated_row_is_a_valid_write(wyrd_server: WyrdTestServer, bifrost:
     assert items(bifrost, "vala.datasets.uncorrelated") == [Item(id=8, value="uncorrelated")]
 
 
-def test_negative_bad_card_ref_raises(wyrd_server: WyrdTestServer) -> None:
-    writer = Bifrost(TableConfig(Item, "vala.datasets.bad_card_ref"))
+def test_negative_bad_card_uid_raises(wyrd_server: WyrdTestServer) -> None:
+    writer = Bifrost(TableConfig(Item, "vala.datasets.bad_card_uid"))
     with pytest.raises(WyrdError) as raised:
-        writer.insert(Item(id=1, value="bad"), {"card_ref": "not-a-ref"})
+        writer.insert(Item(id=1, value="bad"), {"card_uid": "not-a-uid"})
     assert raised.value.code == "WYRD_SPEC_400_VALIDATION"
 
 

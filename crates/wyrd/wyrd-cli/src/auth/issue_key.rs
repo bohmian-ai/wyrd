@@ -136,12 +136,13 @@ pub async fn dispatch(args: IssueKeyArgs) -> Result<ExitCode, WyrdCliError> {
     )
     .await?;
 
-    println!("key_id:     {}", response.key_id);
-    println!("key:        {}", response.key.expose());
-    println!("prefix:     {}", response.prefix);
-    println!("card_ref:   {}", response.card_ref);
-    println!("created_at: {}", response.created_at);
-    println!("expires_at: {}", response.expires_at);
+    println!("key_id:       {}", response.key_id);
+    println!("principal_id: {}", response.principal_id);
+    println!("key:          {}", response.key.expose());
+    println!("prefix:       {}", response.prefix);
+    println!("card_ref:     {}", response.card_ref);
+    println!("created_at:   {}", response.created_at);
+    println!("expires_at:   {}", response.expires_at);
 
     Ok(ExitCode::SUCCESS)
 }

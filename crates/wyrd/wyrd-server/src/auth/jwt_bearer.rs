@@ -34,7 +34,7 @@ pub async fn exchange_jwt_bearer(
     let service = wyrd_auth::jwt_bearer::JwtBearer {
         issuer: state
             .auth
-            .tenant_issuer(&state.audit_outbox)
+            .tenant_issuer(&state.scribe_outbox)
             .ok_or_else(auth_not_configured)?,
         verifier: state
             .auth
@@ -145,6 +145,7 @@ mod pg_tests {
         issuer_write_from_trusted,
     };
     use crate::auth::seed::seed_builtin_roles_for_tenant;
+    use crate::components::gateway::recording::RecordingScribe;
 
     use super::exchange_jwt_bearer;
 
@@ -168,16 +169,18 @@ mod pg_tests {
             "svc",
             Some(EXTERNAL_AUDIENCE),
         );
-        let state = test_state_with_external(
-            &fixture,
-            vec![trusted_issuer(
-                tenant,
-                jwks_uri(&fixture).await,
-                EXTERNAL_AUDIENCE,
-            )],
-            vec![binding.clone()],
-        )
-        .await;
+        let (state, scribe) = RecordingScribe::attach(
+            test_state_with_external(
+                &fixture,
+                vec![trusted_issuer(
+                    tenant,
+                    jwks_uri(&fixture).await,
+                    EXTERNAL_AUDIENCE,
+                )],
+                vec![binding.clone()],
+            )
+            .await,
+        );
         bootstrap_principal(&fixture, tenant, CardKind::Service, "svc", &[role_name])
             .await
             .expect("service principal seeds");
@@ -211,7 +214,7 @@ mod pg_tests {
             "workload jwt-bearer grant must not issue a refresh token"
         );
 
-        let rows = audit_rows(&fixture, &state, tenant).await;
+        let rows = audit_rows(&state, &scribe, tenant).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subject_principal_id, rows[0].actor_principal_id);
         assert_eq!(rows[0].error_tag, "");
@@ -272,22 +275,24 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant = fixture.data_tenant_id();
         let role_name = builtin_role_name();
-        let state = test_state_with_external(
-            &fixture,
-            vec![trusted_issuer(
-                tenant,
-                jwks_uri(&fixture).await,
-                EXTERNAL_AUDIENCE,
-            )],
-            vec![binding(
-                tenant,
-                "system:serviceaccount:default:svc",
-                CardKind::Service,
-                "svc",
-                Some(EXTERNAL_AUDIENCE),
-            )],
-        )
-        .await;
+        let (state, scribe) = RecordingScribe::attach(
+            test_state_with_external(
+                &fixture,
+                vec![trusted_issuer(
+                    tenant,
+                    jwks_uri(&fixture).await,
+                    EXTERNAL_AUDIENCE,
+                )],
+                vec![binding(
+                    tenant,
+                    "system:serviceaccount:default:svc",
+                    CardKind::Service,
+                    "svc",
+                    Some(EXTERNAL_AUDIENCE),
+                )],
+            )
+            .await,
+        );
         bootstrap_principal(&fixture, tenant, CardKind::Service, "svc", &[role_name])
             .await
             .expect("service principal seeds");
@@ -308,7 +313,7 @@ mod pg_tests {
         .expect_err("wrong audience rejected");
         assert!(matches!(error.0, WyrdError::InvalidToken { .. }));
 
-        let rows = audit_rows(&fixture, &state, tenant).await;
+        let rows = audit_rows(&state, &scribe, tenant).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].subject_principal_id, Uuid::nil());
         assert_eq!(rows[0].actor_principal_id, Uuid::nil());
@@ -542,7 +547,7 @@ mod pg_tests {
         let exchanged = crate::auth::exchange_api_key::ExchangeApiKey {
             issuer: state
                 .auth
-                .tenant_issuer(&state.audit_outbox)
+                .tenant_issuer(&state.scribe_outbox)
                 .expect("issuing key configured"),
         }
         .execute(&mut conn, SecretString::from(token), "req-api-key")
@@ -801,47 +806,36 @@ mod pg_tests {
         key.secret.expose_secret().to_owned()
     }
 
-    /// Staged `auth.token.exchange` events for `tenant`, newest first, read
-    /// after `state`'s audit outbox settles.
+    /// Recorded `auth.token.exchange` decisions for `tenant`, in arrival
+    /// order, read after `state`'s Scribe outbox settles into `scribe`.
     ///
     /// # Panics
-    /// Panics when the outbox does not settle or the query fails.
+    /// Panics when the outbox does not settle or a recorded detail names a
+    /// principal id that is not a UUID.
     async fn audit_rows(
-        fixture: &PgFixture,
         state: &AppState,
+        scribe: &RecordingScribe,
         tenant: DataTenantId,
     ) -> Vec<AuditRow> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         assert_eq!(
-            state.audit_outbox.settle(deadline).await,
+            state.scribe_outbox.settle(deadline).await,
             0,
             "audit settles"
         );
-        let mut conn = fixture
-            .tenant_conn_for(tenant)
-            .await
-            .expect("tenant conn opens");
-        let rows = sqlx::query_as::<_, (Uuid, String)>(
-            "SELECT principal_id, detail
-             FROM vala.audit_staging
-             WHERE data_tenant_id = $1
-               AND operation = 'auth.token.exchange'
-             ORDER BY seq DESC",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_all(&mut **conn.transaction())
-        .await
-        .expect("audit rows fetch");
-        conn.commit().await.expect("audit query commits");
-        rows.into_iter()
-            .map(|(principal_id, detail)| {
-                let detail: serde_json::Value =
-                    serde_json::from_str(&detail).expect("audit detail is json");
+        scribe
+            .audit_decisions()
+            .into_iter()
+            .filter(|decision| {
+                decision.tenant == tenant && decision.operation == "auth.token.exchange"
+            })
+            .map(|decision| {
+                let detail = decision.detail.unwrap_or_default();
                 let id = |field: &str| {
                     detail
                         .get(field)
                         .and_then(serde_json::Value::as_str)
-                        .map_or(principal_id, |value| {
+                        .map_or(decision.audit_principal_id, |value| {
                             value.parse().expect("audit principal id is a uuid")
                         })
                 };

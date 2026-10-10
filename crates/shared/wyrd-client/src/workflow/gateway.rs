@@ -6,7 +6,9 @@
 //! header, bounds itself by its own remaining time, and stops when the run is
 //! cancelled. Nothing about one call is stored on the caller, so concurrent
 //! steps cannot see each other's fallback, deadline, or correlation.
-//! Correlation travels only in this call's tracing span. Refusals in the
+//! Workflow correlation travels only in this call's tracing span; a caller
+//! bound to one application Run with [`PublicWyrdGatewayCaller::with_subject`]
+//! sends that Run and Card UID as the gateway correlation headers. Refusals in the
 //! protocol's native error envelope are normalized to a redacted
 //! [`RemoteProblem`].
 
@@ -22,7 +24,9 @@ use tokio_util::sync::CancellationToken;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::native::{AnthropicErrorEnvelope, GoogleErrorEnvelope};
 use wyrd_spec::gateway::openai::OpenAiErrorEnvelope;
-use wyrd_spec::gateway::{FALLBACK_HEADER, ModelRef};
+use wyrd_spec::gateway::{CARD_UID_HEADER, FALLBACK_HEADER, ModelRef, RUN_HEADER};
+use wyrd_spec::ids::CardUid;
+use wyrd_spec::vala::ids::RunId;
 
 use crate::WyrdClient;
 
@@ -37,6 +41,9 @@ const PROVIDER: &str = "wyrd_gateway";
 pub struct PublicWyrdGatewayCaller {
     /// Authenticated transport every call is sent through.
     client: WyrdClient,
+    /// The application Run and Card UID text every call carries as the
+    /// `wyrd-run-id` and `wyrd-card-uid` headers; `None` sends neither.
+    subject: Option<(String, String)>,
 }
 
 impl PublicWyrdGatewayCaller {
@@ -47,7 +54,19 @@ impl PublicWyrdGatewayCaller {
     ///   as its principal.
     #[must_use]
     pub fn new(client: WyrdClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            subject: None,
+        }
+    }
+
+    /// Correlate every call to application Run `run_id` and the Card, by UID
+    /// `card_uid`, it invokes; the gateway authorizes and captures both
+    /// together.
+    #[must_use]
+    pub fn with_subject(mut self, run_id: &RunId, card_uid: &CardUid) -> Self {
+        self.subject = Some((run_id.to_string(), card_uid.to_string()));
+        self
     }
 }
 
@@ -73,9 +92,9 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
         name = "workflow.gateway.call",
         skip_all,
         fields(
-            wyrd.workflow.run_id = %call.correlation.run_id,
-            wyrd.workflow.step_id = %call.correlation.step_id,
-            wyrd.workflow.attempt = call.correlation.attempt,
+            wyrd.workflow.run_id = call.correlation.as_ref().map(|c| tracing::field::display(c.run_id)),
+            wyrd.workflow.step_id = call.correlation.as_ref().map(|c| c.step_id.as_str()),
+            wyrd.workflow.attempt = call.correlation.as_ref().map(|c| c.attempt),
         )
     )]
     async fn call(
@@ -93,10 +112,16 @@ impl WyrdGatewayCaller for PublicWyrdGatewayCaller {
                 })
             })
             .transpose()?;
-        let headers: Vec<(&str, &str)> = fallback
+        let mut headers: Vec<(&str, &str)> = fallback
             .iter()
             .map(|value| (FALLBACK_HEADER, value.as_str()))
             .collect();
+        if let Some((run_id, card_uid)) = &self.subject {
+            headers.extend([
+                (RUN_HEADER, run_id.as_str()),
+                (CARD_UID_HEADER, card_uid.as_str()),
+            ]);
+        }
         let send = self
             .client
             .http

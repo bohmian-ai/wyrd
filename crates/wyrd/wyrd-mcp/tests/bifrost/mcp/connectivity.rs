@@ -414,7 +414,7 @@ mod pg_tests {
 
         // 2. An authenticated but under-scoped principal is denied by the same
         //    audited RBAC path every Bifrost read uses, and the denial is durable.
-        let denied = server.bootstrap_service("mcp-denied", &["reader"]).await?;
+        let denied = server.bootstrap_service("mcp-denied", &[]).await?;
         let denied_key = denied.api_key().ok_or("service bootstrap carries a key")?;
         let denied_request_id = RequestId::now_v7();
         let denied_client = ()
@@ -437,29 +437,26 @@ mod pg_tests {
                 .contains("WYRD_PERMISSION_403_DENIED_RBAC"),
             "the RBAC denial reaches the client verbatim: {refusal}"
         );
-        server
-            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+        server.await_audit_retained().await?;
+        let denial_rows = server
+            .retained_audit_records(
+                tenant,
+                "permission, audit_principal_id, request_id, outcome",
+                &format!(
+                    "operation = '{}' AND request_id = '{}'",
+                    probe::TOOL_NAME,
+                    denied_request_id.as_str()
+                ),
+            )
             .await?;
-        let mut conn = server.tenant_conn_for(tenant).await?;
-        let denial_rows: Vec<(String, uuid::Uuid, String, String)> = sqlx::query_as(
-            "SELECT permission, principal_id, request_id, outcome \
-             FROM vala.audit_staging \
-             WHERE operation = $1 \
-               AND request_id = $2",
-        )
-        .bind(probe::TOOL_NAME)
-        .bind(denied_request_id.as_str())
-        .fetch_all(&mut **conn.transaction())
-        .await?;
-        conn.commit().await?;
         assert_eq!(
             denial_rows,
-            vec![(
-                Permission::bifrost_query_read().to_string(),
-                denied.id().as_uuid(),
-                denied_request_id.to_string(),
-                "denied".to_owned(),
-            )],
+            vec![vec![
+                Some(Permission::bifrost_query_read().to_string()),
+                Some(denied.id().as_uuid().to_string()),
+                Some(denied_request_id.to_string()),
+                Some("denied".to_owned()),
+            ]],
             "the denial is durably audited exactly once, under the caller's own \
              request id, before anything is disclosed"
         );

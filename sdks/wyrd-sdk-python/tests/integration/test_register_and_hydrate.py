@@ -122,8 +122,8 @@ def test_retired_card_kind_is_refused(cards: Cards) -> None:
     assert refused.value.code == "WYRD_LOADER_400_INVALID_ENVELOPE"
 
 
-def test_reader_cannot_register_cards(reader_key: str) -> None:
-    reader = Cards(WyrdClient(credential=reader_key))
+def test_viewer_cannot_register_cards(viewer_key: str) -> None:
+    reader = Cards(WyrdClient(credential=viewer_key))
 
     with pytest.raises(WyrdError) as refused:
         reader.register_from_path(FIXTURES / SUPPORT_DESK)

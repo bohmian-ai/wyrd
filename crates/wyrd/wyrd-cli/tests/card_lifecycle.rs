@@ -808,7 +808,7 @@ mod pg_tests {
         let path = write_prompt(&temp);
         let (server, base_url, storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-lifecycle-writer", &["writer"])
+            .bootstrap_user("cli-lifecycle-writer", &["editor"])
             .await
             .expect("writer bootstraps")
         else {
@@ -1278,7 +1278,7 @@ mod pg_tests {
             .expect("bound server exposes base URL")
             .to_owned();
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("typed-state-journey", &["writer"])
+            .bootstrap_user("typed-state-journey", &["editor"])
             .await
             .expect("journey writer bootstraps")
         else {
@@ -1465,7 +1465,7 @@ mod pg_tests {
             String::from_utf8_lossy(&plan.stderr)
         );
         let plan: Value = serde_json::from_slice(&plan.stdout).expect("plan output is JSON");
-        assert_eq!(plan["cards"].as_array().map(Vec::len), Some(11));
+        assert_eq!(plan["cards"].as_array().map(Vec::len), Some(12));
 
         let server = WyrdTestServer::builder()
             .with_verification_runtime_for_test()
@@ -1477,7 +1477,7 @@ mod pg_tests {
             .expect("bound server exposes base URL")
             .to_owned();
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("canonical-directory-writer", &["writer"])
+            .bootstrap_user("canonical-directory-writer", &["editor"])
             .await
             .expect("journey writer bootstraps")
         else {
@@ -1564,7 +1564,7 @@ mod pg_tests {
         )
         .await
         .expect("canonical authored directory applies");
-        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(11));
+        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(12));
         wait_baseline_ready(
             &public_cards_client(&base_url, &jwt),
             json!({
@@ -1588,7 +1588,7 @@ mod pg_tests {
         .await
         .expect("canonical Service graph hydrates");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 15);
+        assert_eq!(summary["card_count"], 16);
 
         let metadata: Value = serde_yaml::from_slice(
             &std::fs::read(bundle.path().join("metadata.yaml"))
@@ -1600,6 +1600,7 @@ mod pg_tests {
             .expect("bundle metadata lists hydrated cards");
         for (kind, name) in [
             ("Verifier", "churn-triage-eval"),
+            ("Verifier", "cohort-check"),
             ("Verifier", "churn-classifier-drift"),
             ("Verifier", "retention-guardrail"),
             ("Trigger", "retention-observations-ready"),
@@ -1613,9 +1614,9 @@ mod pg_tests {
             );
         }
 
-        for (name, binding_owner) in [
-            ("churn-response-service", "Service"),
-            ("retention-runbook", "Agent"),
+        for (name, binding_owner, binding_count) in [
+            ("churn-response-service", "Service", 2),
+            ("retention-runbook", "Agent", 1),
         ] {
             let card = cards
                 .iter()
@@ -1632,13 +1633,17 @@ mod pg_tests {
             let bindings = document["spec"]["verified_by"]
                 .as_array()
                 .unwrap_or_else(|| panic!("{name} persisted its verified_by list"));
-            assert_eq!(bindings.len(), 1, "{bindings:?}");
+            assert_eq!(bindings.len(), binding_count, "{bindings:?}");
             for leg in ["verifier", "runs_on"] {
                 assert!(
                     bindings[0][leg]["uid"].is_string(),
                     "{name}.{leg} persisted UID-pinned: {:?}",
                     bindings[0][leg]
                 );
+            }
+            if let Some(explicit) = bindings.get(1) {
+                assert!(explicit["verifier"]["uid"].is_string(), "{explicit:?}");
+                assert!(explicit.get("runs_on").is_none(), "{explicit:?}");
             }
 
             let relationships: Value = serde_yaml::from_slice(
@@ -1673,7 +1678,7 @@ mod pg_tests {
         let service_path = write_multi_card_service(&temp);
         let (server, base_url, storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-multi-card-writer", &["writer"])
+            .bootstrap_user("cli-multi-card-writer", &["editor"])
             .await
             .expect("writer bootstraps")
         else {
@@ -2058,105 +2063,6 @@ mod pg_tests {
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 
-    /// Prove `wyrd apply` completes when the completion decision cannot be audited.
-    ///
-    /// Completing a registration is a receiving authorization boundary whose
-    /// permission verdict is staged on the server's non-blocking audit outbox.
-    /// A trigger refuses that one staging insert; the CLI still completes the
-    /// registration and exits `0`, the server counts the failed audit write, and
-    /// the retried decision commits exactly once after the trigger is dropped.
-    ///
-    /// # Panics
-    /// Panics when the embedded server or fixture setup fails, the CLI does not
-    /// complete the registration, the failed write is not counted, or the
-    /// decision does not commit once after recovery.
-    #[tokio::test]
-    async fn apply_completes_when_completion_decision_audit_fails() {
-        let failures =
-            wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
-        let temp = tempfile::tempdir().expect("tempdir creates");
-        let path = write_prompt(&temp);
-        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
-        let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-completion-failure", &["writer"])
-            .await
-            .expect("writer bootstraps")
-        else {
-            panic!("writer bootstrap returned a non-user principal");
-        };
-        let superuser = server
-            .pg_fixture()
-            .superuser_pool()
-            .expect("superuser pool opens");
-        sqlx::query(
-            r"CREATE OR REPLACE FUNCTION vala.test_fail_cli_card_completion_audit()
-               RETURNS trigger LANGUAGE plpgsql AS $$
-               BEGIN
-                 IF NEW.operation = 'card.registration.complete' THEN
-                   RAISE EXCEPTION 'injected CLI completion audit failure';
-                 END IF;
-                 RETURN NEW;
-               END;
-               $$;",
-        )
-        .execute(&superuser)
-        .await
-        .expect("failure function installs");
-        sqlx::query(
-            r"CREATE TRIGGER test_fail_cli_card_completion_audit
-               BEFORE INSERT ON vala.audit_staging
-               FOR EACH ROW EXECUTE FUNCTION vala.test_fail_cli_card_completion_audit()",
-        )
-        .execute(&superuser)
-        .await
-        .expect("failure trigger installs");
-
-        let output = run_cli_async_with_token!(
-            &jwt,
-            "apply",
-            path.to_str().expect("prompt path is UTF-8"),
-            "--server",
-            &base_url,
-            "--format",
-            "json",
-        );
-
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        failures
-            .await_failure(std::time::Duration::from_secs(30))
-            .await
-            .expect("the failed audit write is counted");
-        sqlx::query("DROP TRIGGER test_fail_cli_card_completion_audit ON vala.audit_staging")
-            .execute(&superuser)
-            .await
-            .expect("failure trigger drops");
-        assert_eq!(
-            server
-                .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
-                .await
-                .expect("audit outbox settles"),
-            0,
-            "the retried decision drains"
-        );
-        let completions: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'card.registration.complete'",
-        )
-        .fetch_one(&superuser)
-        .await
-        .expect("completion decisions read");
-        assert_eq!(
-            completions, 1,
-            "the decision commits exactly once after recovery"
-        );
-        stop_cli_server(server, shutdown, serve_handle).await;
-    }
-
     /// Prove a real `wyrd load` transfer clears stdout progress before its final JSON receipt.
     ///
     /// # Panics
@@ -2173,7 +2079,7 @@ mod pg_tests {
         let destination = temp.path().join("loaded");
         let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-load-progress", &["writer"])
+            .bootstrap_user("cli-load-progress", &["editor"])
             .await
             .expect("writer bootstraps")
         else {
@@ -2248,7 +2154,7 @@ mod pg_tests {
         let metadata_only = temp.path().join("metadata-only");
         let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
         let Bootstrap::User { jwt, .. } = server
-            .bootstrap_user("cli-get-progress", &["writer"])
+            .bootstrap_user("cli-get-progress", &["editor"])
             .await
             .expect("writer bootstraps")
         else {
@@ -2680,7 +2586,7 @@ mod pg_tests {
         assert_eq!(enabled["connection_id"], http.as_str());
 
         let Bootstrap::User { jwt: writer, .. } = server
-            .bootstrap_user("cli-connection-writer", &["writer"])
+            .bootstrap_user("cli-connection-writer", &["editor"])
             .await
             .expect("journey writer bootstraps")
         else {

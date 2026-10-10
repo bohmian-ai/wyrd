@@ -17,9 +17,9 @@ use chrono::{DateTime, Duration, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::json;
 use uuid::Uuid;
-use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_issue::{AccessGrant, IssueError, IssuingKey};
 use wyrd_auth_verify::{ActClaim, TokenAudience, TokenPrincipalRef, VerifiedToken};
+use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{Permission, PermissionSet, PrincipalId, RoleRef};
 use wyrd_spec::auth::{
     ExchangeTokenType, OAuthClientId, PrincipalKindTag, SecretBearer, TokenResponse, TokenType,
@@ -339,7 +339,7 @@ impl From<IssuanceError> for WyrdError {
 
 /// The one tenant access-token issuance owner.
 ///
-/// Holds the signing key, token lifetimes, and the process audit outbox; every
+/// Holds the signing key, token lifetimes, and the process audit stage; every
 /// tenant access token is minted through [`Self::issue`] on the caller's
 /// [`TenantConn`], so the token and its credential bookkeeping commit
 /// together. The issuance decision is staged on the outbox and never waits on,
@@ -350,8 +350,8 @@ pub struct TenantTokenIssuer {
     issuing_key: Arc<IssuingKey>,
     /// Access and refresh lifetimes.
     settings: TokenExchangeSettings,
-    /// Process audit outbox every grant decision is staged on.
-    audit: Arc<AuditOutbox>,
+    /// Process audit stage every grant decision is staged on.
+    audit: Arc<dyn AuditStage>,
 }
 
 impl std::fmt::Debug for TenantTokenIssuer {
@@ -369,7 +369,7 @@ impl TenantTokenIssuer {
     pub fn new(
         issuing_key: Arc<IssuingKey>,
         settings: TokenExchangeSettings,
-        audit: Arc<AuditOutbox>,
+        audit: Arc<dyn AuditStage>,
     ) -> Self {
         Self {
             issuing_key,
@@ -378,14 +378,14 @@ impl TenantTokenIssuer {
         }
     }
 
-    /// The process audit outbox shared by every grant built on this issuer.
+    /// The process audit stage shared by every grant built on this issuer.
     ///
     /// Grant services that record their own refusals (refresh reuse, refused
     /// delegation, failed OIDC or workload exchange) stage them here, so every
     /// auth decision reaches the one audit write path.
     #[must_use]
-    pub fn audit(&self) -> &AuditOutbox {
-        &self.audit
+    pub fn audit(&self) -> &dyn AuditStage {
+        &*self.audit
     }
 
     /// Mint a tenant access token for `principal_id` under `grant`.
@@ -397,7 +397,7 @@ impl TenantTokenIssuer {
     /// for a Card-bound principal, its transitive Card scope. It then signs a
     /// token carrying that `PermissionSet` for the configured access TTL and
     /// stages the canonical token-exchange audit (plus the Card-scope mint
-    /// audit for a Card-bound principal) on the process outbox without waiting.
+    /// audit for a Card-bound principal) on the process audit stage without waiting.
     ///
     /// For a [`TenantGrant::Delegation`], `principal_id` is the actor: the
     /// token instead names the grant's subject as its principal, carries the
@@ -429,7 +429,14 @@ impl TenantTokenIssuer {
         request_id: &str,
     ) -> Result<ExchangedToken, IssuanceError> {
         let tenant = conn.data_tenant_id();
-        let (principal, roles, permissions) = self.resolve(conn, principal_id, &grant).await?;
+        let (principal, roles, permissions) = self
+            .resolve(
+                conn,
+                principal_id,
+                grant.is_human(),
+                grant.records_owner_activity(),
+            )
+            .await?;
         let expires_at = Utc::now() + self.settings.access_ttl;
         let scope_mint = grant
             .scope_mint_kind()
@@ -456,7 +463,7 @@ impl TenantTokenIssuer {
         self.audit.stage(tenant, event);
         if let Some((mint_kind, root, scope)) = scope_mint {
             stage_scope_mint_success_audit(
-                &self.audit,
+                &*self.audit,
                 tenant,
                 principal_id,
                 &root,
@@ -495,7 +502,14 @@ impl TenantTokenIssuer {
         principal_id: Uuid,
         grant: TenantGrant,
     ) -> Result<VerifiedToken, IssuanceError> {
-        let (principal, roles, permissions) = self.resolve(conn, principal_id, &grant).await?;
+        let (principal, roles, permissions) = self
+            .resolve(
+                conn,
+                principal_id,
+                grant.is_human(),
+                grant.records_owner_activity(),
+            )
+            .await?;
         let claims = self.issuing_key.access_claims(
             grant.into_access_grant(principal, roles, permissions),
             self.settings.access_ttl,
@@ -503,13 +517,50 @@ impl TenantTokenIssuer {
         Ok(claims.into_verified().map_err(auth_error_to_wyrd)?)
     }
 
-    /// Resolve the principal `grant` issues for, with its current roles and
-    /// permissions.
+    /// Recover the current authority of `principal_id`, the stored writer of
+    /// a durable record, for server work queued on its behalf.
+    ///
+    /// The principal is read as a user when one has that id and as a service
+    /// account otherwise, then resolved exactly as [`Self::verify`] resolves
+    /// it — tenant admission, active status, current roles and permissions,
+    /// and a Card-bound principal's Card scope — so revoking a role or
+    /// suspending the principal takes effect for queued work too. Nothing is
+    /// presented, signed, or recorded: the result carries no credential and
+    /// no delegation, and no owner activity or audit is written.
+    ///
+    /// # Errors
+    /// Every [`Self::verify`] error except the activity write.
+    #[tracing::instrument(level = "debug", skip(self, conn), fields(principal_id = %principal_id), err)]
+    pub async fn recover(
+        &self,
+        conn: &mut TenantConn<'_>,
+        principal_id: Uuid,
+    ) -> Result<VerifiedToken, IssuanceError> {
+        let human = user_by_id(conn, principal_id).await?.is_some();
+        let (principal, roles, permissions) =
+            self.resolve(conn, principal_id, human, false).await?;
+        let claims = self.issuing_key.access_claims(
+            AccessGrant {
+                principal,
+                roles,
+                permissions,
+                credential_id: None,
+                act: None,
+                audience: TokenAudience::Wyrd,
+            },
+            self.settings.access_ttl,
+        )?;
+        Ok(claims.into_verified().map_err(auth_error_to_wyrd)?)
+    }
+
+    /// Resolve `principal_id` — a user when `human`, else a service account —
+    /// with its current roles and permissions.
     ///
     /// Refuses a tenant that does not admit credentials and a principal that
     /// is missing or not active, resolves a Card-bound principal's Card scope,
-    /// and records owner activity when the grant is a Card-bound machine's own
-    /// durable credential.
+    /// and records owner activity when `records_activity` is set for a
+    /// Card-bound principal, which only a machine's own durable-credential
+    /// grant sets.
     ///
     /// # Errors
     /// As [`Self::issue`], less the signing errors.
@@ -517,13 +568,14 @@ impl TenantTokenIssuer {
         &self,
         conn: &mut TenantConn<'_>,
         principal_id: Uuid,
-        grant: &TenantGrant,
+        human: bool,
+        records_activity: bool,
     ) -> Result<(TokenPrincipalRef, Vec<RoleRef>, PermissionSet), IssuanceError> {
         let tenant = conn.data_tenant_id();
         if !tenant_admits_credentials(conn, tenant).await? {
             return Err(IssuanceError::TenantNotAdmitting);
         }
-        let (principal, role_names) = if grant.is_human() {
+        let (principal, role_names) = if human {
             let user = user_by_id(conn, principal_id)
                 .await?
                 .filter(|user| user.status == "active")
@@ -561,7 +613,7 @@ impl TenantTokenIssuer {
         })?;
         let permissions = resolve_permissions(conn, &roles).await?;
 
-        if grant.records_owner_activity() && principal.card_ref.is_some() {
+        if records_activity && principal.card_ref.is_some() {
             record_machine_authentication(conn, principal.id).await?;
         }
         Ok((principal, roles, permissions))
@@ -839,7 +891,7 @@ mod tests {
     fn decodes_and_merges_permissions_from_role_rows() {
         let set = permission_set_from_rows(vec![
             role(
-                "reader",
+                "viewer",
                 json!([
                     { "resource": "cards", "action": "read", "scope": "all" },
                     { "resource": "artifacts", "action": "read", "scope": "all" }
@@ -963,7 +1015,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
     use wyrd_runtime::{Permission, PermissionSet, PrincipalId};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag};
+    use wyrd_spec::auth::{OAuthClientId, PrincipalKindTag, RoleSource};
     use wyrd_spec::card::verifier::OWNER_OCCURRENCE_KEY;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::CardUid;
@@ -981,10 +1033,9 @@ mod pg_tests {
     use wyrd_sql::row_types::auth::{HumanConnectionBinding, HumanSessionBinding};
 
     use super::{IssuanceError, TenantGrant, TenantTokenIssuer, TokenExchangeSettings};
-    use crate::audit::test_outbox::{drain, outbox};
+    use crate::audit::test_audit::RecordedAudit;
     use crate::revoke::pg_tests::wait_for_advisory_lock_wait;
     use crate::revoke::revoke_principal_in_conn;
-    use vala_sql::audit_outbox::AuditOutbox;
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
 
@@ -1013,11 +1064,11 @@ mod pg_tests {
     ///
     /// The test owns `audit` and drains it before its fixture drops, so no audit
     /// commit is still logging in when the fixture drops its database.
-    fn issuer(audit: &Arc<AuditOutbox>) -> TenantTokenIssuer {
+    fn issuer(audit: &Arc<RecordedAudit>) -> TenantTokenIssuer {
         TenantTokenIssuer::new(
             issuing_key(),
             TokenExchangeSettings::default(),
-            Arc::clone(audit),
+            Arc::clone(audit) as _,
         )
     }
 
@@ -1087,7 +1138,7 @@ mod pg_tests {
     #[tokio::test]
     async fn issue_signs_current_grants_and_follows_grant_changes() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let role_id = seed_card_reader_role(&mut conn).await;
@@ -1119,7 +1170,6 @@ mod pg_tests {
             !grants_card_read(&withdrawn.access_token, tenant),
             "the next token carries only the grants the principal holds now"
         );
-        drain(&audit).await;
     }
 
     /// A suspended principal is refused by every tenant grant, and the one
@@ -1131,7 +1181,7 @@ mod pg_tests {
     #[tokio::test]
     async fn a_suspended_principal_is_refused_by_every_grant() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user = seed_user(&mut conn).await;
@@ -1187,7 +1237,6 @@ mod pg_tests {
                 "{label} must refuse a suspended principal, got {result:?}"
             );
         }
-        drain(&audit).await;
     }
 
     /// Seed an active Service Card with one `schedule` binding and its
@@ -1275,7 +1324,7 @@ mod pg_tests {
     #[tokio::test]
     async fn qualifying_machine_grants_activate_the_bound_owner() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let creator = seed_user(&mut conn).await;
         let principal = seed_bound_service(&mut conn, creator).await;
@@ -1309,7 +1358,6 @@ mod pg_tests {
         let (renewed, cursor) = activity(&mut conn, principal).await;
         assert!(renewed.expect("renewal records activity") >= first);
         assert_eq!(cursor, Some(armed), "renewal never moves an armed cursor");
-        drain(&audit).await;
     }
 
     /// Delegation for a Card-bound owner and any grant for a Card-free
@@ -1321,7 +1369,7 @@ mod pg_tests {
     #[tokio::test]
     async fn non_qualifying_grants_never_touch_activity() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let creator = seed_user(&mut conn).await;
@@ -1365,19 +1413,18 @@ mod pg_tests {
                 .expect("card-free issuance succeeds");
         }
         assert_eq!(activity(&mut conn, automation).await, (None, None));
-        drain(&audit).await;
     }
 
     /// A human session carries the user's current grants and a refresh token.
     #[tokio::test]
     async fn a_human_session_carries_current_grants_and_a_refresh_token() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let role_id = seed_card_reader_role(&mut conn).await;
         let user = seed_user(&mut conn).await;
-        grant_role_to_user(&mut conn, user, role_id)
+        grant_role_to_user(&mut conn, user, role_id, RoleSource::Idp)
             .await
             .expect("role grants");
 
@@ -1392,7 +1439,6 @@ mod pg_tests {
 
         assert!(grants_card_read(&session.access_token, tenant));
         assert!(session.refresh_token.is_some(), "a human session renews");
-        drain(&audit).await;
     }
 
     /// No public tenant grant can mint for the SYSTEM writer: API-key exchange,
@@ -1404,7 +1450,7 @@ mod pg_tests {
     #[tokio::test]
     async fn public_grants_refuse_the_system_principal() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let writer = provision_system_principal(&mut conn)
@@ -1455,7 +1501,6 @@ mod pg_tests {
             matches!(session, Err(IssuanceError::PrincipalInactive)),
             "a human session cannot be opened for the writer: {session:?}"
         );
-        drain(&audit).await;
     }
 
     /// A session bound to a connection revision that is no longer Active is
@@ -1463,7 +1508,7 @@ mod pg_tests {
     #[tokio::test]
     async fn a_human_session_bound_to_an_inactive_connection_is_refused() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
         let user = seed_user(&mut conn).await;
         let active = seed_active_human_connection(&mut conn)
@@ -1482,7 +1527,6 @@ mod pg_tests {
             matches!(result, Err(IssuanceError::ConnectionInactive)),
             "a stale binding must refuse, got {result:?}"
         );
-        drain(&audit).await;
     }
 
     /// Read backend `conn`'s process id so a peer can observe its lock waits.
@@ -1530,7 +1574,7 @@ mod pg_tests {
     #[tokio::test]
     async fn initial_session_issuance_and_user_revocation_serialize() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let tenant = fixture.data_tenant_id();
         let mut setup = fixture.tenant_conn().await.expect("setup conn opens");
         let early = seed_user(&mut setup).await;
@@ -1602,6 +1646,5 @@ mod pg_tests {
             (0, 0),
             "a refused first login writes no refresh row"
         );
-        drain(&audit).await;
     }
 }

@@ -831,28 +831,21 @@ async fn scribe_optional_and_scoped_card_correlation_journey() {
     })
     .expect("the writer's SDK client");
 
-    let identity = |card: &wyrd_spec::reference::CardRef| {
-        wyrd_spec::reference::CardRef {
-            uid: None,
-            ..card.clone()
-        }
-        .to_string()
-    };
+    let root_uid = registry_card_uid(&server, &root).await;
+    let secondary_uid = registry_card_uid(&server, &secondary).await;
     append_correlated(
         &client,
         &table,
         &[
             (1, None),
-            (2, Some(identity(&root))),
-            (3, Some(identity(&secondary))),
+            (2, Some(root_uid.clone())),
+            (3, Some(secondary_uid.clone())),
         ],
     )
     .await
     .expect("optional and scoped correlations are admitted");
 
     let stamped = read_correlation(&client, &table).await;
-    let root_uid = registry_card_uid(&server, &root).await;
-    let secondary_uid = registry_card_uid(&server, &secondary).await;
     assert_eq!(
         stamped,
         vec![
@@ -866,7 +859,7 @@ async fn scribe_optional_and_scoped_card_correlation_journey() {
     let refusal = append_correlated(
         &client,
         &table,
-        &[(4, Some("prod/Service/other@1.0.0".to_owned()))],
+        &[(4, Some(uuid::Uuid::now_v7().to_string()))],
     )
     .await
     .expect_err("an out-of-scope Card is refused");
@@ -890,6 +883,108 @@ async fn scribe_optional_and_scoped_card_correlation_journey() {
             .collect::<Vec<_>>(),
         vec![1, 2, 3],
         "the refused batch left no row behind"
+    );
+
+    server.shutdown().await.expect("the server drains cleanly");
+}
+
+/// An unbound writer attributes rows to any registered observation-target
+/// Card in its tenant, end to end through the public routes.
+///
+/// The tenant administrator binds no Card, so its signed claims name no Card
+/// scope at all. A row naming a registered Service still stamps that Card's
+/// registry UID, while a row naming an unregistered Card, or a registered Card
+/// of a kind observations are never attributed to, refuses its frame with the
+/// same typed scope denial a Card-bound writer receives.
+///
+/// # Panics
+///
+/// Panics when the registered Card is not stamped with its registry UID, when
+/// an unregistered or non-observation Card is admitted, or when a refusal
+/// leaves a row behind.
+#[tokio::test]
+#[ignore = "requires Postgres and object storage"]
+async fn scribe_unbound_writer_card_attribution_journey() {
+    let server = start_scribe_server().await;
+    let tenant = server.data_tenant_id();
+    let table = register_table(
+        &server,
+        tenant,
+        BifrostNamespace::Datasets,
+        &unique_table("unbound_attribution"),
+    )
+    .await;
+    let observed = server
+        .bootstrap_service_in_tenant(tenant, &unique_table("observed"), &["viewer"])
+        .await
+        .expect("the observed Service registers")
+        .card_ref()
+        .expect("a bootstrapped service is bound to its Card")
+        .clone();
+    let client = wyrd_client::WyrdClient::with_config(ClientConfig {
+        grpc: GrpcConfig {
+            endpoint: server.grpc_url().expect("bound gRPC URL"),
+            connect_retries: 0,
+            ..GrpcConfig::default()
+        },
+        http: HttpConfig {
+            base_url: server.base_url().expect("bound HTTP URL").to_owned(),
+            ..HttpConfig::default()
+        },
+        credential: Some(server.tenant_admin_key().await.expect("tenant admin key")),
+        ..ClientConfig::default()
+    })
+    .expect("the administrator's SDK client");
+    let trigger = wyrd_client::cards::Cards::with_client(client.clone())
+        .register_from_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../fixtures/cards/scheduled_drift_alerts_operator/daily.yaml"
+        ))
+        .await
+        .expect("the Trigger registers");
+    let observed_uid = registry_card_uid(&server, &observed).await;
+    append_correlated(
+        &client,
+        &table,
+        &[(1, None), (2, Some(observed_uid.clone()))],
+    )
+    .await
+    .expect("a registered observation target is attributable");
+    let stamped = read_correlation(&client, &table)
+        .await
+        .into_iter()
+        .map(|(value, card_uid, _principal)| (value, card_uid))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        stamped,
+        vec![(1, None), (2, Some(observed_uid))],
+        "the registered Card is stamped with its registry UID"
+    );
+
+    for refused in [
+        uuid::Uuid::now_v7().to_string(),
+        registry_card_uid(&server, &trigger.root).await,
+    ] {
+        let refusal = append_correlated(&client, &table, &[(3, Some(refused.clone()))])
+            .await
+            .expect_err("only registered observation targets are attributable");
+        let code = match &refusal {
+            wyrd_spec::error::WyrdError::UpstreamFailure { details, .. } => details
+                .get("original_code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            other => other.code().to_owned(),
+        };
+        assert_eq!(
+            code, "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+            "{refused}: {refusal:?}"
+        );
+    }
+    assert_eq!(
+        read_correlation(&client, &table).await.len(),
+        2,
+        "the refused batches left no row behind"
     );
 
     server.shutdown().await.expect("the server drains cleanly");
@@ -1055,7 +1150,7 @@ async fn append_correlated(
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new(
-            wyrd_spec::vala::managed_columns::CARD_REF,
+            wyrd_spec::vala::managed_columns::CARD_UID,
             DataType::Utf8,
             true,
         ),
@@ -1174,7 +1269,6 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
     let builder = || {
         wyrd_testing::WyrdTestServer::builder()
             .with_durable_bifrost_data_root(data_root.path().to_path_buf())
-            .without_audit_publication_for_test()
     };
     let server = builder()
         .start_bound()

@@ -15,7 +15,6 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-#[cfg(feature = "internal")]
 use skald_spec::Prompt;
 use wyrd_cards::data::DataCard;
 use wyrd_cards::model::ModelCard;
@@ -586,7 +585,7 @@ impl WyrdState {
     /// # Errors
     /// Returns the client configuration error when the global config file
     /// cannot be read or parsed, or the credential resolution error.
-    pub(crate) fn client(&self) -> Result<&WyrdClient, WyrdError> {
+    pub fn client(&self) -> Result<&WyrdClient, WyrdError> {
         if let Some(client) = self.client.get() {
             return Ok(client);
         }
@@ -985,6 +984,15 @@ impl WyrdState {
     /// not a Prompt Card, or remains an authored path.
     #[cfg(feature = "internal")]
     pub fn agent_prompt(&self, alias: &str) -> Result<&Prompt, WyrdError> {
+        self.resolve_agent_prompt(alias)
+    }
+
+    /// Resolve an Agent's inline or exact Prompt Card prompt; the crate-wide
+    /// owner behind [`Self::agent_prompt`] and `Run::invoke`.
+    ///
+    /// # Errors
+    /// As [`Self::agent_prompt`].
+    pub(crate) fn resolve_agent_prompt(&self, alias: &str) -> Result<&Prompt, WyrdError> {
         let agent = self.agent(alias)?;
         match &agent.spec.prompt {
             wyrd_spec::reference::InlineableRef::Inline(prompt) => Ok(prompt.as_ref()),
@@ -1589,7 +1597,6 @@ fn typed_hydration_error(card: &Card, source: &WyrdError) -> WyrdError {
 /// The helper remains free because it only formats deterministic details from
 /// its arguments; the graph-owning lookup remains on `WyrdState`.
 #[must_use]
-#[cfg(feature = "internal")]
 fn invalid_agent_prompt_target(
     alias: &str,
     card_ref: &CardRef,
@@ -1616,7 +1623,6 @@ fn invalid_agent_prompt_target(
 /// # Panics
 /// This helper never panics; paths are copied into structured error details.
 #[must_use]
-#[cfg(feature = "internal")]
 fn unresolved_prompt_path(alias: &str, path: &Path) -> WyrdError {
     state_bundle_error(
         "Agent prompt retains an unresolved path reference",
@@ -2829,10 +2835,10 @@ pub(crate) mod tests {
     ) -> VerificationBinding {
         VerificationBinding {
             verifier: Ref::Ref(verifier),
-            runs_on: InlineableRef::Inline(Box::new(TriggerSpec {
+            runs_on: Some(InlineableRef::Inline(Box::new(TriggerSpec {
                 description: None,
                 activation,
-            })),
+            }))),
             on_failure: Vec::new(),
         }
     }
@@ -3022,6 +3028,48 @@ pub(crate) mod tests {
                 .prompt("triage_prompt_alt")
                 .expect("prompt alias resolves")
         ));
+    }
+
+    /// Prove `Run::invoke` refuses an Agent that declares tools with the stable
+    /// Agent validation code before resolving a client or doing any IO.
+    ///
+    /// # Panics
+    /// Panics if the fixture cannot load or the refusal carries another code.
+    #[tokio::test]
+    async fn invoke_refuses_an_agent_with_tools_before_io() {
+        let mut bundle = TestBundle::with_typed_cards();
+        let agent_ref = test_ref(CardKind::Agent, "tooled", 11);
+        bundle.add_card(
+            "agent_tooled",
+            card(
+                &agent_ref,
+                CardKind::Agent,
+                Spec::Agent(AgentSpec {
+                    prompt: InlineableRef::Inline(Box::new(prompt("tooled"))),
+                    tool_names: vec!["search".to_owned()],
+                    run_config: AgentRunConfigSpec::default(),
+                    verified_by: Vec::new(),
+                }),
+                Relationships::default(),
+            ),
+            &[],
+        );
+        bundle.rewrite_card(&test_ref(CardKind::Service, "service", 1), |card| {
+            let Spec::Service(spec) = &mut card.spec else {
+                panic!("fixture root is a Service");
+            };
+            spec.components
+                .push(service_component("agent_tooled", &agent_ref));
+        });
+        bundle.write();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        let refused = state
+            .run_for_card("agent_tooled")
+            .expect("agent view resolves")
+            .invoke(&[])
+            .await
+            .expect_err("an Agent with tools is refused");
+        assert_eq!(refused.code(), "WYRD_AGENT_422_VALIDATION", "{refused}");
     }
 
     /// Prove inline Agent prompts are borrowed directly from the Agent spec.

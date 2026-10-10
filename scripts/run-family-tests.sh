@@ -19,7 +19,9 @@ case "$family" in
   *) echo "unknown family: $family" >&2; exit 1 ;;
 esac
 
-mapfile -t packages < <(cargo metadata --locked --no-deps --format-version 1 |
+# A read loop rather than mapfile, which macOS's bash 3.2 lacks.
+packages=()
+while IFS= read -r pkg; do packages+=("$pkg"); done < <(cargo metadata --locked --no-deps --format-version 1 |
   jq -r --arg re "^($dirs)" \
     '.workspace_root as $root | .packages[]
      | select(.manifest_path | ltrimstr($root + "/") | test($re)) | .name')

@@ -8,6 +8,7 @@
 //! translation in `wyrd_client::bifrost`).
 
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::BifrostError;
 
 /// Concrete error produced by the producer, queue, and batch builder.
 #[derive(thiserror::Error, Debug)]
@@ -54,7 +55,7 @@ pub enum WyrdQueueError {
     #[error("schema parse: {0}")]
     SchemaParse(String),
 
-    /// A reserved column name (`wyrd_*`, or `card_ref`/`run_id` presented as a
+    /// A reserved column name (`wyrd_*`, or `card_uid`/`run_id` presented as a
     /// payload key rather than via its argument) appeared where user fields are
     /// expected. Serialization-domain `WYRD_VALA_400_BIFROST_RESERVED_COLUMN`.
     #[error("reserved column: {0}")]
@@ -84,14 +85,22 @@ impl WyrdQueueError {
 impl From<WyrdQueueError> for WyrdError {
     /// Map to the stable [`WyrdError`] catalog at the surface boundary.
     ///
-    /// The queue-domain codes project onto typed `WyrdError` variants via the
-    /// shared `WyrdError::from_code` reconstruction (so the client boundary
-    /// reports the real status/code); the `Sink` variant passes its already-mapped
+    /// The serialization-domain failures become their typed Bifrost errors and
+    /// the queue-domain codes project onto typed `WyrdError` variants via the
+    /// shared `WyrdError::from_code` reconstruction, so every boundary reports
+    /// the real status and code; the `Sink` variant passes its already-mapped
     /// error straight through.
     fn from(err: WyrdQueueError) -> Self {
-        if let WyrdQueueError::Sink(inner) = err {
-            return inner;
-        }
+        let err = match err {
+            WyrdQueueError::Sink(inner) => return inner,
+            WyrdQueueError::SchemaParse(detail) => {
+                return BifrostError::SchemaParse { detail }.into();
+            }
+            WyrdQueueError::ReservedColumn(column) => {
+                return BifrostError::ReservedColumn { column }.into();
+            }
+            other => other,
+        };
         let code = err.code();
         let message = err.to_string();
         WyrdError::from_code(code, message.clone(), serde_json::json!({})).unwrap_or(
@@ -100,5 +109,32 @@ impl From<WyrdQueueError> for WyrdError {
                 details: serde_json::json!({ "original_code": code }),
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Surface mapping of queue errors onto the stable catalog.
+
+    use super::*;
+
+    /// Serialization-domain failures keep their Bifrost code and client
+    /// status at the surface instead of collapsing into an internal error.
+    #[test]
+    fn serialization_failures_map_to_their_bifrost_errors() {
+        let cases = [
+            (
+                WyrdQueueError::SchemaParse("free-form object".to_owned()),
+                "WYRD_VALA_400_SCHEMA_PARSE",
+            ),
+            (
+                WyrdQueueError::ReservedColumn("run_id".to_owned()),
+                "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
+            ),
+        ];
+        for (error, code) in cases {
+            let mapped = WyrdError::from(error);
+            assert_eq!((mapped.code(), mapped.status()), (code, 400));
+        }
     }
 }

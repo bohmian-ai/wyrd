@@ -27,9 +27,9 @@ use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest};
+use wyrd_spec::vala::api::{AuthMethod, BifrostQueryRequest};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::WyrdTestCluster;
 use wyrd_testing::bifrost::write::BifrostWriter;
@@ -341,17 +341,6 @@ pub(crate) async fn seed_foreign_hot_row(
         .storage_operator()
         .write(&path, Buffer::from(parquet.clone()))
         .await?;
-    let event = AuditEvent::new(
-        RequestId::now_v7(),
-        None,
-        "oracle.journey.foreign_row".to_owned(),
-        "bifrost.oracle.journey".to_owned(),
-        None,
-        PrincipalId::new(uuid::Uuid::now_v7()),
-        PrincipalKindTag::User,
-        "bifrost_query:read".to_owned(),
-        AuditOutcome::Allowed,
-    );
     let mut conn = cluster.pg_fixture().tenant_conn_for(owner).await?;
     sqlx::query(
         "INSERT INTO vala.file_list \
@@ -372,7 +361,6 @@ pub(crate) async fn seed_foreign_hot_row(
     .bind(hex::encode(Sha256::digest(&parquet)))
     .execute(&mut **conn.transaction())
     .await?;
-    vala_sql::queries::audit_staging::append_audit(&mut conn, &event).await?;
     conn.commit().await?;
     Ok(())
 }

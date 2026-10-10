@@ -215,7 +215,11 @@ pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
 /// collapsing onto `502`. Codes with no matching variant fall back to
 /// [`WyrdError::UpstreamFailure`] with the original code preserved in
 /// `details.original_code` rather than silently dropped.
-fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -> WyrdError {
+pub(crate) fn code_to_wyrd_error(
+    code: &str,
+    message: String,
+    details: serde_json::Value,
+) -> WyrdError {
     if code.starts_with("WYRD_STORAGE_")
         && let Ok(error) = serde_json::from_value::<WyrdStorageError>(details.clone())
     {
@@ -322,13 +326,7 @@ fn bifrost_error_from_code(
         }
         "WYRD_VALA_403_QUERY_PEER_SECURITY" => BifrostError::QueryPeerSecurity,
         "WYRD_VALA_403_QUERY_FORBIDDEN" => BifrostError::QueryForbidden,
-        "WYRD_VALA_403_BIFROST_CARD_SCOPE" => BifrostError::CardScopeDenied {
-            card_ref: message
-                .strip_prefix("card_ref outside principal card scope: ")
-                .or_else(|| details.get("card_ref").and_then(serde_json::Value::as_str))
-                .unwrap_or("<unknown>")
-                .to_owned(),
-        },
+        "WYRD_VALA_403_BIFROST_CARD_SCOPE" => BifrostError::CardScopeDenied,
         "WYRD_VALA_502_QUERY_STREAM_PROTOCOL" => BifrostError::QueryStreamProtocol,
         "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE" => BifrostError::QueryStreamIncomplete,
         "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE" => BifrostError::QueryResultTooLarge,
@@ -544,15 +542,12 @@ mod tests {
 
         let card_scope = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_403_BIFROST_CARD_SCOPE",
-            "detail": "card_ref outside principal card scope: Model/model@1.0.0",
+            "detail": "Card outside principal card scope",
             "details": {},
         }));
         assert_eq!(card_scope.status(), 403);
         assert_eq!(card_scope.code(), "WYRD_VALA_403_BIFROST_CARD_SCOPE");
-        assert_eq!(
-            card_scope.to_string(),
-            "card_ref outside principal card scope: Model/model@1.0.0"
-        );
+        assert_eq!(card_scope.to_string(), "Card outside principal card scope");
 
         let admission = from_problem_json(&serde_json::json!({
             "code": "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",

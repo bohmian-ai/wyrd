@@ -576,7 +576,6 @@ module.exports.NativeWyrdTestServer = nativeBinding.NativeWyrdTestServer
 module.exports.cliApply = nativeBinding.cliApply
 module.exports.cliDeleteProviderCredential = nativeBinding.cliDeleteProviderCredential
 module.exports.cliGet = nativeBinding.cliGet
-module.exports.cliGrantRole = nativeBinding.cliGrantRole
 module.exports.cliIssueKey = nativeBinding.cliIssueKey
 module.exports.cliLoad = nativeBinding.cliLoad
 module.exports.cliPlan = nativeBinding.cliPlan

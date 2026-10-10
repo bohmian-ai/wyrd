@@ -131,7 +131,8 @@ message IngestCaptureRequest {
 // the exact Verifier Card reference and UID Scribe stamps as card_uid, and the
 // tenant SYSTEM principal Scribe stamps as principal_id.
 message VerifierResultAttribution {
-  string run_id = 1; string verifier_ref = 2; string verifier_uid = 3; string principal_id = 4;
+  reserved 1; reserved "run_id";
+  string verifier_ref = 2; string verifier_uid = 3; string principal_id = 4;
 }
 message IngestCaptureResponse {}
 // One successful Scribe promotion Iceberg commit. properties carries only the

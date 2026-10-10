@@ -9,6 +9,7 @@
 //! away, so removing the connection or losing the provider leaves the
 //! deployment administrable.
 
+use crate::scribe_outbox::ScribeOutbox;
 use axum::Extension;
 use axum::Json;
 use axum::extract::rejection::PathRejection;
@@ -18,7 +19,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use uuid::Uuid;
-use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth::pg_resolvers::{client_auth_label, seal_platform_client_secret};
 use wyrd_auth::platform_authz::{
     PLATFORM_ADMINS_RESOURCE, PLATFORM_CONNECTION_RESOURCE, PlatformAuthorization,
@@ -164,12 +164,12 @@ pub(super) async fn commit_decision(decision: TenantConn<'_>) -> Result<(), Wyrd
 /// internal error when the transaction cannot be opened or committed.
 pub(super) async fn authorize_read(
     pool: &OperatorPool,
-    audit: &Arc<AuditOutbox>,
+    audit: &Arc<ScribeOutbox>,
     caller: &PlatformCaller,
     required: &Permission,
     resource: &str,
 ) -> Result<(), WyrdErrorResponse> {
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(audit));
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(audit) as _);
     let decision = authorize(&authz, caller, required, resource).await?;
     commit_decision(decision).await
 }
@@ -217,7 +217,7 @@ async fn configure_connection(
 ) -> Result<Json<PlatformOidcConnectionView>, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
     let mut decision = authorize(
         &authz,
         &caller,
@@ -327,7 +327,7 @@ async fn read_connection(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
-        &state.audit_outbox,
+        &state.scribe_outbox,
         &caller,
         &Permission::platform_identity_read(),
         PLATFORM_CONNECTION_RESOURCE,
@@ -383,7 +383,7 @@ async fn remove_connection(
 ) -> Result<StatusCode, WyrdErrorResponse> {
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
     let mut decision = authorize(
         &authz,
         &caller,
@@ -455,7 +455,7 @@ async fn register_admin(
     // the name an operator would retry with.
     //
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
     // The id is minted before the decision so the record names the principal
     // this request creates. Nothing has adopted an existing row here — unlike
     // tenant provisioning — so the minted id is the one that is written.
@@ -548,7 +548,7 @@ async fn list_platform_admins(
     let pool = operator(&state)?;
     authorize_read(
         &pool,
-        &state.audit_outbox,
+        &state.scribe_outbox,
         &caller,
         &Permission::platform_identity_read(),
         PLATFORM_ADMINS_RESOURCE,
@@ -625,7 +625,7 @@ async fn set_admin_status(
 
     let pool = operator(&state)?;
     // The handle must outlive the transaction it lends out.
-    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.audit_outbox));
+    let authz = PlatformAuthorization::new(pool.clone(), Arc::clone(&state.scribe_outbox) as _);
     let mut decision = authorize(
         &authz,
         &caller,

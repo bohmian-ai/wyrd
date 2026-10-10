@@ -66,6 +66,8 @@ pub struct ObservationRun {
     pub run: VerificationRunId,
     /// Name of the Verifier Card the run executes.
     pub verifier: String,
+    /// Exact Verifier Card version the run executes.
+    pub verifier_uid: Uuid,
     /// The frozen `record_id` of the observation that created the run.
     pub record_id: String,
     /// The frozen server-managed `wyrd_event_time` of that observation.
@@ -83,6 +85,8 @@ struct ObservationRunRow {
     run_id: Uuid,
     /// The Verifier Card name.
     verifier: String,
+    /// The exact Verifier Card version.
+    verifier_uid: Uuid,
     /// The frozen observation record ID.
     record_id: String,
     /// The frozen observation event time.
@@ -623,7 +627,7 @@ impl VerificationFixture {
     pub async fn observation_runs(&self) -> Result<Vec<ObservationRun>, VerificationFixtureError> {
         let mut conn = self.postgres.tenant_conn(self.tenant).await?;
         let rows: Vec<ObservationRunRow> = sqlx::query_as(
-            "SELECT r.run_id, c.name AS verifier, r.input_record_id AS record_id, \
+            "SELECT r.run_id, c.name AS verifier, r.verifier_uid, r.input_record_id AS record_id, \
                     r.input_event_time AS event_time, r.status, r.attempts, r.result_id, \
                     r.error->>'code' AS error_code, \
                     (SELECT count(*) FROM wyrd.operator_dispatches d \
@@ -639,6 +643,7 @@ impl VerificationFixture {
                     run: VerificationRunId::new(row.run_id)
                         .map_err(|error| VerificationFixtureError::Card(error.to_string()))?,
                     verifier: row.verifier,
+                    verifier_uid: row.verifier_uid,
                     record_id: row.record_id,
                     event_time: row.event_time,
                     state: RunRow {

@@ -27,6 +27,7 @@ use wyrd_gateway::{
     IngressDialect, MediaRequest, ProviderAttempt, ProviderDispatch, ResponseBody, ResponseCapture,
     StreamEnd, outcome_error_code, outcome_name,
 };
+use wyrd_runtime::principal::CardAttribution;
 use wyrd_runtime::{Permission, PermissionDenyReason, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::GatewayAccess;
@@ -36,13 +37,16 @@ use wyrd_spec::gateway::{
     GatewayContractError, GatewayFallbackOverride, GatewayOperation, GatewayPayloadField,
     GatewayUsageAmount, ModelRef,
 };
-use wyrd_spec::ids::ProviderDeploymentName;
+use wyrd_spec::ids::{CardUid, ProviderDeploymentName};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuditOutcome;
+use wyrd_spec::vala::error::BifrostError;
+use wyrd_spec::vala::ids::RunId;
+use wyrd_sql::queries::cards::get_card_by_uid;
 
 use super::capture::{
-    CallCapture, CallFacts, CaptureDrop, GatewayCapture, PayloadObjects, error_code,
-    operation_name, request_content, selects,
+    CallCapture, CallFacts, CaptureDrop, PayloadObjects, error_code, operation_name, record,
+    request_content, selects,
 };
 use super::ledger::{Admission, GatewayLedger, LedgerCall};
 use super::service::{GatewayAdministration, unavailable};
@@ -85,6 +89,23 @@ pub struct GatewayCallRequest {
     pub usage_bound: Option<Vec<GatewayUsageAmount>>,
     /// Caller deadline measured from admission.
     pub timeout: Duration,
+    /// Application Run and Card the call is attributed to; `None` records an
+    /// uncorrelated call.
+    pub subject: Option<GatewayCallSubject>,
+}
+
+/// Application Run and Card one governed call is attributed to.
+///
+/// Ingress builds it from the paired `wyrd-run-id` and `wyrd-card-uid`
+/// headers. Admission authorizes the UID against the caller before any
+/// provider sees the call, and the captured `vala.gateway.calls` row records
+/// the authorized UID.
+#[derive(Debug, Clone)]
+pub struct GatewayCallSubject {
+    /// Application Run the call belongs to.
+    pub run_id: RunId,
+    /// UID of the Card the call is attributed to.
+    pub card_uid: CardUid,
 }
 
 /// Provider answer of a governed call: a completion, or the refusal that
@@ -178,6 +199,8 @@ struct AdmittedCall {
     deadline: Instant,
     /// Model the caller requested.
     requested: ModelRef,
+    /// Authorized Run and Card attribution, carrying the Card's UID.
+    subject: Option<GatewayCallSubject>,
 }
 
 impl AdmittedCall {
@@ -401,7 +424,7 @@ impl<'a> GatewayInvocation<'a> {
     async fn admit_call(
         &self,
         caller: &Caller,
-        request: GatewayCallRequest,
+        mut request: GatewayCallRequest,
         authorized: bool,
     ) -> Result<(AdmittedCall, CallPlan, Admission), CallFailure> {
         let call_id = GatewayCallId::new_v7();
@@ -428,6 +451,10 @@ impl<'a> GatewayInvocation<'a> {
             self.decide(caller, OPERATION, &request.model)
                 .map_err(permission_deny_reason_to_wyrd)?;
         }
+        let subject = match request.subject.take() {
+            Some(subject) => Some(self.attribute(caller, subject).await?),
+            None => None,
+        };
 
         let tenant = caller.data_tenant_id;
         let snapshot = GatewayAdministration::new(self.state)
@@ -450,6 +477,7 @@ impl<'a> GatewayInvocation<'a> {
             expires_at: admitted_at + grace,
             deadline: Instant::now() + request.timeout,
             requested: request.model,
+            subject,
         };
         let admission = self.admit(&call, &mut plan).await?;
         Ok((call, plan, admission))
@@ -654,8 +682,59 @@ impl<'a> GatewayInvocation<'a> {
             &permission.to_string(),
             outcome,
         );
-        self.state.audit_outbox.stage(caller.data_tenant_id, event);
+        self.state.scribe_outbox.stage(caller.data_tenant_id, event);
         verdict
+    }
+
+    /// Authorizes the Card UID `subject` attributes a call to.
+    ///
+    /// A Card-bound caller attributes only to a UID its signed scope carries;
+    /// a caller bound to no Card may attribute to any registered
+    /// observation-target Card of its tenant, read from the registry. Runs
+    /// before routing, so a refusal reaches no provider.
+    ///
+    /// # Errors
+    /// Returns `CardScopeDenied` for a UID outside the signed scope or, for an
+    /// unbound caller, one naming no registered observation-target Card, and
+    /// `ServiceUnavailable` when the registry cannot be read.
+    async fn attribute(
+        &self,
+        caller: &Caller,
+        subject: GatewayCallSubject,
+    ) -> Result<GatewayCallSubject, WyrdError> {
+        let authorized = match caller.principal.card_attribution() {
+            CardAttribution::Scoped(scope) => scope.uids().contains(&subject.card_uid),
+            CardAttribution::AnyRegistered => {
+                self.is_observation_target(caller.data_tenant_id, &subject.card_uid)
+                    .await?
+            }
+        };
+        if !authorized {
+            return Err(BifrostError::CardScopeDenied.into());
+        }
+        Ok(subject)
+    }
+
+    /// Whether `uid` names a registered observation-target Card in `tenant`.
+    ///
+    /// # Errors
+    /// Returns `ServiceUnavailable` when the registry cannot be read.
+    async fn is_observation_target(
+        &self,
+        tenant: DataTenantId,
+        uid: &CardUid,
+    ) -> Result<bool, WyrdError> {
+        let mut conn = self
+            .state
+            .postgres
+            .tenant_conn(tenant)
+            .await
+            .map_err(unavailable)?;
+        match get_card_by_uid(&mut conn, uid).await {
+            Ok(row) => Ok(row.kind.is_observation_target()),
+            Err(WyrdError::RegistryCardNotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Admits `call` in its own committed tenant transaction.
@@ -787,50 +866,48 @@ impl<'a> GatewayInvocation<'a> {
             attempts: execution.attempts.clone(),
             entries: entries.map(<[_]>::to_vec).unwrap_or_default(),
             policy: policy.clone(),
+            subject: call.subject.clone(),
             request: None,
             response,
             objects,
         })
     }
 
-    /// Projects and delivers the capture of one terminal call, if selected.
+    /// Projects the capture of one terminal call, if selected, and stages it
+    /// on the process Scribe outbox.
     ///
     /// Runs after the caller has its answer; every outcome is counted by
-    /// [`GatewayCapture::record`]. The whole capture — request content, object
-    /// get, put, and read-back, and every Scribe submission — is bounded by
-    /// the admitted call's absolute deadline, so a hung dependency cannot hold
-    /// facts, object bytes, or this task past the call. Delivery itself stops
-    /// retrying at that deadline with its own drop reason; work still running
-    /// when it passes is dropped, releasing what it held, and one
-    /// [`CaptureDrop::Unavailable`] is recorded.
+    /// [`record`]. Request-content resolution and object get, put, and
+    /// read-back are bounded by the admitted call's absolute deadline, so a
+    /// hung dependency cannot hold facts, object bytes, or this task past the
+    /// call; work still running when it passes is dropped, releasing what it
+    /// held, and one [`CaptureDrop::Unavailable`] is recorded. Staging itself
+    /// never waits: the outbox owns encoding and delivery.
     async fn capture(state: &AppState, call: &AdmittedCall, facts: Option<CallFacts>) {
         let Some(mut facts) = facts else {
             return;
         };
         let work = async {
             if selects(&facts.policy, GatewayPayloadField::Request) {
-                match request_content(&call.body, call.media.as_ref(), &mut facts.objects).await {
-                    Ok(content) => facts.request = Some(content),
-                    Err(_) => {
-                        return GatewayCapture::record(call.call_id, Err(CaptureDrop::Payload));
-                    }
-                }
+                request_content(&call.body, call.media.as_ref(), &mut facts.objects)
+                    .await
+                    .map(|content| facts.request = Some(content))
+                    .map_err(|_| CaptureDrop::Payload)?;
             }
-            match CallCapture::from_facts(facts) {
-                Ok(capture) => {
-                    state
-                        .gateway_capture
-                        .publish(state, &capture, call.deadline)
-                        .await
-                        .ok();
-                }
-                Err(drop) => GatewayCapture::record(call.call_id, Err(drop)),
-            }
+            let mut capture = CallCapture::from_facts(facts)?;
+            capture.persist(state).await?;
+            Ok(capture)
         }
         .instrument(tracing::info_span!("gateway.capture"));
-        if tokio::time::timeout_at(call.deadline, work).await.is_err() {
-            GatewayCapture::record(call.call_id, Err(CaptureDrop::Unavailable));
-        }
+        let result = match tokio::time::timeout_at(call.deadline, work).await {
+            Ok(Ok(capture)) => {
+                state.scribe_outbox.stage(capture.tenant(), capture);
+                Ok(())
+            }
+            Ok(Err(drop)) => Err(drop),
+            Err(_) => Err(CaptureDrop::Unavailable),
+        };
+        record(call.call_id, result);
     }
 
     /// Records the terminal request, attempt, routing, usage, and cost

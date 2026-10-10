@@ -9,7 +9,7 @@
 //! Eval-verified on `observations_ready`. It waits for both baselines to fit
 //! and seeds one window of [`SAMPLES`] Drift observations that every queued
 //! Drift run reads.
-//! Registration gives each Service principal the `wyrd_default` role, so its
+//! Registration gives each Service principal the `workload` role, so its
 //! Card-bound key emits; the administrator runs and executes Verifiers.
 
 use std::fmt::Write as _;

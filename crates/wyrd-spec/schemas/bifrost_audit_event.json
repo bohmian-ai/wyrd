@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "AuditEvent",
-  "description": "One audited authorization decision.\n\nEvery boundary that evaluates a principal's permission stages exactly one `AuditEvent` on the process audit outbox once the decision is known, outside the operation's transaction; the operation proceeds or is refused without waiting for the event to commit. The outbox later commits it as one hash-chained staging row. The hash-chain canonical encoding and per-tenant `seq` are owned by `vala-sql`; this type is the Arrow-free, PyO3-free wire/codegen shape.\n\n`card_ref` is the **writer-identity card** (who performed the op), derived from the resolved `Principal`; it is `None` only for a `User` principal. This is decoupled from the per-row `card_ref` data column.",
+  "description": "One audited authorization decision.\n\nEvery boundary that evaluates a principal's permission stages exactly one `AuditEvent` on the process audit outbox once the decision is known, outside the operation's transaction; the operation proceeds or is refused without waiting for the event to commit. The outbox later commits it as one hash-chained staging row. The hash-chain canonical encoding and per-tenant `seq` are owned by `vala-sql`; this type is the Arrow-free, PyO3-free wire/codegen shape.\n\n`card_ref` is the **writer-identity card** (who performed the op), derived from the resolved `Principal`; it is `None` only for a `User` principal. This is decoupled from the per-row `card_uid` data column.",
   "type": "object",
   "required": [
     "operation",

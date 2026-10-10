@@ -1948,7 +1948,7 @@ mod tests {
     /// the user fields, supplies the correlation inputs, and may supply the
     /// managed candidate. Building a schema from that description must append
     /// each correlation column exactly once — a writer that also re-declared
-    /// `card_ref` would collide with the one the write path resolves.
+    /// `card_uid` would collide with the one the write path resolves.
     ///
     /// # Panics
     ///
@@ -1972,8 +1972,8 @@ mod tests {
                   "metadata": { "PARQUET:field_id": "1" } }
             ],
             "correlation_fields": [
-                { "name": "card_ref", "data_type": "Utf8", "nullable": true,
-                  "metadata": { "wyrd:input_class": "gate_correlation" } },
+                { "name": "card_uid", "data_type": "Utf8", "nullable": true,
+                  "metadata": { "PARQUET:field_id": "1001" } },
                 { "name": "run_id", "data_type": "Utf8", "nullable": true,
                   "metadata": { "PARQUET:field_id": "1000" } }
             ],
@@ -2010,7 +2010,7 @@ mod tests {
                 .iter()
                 .map(|field| field.name().as_str())
                 .collect::<Vec<_>>(),
-            ["trace_id", "card_ref", "run_id", "wyrd_event_time"],
+            ["trace_id", "card_uid", "run_id", "wyrd_event_time"],
             "user fields precede correlation inputs, then the managed candidate"
         );
         assert!(
@@ -2036,14 +2036,14 @@ mod tests {
                 .output_schema()
                 .fields()
                 .iter()
-                .filter(|field| field.name() == "card_ref")
+                .filter(|field| field.name() == "card_uid")
                 .count(),
             1,
             "the write path appends each correlation column exactly once"
         );
         assert!(
             writable.field(1).is_nullable(),
-            "card_ref is nullable: a writer may submit a row with no Card correlation"
+            "card_uid is nullable: a writer may submit a row with no Card correlation"
         );
         assert!(
             builder.output_schema().field(1).is_nullable(),

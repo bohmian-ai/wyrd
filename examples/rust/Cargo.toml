@@ -61,6 +61,10 @@ path = "workflow_structured_output.rs"
 name = "client_request"
 path = "client_request.rs"
 
+[[bin]]
+name = "support_desk"
+path = "../support-desk/rust/main.rs"
+
 [dependencies]
 anyhow = "1"
 reqwest = { workspace = true }
@@ -68,6 +72,7 @@ async-trait = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 skald-agent = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
@@ -75,8 +80,9 @@ skald-spec = { workspace = true }
 skald-tool = { workspace = true }
 skald-workflow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing = { workspace = true }
 wyrd = { path = "../../crates/wyrd/wyrd" }
-wyrd-sdk-rust = { path = "../../sdks/wyrd-sdk-rust" }
+wyrd-sdk-rust = { path = "../../sdks/wyrd-sdk-rust", features = ["otel"] }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]

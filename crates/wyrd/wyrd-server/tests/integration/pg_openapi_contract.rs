@@ -150,7 +150,9 @@ async fn the_served_document_describes_the_composed_surface() {
         "/v1/cards/{card_uid}/complete",
         "/v1/cards/download/init",
         "/v1/principals/{principal_id}/credentials/{credential_id}",
-        "/v1/auth/grant-role",
+        "/v1/principals",
+        "/v1/principals/{principal_id}/roles",
+        "/v1/principals/{principal_id}/roles/{role}",
         "/v1/verification/bindings/{binding_id}",
         "/v1/verification/runs",
         "/v1/verification/runs/{run_id}",
@@ -1083,7 +1085,9 @@ async fn gateway_ingress_publishes_typed_contracts() {
 
 /// Every public inference ingress publishes the optional
 /// `wyrd-gateway-fallback` header with its encoding, size limits, and refusal
-/// code, while ingresses that ignore it publish no such parameter.
+/// code, while ingresses that ignore it publish no such parameter. The same
+/// ingresses publish the optional `wyrd-card-uid` correlation header with its
+/// refusal codes and no `wyrd-card-ref` header.
 ///
 /// # Panics
 /// Panics when the server fails to start or stop or a published header
@@ -1094,16 +1098,17 @@ async fn gateway_inference_ingress_publishes_the_fallback_header() {
         .await
         .expect("test server starts");
     let document = served_document(&server).await;
-    let fallback = |path: &str| {
+    let parameter = |path: &str, name: &str| {
         document["paths"][path]["post"]["parameters"]
             .as_array()
             .and_then(|parameters| {
                 parameters
                     .iter()
-                    .find(|parameter| parameter["name"] == "wyrd-gateway-fallback")
+                    .find(|parameter| parameter["name"] == name)
             })
             .cloned()
     };
+    let fallback = |path: &str| parameter(path, "wyrd-gateway-fallback");
 
     for path in [
         "/v1/chat/completions",
@@ -1124,6 +1129,21 @@ async fn gateway_inference_ingress_publishes_the_fallback_header() {
         ] {
             assert!(description.contains(term), "{path} documents {term}");
         }
+        let card_uid = parameter(path, "wyrd-card-uid")
+            .unwrap_or_else(|| panic!("{path} publishes the Card UID header"));
+        assert_ne!(card_uid["required"], true, "{path} Card UID is optional");
+        let description = card_uid["description"].as_str().unwrap_or_default();
+        for term in [
+            "wyrd-run-id",
+            "WYRD_GATEWAY_400_INVALID_REQUEST",
+            "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+        ] {
+            assert!(description.contains(term), "{path} documents {term}");
+        }
+        assert!(
+            parameter(path, "wyrd-card-ref").is_none(),
+            "{path} publishes no Card reference header"
+        );
     }
     assert!(
         fallback("/v1/embeddings").is_none(),
@@ -1427,7 +1447,7 @@ async fn no_yaml_projection_is_routed() {
     // probe carries a credential: only a genuinely unrouted path reaches the
     // router's own not-found.
     let reader = server
-        .bootstrap_service("openapi-yaml-probe", &["reader"])
+        .bootstrap_service("openapi-yaml-probe", &["viewer"])
         .await
         .expect("service bootstraps");
     let token = server
@@ -1578,7 +1598,7 @@ async fn an_unknown_upload_answers_with_a_code_the_operation_documents() {
         .expect("test server starts");
     let document = served_document(&server).await;
     let writer = server
-        .bootstrap_service("openapi-storage", &["writer"])
+        .bootstrap_service("openapi-storage", &["editor"])
         .await
         .expect("service bootstraps");
     let token = server
@@ -1632,7 +1652,7 @@ async fn an_unextractable_local_transfer_locator_answers_with_a_documented_probl
         .expect("test server starts");
     let document = served_document(&server).await;
     let writer = server
-        .bootstrap_service("openapi-local-transfer", &["writer"])
+        .bootstrap_service("openapi-local-transfer", &["editor"])
         .await
         .expect("service bootstraps");
     let token = server
@@ -1741,7 +1761,7 @@ async fn a_malformed_administrative_identifier_answers_with_a_documented_problem
         .expect("test server starts");
     let document = served_document(&server).await;
     let tenant = server
-        .bootstrap_service("openapi-malformed-id", &["reader"])
+        .bootstrap_service("openapi-malformed-id", &["viewer"])
         .await
         .expect("service bootstraps");
     let tenant_token = server
@@ -1828,111 +1848,6 @@ async fn a_malformed_administrative_identifier_answers_with_a_documented_problem
             "GET {path} lists WYRD_SPEC_400_VALIDATION on its 400"
         );
     }
-
-    server.shutdown().await.expect("server shuts down");
-}
-
-/// A credential exchange whose audit cannot be staged still grants a token.
-///
-/// `/auth/token` is the one operation every caller reaches before it has a
-/// session. Its decision is staged on the non-blocking audit outbox, so a
-/// staging insert refused at the store costs the grant nothing: the exchange
-/// answers `200`, the failed audit write is counted, and the retried decision
-/// commits exactly once after the store accepts it again.
-///
-/// The failure is injected at the store with a trigger scoped to the exchange
-/// operation, so no handler seam is stubbed.
-///
-/// # Panics
-/// Panics when the exchange is refused, the failure is not counted, or the
-/// decision does not commit once after recovery.
-#[tokio::test]
-async fn an_unstageable_exchange_audit_still_grants_a_token() {
-    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
-    let server = WyrdTestServer::start_in_process()
-        .await
-        .expect("test server starts");
-    let service = server
-        .bootstrap_service("openapi-token-audit", &["reader"])
-        .await
-        .expect("service bootstraps");
-    let api_key = service
-        .api_key()
-        .expect("machine bootstraps with a key")
-        .expose_secret()
-        .to_owned();
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
-    let exchanges = || async {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.token.exchange'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("exchange decisions read")
-    };
-    server
-        .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
-        .await
-        .expect("audit outbox settles");
-    let exchanges_before = exchanges().await;
-    sqlx::raw_sql(
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_token_exchange_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'auth.token.exchange' THEN
-               RAISE EXCEPTION 'injected token exchange audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;
-         DROP TRIGGER IF EXISTS test_fail_token_exchange_audit ON vala.audit_staging;
-         CREATE TRIGGER test_fail_token_exchange_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_token_exchange_audit();",
-    )
-    .execute(&pool)
-    .await
-    .expect("token exchange audit failure installs");
-
-    let response = server
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/auth/token")
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(api_key_exchange(&api_key)))
-                .expect("request builds"),
-        )
-        .await
-        .expect("router responds");
-
-    let status = response.status();
-    let body = problem_json(response).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    failures
-        .await_failure(std::time::Duration::from_secs(30))
-        .await
-        .expect("the failed audit write is counted");
-    sqlx::query("DROP TRIGGER test_fail_token_exchange_audit ON vala.audit_staging")
-        .execute(&pool)
-        .await
-        .expect("token exchange audit failure drops");
-    assert_eq!(
-        server
-            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
-            .await
-            .expect("audit outbox settles"),
-        0,
-        "the retried decision drains"
-    );
-    assert_eq!(
-        exchanges().await,
-        exchanges_before + 1,
-        "the decision commits exactly once after recovery"
-    );
 
     server.shutdown().await.expect("server shuts down");
 }

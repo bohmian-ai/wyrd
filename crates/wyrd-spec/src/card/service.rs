@@ -25,6 +25,12 @@ pub struct ServiceSpec {
     /// Continuous verification bindings owned by this Service as a whole.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verified_by: Vec<VerificationBinding>,
+    /// Bifrost dataset tables this Service writes.
+    ///
+    /// Registration validates and ensures each one in `vala.datasets` before
+    /// the Service becomes active; removing the Service never drops them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<ServiceTable>,
     /// Entry point descriptor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_point: Option<String>,
@@ -49,6 +55,22 @@ pub struct ServiceSpec {
     /// Free-form metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, NonSecretValue>,
+}
+
+/// One Bifrost dataset table a Service declares.
+///
+/// `schema` is a JSON Schema object in the subset Bifrost table registration
+/// accepts (a Pydantic `model_json_schema()` shape); an existing table of the
+/// same name must carry the same fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ServiceTable {
+    /// Dataset table name inside `vala.datasets`.
+    pub name: String,
+    /// JSON Schema object describing the table's user fields, whose
+    /// `properties` order is the table's column order.
+    pub schema: serde_json::Value,
 }
 
 /// Server-side runtime declaration; tenancy is inherited from `Card.metadata.space`.

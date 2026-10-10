@@ -11,6 +11,9 @@ pub mod api_keys;
 pub mod device_authorizations;
 pub mod human_connections;
 pub mod login_state;
+/// Discovery of the users and Service or Agent principals a tenant
+/// administrator can assign Roles to.
+pub mod principal_directory;
 pub mod refresh_tokens;
 pub mod revocation;
 pub mod role_assignments;
@@ -40,6 +43,9 @@ pub use login_state::{
     LoginState, RedeemedCode, consume_login_state, insert_login_state, issue_authorization_code,
     redeem_authorization_code,
 };
+pub use principal_directory::{
+    AssignablePrincipalRow, PrincipalFilter, assignable_principal, list_assignable_principals,
+};
 pub use refresh_tokens::{
     active_refresh, consume_active_refresh, insert_human_refresh_token, lock_refresh_family,
     refresh_by_hash, refresh_issuance_instant, revoke_refresh, revoke_refresh_chain,
@@ -47,8 +53,9 @@ pub use refresh_tokens::{
 };
 pub use revocation::{suspend_service_account_principal, suspend_user_principal};
 pub use role_assignments::{
-    grant_role_to_service_account, grant_role_to_user, list_service_account_roles, list_user_roles,
-    replace_user_roles, revoke_role_from_service_account, revoke_role_from_user,
+    grant_role_to_service_account, grant_role_to_user, list_service_account_roles,
+    list_user_role_assignments, list_user_roles, replace_idp_user_roles,
+    revoke_role_from_service_account, revoke_role_from_user,
 };
 pub use roles::{
     RoleRow, delete_role, insert_role, list_roles, role_by_id, role_by_name, roles_by_name,

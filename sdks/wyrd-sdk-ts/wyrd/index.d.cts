@@ -58,10 +58,10 @@ export declare class NativeBifrost {
    * # Errors
    *
    * Returns a napi error only when the outcome cannot be encoded; an invalid
-   * card reference, no-active-table, and queue-full refusals are returned in
+   * Card UID, no-active-table, and queue-full refusals are returned in
    * [`NativeLifecycleResult`].
    */
-  insert(row: string, cardRef?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
+  insert(row: string, cardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Writes one already-built Arrow batch to `table` and awaits durability.
    *
@@ -116,10 +116,10 @@ export declare class NativeBifrost {
    * # Errors
    *
    * Returns a napi error only when the outcome cannot be encoded; an
-   * unparsable or unmappable schema and an invalid card reference are
+   * unparsable or unmappable schema and an invalid Card UID are
    * returned in [`NativeLifecycleResult`].
    */
-  record(table: string, schemaJson: string, row: string, cardRef?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
+  record(table: string, schemaJson: string, row: string, cardUid?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
    * Starts one terminal-safe query through the Rust SDK owner.
    *
@@ -497,6 +497,93 @@ export declare class NativeOperatorConnections {
   disable(id: string): Promise<NativeLifecycleResult>
 }
 
+/** Tenant principal handle over the shared `wyrd_client` handle. */
+export declare class NativePrincipals {
+  /**
+   * Creates an unbound Service principal from a serialized
+   * `CreateServicePrincipalRequest`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the response cannot be serialized; a
+   * malformed request or server refusal is returned in the result.
+   */
+  createServicePrincipal(requestJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Issues one more credential for a Service or Agent principal.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the credential cannot be serialized; a
+   * malformed id or server refusal is returned in the result.
+   */
+  issueCredential(principalId: string): Promise<NativeLifecycleResult>
+  /**
+   * Lists a principal's credential metadata.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the list cannot be serialized; a
+   * malformed id or server refusal is returned in the result.
+   */
+  listCredentials(principalId: string): Promise<NativeLifecycleResult>
+  /**
+   * Revokes one credential of a principal.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be serialized; a
+   * malformed id or server refusal is returned in the result.
+   */
+  revokeCredential(principalId: string, credentialId: string): Promise<NativeLifecycleResult>
+  /**
+   * Revokes a principal and every credential it holds.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be serialized; a
+   * malformed argument or server refusal is returned in the result.
+   */
+  revokePrincipal(principalId: string, requestJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Lists one page of assignable principals from a serialized
+   * `PrincipalQuery`.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the page cannot be serialized; a
+   * malformed query or server refusal is returned in the result.
+   */
+  list(queryJson: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads a principal's Role assignments.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the assignments cannot be serialized; a
+   * malformed id or server refusal is returned in the result.
+   */
+  roles(principalId: string): Promise<NativeLifecycleResult>
+  /**
+   * Idempotently grants a direct Role.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the change cannot be serialized; a
+   * malformed id or server refusal is returned in the result.
+   */
+  grantRole(principalId: string, role: string): Promise<NativeLifecycleResult>
+  /**
+   * Idempotently revokes a direct Role; identity-provider assignments stay.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the change cannot be serialized; a
+   * malformed id or server refusal is returned in the result.
+   */
+  revokeRole(principalId: string, role: string): Promise<NativeLifecycleResult>
+}
+
 /** Structured result of starting a native terminal-safe query. */
 export declare class NativeQueryStart {
   /** Moves the Rust-owned stream out after a successful startup. */
@@ -526,6 +613,11 @@ export declare class NativeRun {
   get runId(): string
   /** The alias this view was opened with. */
   get alias(): string
+  /**
+   * The UID of this view's subject Card, which `Run.scope` stamps on
+   * spans as `wyrd.card_uid`.
+   */
+  get subjectUid(): string
   /** An immutable sibling view scoped to a registered alias. */
   forCard(alias: string): NativeRunOpen
   /**
@@ -567,6 +659,17 @@ export declare class NativeRun {
    * [`NativeLifecycleResult`].
    */
   verify(verifier: string, inputJson: string, mediaJson?: string | undefined | null): Promise<NativeLifecycleResult>
+  /**
+   * Invokes this view's tool-free Agent once through the Wyrd gateway with
+   * the string variables of `variables_json` and returns its final text.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the outcome cannot be projected; a
+   * non-Agent view, an Agent with tools, malformed variables, and the
+   * gateway's refusals are returned in [`NativeLifecycleResult`].
+   */
+  invoke(variablesJson?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
    * Emits one row into a registered `vala.datasets` table.
    *
@@ -709,6 +812,13 @@ export declare class NativeWyrdClient {
    */
   operatorConnections(): NativeOperatorConnections
   /**
+   * Builds one principal handle that calls the server as this client.
+   *
+   * No IO happens here; the public TypeScript `Principals.connect` passes
+   * the caller's client or the ambient one.
+   */
+  principals(): NativePrincipals
+  /**
    * Load an authored Workflow file and its Cards as this client.
    *
    * Delegates to the shared [`Workflow::from_path_with_client`]: registry
@@ -727,6 +837,11 @@ export declare class NativeWyrdClient {
  * on the first read instead of as an untyped constructor failure.
  */
 export declare class NativeWyrdState {
+  /**
+   * The client this state's server calls run as, resolving the ambient one
+   * once on first use, so a telemetry exporter authenticates as the state.
+   */
+  client(): NativeWyrdClientResult
   /**
    * Returns the exact root Card reference.
    *
@@ -1123,6 +1238,13 @@ export declare function tableConfigFromArrowIpc(table: string, schemaIpc: Buffer
  * hyphenated wire spelling is returned as catalog metadata.
  */
 export declare function tableConfigFromJsonSchema(table: string, schemaJson: string, layoutJson?: string | undefined | null, compactionTargetFileSizeBytes?: number | undefined | null, compactionType?: string | undefined | null): NativeTableConfigResult
+
+/**
+ * The catalog refusal `WyrdState.startTelemetry` throws when a global tracer
+ * provider is already registered, so its title and remediation come from the
+ * one Rust catalog.
+ */
+export declare function telemetryProviderExists(): NativeWyrdError
 
 /**
  * Parse a Workflow from its Card envelope YAML text, resolving inline

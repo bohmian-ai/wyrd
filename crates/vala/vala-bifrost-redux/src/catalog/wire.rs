@@ -3,10 +3,9 @@
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
 use vala_sql::row_types::olap_catalog::BifrostTableRow;
 use wyrd_spec::vala::api::{
-    BifrostTableEntry, DataTypeSpec, FieldSpec, INPUT_CLASS_GATE_CORRELATION, INPUT_CLASS_KEY,
-    PhysicalLayoutWire, TableStatus, TimeUnit,
+    BifrostTableEntry, DataTypeSpec, FieldSpec, PhysicalLayoutWire, TableStatus, TimeUnit,
 };
-use wyrd_spec::vala::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
+use wyrd_spec::vala::{CARD_UID, RUN_ID, WYRD_EVENT_TIME};
 
 use crate::catalog::BifrostCatalogError;
 use crate::tables::managed_columns::is_managed_column;
@@ -71,14 +70,14 @@ pub fn layout_wire_from_row(
 /// The three describe field classes projected from one stored physical schema.
 ///
 /// Splitting them is what lets a writer tell what it declares (`user_fields`)
-/// from the correlation inputs Gate resolves (`correlation_fields`) and the
+/// from the correlation inputs it may attach (`correlation_fields`) and the
 /// managed columns it may supply instead of letting the server stamp them
 /// (`managed_candidates`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DescribedFields {
     /// The table's own declared columns, in stored order.
     pub user_fields: Vec<FieldSpec>,
-    /// `card_ref` then `run_id`, the correlation inputs a writer supplies.
+    /// `card_uid` then `run_id`, the correlation inputs a writer supplies.
     pub correlation_fields: Vec<FieldSpec>,
     /// `wyrd_event_time`, the one managed column a writer may supply itself.
     pub managed_candidates: Vec<FieldSpec>,
@@ -86,13 +85,13 @@ pub struct DescribedFields {
 
 /// Project a stored physical schema onto the three describe field classes.
 ///
-/// `card_ref` is a Gate input rather than a stored column: it resolves to
-/// `card_uid` on write, so it is synthesized here with the gate-correlation
-/// input class and carries no field id. It is nullable because Card correlation
-/// is optional: a row without one is accepted and stored with an authenticated
-/// `principal_id` and a null `card_uid`. Every other declaration is taken from
-/// the stored schema, so its type, nullability, and registered field id are
-/// the table's actual ones rather than a restatement.
+/// Every declaration is taken from the stored schema, so its type,
+/// nullability, and registered field id are the table's actual ones rather
+/// than a restatement. A table whose correlation policy appends no
+/// `card_uid` or `run_id` column still accepts one on the wire, so the missing
+/// correlation input is synthesized nullable `Utf8` with no field id. Card
+/// correlation is optional: a row without one is stored with an authenticated
+/// `principal_id` and a null `card_uid`.
 ///
 /// # Errors
 ///
@@ -103,21 +102,15 @@ pub fn described_fields_from_stored_schema(
 ) -> Result<DescribedFields, BifrostCatalogError> {
     let mut described = DescribedFields {
         user_fields: Vec::new(),
-        correlation_fields: vec![FieldSpec {
-            name: CARD_REF.to_owned(),
-            data_type: DataTypeSpec::Utf8,
-            nullable: true,
-            metadata: std::collections::BTreeMap::from([(
-                INPUT_CLASS_KEY.to_owned(),
-                INPUT_CLASS_GATE_CORRELATION.to_owned(),
-            )]),
-        }],
+        correlation_fields: Vec::new(),
         managed_candidates: Vec::new(),
     };
-    let mut run_id = None;
+    let (mut card_uid, mut run_id) = (None, None);
     for field in schema.fields() {
         let name = field.name().as_str();
-        if name == RUN_ID {
+        if name == CARD_UID {
+            card_uid = Some(field_to_spec(field)?);
+        } else if name == RUN_ID {
             run_id = Some(field_to_spec(field)?);
         } else if name == WYRD_EVENT_TIME {
             described.managed_candidates.push(field_to_spec(field)?);
@@ -125,16 +118,16 @@ pub fn described_fields_from_stored_schema(
             described.user_fields.push(field_to_spec(field)?);
         }
     }
-    // A table whose correlation policy appends no `run_id` column still accepts
-    // one on the wire; it simply has no stored field id to report.
-    described
-        .correlation_fields
-        .push(run_id.unwrap_or_else(|| FieldSpec {
-            name: RUN_ID.to_owned(),
-            data_type: DataTypeSpec::Utf8,
-            nullable: true,
-            metadata: std::collections::BTreeMap::new(),
-        }));
+    for (name, stored) in [(CARD_UID, card_uid), (RUN_ID, run_id)] {
+        described
+            .correlation_fields
+            .push(stored.unwrap_or_else(|| FieldSpec {
+                name: name.to_owned(),
+                data_type: DataTypeSpec::Utf8,
+                nullable: true,
+                metadata: std::collections::BTreeMap::new(),
+            }));
+    }
     Ok(described)
 }
 
@@ -307,15 +300,8 @@ mod tests {
                 .iter()
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<_>>(),
-            vec![CARD_REF, RUN_ID],
-            "correlation is exactly the card reference input and the run id"
-        );
-        assert_eq!(
-            described.correlation_fields[0]
-                .metadata
-                .get(INPUT_CLASS_KEY),
-            Some(&INPUT_CLASS_GATE_CORRELATION.to_owned()),
-            "card_ref is a Gate input, not a stored column"
+            vec![CARD_UID, RUN_ID],
+            "correlation is exactly the card uid and the run id"
         );
         assert_eq!(
             described

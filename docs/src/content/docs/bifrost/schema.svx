@@ -166,8 +166,10 @@ matching `observations_ready` binding. The observed subject is the managed
 
 ## vala.verification.results
 
-Exactly one row per completed Drift or Eval Verifier run. Errored, timed-out,
-and running executions have no row. The managed `run_id` is the Verifier run
+One row per completed Drift or Eval Verifier run, staged on the process Scribe
+outbox when the run settles. A result Scribe has not acknowledged is lost on
+abrupt process death or an expired shutdown deadline; the run stays settled.
+Errored, timed-out, and running executions have no row. The managed `run_id` is the Verifier run
 and the managed `card_uid` is the Verifier Card.
 
 | Column | Physical type |

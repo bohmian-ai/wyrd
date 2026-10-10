@@ -194,6 +194,22 @@ fn correlated_resource_spans(anchor: i64) -> Vec<ResourceSpans> {
     resource_spans
 }
 
+/// Builds the negative trace export with each span naming its own `card_uid`.
+///
+/// Position `i` carries `cards[i]` as its final `wyrd.card_uid`, and a `None`
+/// position names no Card, so one export mixes attributable, unattributable,
+/// and uncorrelated siblings.
+fn card_attributed_resource_spans(anchor: i64, cards: [Option<&str>; 3]) -> Vec<ResourceSpans> {
+    let mut resource_spans = negative_resource_spans(anchor, &[]);
+    for (span, card) in resource_spans[0].scope_spans[0].spans.iter_mut().zip(cards) {
+        if let Some(card) = card {
+            span.attributes
+                .push(support::string_attribute("wyrd.card_uid", card));
+        }
+    }
+    resource_spans
+}
+
 /// Reads the sorted `discriminator` markers of one query.
 ///
 /// Sorting makes the result the stored marker multiset, independent of which
@@ -234,8 +250,9 @@ mod pg_tests {
     use super::{
         ATTRIBUTION_RUN, FAN_OUT_TRACE_SCOPE, LOG_MARKERS, LOG_REJECTION, METRIC_REJECTION,
         NEGATIVE_LOG_SCOPE, NEGATIVE_METRIC_SCOPE, NEGATIVE_TRACE_SCOPE, SPAN_MARKERS,
-        SPAN_REJECTION, correlated_resource_spans, fan_out_resource_spans, negative_resource_logs,
-        negative_resource_metrics, negative_resource_spans, sorted_markers,
+        SPAN_REJECTION, card_attributed_resource_spans, correlated_resource_spans,
+        fan_out_resource_spans, negative_resource_logs, negative_resource_metrics,
+        negative_resource_spans, sorted_markers,
     };
 
     /// A mixed request commits its complete siblings and reports exactly one.
@@ -460,6 +477,90 @@ mod pg_tests {
                 "{attribution:?} stores every accepted sibling exactly once"
             );
         }
+
+        journey.shutdown().await;
+    }
+
+    /// An unbound tenant administrator attributes spans to registered Cards.
+    ///
+    /// The administrator's signed claims name no Card scope, so the Gate
+    /// resolves each span's `wyrd.card_uid` against the tenant registry. A span
+    /// naming a registered Service is stored with that Card's registry UID, a
+    /// span naming no Card is stored uncorrelated, and a span naming an
+    /// unregistered Card is rejected alone with the stable scope reason.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the export is refused, when the partial success differs,
+    /// or when the stored rows or their Card UIDs differ from the expectation.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn unbound_writer_attributes_spans_to_registered_cards_only() {
+        let journey = OtlpJourney::start().await;
+        let anchor = support::anchor_nanos();
+        let server = journey.server();
+        let observed = server
+            .bootstrap_service("otlp-observed", &["viewer"])
+            .await
+            .expect("the observed Service registers")
+            .card_ref()
+            .expect("a bootstrapped Service is bound to its Card")
+            .clone();
+        let uid: uuid::Uuid = sqlx::query_scalar(
+            "SELECT card_uid FROM wyrd.cards WHERE kind = 'Service' AND name = $1",
+        )
+        .bind(observed.name.as_str())
+        .fetch_one(&server.pg_fixture().superuser_pool().expect("registry pool"))
+        .await
+        .expect("the observed Service is registered");
+        let uid = uid.to_string();
+        let never_registered = uuid::Uuid::now_v7().to_string();
+        let admin = server
+            .exchange_api_key(&server.tenant_admin_key().await.expect("tenant admin key"))
+            .await
+            .expect("the administrator's key exchanges for a token");
+
+        let partial = export_traces_over_grpc_as(
+            &journey,
+            &admin,
+            card_attributed_resource_spans(anchor, [Some(&uid), Some(&never_registered), None]),
+        )
+        .await
+        .expect("an unregistered Card rejects its span");
+        assert_eq!(
+            partial.rejected_spans, 1,
+            "only the unregistered Card's span"
+        );
+        assert_eq!(
+            partial.error_message,
+            "wyrd.card_uid is outside the principal's Card scope"
+        );
+
+        journey.publish().await;
+        let rows = journey
+            .query(&format!(
+                "SELECT trace_state, card_uid FROM {SPANS_TABLE} \
+                 WHERE scope_name = '{NEGATIVE_TRACE_SCOPE}' ORDER BY trace_state"
+            ))
+            .await;
+        let mut stored = Vec::new();
+        for batch in &rows {
+            let markers = support::column::<StringArray>(batch, "trace_state");
+            let cards = support::column::<StringArray>(batch, "card_uid");
+            for index in 0..batch.num_rows() {
+                stored.push((
+                    markers.value(index).to_owned(),
+                    (!cards.is_null(index)).then(|| cards.value(index).to_owned()),
+                ));
+            }
+        }
+        assert_eq!(
+            stored,
+            vec![
+                (SPAN_MARKERS[0].to_owned(), Some(uid)),
+                (SPAN_MARKERS[2].to_owned(), None),
+            ]
+        );
 
         journey.shutdown().await;
     }

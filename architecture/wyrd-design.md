@@ -125,9 +125,12 @@ not a passive integration or inventory product.
     their Agent card and include its declared card refs. Every token mint —
     including the re-exchange a machine performs when its access token expires
     — resolves those bounded scope identities to Card UIDs and signs that
-    mapping.
-    An observation may carry its subject `card_ref`; when present, the
-    server authorizes it against that scope and stamps the mapped `card_uid`.
+    mapping. A principal bound to no Card — a User, a tenant administrator, or
+    an unbound Service — has no bounded scope: it may attribute to any
+    registered observation-target Card in its tenant, which ingest resolves
+    against the tenant registry.
+    An observation may carry its subject `card_uid`; when present, the
+    server authorizes it against that scope's mapped UIDs and stores it.
     Generic telemetry may omit it and retains the authenticated publisher through
     `principal_id`. A separate emit credential was redundant — see "Observation
     identity — Card → Run → Observation".
@@ -242,7 +245,7 @@ not a passive integration or inventory product.
 21. **`verified_by` is the versioned verification subscription contract.**
     A Service component, Service, or standalone Agent declares typed
     `VerificationBinding` values. Each binding resolves one exact Verifier,
-    one Trigger activation, and zero or more failure Operators. The binding is
+    optional Trigger activation, and zero or more failure Operators. The binding is
     static declaration and never a per-request routing table; changing it
     changes the containing Card spec. There is no separate publication or
     monitor-routing field, and clients never select a Verifier per
@@ -597,10 +600,9 @@ platform plane, and neither plane's credential or token is accepted by the
 other.
 
 Both planes write their authorization decisions to the one canonical audit
-path: `vala.audit_staging`, then `AuditPublisher` into
-`vala.system.audit_log`. Permissions are blocking; audits are non-blocking:
-a decision is staged on the shared audit outbox and never delays or fails
-the operation. A decision records the deciding principal's
+path: the in-memory Scribe outbox into `vala.system.audit_log`. Permissions
+are blocking; audits are non-blocking: a decision is staged on the shared
+Scribe outbox and never delays or fails the operation. A decision records the deciding principal's
 stored kind and, when its token was minted from a credential, that
 credential's non-secret id.
 
@@ -757,7 +759,7 @@ introduce a competing request identity.
 How Card-correlated telemetry ties to a Run and a Card, and how the server
 resolves it. A Run is one client application invocation with one `run_id`;
 each correlated row names its own exact subject Card. A telemetry row may omit
-Card correlation; when supplied, the `(card_ref, run_id)` pair anchors it to
+Card correlation; when supplied, the `(card_uid, run_id)` pair anchors it to
 that subject and invocation. The server owns resolution of that identity.
 
 **A principal is not a card.** A Service or Agent principal is bound to one card
@@ -768,15 +770,15 @@ root Service Card. The first-class SDKs may select an initial hydrated Card
 alias when opening the run, and `for_card(alias)` returns an immutable
 Card-scoped view of that same invocation for multi-component work. Views for
 different components share the `run_id` and the JWT, but each row carries its
-view's exact subject `card_ref`. Switching Cards never requires a distinct Run
+view's exact subject `card_uid`. Switching Cards never requires a distinct Run
 ID, and the principal's root Card cannot say which card a correlated record
 belongs to — the subject Card must be carried on that row. Generic telemetry
 may omit a subject Card.
 
 Python `Run` values are synchronous context managers for optional ambient span
-correlation. Entering a scope best-effort attaches the selected CardRef and
+correlation. Entering a scope best-effort attaches the selected Card UID and
 run ID to Python OpenTelemetry context, annotates an active recording span,
-and lets an idempotently installed span processor copy `wyrd.card_ref` and
+and lets an idempotently installed span processor copy `wyrd.card_uid` and
 `wyrd.run_id` onto spans created inside the scope. Exiting restores the prior
 context. Missing or incompatible Python OpenTelemetry support and enrichment
 failures are no-ops; they never fail application execution or explicit Wyrd
@@ -789,13 +791,15 @@ Service view is `root`); the state returns the exact typed `CardRef` for an
 alias. `run.observe.verify(verifier, input)` judges the view's subject in real
 time: the client resolves the named Verifier among those bound in
 `verified_by` to that subject in the hydrated graph, shapes the input for the
-Verifier's kind (one Eval context, or Drift feature rows), and calls
+Verifier's implementation (one JSON context for Eval or Task, or Drift feature
+rows), and calls
 `POST /v1/verification/execute` once, without replay, returning the typed
 `Judgment`. An unbound name (`WYRD_SDK_404_UNKNOWN_VERIFIER`) or a wrongly
 shaped input (`WYRD_SDK_400_INVALID_OBSERVATION`) fails locally before any
 network IO, and a `failed` verdict is an ordinary return. Judging records no
-observation, run, dispatch, or Bifrost row and does not require Bifrost
-startup. SDKs carry no separate verification handle; binding and run
+observation, durable verification run, or dispatch and does not require Bifrost
+startup. Its completed result is staged through the Scribe outbox. SDKs carry
+no separate verification handle; binding and run
 operations remain server HTTP and MCP surfaces, and verification history is
 read with parameterized SQL through the Bifrost client.
 
@@ -804,32 +808,32 @@ and Run correlation are optional per-row values:
 
 | Value | Source | Grain | Means |
 |---|---|---|---|
-| `card_ref` | optional client assertion of the row's exact subject Card (the run view's selected Card); server authorizes it when present | per row | the optional Card-version anchor — *which* Card |
+| `card_uid` | optional client assertion of the row's exact subject Card UID (the run view's selected Card); server authorizes it when present | per row | the optional Card-version anchor — *which* Card |
 | `run_id` | optional client-generated value per `.run()`, shared by every Card-scoped view of that invocation; passed through opaquely | per row | the optional Run anchor — *which* execution |
 | `principal_id` | server-stamped from the verified JWT | per request | the authenticated publisher — *who* emitted it |
 | `tenant_id` | server-stamped from the verified JWT | per request | the tenancy boundary |
 | `wyrd_request_id` | the propagated `Wyrd-Request-Id` (minted at first sighting) | per request | the request spine — one request spans **many** runs and hops |
 
 Resolution rule: **tenant and `principal_id` come from the token; a present
-`card_ref` is client-asserted, server-authorized, and resolved from its trusted
-signed scope mapping; absent Card correlation produces null `card_uid`;
+`card_uid` is client-asserted and server-authorized against the trusted signed
+scope, or, for a principal bound to no Card, against the tenant registry;
+absent Card correlation produces null `card_uid`;
 `run_id` and `wyrd_request_id` pass through untouched.**
 
 On OTLP input, canonical table projection reads these optional values from the
-record-level attributes named exactly `wyrd.card_ref` and `wyrd.run_id`. The
+record-level attributes named exactly `wyrd.card_uid` and `wyrd.run_id`. The
 final duplicate key wins, matching Wyrd's existing OTLP attribute lookup rule,
 while every original attribute entry remains in the lossless payload.
-`wyrd.card_ref` uses the compact `CardRef` text grammar; a client `#uid` suffix
-is syntactically valid but untrusted and ignored when the server selects the UID
-from signed scope. `wyrd.run_id` uses the existing `RunId` text grammar.
+`wyrd.card_uid` uses the `CardUid` text grammar and `wyrd.run_id` the existing
+`RunId` text grammar.
 Consequences, stated so they stop drifting:
 
-- **`card_ref` and `run_id` are optional per-row columns on the observation payload, not
+- **`card_uid` and `run_id` are optional per-row columns on the observation payload, not
   request metadata.** A client-side queue batches records from different runs —
   and different cards — before it flushes, so one sealed batch (one
   `wyrd_batch_id`) freely mixes them. The producer is keyed by **table only**; it
   never splits a batch by card or run. The server therefore authorizes every
-  present `card_ref` **per row** (every distinct asserted Card in the batch must
+  present `card_uid` **per row** (every distinct asserted Card in the batch must
   be in the principal's scope),
   validates the client-generated UUIDv7 `wyrd_batch_id` request field (the
   idempotency key; it is not a row column), stamps request-scoped
@@ -840,10 +844,10 @@ Consequences, stated so they stop drifting:
   them). A row without `wyrd_event_time` takes `wyrd_ingested_at`. Row
   identity is batch-level; no per-row position is stamped.
 
-- **`card_ref` is optional and authorized, not trusted.** Its absence is valid
+- **`card_uid` is optional and authorized, not trusted.** Its absence is valid
   generic telemetry and produces null `card_uid`; the authenticated publisher
   remains available through non-null `principal_id`. When present, the server checks the asserted
-  `card_ref` against the principal's **card scope**. For Service and Agent
+  `card_uid` against the principal's **card scope**. For Service and Agent
   principals, the scope is the principal's own `card_ref` plus the
   **observation-target** cards reachable through the transitive card-ref graph
   declared in that card's spec. A card is in scope only if its kind is an
@@ -852,32 +856,39 @@ Consequences, stated so they stop drifting:
   control-plane kinds (`Policy`, `Audit`, `Operator`, `Trigger`) never enter the
   emit scope. Service cards contribute `Service.components`; other reachable
   specs contribute their declared card refs according to the shared card-ref
-  extraction rules. A `card_ref` outside that set is rejected: a principal may
+  extraction rules. A `card_uid` outside that set is rejected: a principal may
   not attribute records to a card outside its declared graph. The scope can be resolved from the
   signed `card_ref_scope` claim minted into the JWT at `/auth/token`. Every
   token mint — a first exchange, a machine's re-exchange, or a human refresh
   rotation — resolves each bounded member against the tenant Card registry and
   signs its authoritative UID with the identity. Ingest uses that verified
   in-memory mapping and performs no Card-registry Postgres or cache lookup.
-- **This is not the governance token.** `card_ref` is one field in the
+  A principal bound to no Card (User, tenant administrator, unbound Service)
+  carries no bounded scope; its scope is every registered observation-target
+  Card in its tenant. Gate looks the distinct `card_uid` values of each
+  frame (at most 32) up in the tenant registry before dispatch and hands
+  Scribe the registered observation-target UIDs as that frame's scope, so an
+  unregistered or non-observation Card is refused exactly like a UID outside
+  a signed scope.
+- **This is not the governance token.** `card_uid` is one field in the
   observation envelope, authorized by the existing JWT plus the principal's
   declared card-ref graph — not a separate per-card credential (doctrine #18).
   The token still proves the principal; it bounds a *set* of emittable cards,
   and the envelope selects one within it.
 - **There is no run registry.** Runs are client-side execution records; the
   server never persists a run table and never resolves `run_id` back to a card
-  — the card is the authorized `card_ref` on the row. `run_id` is an **opaque**
+  — the card is the authorized `card_uid` on the row. `run_id` is an **opaque**
   correlation id, never a composite that encodes the card.
-- **When present, `Card → Run → Observation` is the `(card_ref, run_id)` pair on
+- **When present, `Card → Run → Observation` is the `(card_uid, run_id)` pair on
   the row;** generic telemetry remains attributable to `principal_id`, and the
   request spine is the `wyrd_request_id` label that joins many runs across hops.
 - **The observation owns subject identity.** Under pub/sub (Doctrine #3, #21),
-  the observation's `card_ref` IS its subject — no separate `subject_ref` on
+  the observation's `card_uid` IS its subject — no separate `subject_ref` on
   the envelope and no monitor-emits-about-a-different-card case. For a Service
-  principal, the server validates the subject against the locked Service
-  version and matching component `card_ref`. Verification routing is resolved
-  later from that subject's `verified_by` bindings; authorization still
-  reduces to the one subject `card_ref` on the row.
+  principal, the server validates the subject against the UIDs its signed scope
+  maps from the locked Service version and its component Cards. Verification
+  routing is resolved later from that subject's `verified_by` bindings;
+  authorization still reduces to the one subject `card_uid` on the row.
 
 ### Audit
 Immutable case file. Records the result of an investigation against the
@@ -1120,24 +1131,32 @@ Multi-party attestations are not part of the v1 Audit wire contract. Values in
 ### Verifier
 
 A subject-less verification declaration with exactly one typed implementation.
-`Verifier` is the only registrable verification kind: the initial closed
-`implementation.kind` variants are `drift` and `eval`, and `kind: Drift` /
+`Verifier` is the only registrable verification kind: the closed
+`implementation.kind` variants are `drift`, `eval`, and `task`, and `kind: Drift` /
 `kind: Eval` registrations are rejected. Scheduling and failure reaction
 remain on the binding's Trigger and Operators.
 ```yaml
 spec:
   description?: string
   implementation:
-    kind: drift | eval           # closed; variant fields below
-    spec: DriftSpec | EvalSpec    # implementation body below
+    kind: drift | eval | task                 # closed; variant fields below
+    spec: DriftSpec | EvalSpec | TaskVerifierSpec
 ```
+
+`task` deserializes into `TaskVerifierSpec`, not `EvalSpec`. This is the only new
+struct for the task implementation. Its `spec` is one flattened, `kind`-tagged
+`VerifierTask` enum value that reuses the existing `AssertionTask` or
+`LlmJudgeTask` payload; there is no nested `task` field, Eval task map, or
+replacement payload struct. The task uses the existing check behavior over
+direct JSON input, without Eval-only dependencies or conditions. It produces one
+judgment. Registration and binding do not grant invocation authority.
 
 A Verifier runs only through a `verified_by` binding on a Service component,
 Service, or standalone Agent, or through an analysis-only direct invocation:
 ```yaml
 verified_by:
   - verifier: Ref                            # → Verifier (exact version)
-    runs_on: InlineableRef<TriggerSpec>      # activation
+    runs_on?: InlineableRef<TriggerSpec>     # absent means explicit-only
     on_failure: [InlineableRef<OperatorSpec>] # zero or more reactions
 ```
 
@@ -1159,6 +1178,14 @@ not the Drift or Eval implementation, creates dispatches; each Operator owns
 its own delivery. A Verifier run never creates another Trigger. Direct
 Verifier invocation is analysis-only and dispatches nothing.
 
+Public direct and manual invocation checks `verifier:run` against the selected
+Verifier's exact Card UID. `PermissionScope::Verifier(CardUid)` names one UID;
+`All` covers every Verifier in the tenant. `evals:run` alone does not authorize
+the generic verification endpoint. Permission is checked before execution and
+the allowed or denied decision is audited. The subject Card is resolved in the
+same tenant; direct invocation does not use observation-attribution Card scope.
+A binding does not replace the invocation permission.
+
 The runner drains `wyrd.verifier_runs` in claim rounds. Each round considers
 every tenant with a claimable run, oldest first, with no tenant limit, and
 claims at most one run per tenant. Execution has no count limit. The shared
@@ -1171,18 +1198,19 @@ and any fitted Drift baseline. Parsed Verifiers are cached per process by
 tenant and Card UID in a fixed 64 MiB least-recently-used cache that is never
 shared across tenants. A deleted Verifier terminates the run `errored`.
 
-A run's result is decided once. When execution completes, the runner encodes
-the result and stores it, with its result ID, event time, batch IDs, and
-Arrow IPC bytes, in `wyrd.verifier_run_results` in one lease-fenced
-transaction before writing any of it. A stale lease stores nothing. Any later
-claimant of a run with a stored result writes those stored batches instead of
-executing again, so Scribe's batch fence absorbs every repeat. The settlement
-that completes or terminates the run deletes the stored result. While a run is
-in flight, one statement per tenant renews its leases on the PostgreSQL clock
-once a third of the lease has passed. An expired lease is never revived, and a
-renewal that no longer finds a run's token cancels that run's work. A run
-holds a connection only to claim, store, settle, and renew. The store and the
-settlement retry with backoff while the lease holds.
+When execution completes, the runner builds the result once, with one result
+ID and event time, stages it on the process Scribe outbox attributed to the
+tenant SYSTEM principal and the exact Verifier, and settles the run at once:
+settlement never waits for Scribe. The outbox writes the result tables through
+the same in-memory path as audit and gateway capture, so a result Scribe has
+not acknowledged is lost on abrupt process death or an expired shutdown
+deadline, and that loss never changes the settled run. A realtime Verifier
+invocation stages its result the same way. While a run is in flight, one
+statement per tenant renews its leases on the PostgreSQL clock once a third of
+the lease has passed. An expired lease is never revived, and a renewal that no
+longer finds a run's token cancels that run's work. A run holds a connection
+only to claim, settle, and renew. The settlement retries with backoff while
+the lease holds.
 
 #### Drift implementation
 Subject-less observation definition. The implementation is orthogonal: signal +
@@ -1261,7 +1289,7 @@ of refs is the mode):
 
 **Directional flow.** A Service component binding or standalone Agent declares
 `verified_by` with an Eval-backed Verifier and the runtime emits observations
-carrying the component's `card_ref` as subject identity. Continuous evaluation
+carrying the component's `card_uid` as subject identity. Continuous evaluation
 loads the committed subject record, executes the typed task workflow, and
 persists the common Verification Result plus Eval item details.
 

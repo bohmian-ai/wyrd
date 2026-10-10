@@ -138,7 +138,7 @@ pub(crate) mod pg_tests {
     use wyrd_sql::row_types::auth::HumanSessionBinding;
 
     use super::revoke_principal_in_conn;
-    use crate::audit::test_outbox::{drain, outbox};
+    use crate::audit::test_audit::RecordedAudit;
     use crate::issuance::{TenantTokenIssuer, TokenExchangeSettings};
     use crate::refresh::RefreshTokens;
     use wyrd_auth_issue::hash_secret;
@@ -590,12 +590,12 @@ pub(crate) mod pg_tests {
             )
             .expect("test private key loads"),
         );
-        let audit = outbox(&fixture);
+        let audit = RecordedAudit::new();
         let service = RefreshTokens {
             issuer: TenantTokenIssuer::new(
                 key,
                 TokenExchangeSettings::default(),
-                Arc::clone(&audit),
+                Arc::clone(&audit) as _,
             ),
         };
 
@@ -665,6 +665,5 @@ pub(crate) mod pg_tests {
             user.status, "suspended",
             "the revocation suspended the user"
         );
-        drain(&audit).await;
     }
 }

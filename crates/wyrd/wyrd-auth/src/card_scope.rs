@@ -5,8 +5,8 @@ use std::str::FromStr;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use vala_sql::audit_outbox::AuditOutbox;
 use wyrd_auth_issue::IssueError;
+use wyrd_runtime::audit::AuditStage;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
@@ -150,7 +150,7 @@ pub enum IssueErrorOrWyrd {
     Wyrd(WyrdError),
 }
 
-/// Stage the successful card-ref scope mint audit event on the process outbox.
+/// Stage the successful card-ref scope mint audit event on the process audit stage.
 ///
 /// The event carries the scope digest, the full member count, and at most
 /// [`SCOPE_AUDIT_MEMBER_SUMMARY_LIMIT`] members. It is staged without waiting
@@ -163,7 +163,7 @@ pub enum IssueErrorOrWyrd {
 /// `MAX_SCOPE_CARDS` limit upstream; violating it is a programmer error,
 /// not a runtime condition.
 pub fn stage_scope_mint_success_audit(
-    audit: &AuditOutbox,
+    audit: &dyn AuditStage,
     tenant_id: DataTenantId,
     principal_id: Uuid,
     root: &CardRef,
@@ -198,14 +198,14 @@ pub fn stage_scope_mint_success_audit(
     audit.stage(tenant_id, event);
 }
 
-/// Stage a refused card-ref scope mint on the process outbox.
+/// Stage a refused card-ref scope mint on the process audit stage.
 ///
 /// Only errors that name a scope root are recorded; the refused grant has no
 /// authenticated principal yet, so the event is attributed to
 /// [`PLATFORM_AUDIT_PRINCIPAL`]. Staging never waits and never fails the
 /// caller, whose original refusal still reaches the client.
 pub fn stage_scope_mint_failure_audit(
-    audit: &AuditOutbox,
+    audit: &dyn AuditStage,
     tenant_id: DataTenantId,
     request_id: &str,
     mint_kind: CardScopeMintKind,

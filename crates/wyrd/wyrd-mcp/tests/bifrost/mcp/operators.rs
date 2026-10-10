@@ -252,7 +252,7 @@ mod pg_tests {
         foreign_client.cancel().await?;
 
         let writer = server
-            .bootstrap_service("mcp-oc-writer", &["writer"])
+            .bootstrap_service("mcp-oc-writer", &["editor"])
             .await?;
         let writer_client =
             ().serve_with_lifecycle(transport(&server, api_key(&writer)?, None)?, discover())

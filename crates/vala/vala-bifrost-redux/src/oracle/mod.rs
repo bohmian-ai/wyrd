@@ -27,8 +27,8 @@ use sha2::{Digest as _, Sha256};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_sql::ValaPostgres;
-use vala_sql::audit_outbox::AuditOutbox;
 use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
+use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{DelegationStep, Permission, PermissionScope, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -848,9 +848,8 @@ impl Drop for AdmissionWaitTelemetryGuard {
 
 /// Narrow, non-blocking audit collaborator owned by the serving composition root.
 ///
-/// Both methods only stage the event and return: the outbox writer commits it
-/// to the tenant's audit chain in the background and retries a commit that
-/// fails. Rows are never held for that commit.
+/// Both methods only stage the event and return: the process audit stage
+/// writes it in the background. Rows are never held for that write.
 pub trait OracleAudit: Send + Sync {
     /// Stages the immutable read-decision detail after admission.
     fn stage_read_decision(
@@ -867,8 +866,8 @@ pub trait OracleAudit: Send + Sync {
     );
 }
 
-impl OracleAudit for AuditOutbox {
-    /// Stages the immutable read decision on the query tenant's chain.
+impl<T: AuditStage> OracleAudit for T {
+    /// Stages the immutable read decision for the query tenant.
     fn stage_read_decision(
         &self,
         context: &AuthorizedQueryContext,
@@ -883,7 +882,7 @@ impl OracleAudit for AuditOutbox {
         self.stage(context.data_tenant_id, event);
     }
 
-    /// Stages a verified security violation on the query tenant's chain.
+    /// Stages a verified security violation for the query tenant.
     fn stage_security_violation(
         &self,
         context: VerifiedSecurityContext,
@@ -2967,7 +2966,11 @@ impl Oracle {
             tracing::debug!(closed, "Oracle shutdown ended held peer grants");
         }
         let report = self.admission.shutdown(deadline).await;
-        if report.active_queries != 0 || report.queued_queries != 0 || report.peer_running != 0 {
+        if report.active_queries != 0
+            || report.queued_queries != 0
+            || report.reserved_memory_bytes != 0
+            || report.peer_running != 0
+        {
             tracing::warn!(
                 active_queries = report.active_queries,
                 queued_queries = report.queued_queries,

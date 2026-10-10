@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::{PrincipalId, SecretBearer};
+use crate::auth::{PrincipalId, PrincipalKindTag, SecretBearer};
 use crate::reference::CardRef;
 
 /// Request to create a tenant-scoped machine principal.
@@ -118,35 +118,156 @@ pub struct CredentialRevoked {
     pub credential_id: Uuid,
 }
 
-/// Body of `POST /v1/auth/grant-role`: grant one Role to a Card-bound principal.
+/// Where one of a principal's Role assignments came from.
 ///
-/// The target is named by its Card because a Service or Agent principal is the
-/// Card's projection; a human user is never a target, since federated login
-/// replaces their roles on every sign-in.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// A user's assignments are owned per source: federated login replaces only
+/// `idp` rows on every sign-in, and a tenant administrator grants and revokes
+/// only `direct` rows. Service and Agent assignments are always `direct`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields)]
-pub struct GrantRoleRequest {
-    /// Service or Agent Card whose principal receives the Role.
-    pub card_ref: CardRef,
-    /// Name of a built-in or tenant Role, such as `workload`.
-    pub role: String,
+#[serde(rename_all = "snake_case")]
+pub enum RoleSource {
+    /// Asserted by the tenant's identity provider at the user's last login.
+    Idp,
+    /// Granted by a tenant administrator.
+    Direct,
 }
 
-/// Response from `POST /v1/auth/grant-role`.
-///
-/// The grant takes effect at the principal's next key exchange; tokens already
-/// minted keep the roles they were issued with.
+impl RoleSource {
+    /// Stable lowercase label, matching the serde representation and the
+    /// durable `source` column.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idp => "idp",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+/// One Role a principal holds, and where that assignment came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
-pub struct GrantRoleResponse {
-    /// Principal the Role was granted to.
+pub struct RoleAssignment {
+    /// Role name.
+    pub role: String,
+    /// Assignment source.
+    pub source: RoleSource,
+}
+
+/// Response of `GET /v1/principals/{principal_id}/roles`.
+///
+/// The principal's effective Roles are the distinct names across every source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalRoles {
+    /// Principal the assignments belong to.
     pub principal_id: PrincipalId,
-    /// The principal's stored Card binding.
-    pub card_ref: CardRef,
-    /// Every Role the principal now holds, ordered by name.
-    pub roles: Vec<String>,
-    /// `true` when this call added the Role, `false` when it was already held.
-    pub granted: bool,
+    /// Principal kind the server resolved from the id: `user`, `service`, or
+    /// `agent`.
+    pub kind: PrincipalKindTag,
+    /// Assignments ordered by Role name, then source.
+    pub roles: Vec<RoleAssignment>,
+}
+
+/// Response of `PUT` and `DELETE /v1/principals/{principal_id}/roles/{role}`.
+///
+/// Both writes are idempotent. A change takes effect at the principal's next
+/// token; tokens already issued keep their bounded lifetime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RoleAssignmentChange {
+    /// Principal the assignment belongs to.
+    pub principal_id: PrincipalId,
+    /// Principal kind the server resolved from the id.
+    pub kind: PrincipalKindTag,
+    /// Role the call granted or revoked.
+    pub role: String,
+    /// `true` when this call added or removed the direct assignment, `false`
+    /// when it already held the requested state.
+    pub changed: bool,
+    /// Every assignment after the change, ordered by Role name, then source.
+    pub roles: Vec<RoleAssignment>,
+}
+
+/// Lifecycle status of an assignable principal. Deleted principals are never
+/// listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalStatus {
+    /// The principal can authenticate.
+    Active,
+    /// The principal is suspended; its Roles apply once it is reinstated.
+    Suspended,
+}
+
+/// One assignable principal in a `GET /v1/principals` page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalSummary {
+    /// Durable principal id.
+    pub principal_id: PrincipalId,
+    /// `user`, `service`, or `agent`.
+    pub kind: PrincipalKindTag,
+    /// Lifecycle status.
+    pub status: PrincipalStatus,
+    /// Email, for users.
+    pub email: Option<String>,
+    /// Principal name, for services and agents.
+    pub name: Option<String>,
+    /// Bound Card, for Card-bound services and agents.
+    pub card_ref: Option<CardRef>,
+}
+
+/// Response of `GET /v1/principals`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalPage {
+    /// Principals ordered by id, which is UUIDv7 and therefore creation order.
+    pub principals: Vec<PrincipalSummary>,
+    /// Cursor for the next page, present only when one may exist.
+    pub next: Option<PrincipalId>,
+}
+
+/// Query of `GET /v1/principals`: exact-match filters and keyset paging.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::IntoParams))]
+#[cfg_attr(feature = "server", into_params(parameter_in = Query))]
+#[serde(deny_unknown_fields)]
+pub struct PrincipalQuery {
+    /// `user`, `service`, or `agent`; omitted lists all three.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<PrincipalKindTag>,
+    /// Exact email; matches users only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Exact principal name; matches services and agents only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Page size between 1 and 200; default 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 200))]
+    #[cfg_attr(feature = "server", param(minimum = 1, maximum = 200))]
+    pub limit: Option<u32>,
+    /// Last `principal_id` of the previous page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<PrincipalId>,
 }

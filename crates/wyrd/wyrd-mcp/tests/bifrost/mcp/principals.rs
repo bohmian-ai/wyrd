@@ -93,7 +93,7 @@ mod pg_tests {
             .expose_secret()
             .to_owned();
         let reader = server
-            .bootstrap_service("mcp-principal-reader", &["reader"])
+            .bootstrap_service("mcp-principal-reader", &["viewer"])
             .await?;
         let reader_key = reader
             .api_key()
@@ -298,19 +298,13 @@ mod pg_tests {
 
         // Listing an unknown principal is the stable, non-enumerating refusal,
         // and the permission it evaluated is still recorded.
-        let superuser = server.pg_fixture().superuser_pool()?;
-        let listed_decisions = || async {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM vala.audit_staging
-                  WHERE operation = 'auth.credential.list' AND outcome = 'allowed'",
-            )
-            .fetch_one(&superuser)
-            .await
-        };
-        server
-            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
-            .await?;
-        let before = listed_decisions().await?;
+        let tenant = server.data_tenant_id();
+        let listing_decisions = "operation = 'auth.credential.list' AND outcome = 'allowed'";
+        server.await_audit_retained().await?;
+        let decisions_before = server
+            .retained_audit_records(tenant, "outcome", listing_decisions)
+            .await?
+            .len() as u64;
         let unknown = admin_client
             .call_tool(
                 CallToolRequestParams::new(LIST_CREDENTIALS).with_arguments(
@@ -330,13 +324,8 @@ mod pg_tests {
             "an unknown principal is refused as not found: {rendered}"
         );
         server
-            .wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+            .await_retained_audit_count(tenant, listing_decisions, decisions_before + 1)
             .await?;
-        assert_eq!(
-            listed_decisions().await?,
-            before + 1,
-            "the refused listing records exactly one allowed decision"
-        );
 
         reader_client.cancel().await?;
 

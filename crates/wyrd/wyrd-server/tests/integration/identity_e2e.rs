@@ -189,7 +189,7 @@ async fn delegate_through_writer(
     label: &str,
 ) -> (String, Bootstrap) {
     let actor = srv
-        .bootstrap_service(&format!("{label}-actor"), &["writer"])
+        .bootstrap_service(&format!("{label}-actor"), &["editor"])
         .await
         .expect("actor bootstraps");
     let actor_jwt = srv
@@ -451,7 +451,7 @@ async fn workload_jwt_bearer_journey_keycloak() {
 
     // Seed the bound principal under the exact server-owned card_ref. It holds
     // writer so the minted workload token can be the terminal's subject.
-    srv.seed_card_principal(&card_ref, &["writer"])
+    srv.seed_card_principal(&card_ref, &["editor"])
         .await
         .expect("workload principal seeds");
 
@@ -636,7 +636,7 @@ async fn workload_jwt_bearer_activates_only_its_exact_owner_keycloak() {
         .await
         .expect("server boots config-driven");
     let Bootstrap::User { jwt, .. } = srv
-        .bootstrap_user("workload-live-writer", &["writer"])
+        .bootstrap_user("workload-live-writer", &["editor"])
         .await
         .expect("writer bootstraps")
     else {
@@ -695,7 +695,7 @@ async fn ttl_expiry_journey() {
         .expect("test server starts");
 
     let principal = srv
-        .bootstrap_service("ttl-svc", &["writer"])
+        .bootstrap_service("ttl-svc", &["editor"])
         .await
         .expect("service bootstraps");
     let api_key = principal
@@ -751,7 +751,7 @@ async fn revocation_journey() {
         .expect("admin api key exchange succeeds");
 
     let target = srv
-        .bootstrap_service("revoke-target", &["writer"])
+        .bootstrap_service("revoke-target", &["editor"])
         .await
         .expect("target bootstraps");
     let target_key = target.api_key().expect("target has api key").clone();
@@ -852,7 +852,7 @@ async fn revocation_requires_admin_permission() {
 // ─── Service-account issuer full chain ────────────────────────────────────────
 
 /// Full-chain API-key journey with a **service-account** issuer:
-///   1. Admin SA (`runtime_admin`) bootstrapped via harness SQL.
+///   1. Admin SA (`admin`) bootstrapped via harness SQL.
 ///   2. Target SA bootstrapped via harness SQL (the key is issued for this card).
 ///   3. Admin key → `POST /auth/token` → access token.
 ///   4. `POST /auth/issue-key` authenticated as the admin SA; `created_by` is the
@@ -873,9 +873,9 @@ async fn service_account_issuer_full_chain() {
         .await
         .expect("test server starts");
 
-    // Admin service account: holds runtime_admin so it has key-issuance permission.
+    // Admin service account: holds admin so it has key-issuance permission.
     let admin = srv
-        .bootstrap_service("sa-chain-admin", &["runtime_admin"])
+        .bootstrap_service("sa-chain-admin", &["admin"])
         .await
         .expect("admin service account bootstraps");
     let admin_key = admin.api_key().expect("admin has api key").clone();
@@ -889,7 +889,7 @@ async fn service_account_issuer_full_chain() {
     // Target service card: the card a key will be issued for.
     // Holds writer so the issued token can later be the terminal's subject.
     let target = srv
-        .bootstrap_service("sa-chain-target", &["writer"])
+        .bootstrap_service("sa-chain-target", &["editor"])
         .await
         .expect("target service account bootstraps");
     let target_card_ref = target
@@ -971,7 +971,7 @@ fn human_server_builder() -> WyrdTestServerBuilder {
 /// The group map every human journey grants through: the realm's
 /// `wyrd-admins` group confers `writer`, so alice can be a delegation subject.
 fn admins_write() -> HashMap<String, Vec<String>> {
-    HashMap::from([("wyrd-admins".to_owned(), vec!["writer".to_owned()])])
+    HashMap::from([("wyrd-admins".to_owned(), vec!["editor".to_owned()])])
 }
 
 /// A tenant administrator's access token and its recovery API key.
@@ -2349,27 +2349,72 @@ async fn a_withdrawn_oidc_group_invalidates_the_roles_it_granted() {
         .await;
 }
 
-/// Staged allowed `auth.user.roles.sync` events for User `principal_id`.
-///
-/// In-process test servers run no audit publisher, so every committed event
-/// is still in staging.
+/// Retained allowed `auth.user.roles.sync` events for User `principal_id`.
 ///
 /// # Panics
-/// Panics when the query fails.
-async fn roles_sync_events(srv: &WyrdTestServer, principal_id: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-          WHERE operation = 'auth.user.roles.sync' AND outcome = 'allowed' \
-            AND principal_id = $1::uuid AND resource = 'principal:' || $1",
-    )
-    .bind(principal_id)
-    .fetch_one(
-        &srv.pg_fixture()
-            .superuser_pool()
-            .expect("superuser pool opens"),
+/// Panics when audit retention does not settle or the read fails.
+async fn roles_sync_events(srv: &WyrdTestServer, principal_id: &str) -> usize {
+    retained_decisions(
+        srv,
+        srv.data_tenant_id(),
+        &format!(
+            "operation = 'auth.user.roles.sync' AND outcome = 'allowed' \
+             AND audit_principal_id = '{principal_id}' \
+             AND resource = 'principal:{principal_id}'"
+        ),
     )
     .await
-    .expect("role sync audit reads")
+}
+
+/// Count of `tenant`'s retained audit decisions matching `predicate`, read
+/// once every decision `srv` staged so far is retained.
+///
+/// # Panics
+/// Panics when audit retention does not settle or the read fails.
+async fn retained_decisions(srv: &WyrdTestServer, tenant: DataTenantId, predicate: &str) -> usize {
+    srv.await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    srv.retained_audit_records(tenant, "operation", predicate)
+        .await
+        .expect("retained audit reads")
+        .len()
+}
+
+/// `tenant`'s retained candidate-activation decisions as
+/// `(principal, credential, permission, outcome)`, read once every decision
+/// `srv` staged so far is retained.
+///
+/// A replica reads its own live Scribe; a stopped replica's persisted rows
+/// reach other replicas only through Forge publication, so callers read each
+/// replica before it stops.
+///
+/// # Panics
+/// Panics when audit retention does not settle or the read fails.
+async fn activation_decisions(
+    srv: &WyrdTestServer,
+    tenant: DataTenantId,
+) -> Vec<(String, Option<String>, String, String)> {
+    srv.await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    srv.retained_audit_records(
+        tenant,
+        "audit_principal_id, credential_id, permission, outcome",
+        "operation = 'identity.oidc.candidate.activate'",
+    )
+    .await
+    .expect("retained activation decisions read")
+    .into_iter()
+    .map(|row| {
+        (
+            row[0].clone().unwrap_or_default(),
+            row[1].clone(),
+            row[2].clone().unwrap_or_default(),
+            row[3].clone().unwrap_or_default(),
+        )
+    })
+    .collect()
 }
 
 // ─── Tenant human connection administration ─────────────────────────────────
@@ -2388,8 +2433,8 @@ fn assert_refused(status: StatusCode, body: &Value, expected: StatusCode, code: 
 /// Tenant A and tenant B each configure the same Keycloak issuer through the
 /// served `/v1/identity/oidc/*` API — A with the public client, B with the
 /// confidential client and a `SecretPost` secret — and the journey proves:
-///   1. an unauthorized tenant principal (`runtime_admin`, which holds
-///      `service_accounts:write` but not `identity_connections:write`) is
+///   1. an unauthorized tenant principal (`editor`, which does not hold
+///      `identity_connections:write`) is
 ///      refused on read and write, and each refusal is audited;
 ///   2. each tenant reads only its own redacted connection with the
 ///      deployment callback URL, and no response carries B's secret;
@@ -2425,13 +2470,13 @@ async fn tenant_connection_admin_journey() {
     let admin_a = tenant_admin(&srv, tenant_a, "connection-admin-a").await;
     let admin_b = tenant_admin(&srv, tenant_b, "connection-admin-b").await;
     let operator = srv
-        .bootstrap_service_in_tenant(tenant_a, "connection-runtime-admin", &["runtime_admin"])
+        .bootstrap_service_in_tenant(tenant_a, "connection-editor", &["editor"])
         .await
-        .expect("runtime admin bootstraps");
+        .expect("non-admin bootstraps");
     let operator_token = srv
-        .exchange_api_key(operator.api_key().expect("runtime admin has a key"))
+        .exchange_api_key(operator.api_key().expect("non-admin has a key"))
         .await
-        .expect("runtime admin key exchanges");
+        .expect("non-admin key exchanges");
 
     // 1. service_accounts:write alone does not administer human SSO.
     let (status, body) = call_json(&srv, &operator_token, Method::GET, CONNECTIONS, None).await;
@@ -2662,7 +2707,7 @@ async fn tenant_connection_admin_journey() {
         "tenant B is untouched"
     );
 
-    srv.await_audit_published(tenant_a)
+    srv.await_audit_retained()
         .await
         .expect("tenant A audit publishes");
     let decisions = srv
@@ -2729,7 +2774,7 @@ async fn tenant_connection_admin_journey() {
 ///   7. from then on only K2 writers serve: a same-issuer secret rotation
 ///      staged on B is activated by the recovery principal and served by the
 ///      K2-only replica at once, and deactivation on B stops login there;
-///   8. the canonical audit staging attributes each recovery decision to its
+///   8. retained audit history attributes each recovery decision to its
 ///      principal and verified credential: Denied for the underprivileged key, Allowed for
 ///      each successful activation, and nothing for the malformed key.
 ///
@@ -2883,10 +2928,10 @@ async fn tenant_connection_rotation_journey() {
             && window <= ChronoDuration::minutes(15) + ChronoDuration::seconds(5),
         "the stamp lasts fifteen minutes: {window}"
     );
-    let runtime_admin = replica_a
-        .bootstrap_service_in_tenant(tenant, "rotation-runtime-admin", &["runtime_admin"])
+    let non_admin = replica_a
+        .bootstrap_service_in_tenant(tenant, "rotation-editor", &["editor"])
         .await
-        .expect("runtime admin bootstraps");
+        .expect("non-admin bootstraps");
     let recovery_admin = replica_a
         .bootstrap_service_in_tenant(tenant, "rotation-recovery-admin", &["admin"])
         .await
@@ -2916,7 +2961,7 @@ async fn tenant_connection_rotation_journey() {
         CANDIDATE_ACTIVATE,
         Some(activation(
             3,
-            runtime_admin.api_key().expect("runtime admin has a key"),
+            non_admin.api_key().expect("non-admin has a key"),
         )),
     )
     .await;
@@ -2928,9 +2973,9 @@ async fn tenant_connection_rotation_journey() {
     );
     assert!(
         !body.to_string().contains(
-            runtime_admin
+            non_admin
                 .api_key()
-                .expect("runtime admin has a key")
+                .expect("non-admin has a key")
                 .expose_secret()
         ),
         "the refusal never echoes the recovery key"
@@ -3053,6 +3098,7 @@ async fn tenant_connection_rotation_journey() {
         k2_only.open(&late_under_k1).is_err(),
         "A sealed the late write under K1"
     );
+    let mut recovery_decisions = activation_decisions(&replica_a, tenant).await;
     replica_a
         .shutdown()
         .await
@@ -3152,26 +3198,13 @@ async fn tenant_connection_rotation_journey() {
     assert_eq!(status, StatusCode::NO_CONTENT, "B deactivates: {body}");
     assert_eq!(login_refusal(&replica_k2).await, "access_denied");
 
-    // 8. Each recovery decision is staged on the canonical audit path,
+    // 8. Each recovery decision is retained on the canonical audit path,
     //    attributed to the recovery principal and its verified credential;
-    //    the malformed key left none. In-process replicas run no publisher,
-    //    so every committed decision is still in staging.
-    replica_b
-        .wait_oracle_audit_staged(StdDuration::from_secs(30))
-        .await
-        .expect("audit outbox settles");
-    let recovery_decisions = sqlx::query_as::<_, (String, Option<String>, String, String)>(
-        "SELECT principal_id::text, credential_id::text, permission, outcome \
-         FROM vala.audit_staging \
-         WHERE data_tenant_id = $1 AND operation = 'identity.oidc.candidate.activate' \
-         ORDER BY seq",
-    )
-    .bind(tenant.as_uuid())
-    .fetch_all(&superuser)
-    .await
-    .expect("staged activation decisions read");
+    //    the malformed key left none. The rows are compared per principal in
+    //    decision order: A's, read before it stopped, then B's.
+    recovery_decisions.extend(activation_decisions(&replica_b, tenant).await);
     let admin_id = principal_id_of(token);
-    let runtime_id = runtime_admin.id().as_uuid().to_string();
+    let runtime_id = non_admin.id().as_uuid().to_string();
     let recovery_id = recovery_admin.id().as_uuid().to_string();
     let decisions_of = |principal: &str| -> Vec<(Option<String>, String, String)> {
         recovery_decisions
@@ -3186,7 +3219,7 @@ async fn tenant_connection_rotation_journey() {
     assert_eq!(
         decisions_of(&runtime_id),
         vec![(
-            Some(api_key_id(&superuser, &runtime_admin).await),
+            Some(api_key_id(&superuser, &non_admin).await),
             write.clone(),
             "denied".to_owned()
         )],
@@ -3372,18 +3405,23 @@ async fn tenant_connection_session_cutoff_journey() {
         .superuser_pool()
         .expect("superuser pool opens");
     let committed = || async {
-        sqlx::query_as::<_, (i64, i64, i64, i64)>(
+        let rows = sqlx::query_as::<_, (i64, i64, i64)>(
             "SELECT (SELECT count(*) FROM wyrd.auth_refresh_tokens
                       WHERE principal_id = $1::uuid),
                     (SELECT count(*) FROM wyrd.auth_login_state WHERE code_hash IS NOT NULL),
-                    (SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid),
-                    (SELECT count(*) FROM vala.audit_staging
-                      WHERE operation IN ('auth.login', 'auth.user.roles.sync'))",
+                    (SELECT count(*) FROM wyrd.auth_user_roles WHERE user_id = $1::uuid)",
         )
         .bind(&principal)
         .fetch_one(&superuser)
         .await
-        .expect("committed effects read")
+        .expect("committed effects read");
+        let audits = retained_decisions(
+            &replica_a,
+            tenant,
+            "operation IN ('auth.login', 'auth.user.roles.sync')",
+        )
+        .await;
+        (rows, audits)
     };
     let before = committed().await;
     let provider = authorization_code(
@@ -3596,15 +3634,15 @@ async fn tenant_human_login_journey() {
     );
 
     // 5. The issuance decision is on the canonical audit path.
-    let allowed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-          WHERE operation = 'auth.token.exchange' AND outcome = 'allowed' \
-            AND principal_id = $1::uuid",
+    let allowed = retained_decisions(
+        &srv,
+        srv.data_tenant_id(),
+        &format!(
+            "operation = 'auth.token.exchange' AND outcome = 'allowed' \
+             AND audit_principal_id = '{alice}'"
+        ),
     )
-    .bind(&alice)
-    .fetch_one(&superuser)
-    .await
-    .expect("audit reads");
+    .await;
     assert!(allowed >= 1, "alice's issuance is audited");
 
     srv.shutdown().await.expect("server shuts down");
@@ -3810,10 +3848,7 @@ fn assert_oauth_refusal(reply: &(StatusCode, Value), status: StatusCode, error: 
 ///      outage are refused back to the client (`access_denied`, or
 ///      `temporarily_unavailable` for the outage), leaving no code, User,
 ///      identity, role grant, or refresh row, while a valid single-audience
-///      token whose `azp` names the client completes;
-///   6. an injected audit-staging failure at redemption costs the login
-///      nothing: the token and refresh row are issued, the failed audit write
-///      is counted, and the decision commits once after the store recovers.
+///      token whose `azp` names the client completes.
 ///
 /// A discovered unsafe (cleartext or internal) provider URL is proven by the
 /// `wyrd-auth` unit tests (`login::destination_tests`,
@@ -3829,7 +3864,6 @@ async fn tenant_callback_refusal_journey() {
     /// case from the nonce the login began with, so each case can reply with a
     /// forged or failing token exchange.
     type Mutation<'a> = Box<dyn Fn(&str) -> wiremock::ResponseTemplate + 'a>;
-    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
     let keycloak = OidcIssuerFixture::connect(&keycloak_issuer()).await;
     let srv = Box::pin(human_server()).await;
     let superuser = srv
@@ -4248,72 +4282,6 @@ async fn tenant_callback_refusal_journey() {
         "the unmodified mock token completes: {body}"
     );
 
-    // 6. An audit failure at redemption does not refuse the login.
-    let before = refresh_rows(&srv, &alice).await;
-    let (failing_code, failing_verifier) = issued_code(&srv, &keycloak).await;
-    let exchanges = || async {
-        srv.wait_oracle_audit_staged(StdDuration::from_secs(30))
-            .await
-            .expect("audit outbox settles");
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.token.exchange'",
-        )
-        .fetch_one(&superuser)
-        .await
-        .expect("exchange decisions read")
-    };
-    let exchanges_before = exchanges().await;
-    sqlx::query(
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_login_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'auth.token.exchange' THEN
-               RAISE EXCEPTION 'injected login audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure function installs");
-    sqlx::query(
-        r"CREATE TRIGGER test_fail_login_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_login_audit()",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure trigger installs");
-    let (status, body) = redeem(&srv, &failing_code, &failing_verifier).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an unstageable login audit still issues the token: {body}"
-    );
-    assert!(
-        body.get("access_token").is_some(),
-        "the redemption serves a token: {body}"
-    );
-    failures
-        .await_failure(StdDuration::from_secs(30))
-        .await
-        .expect("the failed audit write is counted");
-    sqlx::query("DROP TRIGGER test_fail_login_audit ON vala.audit_staging")
-        .execute(&superuser)
-        .await
-        .expect("failure trigger drops");
-    assert_eq!(
-        refresh_rows(&srv, &alice).await,
-        before + 1,
-        "the login inserted its refresh row"
-    );
-    assert_eq!(
-        exchanges().await,
-        exchanges_before + 1,
-        "the login decision commits exactly once after recovery"
-    );
-
     srv.shutdown().await.expect("server shuts down");
 }
 
@@ -4401,10 +4369,6 @@ async fn tenant_callback_issuer_binding_journey() {
         .await
         .expect("test server starts");
     let tenant = srv.data_tenant_id();
-    let superuser = srv
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
     let mock = wiremock::MockServer::start().await;
     let issuer = mock.uri();
     let silent = mock_discovery(&issuer, &["EdDSA"]);
@@ -4469,19 +4433,12 @@ async fn tenant_callback_issuer_binding_journey() {
     .await;
     assert_eq!(status, StatusCode::OK, "candidate activates: {active}");
 
-    let denied = || async {
-        srv.wait_oracle_audit_staged(StdDuration::from_secs(30))
-            .await
-            .expect("audit outbox settles");
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_staging \
-              WHERE data_tenant_id = $1 AND operation = 'auth.token.exchange' \
-                AND outcome = 'denied'",
+    let denied = || {
+        retained_decisions(
+            &srv,
+            tenant,
+            "operation = 'auth.token.exchange' AND outcome = 'denied'",
         )
-        .bind(tenant.as_uuid())
-        .fetch_one(&superuser)
-        .await
-        .expect("denied exchanges read")
     };
     let wrong_slash = format!("{issuer}/");
     let cases: Vec<IssuerCase> = vec![
@@ -4773,15 +4730,12 @@ async fn tenant_connection_test_sign_in_journey() {
     assert_test_completion(&present_test_return(&srv, &genuine, None).await);
     let (_, listed) = call_json(&srv, &admin_a.token, Method::GET, CONNECTIONS, None).await;
     assert_eq!(listed["candidate"]["tested_revision"], revision);
-    let decisions: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-          WHERE data_tenant_id = $1 AND operation = 'identity.oidc.candidate.tested' \
-            AND outcome = 'allowed'",
+    let decisions = retained_decisions(
+        &srv,
+        tenant_a,
+        "operation = 'identity.oidc.candidate.tested' AND outcome = 'allowed'",
     )
-    .bind(tenant_a.as_uuid())
-    .fetch_one(&superuser)
-    .await
-    .expect("tested decisions read");
+    .await;
     assert_eq!(decisions, 1, "the tester's authority is decided once");
     assert_eq!(
         issued().await,
@@ -5033,7 +4987,7 @@ async fn tenant_machine_independence_journey() {
     // principal resolution, so only the accepted workload needs a principal.
     srv.seed_card_principal(
         &binding_card_ref(CardKind::Service, "machine-sa", "prod"),
-        &["writer"],
+        &["editor"],
     )
     .await
     .expect("workload principal seeds");
@@ -5053,7 +5007,7 @@ async fn tenant_machine_independence_journey() {
 
     // 2. An API key is unaffected.
     let keyed = srv
-        .bootstrap_service("machine-key", &["writer"])
+        .bootstrap_service("machine-key", &["editor"])
         .await
         .expect("keyed service bootstraps");
     let keyed_token = srv
@@ -5106,7 +5060,7 @@ async fn tenant_machine_independence_journey() {
 /// operator path — `wyrd auth trusted-issuer add` and `wyrd auth
 /// workload-binding add` over HTTP into `/admin` → Postgres — then exchange a
 /// live Keycloak assertion and reach `/v1`:
-///   1. an admin SA (`runtime_admin`) mints the access token the CLI presents,
+///   1. an admin SA (`admin`) mints the access token the CLI presents,
 ///   2. the trusted issuer is authored via the CLI with a `SecretPost` client
 ///      secret, which must be sealed to ciphertext at rest (never plaintext),
 ///   3. the `(issuer, subject)` binding is authored via the CLI, resolving to a
@@ -5151,9 +5105,9 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
         .expect("workload token carries a subject")
         .to_owned();
 
-    // Admin SA holding runtime_admin → access token used as the CLI bearer.
+    // Admin SA holding admin → access token used as the CLI bearer.
     let admin = srv
-        .bootstrap_service("cloud-journey-admin", &["runtime_admin"])
+        .bootstrap_service("cloud-journey-admin", &["admin"])
         .await
         .expect("admin service account bootstraps");
     let admin_token = srv
@@ -5163,7 +5117,7 @@ async fn federated_cloud_journey_cli_authored_keycloak() {
 
     // The server-owned card the binding resolves to; seed its principal.
     let card_ref = binding_card_ref(CardKind::Service, "cloud-journey-sa", "prod");
-    srv.seed_card_principal(&card_ref, &["writer"])
+    srv.seed_card_principal(&card_ref, &["editor"])
         .await
         .expect("workload principal seeds");
 
@@ -5305,7 +5259,7 @@ async fn assert_client_workload_lifecycle(srv: &WyrdTestServer, assertion: &str)
 /// tenants, with a subject bound only in tenant A, resolves in A and fails
 /// closed in B.
 ///   1. tenant A is the fixture tenant; tenant B is provisioned fresh,
-///   2. per-tenant `runtime_admin` admins each author the same issuer via the
+///   2. per-tenant `admin` principals each author the same issuer via the
 ///      real CLI (so the issuer is trusted in BOTH tenants),
 ///   3. the `(issuer, subject)` binding is authored via the CLI only in A, and
 ///      its principal is seeded only in A,
@@ -5352,10 +5306,10 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
         .expect("workload token carries a subject")
         .to_owned();
 
-    // Per-tenant runtime_admin admins, each minted under its own tenant so its
+    // Per-tenant admins, each minted under its own tenant so its
     // access token authors into that tenant.
     let admin_a = srv
-        .bootstrap_service_in_tenant(tenant_a, "iso-admin-a", &["runtime_admin"])
+        .bootstrap_service_in_tenant(tenant_a, "iso-admin-a", &["admin"])
         .await
         .expect("tenant A admin bootstraps");
     let admin_token_a = srv
@@ -5363,7 +5317,7 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
         .await
         .expect("admin A api key exchange succeeds");
     let admin_b = srv
-        .bootstrap_service_in_tenant(tenant_b, "iso-admin-b", &["runtime_admin"])
+        .bootstrap_service_in_tenant(tenant_b, "iso-admin-b", &["admin"])
         .await
         .expect("tenant B admin bootstraps");
     let admin_token_b = srv
@@ -5393,7 +5347,7 @@ async fn same_issuer_two_tenant_isolation_keycloak() {
         .await,
         "CLI workload-binding add (tenant A) succeeds",
     );
-    srv.seed_card_principal_in_tenant(tenant_a, &card_ref, &["runtime_admin"])
+    srv.seed_card_principal_in_tenant(tenant_a, &card_ref, &["workload"])
         .await
         .expect("tenant A workload principal seeds");
 

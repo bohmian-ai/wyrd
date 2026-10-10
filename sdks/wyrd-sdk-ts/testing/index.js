@@ -49,9 +49,6 @@ export const cli = {
   async issueKey(card, options = {}) {
     return value(await native.cliIssueKey(card, await connection(options)));
   },
-  async grantRole(grant, options = {}) {
-    return value(await native.cliGrantRole(grant, await connection(options)));
-  },
   async putProviderCredential(write, options = {}) {
     return value(await native.cliPutProviderCredential(write, await connection(options)));
   },

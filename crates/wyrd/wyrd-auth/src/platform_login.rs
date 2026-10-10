@@ -446,7 +446,7 @@ mod pg_tests {
             Arc::new(PlatformSessions::new(
                 fixture.operator_pool().clone(),
                 Arc::new(key),
-                crate::audit::test_outbox::outbox(fixture),
+                crate::audit::test_audit::RecordedAudit::new(),
             )),
             ScreenedHttp::new(policy),
         )

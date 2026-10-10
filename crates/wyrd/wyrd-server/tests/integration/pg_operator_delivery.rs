@@ -114,7 +114,6 @@ impl Delivery {
     /// Panics when startup or seeding fails.
     async fn boot() -> Self {
         let server = WyrdTestServer::builder()
-            .without_audit_publication_for_test()
             .start_bound()
             .await
             .expect("bound server starts");
@@ -1709,25 +1708,27 @@ async fn verifiers_progress_while_operator_deliveries_are_capped() {
             busy_dispatches + quiet_dispatches <= 16,
             "the process-wide Operator ceiling was exceeded"
         );
-        if (busy_runs, busy_dispatches, quiet_runs) == (6, 4, 2) {
+        // The quiet delivery settles on its own task, so it is awaited in the
+        // same poll that sees the busy tenant saturated: both holding at once
+        // is the claim, and a starved quiet tenant reaches the deadline.
+        let quiet_delivered: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM wyrd.operator_dispatches \
+              WHERE data_tenant_id = $1 AND status = 'delivered'",
+        )
+        .bind(quiet.tenant.as_uuid())
+        .fetch_one(&delivery.assertion)
+        .await
+        .expect("quiet dispatch reads");
+        if (busy_runs, busy_dispatches, quiet_runs, quiet_delivered) == (6, 4, 2, 1) {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "pools never saturated: busy {busy_runs}/{busy_dispatches}, quiet {quiet_runs}"
+            "pools never saturated with the quiet tenant delivered: busy \
+             {busy_runs}/{busy_dispatches}, quiet {quiet_runs}, delivered {quiet_delivered}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let quiet_delivered: String =
-        sqlx::query_scalar("SELECT status FROM wyrd.operator_dispatches WHERE data_tenant_id = $1")
-            .bind(quiet.tenant.as_uuid())
-            .fetch_one(&delivery.assertion)
-            .await
-            .expect("quiet dispatch reads");
-    assert_eq!(
-        quiet_delivered, "delivered",
-        "the quiet tenant delivered while the busy tenant was saturated"
-    );
     assert_eq!(
         script.entered(),
         2 + 6 + 2,

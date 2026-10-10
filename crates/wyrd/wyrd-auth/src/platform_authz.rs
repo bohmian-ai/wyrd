@@ -1,22 +1,20 @@
 //! Platform-control-plane authorization, coupled to its canonical audit record.
 //!
 //! Every decision that evaluates a platform principal's permission is staged
-//! on the process audit outbox as soon as it is known, allowed and denied
+//! on the process audit stage as soon as it is known, allowed and denied
 //! alike. The permission blocks; the audit does not. An allowance then opens
 //! the operator transaction the caller performs the operation in; a denial
 //! refuses. Neither waits for, or fails on, the audit commit.
 //!
-//! The record goes to `vala.audit_staging` through the one canonical outbox,
-//! staged under `DataTenantId::SYSTEM_OWNER` because a platform decision has no
-//! owning tenant. The ordinary `AuditPublisher` drains that sentinel tenant like
-//! any other, so these decisions reach retained history through the same
-//! publisher and the same reader as every tenant-plane decision. There is no
-//! platform audit table, publisher, or reader.
+//! The record is staged under `DataTenantId::SYSTEM_OWNER` because a platform
+//! decision has no owning tenant, and reaches retained audit history through
+//! the same Scribe outbox and the same reader as every tenant-plane decision.
+//! There is no platform audit table, writer, or reader.
 
 use std::sync::Arc;
 
 use uuid::Uuid;
-use vala_sql::audit_outbox::AuditOutbox;
+use wyrd_runtime::audit::AuditStage;
 use wyrd_runtime::{AuthContext, Permission};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditOutcome};
@@ -99,15 +97,15 @@ pub enum PlatformAuthzError {
 /// Authorizes platform-plane operations and records every decision.
 ///
 /// Owns the operator boundary the operation's own `platform.*` writes commit
-/// through, and the process audit outbox each decision is staged on. The
+/// through, and the process audit stage each decision is staged on. The
 /// decision is staged, never appended inside the operation's transaction, so
 /// no platform operation waits for or fails on its audit.
 #[derive(Clone)]
 pub struct PlatformAuthorization {
     /// Cross-tenant boundary the authorized operation runs on.
     pool: OperatorPool,
-    /// Process audit outbox every decision is staged on.
-    audit: Arc<AuditOutbox>,
+    /// Process audit stage every decision is staged on.
+    audit: Arc<dyn AuditStage>,
 }
 
 impl Debug for PlatformAuthorization {
@@ -123,13 +121,13 @@ impl PlatformAuthorization {
     /// Bind platform authorization to one operator boundary and the process
     /// audit outbox.
     #[must_use]
-    pub const fn new(pool: OperatorPool, audit: Arc<AuditOutbox>) -> Self {
+    pub const fn new(pool: OperatorPool, audit: Arc<dyn AuditStage>) -> Self {
         Self { pool, audit }
     }
 
     /// Decide one platform-plane permission and record the decision.
     ///
-    /// The decision — allowed or denied — is staged on the process audit outbox
+    /// The decision — allowed or denied — is staged on the process audit stage
     /// under the `wyrd-system` sentinel tenant as soon as it is known, before
     /// the operation runs and outside its transaction. On success the caller
     /// owns the returned operator transaction and must commit it.
@@ -228,7 +226,6 @@ mod pg_tests {
     //! Decision and canonical-audit coupling against real Postgres.
 
     use super::{PLATFORM_TENANTS_RESOURCE, tenant_resource};
-    use sqlx::Row;
     use uuid::Uuid;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{
@@ -237,10 +234,11 @@ mod pg_tests {
     };
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
     use wyrd_sql::queries::platform::principals::insert_platform_principal;
 
     use super::{PLATFORM_AUTHZ_OPERATION, PlatformAuthorization, PlatformAuthzError};
-    use crate::audit::test_outbox::{assert_retrying, drain, outbox};
+    use crate::audit::test_audit::RecordedAudit;
     use std::sync::Arc;
 
     /// A platform context holding exactly `permissions`, backed by a real row.
@@ -274,66 +272,28 @@ mod pg_tests {
         ))
     }
 
-    /// Read the `principal_kind` one staged decision recorded.
-    async fn staged_principal_kind(fixture: &PgFixture, principal: PrincipalId) -> String {
-        let admin = fixture.superuser_pool().expect("superuser pool");
-        sqlx::query_scalar(
-            "SELECT principal_kind FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND principal_id = $2 AND operation = $3",
-        )
-        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-        .bind(principal.as_uuid())
-        .bind(PLATFORM_AUTHZ_OPERATION)
-        .fetch_one(&admin)
-        .await
-        .expect("staged decision is readable")
+    /// The platform decisions staged on `audit` for `principal`, in staging
+    /// order.
+    ///
+    /// A platform decision stages under the sentinel system-owner tenant
+    /// because it has no owning tenant; there is no platform audit table.
+    fn staged(audit: &RecordedAudit, principal: PrincipalId) -> Vec<AuditEvent> {
+        audit
+            .operation(PLATFORM_AUTHZ_OPERATION)
+            .into_iter()
+            .filter(|(tenant, event)| {
+                *tenant == DataTenantId::SYSTEM_OWNER && event.principal_id == principal
+            })
+            .map(|(_, event)| event)
+            .collect()
     }
 
-    /// Count canonical staged rows for one principal, by outcome.
-    ///
-    /// Reads the sentinel tenant's staging rows, which is where a platform
-    /// decision stages: there is no platform audit table to read instead. The
-    /// read goes through the superuser pool on purpose — the operator role is
-    /// granted only `INSERT` on staging, so the production boundary cannot see
-    /// what it wrote.
-    async fn staged_rows(fixture: &PgFixture, principal: PrincipalId, outcome: &str) -> i64 {
-        let admin = fixture.superuser_pool().expect("superuser pool");
-        sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging
-              WHERE data_tenant_id = $1
-                AND principal_id = $2
-                AND operation = $3
-                AND outcome = $4",
-        )
-        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-        .bind(principal.as_uuid())
-        .bind(PLATFORM_AUTHZ_OPERATION)
-        .bind(outcome)
-        .fetch_one(&admin)
-        .await
-        .expect("staged count reads")
-    }
-
-    /// Read the `credential_id` of each staged decision, oldest first.
-    ///
-    /// Ordered by the staged sequence so the caller can compare the decisions
-    /// against the order it made them in.
-    async fn staged_credential_ids(
-        fixture: &PgFixture,
-        principal: PrincipalId,
-    ) -> Vec<Option<Uuid>> {
-        let admin = fixture.superuser_pool().expect("superuser pool");
-        sqlx::query_scalar(
-            "SELECT credential_id FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND principal_id = $2 AND operation = $3
-              ORDER BY seq",
-        )
-        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-        .bind(principal.as_uuid())
-        .bind(PLATFORM_AUTHZ_OPERATION)
-        .fetch_all(&admin)
-        .await
-        .expect("staged decisions are readable")
+    /// Count the decisions staged for `principal` with `outcome`.
+    fn staged_rows(audit: &RecordedAudit, principal: PrincipalId, outcome: AuditOutcome) -> usize {
+        staged(audit, principal)
+            .iter()
+            .filter(|event| event.outcome == outcome)
+            .count()
     }
 
     /// An allowance is staged once the decision is known, outside the
@@ -352,8 +312,9 @@ mod pg_tests {
         let context = platform_context(&fixture, permissions).await;
         let principal = context.principal_id();
 
-        let audit = outbox(&fixture);
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
+        let audit = RecordedAudit::new();
+        let authz =
+            PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit) as _);
         let conn = authz
             .authorize(
                 &context,
@@ -364,9 +325,8 @@ mod pg_tests {
             .await
             .expect("authorized");
         drop(conn);
-        drain(&audit).await;
 
-        assert_eq!(staged_rows(&fixture, principal, "allowed").await, 1);
+        assert_eq!(staged_rows(&audit, principal, AuditOutcome::Allowed), 1);
     }
 
     /// The decision records the principal's stored kind, not the plane's.
@@ -382,8 +342,9 @@ mod pg_tests {
     #[tokio::test]
     async fn a_decision_records_the_stored_principal_kind() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
+        let audit = RecordedAudit::new();
+        let authz =
+            PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit) as _);
         let mut decided = Vec::new();
 
         for (kind, expected) in [
@@ -407,11 +368,10 @@ mod pg_tests {
             conn.commit().await.expect("operation commits");
             decided.push((principal, expected));
         }
-        drain(&audit).await;
 
         for (principal, expected) in decided {
             assert_eq!(
-                staged_principal_kind(&fixture, principal).await,
+                staged(&audit, principal)[0].principal_kind.as_str(),
                 expected,
                 "a {expected} decision is recorded as some other kind"
             );
@@ -432,8 +392,9 @@ mod pg_tests {
     #[tokio::test]
     async fn a_decision_records_the_credential_it_was_made_with() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let audit = outbox(&fixture);
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
+        let audit = RecordedAudit::new();
+        let authz =
+            PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit) as _);
         let mut permissions = PermissionSet::new();
         permissions.insert(Permission::tenant_create());
         let context =
@@ -457,10 +418,12 @@ mod pg_tests {
                 .expect("authorized");
             conn.commit().await.expect("operation commits");
         }
-        drain(&audit).await;
 
         assert_eq!(
-            staged_credential_ids(&fixture, principal).await,
+            staged(&audit, principal)
+                .iter()
+                .map(|event| event.credential_id)
+                .collect::<Vec<_>>(),
             vec![Some(original), Some(replacement), None],
             "the three decisions did not each name the credential they were made with"
         );
@@ -475,8 +438,9 @@ mod pg_tests {
         let principal = context.principal_id();
         let target = DataTenantId::new_v7();
 
-        let audit = outbox(&fixture);
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
+        let audit = RecordedAudit::new();
+        let authz =
+            PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit) as _);
         let error = authz
             .authorize(
                 &context,
@@ -487,25 +451,13 @@ mod pg_tests {
             .await
             .err()
             .expect("denied");
-        drain(&audit).await;
 
         assert!(matches!(error, PlatformAuthzError::Denied { .. }));
-        assert_eq!(staged_rows(&fixture, principal, "denied").await, 1);
+        assert_eq!(staged_rows(&audit, principal, AuditOutcome::Denied), 1);
 
-        let row = sqlx::query(
-            "SELECT resource, permission FROM vala.audit_staging
-              WHERE data_tenant_id = $1 AND principal_id = $2",
-        )
-        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-        .bind(principal.as_uuid())
-        .fetch_one(&fixture.superuser_pool().expect("superuser pool"))
-        .await
-        .expect("denial row reads");
-        assert_eq!(row.get::<String, _>("resource"), format!("tenant:{target}"));
-        assert_eq!(
-            row.get::<String, _>("permission"),
-            Permission::tenant_suspend().to_string()
-        );
+        let denial = &staged(&audit, principal)[0];
+        assert_eq!(denial.resource, format!("tenant:{target}"));
+        assert_eq!(denial.permission, Permission::tenant_suspend().to_string());
     }
 
     /// A tenant-scoped context never authorizes on the platform plane, and the
@@ -525,8 +477,9 @@ mod pg_tests {
         let principal = tenant.id;
         let context = AuthContext::from(tenant);
 
-        let audit = outbox(&fixture);
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
+        let audit = RecordedAudit::new();
+        let authz =
+            PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit) as _);
         let error = authz
             .authorize(
                 &context,
@@ -537,63 +490,12 @@ mod pg_tests {
             .await
             .err()
             .expect("refused");
-        drain(&audit).await;
 
         assert!(matches!(error, PlatformAuthzError::Denied { .. }));
         assert_eq!(
-            staged_rows(&fixture, principal, "denied").await,
+            staged_rows(&audit, principal, AuditOutcome::Denied),
             1,
             "a wildcard tenant grant never becomes platform authority"
         );
-    }
-
-    /// When the canonical audit log cannot accept the decision, the operation
-    /// is still authorized: permissions block, audits do not. The decision is
-    /// retried rather than lost and commits exactly once when the log recovers.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture cannot start, the decision is refused, a row
-    /// reaches staging while its insert privilege is revoked, or the decision
-    /// does not commit exactly once after the privilege returns.
-    #[tokio::test]
-    async fn an_unrecordable_decision_still_authorizes() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let mut permissions = PermissionSet::new();
-        permissions.insert(Permission::tenant_create());
-        let context = platform_context(&fixture, permissions).await;
-        let principal = context.principal_id();
-
-        // Remove the staging table's insert privilege for the role the outbox
-        // commits as, so the commit fails exactly as an unavailable audit log
-        // would.
-        let admin = fixture.superuser_pool().expect("superuser pool");
-        sqlx::query("REVOKE INSERT ON vala.audit_staging FROM wyrd_app")
-            .execute(&admin)
-            .await
-            .expect("privilege revoked");
-
-        let audit = outbox(&fixture);
-        let authz = PlatformAuthorization::new(fixture.operator_pool().clone(), Arc::clone(&audit));
-        let conn = authz
-            .authorize(
-                &context,
-                &Permission::tenant_create(),
-                "req-no-audit",
-                PLATFORM_TENANTS_RESOURCE,
-            )
-            .await
-            .expect("an audit failure never refuses an authorized operation");
-        conn.commit().await.expect("operation commits");
-        assert_retrying(&audit, 1).await;
-        assert_eq!(staged_rows(&fixture, principal, "allowed").await, 0);
-
-        sqlx::query("GRANT INSERT ON vala.audit_staging TO wyrd_app")
-            .execute(&admin)
-            .await
-            .expect("privilege restored");
-        drain(&audit).await;
-
-        assert_eq!(staged_rows(&fixture, principal, "allowed").await, 1);
     }
 }

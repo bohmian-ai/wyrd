@@ -4,8 +4,9 @@
 //! [`ObservationEnqueue`], which derives each row's exact `record_id`,
 //! subject, and committed `wyrd_event_time`, tags it with the Card the writing
 //! principal is bound to, and stages one run request per record on the
-//! [`ObservationRunOutbox`] without waiting. Only bindings that Card owns take
-//! a run of it, and a writer bound to no Card stages nothing (REQ-108). Gate
+//! [`ObservationRunOutbox`] without waiting. A Card-bound writer activates only
+//! the bindings its Card owns on the subject; a writer bound to no Card, such
+//! as a user, activates every `observations_ready` binding of the subject. Gate
 //! hands over only the acknowledgement that first committed a batch, so a
 //! suppressed replay never queues and its later receipt instant can never be
 //! frozen as a run's event time.
@@ -116,18 +117,18 @@ impl ObservationEnqueue {
 }
 
 impl ObservationAck for ObservationEnqueue {
-    /// Decodes the acknowledged frame's records and stages one run request
-    /// per record, tagged with the Card `auth`'s principal is bound to as its
-    /// writer, without waiting.
+    /// Decodes the acknowledged frame's records, keyed by the `card_uid`
+    /// Scribe authorized and stored, and stages one run request per record,
+    /// tagged with the Card `auth`'s principal is bound to as its writer,
+    /// without waiting.
     ///
-    /// A writer bound to no Card owns no binding, so nothing is staged. A
-    /// frame that does not decode is logged and counted as lost; the
-    /// acknowledged observation is never affected.
+    /// A writer bound to no Card is staged without a writer, so its records
+    /// activate every matching binding of their subject. A frame that does
+    /// not decode is logged and counted as lost; the acknowledged
+    /// observation is never affected.
     fn acknowledged(&self, auth: &AuthContext, frame: Bytes, receipt_micros: i64) {
-        let Some(writer) = bound_card(&auth.principal) else {
-            return;
-        };
-        match EvalObservationsTable::acknowledged(&frame, &auth.principal, receipt_micros) {
+        let writer = bound_card(&auth.principal);
+        match EvalObservationsTable::acknowledged(&frame, receipt_micros) {
             Ok(keys) => {
                 for key in keys {
                     self.runs.stage(
@@ -160,7 +161,7 @@ impl ObservationAck for ObservationEnqueue {
 ///
 /// Returns `None` for a principal bound to no Card (humans, tenant
 /// administrators, Card-free automation, SYSTEM) or whose root member carries
-/// no UID; such a writer owns no binding.
+/// no UID; such a writer activates bindings of any owner.
 fn bound_card(principal: &Principal) -> Option<CardUid> {
     let card = principal.card_ref()?;
     principal
@@ -196,7 +197,7 @@ mod tests {
 
     /// A Service principal resolves to its root scope member's UID, while a
     /// User and a Card-free Service resolve to no writer Card, so their
-    /// records create no Eval runs.
+    /// records activate the subject's bindings of every owner.
     #[test]
     fn writer_card_is_the_bound_cards_scope_uid() {
         let uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid Card UID");

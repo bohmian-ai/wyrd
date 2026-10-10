@@ -21,7 +21,7 @@ mod pg_tests {
     use wyrd_testing::bifrost::seed_query_fixture;
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
-    /// caller that also holds tenant principal administration, `evals:run`, and
+    /// caller that also holds tenant principal administration, `verifier:run`, and
     /// `operators:write`: every read tool, then that caller's write tools.
     const ADVERTISED_TOOLS: [&str; 32] = [
         "bifrost.list_tables",
@@ -199,7 +199,7 @@ mod pg_tests {
             .filter_map(|field| field["name"].as_str())
             .collect();
         assert!(
-            correlation_names.contains(&"card_ref") && correlation_names.contains(&"run_id"),
+            correlation_names.contains(&"card_uid") && correlation_names.contains(&"run_id"),
             "the server-resolved correlation columns are their own class: {correlation_names:?}"
         );
         assert!(
@@ -251,7 +251,7 @@ mod pg_tests {
         client.cancel().await?;
 
         let denied = server
-            .bootstrap_service("mcp-discovery-denied", &["reader"])
+            .bootstrap_service("mcp-discovery-denied", &[])
             .await?;
         let denied_client = ()
             .serve_with_lifecycle(

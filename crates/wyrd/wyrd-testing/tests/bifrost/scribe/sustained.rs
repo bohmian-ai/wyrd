@@ -185,7 +185,7 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
     );
     assert!(
         server
-            .scribe_staging_backlog_for_test()
+            .scribe_staging_backlog_for_test(None)
             .expect("the pod's staged backlog is inspectable")
             .live_members
             > 0,
@@ -223,19 +223,13 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
         participant.assert_exact("published-hot").await;
     }
 
-    // Every read above committed a read decision that the server's audit
-    // publisher appends through this same Scribe. Settle that retained history
-    // and publish what it wrote, so the pod is drained rather than mid-append.
-    for tenant in participants
-        .iter()
-        .map(|participant| participant.tenant)
-        .chain([server.data_tenant_id()])
-    {
-        server
-            .await_audit_published(tenant)
-            .await
-            .expect("retained audit history settles");
-    }
+    // Every read above staged a read decision on the server's Scribe outbox.
+    // Settle that retained history and publish what it wrote, so the pod is
+    // drained rather than mid-append.
+    server
+        .await_audit_retained()
+        .await
+        .expect("retained audit history settles");
     server
         .flush_bifrost()
         .await
@@ -368,7 +362,7 @@ fn batch_values(tenant_ordinal: usize, batch: usize) -> Vec<i64> {
 /// Panics when the totals are not inspectable or any of them does not settle.
 fn assert_terminal_reconciliation(server: &WyrdTestServer) {
     let staging = server
-        .scribe_staging_backlog_for_test()
+        .scribe_staging_backlog_for_test(None)
         .expect("the pod's staged backlog is inspectable");
     assert_eq!(
         staging.outstanding_claims, 0,

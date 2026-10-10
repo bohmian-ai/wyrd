@@ -96,6 +96,10 @@ class IssueKeyResponse:
         """Credential id of the issued key."""
         ...
     @property
+    def principal_id(self) -> str:
+        """Principal the key authenticates as."""
+        ...
+    @property
     def key(self) -> str:
         """Plaintext API key."""
         ...
@@ -114,26 +118,6 @@ class IssueKeyResponse:
     @property
     def expires_at(self) -> datetime.datetime:
         """When the key expires."""
-        ...
-
-class GrantRoleResponse:
-    """The principal's Roles after ``grant_role``."""
-
-    @property
-    def principal_id(self) -> str:
-        """Principal the Role was granted to."""
-        ...
-    @property
-    def card_ref(self) -> CardRef:
-        """The principal's stored Card binding."""
-        ...
-    @property
-    def roles(self) -> list[str]:
-        """Every Role the principal now holds, ordered by name."""
-        ...
-    @property
-    def granted(self) -> bool:
-        """``True`` when this call added the Role, ``False`` when already held."""
         ...
 
 def plan(path: str | PathLike[str]) -> PlanReport:
@@ -264,40 +248,6 @@ def issue_key(
     """
     ...
 
-def grant_role(
-    *,
-    kind: str,
-    name: str,
-    version: str,
-    space: str,
-    role: str,
-    client: WyrdClient | None = None,
-) -> GrantRoleResponse:
-    """Grant one Role to the principal bound to a Card (``wyrd auth grant-role``).
-
-    Requires tenant administration. Granting a Role already held succeeds with
-    ``granted=False``. The Role reaches the principal's tokens at its next key
-    exchange, so a client built from the principal's key afterwards holds it.
-
-    Args:
-        kind: The Card kind, ``"Service"`` or ``"Agent"``.
-        name: The Card name.
-        version: The Card version.
-        space: The Card space.
-        role: A built-in or tenant Role name, such as ``"workload"``.
-        client: The administrator to act as. Omitted, the ambient chain.
-
-    Returns:
-        The principal's Roles after the grant.
-
-    Raises:
-        WyrdError: ``WYRD_SPEC_400_VALIDATION`` for invalid coordinates or an
-            unknown role; ``WYRD_PERMISSION_403_DENIED_RBAC`` when the caller
-            is not a tenant administrator; ``WYRD_AUTH_404_PRINCIPAL_NOT_FOUND``
-            when no principal is bound to the Card.
-    """
-    ...
-
 def put_provider_credential(
     write: Mapping[str, Any], *, client: WyrdClient | None = None
 ) -> ProviderCredentialView:
@@ -352,7 +302,6 @@ def delete_provider_credential(name: str, *, client: WyrdClient | None = None) -
     ...
 
 __all__ = [
-    "GrantRoleResponse",
     "IssueKeyResponse",
     "LoadOutput",
     "PlanCard",
@@ -361,7 +310,6 @@ __all__ = [
     "apply",
     "delete_provider_credential",
     "get",
-    "grant_role",
     "issue_key",
     "load",
     "plan",

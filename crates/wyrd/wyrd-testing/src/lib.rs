@@ -19,7 +19,7 @@ pub use oidc_fixture::{
 };
 pub use principal::Bootstrap;
 pub use server::{
-    AuditCommitFailures, OracleRuntimeInspection, WyrdTestServer, WyrdTestServerBuilder,
-    WyrdTestServerError, server_postgres_from_fixture,
+    OracleRuntimeInspection, WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError,
+    server_postgres_from_fixture,
 };
 pub use time::ClockHandle;

@@ -13,6 +13,8 @@ use vala_eval::EvalExecError;
 use vala_eval::executor::EvalReport;
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::card::operator::VerifierCounts;
+use wyrd_spec::vala::eval::AssertionResult;
+use wyrd_spec::vala::ids::RunId;
 use wyrd_spec::verification::{VerificationError, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::TerminalStatus;
 
@@ -34,7 +36,13 @@ pub enum VerifierReport {
         report: EvalReport,
         /// The workflow verdict the Eval engine's pass gate decided.
         verdict: VerificationVerdict,
+        /// The application Run that wrote the judged record, recorded as the
+        /// result's managed `run_id`; `None` when the record names no Run.
+        run_id: Option<RunId>,
     },
+    /// A task Verifier's one check, judged directly; it passes or fails.
+    /// Boxed because the result dwarfs every other report.
+    Task(Box<AssertionResult>),
 }
 
 impl VerifierReport {
@@ -44,6 +52,7 @@ impl VerifierReport {
         match self {
             Self::Drift(_) => "drift",
             Self::Eval { .. } => "eval",
+            Self::Task(_) => "task",
         }
     }
 
@@ -68,14 +77,19 @@ impl VerifierReport {
             }
             _ => VerificationVerdict::Inconclusive,
         };
-        Ok(Self::Eval { report, verdict })
+        Ok(Self::Eval {
+            report,
+            verdict,
+            run_id: None,
+        })
     }
 
     /// The common verdict of this result.
     ///
     /// Drift maps its own verdict (`no_drift` passes, `drift` fails,
     /// `inconclusive` stays inconclusive) and an unscored execution is
-    /// inconclusive; Eval reports the verdict its pass gate decided.
+    /// inconclusive; Eval reports the verdict its pass gate decided; a task
+    /// passes or fails with its one check.
     #[must_use]
     pub const fn verdict(&self) -> VerificationVerdict {
         match self {
@@ -86,6 +100,8 @@ impl VerifierReport {
                 DriftVerdict::Inconclusive => VerificationVerdict::Inconclusive,
             },
             Self::Eval { verdict, .. } => *verdict,
+            Self::Task(result) if result.passed => VerificationVerdict::Passed,
+            Self::Task(_) => VerificationVerdict::Failed,
         }
     }
 
@@ -110,7 +126,9 @@ impl VerifierReport {
                     report.features.len()
                 )
             }
-            Self::Eval { report, verdict } => {
+            Self::Eval {
+                report, verdict, ..
+            } => {
                 let rollup = report.workflow_summary();
                 format!(
                     "Eval verdict {}: {} of {} tasks passed.",
@@ -119,7 +137,35 @@ impl VerifierReport {
                     rollup.total_tasks
                 )
             }
+            Self::Task(result) => format!(
+                "Task {} {}.",
+                result.task_id.as_str(),
+                if result.passed { "passed" } else { "failed" }
+            ),
         }
+    }
+
+    /// The application Run an Eval report judged, if its record named one.
+    ///
+    /// Drift and task reports carry none: scheduled Drift has no application
+    /// Run and a direct execution takes it from its request.
+    #[must_use]
+    pub const fn run_id(&self) -> Option<&RunId> {
+        match self {
+            Self::Eval { run_id, .. } => run_id.as_ref(),
+            Self::Drift(_) | Self::Task(_) => None,
+        }
+    }
+
+    /// This report attributed to the application Run of its judged record.
+    ///
+    /// Only an Eval report records a Run; any other report is returned as is.
+    #[must_use]
+    pub fn with_run(mut self, run: Option<RunId>) -> Self {
+        if let Self::Eval { run_id, .. } = &mut self {
+            *run_id = run;
+        }
+        self
     }
 
     /// The count-only numbers frozen beside [`VerifierReport::summary`] into
@@ -127,11 +173,12 @@ impl VerifierReport {
     ///
     /// Drift counts drifted and scored features; Eval counts passed and ran
     /// tasks. An unscored Drift execution (never `failed`) reads zero of zero,
-    /// and a negative rollup count reads zero.
+    /// and a negative rollup count reads zero. A task has none: its one
+    /// check is fully described by its verdict.
     #[must_use]
-    pub fn counts(&self) -> VerifierCounts {
+    pub fn counts(&self) -> Option<VerifierCounts> {
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        match self {
+        Some(match self {
             Self::Drift(None) => VerifierCounts::Drift {
                 drifted_features: 0,
                 total_features: 0,
@@ -153,7 +200,8 @@ impl VerifierReport {
                     u32::try_from(rollup.total_tasks).unwrap_or(0),
                 )
             }
-        }
+            Self::Task(_) => return None,
+        })
     }
 }
 

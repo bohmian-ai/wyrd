@@ -21,6 +21,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Value, json};
 use wyrd_server::boot::init::InitError;
+use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 
 /// The one header every Wyrd plane authenticates on.
@@ -831,7 +832,7 @@ async fn a_tenant_rotates_an_automation_credential_without_an_outage() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -985,7 +986,7 @@ async fn replaying_a_revoke_does_not_disturb_the_surviving_credential() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -1224,7 +1225,7 @@ async fn a_credential_cannot_be_revoked_through_another_principal() {
                 tenant_request(
                     Method::POST,
                     "/v1/principals",
-                    Some(json!({ "name": name, "roles": ["reader"] })),
+                    Some(json!({ "name": name, "roles": ["viewer"] })),
                 ),
             )
             .await
@@ -1304,7 +1305,7 @@ async fn automation_cannot_escalate_itself_to_an_administrator() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "ci-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "ci-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -2048,61 +2049,42 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
     );
 
     // Both principals performed the same operation on the same plane, so the
-    // recorded kind is the only thing separating a machine root's decision from
-    // a registered human's. It used to be hard-coded `global_admin` for every
-    // platform decision, which filed every human action under a machine.
-    let superuser = srv
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool for staged audit");
+    // retained kind is the only thing separating the machine root's decision
+    // from the registered human's. A federated sign-in presents a provider
+    // token, not a credential, so its decisions name none.
     let root_id: String =
         sqlx::query_scalar("SELECT id::text FROM platform.principals WHERE name = $1")
             .bind(wyrd_server::boot::init::PLATFORM_ROOT_NAME)
-            .fetch_one(&superuser)
+            .fetch_one(srv.operator_pool().pool())
             .await
             .expect("the root principal exists");
-    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
-        .await
-        .expect("audit outbox settles");
+    let registered_id = registered_id.to_string();
+    let decisions = system_audit_decisions(&srv).await;
     for (principal, expected) in [
         (root_id.as_str(), "global_admin"),
-        (
-            registered["principal_id"].as_str().expect("principal id"),
-            "user",
-        ),
+        (registered_id.as_str(), "user"),
     ] {
-        let kinds: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT principal_kind FROM vala.audit_staging
-              WHERE operation = 'platform.authz' AND principal_id = $1::uuid",
-        )
-        .bind(principal)
-        .fetch_all(&superuser)
-        .await
-        .expect("staged decisions read");
-
+        let mut kinds = decisions
+            .iter()
+            .filter(|row| {
+                row["operation"].as_deref() == Some("platform.authz")
+                    && row["audit_principal_id"].as_deref() == Some(principal)
+            })
+            .map(|row| row["principal_kind"].clone())
+            .collect::<Vec<_>>();
+        kinds.sort_unstable();
+        kinds.dedup();
         assert_eq!(
             kinds,
-            vec![expected.to_owned()],
-            "decisions by {principal} were recorded as {kinds:?}, expected only {expected}"
+            vec![Some(expected.to_owned())],
+            "decisions by {principal} were retained as {kinds:?}, expected only {expected}"
         );
     }
-
-    // A federated sign-in presents a provider token, not a credential, so
-    // there is no credential of this principal's for a decision to name.
-    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
-        .await
-        .expect("audit outbox settles");
-    let attributed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging
-          WHERE operation = 'platform.authz' AND principal_id = $1::uuid
-            AND credential_id IS NOT NULL",
-    )
-    .bind(registered["principal_id"].as_str().expect("principal id"))
-    .fetch_one(&superuser)
-    .await
-    .expect("attributed count reads");
-    assert_eq!(
-        attributed, 0,
+    assert!(
+        decisions
+            .iter()
+            .filter(|row| row["audit_principal_id"].as_deref() == Some(registered_id.as_str()))
+            .all(|row| row["credential_id"].is_none()),
         "a federated session names no credential, so its decisions must not claim one"
     );
 }
@@ -2538,21 +2520,19 @@ async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
 
     // Both creation decisions name the slug. The retry proposed a fresh tenant
     // id that the directory discarded in favour of the original, so a decision
-    // recorded against a proposed id would name a tenant that does not exist.
-    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+    // retained against a proposed id would name a tenant that does not exist.
+    let creation_resources = system_audit_decisions(&srv)
         .await
-        .expect("audit outbox settles");
-    let creation_resources: Vec<String> = sqlx::query_scalar(
-        "SELECT resource FROM vala.audit_staging
-          WHERE operation = 'platform.authz' AND permission = 'tenants:write'
-          ORDER BY resource",
-    )
-    .fetch_all(&superuser)
-    .await
-    .expect("creation decision resources read");
+        .into_iter()
+        .filter(|row| {
+            row["operation"].as_deref() == Some("platform.authz")
+                && row["permission"].as_deref() == Some("tenants:write")
+        })
+        .map(|row| row["resource"].clone())
+        .collect::<Vec<_>>();
     assert_eq!(
         creation_resources,
-        vec!["tenant_slug:retryable".to_owned(); 2],
+        vec![Some("tenant_slug:retryable".to_owned()); 2],
         "every provisioning decision names the requested slug, never a proposed tenant id"
     );
 }
@@ -2598,14 +2578,8 @@ async fn an_active_tenant_slug_is_still_refused() {
 /// SQLx and `serde_json` message shapes, the PL/pgSQL fault this test injects.
 /// A caller that can see any of them can map the server's internals from
 /// ordinary error responses.
-const INTERNAL_FRAGMENTS: [&str; 6] = [
-    "audit_staging",
-    "platform.",
-    "sqlx",
-    "plpgsql",
-    "expected value",
-    "injected",
-];
+const INTERNAL_FRAGMENTS: [&str; 5] =
+    ["platform.", "sqlx", "plpgsql", "expected value", "injected"];
 
 /// Assert a problem body is the stable public shape and nothing more.
 ///
@@ -2659,109 +2633,6 @@ async fn served_platform_failures_disclose_nothing_internal() {
         .expect("tenant route responds");
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert_safe_problem(&body_json(resp).await, "WYRD_SPEC_500_INTERNAL");
-}
-
-/// A tenant mutation whose decision cannot be committed still happens, and its
-/// decision commits once the database recovers.
-///
-/// Permissions block and audits do not: the decision is staged on the
-/// non-blocking audit outbox, so a staging insert refused at the database
-/// costs the caller nothing. The principal is created, no audit row is staged
-/// for it while the insert is refused, and the failed write is counted. Once
-/// the insert is accepted again, the retried decision commits exactly once.
-///
-/// # Panics
-/// Panics when the mutation is refused, the principal is missing, an audit row
-/// is staged while audit fails, the failure is not counted, or the decision
-/// does not commit once after recovery.
-#[tokio::test]
-async fn an_unrecordable_tenant_mutation_still_happens() {
-    let failures = wyrd_testing::AuditCommitFailures::install().expect("metrics recorder installs");
-    let srv = WyrdTestServer::start_in_process()
-        .await
-        .expect("server starts");
-    let admin = provisioned_tenant_admin(&srv, "unrecordable-tenant").await;
-
-    let superuser = srv
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
-    sqlx::query(
-        r"CREATE OR REPLACE FUNCTION vala.test_fail_principal_create_audit()
-           RETURNS trigger LANGUAGE plpgsql AS $$
-           BEGIN
-             IF NEW.operation = 'auth.principal.create' THEN
-               RAISE EXCEPTION 'injected principal creation audit failure';
-             END IF;
-             RETURN NEW;
-           END;
-           $$;",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure function installs");
-    sqlx::query(
-        r"CREATE TRIGGER test_fail_principal_create_audit
-           BEFORE INSERT ON vala.audit_staging
-           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_principal_create_audit()",
-    )
-    .execute(&superuser)
-    .await
-    .expect("failure trigger installs");
-
-    let resp = srv
-        .oneshot_authenticated(
-            &admin,
-            tenant_request(
-                Method::POST,
-                "/v1/principals",
-                Some(json!({ "name": "unrecordable-runner", "roles": ["reader"] })),
-            ),
-        )
-        .await
-        .expect("principal route responds");
-    let status = resp.status();
-    let body = body_json(resp).await;
-    assert!(status.is_success(), "created: {body}");
-    failures
-        .await_failure(std::time::Duration::from_secs(30))
-        .await
-        .expect("the failed audit write is counted");
-
-    let principals: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM wyrd.auth_service_accounts WHERE name = 'unrecordable-runner'",
-    )
-    .fetch_one(&superuser)
-    .await
-    .expect("principal count reads");
-    assert_eq!(principals, 1, "the principal was created");
-
-    let creates = || async {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_staging WHERE operation = 'auth.principal.create'",
-        )
-        .fetch_one(&superuser)
-        .await
-        .expect("audit count reads")
-    };
-    assert_eq!(creates().await, 0, "no row is staged while audit fails");
-
-    sqlx::query("DROP TRIGGER test_fail_principal_create_audit ON vala.audit_staging")
-        .execute(&superuser)
-        .await
-        .expect("failure trigger drops");
-    assert_eq!(
-        srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
-            .await
-            .expect("audit outbox settles"),
-        0,
-        "the retried decision drains"
-    );
-    assert_eq!(
-        creates().await,
-        1,
-        "the decision commits exactly once after recovery"
-    );
 }
 
 /// The deployment root is rotatable through Wyrd, with no outage and no SQL.
@@ -2915,25 +2786,23 @@ async fn an_operator_rotates_the_deployment_root_credential() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     // The credential's non-secret id is what travels into audit; the secret
-    // itself never reaches a staged row. Which decision named which credential
-    // is settled deterministically in `platform_authz`, because publication
-    // drains staging on its own schedule here.
-    let superuser = srv
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool for staged audit");
-    // What travels is the credential's id, never the credential.
-    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
-        .await
-        .expect("audit outbox settles");
-    let leaked: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging WHERE to_jsonb(audit_staging)::text LIKE $1",
-    )
-    .bind(format!("%{replacement}%"))
-    .fetch_one(&superuser)
-    .await
-    .expect("staged rows scan");
-    assert_eq!(leaked, 0, "no staged audit row carries credential material");
+    // itself never reaches a retained row.
+    let decisions = system_audit_decisions(&srv).await;
+    let replacement_id = issued["id"].as_str().expect("the replacement's id");
+    assert!(
+        decisions.iter().any(|row| {
+            row["audit_principal_id"].as_deref() == Some(principal_id.as_str())
+                && row["credential_id"].as_deref() == Some(replacement_id)
+        }),
+        "the replacement session's decisions name its credential id"
+    );
+    assert!(
+        decisions
+            .iter()
+            .flat_map(|row| row.values().flatten())
+            .all(|value| !value.contains(&replacement)),
+        "no retained audit row carries credential material"
+    );
 }
 
 /// A tenant administrator ends a compromised identity outright and the reason
@@ -2958,7 +2827,7 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "leaked-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "leaked-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3058,39 +2927,39 @@ async fn a_tenant_revokes_a_compromised_principal_with_its_reason() {
     // authorization boundary. The wrong-kind attempt was an authorized decision
     // that found nothing: its allowance commits with no effect before the
     // `404`, so an operator can see the attempt. The accepted revocation
-    // commits its allowance together with the suspension.
-    // Read past RLS on purpose: the assertion is about the durable audit row
-    // the server wrote, which no tenant-plane route projects.
-    let superuser = srv
-        .pg_fixture()
-        .superuser_pool()
-        .expect("superuser pool opens");
-    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+    // commits its allowance together with the suspension. No tenant-plane
+    // route projects the retained audit row, so it is read directly.
+    let tenant = tenant_named(&srv, "compromised").await;
+    srv.await_audit_retained()
         .await
-        .expect("audit outbox settles");
-    let unknown_decisions: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging \
-          WHERE operation = 'auth.principal.revoke' AND resource = $1",
-    )
-    .bind(format!("principal:{unknown}"))
-    .fetch_one(&superuser)
-    .await
-    .expect("the unknown-id decision is audited");
+        .expect("audit retention settles");
+    let unknown_decisions = srv
+        .retained_audit_records(
+            tenant,
+            "operation",
+            &format!("operation = 'auth.principal.revoke' AND resource = 'principal:{unknown}'"),
+        )
+        .await
+        .expect("the unknown-id decision is audited")
+        .len();
     assert_eq!(
         unknown_decisions, 1,
         "the unknown-id miss commits exactly one allowed decision"
     );
-    let rows: Vec<Option<String>> = sqlx::query_scalar(
-        "SELECT detail FROM vala.audit_staging \
-          WHERE operation = 'auth.principal.revoke' AND resource = $1 \
-          ORDER BY seq",
-    )
-    .bind(format!("principal:{principal_id}"))
-    .fetch_all(&superuser)
-    .await
-    .expect("the revocation decisions are audited");
-    // `detail` is stored as the canonical JSON string the audit hash is taken
-    // over, so it is parsed here rather than decoded as JSONB.
+    let rows: Vec<Option<String>> = srv
+        .retained_audit_records(
+            tenant,
+            "detail",
+            &format!(
+                "operation = 'auth.principal.revoke' AND resource = 'principal:{principal_id}'"
+            ),
+        )
+        .await
+        .expect("the revocation decisions are audited")
+        .into_iter()
+        .map(|mut row| row.remove(0))
+        .collect();
+    // `detail` is retained as canonical JSON text, so it is parsed here.
     let decisions: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|row| {
@@ -3250,7 +3119,7 @@ async fn recovery_is_refused_for_every_state_but_active() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "post-recovery", "roles": ["reader"] })),
+                Some(json!({ "name": "post-recovery", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3319,7 +3188,7 @@ async fn one_tenant_cannot_reach_another_tenants_identities() {
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "beta-runner", "roles": ["reader"] })),
+                Some(json!({ "name": "beta-runner", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3537,7 +3406,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "before-suspension", "roles": ["reader"] })),
+                Some(json!({ "name": "before-suspension", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3575,7 +3444,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "during-suspension", "roles": ["reader"] })),
+                Some(json!({ "name": "during-suspension", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -3615,7 +3484,7 @@ async fn an_operator_suspends_and_resumes_a_tenant_through_the_platform_plane() 
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "after-resume", "roles": ["reader"] })),
+                Some(json!({ "name": "after-resume", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -4358,7 +4227,7 @@ async fn an_uninitialized_deployment_serves_tenants_and_refuses_the_platform_pla
             tenant_request(
                 Method::POST,
                 "/v1/principals",
-                Some(json!({ "name": "unaffected", "roles": ["reader"] })),
+                Some(json!({ "name": "unaffected", "roles": ["viewer"] })),
             ),
         )
         .await
@@ -4447,38 +4316,147 @@ async fn stop_failing_writes(pool: &PgPool, label: &str, table: &str) {
     .expect("failure trigger drops");
 }
 
-/// Count staged authorization decisions for one operation and outcome.
+/// Count `tenant`'s retained authorization decisions for one operation and
+/// outcome.
 ///
-/// Settles `srv`'s audit outbox first, so every decision already staged is
+/// Settles `srv`'s Scribe outbox first, so every decision staged so far is
 /// counted.
 ///
 /// # Panics
 ///
-/// Panics when the outbox does not settle or the staging table cannot be read.
-async fn staged_decisions(
+/// Panics when audit retention does not settle or the retained read fails.
+async fn tenant_decisions(
     srv: &WyrdTestServer,
-    pool: &PgPool,
+    tenant: DataTenantId,
     operation: &str,
     outcome: &str,
-) -> i64 {
-    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
+) -> usize {
+    srv.await_audit_retained()
         .await
-        .expect("audit outbox settles");
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging
-          WHERE operation = $1 AND outcome = $2",
+        .expect("audit retention settles");
+    srv.retained_audit_records(
+        tenant,
+        "operation",
+        &format!("operation = '{operation}' AND outcome = '{outcome}'"),
     )
-    .bind(operation)
-    .bind(outcome)
-    .fetch_one(pool)
     .await
     .expect("decision count reads")
+    .len()
+}
+
+/// Count the retained audit batches Scribe has committed for the reserved
+/// system owner.
+///
+/// Platform-plane decisions are staged under [`DataTenantId::SYSTEM_OWNER`],
+/// which Oracle refuses to read, so their retention is observed through the
+/// batch fence Scribe commits per retained batch. Settles `srv`'s Scribe outbox
+/// first, so a single decision settled on its own adds exactly one batch.
+///
+/// # Panics
+///
+/// Panics when audit retention does not settle or the fence cannot be read.
+async fn system_audit_batches(srv: &WyrdTestServer) -> i64 {
+    srv.await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    let mut conn = srv
+        .tenant_conn_for(DataTenantId::SYSTEM_OWNER)
+        .await
+        .expect("system owner connection opens");
+    let batches = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.scribe_batch_commits \
+          WHERE logical_table_fqn = 'vala.system.audit_log'",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("system audit batches read");
+    conn.commit().await.expect("batch read commits");
+    batches
+}
+
+/// Every system-owner audit decision Scribe has acknowledged, one map of
+/// column name to text value per row.
+///
+/// Platform-plane decisions are retained under [`DataTenantId::SYSTEM_OWNER`],
+/// which Oracle refuses to read on every production surface, so the journey
+/// reads them from the durable Scribe WAL instead: Scribe acknowledges only
+/// after the WAL fsync, so every settled decision is already replayable.
+/// Settles `srv`'s Scribe outbox first, and must run before a Scribe drain
+/// seals the generation, because replay suppresses sealed records.
+///
+/// # Panics
+///
+/// Panics when audit retention does not settle, or the WAL cannot be replayed
+/// or decoded.
+async fn system_audit_decisions(
+    srv: &WyrdTestServer,
+) -> Vec<std::collections::HashMap<String, Option<String>>> {
+    use arrow::array::Array as _;
+
+    srv.await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    let replayed = vala_bifrost_redux::scribe::replay::replay_wal_directory(
+        srv.scribe_wal_root_for_test()
+            .expect("the in-process server owns a WAL root"),
+    )
+    .expect("acknowledged WAL replays");
+    let mut decisions = Vec::new();
+    for stream in replayed.values().filter(|stream| {
+        stream.seal_key.tenant == DataTenantId::SYSTEM_OWNER
+            && vala_bifrost_redux::tables::AuditLogTable::admits_system_owner(
+                &stream.seal_key.table,
+            )
+    }) {
+        for record in &stream.data_records {
+            let reader =
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(record), None)
+                    .expect("a WAL record is an Arrow IPC stream");
+            for batch in reader {
+                let batch = batch.expect("a WAL record decodes");
+                for row in 0..batch.num_rows() {
+                    decisions.push(
+                        batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .zip(batch.columns())
+                            .map(|(field, column)| {
+                                let value = (!column.is_null(row)).then(|| {
+                                    arrow::util::display::array_value_to_string(column, row)
+                                        .expect("a retained value displays")
+                                });
+                                (field.name().clone(), value)
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+    }
+    decisions
+}
+
+/// Resolve the data tenant provisioned under `slug`.
+///
+/// # Panics
+///
+/// Panics when no live tenant carries the slug.
+async fn tenant_named(srv: &WyrdTestServer, slug: &str) -> DataTenantId {
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT data_tenant_id FROM platform.tenants WHERE slug = $1 AND deleted_at IS NULL",
+    )
+    .bind(slug)
+    .fetch_one(srv.operator_pool().pool())
+    .await
+    .expect("tenant resolves by slug");
+    DataTenantId::new(id).expect("a provisioned tenant id is valid")
 }
 
 /// An authorized request that changes nothing still records the decision.
 ///
 /// Every route here evaluates the caller's permission, allows it, stages the
-/// decision on the audit outbox, and then discovers there is nothing to do:
+/// decision on the Scribe outbox, and then discovers there is nothing to do:
 /// the credential is unknown or belongs to someone else, the revoke is a
 /// replay, no connection is configured, the principal does not exist,
 /// suspending it would strand the deployment, or the issuer or binding is
@@ -4502,18 +4480,18 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
         .expect("deployment initializes");
     let secret = secrecy::ExposeSecret::expose_secret(&root).to_owned();
     let session = platform_session(&srv, &secret).await;
-    // Staged decisions are read as the superuser: `vala.audit_staging` is under
-    // row-level security, and this reads across the platform sentinel and the
+    // Platform rows are read as the superuser across the platform plane and the
     // provisioned tenant.
     let superuser = srv
         .pg_fixture()
         .superuser_pool()
-        .expect("superuser pool for staged decisions");
+        .expect("superuser pool opens");
 
     // Each case: the request, the status it must answer with, and what it is.
-    // `platform.authz` is one operation, so the cases are counted one at a time
-    // against the running total rather than filtered apart.
-    let mut expected = staged_decisions(&srv, &superuser, "platform.authz", "allowed").await;
+    // Platform decisions are retained under the reserved system owner, which
+    // Oracle refuses to read, so each case is counted as the one retained batch
+    // its settled decision adds to the running total.
+    let mut expected = system_audit_batches(&srv).await;
     let unknown = uuid::Uuid::now_v7();
     let cases: Vec<(Request<Body>, StatusCode, &str)> = vec![
         (
@@ -4566,7 +4544,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
         assert_eq!(resp.status(), status, "{what} answers {status}");
         expected += 1;
         assert_eq!(
-            staged_decisions(&srv, &superuser, "platform.authz", "allowed").await,
+            system_audit_batches(&srv).await,
             expected,
             "{what} records exactly one allowed decision"
         );
@@ -4595,7 +4573,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
     );
     expected += 1;
     assert_eq!(
-        staged_decisions(&srv, &superuser, "platform.authz", "allowed").await,
+        system_audit_batches(&srv).await,
         expected,
         "a last-admin conflict records exactly one allowed decision"
     );
@@ -4626,7 +4604,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
         .expect("status route responds");
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
-        staged_decisions(&srv, &superuser, "platform.authz", "allowed").await,
+        system_audit_batches(&srv).await,
         expected,
         "a request refused on syntax opens no decision to record"
     );
@@ -4655,7 +4633,8 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
     // Resuming a tenant that is already active is the replayed transition: it
     // changes nothing and is refused, but the permission was evaluated.
     let tenant_id = created["tenant"]["id"].as_str().expect("tenant id");
-    let before = staged_decisions(&srv, &superuser, "platform.authz", "allowed").await;
+    let tenant: DataTenantId = tenant_id.parse().expect("tenant id is a data tenant");
+    let before = system_audit_batches(&srv).await;
     let resp = srv
         .oneshot(platform_request(
             Method::PUT,
@@ -4671,7 +4650,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
         "a replayed resume answers 404"
     );
     assert_eq!(
-        staged_decisions(&srv, &superuser, "platform.authz", "allowed").await,
+        system_audit_batches(&srv).await,
         before + 1,
         "a replayed resume records exactly one allowed decision"
     );
@@ -4717,14 +4696,14 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             "creating a principal with a role that does not exist",
         ),
     ] {
-        let before = staged_decisions(&srv, &superuser, operation, "allowed").await;
+        let before = tenant_decisions(&srv, tenant, operation, "allowed").await;
         let resp = srv
             .oneshot_authenticated(&admin, request)
             .await
             .expect("principal route responds");
         assert_eq!(resp.status(), status, "{what} answers {status}");
         assert_eq!(
-            staged_decisions(&srv, &superuser, operation, "allowed").await,
+            tenant_decisions(&srv, tenant, operation, "allowed").await,
             before + 1,
             "{what} records exactly one allowed decision"
         );
@@ -4755,7 +4734,7 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             "deleting a binding that is not configured",
         ),
     ] {
-        let before = staged_decisions(&srv, &superuser, operation, "allowed").await;
+        let before = tenant_decisions(&srv, tenant, operation, "allowed").await;
         let resp = srv
             .oneshot_authenticated(&admin, tenant_request(Method::DELETE, uri, None))
             .await
@@ -4766,39 +4745,17 @@ async fn an_authorized_request_that_changes_nothing_still_records_the_decision()
             "{what} answers 404 Not Found"
         );
         assert_eq!(
-            staged_decisions(&srv, &superuser, operation, "allowed").await,
+            tenant_decisions(&srv, tenant, operation, "allowed").await,
             before + 1,
             "{what} records exactly one allowed decision"
         );
     }
 }
 
-/// Count staged platform authorization rows by outcome.
-///
-/// Settles `srv`'s audit outbox first, so every decision already staged is
-/// counted.
-///
-/// # Panics
-///
-/// Panics when the outbox does not settle or the staging table cannot be read.
-async fn staged_platform_decisions(srv: &WyrdTestServer, pool: &PgPool, outcome: &str) -> i64 {
-    srv.wait_oracle_audit_staged(std::time::Duration::from_secs(30))
-        .await
-        .expect("audit outbox settles");
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_staging
-          WHERE operation = 'platform.authz' AND outcome = $1",
-    )
-    .bind(outcome)
-    .fetch_one(pool)
-    .await
-    .expect("decision count reads")
-}
-
 /// A failed platform mutation records the decision it evaluated and no effect.
 ///
 /// The audit row records an authorization decision, not the operation's
-/// outcome: the decision is staged on the audit outbox as soon as permission
+/// outcome: the decision is staged on the Scribe outbox as soon as permission
 /// is evaluated, before the mutation runs and outside its transaction. Four
 /// mutation classes cover the plane's write surface — the identity connection,
 /// a credential, a principal's status, and a tenant's admission — and each is
@@ -4882,7 +4839,7 @@ async fn a_failed_platform_mutation_records_its_decision_and_no_effect() {
             .expect("root principal reads");
 
     // The assertions below are about what each *failed* attempt adds.
-    let mut expected = staged_platform_decisions(&srv, &superuser, "allowed").await;
+    let mut expected = system_audit_batches(&srv).await;
 
     let classes: Vec<(&str, &str, &str, Request<Body>)> = vec![
         (
@@ -4947,7 +4904,7 @@ async fn a_failed_platform_mutation_records_its_decision_and_no_effect() {
         );
         expected += 1;
         assert_eq!(
-            staged_platform_decisions(&srv, &superuser, "allowed").await,
+            system_audit_batches(&srv).await,
             expected,
             "the {label} failure records exactly its one allowance"
         );
@@ -4992,7 +4949,7 @@ async fn a_failed_platform_mutation_records_its_decision_and_no_effect() {
     // — because every credential this plane issues carries the fixed platform
     // grant, so the only refusal an HTTP caller can provoke is the session
     // extractor's, which evaluates no permission and stages nothing.
-    let allowances = staged_platform_decisions(&srv, &superuser, "allowed").await;
+    let allowances = system_audit_batches(&srv).await;
     let tenant_admin = tenant_token(&srv, &tenant_credential)
         .await
         .expect("the tenant administrator authenticates");
@@ -5011,7 +4968,7 @@ async fn a_failed_platform_mutation_records_its_decision_and_no_effect() {
         "tenant authority never reaches the platform plane"
     );
     assert_eq!(
-        staged_platform_decisions(&srv, &superuser, "allowed").await,
+        system_audit_batches(&srv).await,
         allowances,
         "a refused caller earns no allowance"
     );

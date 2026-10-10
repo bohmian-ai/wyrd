@@ -20,7 +20,7 @@ use wyrd_cards::card_ref::CardRefPy;
 use wyrd_cli::commands::{self, LoadOutput, PlanCard, PlanReport, SelectorArgs};
 use wyrd_cli::{Diagnostic, Severity};
 use wyrd_client::WyrdClient;
-use wyrd_spec::auth::{GrantRoleResponse, IssueKeyResponse};
+use wyrd_spec::auth::IssueKeyResponse;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::ProviderCredentialWrite;
 use wyrd_utils::py::WyrdPyResult;
@@ -191,6 +191,13 @@ impl PyIssueKeyResponse {
         self.inner.key_id.to_string()
     }
 
+    /// Principal the key authenticates: the Card's Service or Agent
+    /// principal, the id its Role assignments are addressed by.
+    #[getter]
+    fn principal_id(&self) -> String {
+        self.inner.principal_id.to_string()
+    }
+
     /// Plaintext API key.
     #[getter]
     fn key(&self) -> &str {
@@ -219,40 +226,6 @@ impl PyIssueKeyResponse {
     #[getter]
     const fn expires_at(&self) -> DateTime<Utc> {
         self.inner.expires_at
-    }
-}
-
-/// The principal's Roles after `grant_role`.
-#[pyclass(module = "wyrd.testing.cli", name = "GrantRoleResponse", frozen)]
-pub struct PyGrantRoleResponse {
-    /// Response from the shared grant-role command.
-    inner: GrantRoleResponse,
-}
-
-#[pymethods]
-impl PyGrantRoleResponse {
-    /// Principal the Role was granted to.
-    #[getter]
-    fn principal_id(&self) -> String {
-        self.inner.principal_id.to_string()
-    }
-
-    /// The principal's stored Card binding.
-    #[getter]
-    fn card_ref(&self) -> CardRefPy {
-        CardRefPy(self.inner.card_ref.clone())
-    }
-
-    /// Every Role the principal now holds, ordered by name.
-    #[getter]
-    fn roles(&self) -> Vec<String> {
-        self.inner.roles.clone()
-    }
-
-    /// `True` when this call added the Role, `False` when it was already held.
-    #[getter]
-    const fn granted(&self) -> bool {
-        self.inner.granted
     }
 }
 
@@ -387,41 +360,6 @@ fn issue_key(
     Ok(PyIssueKeyResponse { inner })
 }
 
-/// Grant one Role to the principal bound to a Card (`wyrd auth grant-role`).
-///
-/// `card` is `(kind, name, version, space)`. The request runs as `client`,
-/// or the ambient chain when it is omitted, and requires tenant
-/// administration. The Role reaches the principal's tokens at its next key
-/// exchange.
-///
-/// # Arguments
-/// * `card` - The Service or Agent Card coordinates.
-/// * `role` - Built-in or tenant Role name.
-/// * `client` - The administrator to act as, or `None` for the ambient chain.
-///
-/// # Errors
-///
-/// Raises `WyrdError` for invalid coordinates or an unknown role, a missing
-/// credential, `WYRD_PERMISSION_403_DENIED_RBAC` for a caller that is not a
-/// tenant administrator, or `WYRD_AUTH_404_PRINCIPAL_NOT_FOUND` when no
-/// principal is bound to the Card.
-#[pyfunction]
-#[pyo3(signature = (card, role, client))]
-fn grant_role(
-    py: Python<'_>,
-    card: (String, String, String, String),
-    role: String,
-    client: Option<&Bound<'_, PyWyrdClient>>,
-) -> WyrdPyResult<PyGrantRoleResponse> {
-    let (kind, name, version, space) = card;
-    let client = rust_client(client);
-    let inner = block_on(
-        py,
-        commands::grant_role(&kind, &name, &version, &space, &role, client),
-    )?;
-    Ok(PyGrantRoleResponse { inner })
-}
-
 /// Create or rotate one provider credential (`wyrd gateway credential put`).
 ///
 /// `write` may carry a provider key; a decode failure never quotes it, and
@@ -493,13 +431,11 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyPlanReport>()?;
     module.add_class::<PyLoadOutput>()?;
     module.add_class::<PyIssueKeyResponse>()?;
-    module.add_class::<PyGrantRoleResponse>()?;
     module.add_function(wrap_pyfunction!(plan, module)?)?;
     module.add_function(wrap_pyfunction!(apply, module)?)?;
     module.add_function(wrap_pyfunction!(get, module)?)?;
     module.add_function(wrap_pyfunction!(load, module)?)?;
     module.add_function(wrap_pyfunction!(issue_key, module)?)?;
-    module.add_function(wrap_pyfunction!(grant_role, module)?)?;
     module.add_function(wrap_pyfunction!(put_provider_credential, module)?)?;
     module.add_function(wrap_pyfunction!(revoke_provider_credential, module)?)?;
     module.add_function(wrap_pyfunction!(delete_provider_credential, module)?)

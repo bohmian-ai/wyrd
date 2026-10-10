@@ -31,7 +31,7 @@ use crate::tables::signal::{
     last_string_attribute, list_column, nested_fields, projected_signal_schema, span_id_bytes,
     struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
 };
-use wyrd_spec::reference::CardRefScope;
+use wyrd_spec::ids::CardUid;
 
 /// Largest accepted span or event name, in bytes.
 const MAX_NAME_BYTES: usize = 256;
@@ -86,7 +86,7 @@ const GEN_AI_INT_PROMOTIONS: [&str; 2] =
 /// projection rather than caller input.
 pub fn project_resource_spans(
     resource_spans: &[ResourceSpans],
-    card_scope: Option<&CardRefScope>,
+    card_scope: Option<&[CardUid]>,
     output_limit_bytes: usize,
 ) -> Result<(RecordBatch, IngestOutcome), TableError> {
     let mut columns = SpanColumns::default();
@@ -270,7 +270,7 @@ struct SpanColumns {
     service_name: Vec<Option<String>>,
     gen_ai_strings: [Vec<Option<String>>; 4],
     gen_ai_ints: [Vec<Option<i64>>; 2],
-    card_ref: Vec<Option<String>>,
+    card_uid: Vec<Option<String>>,
     run_id: Vec<Option<String>>,
 }
 
@@ -295,7 +295,7 @@ impl SpanColumns {
         resource: &ResourceEnvelope,
         scope: &ScopeEnvelope,
         service_name: Option<&str>,
-        card_scope: Option<&CardRefScope>,
+        card_scope: Option<&[CardUid]>,
     ) -> Result<usize, &'static str> {
         let trace_id = trace_id_bytes(&span.trace_id)?;
         let span_id = span_id_bytes(&span.span_id)?;
@@ -341,7 +341,7 @@ impl SpanColumns {
                 .flatten()
                 .map(String::len)
                 .sum::<usize>()
-            + correlation.card_ref.as_ref().map_or(0, String::len)
+            + correlation.card_uid.as_ref().map_or(0, String::len)
             + correlation.run_id.as_ref().map_or(0, String::len);
 
         self.trace_id.push(trace_id.to_vec());
@@ -393,7 +393,7 @@ impl SpanColumns {
         for (column, value) in self.gen_ai_ints.iter_mut().zip(promotions.ints) {
             column.push(value);
         }
-        self.card_ref.push(correlation.card_ref);
+        self.card_uid.push(correlation.card_uid);
         self.run_id.push(correlation.run_id);
 
         self.rows += 1;
@@ -577,7 +577,7 @@ impl SpanColumns {
             utf8_opt_column(gen_ai_strings.next().unwrap_or_default()),
             i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
             i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
-            utf8_opt_column(self.card_ref),
+            utf8_opt_column(self.card_uid),
             utf8_opt_column(self.run_id),
         ];
 

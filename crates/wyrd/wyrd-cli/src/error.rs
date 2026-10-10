@@ -357,7 +357,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_400_MCP_HOST_SELECTION",
         status = 400,
         title = "MCP host selection required",
-        remediation = "Pass --host for each host to connect (codex, claude-code, copilot-cli, vscode); install and open the host first if none is detected."
+        remediation = "Pass --host for each host to connect (codex, claude-code, copilot-cli, vscode, cursor, pi, hermes); install and open the host first if none is detected."
     )]
     McpHostSelection {
         /// Which hosts were detected, or that none was.

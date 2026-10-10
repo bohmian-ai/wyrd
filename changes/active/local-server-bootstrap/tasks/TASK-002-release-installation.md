@@ -125,3 +125,47 @@ migration without a new public compatibility rule.
 `changes/active/local-server-bootstrap/spec.md` revision 2;
 `AGENTS.md` §§2, 9, 11; `architecture/operations/deployment-and-release.md`;
 `architecture/references/languages/testing-workflows.md`.
+
+## Implementation Evidence
+
+**Provenance decision (owner-approved in session).** Current releases had only
+an unsigned `checksums.txt` plus GitHub Sigstore attestations that nothing in
+the workspace can verify. The owner chose a Wyrd-owned Ed25519 release key
+instead of adding a Sigstore dependency: CI signs `checksums.txt` with the
+`WYRD_RELEASE_SIGNING_KEY` release secret into `checksums.txt.sig`, and the
+CLI verifies it against the public key it embeds
+(`crates/wyrd/wyrd-cli/src/server/release-signing-key.pem`) with
+`ed25519-dalek`, already a workspace dependency. No new crate entered the
+lockfile. Compatibility uses Cargo's caret rule symmetrically, so no new
+public compatibility rule was needed.
+
+**Reuse map.** CLI dispatch: `Cli::dispatch` gained one `Server` arm. Errors:
+four `WyrdCliError` variants, rendered by the existing `run_cli_code`. Install
+root: `wyrd_client::environment::Environment::config_dir` plus `server/`.
+Python and TypeScript entries project the command unchanged through
+`run_cli_code`. Extraction uses the system `tar` instead of a new crate.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Newest stable, non-draft, versioned release for the host target; version reported | `server/install.rs` `ServerInstaller::latest_release`, `host_target`; `server/mod.rs` prints the version | `server_install::server_install_selects_latest_stable` | PASS |
+| Incompatible client/server refused before use | `install.rs` `compatible`, `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | same test; unit `compatibility_follows_the_caret_line` | PASS |
+| Missing target or provenance, altered metadata or bytes, truncated transfer, and failed extraction fail closed with stable codes; previous install stays runnable; no partial version | `download_verified`, `extract`, staging tempdir, atomic `activate` | `server_install::server_install_preserves_previous_on_failure` (6 corruptions plus an unreachable listing) | PASS |
+| No unverified binary can run; updates explicit | Signature checked before any digest is trusted; only a verified extract is renamed into `versions/`; no implicit update path | both scenario tests; unit `official_key_verifies_openssl_release_signatures` (openssl-made signature verifies; altered checksums rejected) | PASS |
+| Python and TypeScript installed entries expose the command | existing `run_cli_code` projections | `test_server_install_is_projected` (`mise run py:test:cli:unit`, 7 passed); `the installed cli projects wyrd server install` (`mise run ts:test:unit`, 64 passed) | PASS |
+| Release publishes four bundles plus verification data | `.github/workflows/release.yml`: `build-server` matrix covers all four triples with bundle-content checks; `publish-binaries` signs and uploads `checksums.txt.sig` and refuses a key that is not the embedded one; Docker artifact names updated | YAML lint; local dry run of the bundle listing checks and of the exact `openssl` sign, compare, and verify commands | PASS (static) |
+| Mock release tests need no live GitHub | wiremock release service and a test key | both scenario tests | PASS |
+| Docs agree (AC-008) | `architecture/operations/deployment-and-release.md` "Local server bundles"; `docs/.../self-hosting/binary.svx`; generated `api/errors.md` via `docs/scripts/generate_api_docs.py` | `mise run docs:check` | PASS |
+
+Commands:
+
+- `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=server_install::server_install_selects_latest_stable) | test(=server_install::server_install_preserves_previous_on_failure)'`:
+  2 passed. The task text's `test(=server_install_selects_latest_stable)` selects nothing because the tests sit in the `server_install` module, so this is the corrected exact selector.
+- `mise exec -- cargo nextest run --locked -p wyrd-cli --lib -E 'test(/server::install::tests|cli::tests/)'`: 6 passed.
+- `mise run py:test:cli:unit`, `mise run ts:test:unit`, `mise run codegen:check`, `mise run docs:check`, `mise run fmt`, `mise run lints`, `git diff --check`: pass.
+- Live check: `wyrd server install` against the real GitHub API returns `WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE` ("no stable Wyrd release is published"), because no release exists yet.
+
+Docsite rebuild (`wyrd-doc-site` worktree, left uncommitted because both pages are untracked work in progress there): `get-started/setup.md` (installs the server with `wyrd server install`, keeps the checkout build until the first release, `status: partial`) and `operate/troubleshoot-a-deployment.md` (a new "Server installation" section). Ran `docs:check:commands`, `docs:linkcheck`, `docs:build`, `docs:a11y`: all exit 0. `docs:a11y` reported 0 pages checked, because draft pages are not rendered.
+
+Non-goals held: no `server dev`, no silent update, no Windows bundle, no new dependency, no package-specific downloader.
+
+Material limits: the first real install needs the owner to store `WYRD_RELEASE_SIGNING_KEY` as a `release`-environment secret (its public half is committed). The new macOS `build-server` jobs and the signing step have not run in CI yet. Rotating the key requires a CLI release.

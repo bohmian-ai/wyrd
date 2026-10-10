@@ -93,6 +93,27 @@ Run both exact scenario commands, then `mise run test:wyrd`,
 and provenance in the release-workflow dry run; this static CI proof has no
 manufactured RED.
 
+## Docsite Rebuild Update
+
+After implementation and verification pass, update the developer docsite
+rebuild so developers can use what this task delivered. The rebuild lives in
+the `wyrd-doc-site` worktree under the `developer-docsite-rebuild` change
+packet. Its spec sets the page map, and its tasks set the page rules. Use
+`$human-tech-docs`, keep pages `draft: true` with an accurate `status`, and
+describe only behavior this task delivered and verified. Keep the development
+setup minimal: put production detail in Operate, not Get started. Run every
+documented command against the delivered build, then run the docsite's
+`docs:check:commands`, `docs:linkcheck`, `docs:build`, and `docs:a11y`.
+Record the pages changed and the checks run in Implementation Evidence.
+
+Pages:
+
+- Get started → *Set up Wyrd*: install the server with the CLI
+  (`wyrd server install`) instead of building it from a checkout. Keep the
+  checkout build only where a contributor needs it.
+- Operate → *Troubleshoot a deployment*: failed download or verification, an
+  unsupported host, and a failed update that keeps the working installation.
+
 ## Material Stop Conditions
 
 Stop for spec revision if current release provenance cannot establish the

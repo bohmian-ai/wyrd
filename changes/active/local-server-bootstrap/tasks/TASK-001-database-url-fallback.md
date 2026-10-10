@@ -1,6 +1,6 @@
 ---
 id: TASK-001
-spec: SPEC-local-server-bootstrap@3
+spec: SPEC-local-server-bootstrap@4
 depends_on: []
 maps: [REQ-006, REQ-015, REQ-016, INV-002, INV-003, AC-003, AC-007, AC-008]
 ---
@@ -86,6 +86,31 @@ Follow actual consumers; these paths are guidance, not an allowlist.
 Run the exact scenario commands above, then `mise run test:sql`,
 `mise run check:tenant-isolation`, `mise run docs:check`, `mise run fmt`,
 `mise run lints`, and `git diff --check`.
+
+## Docsite Rebuild Update
+
+After implementation and verification pass, update the developer docsite
+rebuild so developers can use what this task delivered. The rebuild lives in
+the `wyrd-doc-site` worktree under the `developer-docsite-rebuild` change
+packet. Its spec sets the page map, and its tasks set the page rules. Use
+`$human-tech-docs`, keep pages `draft: true` with an accurate `status`, and
+describe only behavior this task delivered and verified. Keep the development
+setup minimal: put production detail in Operate, not Get started. Run every
+documented command against the delivered build, then run the docsite's
+`docs:check:commands`, `docs:linkcheck`, `docs:build`, and `docs:a11y`.
+Record the pages changed and the checks run in Implementation Evidence.
+
+Pages:
+
+- Get started → *Set up Wyrd*: the one-login development database.
+- Operate → *Deploy Wyrd for a team*: platform and tenant logins, tenant
+  grants, migrate, and readiness.
+- Operate → *Troubleshoot a deployment*: database refusals by message.
+- Understand → *Identity and authorization*: row-level security isolates
+  tenants, and Wyrd's roles are the only permission model.
+
+Status: drafted and verified against the delivered build, together with the
+spec revision 4 storage default. Not yet committed in the docsite worktree.
 
 ## Material Stop Conditions
 

@@ -111,6 +111,27 @@ Run the three exact scenario commands, `mise run test:wyrd`,
 `git diff --check`. MCP runtime discovery/call proof is required; static
 host-file assertions alone are insufficient.
 
+## Docsite Rebuild Update
+
+After implementation and verification pass, update the developer docsite
+rebuild so developers can use what this task delivered. The rebuild lives in
+the `wyrd-doc-site` worktree under the `developer-docsite-rebuild` change
+packet. Its spec sets the page map, and its tasks set the page rules. Use
+`$human-tech-docs`, keep pages `draft: true` with an accurate `status`, and
+describe only behavior this task delivered and verified. Keep the development
+setup minimal: put production detail in Operate, not Get started. Run every
+documented command against the delivered build, then run the docsite's
+`docs:check:commands`, `docs:linkcheck`, `docs:build`, and `docs:a11y`.
+Record the pages changed and the checks run in Implementation Evidence.
+
+Pages:
+
+- Connect → *Connect an agent through MCP*: `wyrd mcp install`, choosing
+  detected hosts, connecting to a local server or an explicitly selected
+  deployed server, and how credentials resolve when the host connects.
+- Name the MCP failure modes a developer hits (no detected host, unreachable
+  server, missing credential) on that page, not in Operate.
+
 ## Material Stop Conditions
 
 Stop for spec revision if a supported host cannot launch an authenticated

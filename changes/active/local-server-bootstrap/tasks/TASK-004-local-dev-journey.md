@@ -1,6 +1,6 @@
 ---
 id: TASK-004
-spec: SPEC-local-server-bootstrap@2
+spec: SPEC-local-server-bootstrap@4
 depends_on: [TASK-001, TASK-002, TASK-003]
 maps: [REQ-001, REQ-004, REQ-005, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-014, REQ-015, INV-001, INV-003, INV-004, AC-001, AC-004, AC-005, AC-007, AC-008]
 ---
@@ -131,6 +131,30 @@ change, run `mise run py:format`, `mise run py:lints`, and
 change, run `mise run ts:typecheck`.
 The fresh-client and MCP journeys are behavioral RED/GREEN proof; docs and
 package metadata receive static checks rather than artificial RED.
+
+## Docsite Rebuild Update
+
+After implementation and verification pass, update the developer docsite
+rebuild so developers can use what this task delivered. The rebuild lives in
+the `wyrd-doc-site` worktree under the `developer-docsite-rebuild` change
+packet. Its spec sets the page map, and its tasks set the page rules. Use
+`$human-tech-docs`, keep pages `draft: true` with an accurate `status`, and
+describe only behavior this task delivered and verified. Keep the development
+setup minimal: put production detail in Operate, not Get started. Run every
+documented command against the delivered build, then run the docsite's
+`docs:check:commands`, `docs:linkcheck`, `docs:build`, and `docs:a11y`.
+Record the pages changed and the checks run in Implementation Evidence.
+
+Pages:
+
+- Get started → *Set up Wyrd*: rewrite the development setup around
+  `wyrd server dev --tenant <slug>`. It replaces the manual build, migrate,
+  serve, and setup steps. The developer still supplies PostgreSQL and
+  `WYRD_DATABASE_URL`.
+- Get started → *Quickstart*: make its prerequisites point at the new setup
+  and the saved credential and endpoint.
+- Operate → *Troubleshoot a deployment*: local startup failures and safe
+  reruns that do not reissue credentials.
 
 ## Material Stop Conditions
 

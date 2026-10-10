@@ -749,11 +749,11 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
 
 /// An Oracle-only pod drained soon after boot still retains its audit decisions.
 ///
-/// The first Oracle of a role-separated cluster boots before the Scribe-only
-/// pod registers, so its boot-time membership names no Scribe. Its read
-/// decision is staged on the process Scribe outbox, which routes over the peer
-/// plane from that membership; the pod is then drained gracefully. Membership
-/// must keep refreshing through the drain, so the outbox finds the Scribe and
+/// The Scribe-only pod of a role-separated cluster is held unbooted, so an
+/// Oracle's read decision is staged on its process Scribe outbox while the
+/// membership names no Scribe and every delivery attempt finds an empty
+/// roster. The Scribe then boots and the Oracle pod is drained gracefully.
+/// Membership must keep refreshing, so the outbox finds the late Scribe and
 /// the decision lands in retained history, read back through the other Oracle.
 ///
 /// # Errors
@@ -762,19 +762,23 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn oracle_only_pod_retains_audit_staged_before_its_drain() -> Result<(), ServerJourneyError> {
-    let mut cluster = wyrd_testing::bifrost::WyrdTestCluster::start_spec(
+    let mut cluster = wyrd_testing::bifrost::WyrdTestCluster::start_spec_delayed_last(
         wyrd_testing::bifrost::BifrostClusterSpec::role_separated(),
     )
     .await?;
     let tenant = cluster.data_tenant_id();
-    let oracles = cluster
-        .servers()
-        .filter(|server| server.bifrost_scribe().is_none())
-        .map(WyrdTestServer::node_id)
-        .collect::<Vec<_>>();
+    if !cluster.ready_ingest_nodes().is_empty() {
+        return Err("the Scribe-only pod must stay unbooted while the audit stages".into());
+    }
+    let oracles = cluster.ready_query_nodes();
     let [drained, reader] = oracles[..] else {
         return Err("the role-separated cluster runs two Oracle-only pods".into());
     };
+    let scribe = cluster
+        .configured_node_ids()
+        .into_iter()
+        .find(|node| !oracles.contains(node))
+        .ok_or("missing the delayed Scribe slot")?;
     let table = format!("drained_audit_{}", uuid::Uuid::now_v7().simple());
     let oracle = cluster
         .server_by_node(drained)
@@ -801,6 +805,7 @@ async fn oracle_only_pod_retains_audit_staged_before_its_drain() -> Result<(), S
     while let Some(frame) = stream.frames.next().await {
         frame?;
     }
+    cluster.restart_node(scribe).await?;
     cluster.stop_node(drained).await?;
 
     cluster

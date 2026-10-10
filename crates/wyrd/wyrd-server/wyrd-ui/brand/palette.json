@@ -1,80 +1,84 @@
 {
-  "name": "bohmian · Wyrd",
-  "description": "Canonical token source for the Wyrd design system under the bohmian brand. Edit here, then run `node brand/gen-theme.mjs` to regenerate theme.css. Consumed directly by agents/A2UI; the human/visual reference is DESIGN.md + ./renders/styleguide.html. Derived from .dev/assets/bohmian/bohmian-brand-mockups-v4.html (approved).",
+  "name": "Wyrd · Evidence Thread",
+  "description": "Canonical token source for Wyrd's Evidence Thread design system, shared by the documentation site and the workbench. Edit here, then run `node brand/gen-theme.mjs` to regenerate every projection (workbench theme.css, docs wyrd-tokens.css, the wyrd-ui skill theme, and the Wyrd mark renderings). Consumers never restate a value from this file. The human reference is DESIGN.md + ./renders/styleguide.html.",
   "modes": ["light", "dark"],
   "scale": {
     "fonts": {
-      "sans": "\"Archivo\", system-ui, sans-serif",
-      "display": "\"Space Grotesk\", \"Archivo\", system-ui, sans-serif",
-      "mono": "\"JetBrains Mono\", monospace",
-      "serif": "\"Fraunces\", Georgia, serif"
+      "sans": "\"Familjen Grotesk\", system-ui, sans-serif",
+      "mono": "\"Fragment Mono\", ui-monospace, monospace"
     },
-    "radius": "5px",
-    "shadow": { "sm": "3px", "md": "6px", "lg": "10px" }
+    "radius": "2px"
   },
   "tokens": {
-    "--bg":            { "group": "surface", "light": "#f2f0ea", "dark": "#0b0c12", "role": "page / main background — warm paper on light, blue-cast near-black on dark" },
-    "--surface":       { "group": "surface", "light": "#ffffff", "dark": "#12141c", "role": "card / table / header surface" },
-    "--surface-2":     { "group": "surface", "light": "#eceadf", "dark": "#1a1d28", "role": "insets, hover, pills, code blocks" },
+    "--bg":            { "group": "surface", "light": "#f5f6f8", "dark": "#0b0c12", "role": "Canvas — the page field. Light is Bohmian cool paper; dark is the blue-black canvas, always darker than its panels." },
+    "--surface":       { "group": "surface", "light": "#ffffff", "dark": "#12141c", "role": "Surface — primary panel and chrome, lifted above the canvas in both modes." },
+    "--surface-2":     { "group": "surface", "light": "#eef0f4", "dark": "#1a1d28", "role": "Surface secondary — subordinate regions, panel headers, and neutral controls." },
+    "--surface-hover": { "group": "surface", "light": "#e9ecf2", "dark": "#1f2230", "role": "Surface hover — neutral interaction feedback." },
 
-    "--border":        { "group": "ink", "light": "#101014", "dark": "#424866", "role": "2px ink borders (always present, never hairline). Dark stays quiet (~2:1 on surface) — visible structure without light-mode ink loudness" },
-    "--shadow":        { "group": "ink", "light": "#101014", "dark": "#050609", "role": "hard-offset zero-blur shadow color" },
+    "--text":          { "group": "ink", "light": "#101014", "dark": "#e6e4da", "role": "Ink — primary text and the strongest rule." },
+    "--muted":         { "group": "ink", "light": "#62626d", "dark": "#8f92a5", "role": "Muted ink — supporting text and metadata." },
+    "--border":        { "group": "ink", "light": "#d9dde5", "dark": "#252838", "role": "Rule — one-pixel structural dividers and control borders. Separation only; never the sole identifier of a control." },
+    "--border-soft":   { "group": "ink", "light": "#e8ebf0", "dark": "#1c1f2c", "role": "Rule soft — row and subordinate dividers." },
 
-    "--text":          { "group": "text", "light": "#101014", "dark": "#e6e4da", "role": "body text — LOCKED for readability (~17:1 light, ~14:1 dark). Do not re-tune." },
-    "--muted":         { "group": "text", "light": "#62626d", "dark": "#84879a", "role": "labels, metadata, secondary text" },
+    "--declare":       { "group": "declare", "light": "#4d5ef0", "dark": "#7a8cff", "role": "Declare / primary — cobalt in light, periwinkle in dark: the one hue that shifts per mode. Declaration identity, links, selection, focus, and the primary action." },
+    "--declare-soft":  { "group": "declare", "light": "#eceefe", "dark": "#1a2040", "role": "Declare soft — selected or contextual declaration field." },
+    "--declare-ink":   { "group": "declare", "light": "#ffffff", "dark": "#0b0c12", "role": "Label on a --declare fill (the primary action)." },
 
-    "--brand":         { "group": "brand", "light": "#2745e8", "dark": "#1a2040", "role": "brand blue fill (button/chip), panel top-bar. Collapses onto --brand-strong in light and onto --brand-soft in dark; the tokens stay distinct because their roles differ per mode." },
-    "--brand-strong":  { "group": "brand", "light": "#2745e8", "dark": "#7a8cff", "role": "links, selected refs, big stats, llm span kind, heat ramp" },
-    "--brand-soft":    { "group": "brand", "light": "#e9edfd", "dark": "#1a2040", "role": "selection / hover row wash, panel backgrounds" },
-    "--brand-btn":     { "group": "brand", "light": "#2745e8", "dark": "#7a8cff", "role": "primary button fill" },
-    "--brand-btn-ink": { "group": "brand", "light": "#ffffff", "dark": "#0b0c12", "role": "text on the primary button" },
+    "--observe":       { "group": "observe", "light": "#c5f23b", "dark": "#c5f23b", "role": "Observe — observed facts and Observation identity. The same lime in both modes; a fill, line, or underline, never text on a light field." },
+    "--observe-soft":  { "group": "observe", "light": "#f3fce0", "dark": "#394523", "role": "Observe soft — lime wash for a selected or contextual observation field; ordinary ink on top." },
 
-    "--lime":          { "group": "acid", "light": "#c5f23c", "dark": "#c5f23c", "role": "secondary accent — the second voice after brand blue. Secondary action fills, the client/runtime plane, and secondary emphasis. Bright lime is a FILL only; it is 1.30:1 on white and can never be text or a thin bar there." },
-    "--lime-ink":      { "group": "acid", "light": "#101014", "dark": "#101014", "role": "text on lime fills (both modes — safe because --lime is mode-invariant)" },
-    "--lime-text":     { "group": "acid", "light": "#4a7a06", "dark": "#c5f23c", "role": "lime as text or as a thin bar: raw lime on dark, darkened lime on light. 5.15:1 on white." },
+    "--evidence":      { "group": "evidence", "light": "#c5f23b", "dark": "#c5f23b", "role": "Retained Evidence — the retained-evidence signal, the Wyrd mark's center spine, and evidence-capture feedback only. Never a general accent, hover, or wash." },
+    "--evidence-ink":  { "group": "evidence", "light": "#0b0c12", "dark": "#0b0c12", "role": "Label and outline on a --evidence fill. A dark ink in both modes; --evidence stays a light fill." },
 
-    "--client":        { "group": "line", "light": "#4a7a06", "dark": "#c5f23c", "role": "the Line — client/runtime plane. This IS lime, mode-split so it survives a light surface (5.15:1 on white vs 1.30:1 for raw lime)." },
-    "--client-bar":    { "group": "line", "light": "#4a7a06", "dark": "#c5f23c", "role": "client/agent kind left-bar + indicators. 2.03:1 luminance separation from --server-bar amber." },
-    "--server":        { "group": "line", "light": "#f2a23c", "dark": "#f2a23c", "role": "the Line — server/enterprise plane fill" },
-    "--server-bar":    { "group": "line", "light": "#ec8b14", "dark": "#f2a23c", "role": "server/tool kind left-bar + indicators (darkened on light)" },
-    "--control":       { "group": "line", "light": "#7cc4e8", "dark": "#6fb3d6", "role": "the Line — control/deploy plane fill" },
-    "--control-bar":   { "group": "line", "light": "#2f6f9e", "dark": "#6fb3d6", "role": "control/retrieval kind left-bar + indicators (darkened on light). Steel blue: near brand blue but never a stand-in for brand identity." },
+    "--ok":            { "group": "status", "light": "#3dbe5a", "dark": "#3dbe5a", "role": "Success — the same green in both modes; always paired with a glyph or word." },
+    "--warn":          { "group": "status", "light": "#f0a13c", "dark": "#f0a13c", "role": "Warning — the same amber in both modes; always paired with a glyph or word." },
+    "--danger":        { "group": "status", "light": "#e2484d", "dark": "#e2484d", "role": "Failure — the same red in both modes; always paired with a glyph or word." },
+    "--danger-soft":   { "group": "status", "light": "#fbe9ea", "dark": "#2b1a22", "role": "Failure soft — red wash for a failure context field; ordinary ink on top." },
 
-    "--ok":            { "group": "status", "light": "#2f9e44", "dark": "#7ee081", "role": "healthy / pass / success — FILL and bar use only" },
-    "--warn":          { "group": "status", "light": "#ec8b14", "dark": "#f2a23c", "role": "drift / caution / warning — FILL and bar use only" },
-    "--danger":        { "group": "status", "light": "#d2402a", "dark": "#e8615a", "role": "fail / error / removed (overrides kind) — FILL and bar use only" },
-    "--ok-text":       { "group": "status", "light": "#247b35", "dark": "#7ee081", "role": "healthy AS TEXT. Raw --ok is 3.01:1 as a badge label on light; this is the darkest hue-preserving value clearing 4.5:1. Dark mode already passes, so it is unchanged there." },
-    "--warn-text":     { "group": "status", "light": "#9c5c0d", "dark": "#f2a23c", "role": "caution AS TEXT. Raw --warn is 2.28:1 as a badge label on light. Also decouples warning text from --server-bar, which shares --warn's hex." },
-    "--danger-text":   { "group": "status", "light": "#c03a26", "dark": "#e8615a", "role": "failure AS TEXT. Raw --danger is 3.94:1 as a badge label on light." },
+    "--code-bg":       { "group": "code", "light": "#12141c", "dark": "#12141c", "role": "Code surface — code and terminal blocks: the dark panel field in both modes, lifted above the dark canvas." },
+    "--code-text":     { "group": "code", "light": "#e6e4da", "dark": "#e6e4da", "role": "Code ink — default code text." },
+    "--code-muted":    { "group": "code", "light": "#8f92a5", "dark": "#8f92a5", "role": "Code comment and punctuation ink. The code field is dark in both modes." },
+    "--code-keyword":  { "group": "code", "light": "#7a8cff", "dark": "#7a8cff", "role": "Code keyword and storage ink (declaration syntax)." },
+    "--code-string":   { "group": "code", "light": "#c5f23b", "dark": "#c5f23b", "role": "Code string and literal-value ink (lime, the evidence hue)." },
+    "--code-number":   { "group": "code", "light": "#f0a13c", "dark": "#f0a13c", "role": "Code number, constant, function-name, and control-keyword ink (amber)." },
 
-    "--hero-bg":       { "group": "hero", "light": "#2745e8", "dark": "#1a2040", "role": "loud hero block background" },
-    "--hero-ink":      { "group": "hero", "light": "#ffffff", "dark": "#e9edfd", "role": "text on hero block" },
-    "--ink-on-fill":   { "group": "hero", "light": "#101014", "dark": "#101014", "role": "always-dark text on bright fills" },
-
-    "--r":             { "group": "geometry", "light": "5px", "dark": "5px", "role": "radius — locked at 5px (true circles only for dots/avatars)" }
+    "--weight-strong": { "group": "type", "light": "700", "dark": "600", "role": "Strong weight — headings, labels, and emphasis. Capped at 600 in dark mode, where light-on-dark text renders heavier." },
+    "--r":             { "group": "geometry", "light": "2px", "dark": "2px", "role": "Radius — restrained two-pixel corners (true circles only for dots/avatars)." }
   },
 
-  "$pairs": "Contrast contract, asserted by gen-theme.mjs in BOTH modes. Every foreground/background pairing the system actually renders is declared here so a palette edit that breaks one fails the build instead of shipping. `fill` may be a token name or {mix:[a,b],pct} for a color-mix() background. `min` is the WCAG floor for the role: 4.5 for text, 3.0 for non-text UI (WCAG 1.4.11), 7.0 where we hold ourselves to AAA. The reason this exists: --ink-on-fill and --lime-ink are mode-INVARIANT, so they are only safe on a mode-invariant fill; and --brand collapses onto --brand-btn-ink in dark (1.23:1) while looking fine in light (6.77:1).",
+  "$pairs": "Contrast contract, asserted by gen-theme.mjs in BOTH modes. Every foreground/background pairing the applications render as text is declared here so a palette edit that breaks one fails the token gate instead of shipping. `min` is the floor for the role: 7.0 for body ink, 4.5 for secondary and link ink, 4.0 for declare ink on its own wash, 1.2 for structural rules (separation only). The lime, green, amber, and red hues are deliberately identical in both modes (approved 2026-09-26) and are not text-contrast contracts on light fields: lime renders only as a fill, line, or underline with --evidence-ink on top; status hues render as labels that always carry a glyph or word and a two-pixel colored border. Rule pairs are structural separation and never the sole identifier of a control; see DESIGN.md 'Rules are structure'.",
   "pairs": [
-    { "ink": "--text", "fill": "--bg", "min": 7.0, "role": "body text on page" },
-    { "ink": "--text", "fill": "--surface", "min": 7.0, "role": "body text on card" },
-    { "ink": "--muted", "fill": "--surface", "min": 4.5, "role": "labels, metadata" },
-    { "ink": "--brand-strong", "fill": "--surface", "min": 4.5, "role": "links, big stats" },
-    { "ink": "--lime-text", "fill": "--surface", "min": 4.5, "role": "lime as text" },
+    { "ink": "--text", "fill": "--bg", "min": 7.0, "role": "body text on canvas" },
+    { "ink": "--text", "fill": "--surface", "min": 7.0, "role": "body text on a panel" },
+    { "ink": "--text", "fill": "--surface-2", "min": 7.0, "role": "text in subordinate regions and neutral controls" },
+    { "ink": "--text", "fill": "--surface-hover", "min": 7.0, "role": "text on a hovered row or control" },
+    { "ink": "--muted", "fill": "--bg", "min": 4.5, "role": "metadata on canvas" },
+    { "ink": "--muted", "fill": "--surface", "min": 4.5, "role": "metadata on a panel; neutral badge label" },
+    { "ink": "--muted", "fill": "--surface-2", "min": 4.5, "role": "metadata in subordinate regions" },
+    { "ink": "--muted", "fill": "--surface-hover", "min": 4.5, "role": "metadata on a hovered row" },
 
-    { "ink": "--brand-btn-ink", "fill": "--brand-btn", "min": 4.5, "role": "primary button label" },
-    { "ink": "--lime-ink", "fill": "--lime", "min": 4.5, "role": "label on a lime fill" },
-    { "ink": "--hero-ink", "fill": "--hero-bg", "min": 4.5, "role": "hero copy" },
+    { "ink": "--declare", "fill": "--bg", "min": 4.5, "role": "links on canvas" },
+    { "ink": "--declare", "fill": "--surface", "min": 4.5, "role": "links, selected refs, focus ring on a panel" },
+    { "ink": "--declare", "fill": "--surface-hover", "min": 4.0, "role": "link on a hovered row" },
+    { "ink": "--declare", "fill": "--declare-soft", "min": 4.0, "role": "selected declaration label" },
+    { "ink": "--text", "fill": "--declare-soft", "min": 7.0, "role": "text in a selected declaration field" },
+    { "ink": "--declare-ink", "fill": "--declare", "min": 4.5, "role": "primary action label" },
 
-    { "ink": "--ok-text", "fill": { "mix": ["--ok-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "ok badge label" },
-    { "ink": "--warn-text", "fill": { "mix": ["--warn-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "warn badge label" },
-    { "ink": "--danger-text", "fill": { "mix": ["--danger-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "danger badge label" },
-    { "ink": "--muted", "fill": "--surface", "min": 4.5, "role": "neutral badge label — untinted; a 12% --muted tint lands at 4.46:1 in dark, and 'neutral' means no status, so it gets no fill" },
+    { "ink": "--text", "fill": "--observe-soft", "min": 7.0, "role": "text in a selected observation field" },
+    { "ink": "--evidence-ink", "fill": "--observe", "min": 4.5, "role": "label on an observe fill (lime is a fill, never text on a light field)" },
 
-    { "ink": "--client-bar", "fill": "--surface", "min": 3.0, "role": "client kind bar (non-text)" },
-    { "ink": "--server-bar", "fill": "--surface", "min": 2.5, "role": "server kind bar (non-text) — 2.54:1, inherited; see DESIGN.md" },
-    { "ink": "--control-bar", "fill": "--surface", "min": 3.0, "role": "control kind bar (non-text)" },
-    { "ink": "--ok", "fill": "--surface", "min": 3.0, "role": "ok bar / dot (non-text)" },
-    { "ink": "--danger", "fill": "--surface", "min": 3.0, "role": "danger bar / dot (non-text)" }
+    { "ink": "--evidence-ink", "fill": "--evidence", "min": 4.5, "role": "label and outline on a retained-evidence fill" },
+    { "ink": "--evidence", "fill": "--code-bg", "min": 3.0, "role": "retained-evidence signal on a code/terminal block (non-text)" },
+
+    { "ink": "--text", "fill": "--danger-soft", "min": 7.0, "role": "text in a failure context field" },
+
+    { "ink": "--code-text", "fill": "--code-bg", "min": 7.0, "role": "code and terminal text" },
+    { "ink": "--code-muted", "fill": "--code-bg", "min": 4.5, "role": "code comments and punctuation" },
+    { "ink": "--code-keyword", "fill": "--code-bg", "min": 4.5, "role": "code keywords" },
+    { "ink": "--code-string", "fill": "--code-bg", "min": 4.5, "role": "code strings" },
+    { "ink": "--code-number", "fill": "--code-bg", "min": 4.5, "role": "code numbers, constants, and function names" },
+
+    { "ink": "--border", "fill": "--surface", "min": 1.2, "role": "structural rule on a panel — separation only; controls are also identified by label, fill, or --declare focus" },
+    { "ink": "--border", "fill": "--bg", "min": 1.2, "role": "structural rule on canvas — separation only" }
   ]
 }

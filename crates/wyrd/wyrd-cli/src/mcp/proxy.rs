@@ -40,7 +40,12 @@ impl ServerHandler for McpProxy {
     /// upstream session, so a host pinned to an earlier revision still reaches
     /// Wyrd's session-free one.
     fn get_info(&self) -> ServerInfo {
-        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+        let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
+        info.instructions = self
+            .upstream
+            .peer_info()
+            .and_then(|info| info.instructions.clone());
+        info
     }
 
     /// Return the server's own catalog for the authenticated caller.

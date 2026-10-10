@@ -1,0 +1,11 @@
+{
+  "task_id": "no_refund_promise",
+  "passed": false,
+  "actual": "guaranteed refund",
+  "expected": "guaranteed refund",
+  "operator": "not_contains",
+  "message": "The reply promised a refund.",
+  "stage": 0,
+  "started_at": "2026-10-10T00:00:00Z",
+  "duration_ms": 1
+}

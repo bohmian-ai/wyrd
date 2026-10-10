@@ -1,0 +1,7 @@
+{
+  "method": "Custom",
+  "features": {
+    "latency": {"feature": "latency", "score": 3.0, "threshold": 1.0, "verdict": "Drift"}
+  },
+  "verdict": "Drift"
+}

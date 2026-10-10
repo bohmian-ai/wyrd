@@ -15,12 +15,16 @@
 
 /// The Postgres-backed half of the verification journey.
 mod pg_tests {
-    use crate::connectivity::{McpJourneyError, client, discover, problem, structured, transport};
+    use crate::connectivity::{
+        McpJourneyError, client, discover, problem, refusal, structured, transport,
+    };
 
+    use std::path::Path;
     use std::time::Duration;
 
     use rmcp::ClientServiceExt as _;
     use rmcp::model::CallToolRequestParams;
+    use rmcp::service::{RoleClient, RunningService};
     use secrecy::ExposeSecret as _;
     use serde_json::Value as JsonValue;
     use wyrd_client::QueueConfig;
@@ -29,7 +33,9 @@ mod pg_tests {
     use wyrd_client::state::WyrdState;
     use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_runtime::Permission;
+    use wyrd_spec::envelope::CardKind;
     use wyrd_spec::reference::CardRef;
+    use wyrd_spec::registry::{GetCardResponse, ListCardsResponse};
     use wyrd_testing::{Bootstrap, WyrdTestServer};
 
     /// The Card read tool an agent uses to find binding IDs.
@@ -140,6 +146,272 @@ mod pg_tests {
             verifier_uid: uid(&verifier.root)?,
             service_ref: receipt.root,
         })
+    }
+
+    /// A real MCP connection and registered shared Card graphs for investigation.
+    struct CardInvestigation {
+        /// Owns the listener, tenant fixtures, and shutdown lifecycle.
+        server: WyrdTestServer,
+        /// Administrator connection used for Card discovery and navigation.
+        agent: RunningService<RoleClient, ()>,
+        /// Exact root of the shared support desk graph.
+        service: CardRef,
+    }
+
+    impl CardInvestigation {
+        /// Register the shared support desk and observed Service graphs.
+        ///
+        /// # Errors
+        /// Returns server, fixture registration, or connection failures.
+        async fn start() -> Result<Self, McpJourneyError> {
+            let server = WyrdTestServer::start_bound().await?;
+            let admin = server
+                .bootstrap_agent("mcp-card-discovery", &["admin"])
+                .await?;
+            let cards = Cards::with_client(client(&server, api_key(&admin)?)?);
+            let fixtures = Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../fixtures/cards"
+            ));
+
+            Box::pin(
+                cards.register_from_path(&fixtures.join("register_and_hydrate/support-model.yaml")),
+            )
+            .await?;
+            let desk = Box::pin(
+                cards.register_from_path(&fixtures.join("register_and_hydrate/support-desk.yaml")),
+            )
+            .await?;
+            Box::pin(cards.register_from_path(&fixtures.join("observe_a_run/observed-model.yaml")))
+                .await?;
+            Box::pin(
+                cards.register_from_path(&fixtures.join("observe_a_run/observed-service.yaml")),
+            )
+            .await?;
+
+            let agent = Self::connect(&server, &admin).await?;
+            Ok(Self {
+                server,
+                agent,
+                service: desk.root,
+            })
+        }
+
+        /// Connect a principal through the production MCP transport.
+        ///
+        /// # Errors
+        /// Returns credential or transport failures.
+        async fn connect(
+            server: &WyrdTestServer,
+            principal: &Bootstrap,
+        ) -> Result<RunningService<RoleClient, ()>, McpJourneyError> {
+            Ok(
+                ().serve_with_lifecycle(transport(server, api_key(principal)?, None)?, discover())
+                    .await?,
+            )
+        }
+
+        /// Read a typed Card page through MCP's advertised filters.
+        ///
+        /// # Errors
+        /// Returns tool, transport, or response decoding failures.
+        async fn list(&self, arguments: JsonValue) -> Result<ListCardsResponse, McpJourneyError> {
+            let response = self.agent.call_tool(call("cards.list", arguments)?).await?;
+            Ok(serde_json::from_value(structured(response)?)?)
+        }
+
+        /// Read one exact reference through MCP.
+        ///
+        /// # Errors
+        /// Returns tool, transport, or response decoding failures.
+        async fn get(&self, reference: &CardRef) -> Result<GetCardResponse, McpJourneyError> {
+            let arguments = serde_json::json!({ "card_ref": reference });
+            let response = self
+                .agent
+                .call_tool(call("cards.get_by_ref", arguments)?)
+                .await?;
+            Ok(serde_json::from_value(structured(response)?)?)
+        }
+
+        /// Select the named Service and follow opaque continuation without repeating a Card.
+        ///
+        /// # Errors
+        /// Returns MCP or response decoding failures.
+        async fn discover(&self) -> Result<(), McpJourneyError> {
+            let named = self
+                .list(serde_json::json!({ "kind": "Service", "name": "support-desk" }))
+                .await?;
+            assert_eq!(named.items.len(), 1);
+            assert_eq!(Some(&named.items[0].card_uid), self.service.uid.as_ref());
+            assert_eq!(named.items[0].version, self.service.version);
+
+            let first = self
+                .list(serde_json::json!({ "kind": "Service", "limit": 1 }))
+                .await?;
+            assert_eq!(first.items.len(), 1);
+            let cursor = first
+                .next_cursor
+                .ok_or("two Services require continuation")?;
+            let second = self
+                .list(serde_json::json!({ "kind": "Service", "limit": 1, "cursor": cursor }))
+                .await?;
+            assert_eq!(second.items.len(), 1);
+            assert_ne!(first.items[0].card_uid, second.items[0].card_uid);
+            assert!(second.next_cursor.is_none());
+            Ok(())
+        }
+
+        /// Follow the Service's Model and Agent edges, then their inbound references.
+        ///
+        /// # Errors
+        /// Returns MCP or response decoding failures.
+        async fn navigate(&self) -> Result<(), McpJourneyError> {
+            let parent = self.get(&self.service).await?;
+            let arguments = serde_json::json!({ "kind": "Service", "card_uid": self.service.uid });
+            let response = self.agent.call_tool(call(CARDS_GET, arguments)?).await?;
+            let by_uid: GetCardResponse = serde_json::from_value(structured(response)?)?;
+            assert_eq!(parent, by_uid, "UID reads retain the full Card contract");
+
+            let components = &parent.card.relationships.outbound_refs;
+            for kind in [CardKind::Model, CardKind::Agent] {
+                let edge = components
+                    .iter()
+                    .find(|edge| edge.card_ref.kind == kind)
+                    .ok_or("Service has both component kinds")?;
+                let component = self.get(&edge.card_ref).await?;
+                assert_eq!(component.card.kind, kind);
+                assert!(
+                    component
+                        .card
+                        .relationships
+                        .inbound_refs
+                        .iter()
+                        .any(|edge| edge.card_ref == self.service),
+                    "component identifies its exact parent"
+                );
+            }
+            Ok(())
+        }
+
+        /// Refuse malformed cursors, incomplete references, and missing Cards.
+        ///
+        /// # Errors
+        /// Returns transport failures or an unexpectedly successful call.
+        async fn reject_invalid_reads(&self) -> Result<(), McpJourneyError> {
+            for (tool, arguments, code) in [
+                (
+                    "cards.list",
+                    serde_json::json!({ "cursor": "invalid!" }),
+                    "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
+                ),
+                (
+                    "cards.get_by_ref",
+                    serde_json::json!({ "card_ref": { "kind": "Service", "name": "support-desk" } }),
+                    "WYRD_SPEC_400_VALIDATION",
+                ),
+                (
+                    "cards.get_by_ref",
+                    serde_json::json!({ "card_ref": { "kind": "Service", "name": "absent", "version": "1.0.0", "space": "default" } }),
+                    "WYRD_REGISTRY_404_CARD_NOT_FOUND",
+                ),
+            ] {
+                let failure = refusal(self.agent.call_tool(call(tool, arguments)?).await)?;
+                assert!(failure.contains(code), "{failure}");
+            }
+            Ok(())
+        }
+
+        /// A foreign tenant cannot list or resolve the registered Service.
+        ///
+        /// # Errors
+        /// Returns tenant, principal, transport, or response failures.
+        async fn isolate_tenants(&self) -> Result<(), McpJourneyError> {
+            let tenant = self.server.seed_tenant("mcp-card-foreign").await?;
+            let principal = self
+                .server
+                .bootstrap_service_in_tenant(tenant, "foreign", &["admin"])
+                .await?;
+            let foreign = Self::connect(&self.server, &principal).await?;
+
+            let failure = refusal(
+                foreign
+                    .call_tool(call(
+                        "cards.get_by_ref",
+                        serde_json::json!({ "card_ref": self.service }),
+                    )?)
+                    .await,
+            )?;
+            assert!(
+                failure.contains("WYRD_REGISTRY_404_CARD_NOT_FOUND"),
+                "{failure}"
+            );
+            let response = foreign
+                .call_tool(call(
+                    "cards.list",
+                    serde_json::json!({ "name": "support-desk" }),
+                )?)
+                .await?;
+            let listed: ListCardsResponse = serde_json::from_value(structured(response)?)?;
+            assert!(listed.items.is_empty());
+
+            foreign.cancel().await?;
+            Ok(())
+        }
+
+        /// Both new reads enforce cards:read even when called by name.
+        ///
+        /// # Errors
+        /// Returns principal, transport, or response failures.
+        async fn enforce_permissions(&self) -> Result<(), McpJourneyError> {
+            self.server.seed_role("mcp_no_cards", &[]).await?;
+            let principal = self
+                .server
+                .bootstrap_service("denied", &["mcp_no_cards"])
+                .await?;
+            let denied = Self::connect(&self.server, &principal).await?;
+
+            for (tool, arguments) in [
+                ("cards.list", serde_json::json!({})),
+                (
+                    "cards.get_by_ref",
+                    serde_json::json!({ "card_ref": self.service }),
+                ),
+            ] {
+                let failure = refusal(denied.call_tool(call(tool, arguments)?).await)?;
+                assert!(
+                    failure.contains("WYRD_PERMISSION_403_DENIED_RBAC"),
+                    "{failure}"
+                );
+            }
+            denied.cancel().await?;
+            Ok(())
+        }
+
+        /// Close the connection before draining the server.
+        ///
+        /// # Errors
+        /// Returns transport or server shutdown failures.
+        async fn shutdown(self) -> Result<(), McpJourneyError> {
+            self.agent.cancel().await?;
+            self.server.shutdown().await?;
+            Ok(())
+        }
+    }
+
+    /// An agent discovers and navigates shared Card graphs through the real MCP endpoint.
+    ///
+    /// # Errors
+    /// Returns fixture, MCP, or shutdown failures.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn agent_discovers_service_and_component_cards() -> Result<(), McpJourneyError> {
+        let investigation = CardInvestigation::start().await?;
+        investigation.discover().await?;
+        investigation.navigate().await?;
+        investigation.reject_invalid_reads().await?;
+        investigation.isolate_tenants().await?;
+        investigation.enforce_permissions().await?;
+        investigation.shutdown().await
     }
 
     /// A bound Service discovers its binding, starts a keyed run, and reads it
@@ -345,21 +617,6 @@ mod pg_tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    }
-
-    /// Render a refused tool call as text, whether the refusal arrived as a
-    /// protocol error or as a structured Wyrd problem.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the call succeeded.
-    fn refusal(
-        result: Result<rmcp::model::CallToolResult, rmcp::ServiceError>,
-    ) -> Result<String, McpJourneyError> {
-        Ok(match result {
-            Err(error) => error.to_string(),
-            Ok(result) => problem(result)?.to_string(),
-        })
     }
 
     /// Run one `bifrost.query` over `sql` and return its rows.

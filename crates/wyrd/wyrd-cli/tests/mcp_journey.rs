@@ -148,6 +148,10 @@ pub(crate) async fn list_tables_through_proxy(
     let host = ().serve(proxy.stdio()).await.unwrap_or_else(|error| {
         panic!("the host initializes through the proxy: {error}");
     });
+    let info = host.peer_info().expect("proxy initialization metadata");
+    let instructions = info.instructions.as_deref().expect("server instructions");
+    assert!(instructions.contains("tools/list"));
+    assert!(instructions.contains("wyrd.guide"));
     let tools = host
         .list_all_tools()
         .await

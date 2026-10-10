@@ -107,7 +107,10 @@ where
     I: JsonSchema,
     O: JsonSchema,
 {
-    Tool::new(name, description, schema_of::<I>())
+    let mut input = schema_of::<I>();
+    // Tagged enums omit the root type; MCP still requires object arguments.
+    Arc::make_mut(&mut input).insert("type".to_owned(), JsonValue::String("object".to_owned()));
+    Tool::new(name, description, input)
         .with_raw_output_schema(schema_of::<O>())
         .with_title(title)
         .annotate({

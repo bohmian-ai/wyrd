@@ -1,6 +1,6 @@
 ---
 id: SPEC-local-server-bootstrap
-revision: 5
+revision: 7
 status: approved
 ---
 
@@ -168,6 +168,62 @@ configuration; this change adds no login or credential format.
   credential/config storage, and failed host installation. Secrets are
   redacted.
 
+### Native SDK contracts without a schema collection
+
+- **REQ-017 — Remove the schema collection.** Remove the checked-in JSON
+  Schema collection, its bulk exporter, and the schema-based Python/TypeScript
+  Card model generator and outputs. Do not relocate the collection, replace it
+  with a bundled dump, or retain schema-to-SDK generation through temporary
+  files. Rust contract types and runtime schema derivation remain supported.
+- **REQ-018 — Native typed language boundaries.** Expose the existing typed
+  Card contract through Python SDK-owned PyO3 bindings with matching `.pyi`
+  stubs and TypeScript SDK-owned N-API bindings with matching `.d.ts`
+  declarations. Preserve current public entry points, field access, kind and
+  variant narrowing, optionality, read-only envelope behavior, and the
+  existing typed nested fields, including metadata, relationships, status,
+  and verification evidence. Preserve native authoring, Prompt execution,
+  artifact loading, and hydrated-state behavior. Rust contracts remain the
+  authority; bindings do not duplicate validation or durable behavior.
+- **REQ-019 — Close every schema consumer.** MCP advertises schemas derived
+  directly from the Rust contracts its handlers accept, preserving discovery,
+  nested references, annotations, secret protection, and authorization.
+  Documentation retains contract field information and machine-readable
+  guidance without a schema-file inventory or checked-in schema dump.
+  Build, packaging, codegen, and contract tests work without the collection.
+  Retain non-schema generated error-code declarations and UI error-example
+  data under their actual owners. Replace file-snapshot dependencies with
+  focused contract assertions without losing meaningful regression coverage.
+
+### Consistent branded terminal output
+
+- **REQ-020 — One terminal presentation policy.** Wyrd-owned human-facing
+  CLI output, client artifact-transfer displays, server operator messages,
+  and human-readable terminal logs share Evidence Thread color roles.
+  Primary blue identifies active work and selection; green identifies
+  success, amber caution, and red failure. Lime is reserved for observations
+  and retained evidence, always identified by context and labels. Status
+  carries a word or glyph; ordinary text, data, and the terminal background
+  retain the user's defaults. Help, argument errors, runtime errors, prompts,
+  progress, and completion messages follow this policy. Installed Python and
+  TypeScript CLI entry points and existing SDK transfer displays use the
+  same Rust-owned policy; no language-specific terminal implementation is added.
+- **REQ-021 — Portable, machine-safe output.** Default colored output uses
+  terminal-native ANSI blue, green, yellow, and red as semantic fallbacks.
+  Color is enabled only for an eligible terminal stream and is suppressed
+  when `NO_COLOR` is nonempty or the terminal is incapable of color.
+  Detect stdout and stderr independently. JSON, JSONL, Arrow, saved results,
+  structured problem records, and MCP protocol stdout contain no presentation
+  escapes even when attached to a terminal. SDK return values and error
+  metadata remain typed and unstyled. Do not add color flags, theme settings,
+  background probing, or exact-RGB terminal rendering in this change.
+- **REQ-022 — Canonical brand projection.** Evidence Thread
+  `crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json` is the brand authority.
+  Its existing generator projects the terminal role values and the mapping
+  to portable ANSI colors; consumers do not maintain another RGB palette.
+  Generated terminal assets participate in the existing regeneration/drift
+  workflow. Terminal consumers require neither a UI runtime nor brand-file
+  reads from a developer's checkout.
+
 ## Constraints and invariants
 
 - **INV-001 — Server authority.** The CLI owns release installation, process
@@ -196,6 +252,18 @@ configuration; this change adds no login or credential format.
   existing protections and preserve unrelated user data. Failed or interrupted
   release installation and host edits leave the prior usable state intact.
   Database URLs and credentials are never passed as process arguments.
+- **INV-005 — One Rust contract, thin bindings.** `wyrd-spec` remains
+  PyO3/N-API-free. New foreign-runtime wrappers belong in the owning SDK and
+  use existing Rust contracts and shared-client operations. No typed contract
+  becomes an untyped dictionary, JSON string, broad `Any`, or unchecked cast
+  merely to remove schema files. Existing deliberately opaque JSON slots
+  remain permitted. Runtime MCP/OpenAPI schemas are not removed.
+
+- **INV-006 — Presentation only.** Terminal styling changes no command
+  spelling, exit code, credential disclosure/redaction rule, structured data,
+  permission, audit behavior, log filtering, or telemetry export. Shared
+  terminal code stays lightweight and outside `wyrd-spec`; it does not pull
+  server, frontend, or OTLP dependencies into a client just to format output.
 
 ## Scope and non-goals
 
@@ -204,11 +272,22 @@ server bundles; `wyrd server install`, `wyrd server dev`,
 `wyrd mcp install`, and the MCP proxy; database URL fallback; first-use
 credential and client config persistence; detected host integration; docs and
 user journeys for local and externally hosted MCP connections.
+Also in scope: removal of the schema collection and schema-generated SDK
+models, native contract exposure with accompanying declarations, and closure
+of their current runtime, documentation, test, build, and package consumers.
+Also in scope: the owner's requested replacement of the older brand library
+with Evidence Thread from `wyrd-doc-site`, and consistent terminal presentation
+across the existing Wyrd-owned output surfaces (REQ-020–REQ-022).
 
 Out of scope: running PostgreSQL or an object store; Windows local-server binaries;
 automatic upgrade of an installed server; changed SDK authentication
 contracts; a second Wyrd MCP tool catalog; configuration of undetected hosts;
 production fleet deployment or migration orchestration.
+Terminal work adds no TUI framework, banner, new SDK printing API, coloring of
+arbitrary caller `print()` output, syntax highlighting of machine data, or
+frontend redesign. Existing UI/docs consumers of retired brand tokens require
+their own consumer migration; importing the brand library alone is not proof
+that those applications implement Evidence Thread.
 
 ## Expensive-to-reverse decisions and authority changes
 
@@ -245,6 +324,16 @@ production fleet deployment or migration orchestration.
 - **D-005 — One-off migration.** `wyrd server dev` automates
   `wyrd-server migrate` before serving. Normal server boot retains read-only
   schema verification, preserving `SPEC-verified-change-contract` REQ-157.
+- **D-006 — Native SDK models replace schema-generated models.** Python and
+  TypeScript expose Rust contracts through their established PyO3 and N-API
+  boundaries with accompanying type declarations. Python dataclass identity
+  and dataclass-specific reflection/exception behavior are retired; typed
+  public imports, fields, read-only behavior, and server evidence remain.
+  Checked-in schema file paths and their inventory are intentionally retired,
+  without compatibility copies or aliases. This changes representation and
+  artifact publication, not the durable wire contract or server behavior.
+  Reconcile architecture and reference text that requires checked-in schema
+  artifacts during implementation; runtime contract discovery stays intact.
 
 Implementing this approved revision requires reconciling the conflicting text in
 `SPEC-verified-change-contract`,
@@ -298,6 +387,37 @@ a shared login bypasses RLS do not describe this change.
   delivered commands and URL fallback, and state exactly which privileges the
   operator-created logins need for one-login and two-login deployments.
   Evidence: relevant `mise` checks and documentation review.
+- **AC-009:** Rust, Python, and TypeScript retain their existing typed Card
+  and hydrated-state functionality without schema-generated SDK models.
+  Python returns native-bound objects with accurate public stubs; TypeScript
+  returns typed native-bound values with accurate declarations. Existing
+  typed fields and discriminator narrowing remain precise; complete server
+  metadata, relationships, status, and verification evidence survive the
+  boundary. Native authoring, artifact workflows, and stable negative flows
+  continue to work. Evidence: focused runtime-owned tests, static typing, and
+  real SDK-to-server journeys.
+- **AC-010:** The schema collection, bulk schema exporter, generated fixture
+  schema collections, and schema-to-SDK generator/outputs are absent. MCP
+  discovery and calls, contract documentation, codegen, UI error projection,
+  and package/build consumers work without recreating them. Runtime schemas
+  and contract regression assertions remain meaningful. Evidence: consumer
+  closure inspection, focused MCP/contract tests, regeneration, documentation,
+  and installed-package checks.
+
+- **AC-011:** Eligible terminal help, prompts, progress, status, errors, and
+  human-readable logs use the shared semantic roles with non-color cues.
+  Redirected, incapable-terminal, and nonempty `NO_COLOR` runs remain plain.
+  Stdout/stderr are evaluated independently; structured outputs remain
+  parseable and presentation-free. Installed Python/TypeScript CLIs and
+  existing Rust/Python/TypeScript client artifact displays behave consistently.
+  Evidence: focused terminal process tests, runtime-owned package tests, and
+  real-server transfer and MCP journeys.
+- **AC-012:** The terminal projection is generated from the local Evidence
+  Thread palette, is reproducible, and needs no checkout at runtime. No second
+  palette or language-specific rendering engine exists. Codes, receipts,
+  secrets, permissions, and OTLP records retain their contracts. Evidence:
+  generator regression/drift proof, consumer inspection, dependency checks,
+  installed-package tests, and focused behavior regressions.
 
 ## Open material decisions
 
@@ -322,3 +442,5 @@ None.
 | 3 | approved | Externally supplied credentials and pool-scoped RLS replace named serving roles and the shared-admin RLS tradeoff (REQ-016, INV-002, D-001, AC-003, AC-008); approved by the owner. |
 | 4 | approved | An unset `WYRD_STORAGE_URL` selects created local storage at `.wyrd/storage` instead of failing (journey step 2, REQ-007, AC-007); approved by the owner. |
 | 5 | approved | Cursor, Pi, and Hermes Agent join the initial MCP host variants (REQ-011); approved by the owner. |
+| 6 | approved | Owner explicitly requested removal of the schema collection and schema-based SDK models in favor of PyO3/N-API exposure with accompanying declarations, preserving current strict typing and functionality (REQ-017–REQ-019, INV-005, D-006, AC-009–AC-010). Earlier bootstrap obligations are unchanged. |
+| 7 | approved | Owner requested the proposed shared branded terminal-output task and replacement of the older local brand library with Evidence Thread from `wyrd-doc-site` (REQ-020–REQ-022, INV-006, AC-011–AC-012). Portable ANSI semantics are the first delivery; earlier obligations are unchanged. |

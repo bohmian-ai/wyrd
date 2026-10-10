@@ -1,25 +1,26 @@
 {
-  "$comment": "Machine-readable component contracts for the Wyrd design system under the bohmian brand. Every entry is implemented in src/lib/components and, when `catalog` is true, registered in src/lib/registry.ts (parity enforced by src/lib/registry.test.ts). `catalog: true` marks a component a future composed view may place by name: its props are typed, JSON-safe and semantic. `catalog: false` marks trusted application code — chrome that resolves tenant identity, session state and navigation — which an authored view must never be able to place, replace or impersonate. `consumers` lists the accepted product mock pages that require the component; a shared component earns its place only with at least two. The rendered reference is ./renders/styleguide.html.",
+  "$comment": "Machine-readable component contracts for Wyrd's Evidence Thread design system. Every entry is implemented in src/lib/components and, when `catalog` is true, registered in src/lib/registry.ts (parity enforced by src/lib/registry.test.ts). `catalog: true` marks a component a future composed view may place by name: its props are typed, JSON-safe and semantic. `catalog: false` marks trusted application code — chrome that resolves tenant identity, session state and navigation — which an authored view must never be able to place, replace or impersonate. `consumers` lists the accepted product mock pages that require the component; a shared component earns its place only with at least two. The rendered reference is ./renders/styleguide.html.",
   "altitudes": {
-    "quiet": "workbench default — 3px hard-offset shadow, restrained accent",
-    "raised": "drilldown panels — 6px shadow + 4px kind/status top-bar",
-    "flat": "subordinate block — 2px border, no shadow",
-    "loud": "hero / landing only — 10px shadow, tricolor rail, serif display type"
+    "quiet": "workbench default — 1px --border rule, 2px radius, no elevation",
+    "raised": "the page's single attention surface — 1px --text rule, no elevation",
+    "flat": "subordinate block — 1px --border-soft rule, no fill change"
   },
   "ownership": {
-    "$comment": "Blue is primary, lime is secondary. See DESIGN.md 'Never colour alone': --ok and --danger collapse to 1.11:1 under deuteranopia, so no meaning in this system may rest on hue alone.",
-    "primary": [
-      "--brand",
-      "--brand-strong",
-      "--brand-soft",
-      "--brand-btn"
+    "$comment": "Evidence Thread semantics. See DESIGN.md 'Never colour alone': status pairs such as --ok and --danger can collapse under colour-vision deficiency, so no meaning in this system may rest on hue alone.",
+    "declare": [
+      "--declare",
+      "--declare-soft",
+      "--declare-ink"
     ],
-    "secondary": [
-      "--lime",
-      "--lime-text",
-      "--lime-ink"
+    "observe": [
+      "--observe",
+      "--observe-soft"
     ],
-    "rule": "Bright --lime is a FILL only (1.30:1 on white). Anything that needs lime as a mark — text, a thin bar, the client plane — uses --lime-text.",
+    "evidence": [
+      "--evidence",
+      "--evidence-ink"
+    ],
+    "rule": "Indigo (--declare) is Declaration, links, selection, focus, and the primary action. Green (--observe) is observed fact. Lime (--evidence) is reserved for retained Evidence, the Wyrd mark spine, and evidence-capture feedback — never a secondary action, hover, or wash. Lime is a fill carrying --evidence-ink, never text on a light surface.",
     "redundancy": "Status carries a glyph, thresholds carry a tick, chart series carry a dash and a marker. Colour is never the sole carrier of a meaning."
   },
   "components": {
@@ -37,10 +38,10 @@
       "tokens": [
         "--surface",
         "--border",
-        "--shadow",
         "--muted",
         "--text",
-        "--r"
+        "--r",
+        "--border-soft"
       ],
       "props": {
         "variant": "quiet | raised | flat | wide | accent",
@@ -60,10 +61,10 @@
       ],
       "rules": [
         "named Panel, never Card: a Wyrd Card is a registered domain record, a panel is only a surface it may be drawn on",
-        "2px border always, 5px radius",
-        "quiet = 3px shadow, raised = 6px shadow and marks the page's single attention surface, flat = no shadow for a subordinate block",
+        "1px rule, 2px radius, no decorative elevation",
+        "quiet = --border rule; raised = --text rule marking the page's single attention surface; flat = --border-soft rule for a subordinate block",
         "wide spans grid-column 1 / -1",
-        "accent = the page's single dominant work region: 6px shadow plus a brand-tinted head color-mix(--brand-strong 14%, --surface); at most one accent panel per page",
+        "accent = the page's single dominant work region: a --declare-soft head over a --surface body; at most one accent panel per page",
         "container-type: inline-size so contained components respond to the panel, not the viewport"
       ]
     },
@@ -79,14 +80,13 @@
       ],
       "tokens": [
         "--border",
-        "--shadow",
         "--surface",
         "--text",
-        "--brand-btn",
-        "--brand-btn-ink",
-        "--lime",
-        "--lime-ink",
-        "--r"
+        "--declare",
+        "--declare-ink",
+        "--r",
+        "--surface-2",
+        "--surface-hover"
       ],
       "props": {
         "variant": "primary | secondary | ghost",
@@ -102,13 +102,13 @@
         "label"
       ],
       "rules": [
-        "primary = brand blue fill (--brand-btn) — the one strong action on a surface",
-        "secondary = lime fill — the second voice. Any genuine secondary action beside a blue primary may take it; it is signal, never decoration.",
+        "primary = --declare fill with --declare-ink label — the one strong action on a surface",
+        "secondary = neutral --surface-2 fill with --text label; lime is reserved for retained Evidence and never marks an action",
         "ghost = surface fill, no accent",
         "href renders an <a> with identical treatment, so a catalog-safe view offers navigation without a callback crossing the contract",
-        "fill is --brand-btn, never --brand: --brand is a dim navy panel colour in dark and pairs with --brand-btn-ink at 1.23:1",
-        "press interaction: hover lifts to 5px, active sinks to 1px",
-        "focus-visible draws an explicit 2px --text outline: the browser default ring is low contrast on the brand and lime fills"
+        "1px --border rule, 2px radius, no shadow; hover moves to --surface-hover (or a stronger --declare on primary)",
+        "no lift, sink, or offset motion: state is carried by fill and rule, not by displacement",
+        "focus-visible draws an explicit 2px --declare outline with offset so it stays visible on every fill"
       ]
     },
     "Badge": {
@@ -123,10 +123,10 @@
         "E-04"
       ],
       "tokens": [
-        "--ok-text",
-        "--warn-text",
-        "--danger-text",
-        "--brand-strong",
+        "--ok",
+        "--warn",
+        "--danger",
+        "--declare",
         "--muted",
         "--surface"
       ],
@@ -147,9 +147,9 @@
       ],
       "rules": [
         "tone is a status signal, not decoration",
-        "tone drives border, label, and tint from one --bc custom property, and --bc is always a *-text token: raw --ok/--warn/--danger are fill colours and land at 3.01 / 2.28 / 3.94:1 as an 8.5px label on light",
-        "2px border in tone colour, 12% tinted fill, 4px radius",
-        "MUST render an aria-hidden glyph before the label — ok=✓ warn=! danger=✕running=●. --ok and --danger collapse to 1.11:1 under deuteranopia, so a colour-only badge makes pass and fail identical for ~6% of men.",
+        "tone drives border, label, and tint from one --bc custom property; --ok/--warn/--danger each clear 4.5:1 as text on --surface and --bg in both modes",
+        "1px border in tone colour, 12% tinted fill, 2px radius",
+        "MUST render an aria-hidden glyph before the label — ok=✓ warn=! danger=✕ running=●. Status hues can collapse under colour-vision deficiency, so a colour-only badge makes pass and fail identical for some readers.",
         "neutral takes no glyph and no tint: 'neutral' means no status, and a 12% --muted wash lands at 4.46:1 in dark, which the contrast contract rejects"
       ],
       "tones": []
@@ -202,12 +202,12 @@
       "tokens": [
         "--surface",
         "--border",
-        "--shadow",
         "--text",
         "--muted",
         "--r",
-        "--brand-soft",
-        "--brand-strong"
+        "--declare-soft",
+        "--declare",
+        "--surface-hover"
       ],
       "props": {
         "label": "string",
@@ -226,7 +226,7 @@
         "the visible <label> is bound by id — a filter control is never labeled by placement alone",
         "auto submits the enclosing form on change; the component takes no callback, so the destination stays a server-owned action or GET route",
         "time-range control is this component with range options, not a separate component",
-        "appearance:none plus a wrapper caret gives the control the workbench geometry — 2px border, 5px radius, 3px hard shadow, the same hover lift and active sink as Button — while the element underneath stays a real <select>. The option list is still drawn by the OS; that is the trade for free keyboard operation, a real mobile picker and correct screen-reader semantics.",
+        "appearance:none plus a wrapper caret gives the control the workbench geometry — 1px --border rule, 2px radius, --surface-hover on hover, 2px --declare focus ring — while the element underneath stays a real <select>. The option list is still drawn by the OS; that is the trade for free keyboard operation, a real mobile picker and correct screen-reader semantics.",
         "the option list is styled through customizable select (appearance: base-select + ::picker(select)) inside an @supports guard. Where that is unsupported the browser draws its own popup and nothing else changes — the element is always a real <select>, so keyboard operation, the mobile picker and screen-reader semantics never depend on the enhancement."
       ]
     },
@@ -244,12 +244,13 @@
       "tokens": [
         "--surface",
         "--border",
-        "--shadow",
         "--muted",
         "--text",
-        "--brand-soft",
-        "--brand-strong",
-        "--r"
+        "--declare-soft",
+        "--declare",
+        "--r",
+        "--border-soft",
+        "--surface-hover"
       ],
       "props": {
         "label": "string",
@@ -262,11 +263,11 @@
         "tbody"
       ],
       "rules": [
-        "header is plain surface (not gray) relying on the 2px bottom border",
-        "selection wash uses --brand-soft plus a 4px --brand-strong inset left marker, never lime — selection is positional as well as tinted",
-        "2px row dividers, last row borderless",
+        "header is plain surface (not gray) relying on a 1px --border bottom rule",
+        "selection wash uses --declare-soft plus a 3px --declare inset left marker, never lime — selection is positional as well as tinted",
+        "1px --border-soft row dividers, last row borderless",
         "an irreducibly wide table scrolls rather than dropping columns; the scroller is role=region with an aria-label and tabindex=0 so a keyboard-only reader can focus and pan it",
-        "a row is interactive only when it carries a link: tbody tr:has(a) takes a surface-2 hover wash and an inset brand-strong marker on focus-visible, and the linked cell underlines. A static readout row gets no hover, so the treatment never promises a click that is not there."
+        "a row is interactive only when it carries a link: tbody tr:has(a) takes a --surface-hover wash and an inset --declare marker on focus-visible, and the linked cell underlines. A static readout row gets no hover, so the treatment never promises a click that is not there."
       ]
     },
     "KpiTile": {
@@ -304,7 +305,7 @@
         "spark"
       ],
       "rules": [
-        "value is set in --font-display (Space Grotesk 700), not the body face",
+        "value is set in --font-sans (Familjen Grotesk 700) with tabular numerals",
         "delta trend up = --ok, down = --danger, and the delta text states the direction so the tone is never the only signal",
         "min-width:0 + overflow:hidden so wide values never blow out a grid track"
       ]
@@ -341,7 +342,7 @@
       "rules": [
         "native <details>/<summary>: open state, keyboard operation and the expanded/collapsed announcement come from the platform",
         "open is the initial state only — the element owns it afterwards",
-        "2px dashed divider between summary and body, matching the internal-divider rule"
+        "1px --border-soft divider between summary and body, matching the internal-divider rule"
       ]
     },
     "StateBlock": {
@@ -359,9 +360,9 @@
         "--surface",
         "--muted",
         "--text",
-        "--danger-text",
-        "--warn-text",
-        "--brand-strong",
+        "--danger",
+        "--warn",
+        "--declare",
         "--r"
       ],
       "props": {
@@ -406,11 +407,10 @@
         "Q-01"
       ],
       "tokens": [
-        "--surface-2",
-        "--border",
-        "--text",
-        "--muted",
-        "--r"
+        "--code-bg",
+        "--code-text",
+        "--r",
+        "--evidence"
       ],
       "props": {
         "code": "string",
@@ -422,8 +422,8 @@
         "copy"
       ],
       "rules": [
-        "mono surface-2 block, 2px border, 5px radius",
-        "optional copy button via navigator.clipboard",
+        "--code-bg block with --code-text in --font-mono (Fragment Mono), 2px radius, horizontally scrollable, dark in both modes",
+        "optional copy button via navigator.clipboard; copied feedback is a written word plus glyph, and may take the --evidence fill because it confirms capture",
         "renders text, never markup: the code prop is escaped content, not HTML"
       ]
     },
@@ -443,8 +443,8 @@
         "--border",
         "--muted",
         "--text",
-        "--brand-strong",
-        "--font-display"
+        "--declare",
+        "--font-sans"
       ],
       "props": {
         "title": "string",
@@ -495,17 +495,13 @@
         "S-01"
       ],
       "tokens": [
-        "--brand-strong",
-        "--control-bar",
-        "--server-bar",
-        "--lime-text",
+        "--declare",
+        "--observe",
         "--danger",
-        "--danger-text",
         "--border",
         "--surface",
         "--muted",
-        "--text",
-        "--shadow"
+        "--text"
       ],
       "props": {
         "series": "Array<{ label: string, points: number[] }>",
@@ -526,7 +522,7 @@
       "rules": [
         "inline SVG 300x148, multi-series, dashed gridlines",
         "series take no colour prop: stroke, stroke-dasharray and marker shape are chosen by series position from a fixed four-style table; more than four series are rejected, so a serialized view can never name a token",
-        "each series MUST carry a distinct dash and marker (solid square, '6 3' circle, '2 3' triangle, '8 2 2 2' diamond) and the legend MUST mirror both as a line sample, not a block swatch. --control-bar and --brand-strong collapse to 1.22:1 under deuteranopia, so hue alone cannot separate two percentiles.",
+        "each series MUST carry a distinct dash and marker (solid square, '6 3' circle, '2 3' triangle, '8 2 2 2' diamond) in --declare, --observe, --text, --muted, and the legend MUST mirror both as a line sample, not a block swatch. Hue alone cannot separate two percentiles.",
         "a threshold is drawn as a labeled dashed rule plus a positional tick on the axis — never an unlabeled red line",
         "values are reported by a tooltip pinned to the point under the cursor. It is not pointer-only: focusing the plot opens it on the most recent point and arrow/Home/End walk it, so a keyboard or touch reader reaches every value. It anchors inward at the ends of the range and never takes pointer events."
       ]
@@ -540,7 +536,7 @@
         "C-03"
       ],
       "tokens": [
-        "--brand-strong",
+        "--declare",
         "--border",
         "--text",
         "--muted"
@@ -557,7 +553,7 @@
         "category"
       ],
       "rules": [
-        "inline SVG 300x148, --brand-strong fill, value above and category under every bar",
+        "inline SVG 300x148, --declare fill, value above and category under every bar",
         "bars take no colour prop; the reading is positional and textual, and the SVG carries an aria-label naming every category and value"
       ]
     },
@@ -610,7 +606,7 @@
         "main"
       ],
       "rules": [
-        "212px sidebar + topbar + main grid; 3px outer border",
+        "212px sidebar + topbar + main grid; 1px --border rules between regions on a neutral --bg canvas",
         "trusted application chrome — not catalog: it frames every authored view and must never be placeable by one"
       ]
     },
@@ -624,8 +620,7 @@
       "tokens": [
         "--surface",
         "--border",
-        "--brand-soft",
-        "--shadow",
+        "--declare-soft",
         "--text",
         "--muted",
         "--r"
@@ -640,8 +635,8 @@
         "nav"
       ],
       "rules": [
-        "nav groups; active item brand-soft wash + border + 2px shadow",
-        "brand slot is the bohmian mark (logo.svg) followed by the lowercase 'bohmian' wordmark in --font-serif",
+        "nav groups; active item takes a --declare-soft wash, --declare label, and a 3px --declare inset marker — positional as well as tinted",
+        "brand slot is the Wyrd mark (logo.svg / logo-light.svg, generated from palette.json) followed by the 'Wyrd' wordmark in --font-sans",
         "carries the five product entries and no per-item kind bar: navigation is not a typed plane",
         "trusted application chrome — not catalog: it owns navigation, which an authored view must never redirect"
       ]
@@ -712,8 +707,8 @@
         "every authenticated route"
       ],
       "tokens": [
-        "--brand-btn",
-        "--brand-btn-ink",
+        "--declare",
+        "--declare-ink",
         "--border",
         "--r"
       ],
@@ -728,9 +723,9 @@
       ],
       "rules": [
         "uppercase --font-mono, 10px, 700, .08em tracking",
-        "wyrd = --brand-btn fill + --brand-btn-ink",
-        "the fill is --brand-btn, NOT --brand: --brand is a dim navy panel colour in dark mode and pairs with --brand-btn-ink at 1.23:1. --brand-btn holds ≥6.5:1 in both modes.",
-        "2px border, 3px radius — sits immediately after the bohmian wordmark in the Topbar",
+        "wyrd = --declare fill + --declare-ink",
+        "--declare-ink on --declare holds ≥4.5:1 in both modes (asserted by gen-theme.mjs)",
+        "1px border, 2px radius — sits immediately after the Wyrd wordmark in the Topbar",
         "names the product layer the current surface belongs to; it is identity, never a control",
         "trusted application chrome — not catalog: an authored view must never label itself as a product layer"
       ]

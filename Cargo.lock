@@ -11538,11 +11538,13 @@ dependencies = [
  "tokio",
  "uuid",
  "vala-bifrost-redux",
+ "vala-eval",
  "workspace-hack",
  "wyrd-client",
  "wyrd-runtime",
  "wyrd-server",
  "wyrd-spec",
+ "wyrd-sql",
  "wyrd-testing",
 ]
 

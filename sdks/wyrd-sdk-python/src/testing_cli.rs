@@ -17,7 +17,9 @@ use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use wyrd_cards::card_ref::CardRefPy;
-use wyrd_cli::commands::{self, LoadOutput, PlanCard, PlanReport, SelectorArgs};
+use wyrd_cli::commands::{
+    self, LoadOutput, McpHostReport, McpInstallReport, PlanCard, PlanReport, SelectorArgs,
+};
 use wyrd_cli::{Diagnostic, Severity};
 use wyrd_client::WyrdClient;
 use wyrd_spec::auth::IssueKeyResponse;
@@ -229,6 +231,66 @@ impl PyIssueKeyResponse {
     }
 }
 
+/// What `mcp_install` did to one host's configuration file.
+#[pyclass(module = "wyrd.testing.cli", name = "McpHostReport", frozen)]
+pub struct PyMcpHostReport {
+    /// Outcome from the shared installer.
+    inner: McpHostReport,
+}
+
+#[pymethods]
+impl PyMcpHostReport {
+    /// The `--host` value naming the host, such as `claude-code`.
+    #[getter]
+    fn host(&self) -> &'static str {
+        self.inner.host.name()
+    }
+
+    /// `added`, `updated`, or `unchanged` when the host is connected;
+    /// otherwise `not_detected`, `conflict`, `unreadable`, or `unwritable`.
+    #[getter]
+    fn status(&self) -> String {
+        self.inner.status.to_string()
+    }
+
+    /// The host's configuration file, or `None` when it was not detected.
+    #[getter]
+    fn path(&self) -> Option<PathBuf> {
+        self.inner.path.clone()
+    }
+
+    /// Why the host was not connected and what to do next, or `None`.
+    #[getter]
+    fn detail(&self) -> Option<&str> {
+        self.inner.detail.as_deref()
+    }
+}
+
+/// Per-host outcomes returned by `mcp_install`, in selection order.
+#[pyclass(module = "wyrd.testing.cli", name = "McpInstallReport")]
+pub struct PyMcpInstallReport {
+    /// One outcome per distinct selected host.
+    #[pyo3(get)]
+    hosts: Vec<Py<PyMcpHostReport>>,
+}
+
+impl PyMcpInstallReport {
+    /// Move the shared report into Python-owned items.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Python error when an item cannot be allocated.
+    fn new(py: Python<'_>, report: McpInstallReport) -> PyResult<Self> {
+        Ok(Self {
+            hosts: report
+                .hosts
+                .into_iter()
+                .map(|inner| Py::new(py, PyMcpHostReport { inner }))
+                .collect::<PyResult<_>>()?,
+        })
+    }
+}
+
 /// Validate a local Card tree without contacting a server (`wyrd plan`).
 ///
 /// # Errors
@@ -419,6 +481,27 @@ fn delete_provider_credential(
     )?)
 }
 
+/// Connect the named MCP hosts to Wyrd (`wyrd mcp install --host ...`).
+///
+/// Hosts are located from the process environment; a host that cannot be
+/// connected is reported in the result, not raised.
+///
+/// # Errors
+///
+/// Raises `WyrdError` with `WYRD_SPEC_400_VALIDATION` for an unknown or empty
+/// host selection, and `WYRD_CLIENT_400_CONFIG_INVALID` for an invalid
+/// `server`.
+#[pyfunction]
+#[pyo3(signature = (hosts, *, server=None))]
+fn mcp_install(
+    py: Python<'_>,
+    hosts: Vec<String>,
+    server: Option<String>,
+) -> WyrdPyResult<PyMcpInstallReport> {
+    let report = py.detach(|| commands::mcp_install(&hosts, server.as_deref()))?;
+    Ok(PyMcpInstallReport::new(py, report)?)
+}
+
 /// Register every in-process command and result type on
 /// `wyrd._wyrd.testing.cli`.
 ///
@@ -431,11 +514,14 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyPlanReport>()?;
     module.add_class::<PyLoadOutput>()?;
     module.add_class::<PyIssueKeyResponse>()?;
+    module.add_class::<PyMcpHostReport>()?;
+    module.add_class::<PyMcpInstallReport>()?;
     module.add_function(wrap_pyfunction!(plan, module)?)?;
     module.add_function(wrap_pyfunction!(apply, module)?)?;
     module.add_function(wrap_pyfunction!(get, module)?)?;
     module.add_function(wrap_pyfunction!(load, module)?)?;
     module.add_function(wrap_pyfunction!(issue_key, module)?)?;
+    module.add_function(wrap_pyfunction!(mcp_install, module)?)?;
     module.add_function(wrap_pyfunction!(put_provider_credential, module)?)?;
     module.add_function(wrap_pyfunction!(revoke_provider_credential, module)?)?;
     module.add_function(wrap_pyfunction!(delete_provider_credential, module)?)

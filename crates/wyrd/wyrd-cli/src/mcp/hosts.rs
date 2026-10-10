@@ -18,18 +18,27 @@
 //! and a `wyrd` entry that does not launch the proxy is reported as a
 //! conflict instead of being replaced.
 
+use std::env;
 use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tempfile::NamedTempFile;
+use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, value};
+use wyrd_client::environment::Environment;
 
 /// Name of the server entry Wyrd owns in every host configuration.
 const ENTRY: &str = "wyrd";
 
 /// The supported MCP host variants.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+///
+/// Serialized as the `--host` value naming the host, such as `claude-code`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum McpHost {
     /// OpenAI Codex CLI and IDE extension, which share one configuration.
     Codex,
@@ -43,7 +52,7 @@ pub enum McpHost {
 
 impl McpHost {
     /// Every supported host, in the order detection reports them.
-    pub(super) const ALL: [Self; 4] = [
+    const ALL: [Self; 4] = [
         Self::Codex,
         Self::ClaudeCode,
         Self::CopilotCli,
@@ -72,31 +81,69 @@ impl McpHost {
     }
 }
 
-/// What installing one host changed.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum Change {
+/// What installing one host did to its configuration file.
+///
+/// The first three variants succeeded; every other variant left the file as
+/// it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpHostStatus {
     /// No `wyrd` entry existed; one was added.
     Added,
     /// A `wyrd` proxy entry existed with other values; it was replaced.
     Updated,
     /// The `wyrd` entry already matched; the file was not rewritten.
     Unchanged,
+    /// The host's configuration directory does not exist.
+    NotDetected,
+    /// The host already has a `wyrd` entry that does not launch the proxy.
+    Conflict,
+    /// The file exists but is not a configuration the installer can edit.
+    Unreadable,
+    /// The edited configuration could not be written.
+    Unwritable,
 }
 
-impl fmt::Display for Change {
-    /// Render the past-tense verb printed beside the host's file.
+impl McpHostStatus {
+    /// Whether the host now launches the Wyrd proxy.
+    #[must_use]
+    pub const fn connected(self) -> bool {
+        matches!(self, Self::Added | Self::Updated | Self::Unchanged)
+    }
+}
+
+impl fmt::Display for McpHostStatus {
+    /// Render the status word printed beside the host's file.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Added => "added",
             Self::Updated => "updated",
             Self::Unchanged => "unchanged",
+            Self::NotDetected => "not_detected",
+            Self::Conflict => "conflict",
+            Self::Unreadable => "unreadable",
+            Self::Unwritable => "unwritable",
         })
     }
 }
 
+/// The outcome of connecting one host, as `wyrd mcp install` reports it.
+#[derive(Debug, Serialize)]
+pub struct McpHostReport {
+    /// Host this outcome is for.
+    pub host: McpHost,
+    /// What happened to the host's configuration file.
+    pub status: McpHostStatus,
+    /// The host's configuration file, when the host was detected.
+    pub path: Option<PathBuf>,
+    /// Why the host was not connected and what to do next; `None` when it
+    /// was.
+    pub detail: Option<String>,
+}
+
 /// Why one host could not be installed. Its file is left as it was.
 #[derive(Debug)]
-pub(super) enum HostFailure {
+enum HostFailure {
     /// The host's configuration directory does not exist.
     NotDetected,
     /// The host already has a `wyrd` entry that does not launch the proxy.
@@ -132,6 +179,28 @@ impl fmt::Display for HostFailure {
     }
 }
 
+impl HostFailure {
+    /// The reported status of this failure.
+    const fn status(&self) -> McpHostStatus {
+        match self {
+            Self::NotDetected => McpHostStatus::NotDetected,
+            Self::Conflict(_) => McpHostStatus::Conflict,
+            Self::Unreadable(..) => McpHostStatus::Unreadable,
+            Self::Unwritable(..) => McpHostStatus::Unwritable,
+        }
+    }
+
+    /// The configuration file the failure concerns, when one was located.
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::NotDetected => None,
+            Self::Conflict(path) | Self::Unreadable(path, _) | Self::Unwritable(path, _) => {
+                Some(path)
+            }
+        }
+    }
+}
+
 /// Writes the Wyrd proxy entry into host configuration files.
 ///
 /// Owns the resolved host locations and the one launch command every host
@@ -163,10 +232,10 @@ impl HostInstaller {
     /// without one the bare name is written. `server` is retained verbatim as
     /// the proxy's `--server`.
     pub(super) fn from_process(server: Option<&str>) -> Self {
-        let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+        let var = |name: &str| env::var_os(name).filter(|value| !value.is_empty());
         let command = var("PATH")
             .and_then(|path| {
-                std::env::split_paths(&path)
+                env::split_paths(&path)
                     .map(|dir| dir.join("wyrd"))
                     .find(|candidate| candidate.is_file())
             })
@@ -178,8 +247,17 @@ impl HostInstaller {
             xdg_config_home: var("XDG_CONFIG_HOME").map(PathBuf::from),
             command,
             args: proxy_args(server),
-            config_home: wyrd_client::environment::Environment::Process.config_dir(),
+            config_home: Environment::Process.config_dir(),
         }
+    }
+
+    /// Every supported host whose configuration directory exists, in
+    /// [`McpHost::ALL`] order.
+    pub(super) fn detected(&self) -> Vec<McpHost> {
+        McpHost::ALL
+            .into_iter()
+            .filter(|host| self.config_path(*host).is_some())
+            .collect()
     }
 
     /// The configuration file for `host`, when the host is detected.
@@ -187,7 +265,7 @@ impl HostInstaller {
     /// A host is detected when its configuration directory exists; Claude
     /// Code is also detected by an existing `~/.claude.json`. The file itself
     /// may not exist yet.
-    pub(super) fn config_path(&self, host: McpHost) -> Option<PathBuf> {
+    fn config_path(&self, host: McpHost) -> Option<PathBuf> {
         let home = self.home.as_deref();
         match host {
             McpHost::Codex => existing_dir(
@@ -243,7 +321,29 @@ impl HostInstaller {
         entry
     }
 
-    /// Install the Wyrd entry for `host` and report what changed.
+    /// Install the Wyrd entry for `host` and report the outcome.
+    ///
+    /// A failure is reported, not returned, so one host's failure never
+    /// blocks another's; the report's `detail` names the file and the next
+    /// step.
+    pub(super) fn install(&self, host: McpHost) -> McpHostReport {
+        match self.try_install(host) {
+            Ok((status, path)) => McpHostReport {
+                host,
+                status,
+                path: Some(path),
+                detail: None,
+            },
+            Err(failure) => McpHostReport {
+                host,
+                status: failure.status(),
+                path: failure.path().map(Path::to_path_buf),
+                detail: Some(failure.to_string()),
+            },
+        }
+    }
+
+    /// Write the Wyrd entry for `host` and return what changed.
     ///
     /// The file is parsed whole; an existing `wyrd` entry is compared before
     /// anything is written, and only a changed entry rewrites the file. The
@@ -256,7 +356,7 @@ impl HostInstaller {
     /// [`HostFailure::Unreadable`] for a file that cannot be read or parsed as
     /// the host's format, [`HostFailure::Conflict`] for a foreign `wyrd`
     /// entry, and [`HostFailure::Unwritable`] when the replacement fails.
-    pub(super) fn install(&self, host: McpHost) -> Result<(Change, PathBuf), HostFailure> {
+    fn try_install(&self, host: McpHost) -> Result<(McpHostStatus, PathBuf), HostFailure> {
         let path = self.config_path(host).ok_or(HostFailure::NotDetected)?;
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
@@ -272,7 +372,7 @@ impl HostInstaller {
         match edited {
             Err(Edit::Unreadable(reason)) => Err(HostFailure::Unreadable(path, reason)),
             Err(Edit::Conflict) => Err(HostFailure::Conflict(path)),
-            Ok((Change::Unchanged, _)) => Ok((Change::Unchanged, path)),
+            Ok((McpHostStatus::Unchanged, _)) => Ok((McpHostStatus::Unchanged, path)),
             Ok((change, contents)) => match replace(&path, &contents) {
                 Ok(()) => Ok((change, path)),
                 Err(error) => Err(HostFailure::Unwritable(path, error)),
@@ -311,18 +411,18 @@ enum Edit {
 ///
 /// # Errors
 /// Returns [`Edit::Conflict`] when an entry exists but does not run the proxy.
-fn classify(existing: Option<&Value>, entry: &Value) -> Result<Change, Edit> {
+fn classify(existing: Option<&Value>, entry: &Value) -> Result<McpHostStatus, Edit> {
     let Some(existing) = existing else {
-        return Ok(Change::Added);
+        return Ok(McpHostStatus::Added);
     };
     if existing == entry {
-        return Ok(Change::Unchanged);
+        return Ok(McpHostStatus::Unchanged);
     }
     let runs_proxy = existing["args"]
         .as_array()
         .is_some_and(|args| args.len() >= 2 && args[0] == "mcp" && args[1] == "proxy");
     if runs_proxy {
-        Ok(Change::Updated)
+        Ok(McpHostStatus::Updated)
     } else {
         Err(Edit::Conflict)
     }
@@ -336,7 +436,7 @@ fn classify(existing: Option<&Value>, entry: &Value) -> Result<Change, Edit> {
 /// Returns [`Edit::Unreadable`] when `text` is not a JSON object (a JSONC
 /// file with comments included) or `servers` is not an object, and
 /// [`Edit::Conflict`] for a foreign entry.
-fn edit_json(text: &str, servers: &str, entry: Value) -> Result<(Change, String), Edit> {
+fn edit_json(text: &str, servers: &str, entry: Value) -> Result<(McpHostStatus, String), Edit> {
     let mut root: Value = if text.trim().is_empty() {
         json!({})
     } else {
@@ -365,10 +465,10 @@ fn edit_json(text: &str, servers: &str, entry: Value) -> Result<(Change, String)
 /// # Errors
 /// Returns [`Edit::Unreadable`] when `text` is not TOML or `mcp_servers` is
 /// not a table, and [`Edit::Conflict`] for a foreign entry.
-fn edit_toml(text: &str, entry: Value) -> Result<(Change, String), Edit> {
+fn edit_toml(text: &str, entry: Value) -> Result<(McpHostStatus, String), Edit> {
     let unreadable = |error: &dyn fmt::Display| Edit::Unreadable(error.to_string());
     let mut document = text
-        .parse::<toml_edit::DocumentMut>()
+        .parse::<DocumentMut>()
         .map_err(|error| unreadable(&error))?;
     let existing: Value = toml::from_str(text).map_err(|error| unreadable(&error))?;
     let change = classify(
@@ -376,32 +476,32 @@ fn edit_toml(text: &str, entry: Value) -> Result<(Change, String), Edit> {
         &entry,
     )?;
 
-    let mut table = toml_edit::Table::new();
-    table["command"] = toml_edit::value(entry["command"].as_str().unwrap_or_default());
-    table["args"] = toml_edit::value(
+    let mut table = Table::new();
+    table["command"] = value(entry["command"].as_str().unwrap_or_default());
+    table["args"] = value(
         entry["args"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
-            .collect::<toml_edit::Array>(),
+            .collect::<Array>(),
     );
-    let mut env = toml_edit::InlineTable::new();
-    for (name, value) in entry["env"].as_object().into_iter().flatten() {
-        env.insert(name, value.as_str().unwrap_or_default().into());
+    let mut env = InlineTable::new();
+    for (name, setting) in entry["env"].as_object().into_iter().flatten() {
+        env.insert(name, setting.as_str().unwrap_or_default().into());
     }
-    table["env"] = toml_edit::value(env);
+    table["env"] = value(env);
 
     let servers = document
         .entry("mcp_servers")
         .or_insert_with(|| {
-            let mut servers = toml_edit::Table::new();
+            let mut servers = Table::new();
             servers.set_implicit(true);
-            toml_edit::Item::Table(servers)
+            Item::Table(servers)
         })
         .as_table_mut()
         .ok_or_else(|| Edit::Unreadable("`mcp_servers` is not a table".to_owned()))?;
-    servers.insert(ENTRY, toml_edit::Item::Table(table));
+    servers.insert(ENTRY, Item::Table(table));
     Ok((change, document.to_string()))
 }
 
@@ -415,7 +515,7 @@ fn edit_toml(text: &str, entry: Value) -> Result<(Change, String), Edit> {
 /// Returns the IO error of creating, writing, or renaming the temporary file.
 fn replace(path: &Path, contents: &str) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    let mut temp = NamedTempFile::new_in(dir)?;
     temp.write_all(contents.as_bytes())?;
     if let Ok(metadata) = fs::metadata(path) {
         temp.as_file().set_permissions(metadata.permissions())?;
@@ -513,14 +613,14 @@ mod tests {
         let entry = json!({ "command": "wyrd", "args": ["mcp", "proxy"], "env": {} });
         let text = r#"{"theme":"dark","mcpServers":{"other":{"command":"x"}}}"#;
         let (change, rendered) = edit_json(text, "mcpServers", entry.clone()).expect("edits");
-        assert_eq!(change, Change::Added);
+        assert_eq!(change, McpHostStatus::Added);
         let parsed: Value = serde_json::from_str(&rendered).expect("valid JSON");
         assert_eq!(parsed["theme"], "dark");
         assert_eq!(parsed["mcpServers"]["other"]["command"], "x");
         assert_eq!(parsed["mcpServers"]["wyrd"], entry);
 
         let (again, _) = edit_json(&rendered, "mcpServers", entry.clone()).expect("edits");
-        assert_eq!(again, Change::Unchanged);
+        assert_eq!(again, McpHostStatus::Unchanged);
 
         let foreign = r#"{"mcpServers":{"wyrd":{"command":"other-tool"}}}"#;
         assert!(matches!(
@@ -544,7 +644,7 @@ mod tests {
         });
         let text = "# keep me\nmodel = \"o3\"\n\n[mcp_servers.wyrd]\ncommand = \"/old/wyrd\"\nargs = [\"mcp\", \"proxy\"]\n\n[mcp_servers.other]\ncommand = \"x\"\n";
         let (change, rendered) = edit_toml(text, entry.clone()).expect("edits");
-        assert_eq!(change, Change::Updated);
+        assert_eq!(change, McpHostStatus::Updated);
         assert!(rendered.starts_with("# keep me\nmodel = \"o3\"\n"));
         assert_eq!(rendered.matches("[mcp_servers.wyrd]").count(), 1);
         let parsed: Value = toml::from_str(&rendered).expect("valid TOML");
@@ -552,6 +652,6 @@ mod tests {
         assert_eq!(parsed["mcp_servers"]["other"]["command"], "x");
 
         let (again, _) = edit_toml(&rendered, entry).expect("edits");
-        assert_eq!(again, Change::Unchanged);
+        assert_eq!(again, McpHostStatus::Unchanged);
     }
 }

@@ -58,4 +58,7 @@ export const cli = {
   async deleteProviderCredential(name, options = {}) {
     value(await native.cliDeleteProviderCredential(name, await connection(options)));
   },
+  mcpInstall(hosts, options = {}) {
+    return value(native.cliMcpInstall(hosts, options.server));
+  },
 };

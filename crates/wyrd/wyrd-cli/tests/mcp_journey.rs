@@ -7,14 +7,23 @@
 //! endpoints is observed through the shipped command rather than an
 //! in-process fixture.
 
-use std::path::Path;
+use std::fs::{self, Permissions};
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
+use assert_cmd::cargo::cargo_bin;
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
+use rmcp::model::{CallToolRequestParams, CallToolResult};
 use secrecy::ExposeSecret as _;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use wyrd_client::WyrdClient;
+use wyrd_client::auth::AuthMiddleware;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
+use wyrd_spec::error::WyrdError;
 use wyrd_testing::WyrdTestServer;
 
 /// Every ambient variable that could hand the proxy a credential or an
@@ -40,7 +49,7 @@ const AMBIENT: [&str; 9] = [
 /// # Panics
 /// Panics when the `wyrd` binary cannot be located.
 pub(crate) fn wyrd(home: &Path) -> Command {
-    let mut command = Command::new(assert_cmd::cargo::cargo_bin("wyrd"));
+    let mut command = Command::new(cargo_bin("wyrd"));
     command
         .env("HOME", home)
         .env("WYRD_CONFIG_HOME", home.join("wyrd"))
@@ -132,7 +141,7 @@ pub(crate) async fn list_tables_through_proxy(
     home: &Path,
     arguments: &[&str],
     sources: &[(&str, &str)],
-) -> (Vec<String>, rmcp::model::CallToolResult) {
+) -> (Vec<String>, CallToolResult) {
     let mut proxy = Proxy::spawn(home, arguments, sources);
     let host = ().serve(proxy.stdio()).await.unwrap_or_else(|error| {
         panic!("the host initializes through the proxy: {error}");
@@ -159,23 +168,21 @@ pub(crate) async fn list_tables_through_proxy(
 ///
 /// # Panics
 /// Panics when the client cannot be built or the credential is accepted.
-async fn shared_client_refusal(base_url: &str, api_key: &str) -> wyrd_spec::error::WyrdError {
-    let config = wyrd_client::config::ClientConfig {
-        http: wyrd_client::transport::HttpConfig {
+async fn shared_client_refusal(base_url: &str, api_key: &str) -> WyrdError {
+    let config = ClientConfig {
+        http: HttpConfig {
             base_url: base_url.to_owned(),
-            ..wyrd_client::transport::HttpConfig::default()
+            ..HttpConfig::default()
         },
-        ..wyrd_client::config::ClientConfig::default()
+        ..ClientConfig::default()
     };
-    let auth = wyrd_client::auth::AuthMiddleware::new(
+    let auth = AuthMiddleware::new(
         &config,
-        wyrd_client::transport::ResolvedCredential::ApiKey(api_key.to_owned().into()),
+        ResolvedCredential::ApiKey(api_key.to_owned().into()),
     )
     .expect("auth middleware builds");
-    let http =
-        wyrd_client::transport::HttpTransport::new(&config.http, std::sync::Arc::clone(&auth))
-            .expect("HTTP transport builds");
-    wyrd_client::WyrdClient::from_parts(auth, http, config.grpc)
+    let http = HttpTransport::new(&config.http, Arc::clone(&auth)).expect("HTTP transport builds");
+    WyrdClient::from_parts(auth, http, config.grpc)
         .access_token()
         .await
         .expect_err("the unknown key is refused")
@@ -284,7 +291,7 @@ pub(crate) async fn mcp_proxy_discovers_and_reads_with_shared_auth() {
 
 /// The VS Code user-profile directory under `home` for this platform, as the
 /// isolated [`wyrd`] environment resolves it.
-fn vscode_profile(home: &Path) -> std::path::PathBuf {
+fn vscode_profile(home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/Code/User")
     } else {
@@ -295,13 +302,13 @@ fn vscode_profile(home: &Path) -> std::path::PathBuf {
 /// Every supported host's configuration file under `home`.
 struct HostFiles {
     /// Codex `config.toml`.
-    codex: std::path::PathBuf,
+    codex: PathBuf,
     /// Claude Code `~/.claude.json`.
-    claude: std::path::PathBuf,
+    claude: PathBuf,
     /// Copilot CLI `mcp-config.json`.
-    copilot: std::path::PathBuf,
+    copilot: PathBuf,
     /// VS Code user `mcp.json`.
-    vscode: std::path::PathBuf,
+    vscode: PathBuf,
 }
 
 impl HostFiles {
@@ -316,7 +323,7 @@ impl HostFiles {
             home.join(".copilot"),
             vscode_profile(home),
         ] {
-            std::fs::create_dir_all(dir).expect("host directory");
+            fs::create_dir_all(dir).expect("host directory");
         }
         let files = Self {
             codex: home.join(".codex/config.toml"),
@@ -324,7 +331,7 @@ impl HostFiles {
             copilot: home.join(".copilot/mcp-config.json"),
             vscode: vscode_profile(home).join("mcp.json"),
         };
-        let write = |path: &Path, text: &str| std::fs::write(path, text).expect("host file");
+        let write = |path: &Path, text: &str| fs::write(path, text).expect("host file");
         write(
             &files.codex,
             "# user comment\nmodel = \"o3\"\n\n[mcp_servers.other]\ncommand = \"other\"\n",
@@ -350,8 +357,7 @@ impl HostFiles {
     /// Panics when a file cannot be read.
     fn snapshot(&self) -> [String; 4] {
         [&self.codex, &self.claude, &self.copilot, &self.vscode].map(|path| {
-            std::fs::read_to_string(path)
-                .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+            fs::read_to_string(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
         })
     }
 }
@@ -385,7 +391,7 @@ const SENTINEL_KEY: &str = "wyrd_sk_00000000000000000000000000000000_00000000_se
 /// # Panics
 /// Panics when the file is not JSON.
 fn json_file(path: &Path) -> Value {
-    serde_json::from_str(&std::fs::read_to_string(path).expect("host file reads"))
+    serde_json::from_str(&fs::read_to_string(path).expect("host file reads"))
         .expect("host file stays valid JSON")
 }
 
@@ -433,7 +439,7 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     let codex: Value = toml::from_str(&first[0]).expect("Codex config stays TOML");
     assert_eq!(codex["mcp_servers"]["other"]["command"], "other");
     let codex_entry = &codex["mcp_servers"]["wyrd"];
-    assert_eq!(codex_entry["args"], serde_json::json!(["mcp", "proxy"]));
+    assert_eq!(codex_entry["args"], json!(["mcp", "proxy"]));
     assert_eq!(codex_entry["env"]["WYRD_CONFIG_HOME"], config_home.as_str());
     assert!(
         codex_entry["command"]
@@ -450,7 +456,7 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     assert_eq!(claude["mcpServers"]["other"]["command"], "other");
     let claude_entry = &claude["mcpServers"]["wyrd"];
     assert_eq!(claude_entry["type"], "stdio");
-    assert_eq!(claude_entry["args"], serde_json::json!(["mcp", "proxy"]));
+    assert_eq!(claude_entry["args"], json!(["mcp", "proxy"]));
     assert_eq!(
         claude_entry["env"]["WYRD_CONFIG_HOME"],
         config_home.as_str()
@@ -462,7 +468,7 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     assert!(stdout.contains("codex: unchanged") && stdout.contains("claude-code: unchanged"));
     assert_eq!(files.snapshot(), first, "a repeat rewrites nothing");
 
-    std::fs::write(
+    fs::write(
         &files.copilot,
         r#"{"mcpServers":{"wyrd":{"type":"local","command":"someone-else"}}}"#,
     )
@@ -485,29 +491,23 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     let vscode = json_file(&files.vscode);
     assert_eq!(vscode["servers"]["other"]["command"], "other");
     assert_eq!(vscode["servers"]["wyrd"]["type"], "stdio");
-    assert_eq!(
-        vscode["servers"]["wyrd"]["args"],
-        serde_json::json!(["mcp", "proxy"])
-    );
+    assert_eq!(vscode["servers"]["wyrd"]["args"], json!(["mcp", "proxy"]));
 
-    std::fs::write(&files.copilot, &original[2]).expect("restore Copilot CLI file");
+    fs::write(&files.copilot, &original[2]).expect("restore Copilot CLI file");
     let (code, _, _) = install(home.path(), &["--host", "copilot-cli"]).await;
     assert_eq!(code, Some(0));
     let copilot = json_file(&files.copilot);
     assert_eq!(copilot["mcpServers"]["other"]["command"], "other");
     let copilot_entry = &copilot["mcpServers"]["wyrd"];
     assert_eq!(copilot_entry["type"], "stdio");
-    assert_eq!(copilot_entry["tools"], serde_json::json!(["*"]));
-    assert_eq!(copilot_entry["args"], serde_json::json!(["mcp", "proxy"]));
+    assert_eq!(copilot_entry["tools"], json!(["*"]));
+    assert_eq!(copilot_entry["args"], json!(["mcp", "proxy"]));
 
     let before = files.snapshot();
     let codex_dir = home.path().join(".codex");
     let set_mode = |mode: u32| {
-        std::fs::set_permissions(
-            &codex_dir,
-            std::os::unix::fs::PermissionsExt::from_mode(mode),
-        )
-        .expect("codex dir mode changes");
+        fs::set_permissions(&codex_dir, Permissions::from_mode(mode))
+            .expect("codex dir mode changes");
     };
     set_mode(0o555);
     let (code, stdout, _) = install(
@@ -565,19 +565,19 @@ pub(crate) async fn mcp_external_server_preserves_global_endpoint() {
 
     let home = tempfile::tempdir().expect("journey home");
     let config_dir = home.path().join("wyrd");
-    std::fs::create_dir_all(&config_dir).expect("config dir");
+    fs::create_dir_all(&config_dir).expect("config dir");
     let global = "[client]\nhttp_url = \"http://127.0.0.1:9\"\n";
-    std::fs::write(config_dir.join("config.toml"), global).expect("global config");
+    fs::write(config_dir.join("config.toml"), global).expect("global config");
     let credentials = config_dir.join("credentials.toml");
-    std::fs::write(&credentials, format!("[default]\napi_key = \"{key}\"\n")).expect("credentials");
-    let mut private = std::fs::metadata(&credentials)
+    fs::write(&credentials, format!("[default]\napi_key = \"{key}\"\n")).expect("credentials");
+    let mut private = fs::metadata(&credentials)
         .expect("credentials")
         .permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut private, 0o600);
-    std::fs::set_permissions(&credentials, private).expect("credentials are private");
-    std::fs::create_dir_all(home.path().join(".claude")).expect("Claude Code detected");
+    private.set_mode(0o600);
+    fs::set_permissions(&credentials, private).expect("credentials are private");
+    fs::create_dir_all(home.path().join(".claude")).expect("Claude Code detected");
 
-    let wyrd_dir = assert_cmd::cargo::cargo_bin("wyrd")
+    let wyrd_dir = cargo_bin("wyrd")
         .parent()
         .expect("binary directory")
         .to_owned();
@@ -601,7 +601,7 @@ pub(crate) async fn mcp_external_server_preserves_global_endpoint() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let host_file = std::fs::read_to_string(home.path().join(".claude.json")).expect("host file");
+    let host_file = fs::read_to_string(home.path().join(".claude.json")).expect("host file");
     assert!(
         !host_file.contains(&key),
         "the host file holds no credential"
@@ -609,7 +609,7 @@ pub(crate) async fn mcp_external_server_preserves_global_endpoint() {
     let entry = &serde_json::from_str::<Value>(&host_file).expect("JSON")["mcpServers"]["wyrd"];
     assert_eq!(
         entry["args"],
-        serde_json::json!(["mcp", "proxy", "--server", base_url]),
+        json!(["mcp", "proxy", "--server", base_url]),
         "the external URL is retained in the launch command"
     );
     let command = entry["command"].as_str().expect("command");
@@ -655,7 +655,7 @@ pub(crate) async fn mcp_external_server_preserves_global_endpoint() {
     host.cancel().await.expect("the host disconnects");
 
     assert_eq!(
-        std::fs::read_to_string(config_dir.join("config.toml")).expect("global config"),
+        fs::read_to_string(config_dir.join("config.toml")).expect("global config"),
         global,
         "the global endpoint is unchanged"
     );

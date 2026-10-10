@@ -17,11 +17,13 @@ use rmcp::model::{
 };
 use rmcp::service::{RequestContext, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::io::stdio;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{ClientLifecycleMode, ClientServiceExt as _, Peer, RoleClient, RoleServer};
 use rmcp::{ServerHandler, ServiceExt as _};
 use wyrd_mcp::client::WyrdMcpHttpClient;
 
+use crate::client::from_global;
 use crate::error::{CliBoundaryError, WyrdCliError};
 
 /// The host-facing MCP server: every request is answered by the upstream
@@ -105,7 +107,7 @@ fn upstream_error(error: ServiceError) -> ErrorData {
 /// server's stable error when it refuses the credential or cannot be reached,
 /// and [`WyrdCliError::McpProxy`] when either MCP session cannot start.
 pub(super) async fn run(server: Option<&str>) -> Result<ExitCode, CliBoundaryError> {
-    let client = crate::client::from_global(server)?;
+    let client = from_global(server)?;
     client.access_token().await?;
     let transport = StreamableHttpClientTransport::with_client(
         WyrdMcpHttpClient::new(&client),
@@ -125,7 +127,7 @@ pub(super) async fn run(server: Option<&str>) -> Result<ExitCode, CliBoundaryErr
     let host = McpProxy {
         upstream: upstream.peer().clone(),
     }
-    .serve(rmcp::transport::io::stdio())
+    .serve(stdio())
     .await
     .map_err(|error| WyrdCliError::McpProxy {
         detail: format!("host MCP session failed: {error}"),

@@ -49,10 +49,6 @@ def test_help_exits_zero(run_cli) -> None:
     assert run_cli("--help") == 0
 
 
-def test_server_install_is_projected(run_cli) -> None:
-    assert run_cli("server", "install", "--help") == 0
-
-
 def test_unknown_subcommand_exits_with_usage(run_cli) -> None:
     assert run_cli("dev", "bootstrap") == os.EX_USAGE
 

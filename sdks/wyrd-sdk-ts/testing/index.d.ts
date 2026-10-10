@@ -69,6 +69,23 @@ export interface ProviderCredentialWrite {
     | { readonly managed_secret: { readonly secret: string } };
 }
 
+/** What {@link cli.mcpInstall} did to one host's configuration file. */
+export interface McpHostReport {
+  /** The `--host` value naming the host, such as `claude-code`. */
+  readonly host: "codex" | "claude-code" | "copilot-cli" | "vscode";
+  /** Connected: `added`, `updated`, or `unchanged`; otherwise why the file was left as it was. */
+  readonly status: "added" | "updated" | "unchanged" | "not_detected" | "conflict" | "unreadable" | "unwritable";
+  /** The host's configuration file, or `null` when the host was not detected. */
+  readonly path: string | null;
+  /** Why the host was not connected and what to do next, or `null`. */
+  readonly detail: string | null;
+}
+
+/** Per-host outcomes returned by {@link cli.mcpInstall}, in selection order. */
+export interface McpInstallReport {
+  readonly hosts: readonly McpHostReport[];
+}
+
 /** The client a networked {@link cli} command runs as. */
 export interface CliClientOptions {
   /** Client the command runs as; omitted, the ambient credential chain resolves one. */
@@ -113,4 +130,6 @@ export declare const cli: {
   revokeProviderCredential(name: string, options?: CliClientOptions): Promise<ProviderCredentialView>;
   /** Delete an unreferenced provider credential; an absent name succeeds. */
   deleteProviderCredential(name: string, options?: CliClientOptions): Promise<void>;
+  /** Connect the named MCP hosts to Wyrd (`wyrd mcp install --host ...`); per-host failures are reported, not thrown. */
+  mcpInstall(hosts: readonly string[], options?: { readonly server?: string }): McpInstallReport;
 };

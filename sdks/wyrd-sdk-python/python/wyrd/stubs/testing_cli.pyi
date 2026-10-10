@@ -120,6 +120,39 @@ class IssueKeyResponse:
         """When the key expires."""
         ...
 
+class McpHostReport:
+    """What ``mcp_install`` did to one host's configuration file."""
+
+    @property
+    def host(self) -> Literal["codex", "claude-code", "copilot-cli", "vscode"]:
+        """The ``--host`` value naming the host."""
+        ...
+    @property
+    def status(
+        self,
+    ) -> Literal[
+        "added", "updated", "unchanged", "not_detected", "conflict", "unreadable", "unwritable"
+    ]:
+        """``added``, ``updated``, or ``unchanged`` when the host is connected;
+        otherwise why its file was left as it was."""
+        ...
+    @property
+    def path(self) -> Path | None:
+        """The host's configuration file, or ``None`` when it was not detected."""
+        ...
+    @property
+    def detail(self) -> str | None:
+        """Why the host was not connected and what to do next, or ``None``."""
+        ...
+
+class McpInstallReport:
+    """Per-host outcomes returned by ``mcp_install``, in selection order."""
+
+    @property
+    def hosts(self) -> list[McpHostReport]:
+        """One outcome per distinct selected host."""
+        ...
+
 def plan(path: str | PathLike[str]) -> PlanReport:
     """Validate a local Card tree without contacting a server (``wyrd plan``).
 
@@ -248,6 +281,30 @@ def issue_key(
     """
     ...
 
+def mcp_install(hosts: list[str], *, server: str | None = None) -> McpInstallReport:
+    """Connect the named MCP hosts to Wyrd (``wyrd mcp install --host ...``).
+
+    Hosts are located from ``HOME``, ``CODEX_HOME``, ``COPILOT_HOME``, and
+    ``XDG_CONFIG_HOME``. A host that cannot be connected is reported in the
+    result with its file left as it was, never raised. No credential is
+    written.
+
+    Args:
+        hosts: ``codex``, ``claude-code``, ``copilot-cli``, or ``vscode``;
+            repeats are installed once.
+        server: The Wyrd server retained in each host's launch command.
+            Omitted, the host follows the global client endpoint.
+
+    Returns:
+        One outcome per distinct selected host.
+
+    Raises:
+        WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unknown or empty host
+            selection, or ``WYRD_CLIENT_400_CONFIG_INVALID`` for an invalid
+            ``server``.
+    """
+    ...
+
 def put_provider_credential(
     write: Mapping[str, Any], *, client: WyrdClient | None = None
 ) -> ProviderCredentialView:
@@ -304,6 +361,8 @@ def delete_provider_credential(name: str, *, client: WyrdClient | None = None) -
 __all__ = [
     "IssueKeyResponse",
     "LoadOutput",
+    "McpHostReport",
+    "McpInstallReport",
     "PlanCard",
     "PlanDiagnostic",
     "PlanReport",
@@ -312,6 +371,7 @@ __all__ = [
     "get",
     "issue_key",
     "load",
+    "mcp_install",
     "plan",
     "put_provider_credential",
     "revoke_provider_credential",

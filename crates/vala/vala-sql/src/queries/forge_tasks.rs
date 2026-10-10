@@ -881,9 +881,10 @@ impl ForgeTasks {
     /// under the same row locks that cleared durable ownership.
     ///
     /// `previous_owner` also selects the unexpired attempts that owner still
-    /// holds. Only a starting worker passes its own identity: its previous
-    /// incarnation's attempts have stopped, so their leases protect no live
-    /// execution, and clearing the attempt id fences any stale holder.
+    /// holds. Only a starting worker passes its own identity, and only after
+    /// its previous incarnation's loop joined every plan and heartbeat, so
+    /// those leases protect no live execution and clearing the attempt id
+    /// fences any stale holder.
     ///
     /// # Errors
     /// Returns SQL errors from the bounded reclaim transaction.

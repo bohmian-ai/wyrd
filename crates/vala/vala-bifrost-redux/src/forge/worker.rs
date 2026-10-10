@@ -9,9 +9,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(feature = "test-support")]
-use std::sync::atomic::AtomicBool;
-#[cfg(feature = "test-support")]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::metrics::ForgeActiveTask;
@@ -700,6 +699,42 @@ struct ForgeWorkerLoopHandles {
     readiness: ForgeRoleReadiness,
     /// Child token cancelling admitted runners without touching process shutdown.
     stop: CancellationToken,
+}
+
+/// Whether every earlier event loop of one worker joined its spawned work.
+///
+/// Shared by every incarnation the supervisor clones from the retained
+/// worker. A loop marks itself running on entry and joined only after
+/// [`ForgeWorker::run_event_loop`] has joined every plan runner and claim
+/// heartbeat it spawned; a panic or abort unwinds past that mark. Only a
+/// joined predecessor lets startup clear this owner's unexpired attempts at
+/// once. Otherwise detached work may still be live, so recovery waits for
+/// those leases to lapse like any other owner's. A fresh process starts
+/// joined: a previous process with the same identity has no live tasks here.
+#[derive(Clone, Debug)]
+struct ForgeLoopQuiescence(Arc<AtomicBool>);
+
+impl ForgeLoopQuiescence {
+    /// Starts joined, because no earlier loop of this process exists.
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+
+    /// Records that a loop is about to spawn plans and heartbeats.
+    fn enter(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+
+    /// Records that the loop joined everything it spawned.
+    fn joined(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Returns `owner` when its earlier loops all joined, so startup reclaim
+    /// may clear the attempts they left unexpired, and `None` otherwise.
+    fn reclaimable_owner(&self, owner: Uuid) -> Option<Uuid> {
+        self.0.load(Ordering::Acquire).then_some(owner)
+    }
 }
 
 /// Fixed process-local bounds for one Forge worker.
@@ -1983,6 +2018,8 @@ pub struct ForgeWorker {
     completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Readiness and stop bookkeeping, present only while the event loop runs.
     loop_handles: Option<ForgeWorkerLoopHandles>,
+    /// Whether every earlier incarnation's loop joined its spawned work.
+    quiescence: ForgeLoopQuiescence,
     /// Executor admitted compaction runners are spawned on.
     ///
     /// `None` on a direct fixture or an embedded deployment with no dedicated
@@ -2015,6 +2052,7 @@ impl ForgeWorker {
             owner,
             config,
             loop_handles: None,
+            quiescence: ForgeLoopQuiescence::new(),
             compaction_runtime: None,
             dispatched: Arc::default(),
         })
@@ -2142,10 +2180,16 @@ impl ForgeWorker {
             readiness: readiness.clone(),
             stop: stop.clone(),
         });
+        // A panic that unwinds past the loop skips its join; cancelling the
+        // stop token still halts detached plans and heartbeats at their safe
+        // boundaries, so their leases lapse for ordinary recovery.
+        let _stop_on_unwind = stop.clone().drop_guard();
+        self.quiescence.enter();
         // Boxed because the loop's per-claim execution arms are large enough
         // that inlining the whole state machine here overflows a default task
         // stack in debug builds.
         let outcome = Box::pin(self.run_event_loop(stop)).await;
+        self.quiescence.joined();
         if let Err(error) = outcome {
             publish_worker_readiness(&readiness, false);
             tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after it could not settle its work");
@@ -2160,10 +2204,12 @@ impl ForgeWorker {
     /// Resolves every durable attempt left unsettled before this worker starts.
     ///
     /// Reclaims lapsed claims, and every claim this owner's previous
-    /// incarnation still holds, then reconciles Prepared attempts until the
-    /// durable predicate reports nothing recoverable. A supervised restart
-    /// keeps the owner identity, and the stopped loop joined its attempts, so
-    /// waiting for their leases to lapse would only hold readiness down. Ready and retryable demand is not
+    /// incarnation still holds once that incarnation's loop joined its work,
+    /// then reconciles Prepared attempts until the durable predicate reports
+    /// nothing recoverable. A supervised restart keeps the owner identity, so
+    /// after a joined stop waiting for those leases would only hold readiness
+    /// down; after a panic the old work may be live, so its leases must lapse
+    /// first. Ready and retryable demand is not
     /// recovery — the slots claim it once they start — so this terminates.
     ///
     /// # Errors
@@ -2188,7 +2234,10 @@ impl ForgeWorker {
                     return Ok(());
                 }
                 let reclaimed = self
-                    .reclaim_attempts(claim_limits.max_active_per_tenant, Some(self.owner))
+                    .reclaim_attempts(
+                        claim_limits.max_active_per_tenant,
+                        self.quiescence.reclaimable_owner(self.owner),
+                    )
                     .await?;
                 if reclaimed.len() < claim_limits.max_active_per_tenant as usize {
                     break;
@@ -9099,6 +9148,32 @@ mod tests {
     };
 
     use super::*;
+
+    /// Only a predecessor loop that joined its work enables same-owner reclaim.
+    ///
+    /// A loop that panics never marks itself joined, so its successor clone
+    /// reclaims expired attempts only; the next loop that joins restores it.
+    ///
+    /// # Panics
+    /// Panics when a panicked loop still enables same-owner reclaim or a
+    /// joined loop does not.
+    #[tokio::test]
+    async fn only_a_joined_loop_enables_same_owner_reclaim() {
+        let owner = Uuid::now_v7();
+        let quiescence = ForgeLoopQuiescence::new();
+        assert_eq!(quiescence.reclaimable_owner(owner), Some(owner));
+        let panicked = quiescence.clone();
+        let join = tokio::spawn(async move {
+            panicked.enter();
+            panic!("the worker loop panics before joining its work");
+        })
+        .await;
+        assert!(join.is_err_and(|error| error.is_panic()));
+        assert_eq!(quiescence.reclaimable_owner(owner), None);
+        quiescence.enter();
+        quiescence.joined();
+        assert_eq!(quiescence.reclaimable_owner(owner), Some(owner));
+    }
 
     /// The per-plan reducer applies exactly the documented priority.
     ///

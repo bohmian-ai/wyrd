@@ -8,8 +8,11 @@
 
 use crate::connectivity::{McpJourneyError, client, discover, problem, structured, transport};
 
+mod investigation;
+
 /// The query journey's Postgres-backed cases.
 mod pg_tests {
+    use super::investigation::EvidenceInvestigation;
     use super::{McpJourneyError, client, discover, problem, structured, transport};
     use std::fmt::Write as _;
 
@@ -25,6 +28,24 @@ mod pg_tests {
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::bifrost::seed_query_fixture;
     use wyrd_testing::server::BifrostQueryResourceSnapshot;
+
+    /// An agent correlates telemetry, Cards, judgments, and custom rows through existing SQL.
+    ///
+    /// # Errors
+    /// Returns fixture, MCP, query, or shutdown failures.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn agent_investigates_from_multiple_evidence_pivots() -> Result<(), McpJourneyError> {
+        let investigation = EvidenceInvestigation::start().await?;
+        investigation.describe_evidence().await?;
+        investigation.correlate_trace().await?;
+        investigation.follow_subject_and_results().await?;
+        investigation.read_custom_data().await?;
+        investigation
+            .refuse_unauthorized_or_oversized_reads()
+            .await?;
+        investigation.shutdown().await
+    }
 
     /// Build one `bifrost.query` call from its closed arguments.
     ///

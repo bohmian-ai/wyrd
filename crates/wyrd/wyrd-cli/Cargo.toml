@@ -30,6 +30,14 @@ clap = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pem"] }
 indicatif = { workspace = true }
 reqwest = { workspace = true }
+# Stdio MCP server for the host-facing `wyrd mcp proxy`, bridged to Wyrd's
+# `/mcp` through the Streamable HTTP client `wyrd-mcp` authenticates.
+rmcp = { workspace = true, features = [
+    "client",
+    "server",
+    "transport-io",
+    "transport-streamable-http-client-reqwest",
+] }
 secrecy = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -41,6 +49,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "time"] }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
@@ -50,6 +59,7 @@ wyrd-client = { workspace = true, features = ["internal"] }
 wyrd-error-derive = { workspace = true }
 
 wyrd-loader = { workspace = true }
+wyrd-mcp = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
@@ -62,6 +72,7 @@ axum = { workspace = true }
 base64 = { workspace = true }
 predicates = "3"
 sqlx = { workspace = true }
+tokio = { workspace = true, features = ["process"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }

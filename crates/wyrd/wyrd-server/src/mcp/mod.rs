@@ -36,7 +36,9 @@ use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::state::AppState;
 
 mod bifrost;
+mod cards;
 mod gateway;
+mod guide;
 mod operators;
 mod principals;
 #[cfg(feature = "test-support")]
@@ -146,9 +148,11 @@ impl WyrdMcpHandler {
     fn catalog(&self) -> Vec<Tool> {
         let mut catalog = bifrost::descriptors();
         catalog.extend(principals::descriptors_unscoped());
+        catalog.extend(cards::descriptors());
         catalog.extend(verification::descriptors_unscoped());
         catalog.extend(operators::descriptors_unscoped());
         catalog.extend(gateway::descriptors());
+        catalog.push(guide::descriptor());
         catalog
     }
 
@@ -172,6 +176,7 @@ impl ServerHandler for WyrdMcpHandler {
     fn get_info(&self) -> ServerInfo {
         let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
         info.protocol_version = WYRD_MCP_PROTOCOL_VERSION;
+        info.instructions = Some("Use tools/list for the current caller-dependent tool catalog and schemas. Call wyrd.guide with overview, cards, verification, or bifrost_sql for investigation workflows. Discovery grants no permission; attribute answers to exact evidence and report refusals or incomplete queries.".to_owned());
         info
     }
 
@@ -246,6 +251,10 @@ impl ServerHandler for WyrdMcpHandler {
         // the result back out.
         let _token = self.state.mcp_tasks.token();
         let outcome = match request.name.as_ref() {
+            guide::GUIDE => {
+                let _caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                guide::invoke(request.arguments).map_err(wyrd_error_to_mcp)
+            }
             bifrost::LIST_TABLES => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 self.list_tables(caller, request.arguments).await
@@ -275,9 +284,21 @@ impl ServerHandler for WyrdMcpHandler {
                     .await
                     .map_err(wyrd_error_to_mcp)
             }
-            verification::CARDS_GET => {
+            cards::GET => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 self.mcp_get_card(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            cards::LIST => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_list_cards(caller, request.arguments)
+                    .await
+                    .map_err(wyrd_error_to_mcp)
+            }
+            cards::GET_BY_REF => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                self.mcp_get_card_by_ref(caller, request.arguments)
                     .await
                     .map_err(wyrd_error_to_mcp)
             }

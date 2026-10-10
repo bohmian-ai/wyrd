@@ -320,3 +320,21 @@ pub async fn cli_delete_provider_credential(
     };
     NativeCliOutcome::from_result(result)
 }
+
+/// Connects the named MCP hosts to Wyrd (`wyrd mcp install --host ...`).
+///
+/// Hosts are located from the process environment; a host that cannot be
+/// connected is reported in the outcome's value, not as a problem.
+///
+/// # Errors
+///
+/// Returns a napi error only when the report cannot be serialized; an
+/// unknown or empty host selection or an invalid `server` is returned in the
+/// outcome.
+#[napi]
+pub fn cli_mcp_install(
+    hosts: Vec<String>,
+    server: Option<String>,
+) -> napi::Result<NativeCliOutcome> {
+    NativeCliOutcome::from_result(commands::mcp_install(&hosts, server.as_deref()))
+}

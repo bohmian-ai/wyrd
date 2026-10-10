@@ -1,6 +1,6 @@
 ---
 title: CLI
-description: The wyrd binary — auth, eval, principal, and gateway commands, with every flag and environment variable.
+description: The wyrd binary — auth, eval, principal, gateway, and mcp commands, with every flag and environment variable.
 pillar: wyrd
 group: Reference
 order: 2
@@ -306,6 +306,37 @@ wyrd operator-connection list --server https://acme.wyrd.cloud
     ['--server', 'Wyrd server base URL (WYRD_SERVER_URL). The credential resolves from the ambient chain.']
   ]}
 />
+
+## wyrd mcp
+
+Connect local MCP hosts to Wyrd. `install` writes a launch entry for
+`wyrd mcp proxy` into each selected host's user configuration; the host then
+runs the proxy, which serves the server's own `/mcp` tools over stdio and
+authenticates every request through the ambient credential chain. Host files
+never hold a credential.
+
+```bash
+wyrd mcp install --host claude-code --host codex
+wyrd mcp install --host cursor --server https://acme.wyrd.cloud
+```
+
+<DataTable
+  columns={[
+    { header: 'Command', role: 'name' },
+    { header: 'Meaning' }
+  ]}
+  rows={[
+    ['install', 'On a terminal, offer the detected hosts as a multi-select. Without a terminal, --host is required and nothing is configured implicitly.'],
+    ['install --host <host>', 'Connect one host; repeat for several: codex, claude-code, copilot-cli, vscode, cursor, pi, hermes. Each host is reported as added, updated, or unchanged, or with why its file was left as it was.'],
+    ['install --server <url>', 'Keep this server in the host entry. The global config.toml endpoint is not changed. Omitted, the proxy follows the global endpoint.'],
+    ['proxy [--server <url>]', 'Serve Wyrd\'s MCP tools to a host over stdio. Hosts launch this; you rarely run it directly.']
+  ]}
+/>
+
+Each entry pins `WYRD_CONFIG_HOME`, so hosts that pass a reduced environment
+still find your saved login or `credentials.toml`. An existing `wyrd` entry
+that does not run the proxy is a conflict: rename or remove it, then rerun.
+Failures use the [MCP host codes](/api/errors/#mcp-host-codes).
 
 ## Related
 

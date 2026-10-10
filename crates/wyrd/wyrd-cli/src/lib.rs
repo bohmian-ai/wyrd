@@ -16,6 +16,8 @@ pub mod error;
 mod eval;
 pub mod gateway;
 pub mod load;
+/// `wyrd mcp`: MCP host installation and the host-facing stdio proxy.
+pub mod mcp;
 mod operator_connection;
 mod platform;
 mod principal;
@@ -44,6 +46,8 @@ pub mod commands {
     pub use crate::gateway::{
         delete_provider_credential, put_provider_credential, revoke_provider_credential,
     };
+    pub use crate::mcp::install as mcp_install;
+    pub use crate::mcp::{McpHost, McpHostReport, McpHostStatus, McpInstallReport};
 }
 
 // Re-export the public loader API

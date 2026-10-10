@@ -41,6 +41,9 @@ wyrd-testing = { workspace = true }
 # table through the production catalog so the list projection's tenancy claim
 # is about two real tables, not one.
 vala-bifrost-redux = { workspace = true, features = ["test-support"] }
+# Reuse native result mapping and reports when seeding retained evidence.
+vala-eval = { workspace = true }
+wyrd-sql = { workspace = true }
 arrow = { workspace = true }
 wyrd-server = { workspace = true, features = ["test-support"] }
 wyrd-spec = { workspace = true }

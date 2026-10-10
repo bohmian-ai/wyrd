@@ -6,29 +6,34 @@
 //! without a second lookup. The journey drives all three through a real `rmcp`
 //! client so what it observes is what an agent observes.
 
-use crate::connectivity::{McpJourneyError, discover, problem, structured, transport};
+use crate::connectivity::{McpJourneyError, discover, problem, refusal, structured, transport};
 
 /// The discovery journey's Postgres-backed cases.
 mod pg_tests {
-    use super::{McpJourneyError, discover, problem, structured, transport};
+    use super::{McpJourneyError, discover, problem, refusal, structured, transport};
 
     use rmcp::ClientServiceExt as _;
-    use rmcp::model::CallToolRequestParams;
+    use rmcp::model::{CallToolRequestParams, Tool};
+    use rmcp::service::{RoleClient, RunningService};
+    use serde_json::{Value as JsonValue, json};
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_testing::WyrdTestServer;
+    use wyrd_testing::bifrost::canonical_signals;
     use wyrd_testing::bifrost::seed_query_fixture;
 
     /// The exact catalog an ordinary Wyrd server advertises over `/mcp` to a
     /// caller that also holds tenant principal administration, `verifier:run`, and
     /// `operators:write`: every read tool, then that caller's write tools.
-    const ADVERTISED_TOOLS: [&str; 32] = [
+    const ADVERTISED_TOOLS: [&str; 35] = [
         "bifrost.list_tables",
         "bifrost.describe_table",
         "bifrost.query",
         "principals.list_credentials",
         "cards.get",
+        "cards.list",
+        "cards.get_by_ref",
         "verification.get_binding",
         "verification.get_run",
         "operator_connections.list",
@@ -50,6 +55,7 @@ mod pg_tests {
         "gateway.delete_provider_deployment",
         "gateway.delete_fallback_policy",
         "gateway.delete_governance_policy",
+        "wyrd.guide",
         "principals.revoke_credential",
         "verification.start_run",
         "verification.execute",
@@ -57,6 +63,191 @@ mod pg_tests {
         "operator_connections.update",
         "operator_connections.disable",
     ];
+
+    /// A bound MCP reader and the custom table used to execute guide examples.
+    struct GuideInvestigation {
+        /// Owns the real catalog and query service.
+        server: WyrdTestServer,
+        /// Authenticated MCP connection under test.
+        agent: RunningService<RoleClient, ()>,
+        /// Qualified custom table substituted into guide examples.
+        table: String,
+    }
+
+    impl GuideInvestigation {
+        /// Seed the existing query fixture and connect through MCP.
+        ///
+        /// # Errors
+        /// Returns server, seed, or transport failures.
+        async fn start() -> Result<Self, McpJourneyError> {
+            let server = WyrdTestServer::start_bound().await?;
+            let fixture = seed_query_fixture(&server, "mcp-guide").await?;
+            let agent = ()
+                .serve_with_lifecycle(
+                    transport(
+                        &server,
+                        ResolvedCredential::BearerToken(fixture.token.into()),
+                        None,
+                    )?,
+                    discover(),
+                )
+                .await?;
+            Ok(Self {
+                server,
+                agent,
+                table: fixture.table,
+            })
+        }
+
+        /// Read one tool's structured response using its advertised argument object.
+        ///
+        /// # Errors
+        /// Returns invalid fixture arguments, transport failures, or a tool refusal.
+        async fn read(
+            &self,
+            name: &str,
+            arguments: JsonValue,
+        ) -> Result<JsonValue, McpJourneyError> {
+            let arguments = arguments
+                .as_object()
+                .ok_or("tool arguments are an object")?
+                .clone();
+            let request = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
+            structured(self.agent.call_tool(request).await?)
+        }
+
+        /// Check discovery instructions and closed, read-only descriptors.
+        ///
+        /// # Errors
+        /// Returns missing discovery fields or a catalog read failure.
+        async fn catalog(&self) -> Result<Vec<Tool>, McpJourneyError> {
+            let info = self.agent.peer_info().ok_or("server discovery info")?;
+            let instructions = info.instructions.as_deref().ok_or("server instructions")?;
+            assert!(instructions.contains("tools/list"));
+            assert!(instructions.contains("wyrd.guide"));
+            let tools = self.agent.list_all_tools().await?;
+            for tool in &tools {
+                assert_eq!(
+                    tool.input_schema.get("type"),
+                    Some(&json!("object")),
+                    "MCP requires an object input schema: {}",
+                    tool.name
+                );
+            }
+            for name in ["cards.list", "cards.get_by_ref", "wyrd.guide"] {
+                let tool = tools
+                    .iter()
+                    .find(|tool| tool.name == name)
+                    .ok_or("investigation tool is advertised")?;
+                assert_eq!(
+                    tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+                    Some(true)
+                );
+                assert_eq!(
+                    tool.input_schema.get("additionalProperties"),
+                    Some(&json!(false))
+                );
+                assert!(tool.output_schema.is_some());
+            }
+            Ok(tools)
+        }
+
+        /// Validate every topic and execute each SQL example against current schemas.
+        ///
+        /// # Errors
+        /// Returns a malformed guide, missing tool, or failed query example.
+        async fn topics(&self, tools: &[Tool]) -> Result<(), McpJourneyError> {
+            for topic in ["overview", "cards", "verification", "bifrost_sql"] {
+                let guide = self.read("wyrd.guide", json!({ "topic": topic })).await?;
+                assert_eq!(guide["topic"], topic);
+                let steps = guide["steps"].as_array().ok_or("guide has steps")?;
+                assert!(!steps.is_empty());
+                let examples = guide["examples"].as_array().ok_or("guide has examples")?;
+                for example in examples {
+                    let name = example["tool"].as_str().ok_or("example names its tool")?;
+                    assert!(
+                        tools.iter().any(|tool| tool.name == name),
+                        "example names a shipped tool: {example}"
+                    );
+                    assert!(example["purpose"].as_str().is_some());
+                    assert!(example["arguments"].is_object());
+                    if name == "bifrost.query" {
+                        self.execute_sql_example(example).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Substitute only documented identifiers; Oracle validates the SQL and fields.
+        ///
+        /// # Errors
+        /// Returns missing SQL or a query refusal.
+        async fn execute_sql_example(&self, example: &JsonValue) -> Result<(), McpJourneyError> {
+            let mut arguments = example["arguments"].clone();
+            let trace_id =
+                wyrd_spec::vala::ids::TraceId::from_bytes(canonical_signals::TRACE_ID)?.to_hex();
+            let sql = arguments["sql"]
+                .as_str()
+                .ok_or("query example has sql")?
+                .replace("<custom_table>", &self.table)
+                .replace("<subject_card_uid>", "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
+                .replace("<result_id>", "guide-absent-result")
+                .replace("<trace_id>", &trace_id);
+            arguments["sql"] = json!(sql);
+            let result = self.read("bifrost.query", arguments).await?;
+            assert_eq!(
+                result["terminal"]["outcome"], "success",
+                "{example}: {result}"
+            );
+            Ok(())
+        }
+
+        /// Refuse unknown topics and caller-supplied tenant data.
+        ///
+        /// # Errors
+        /// Returns transport failures or an unexpectedly successful call.
+        async fn reject_invalid_topics(&self) -> Result<(), McpJourneyError> {
+            for arguments in [
+                json!({ "topic": "unknown" }),
+                json!({ "topic": "overview", "tenant": "other" }),
+            ] {
+                let request = CallToolRequestParams::new("wyrd.guide").with_arguments(
+                    arguments
+                        .as_object()
+                        .ok_or("invalid arguments object")?
+                        .clone(),
+                );
+                let failure = refusal(self.agent.call_tool(request).await)?;
+                assert!(failure.contains("WYRD_SPEC_400_VALIDATION"), "{failure}");
+            }
+            Ok(())
+        }
+
+        /// Close the MCP connection before the server drains.
+        ///
+        /// # Errors
+        /// Returns connection or server shutdown failures.
+        async fn shutdown(self) -> Result<(), McpJourneyError> {
+            self.agent.cancel().await?;
+            self.server.shutdown().await?;
+            Ok(())
+        }
+    }
+
+    /// An authenticated agent discovers the guide and executes its bounded SQL examples.
+    ///
+    /// # Errors
+    /// Returns fixture, MCP, query, or shutdown failures.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn agent_discovers_mcp_guide_and_sql_examples() -> Result<(), McpJourneyError> {
+        let investigation = GuideInvestigation::start().await?;
+        let tools = investigation.catalog().await?;
+        investigation.topics(&tools).await?;
+        investigation.reject_invalid_topics().await?;
+        investigation.shutdown().await
+    }
 
     /// An agent sees exactly the advertised Bifrost, principal, and gateway
     /// tools, only its own tenant's tables, and the complete physical layout

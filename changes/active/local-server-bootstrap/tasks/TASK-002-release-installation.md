@@ -161,6 +161,7 @@ Commands:
 - `mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=server_install::server_install_selects_latest_stable) | test(=server_install::server_install_preserves_previous_on_failure)'`:
   2 passed. The task text's `test(=server_install_selects_latest_stable)` selects nothing because the tests sit in the `server_install` module, so this is the corrected exact selector.
 - `mise exec -- cargo nextest run --locked -p wyrd-cli --lib -E 'test(/server::install::tests|cli::tests/)'`: 6 passed.
+- `mise run test:wyrd`: 2413 passed, 215 skipped.
 - `mise run py:test:cli:unit`, `mise run ts:test:unit`, `mise run codegen:check`, `mise run docs:check`, `mise run fmt`, `mise run lints`, `git diff --check`: pass.
 - Live check: `wyrd server install` against the real GitHub API returns `WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE` ("no stable Wyrd release is published"), because no release exists yet.
 

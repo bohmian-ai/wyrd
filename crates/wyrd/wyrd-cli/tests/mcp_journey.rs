@@ -172,8 +172,9 @@ async fn shared_client_refusal(base_url: &str, api_key: &str) -> wyrd_spec::erro
         wyrd_client::transport::ResolvedCredential::ApiKey(api_key.to_owned().into()),
     )
     .expect("auth middleware builds");
-    let http = wyrd_client::transport::HttpTransport::new(&config.http, std::sync::Arc::clone(&auth))
-        .expect("HTTP transport builds");
+    let http =
+        wyrd_client::transport::HttpTransport::new(&config.http, std::sync::Arc::clone(&auth))
+            .expect("HTTP transport builds");
     wyrd_client::WyrdClient::from_parts(auth, http, config.grpc)
         .access_token()
         .await
@@ -336,7 +337,10 @@ impl HostFiles {
             &files.copilot,
             r#"{"mcpServers":{"other":{"type":"local","command":"other","tools":["*"]}}}"#,
         );
-        write(&files.vscode, r#"{"servers":{"other":{"command":"other"}}}"#);
+        write(
+            &files.vscode,
+            r#"{"servers":{"other":{"command":"other"}}}"#,
+        );
         files
     }
 
@@ -346,7 +350,8 @@ impl HostFiles {
     /// Panics when a file cannot be read.
     fn snapshot(&self) -> [String; 4] {
         [&self.codex, &self.claude, &self.copilot, &self.vscode].map(|path| {
-            std::fs::read_to_string(path).unwrap_or_else(|error| panic!("{path:?}: {error}"))
+            std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
         })
     }
 }
@@ -373,8 +378,7 @@ async fn install(home: &Path, arguments: &[&str]) -> (Option<i32>, String, Strin
 }
 
 /// A credential that would be caught if installation ever copied it.
-const SENTINEL_KEY: &str =
-    "wyrd_sk_00000000000000000000000000000000_00000000_sentinelsentinelsentinelsentinelsentinelsent";
+const SENTINEL_KEY: &str = "wyrd_sk_00000000000000000000000000000000_00000000_sentinelsentinelsentinelsentinelsentinelsent";
 
 /// Parse a JSON host file.
 ///
@@ -419,7 +423,10 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     assert_eq!(first[2], original[2], "Copilot CLI was not selected");
     assert_eq!(first[3], original[3], "VS Code was not selected");
     for text in &first {
-        assert!(!text.contains(SENTINEL_KEY), "a host file holds no credential");
+        assert!(
+            !text.contains(SENTINEL_KEY),
+            "a host file holds no credential"
+        );
     }
 
     assert!(first[0].starts_with("# user comment\nmodel = \"o3\"\n"));
@@ -428,8 +435,15 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     let codex_entry = &codex["mcp_servers"]["wyrd"];
     assert_eq!(codex_entry["args"], serde_json::json!(["mcp", "proxy"]));
     assert_eq!(codex_entry["env"]["WYRD_CONFIG_HOME"], config_home.as_str());
-    assert!(codex_entry["command"].as_str().is_some_and(|c| c.ends_with("wyrd")));
-    assert!(codex_entry.get("type").is_none(), "Codex entries carry no type");
+    assert!(
+        codex_entry["command"]
+            .as_str()
+            .is_some_and(|c| c.ends_with("wyrd"))
+    );
+    assert!(
+        codex_entry.get("type").is_none(),
+        "Codex entries carry no type"
+    );
 
     let claude = json_file(&files.claude);
     assert_eq!(claude["numStartups"], 3);
@@ -437,7 +451,10 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     let claude_entry = &claude["mcpServers"]["wyrd"];
     assert_eq!(claude_entry["type"], "stdio");
     assert_eq!(claude_entry["args"], serde_json::json!(["mcp", "proxy"]));
-    assert_eq!(claude_entry["env"]["WYRD_CONFIG_HOME"], config_home.as_str());
+    assert_eq!(
+        claude_entry["env"]["WYRD_CONFIG_HOME"],
+        config_home.as_str()
+    );
 
     let (code, stdout, _) =
         install(home.path(), &["--host", "codex", "--host", "claude-code"]).await;
@@ -454,14 +471,24 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     let (code, stdout, stderr) =
         install(home.path(), &["--host", "copilot-cli", "--host", "vscode"]).await;
     assert_eq!(code, Some(73), "a conflict fails the run");
-    assert_eq!(cli_problem(&stderr)["code"], "WYRD_CLI_409_MCP_HOST_INSTALL");
+    assert_eq!(
+        cli_problem(&stderr)["code"],
+        "WYRD_CLI_409_MCP_HOST_INSTALL"
+    );
     assert!(stdout.contains("copilot-cli: conflict"), "{stdout}");
     assert!(stdout.contains("vscode: added"), "{stdout}");
-    assert_eq!(files.snapshot()[2], foreign, "the conflicting file is untouched");
+    assert_eq!(
+        files.snapshot()[2],
+        foreign,
+        "the conflicting file is untouched"
+    );
     let vscode = json_file(&files.vscode);
     assert_eq!(vscode["servers"]["other"]["command"], "other");
     assert_eq!(vscode["servers"]["wyrd"]["type"], "stdio");
-    assert_eq!(vscode["servers"]["wyrd"]["args"], serde_json::json!(["mcp", "proxy"]));
+    assert_eq!(
+        vscode["servers"]["wyrd"]["args"],
+        serde_json::json!(["mcp", "proxy"])
+    );
 
     std::fs::write(&files.copilot, &original[2]).expect("restore Copilot CLI file");
     let (code, _, _) = install(home.path(), &["--host", "copilot-cli"]).await;
@@ -485,14 +512,25 @@ pub(crate) async fn mcp_install_changes_only_selected_hosts() {
     set_mode(0o555);
     let (code, stdout, _) = install(
         home.path(),
-        &["--host", "codex", "--host", "claude-code", "--server", "https://wyrd.example"],
+        &[
+            "--host",
+            "codex",
+            "--host",
+            "claude-code",
+            "--server",
+            "https://wyrd.example",
+        ],
     )
     .await;
     set_mode(0o755);
     assert_eq!(code, Some(73), "an unwritable host fails the run: {stdout}");
     assert!(stdout.contains("codex: cannot write"), "{stdout}");
     assert!(stdout.contains("claude-code: updated"), "{stdout}");
-    assert_eq!(files.snapshot()[0], before[0], "the unwritable file is intact");
+    assert_eq!(
+        files.snapshot()[0],
+        before[0],
+        "the unwritable file is intact"
+    );
 
     let empty = tempfile::tempdir().expect("hostless home");
     let (code, stdout, _) = install(empty.path(), &["--host", "vscode"]).await;
@@ -532,7 +570,9 @@ pub(crate) async fn mcp_external_server_preserves_global_endpoint() {
     std::fs::write(config_dir.join("config.toml"), global).expect("global config");
     let credentials = config_dir.join("credentials.toml");
     std::fs::write(&credentials, format!("[default]\napi_key = \"{key}\"\n")).expect("credentials");
-    let mut private = std::fs::metadata(&credentials).expect("credentials").permissions();
+    let mut private = std::fs::metadata(&credentials)
+        .expect("credentials")
+        .permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut private, 0o600);
     std::fs::set_permissions(&credentials, private).expect("credentials are private");
     std::fs::create_dir_all(home.path().join(".claude")).expect("Claude Code detected");
@@ -542,7 +582,14 @@ pub(crate) async fn mcp_external_server_preserves_global_endpoint() {
         .expect("binary directory")
         .to_owned();
     let output = wyrd(home.path())
-        .args(["mcp", "install", "--host", "claude-code", "--server", &base_url])
+        .args([
+            "mcp",
+            "install",
+            "--host",
+            "claude-code",
+            "--server",
+            &base_url,
+        ])
         .env("PATH", &wyrd_dir)
         .stdin(Stdio::null())
         .output()
@@ -555,7 +602,10 @@ pub(crate) async fn mcp_external_server_preserves_global_endpoint() {
     );
 
     let host_file = std::fs::read_to_string(home.path().join(".claude.json")).expect("host file");
-    assert!(!host_file.contains(&key), "the host file holds no credential");
+    assert!(
+        !host_file.contains(&key),
+        "the host file holds no credential"
+    );
     let entry = &serde_json::from_str::<Value>(&host_file).expect("JSON")["mcpServers"]["wyrd"];
     assert_eq!(
         entry["args"],
@@ -563,7 +613,11 @@ pub(crate) async fn mcp_external_server_preserves_global_endpoint() {
         "the external URL is retained in the launch command"
     );
     let command = entry["command"].as_str().expect("command");
-    assert_eq!(Path::new(command), wyrd_dir.join("wyrd"), "the resolved wyrd is recorded");
+    assert_eq!(
+        Path::new(command),
+        wyrd_dir.join("wyrd"),
+        "the resolved wyrd is recorded"
+    );
 
     let mut host_launch = Command::new(command);
     host_launch

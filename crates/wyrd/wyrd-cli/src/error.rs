@@ -435,9 +435,7 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             }
             WyrdCliError::ClientTransport { .. }
             | WyrdCliError::ServerReleaseUnavailable { .. }
-            | WyrdCliError::McpProxy { .. } => {
-                WyrdError::ClientTransportDown { message, details }
-            }
+            | WyrdCliError::McpProxy { .. } => WyrdError::ClientTransportDown { message, details },
             WyrdCliError::CardLoad(error) => WyrdError::from(error),
             WyrdCliError::InvalidArgument { field, .. } => WyrdError::Validation {
                 message,
@@ -454,18 +452,14 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             | WyrdCliError::DeleteSelectorRequiresExact
             | WyrdCliError::ServerHostUnsupported { .. }
             | WyrdCliError::ServerVersionIncompatible { .. }
-            | WyrdCliError::McpHostSelection { .. } => {
-                WyrdError::Validation { message, details }
-            }
+            | WyrdCliError::McpHostSelection { .. } => WyrdError::Validation { message, details },
             WyrdCliError::Query { .. }
             | WyrdCliError::Io { .. }
             | WyrdCliError::EvalEngine { .. }
             | WyrdCliError::Orchestrator { .. }
             | WyrdCliError::Output { .. }
             | WyrdCliError::ServerReleaseUnverified { .. }
-            | WyrdCliError::McpHostInstall { .. } => {
-                WyrdError::Internal { message, details }
-            }
+            | WyrdCliError::McpHostInstall { .. } => WyrdError::Internal { message, details },
         }
     }
 }

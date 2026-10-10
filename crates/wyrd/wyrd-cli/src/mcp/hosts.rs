@@ -43,7 +43,12 @@ pub enum McpHost {
 
 impl McpHost {
     /// Every supported host, in the order detection reports them.
-    pub(super) const ALL: [Self; 4] = [Self::Codex, Self::ClaudeCode, Self::CopilotCli, Self::Vscode];
+    pub(super) const ALL: [Self; 4] = [
+        Self::Codex,
+        Self::ClaudeCode,
+        Self::CopilotCli,
+        Self::Vscode,
+    ];
 
     /// The `--host` value naming this host.
     #[must_use]
@@ -366,7 +371,10 @@ fn edit_toml(text: &str, entry: Value) -> Result<(Change, String), Edit> {
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| unreadable(&error))?;
     let existing: Value = toml::from_str(text).map_err(|error| unreadable(&error))?;
-    let change = classify(existing.get("mcp_servers").and_then(|t| t.get(ENTRY)), &entry)?;
+    let change = classify(
+        existing.get("mcp_servers").and_then(|t| t.get(ENTRY)),
+        &entry,
+    )?;
 
     let mut table = toml_edit::Table::new();
     table["command"] = toml_edit::value(entry["command"].as_str().unwrap_or_default());
@@ -430,10 +438,19 @@ pub(super) fn prompt_selection(
 ) -> io::Result<Vec<McpHost>> {
     writeln!(output, "Detected MCP hosts:")?;
     for (index, host) in detected.iter().enumerate() {
-        writeln!(output, "  {}) {} ({})", index + 1, host.label(), host.name())?;
+        writeln!(
+            output,
+            "  {}) {} ({})",
+            index + 1,
+            host.label(),
+            host.name()
+        )?;
     }
     loop {
-        write!(output, "Connect which hosts to Wyrd? [numbers, all, or empty for none]: ")?;
+        write!(
+            output,
+            "Connect which hosts to Wyrd? [numbers, all, or empty for none]: "
+        )?;
         output.flush()?;
         let mut answer = String::new();
         if input.read_line(&mut answer)? == 0 {

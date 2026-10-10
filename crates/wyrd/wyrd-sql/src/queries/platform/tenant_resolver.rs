@@ -9,7 +9,7 @@ use crate::{OperatorPool, SqlError, TenantConn};
 /// `platform.resolve_tenant_by_slug` bridge on the operator pool.
 ///
 /// A slug names no tenant yet, so this pre-tenant directory read runs on the
-/// audited `wyrd_platform_admin` role rather than a tenant transaction. It is
+/// audited platform operator pool rather than a tenant transaction. It is
 /// crate-private: [`crate::WyrdPostgres::resolve_tenant_slug`] is the single
 /// resolver every login, workload, and boot caller goes through, and it fails
 /// closed when no operator pool is configured.
@@ -43,8 +43,8 @@ pub(crate) async fn resolve_by_slug(
 /// Report whether a tenant's lifecycle state admits its credentials.
 ///
 /// The authentication path's one question about the tenant directory, answered
-/// through a SECURITY DEFINER function so the `wyrd_app` role never gains read
-/// access to `platform.tenants` itself. A tenant that is provisioning, failed,
+/// through a SECURITY DEFINER function so a tenant session never reads
+/// `platform.tenants` itself. A tenant that is provisioning, failed,
 /// suspended, or deleted admits nothing; only an active, undeleted tenant does.
 ///
 /// Takes the row-level-secured connection because it is called on the exchange

@@ -8,7 +8,7 @@ order: 3
 
 # Running the server
 
-The server is a single binary, `wyrd-server`. Run it with no subcommand and it serves. Four operator subcommands exist: `migrate`, which applies the embedded schema with the database-owner login; `init`, which establishes the deployment's platform administrative root; `setup`, which runs `init` if needed and creates a first tenant (a no-op when the tenant exists); and `recover-root`, which reissues a credential for that root when every platform credential is gone.
+The server is a single binary, `wyrd-server`. Run it with no subcommand and it serves. Four operator subcommands exist: `migrate`, which applies the embedded schema as the platform login; `init`, which establishes the deployment's platform administrative root; `setup`, which runs `init` if needed and creates a first tenant (a no-op when the tenant exists); and `recover-root`, which reissues a credential for that root when every platform credential is gone.
 
 ## Command line
 

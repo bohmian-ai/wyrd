@@ -42,16 +42,8 @@ ALTER TABLE wyrd.card_relationships FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.card_relationships
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-CREATE POLICY admin_cross_tenant ON wyrd.card_relationships
-    TO wyrd_platform_admin
-    USING (true)
-    WITH CHECK (true);
+CREATE POLICY operator_access ON wyrd.card_relationships TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE INDEX card_relationships_target_idx
     ON wyrd.card_relationships (data_tenant_id, target_uid);
-
-REVOKE ALL ON TABLE wyrd.card_relationships FROM wyrd_app;
-REVOKE ALL ON TABLE wyrd.card_relationships FROM wyrd_platform_admin;
-GRANT SELECT, INSERT, DELETE ON wyrd.card_relationships TO wyrd_app;
-GRANT SELECT, DELETE ON wyrd.card_relationships TO wyrd_platform_admin;

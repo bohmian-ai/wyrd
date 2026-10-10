@@ -54,9 +54,8 @@ mounts its state volume at `/var/lib/wyrd`.
 
 | Variable | When | Value | Source |
 | --- | --- | --- | --- |
-| `WYRD_DATABASE_URL` in the migration Job | Required, Job only | `postgresql://<owner>:…@<db-host>:5432/wyrd` | The database-owner login. Secret `wyrd-owner`, mounted only by the Job. |
-| `WYRD_DATABASE_URL` | Required | `postgresql://wyrd_app:…@<db-host>:5432/wyrd` | `wyrd_app` password from the role bootstrap. Secret `wyrd-db`. |
-| `WYRD_PLATFORM_DATABASE_URL` | Required | `postgresql://wyrd_platform_admin:…@<db-host>:5432/wyrd` | `wyrd_platform_admin` password from the role bootstrap. Secret `wyrd-db`. |
+| `WYRD_DATABASE_URL` | Required | `postgresql://wyrd_tenant:…@<db-host>:5432/wyrd` | The tenant login you create. Secret `wyrd-db`. |
+| `WYRD_PLATFORM_DATABASE_URL` | Optional; this guide separates the logins | `postgresql://wyrd_platform:…@<db-host>:5432/wyrd` | The platform login you create; the migration Job connects as it. Secret `wyrd-db`. Unset, it defaults to `WYRD_DATABASE_URL` (see [Database](/self-hosting/database/#logins)). |
 | `WYRD_STORAGE_URL` | Required | `file:///var/lib/wyrd/storage` | The pod's persistent volume. An object store (`s3://…`, `gs://…`, `az://…`) also works: see [Storage](/self-hosting/storage/). |
 | `WYRD_BIFROST_DATA_DIR` | Set by the image | `/var/lib/wyrd/bifrost` | Scribe WAL, staging, and stable node identity. It lives on the same persistent volume. |
 | `WYRD_SIGNING_KEY_FILE` | Required for stable tokens | `/run/wyrd/signing.pem` | An Ed25519 key in Secret `wyrd-signing`. Without it a development pod mints an ephemeral key on every start. |
@@ -64,21 +63,14 @@ mounts its state volume at `/var/lib/wyrd`.
 | `WYRD_TARGET` | Optional | unset (`all`) | One process runs every role. |
 | `WYRD_PEER_ADDRESS`, `WYRD_PEER_TLS_DIR` | Only for peer mode | unset | See [Adding replicas](#adding-replicas). |
 
-## 1. Database roles and Secrets
+## 1. Database logins and Secrets
 
-Passwords never go on a command line, where other users of the machine and
-command auditing can read them. Load the three into shell variables from your
-password manager (for example `read -rs OWNER_PW`), using URL-safe values such
-as `openssl rand -hex 32`. Create the two serving logins once, as the database
-owner, with `psql` 15 or later; `roles.sql` reads both new passwords from the
-environment and `psql` reads the owner's from `PGPASSWORD`:
-
-```bash
-PGPASSWORD="$OWNER_PW" WYRD_APP_PASSWORD="$APP_PW" \
-  WYRD_PLATFORM_ADMIN_PASSWORD="$PLATFORM_PW" \
-  psql "postgresql://<owner>@<db-host>:5432/wyrd" -v ON_ERROR_STOP=1 \
-  < crates/wyrd/wyrd-sql/bootstrap/roles.sql
-```
+Create the `wyrd_tenant` and `wyrd_platform` logins and their privileges once,
+as described in [Database](/self-hosting/database/#logins). Passwords never go
+on a command line, where other users of the machine and command auditing can
+read them. Load both into shell variables from your password manager (for
+example `read -rs TENANT_PW`), using URL-safe values such as
+`openssl rand -hex 32`.
 
 Generate the signing key and store every credential as a Secret. Each
 `<(printf …)` hands `kubectl` a pipe to read, so the URL never appears in its
@@ -88,18 +80,16 @@ the cluster is not the only record.
 ```bash
 openssl genpkey -algorithm ed25519 -out signing.pem
 kubectl create namespace wyrd
-kubectl -n wyrd create secret generic wyrd-owner \
-  --from-file=database-url=<(printf %s "postgresql://<owner>:$OWNER_PW@<db-host>:5432/wyrd")
 kubectl -n wyrd create secret generic wyrd-db \
-  --from-file=database-url=<(printf %s "postgresql://wyrd_app:$APP_PW@<db-host>:5432/wyrd") \
-  --from-file=platform-database-url=<(printf %s "postgresql://wyrd_platform_admin:$PLATFORM_PW@<db-host>:5432/wyrd")
+  --from-file=database-url=<(printf %s "postgresql://wyrd_tenant:$TENANT_PW@<db-host>:5432/wyrd") \
+  --from-file=platform-database-url=<(printf %s "postgresql://wyrd_platform:$PLATFORM_PW@<db-host>:5432/wyrd")
 kubectl -n wyrd create secret generic wyrd-signing --from-file=signing.pem
 rm signing.pem
 ```
 
 ## 2. Migrate with a one-off Job
 
-The Job is the only workload that ever mounts the owner URL.
+The Job reads the same Secret the server does and connects as the platform login.
 
 ```yaml
 apiVersion: batch/v1
@@ -117,7 +107,9 @@ spec:
           command: [wyrd-server, migrate]
           env:
             - name: WYRD_DATABASE_URL
-              valueFrom: {secretKeyRef: {name: wyrd-owner, key: database-url}}
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: database-url}}
+            - name: WYRD_PLATFORM_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-db, key: platform-database-url}}
 ```
 
 ```bash
@@ -267,7 +259,7 @@ Bifrost data.
 | Symptom | Cause | Recovery |
 | --- | --- | --- |
 | The pod exits with `WYRD_SQL_503_SCHEMA_NOT_READY` | The schema is unmigrated, from another image, or its grants or policies drifted. | Run the migration Job for this image, then delete the pod. |
-| The migration Job fails | Bad owner URL, unreachable database, or a failed migration. | Read `kubectl logs job/wyrd-migrate`, fix the cause, delete and reapply the Job. Serving pods keep refusing a mismatched schema rather than serving it. |
+| The migration Job fails | A bad database URL, an unreachable database, or a failed migration. | Read `kubectl logs job/wyrd-migrate`, fix the cause, delete and reapply the Job. Serving pods keep refusing a mismatched schema rather than serving it. |
 | The pod stays unready | A dependency is down. | `kubectl logs wyrd-0` names the failing check. |
 | The pod is OOM-killed or refuses to boot on its memory budget | The limit is below the `all` floor. | Keep the limit at 3.75 GiB or more. |
 | `setup` asks for `WYRD_PLATFORM_CREDENTIAL` | The platform root already exists. | Create the tenant with `wyrd platform tenant create`, as in step 4. If the root credential is lost, `kubectl exec wyrd-0 -- wyrd-server recover-root`. |

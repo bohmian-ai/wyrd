@@ -27,10 +27,8 @@ ALTER TABLE vala.bifrost_tables FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.bifrost_tables
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON vala.bifrost_tables TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE INDEX bifrost_tables_fingerprint_idx
     ON vala.bifrost_tables (data_tenant_id, fingerprint);
-
-GRANT SELECT, INSERT, UPDATE, DELETE
-    ON vala.bifrost_tables
-    TO wyrd_app;

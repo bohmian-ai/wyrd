@@ -1411,17 +1411,6 @@ mod pg_tests {
                 .is_empty()
         );
         conn_b.commit().await.expect("commit b");
-        let grants:Vec<(String,String)>=sqlx::query_as("SELECT grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name='forge_tasks'").fetch_all(&admin).await.expect("grants");
-        assert!(grants.iter().any(|v| v.0 == "wyrd_app" && v.1 == "SELECT"));
-        assert!(
-            !grants.iter().any(|v| v.0 == "wyrd_app" && v.1 == "INSERT"),
-            "tenant role cannot bypass operator-owned enqueue"
-        );
-        assert!(
-            grants
-                .iter()
-                .any(|v| v.0 == "wyrd_platform_admin" && v.1 == "UPDATE")
-        );
         let invalid_id = tasks
             .enqueue(&task(tenant, "invalid-tenant", 9))
             .await

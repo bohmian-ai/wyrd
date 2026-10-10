@@ -35,7 +35,7 @@ controls required to operate those boundaries.
 | Client or agent to gateway | TLS, verified Wyrd token, typed permission, request bounds |
 | Gateway to `wyrd-server` | Authenticated transport; original credentials preserved; gateway metadata is never tenant authority |
 | `wyrd-server` replica to replica | Mutual TLS from one dedicated cluster CA with the fixed `wyrd-peer` identity; the receiver checks every operation's context against its own state |
-| Application to Postgres | Role-separated DSNs; RLS for tenant traffic; privileged pools excluded from handlers by construction |
+| Application to Postgres | Tenant traffic always runs under RLS through `TenantConn`; the operator pool is excluded from handlers by construction. Operators supply the logins; boot refuses superuser and `BYPASSRLS` logins. Production uses a separate tenant login that does not own Wyrd's objects, so RLS confines it even if compromised. One ordinary login (local and small self-hosted) keeps RLS per pool, but a process compromise could set the operator flag and reach every tenant |
 | Application to object storage | Workload identity or short-lived credentials; tenant-qualified prefixes; encryption in transit and at rest |
 | Server to a Source endpoint | Credential indirection, DNS resolution and SSRF screening, address pinning, bounded IO |
 

@@ -100,19 +100,19 @@ projection is ingested.
 
 ## Database privilege model
 
-Bifrost uses two control-plane database pools, each connecting as a different
-Postgres role.
+Bifrost uses two control-plane database pools. Every table forces row-level
+security; the pool decides which policy admits a row.
 
-| Pool | Connecting role | RLS | Purpose |
+| Pool | Connecting login | Admitting policy | Purpose |
 |---|---|---|---|
-| App pool | `wyrd_app` | Enforced via `wyrd.current_tenant()` | Tenant-scoped reads and writes from the server; Scribe lineage inserts |
-| Operator pool | `wyrd_platform_admin` | BYPASSRLS | Cross-tenant control-plane tables (`vala.maintenance_leases`, Forge lease coordination) |
+| App pool | `WYRD_DATABASE_URL` (tenant login) | `tenant_isolation`, via `wyrd.current_tenant()` | Tenant-scoped reads and writes from the server; Scribe lineage inserts |
+| Operator pool | `WYRD_PLATFORM_DATABASE_URL`, else `WYRD_DATABASE_URL` | `operator_access`, via `wyrd.operator_session()` | Cross-tenant control-plane work (`vala.maintenance_leases`, Forge lease coordination) |
 
 A few things worth being explicit about for audit purposes.
 
-The operator pool is the sole path to tables that are intentionally cross-tenant by design. `vala.maintenance_leases` is the only such table today. All other `vala.*` tables are RLS-enforced. The `check:tenant-isolation` CI script fails any new query module that reads a non-RLS table without using the operator pool.
+The operator pool connects with `app.operator=on`. The `operator_access` policy on each table applies only to the login that ran `wyrd-server migrate` and so owns the table; a separate tenant login never matches it even if it sets the flag. Boot refuses superuser and `BYPASSRLS` logins, which Postgres exempts from every policy. The `check:tenant-isolation` CI script fails any new query module that reads a cross-tenant table without using the operator pool.
 
-The app pool enforces tenant isolation via a Postgres RLS policy on every table. The policy calls `wyrd.current_tenant()`, which reads `current_setting('app.current_tenant')`. `TenantConn::acquire` sets this parameter at connection acquisition; any query on a `wyrd_app` connection without a tenant bound will fail the policy check.
+The app pool's `tenant_isolation` policy calls `wyrd.current_tenant()`, which reads `current_setting('app.current_tenant')`. `TenantConn::acquire` sets this parameter per transaction; a tenant-pool query without a tenant bound fails rather than reading rows.
 
 ## Failure modes
 

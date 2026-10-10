@@ -80,24 +80,30 @@ Configuration follows these rules:
    never silently clamps a value or falls back from a production provider to a
    local emulator.
 
-A serving process receives exactly two Postgres DSNs: `WYRD_DATABASE_URL`
-(`wyrd_app`) and `WYRD_PLATFORM_DATABASE_URL` (`wyrd_platform_admin`). Both are
-required. The one-off `wyrd-server migrate` process instead reads the
-database-owner DSN from `WYRD_DATABASE_URL`; the owner credential is never part
-of a serving environment. There is no embedded database.
+`WYRD_DATABASE_URL` is the only required Postgres DSN in every server mode.
+`WYRD_PLATFORM_DATABASE_URL` is optional and defaults to it. Operators create
+every login; Wyrd creates no role and grants nothing to a named role. The
+platform login runs `wyrd-server migrate` and so owns every Wyrd object.
+Local and small self-hosted deployments may use one ordinary login for both;
+the pool, not the login, then decides scope, so a compromise of the serving
+process reaches every tenant. Production sets both URLs to separate logins:
+the tenant login is not the owner, so row-level security confines it to the
+bound tenant even if it sets the operator flag. Boot refuses a superuser or
+`BYPASSRLS` login, a platform login that does not own Wyrd's objects, and,
+with two logins, a tenant login that owns them or holds `TRUNCATE`,
+`REFERENCES`, or `TRIGGER`. There is no embedded database.
 
-Unsuffixed `WYRD_DB_*` variables tune the `wyrd_app` pool. `_MIGRATOR` and
+Unsuffixed `WYRD_DB_*` variables tune the tenant pool. `_MIGRATOR` and
 `_PLATFORM_ADMIN` suffixes tune the one-off migration pool and the platform
 pool. Missing suffixed values use that role's typed defaults; they do not
 inherit the application value.
 
-## Database roles and connection budget
+## Database logins and connection budget
 
-| Role | Lifetime | Purpose |
+| Login | Lifetime | Purpose |
 |---|---|---|
-| `wyrd_app` | Runtime | Tenant-scoped RLS traffic through `TenantConn` |
-| `wyrd_platform_admin` | Runtime | Named, audited, cross-tenant operator capabilities through `OperatorPool`; Bifrost Iceberg catalog owner |
-| database owner | `wyrd-server migrate` only | DDL for Wyrd and Vala schemas; never held by a serving process |
+| platform (`WYRD_PLATFORM_DATABASE_URL`, else `WYRD_DATABASE_URL`) | `wyrd-server migrate` and runtime | Owns every Wyrd object; audited cross-tenant operator sessions (`app.operator=on`) through `OperatorPool`; Bifrost Iceberg catalog |
+| tenant (`WYRD_DATABASE_URL`) | Runtime | Tenant-scoped RLS traffic through `TenantConn`; the platform login itself in a one-login deployment |
 
 The deployment connection budget is:
 
@@ -141,8 +147,8 @@ transaction-pooled path.
 ## Migration contract
 
 Migrations are immutable, ordered, idempotent where re-entry is required, and
-executed by `wyrd-server migrate` with the database-owner login. Serving
-processes never receive that login and never run DDL.
+executed by `wyrd-server migrate` as the platform login, which must be able
+to create schemas in the database. Serving processes never run DDL.
 
 The deployment migration lease is one Postgres advisory lock for the physical
 migration domain: the connected Postgres cluster/database plus the fixed

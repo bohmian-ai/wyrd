@@ -2,18 +2,6 @@
 
 use crate::error::{ConfigParseError, StorageError};
 
-/// Read a required environment variable.
-///
-/// # Errors
-/// Returns [`StorageError::ConfigParse`] when the variable is absent or
-/// contains non-UTF-8 bytes.
-pub fn env_required(var: &'static str) -> Result<String, StorageError> {
-    std::env::var(var).map_err(|source| StorageError::ConfigParse {
-        var,
-        source: ConfigParseError::MissingEnv(source),
-    })
-}
-
 /// Read an optional environment variable.
 ///
 /// Returns `None` when the variable is not set.

@@ -37,6 +37,8 @@ ALTER TABLE wyrd.auth_users FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_users
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_users TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Roles (RBAC)
@@ -57,6 +59,8 @@ ALTER TABLE wyrd.auth_roles FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_roles
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_roles TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Non-human principals (Service / Agent) — card-bound
@@ -99,6 +103,8 @@ ALTER TABLE wyrd.auth_service_accounts FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_service_accounts
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_service_accounts TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Role grants (user-to-role and service-account-to-role)
@@ -125,6 +131,8 @@ ALTER TABLE wyrd.auth_user_roles FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_user_roles
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_user_roles TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE TABLE wyrd.auth_service_account_roles (
     data_tenant_id        UUID NOT NULL REFERENCES platform.tenants(data_tenant_id),
@@ -143,6 +151,8 @@ ALTER TABLE wyrd.auth_service_account_roles FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_service_account_roles
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_service_account_roles TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- API keys (bootstrap credential for Service / Agent pods)
@@ -178,6 +188,8 @@ ALTER TABLE wyrd.auth_api_keys FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_api_keys
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_api_keys TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Refresh tokens — principal-generic
@@ -214,3 +226,5 @@ ALTER TABLE wyrd.auth_refresh_tokens FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_refresh_tokens
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_refresh_tokens TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

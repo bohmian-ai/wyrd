@@ -25,8 +25,8 @@ ALTER TABLE vala.audit_publication FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.audit_publication
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-GRANT SELECT, INSERT, UPDATE ON vala.audit_publication TO wyrd_app;
+CREATE POLICY operator_access ON vala.audit_publication TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 INSERT INTO vala.audit_publication (data_tenant_id, published_seq, publishing_seq_hi)
 SELECT data_tenant_id, published_seq, publishing_seq_hi

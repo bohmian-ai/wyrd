@@ -342,10 +342,9 @@ Write-path redaction (when enabled) zeros sensitive columns before seal. Columns
 
 ## Database privilege model
 
-Bifrost uses three Postgres connection pools with distinct privilege levels:
+Bifrost uses two Postgres pools. Every table forces row-level security; the pool decides scope:
 
-- **TenantConn** (RLS-enforced, `wyrd_app` role). Tenant-scoped queries and writes. Row-level security enforced on `data_tenant_id`.
-- **OperatorPool** (BYPASSRLS, `wyrd_platform_admin` role). Cross-tenant reads/writes for Forge compaction, Oracle query coordination, and maintenance tasks.
-- **RecoveryConn** (`wyrd_recovery` role). Disaster recovery and migration tasks only.
+- **TenantConn** (tenant login). Tenant-scoped queries and writes. The `tenant_isolation` policy admits only the bound tenant's `data_tenant_id`.
+- **OperatorPool** (platform login, operator session). Cross-tenant reads and writes for Forge compaction, Oracle query coordination, and maintenance tasks. The `operator_access` policy admits it only because that login owns Wyrd's objects.
 
-Scribe uses TenantConn for its tenant lineage writes (RLS-bound). Forge and Oracle use OperatorPool for cross-tenant operations with explicit admin roles.
+Scribe uses TenantConn for its tenant lineage writes. Forge and Oracle use OperatorPool for cross-tenant operations.

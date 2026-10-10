@@ -4,7 +4,7 @@
 //! store: `POST/GET/DELETE /v1/admin/trusted-issuers` and
 //! `/v1/admin/workload-bindings`. Every mutation is permission-gated
 //! (`service_accounts:write`) and writes through a [`TenantConn`] on the
-//! `wyrd_app` RLS pool, so Postgres row-level security is the load-bearing
+//! RLS-scoped tenant pool, so Postgres row-level security is the load-bearing
 //! tenant boundary — no per-query tenant filtering.
 //!
 //! Create resolves OIDC discovery exactly once to fill `jwks_uri`, encrypts the

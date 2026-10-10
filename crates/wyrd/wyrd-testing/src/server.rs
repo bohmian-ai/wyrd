@@ -3653,7 +3653,7 @@ impl WyrdTestServer {
     ///
     /// The RLS handle the isolation test drives directly: two distinct calls
     /// yield two independent [`TenantConn`]s scoped to different
-    /// `data_tenant_id`s on the shared `wyrd_app` pool.
+    /// `data_tenant_id`s on the shared tenant pool.
     ///
     /// # Errors
     /// Returns an error when acquiring or binding the transaction fails.

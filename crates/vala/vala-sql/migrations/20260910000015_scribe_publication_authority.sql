@@ -6,10 +6,15 @@ CREATE FUNCTION vala.assert_scribe_publication_fence(
     p_node_id uuid,
     p_fencing_token bigint
 ) RETURNS boolean
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, vala
 AS $$
+DECLARE
+    prior text := coalesce(current_setting('app.operator', true), '');
+    matched boolean;
+BEGIN
+    PERFORM set_config('app.operator', 'on', true);
     SELECT EXISTS (
         SELECT 1
           FROM vala.cluster_nodes
@@ -18,9 +23,8 @@ AS $$
            AND role = 'scribe'
            AND fencing_token = p_fencing_token
          FOR UPDATE
-    )
+    ) INTO matched;
+    PERFORM set_config('app.operator', prior, true);
+    RETURN matched;
+END;
 $$;
-
-REVOKE ALL ON FUNCTION vala.assert_scribe_publication_fence(uuid, uuid, bigint) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION vala.assert_scribe_publication_fence(uuid, uuid, bigint)
-    TO wyrd_platform_admin;

@@ -86,8 +86,5 @@ jobs:
       - name: Run isolated Postgres concurrency checks
         run: mise run test:postgres:concurrency
 
-      - name: Run isolated Postgres role checks
-        run: mise run test:postgres:roles
-
       - name: Run isolated Postgres inventory checks
         run: mise run test:postgres:inventory

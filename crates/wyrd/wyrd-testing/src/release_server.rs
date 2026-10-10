@@ -2,7 +2,7 @@
 //! (`docs/src/content/docs/self-hosting/local-development.svx`) tells an
 //! operator to, for the opt-in benchmark binaries.
 //!
-//! The operator steps are: the database owner runs `wyrd-server migrate`;
+//! The operator steps are: `wyrd-server migrate` runs as the platform login;
 //! `wyrd-server` serves with the environment the Postgres wrapper exported;
 //! `wyrd-server setup --tenant` prints each tenant's admin credential, the
 //! first run also disclosing the platform credential the later runs present.
@@ -173,8 +173,8 @@ enum Role {
 }
 
 impl LocalServer {
-    /// Migrates `binary` as the database owner at `owner_url` and serves it
-    /// with `env` added in `envelope`, then runs `setup` once per slug in
+    /// Migrates `binary` with the database URLs the Postgres wrapper exported
+    /// and serves it with `env` added in `envelope`, then runs `setup` once per slug in
     /// `tenants`, returning once `/readyz` answers 200, the cgroup enforces
     /// the envelope, and every tenant's credential was printed.
     ///
@@ -199,7 +199,6 @@ impl LocalServer {
     /// wrote stay in the database; a retry starts from a fresh database.
     pub async fn start(
         binary: &Path,
-        owner_url: &str,
         tenants: &[&str],
         env: &[(&str, &str)],
         envelope: Envelope,
@@ -210,9 +209,7 @@ impl LocalServer {
         let storage_url = format!("file://{}", storage.display());
         let workdir = root.path().to_path_buf();
         OperatorRun::spawn(
-            operator(binary, &workdir, &storage_url, 0, Role::Serving, env)
-                .arg("migrate")
-                .env("WYRD_DATABASE_URL", owner_url),
+            operator(binary, &workdir, &storage_url, 0, Role::Serving, env).arg("migrate"),
             &workdir.join("migrate.stderr"),
         )?
         .finish()

@@ -8,7 +8,7 @@
 //! "one Active, one Candidate".
 //!
 //! The two sealed-secret rewrap functions are the only cross-tenant slots: they
-//! run on the BYPASSRLS [`OperatorPool`] because sealing-key rotation is a
+//! run on the cross-tenant [`OperatorPool`] because sealing-key rotation is a
 //! deployment operation over every tenant's ciphertext, and each update is a
 //! compare-and-swap on the exact bytes read so a concurrent rotation cannot be
 //! overwritten. Besides this table's client secrets they cover the workload

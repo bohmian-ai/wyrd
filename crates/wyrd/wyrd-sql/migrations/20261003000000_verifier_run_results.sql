@@ -33,6 +33,5 @@ ALTER TABLE wyrd.verifier_run_results FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.verifier_run_results
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-REVOKE ALL ON TABLE wyrd.verifier_run_results FROM wyrd_app, wyrd_platform_admin;
-GRANT SELECT, INSERT, DELETE ON wyrd.verifier_run_results TO wyrd_app;
+CREATE POLICY operator_access ON wyrd.verifier_run_results TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

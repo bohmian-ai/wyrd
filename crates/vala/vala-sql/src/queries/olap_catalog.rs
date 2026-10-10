@@ -1,7 +1,7 @@
 //! Tenant-scoped reads + writes for the Vala OLAP catalog control table
 //! `vala.bifrost_tables`.
 //! All callers must pass a [`TenantConn`] — the wyrd-sql RLS bind enforces
-//! tenant scope for wyrd_app-role paths.
+//! tenant scope.
 // raw-query grep allowlist: olap control tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use serde_json::Value;

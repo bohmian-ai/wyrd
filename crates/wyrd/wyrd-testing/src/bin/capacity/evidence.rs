@@ -219,12 +219,12 @@ type RunRow = (String, String, Option<i64>);
 
 /// The database owner's view of every durable queue.
 pub struct Queue {
-    /// Owner pool, which reads every tenant's rows.
+    /// Superuser pool, which reads every tenant's rows.
     owner: PgPool,
 }
 
 impl Queue {
-    /// Connects as the database owner at `owner_url`.
+    /// Connects as the cluster administrator at `admin_url`.
     ///
     /// # Errors
     ///
@@ -233,9 +233,9 @@ impl Queue {
     /// # Cancellation
     ///
     /// Read-only; a dropped connect leaves nothing behind.
-    pub async fn connect(owner_url: &str) -> Result<Self> {
+    pub async fn connect(admin_url: &str) -> Result<Self> {
         Ok(Self {
-            owner: PgPool::connect(owner_url).await?,
+            owner: PgPool::connect(admin_url).await?,
         })
     }
 

@@ -24,7 +24,7 @@ readonly root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly manifests="$root/deploy/kubernetes/kind"
 readonly cluster="wyrd-autoscale"
 readonly ns=wyrd-kind
-readonly owner_pw=owner_pw_kind app_pw=app_pw_kind platform_pw=platform_pw_kind
+readonly app_pw=app_pw_kind platform_pw=platform_pw_kind
 readonly deadline_scale=240 deadline_ready=300
 mkdir -p "$root/target"
 readonly work="$(mktemp -d "$root/target/wyrd-kind.XXXXXX")"
@@ -153,9 +153,13 @@ k run bucket --rm -i --restart=Never --quiet \
   --env=AWS_DEFAULT_REGION=us-east-1 \
   -- --endpoint-url http://rustfs.$ns.svc:9000 s3api create-bucket --bucket wyrd-kind >/dev/null
 
-echo "== secrets: serving roles, signing key, and one dedicated peer CA"
-psql_owner --set "app_password=$app_pw" --set "platform_admin_password=$platform_pw" \
-  <"$root/crates/wyrd/wyrd-sql/bootstrap/roles.sql" >/dev/null
+echo "== secrets: DBA-created logins, signing key, and one dedicated peer CA"
+{
+  printf "CREATE ROLE wyrd_platform LOGIN PASSWORD '%s';\n" "$platform_pw"
+  printf "CREATE ROLE wyrd_tenant LOGIN PASSWORD '%s';\n" "$app_pw"
+  printf 'ALTER DATABASE wyrd OWNER TO wyrd_platform;\n'
+  cat "$root/scripts/postgres/test-database-setup.sql"
+} | psql_owner >/dev/null
 openssl genpkey -algorithm ed25519 -out "$work/signing.pem" 2>/dev/null
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
   -subj "/CN=Wyrd kind peer CA" -keyout "$work/ca.key" -out "$work/ca.crt" \
@@ -169,11 +173,9 @@ openssl x509 -req -in "$work/tls.csr" -CA "$work/ca.crt" -CAkey "$work/ca.key" -
 # The CA private key never leaves the script's work directory.
 k create secret generic wyrd-peer-tls --from-file="$work/ca.crt" --from-file="$work/tls.crt" \
   --from-file="$work/tls.key" >/dev/null
-k create secret generic wyrd-owner \
-  --from-literal=database-url="postgres://wyrd_owner:$owner_pw@postgres.$ns.svc:5432/wyrd" >/dev/null
 k create secret generic wyrd-secrets --from-file=signing.pem="$work/signing.pem" \
-  --from-literal=database-url="postgres://wyrd_app:$app_pw@postgres.$ns.svc:5432/wyrd" \
-  --from-literal=platform-database-url="postgres://wyrd_platform_admin:$platform_pw@postgres.$ns.svc:5432/wyrd" \
+  --from-literal=database-url="postgres://wyrd_tenant:$app_pw@postgres.$ns.svc:5432/wyrd" \
+  --from-literal=platform-database-url="postgres://wyrd_platform:$platform_pw@postgres.$ns.svc:5432/wyrd" \
   >/dev/null
 
 echo "== migrate, then one anchor and one autoscaled Oracle"

@@ -2,8 +2,7 @@
 --
 -- Two stores, one model. Tenant-scope principals stay in `wyrd.*` under row
 -- level security, which remains the load-bearing tenant boundary. Platform-scope
--- principals live in `platform.*`, reachable only through the BYPASSRLS operator
--- role. A platform principal's absence of tenancy is structural — the table has
+-- principals live in `platform.*`, reachable only through operator sessions. A platform principal's absence of tenancy is structural — the table has
 -- no tenant column — rather than a nullable column guarded by a check.
 --
 -- Principal kind fixes scope; grants fix authority. `global_admin` is the only
@@ -28,7 +27,7 @@ DROP TABLE IF EXISTS platform.users;
 -- ---------------------------------------------------------------------------
 -- No `data_tenant_id` column exists here by design: a platform principal cannot
 -- be given a tenant, so the constraint cannot be violated rather than merely
--- being checked. Only `wyrd_platform_admin` reaches this table.
+-- being checked. Only operator sessions reach the platform-scope tables.
 CREATE TABLE platform.principals (
     id              UUID PRIMARY KEY,
     principal_kind  TEXT NOT NULL CHECK (principal_kind = 'global_admin'),
@@ -77,9 +76,20 @@ CREATE TABLE platform.principal_grants (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-GRANT SELECT, INSERT, UPDATE, DELETE
-    ON platform.principals, platform.credentials, platform.principal_grants
-    TO wyrd_platform_admin;
+ALTER TABLE platform.principals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE platform.principals FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON platform.principals TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
+
+ALTER TABLE platform.credentials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE platform.credentials FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON platform.credentials TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
+
+ALTER TABLE platform.principal_grants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE platform.principal_grants FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON platform.principal_grants TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Tenant-scope principals: Card binding becomes a property

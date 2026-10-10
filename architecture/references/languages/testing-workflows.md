@@ -62,10 +62,12 @@ Use the narrowest `mise` task that covers the touched surface:
 ## Repository-managed Postgres and production-shaped harnesses
 
 `wyrd-dev-fixtures::PgFixture` owns one isolated ephemeral database per test.
-The least-privilege `wyrd_test_admin` role alone creates and drops databases;
-it also owns and migrates each fixture database, as `wyrd-server migrate` does,
-while the serving `wyrd_app` and `wyrd_platform_admin` logins cannot create or
-drop databases.
+The Compose superuser `wyrd_test_admin` plays the DBA: it alone creates and
+drops databases, hands each one to the ordinary `wyrd_platform` login, and
+performs the per-database setup in `scripts/postgres/test-database-setup.sql`
+for the separate `wyrd_tenant` login. `wyrd_platform` migrates each fixture
+database, as `wyrd-server migrate` does; neither serving login can create
+databases.
 `PgFixture::attach` lets child processes reuse the parent-created database
 without remigration, reseeding, or cleanup authority. Attached fixtures are
 non-owning and cannot destroy the parent database.

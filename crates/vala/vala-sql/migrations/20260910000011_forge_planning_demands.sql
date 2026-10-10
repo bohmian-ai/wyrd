@@ -17,9 +17,8 @@ ALTER TABLE vala.forge_planning_demands FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.forge_planning_demands
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON vala.forge_planning_demands TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE INDEX forge_planning_demands_ring
     ON vala.forge_planning_demands (data_tenant_id, last_requested_at, catalog_name, namespace_name, table_name);
-
-GRANT SELECT, INSERT, UPDATE ON vala.forge_planning_demands TO wyrd_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON vala.forge_planning_demands TO wyrd_platform_admin;

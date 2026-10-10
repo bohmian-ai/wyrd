@@ -29,7 +29,7 @@ pub use operator_pool::OperatorPool;
 pub use pool::PoolConfig;
 pub use postgres::WyrdPostgres;
 pub use row_types::cards::{CardRow, CardStatus, ParsedCardRow};
-pub use schema_check::SchemaAccess;
+pub use schema_check::RowScope;
 pub use tenant_conn::TenantConn;
 
 /// Platform-global schema owned by `wyrd-sql`.
@@ -73,8 +73,10 @@ impl MigrationLease {
     /// Apply one crate's embedded migrations under this lease.
     ///
     /// Creates the crate's owned `schemas` if absent, sets the session
-    /// `search_path` the crate's migrations expect, and runs `migrator` on the
-    /// lease's own session. Each schema owner calls this through its own
+    /// `search_path` the crate's migrations expect, marks the session as an
+    /// operator session so migration seeds and backfills pass the
+    /// `operator_access` policies, and runs `migrator` on the lease's own
+    /// session. Each schema owner calls this through its own
     /// `migrate` function; Wyrd must run before Vala, whose migrations depend
     /// on Wyrd's schemas.
     ///
@@ -97,6 +99,11 @@ impl MigrationLease {
             .map_err(classify_bootstrap_error)?;
         }
         sqlx::query(AssertSqlSafe(format!("SET search_path TO {search_path}")))
+            .execute(&mut self.session)
+            .await
+            .map_err(classify_bootstrap_error)?;
+        sqlx::query("SELECT set_config($1, 'on', false)")
+            .bind(dsn::OPERATOR_SETTING)
             .execute(&mut self.session)
             .await
             .map_err(classify_bootstrap_error)?;
@@ -130,12 +137,14 @@ impl MigrationLease {
 /// Apply embedded Wyrd SQL migrations under the migration lease.
 ///
 /// Creates the `platform` and `wyrd` schemas and runs every Wyrd migration
-/// with `search_path` set to `wyrd, platform, public`. Calling with a lease
-/// acquired from a serving `wyrd_app` DSN fails on the bootstrap DDL and
-/// returns [`SqlError::InsufficientPrivilege`].
+/// with `search_path` set to `wyrd, platform, public`. The lease's login
+/// becomes the owner of every object, and so the role every `operator_access`
+/// policy admits; serving must use the same login for its platform pool. A
+/// login without DDL privileges fails on the schema bootstrap and returns
+/// [`SqlError::InsufficientPrivilege`].
 ///
 /// # Errors
-/// Returns [`SqlError::InsufficientPrivilege`] when the role lacks DDL
+/// Returns [`SqlError::InsufficientPrivilege`] when the login lacks DDL
 /// privileges, [`SqlError::Connect`] when a bootstrap statement fails, and
 /// [`SqlError::Migrate`] when migration execution fails.
 pub async fn migrate(lease: &mut MigrationLease) -> Result<(), SqlError> {
@@ -146,27 +155,26 @@ pub async fn migrate(lease: &mut MigrationLease) -> Result<(), SqlError> {
 
 /// Prove the Wyrd schema contract holds for serving.
 ///
-/// Checks both serving roles' attributes, every embedded Wyrd migration and
-/// checksum, both roles' privileges on the `platform` and `wyrd` schemas, and
-/// tenant isolation in `wyrd`. The one-off migration runs this after migrating
-/// and serving boot runs it before reporting ready, so both enforce the same
-/// contract. Read-only.
+/// Checks every embedded Wyrd migration and checksum and the row-level
+/// security of every table in `platform` ([`RowScope::Platform`]) and `wyrd`
+/// ([`RowScope::Tenant`]). The one-off migration runs this after migrating and
+/// serving boot runs it before reporting ready, so both enforce the same
+/// contract. Login posture is checked by the serving owners. Read-only.
 ///
 /// # Errors
 /// Returns [`SqlError::SchemaNotReady`] for the first failed check,
 /// [`SqlError::MigrateChecksum`] for checksum drift, and [`SqlError::Connect`]
 /// on query failure.
 pub async fn verify_schema(operator: &OperatorPool) -> Result<(), SqlError> {
-    operator.verify_serving_roles().await?;
     operator
         .verify_migrations(MIGRATION_LEDGER, &MIGRATOR)
         .await?;
-    for schema in OWNED_SCHEMAS {
-        operator
-            .verify_schema_privileges(schema, SchemaAccess::Usage, SchemaAccess::Usage)
-            .await?;
-    }
-    operator.verify_tenant_isolation(CONTROL_SCHEMA).await
+    operator
+        .verify_row_security(PLATFORM_SCHEMA, RowScope::Platform)
+        .await?;
+    operator
+        .verify_row_security(CONTROL_SCHEMA, RowScope::Tenant)
+        .await
 }
 
 fn classify_bootstrap_error(error: sqlx::Error) -> SqlError {
@@ -184,9 +192,8 @@ impl OperatorPool {
     /// Acquire the migration lease on a dedicated owner connection.
     ///
     /// Only the one-off `wyrd-server migrate` calls this, on an operator pool
-    /// it builds from the database-owner DSN; serving pools never hold that
-    /// credential. The connection is opened from the pool's options rather
-    /// than detached from it, so its session state and the lock never return
+    /// it builds from the platform login. The connection is opened from the
+    /// pool's options rather than detached from it, so its session state and the lock never return
     /// to the pool, and the pool never starts a background reconnect to
     /// replace it: a reconnect stranded mid-login holds up every
     /// `DROP DATABASE` in the cluster until authentication times out. The
@@ -583,72 +590,6 @@ mod tests {
                 && migrations.contains("wire_protocol"),
             "multipart rows must persist restart-safe non-bearer completion state"
         );
-    }
-
-    #[test]
-    fn storage_migrations_revoke_inherited_broad_privileges() {
-        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let storage = fs::read_to_string(
-            crate_dir
-                .join("migrations")
-                .join("20260601000002_storage.sql"),
-        )
-        .expect("storage migration is readable");
-        let idempotency = fs::read_to_string(
-            crate_dir
-                .join("migrations")
-                .join("20260601000003_storage_idempotency.sql"),
-        )
-        .expect("storage idempotency migration is readable");
-        let migrations = format!("{storage}\n{idempotency}");
-
-        for (table, app_grant, admin_grant) in [
-            (
-                "wyrd.storage_multipart_uploads",
-                "GRANT SELECT, INSERT, UPDATE ON wyrd.storage_multipart_uploads TO wyrd_app;",
-                "GRANT SELECT, UPDATE ON wyrd.storage_multipart_uploads TO wyrd_platform_admin;",
-            ),
-            (
-                "wyrd.storage_artifact_metadata",
-                "GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_artifact_metadata TO wyrd_app;",
-                "GRANT SELECT ON wyrd.storage_artifact_metadata TO wyrd_platform_admin;",
-            ),
-            (
-                "wyrd.storage_idempotency_keys",
-                "GRANT SELECT, INSERT, UPDATE ON wyrd.storage_idempotency_keys TO wyrd_app;",
-                "GRANT SELECT, DELETE ON wyrd.storage_idempotency_keys TO wyrd_platform_admin;",
-            ),
-        ] {
-            assert!(
-                migrations.contains(&format!("REVOKE ALL ON TABLE {table} FROM wyrd_app;")),
-                "{table} must revoke inherited app table privileges"
-            );
-            assert!(
-                migrations.contains(&format!(
-                    "REVOKE ALL ON TABLE {table} FROM wyrd_platform_admin;"
-                )),
-                "{table} must revoke inherited platform-admin table privileges"
-            );
-            assert!(
-                migrations.contains(app_grant),
-                "{table} must grant the exact intended app privileges"
-            );
-            assert!(
-                migrations.contains(admin_grant),
-                "{table} must grant the exact intended platform-admin privileges"
-            );
-        }
-
-        for forbidden in [
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_multipart_uploads",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_artifact_metadata TO wyrd_platform_admin",
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_idempotency_keys TO wyrd_app",
-        ] {
-            assert!(
-                !migrations.contains(forbidden),
-                "storage migrations must not leave broad grant shape: {forbidden}"
-            );
-        }
     }
 
     #[test]

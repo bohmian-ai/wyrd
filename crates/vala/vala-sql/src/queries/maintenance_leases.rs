@@ -8,8 +8,8 @@
 //!
 //! Lease rows live in `vala.maintenance_leases` (created by migration
 //! `20260906000001_maintenance_leases`). The table is a cross-tenant
-//! control-plane surface with no tenant column and no RLS, so these functions
-//! take `&OperatorPool` (the `wyrd_platform_admin` BYPASSRLS pool) rather than a
+//! control-plane surface with no tenant column that admits only operator
+//! sessions, so these functions take `&OperatorPool` rather than a
 //! tenant-scoped `TenantConn`.
 
 use sqlx::types::Uuid;
@@ -74,7 +74,7 @@ pub async fn renew_lease_fenced(
     lease_secs: i64,
 ) -> Result<bool, SqlError> {
     // Dynamic query is intentional: maintenance leases are a cross-tenant
-    // control-plane table accessed via the operator pool (BYPASSRLS).
+    // control-plane table accessed via the operator pool.
     let result = sqlx::query(
         r"
         UPDATE vala.maintenance_leases
@@ -154,7 +154,7 @@ pub async fn try_acquire_lease(
     lease_secs: i64,
 ) -> Result<Option<LeaseAcquisition>, SqlError> {
     // Dynamic query is intentional: maintenance leases are a cross-tenant
-    // control-plane table accessed via the operator pool (BYPASSRLS).
+    // control-plane table accessed via the operator pool.
     //
     // The WHERE clause also allows re-acquisition by the SAME owner (equal
     // `owner`), which is how back-to-back ticks from one process (NOTIFY →

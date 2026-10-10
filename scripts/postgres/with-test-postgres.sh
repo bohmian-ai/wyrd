@@ -12,8 +12,8 @@ readonly repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly compose_file="${WYRD_POSTGRES_COMPOSE_FILE:-$repo_root/docker-compose.yml}"
 readonly compose_project="$(printf 'wyrd-test-%s-%s-%s' "$(basename "$repo_root")" "${PPID:-0}" "${BASHPID:-$$}" | tr '[:upper:]_./ ' '[:lower:]----' | tr -cd 'a-z0-9-' | cut -c1-48)"
 readonly admin_password="${WYRD_TEST_POSTGRES_ADMIN_PASSWORD:-wyrd_test_admin_pw}"
-readonly app_password="${WYRD_TEST_POSTGRES_APP_PASSWORD:-wyrd_app_pw}"
-readonly platform_admin_password="${WYRD_TEST_POSTGRES_PLATFORM_ADMIN_PASSWORD:-wyrd_platform_admin_pw}"
+readonly tenant_password="${WYRD_TEST_POSTGRES_TENANT_PASSWORD:-wyrd_tenant_pw}"
+readonly platform_password="${WYRD_TEST_POSTGRES_PLATFORM_PASSWORD:-wyrd_platform_pw}"
 readonly compose=(docker compose --project-name "$compose_project" --file "$compose_file")
 
 cleanup() {
@@ -95,14 +95,16 @@ if ! start_postgres; then
   fi
 fi
 
-# The Compose administrator is the database owner: it bootstraps the two
-# serving roles, creates fixture databases, and runs migrations exactly as
-# `wyrd-server migrate` does. Serving code receives only the two serving URLs.
+# The Compose superuser plays the DBA: it creates two ordinary logins, hands
+# the `wyrd` database to the platform login, and performs the per-database
+# setup in `test-database-setup.sql`, as an operator would for a two-login
+# deployment. The fixture repeats that setup for every database it creates.
+# Serving code receives only the two serving URLs.
 admin_dsn="postgres://wyrd_test_admin:${admin_password}@${host}:${port}/wyrd"
 export DATABASE_URL="$admin_dsn"
 export WYRD_TEST_DATABASE_ADMIN_URL="$admin_dsn"
-export WYRD_DATABASE_URL="postgres://wyrd_app:${app_password}@${host}:${port}/wyrd"
-export WYRD_PLATFORM_DATABASE_URL="postgres://wyrd_platform_admin:${platform_admin_password}@${host}:${port}/wyrd"
+export WYRD_DATABASE_URL="postgres://wyrd_tenant:${tenant_password}@${host}:${port}/wyrd"
+export WYRD_PLATFORM_DATABASE_URL="postgres://wyrd_platform:${platform_password}@${host}:${port}/wyrd"
 
 # Journey and e2e lanes boot one WyrdTestServer per test, each retaining an
 # app pool sized for a production server (PoolConfig::app_defaults, 32). A test
@@ -111,13 +113,14 @@ export WYRD_PLATFORM_DATABASE_URL="postgres://wyrd_platform_admin:${platform_adm
 # platform-admin pools are already 2 and read their own suffixed vars.
 export WYRD_DB_MAX_CONNECTIONS="${WYRD_DB_MAX_CONNECTIONS:-8}"
 
-# Bootstrap with the container's own psql so the client always matches the
-# server; `roles.sql` needs psql 15+, which a host PATH does not guarantee.
-"${compose[@]}" exec -T postgres psql --username=wyrd_test_admin --dbname=wyrd \
-  --set=ON_ERROR_STOP=1 \
-  --set=app_password="$app_password" \
-  --set=platform_admin_password="$platform_admin_password" \
-  <"$repo_root/crates/wyrd/wyrd-sql/bootstrap/roles.sql"
+# Use the container's own psql so the client always matches the server.
+{
+  printf "CREATE ROLE wyrd_platform LOGIN PASSWORD '%s';\n" "$platform_password"
+  printf "CREATE ROLE wyrd_tenant LOGIN PASSWORD '%s';\n" "$tenant_password"
+  printf 'ALTER DATABASE wyrd OWNER TO wyrd_platform;\n'
+  cat "$repo_root/scripts/postgres/test-database-setup.sql"
+} | "${compose[@]}" exec -T postgres psql --username=wyrd_test_admin --dbname=wyrd \
+  --set=ON_ERROR_STOP=1 --quiet
 
 set +e
 "$@"

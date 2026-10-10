@@ -37,6 +37,8 @@ ALTER TABLE vala.forge_tasks FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.forge_tasks
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON vala.forge_tasks TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE UNIQUE INDEX forge_tasks_idempotency ON vala.forge_tasks
  (data_tenant_id, catalog_name, namespace_name, table_name, strategy, base_snapshot_id, plan_hash);
@@ -67,8 +69,9 @@ CREATE TABLE vala.forge_scheduler_state (
     last_tenant_id uuid,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
-INSERT INTO vala.forge_scheduler_state (singleton) VALUES (true);
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON vala.forge_tasks TO wyrd_platform_admin;
-GRANT SELECT, UPDATE, DELETE ON vala.forge_tasks TO wyrd_app;
-GRANT SELECT, UPDATE ON vala.forge_scheduler_state TO wyrd_platform_admin;
+ALTER TABLE vala.forge_scheduler_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.forge_scheduler_state FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON vala.forge_scheduler_state TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
+INSERT INTO vala.forge_scheduler_state (singleton) VALUES (true);

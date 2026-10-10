@@ -435,40 +435,23 @@ mod pg_tests {
             .expect("policy query");
             assert_eq!(
                 policies,
-                vec![(
-                    "tenant_isolation".to_owned(),
-                    "PERMISSIVE".to_owned(),
-                    "ALL".to_owned(),
-                    "(data_tenant_id = wyrd.current_tenant())".to_owned(),
-                    "(data_tenant_id = wyrd.current_tenant())".to_owned(),
-                )],
-                "exact RLS policy mode, command, USING, and WITH CHECK"
-            );
-
-            let grants: Vec<(String, String)> = sqlx::query_as(
-                r"
-                SELECT grantee, privilege_type
-                  FROM information_schema.table_privileges
-                 WHERE table_schema = 'vala'
-                   AND table_name = 'forge_operation_state'
-                   AND grantee IN ('wyrd_app', 'wyrd_platform_admin')
-                 ORDER BY grantee, privilege_type
-                ",
-            )
-            .fetch_all(&superuser)
-            .await
-            .expect("grant query");
-            assert_eq!(
-                grants,
                 vec![
-                    ("wyrd_app".to_owned(), "INSERT".to_owned()),
-                    ("wyrd_app".to_owned(), "SELECT".to_owned()),
-                    ("wyrd_app".to_owned(), "UPDATE".to_owned()),
-                    ("wyrd_platform_admin".to_owned(), "INSERT".to_owned()),
-                    ("wyrd_platform_admin".to_owned(), "SELECT".to_owned()),
-                    ("wyrd_platform_admin".to_owned(), "UPDATE".to_owned()),
+                    (
+                        "operator_access".to_owned(),
+                        "PERMISSIVE".to_owned(),
+                        "ALL".to_owned(),
+                        "wyrd.operator_session()".to_owned(),
+                        "wyrd.operator_session()".to_owned(),
+                    ),
+                    (
+                        "tenant_isolation".to_owned(),
+                        "PERMISSIVE".to_owned(),
+                        "ALL".to_owned(),
+                        "(data_tenant_id = wyrd.current_tenant())".to_owned(),
+                        "(data_tenant_id = wyrd.current_tenant())".to_owned(),
+                    ),
                 ],
-                "complete role/privilege set"
+                "exact RLS policy mode, command, USING, and WITH CHECK"
             );
         }
 
@@ -1846,27 +1829,6 @@ mod pg_tests {
             .await
             .expect("rls flags");
             assert!(rls_enabled && rls_forced, "claims force row level security");
-
-            let grants: Vec<(String, String)> = sqlx::query_as(
-                "SELECT grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name='forge_snapshot_expiration_claims' AND grantee IN ('wyrd_app','wyrd_platform_admin') ORDER BY grantee,privilege_type",
-            )
-            .fetch_all(&superuser)
-            .await
-            .expect("claim grants");
-            let granted: Vec<(&str, &str)> = grants
-                .iter()
-                .map(|row| (row.0.as_str(), row.1.as_str()))
-                .collect();
-            assert_eq!(
-                granted,
-                vec![
-                    ("wyrd_app", "SELECT"),
-                    ("wyrd_platform_admin", "DELETE"),
-                    ("wyrd_platform_admin", "INSERT"),
-                    ("wyrd_platform_admin", "SELECT"),
-                ],
-                "claims are immutable: no role holds UPDATE"
-            );
 
             // --- preparation is one atomic transaction ---------------------
             let authority = ForgeExpirationAuthority {

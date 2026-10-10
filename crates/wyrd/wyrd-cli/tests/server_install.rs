@@ -19,6 +19,9 @@ use wyrd_cli::server::ServerInstaller;
 /// Host target every mock release publishes a bundle for.
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 
+/// A change that breaks one mock release in a specific way.
+type Corruption<'a> = dyn Fn(&mut MockRelease) + 'a;
+
 /// Fixed release signing key for the mock release service.
 fn signing_key() -> SigningKey {
     SigningKey::from_bytes(&[7; 32])
@@ -222,7 +225,7 @@ async fn server_install_preserves_previous_on_failure() {
         release.assets[0].1 = bytes;
         release.assets[1].1 = sums;
     };
-    let cases: [(&str, &dyn Fn(&mut MockRelease)); 6] = [
+    let cases: [(&str, &Corruption<'_>); 6] = [
         ("WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE", &missing_target),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &unsigned),
         ("WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED", &altered_sums),

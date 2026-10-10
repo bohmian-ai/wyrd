@@ -388,7 +388,8 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             WyrdCliError::ClientConfig { .. } => {
                 WyrdError::ClientConfigInvalid { message, details }
             }
-            WyrdCliError::ClientTransport { .. } => {
+            WyrdCliError::ClientTransport { .. }
+            | WyrdCliError::ServerReleaseUnavailable { .. } => {
                 WyrdError::ClientTransportDown { message, details }
             }
             WyrdCliError::CardLoad(error) => WyrdError::from(error),
@@ -408,9 +409,6 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             | WyrdCliError::ServerHostUnsupported { .. }
             | WyrdCliError::ServerVersionIncompatible { .. } => {
                 WyrdError::Validation { message, details }
-            }
-            WyrdCliError::ServerReleaseUnavailable { .. } => {
-                WyrdError::ClientTransportDown { message, details }
             }
             WyrdCliError::Query { .. }
             | WyrdCliError::Io { .. }

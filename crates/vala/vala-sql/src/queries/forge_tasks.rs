@@ -422,9 +422,13 @@ impl ForgeTasks {
     /// that attempt UUID while assigning a new compute owner. Recovery is
     /// governed by the same durable bounds as the fair claim (D78). There is no
     /// separate lease row to reacquire; the retained per-table publication index and the
-    /// task's own `claim_expires_at` expiry are the recovery authority. Because
-    /// a candidate's own Prepared row is excluded from the per-owner scan, an
-    /// owner that already holds it can renew ownership without self-blocking.
+    /// task's own `claim_expires_at` expiry are the recovery authority.
+    ///
+    /// `previous_owner` also selects an unexpired Prepared row that owner
+    /// still holds, so it renews ownership without self-blocking. The attempt
+    /// UUID is kept, so nothing fences a stale holder: a starting worker
+    /// passes its identity only after its previous invocation joined every
+    /// plan and heartbeat, and passes `None` otherwise so the lease lapses.
     ///
     /// # Errors
     /// Returns conflict for a zero lease, invariant errors for malformed rows,
@@ -436,6 +440,7 @@ impl ForgeTasks {
         &self,
         owner: Uuid,
         lease_seconds: u32,
+        previous_owner: Option<Uuid>,
     ) -> Result<Option<ForgePreparedTaskClaim>, SqlError> {
         if lease_seconds == 0 {
             return Err(SqlError::Conflict {
@@ -443,7 +448,7 @@ impl ForgeTasks {
             });
         }
         let sql = format!(
-            "WITH candidate AS MATERIALIZED (SELECT task_id,data_tenant_id,attempt_id FROM vala.forge_tasks c WHERE c.state='prepared' AND (c.claim_expires_at<statement_timestamp() OR c.claimed_by=$1) AND c.attempt_id IS NOT NULL ORDER BY c.claim_expires_at,c.task_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE vala.forge_tasks t SET claimed_by=$1,claim_expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id RETURNING t.*) SELECT c.data_tenant_id AS execution_tenant_id,{CLAIM_TASK_PROJECTION} FROM claimed t JOIN candidate c USING(task_id)"
+            "WITH candidate AS MATERIALIZED (SELECT task_id,data_tenant_id,attempt_id FROM vala.forge_tasks c WHERE c.state='prepared' AND (c.claim_expires_at<statement_timestamp() OR c.claimed_by=$3) AND c.attempt_id IS NOT NULL ORDER BY c.claim_expires_at,c.task_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE vala.forge_tasks t SET claimed_by=$1,claim_expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id RETURNING t.*) SELECT c.data_tenant_id AS execution_tenant_id,{CLAIM_TASK_PROJECTION} FROM claimed t JOIN candidate c USING(task_id)"
         );
         let mut tx = self
             .operator_pool
@@ -454,6 +459,7 @@ impl ForgeTasks {
         let row = sqlx::query_as::<_, ForgePreparedTaskClaimSqlRow>(AssertSqlSafe(sql))
             .bind(owner)
             .bind(i64::from(lease_seconds))
+            .bind(previous_owner)
             .fetch_optional(&mut *tx)
             .await
             .map_err(SqlError::from)?;
@@ -882,7 +888,7 @@ impl ForgeTasks {
     ///
     /// `previous_owner` also selects the unexpired attempts that owner still
     /// holds. Only a starting worker passes its own identity, and only after
-    /// its previous incarnation's loop joined every plan and heartbeat, so
+    /// its previous invocation joined every plan and heartbeat, so
     /// those leases protect no live execution and clearing the attempt id
     /// fences any stale holder.
     ///

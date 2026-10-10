@@ -976,8 +976,8 @@ mod pg_tests {
         let successor_a = Uuid::now_v7();
         let successor_b = Uuid::now_v7();
         let (takeover_a, takeover_b) = tokio::join!(
-            tasks.claim_prepared_for_reconciliation(successor_a, 30),
-            tasks.claim_prepared_for_reconciliation(successor_b, 30),
+            tasks.claim_prepared_for_reconciliation(successor_a, 30, None),
+            tasks.claim_prepared_for_reconciliation(successor_b, 30, None),
         );
         let taken = [
             takeover_a.expect("takeover A"),
@@ -1064,7 +1064,7 @@ mod pg_tests {
 
         let successor = Uuid::now_v7();
         let taken = tasks
-            .claim_prepared_for_reconciliation(successor, 30)
+            .claim_prepared_for_reconciliation(successor, 30, None)
             .await
             .expect("takeover")
             .expect("large Prepared task recovered");

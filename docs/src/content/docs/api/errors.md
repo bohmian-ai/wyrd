@@ -91,6 +91,16 @@ This page is the generated error catalog. For how an agent should act on these e
 | `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | 422 | `checksums.txt` or its signature is missing or not signed by the Wyrd release key, the bundle's SHA-256 differs, or the bundle does not extract to a runnable server. |
 | `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | 409 | The newest stable server is outside the CLI's compatible version line. Upgrade the CLI. |
 
+## MCP host codes
+
+`wyrd mcp install` and `wyrd mcp proxy` report these. Credential and endpoint failures use the shared client codes.
+
+| Code | Status | When |
+| --- | --- | --- |
+| `WYRD_CLI_400_MCP_HOST_SELECTION` | 400 | No host was selected: a non-interactive run named no `--host` (the message lists the detected hosts), or no supported host was detected for the prompt. Nothing changed. |
+| `WYRD_CLI_409_MCP_HOST_INSTALL` | 409 | At least one selected host was not connected: not detected, a `wyrd` entry that does not run `wyrd mcp proxy`, a file that cannot be parsed or edited, or a file that cannot be written. Each host's line names the file and next step; that host's file is unchanged and other hosts still install. |
+| `WYRD_CLI_503_MCP_PROXY` | 503 | The proxy could not establish its MCP session with the server's `/mcp`, or could not serve the host over stdio. |
+
 ## Registry codes
 
 | Code | Status | When |

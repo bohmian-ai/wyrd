@@ -84,7 +84,7 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 ## Reference
 
 - [Reference](https://mitari-ai.github.io/wyrd/reference/): The literal contract — CLI verbs, card schemas, error codes, and the API surface.
-- [CLI](https://mitari-ai.github.io/wyrd/reference/cli/): The wyrd binary — auth, eval, principal, and gateway commands, with every flag and environment variable.
+- [CLI](https://mitari-ai.github.io/wyrd/reference/cli/): The wyrd binary — auth, eval, principal, gateway, and mcp commands, with every flag and environment variable.
 
 ## Self-hosting
 

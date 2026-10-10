@@ -2063,7 +2063,12 @@ struct LeaderJourney {
 }
 
 impl LeaderJourney {
-    /// Starts `spec` with the default Forge policy and a completion observer.
+    /// Starts `spec` with the default Forge policy, no snapshot retention
+    /// window, and a completion observer.
+    ///
+    /// Retention is measured by Postgres time, which `advance` cannot move,
+    /// so a zero window is what lets a replaced snapshot expire on the pass
+    /// a scenario requests.
     ///
     /// `inject_uncertainty` routes every node's Forge catalog through the
     /// cluster's shared [`CommitUncertaintyCatalog`], which passes commits
@@ -2074,7 +2079,10 @@ impl LeaderJourney {
     async fn start(spec: BifrostClusterSpec, inject_uncertainty: bool) -> Self {
         let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
             spec,
-            ForgeConfig::default(),
+            ForgeConfig {
+                snapshot_retention: Duration::ZERO,
+                ..ForgeConfig::default()
+            },
             false,
             inject_uncertainty,
         )

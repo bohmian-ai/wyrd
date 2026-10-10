@@ -902,26 +902,28 @@ pub(crate) struct ScribeShardStartConfig {
 }
 
 impl ScribeShardRuntime {
-    /// Returns every writable or pending immutable seal key for one tenant table.
+    /// Returns every live partition of one tenant table, per memtable source,
+    /// with the bytes `scope` reads from it.
     ///
     /// Reads each shard's memtable directly, as [`Self::snapshot`] does for
     /// rows. An owner inserts rows before it acknowledges them but republishes
     /// its inspection snapshot only afterwards, so discovery from published
     /// snapshots could omit the partition of an already acknowledged write.
-    /// Only `table`'s keys are collected; the caller deduplicates.
+    /// Only `table`'s sources are collected; the caller sums per partition.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] when a memtable lock is poisoned.
-    pub(crate) fn active_seal_keys_for_table(
+    pub(crate) fn active_live_bytes_for_table(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
-    ) -> Result<Vec<crate::scribe::seal_key::SealKey>, ScribeError> {
-        let mut keys = Vec::new();
+        scope: &crate::scan_sizing::ScanScope,
+    ) -> Result<Vec<(crate::catalog::layout::TimePartition, u64)>, ScribeError> {
+        let mut partitions = Vec::new();
         for memtable in &self.memtables {
-            keys.extend(memtable.seal_keys_for_table(tenant, table)?);
+            partitions.extend(memtable.live_bytes_for_table(tenant, table, scope)?);
         }
-        Ok(keys)
+        Ok(partitions)
     }
 
     /// Closes shard admission before any potentially stalled graceful wait.

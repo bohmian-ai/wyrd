@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use vala_bifrost_redux::scan_sizing::ScanScope;
 use vala_bifrost_redux::scribe::tail_rpc::{FetchLiveTailService, TailReadError};
 use wyrd_tonic::private_conversion::PrivateConversionError;
 use wyrd_tonic::tonic::{Request, Response, Status};
@@ -39,27 +40,30 @@ impl ScribeTailGrpc {
 
 #[wyrd_tonic::tonic::async_trait]
 impl ScribeTailService for ScribeTailGrpc {
-    /// Lists active tenant/table event-day scopes; returns metadata, never rows.
+    /// Lists active tenant/table event-day scopes with the bytes the request's
+    /// scope reads in each; returns metadata, never rows.
     async fn list_active_streams(
         &self,
         request: Request<ListActiveStreamsRequest>,
     ) -> Result<Response<ListActiveStreamsResponse>, Status> {
+        let request = request.into_inner();
         let binding = request
-            .into_inner()
             .binding
             .ok_or_else(|| Status::invalid_argument("tail binding is required"))?;
         let binding = wyrd_spec::vala::api::TenantTableBinding::try_from(binding)
             .map_err(conversion_status)?;
+        let scope = ScanScope::from_wire(request.columns, &request.filters);
         let streams = self
             .source
-            .list_active_streams(&binding)
+            .list_active_streams(&binding, &scope)
             .map_err(tail_status)?;
         Ok(Response::new(ListActiveStreamsResponse {
             streams: streams
                 .into_iter()
-                .map(|(time_partition, stream)| proto::ActiveTailStream {
-                    time_partition: Some(time_partition.into()),
-                    stream: Some(stream.into()),
+                .map(|stream| proto::ActiveTailStream {
+                    time_partition: Some(stream.time_partition.into()),
+                    stream: Some(stream.stream.into()),
+                    bytes: stream.bytes,
                 })
                 .collect(),
         }))

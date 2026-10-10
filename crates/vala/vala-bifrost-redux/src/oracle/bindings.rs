@@ -25,7 +25,8 @@ use wyrd_spec::vala::error::BifrostError;
 use super::live::LiveDispatch;
 use super::{DegradedSourceAccumulator, QueryCatalogError};
 #[cfg(all(feature = "test-support", feature = "bench-support"))]
-use crate::resources::{OracleSessionShape, oracle_target_partitions};
+use crate::resources::OracleSessionShape;
+use crate::scan_sizing::oracle_target_partitions;
 
 /// The admitted execution governance every leaf resolves from its task.
 ///

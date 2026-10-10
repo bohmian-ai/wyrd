@@ -2190,6 +2190,7 @@ mod tests {
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             scratch_root: None,
             volume_roots: None,
         };
@@ -2287,7 +2288,7 @@ mod tests {
                         fixture_oracle_role()
                             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                                 wyrd_spec::vala::api::QueryClass::Analytical,
-                                0.0,
+                                8,
                             ))
                             .expect("an idle Oracle admits one analytical query"),
                     ),

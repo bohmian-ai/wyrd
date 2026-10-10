@@ -746,12 +746,35 @@ allocations outside cooperative reservation fall in the server minimum; the
 pool is the Bifrost safety boundary, not a guarantee against operating-system
 or cgroup OOM.
 
-Query parallelism comes from CPU, not memory. Before
-physical planning, every Oracle leader, Oracle peer, and distributed stage
-session sets its target partitions from the node's effective CPU and the pinned input's
-locality: `cpu + (4 * cpu - cpu) * (1 - local_ratio)`, never below two, where
-`local_ratio` is the pinned bytes held in the local hot tier. Neither the grant
-nor the pinned file count changes it. Batch size and join preference are the
+Query parallelism comes from CPU and scanned bytes, not memory. The node's
+effective CPU and the pinned input's locality cap it:
+`cpu + (4 * cpu - cpu) * (1 - local_ratio)`, never below two, where
+`local_ratio` is the pinned bytes held in the local hot tier. Before physical
+planning, the Oracle leader narrows that cap to the bytes the query scans: one
+partition per started `WYRD_BIFROST_ORACLE_PARTITION_SCAN_BYTES` (24 MiB by
+default), at least one. Scanned bytes are measured by one owner,
+`scan_sizing::ScanSizer`, on every tier: the query's projected columns in the
+units its filters cannot rule out by their recorded bounds, counted in decoded
+bytes. A Parquet unit is a row group of a published file, hot file, or staged
+run, counted by its uncompressed column chunks from the footer (a file whose
+footer cannot be read counts its size on disk); a memtable unit is an append
+batch, counted by the Arrow memory it retains. Oracle sizes published and hot
+files; each Scribe reports its memtable batches and staged runs for the same
+columns and filters, and its follower sizes its memtable leaf from the batches
+it actually keeps. Neither the grant nor the pinned file count changes it.
+Where the rule cannot apply (a filter conjunct that does not plan, a footer
+not read) sizing keeps more and counts it in
+`bifrost_scan_sizing_fallback_total{reason}`; Oracle counts the row groups it
+sized in `oracle_query_row_groups_sized_total`, read beside
+`oracle_query_row_groups_scanned_total`, and the query capacity benchmark
+flags a window where either diverges.
+
+Because the class is read from the physical root, it follows from this count:
+a single-partition plan has no exchange for the distributed planner to cut, so
+a point lookup or small scan runs Interactive, and only a scan large enough to
+earn several partitions can plan Analytical. Distributed-path journeys set the
+partition bytes to one, so their kilobyte tables plan the shape a
+production-sized table does. Batch size and join preference are the
 `DataFusion` defaults. Oracle retains the planning `SessionConfig` with the
 single physical root. The actual grant supplies only the query-owned
 `RuntimeEnv`, its `MemoryPool` ceiling, and a per-partition sort-merge
@@ -812,9 +835,10 @@ writes no row, and nothing is released at the query's terminal. Each Oracle
 node caches the returned cuts per table and serves them only while it is
 listening on the `bifrost_cut` channel, which a `vala.file_list` trigger
 notifies in every committing transaction that changes a table's hot
-candidates; a lost listener clears the cache. Pointer moves that leave the
-candidates alone send nothing, because the older pointer returns the same
-rows. A cached cut serves a query only when it was read no earlier than the
+candidates; a lost listener clears the cache. A Forge rewrite's terminal
+transition sends the same notification in its transaction, so warm nodes stop
+reading the files it replaced. Expiry and manifest rewrites send nothing,
+because the older pointer returns the same rows from the same files. A cached cut serves a query only when it was read no earlier than the
 query deadline minus `max_query_deadline_ms`, so snapshot retention still
 covers it. Delivery follows commit, so the cache adds its notification
 latency to the publication race below. Oracle

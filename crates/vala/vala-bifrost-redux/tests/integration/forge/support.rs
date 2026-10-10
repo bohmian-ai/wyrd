@@ -2666,6 +2666,7 @@ fn fixture_roles(
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             scratch_root: Some(scratch_root.to_owned()),
             volume_roots: Some(BifrostVolumeRoots {
                 wal: wal_root.to_owned(),

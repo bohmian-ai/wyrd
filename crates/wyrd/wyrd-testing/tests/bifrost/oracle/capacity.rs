@@ -679,7 +679,7 @@ fn expected_analytical_grant(
     let envelope = oracle.try_acquire_query(
         vala_bifrost_redux::resources::OracleResourceRequest::for_class(
             wyrd_spec::vala::api::QueryClass::Analytical,
-            0.0,
+            8,
         ),
     )?;
     let granted = u64::try_from(envelope.execution().granted_memory_bytes())?;

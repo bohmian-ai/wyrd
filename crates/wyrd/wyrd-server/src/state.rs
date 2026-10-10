@@ -865,6 +865,7 @@ impl Scribe {
         let fragment_follower = Arc::new(PhysicalPlanFollower::new(ScribeTailResolver::new(
             Arc::clone(&tail_service),
             Arc::clone(&catalog),
+            resources.oracle_partitioning(),
         )));
         // A WAL that faulted during boot replay never advertises ready.
         let advertise_ready = Arc::new(AtomicBool::new(

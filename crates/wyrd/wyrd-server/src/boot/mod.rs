@@ -2090,6 +2090,8 @@ mod tests {
             memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             effective_cpu: 6,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes:
+                vala_bifrost_redux::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
             server_memory_min_bytes: 1024 * 1024 * 1024,
             managed_memory_bytes: 3 * 1024 * 1024 * 1024,
             scribe_enabled: false,

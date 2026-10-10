@@ -3643,6 +3643,7 @@ mod tests {
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             scratch_root: None,
             volume_roots: None,
         };
@@ -3759,10 +3760,7 @@ mod tests {
             let leader_node_id = NodeId::new(Uuid::from_u128(1));
             let leader_fence = 3;
             let resources = fixture_oracle_role()
-                .try_acquire_query(OracleResourceRequest::for_class(
-                    QueryClass::Analytical,
-                    0.0,
-                ))
+                .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
                 .expect("an idle Oracle admits one analytical query");
             let grant = reservations
                 .hold(
@@ -3838,10 +3836,7 @@ mod tests {
                 DataFusionQueryId::from_uuid(Uuid::from_u128(22)),
             );
             let resources = fixture_oracle_role()
-                .try_acquire_query(OracleResourceRequest::for_class(
-                    QueryClass::Analytical,
-                    0.0,
-                ))
+                .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
                 .expect("an idle Oracle admits one analytical query");
             let grant = self
                 .reservations
@@ -3996,7 +3991,7 @@ mod tests {
     /// lease test hands `lease_session` the same shape rather than letting the
     /// handle invent one.
     fn min_grant_lease_config() -> datafusion::prelude::SessionConfig {
-        crate::resources::OracleSessionShape::new(crate::resources::ORACLE_MIN_TARGET_PARTITIONS)
+        crate::resources::OracleSessionShape::new(crate::scan_sizing::ORACLE_MIN_TARGET_PARTITIONS)
             .session_config()
     }
 
@@ -4041,10 +4036,7 @@ mod tests {
             "the admitted guard has no second envelope to hand out"
         );
         let other = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits a second analytical query");
         assert!(
             !Arc::ptr_eq(pool, other.execution().memory_pool()),
@@ -4110,10 +4102,7 @@ mod tests {
         );
         let handle = fixture.execution_handle_with(Some(directory));
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let (mut admitted, _shared, _cancel) = super::super::admission::admitted_guard_for_test();
         admitted.install_query_resources_for_test(resources);
@@ -4681,10 +4670,7 @@ mod tests {
         let oracle = fixture_oracle_role();
 
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let pool = Arc::clone(resources.execution().memory_pool());
         let admitted_once = oracle
@@ -5259,10 +5245,7 @@ mod tests {
         let now = Utc::now();
         let fixture = GraphFixture::new(now);
         let occupying = fixture_oracle_role()
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let occupying_runtime = occupying.execution().clone();
         let occupied = fixture
@@ -5564,7 +5547,7 @@ mod tests {
             .admit(super::super::admission::PreparedAdmission {
                 tenant: fixture.tenant_id,
                 query_class: QueryClass::Analytical,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: std::time::Instant::now() + Duration::from_mins(1),
                 cancellation: CancellationToken::new(),
             })
@@ -5635,7 +5618,7 @@ mod tests {
                 .admit(super::super::admission::PreparedAdmission {
                     tenant: queued_tenant,
                     query_class: QueryClass::Analytical,
-                    local_ratio: 0.0,
+                    target_partitions: 8,
                     deadline: std::time::Instant::now() + Duration::from_secs(30),
                     cancellation: CancellationToken::new(),
                 })
@@ -6230,10 +6213,7 @@ mod tests {
             // not move its graph to draining or retain a failed cleanup.
             let oracle = fixture_oracle_role();
             let resources = oracle
-                .try_acquire_query(OracleResourceRequest::for_class(
-                    QueryClass::Analytical,
-                    0.0,
-                ))
+                .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
                 .expect("an idle Oracle admits one analytical query");
             let runtime = resources.execution().clone();
             let graph_guard = graph
@@ -7378,6 +7358,12 @@ pub(super) struct AnalyticalGraphMetricFold {
     /// unexecuted plan's evidence as the query's.
     fold:
         futures_util::future::BoxFuture<'static, datafusion::error::Result<Arc<dyn ExecutionPlan>>>,
+    /// The attempt's profile, which the metric-carrier plan's operator
+    /// metrics fold into once the fold settles.
+    ///
+    /// The graph, not the admission guard, owns an Analytical root, so the
+    /// root is gone before the graph waits for the envelope's children.
+    profile: Arc<super::profile::QueryProfile>,
 }
 
 impl fmt::Debug for AnalyticalGraphMetricFold {
@@ -7390,13 +7376,16 @@ impl fmt::Debug for AnalyticalGraphMetricFold {
 }
 
 impl AnalyticalGraphMetricFold {
-    /// Composes one graph's fold over an executed plan and its scan sink.
+    /// Composes one graph's fold over an executed plan and its scan sink,
+    /// folding the result into `profile`.
     pub(super) fn new(
         plan: Arc<dyn ExecutionPlan>,
         sink: Arc<super::exec::RemoteScanMetrics>,
+        profile: Arc<super::profile::QueryProfile>,
     ) -> Self {
         Self {
             fold: Box::pin(super::exec::record_distributed_scan_metrics(plan, sink)),
+            profile,
         }
     }
 
@@ -7408,10 +7397,15 @@ impl AnalyticalGraphMetricFold {
             datafusion::error::Result<Arc<dyn ExecutionPlan>>,
         >,
     ) -> Self {
-        Self { fold }
+        Self {
+            fold,
+            profile: Arc::new(super::profile::QueryProfile::new()),
+        }
     }
 
-    /// Awaits the follower fold, then reads the plan's own output-sort evidence.
+    /// Awaits the follower fold, folds the metric-carrier plan's operator
+    /// metrics into the attempt's profile, then reads the plan's own
+    /// output-sort evidence.
     ///
     /// The caller bounds this; nothing here imposes a second timer.
     ///
@@ -7433,6 +7427,7 @@ impl AnalyticalGraphMetricFold {
             plan = %datafusion::physical_plan::displayable(executed.as_ref()).indent(true),
             "analytical metric-carrier plan"
         );
+        self.profile.fold_root(executed.as_ref());
         Ok(super::exec::output_sort_evidence(&executed))
     }
 }

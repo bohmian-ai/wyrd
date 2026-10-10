@@ -315,6 +315,9 @@ pub struct ScribeTailResolver<T = FetchLiveTailService> {
     tail: Arc<T>,
     /// Closed source for the authenticated role-local table schema.
     schema_source: ScribeSchemaSource,
+    /// The pod's Oracle partition sizing, the one the leader sized the query
+    /// with; memtable batches are dealt by it.
+    partitioning: crate::scan_sizing::OraclePartitioning,
 }
 
 /// Closed Scribe schema source separating production catalog IO from unit fixtures.
@@ -347,15 +350,21 @@ impl<T> std::fmt::Debug for ScribeTailResolver<T> {
 }
 
 impl ScribeTailResolver<FetchLiveTailService> {
-    /// Creates a Scribe resolver from the local tail capability and shared catalog.
+    /// Creates a Scribe resolver from the local tail capability, shared
+    /// catalog, and the pod's Oracle partition sizing.
     #[must_use]
-    pub fn new(tail: Arc<FetchLiveTailService>, catalog: Arc<BifrostCatalog>) -> Self {
+    pub fn new(
+        tail: Arc<FetchLiveTailService>,
+        catalog: Arc<BifrostCatalog>,
+        partitioning: crate::scan_sizing::OraclePartitioning,
+    ) -> Self {
         Self {
             tail,
             schema_source: ScribeSchemaSource::Catalog {
                 catalog,
                 schemas: std::sync::RwLock::default(),
             },
+            partitioning,
         }
     }
 }
@@ -367,6 +376,10 @@ impl<T> ScribeTailResolver<T> {
         Self {
             tail,
             schema_source: ScribeSchemaSource::Fixed(schema),
+            partitioning: crate::scan_sizing::OraclePartitioning::new(
+                4,
+                crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
+            ),
         }
     }
 }
@@ -375,10 +388,12 @@ impl<T> ScribeTailResolver<T> {
     /// Builds the Scribe follower's leaf over one opened live read.
     ///
     /// Memtable rows are projected to the signed closure and dealt round-robin
-    /// across exactly the session's target partitions of one in-memory source,
-    /// leaving unused partitions empty, so a sparse cut keeps the session
-    /// shape. Each batch keeps the exact bounds Scribe recorded at append, so
-    /// the query's pushed predicate drops batches it cannot match. The unserved staged runs are read by
+    /// across the partitions their bytes earn, at most the session's target
+    /// partitions (see [`crate::scan_sizing::OraclePartitioning::scan_partitions`]), of one
+    /// in-memory source. Each batch keeps the exact bounds Scribe recorded at
+    /// append, so the query's pushed predicate drops batches it cannot match,
+    /// and the kept batches are dealt again over the partitions their own
+    /// bytes earn. The unserved staged runs are read by
     /// `DataFusion`'s Parquet scan, so they get the row-group and page pruning
     /// every Oracle hot read gets, with no footer caching because a staged run
     /// is rewritable; the scan's files hold the staged lease until the plan
@@ -398,20 +413,25 @@ impl<T> ScribeTailResolver<T> {
         session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, FollowerResolutionError> {
         let fault = |detail: &str| FollowerResolutionError::Fault(detail.to_owned());
-        let partitions = session.config().target_partitions().max(1);
         let (rows, runs, lease) = read.into_parts();
         let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
         if !rows.is_empty() || runs.is_empty() {
-            let mut groups = vec![Vec::new(); partitions];
-            for (index, batch) in rows.iter().enumerate() {
-                groups[index % partitions].push((
-                    super::exec::project_batch(&batch.rows, Arc::clone(required_schema))
-                        .map_err(|_| fault("Scribe memtable rows do not match the closure"))?,
-                    Arc::clone(&batch.statistics),
-                ));
-            }
+            let projected = rows
+                .iter()
+                .map(|batch| {
+                    Ok((
+                        super::exec::project_batch(&batch.rows, Arc::clone(required_schema))
+                            .map_err(|_| fault("Scribe memtable rows do not match the closure"))?,
+                        Arc::clone(&batch.statistics),
+                    ))
+                })
+                .collect::<Result<Vec<_>, FollowerResolutionError>>()?;
+            // Dealt over the partitions the projected bytes earn; pushdown
+            // re-deals whatever the query's predicate keeps.
             let source = super::memtable_source::MemtableSource::try_new(
-                groups,
+                projected,
+                self.partitioning,
+                session.config().target_partitions(),
                 Arc::clone(required_schema),
             )
             .map_err(|_| fault("Scribe memtable source construction failed"))?;
@@ -2293,9 +2313,9 @@ pub(crate) mod tests {
     /// Each live source reads at its own partition count and every row once.
     ///
     /// At four target partitions, an empty snapshot and a one-batch memtable
-    /// cut (fewer batches than partitions) give the memtable four partitions,
-    /// with unused groups left empty, while a small staged run reads as one
-    /// partition by `DataFusion`'s scan rules. Draining every partition returns
+    /// cut each earn one memtable partition, as their bytes fall under one
+    /// scan chunk, and a small staged run reads as one partition by
+    /// `DataFusion`'s scan rules. Draining every partition returns
     /// each row exactly once; the query predicate is the fragment's own
     /// `FilterExec`, not the resolver's.
     ///
@@ -2325,7 +2345,7 @@ pub(crate) mod tests {
             .await
             .expect("the one-batch cut resolves")
             .plan;
-        assert_eq!(live_source_partitions(&plan), vec![4]);
+        assert_eq!(live_source_partitions(&plan), vec![1]);
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await
             .expect("the one-batch cut executes");
@@ -2351,7 +2371,7 @@ pub(crate) mod tests {
             .await
             .expect("the empty cut resolves")
             .plan;
-        assert_eq!(live_source_partitions(&plan), vec![4]);
+        assert_eq!(live_source_partitions(&plan), vec![1]);
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await
             .expect("the empty cut executes");
@@ -2391,7 +2411,7 @@ pub(crate) mod tests {
             .expect("the newer batch inserts");
         let service = Arc::clone(&fixture.service);
         let plan = resolve_staged_fixture(&fixture, service, &session).await;
-        assert_eq!(live_source_partitions(&plan), vec![4, 1]);
+        assert_eq!(live_source_partitions(&plan), vec![1, 1]);
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await
             .expect("the mixed cut executes");

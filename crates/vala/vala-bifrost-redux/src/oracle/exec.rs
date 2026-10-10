@@ -1268,8 +1268,19 @@ pub(crate) struct OracleTableProvider {
     context: AuthorizedQueryContext,
     /// Canonical table name included in scrubbed security diagnostics.
     table: String,
-    /// Scribe live routes discovered for this table before planning.
-    live: Option<super::live::LiveTableRoutes>,
+    /// Scribe live routes discovered for this table.
+    ///
+    /// Discovery runs after the logical plan, so it can list with the query's
+    /// own scope; the routes are set once, before the physical plan reads
+    /// them in [`TableProvider::scan`].
+    live: std::sync::OnceLock<super::live::LiveTableRoutes>,
+    /// The published files Iceberg last listed and the pushed filters it
+    /// listed them with.
+    ///
+    /// Sizing lists a scan's files before the physical plan does; the scan
+    /// with the same filters reuses that listing instead of reading the
+    /// manifests twice.
+    listed: std::sync::Mutex<Option<(Vec<Expr>, Vec<HotFileSource>)>>,
 }
 
 impl fmt::Debug for OracleTableProvider {
@@ -1350,7 +1361,8 @@ impl OracleTableProvider {
             physical_schema,
             context,
             table: table_name,
-            live,
+            live: live.map(std::sync::OnceLock::from).unwrap_or_default(),
+            listed: std::sync::Mutex::new(None),
         })
     }
 }
@@ -1366,23 +1378,25 @@ impl OracleTableProvider {
     /// as `DataFusion`'s do. A failed fetch is left to the scan, which reports
     /// it with its stale-object marker; a node without a cache does nothing.
     ///
-    /// Returns the files' total row groups, the most partitions the scan can
-    /// give work to, or `None` when any footer was not read.
+    /// Returns each file's footer in `files` order, `None` for one that was
+    /// not read; every footer is `None` on a node without a cache.
     async fn cache_footers(
         &self,
         files: &[HotFileSource],
         options: &ConfigOptions,
-    ) -> Option<usize> {
-        let cache = self.objects.storage().metadata_cache()?;
+    ) -> Vec<Option<Arc<ParquetMetaData>>> {
+        let Some(cache) = self.objects.storage().metadata_cache() else {
+            return vec![None; files.len()];
+        };
         let fetches: Vec<_> = files
             .iter()
             .map(|file| self.cache_footer(file, cache, options))
             .collect();
         futures_util::stream::iter(fetches)
-            .buffer_unordered(options.execution.meta_fetch_concurrency.get())
-            .try_fold(0, |total, row_groups| async move { Ok(total + row_groups) })
+            .buffered(options.execution.meta_fetch_concurrency.get())
+            .map(Result::ok)
+            .collect()
             .await
-            .ok()
     }
 
     /// Fetches one warehouse file's footer and page index through
@@ -1398,7 +1412,7 @@ impl OracleTableProvider {
         file: &HotFileSource,
         cache: &Arc<FileMetadataCache>,
         options: &ConfigOptions,
-    ) -> DataFusionResult<usize> {
+    ) -> DataFusionResult<Arc<ParquetMetaData>> {
         let path = self
             .objects
             .relativize(&file.location)
@@ -1410,7 +1424,142 @@ impl OracleTableProvider {
             .with_file_metadata_cache(Some(Arc::clone(cache)))
             .fetch_metadata()
             .await
-            .map(|metadata| metadata.num_row_groups())
+    }
+
+    /// Lists the pinned snapshot's published files Iceberg keeps under
+    /// `filters`, reusing the previous listing when it was made with the same
+    /// filters.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when Iceberg cannot list the snapshot's
+    /// files or a listed file is refused (see [`published_files`]).
+    async fn listed_files(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+    ) -> DataFusionResult<Vec<HotFileSource>> {
+        if let Ok(listed) = self.listed.lock()
+            && let Some((listed_filters, files)) = listed.as_ref()
+            && listed_filters.as_slice() == filters
+        {
+            return Ok(files.clone());
+        }
+        let published = self.iceberg.scan(state, None, filters, None).await?;
+        let published = published
+            .downcast_ref::<IcebergTableScan>()
+            .ok_or_else(|| {
+                DataFusionError::Plan("Oracle requires the pinned IcebergTableScan".to_owned())
+            })?;
+        let files = published_files(published).await?;
+        if let Ok(mut listed) = self.listed.lock() {
+            *listed = Some((filters.to_vec(), files.clone()));
+        }
+        Ok(files)
+    }
+
+    /// Returns the canonical name of the table this provider reads.
+    pub(super) fn table(&self) -> &str {
+        &self.table
+    }
+
+    /// Sets the live routes discovery found for this table; a second call
+    /// keeps the first routes.
+    pub(super) fn set_live(&self, routes: super::live::LiveTableRoutes) {
+        let _ = self.live.set(routes);
+    }
+
+    /// Estimates what one scan of this table reads, before its physical plan
+    /// exists: the bytes, and the row groups of its Parquet files.
+    ///
+    /// The files are the published ones Iceberg keeps under `pushed` plus the
+    /// hot files, the same files [`Self::persisted_input`] scans, less those
+    /// [`Self::kept_files`] rules out by their declared bounds. Each kept
+    /// file is sized by [`crate::scan_sizing::ScanSizer::file_size`] from
+    /// its cached footer, and the live routes count the bytes Scribe reported
+    /// for the same scope; live data has no row groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when Iceberg cannot list the snapshot's
+    /// files or a listed file is refused (see [`published_files`]).
+    pub(super) async fn scan_size(
+        &self,
+        state: &dyn Session,
+        pushed: &[Expr],
+        scope: &crate::scan_sizing::ScanScope,
+    ) -> DataFusionResult<crate::scan_sizing::ScanSize> {
+        let sizer = crate::scan_sizing::ScanSizer::new(scope, &self.physical_schema);
+        let files = self.kept_files(&self.scanned_files(state, pushed).await?, &sizer);
+        let footers = self.cache_footers(&files, state.config().options()).await;
+        let persisted = files
+            .iter()
+            .zip(&footers)
+            .map(|(file, footer)| {
+                sizer.file_size(
+                    footer.as_deref(),
+                    u64::try_from(file.size_bytes).unwrap_or(u64::MAX),
+                )
+            })
+            .fold(crate::scan_sizing::ScanSize::default(), |total, size| {
+                total.plus(size)
+            });
+        let live = self.live.get().map_or(0, |live| {
+            live.routes
+                .iter()
+                .map(|route| route.bytes)
+                .fold(0_u64, u64::saturating_add)
+        });
+        Ok(persisted.plus(crate::scan_sizing::ScanSize {
+            bytes: live,
+            row_groups: 0,
+        }))
+    }
+
+    /// Returns the `files` whose declared bounds leave them possibly matching
+    /// `sizer`'s filters, by [`crate::scan_sizing::ScanSizer::keep`].
+    ///
+    /// These are the bounds the scan's file pruner excludes a file by before
+    /// its footer is opened, so a footer is fetched only for a file the scan
+    /// may read.
+    fn kept_files(
+        &self,
+        files: &[HotFileSource],
+        sizer: &crate::scan_sizing::ScanSizer<'_>,
+    ) -> Vec<HotFileSource> {
+        let statistics: Vec<_> = files
+            .iter()
+            .map(|file| {
+                Arc::new(
+                    file.statistics(&self.physical_schema)
+                        .unwrap_or_else(|| Statistics::new_unknown(&self.physical_schema)),
+                )
+            })
+            .collect();
+        let keep = sizer.keep(&statistics, files.len());
+        files
+            .iter()
+            .zip(keep)
+            .filter(|(_, keep)| *keep)
+            .map(|(file, _)| file.clone())
+            .collect()
+    }
+
+    /// Returns the files one persisted scan reads: the published files
+    /// Iceberg keeps under `filters`, then the hot files.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when Iceberg cannot list the snapshot's
+    /// files or a listed file is refused (see [`published_files`]).
+    async fn scanned_files(
+        &self,
+        state: &dyn Session,
+        filters: &[Expr],
+    ) -> DataFusionResult<Vec<HotFileSource>> {
+        let mut files = self.listed_files(state, filters).await?;
+        files.extend(self.hot_files.iter().cloned());
+        Ok(files)
     }
 
     /// Builds this cut's persisted leaf: one `DataFusion` Parquet scan over
@@ -1432,21 +1581,24 @@ impl OracleTableProvider {
         filters: &[Expr],
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let options = state.config().options();
-        // Iceberg lists the snapshot's files with the pushed filters.
-        let published = self.iceberg.scan(state, None, filters, None).await?;
-        let published = published
-            .downcast_ref::<IcebergTableScan>()
-            .ok_or_else(|| {
-                DataFusionError::Plan("Oracle requires the pinned IcebergTableScan".to_owned())
-            })?;
-        let mut files = published_files(published).await?;
-        // Only the files Iceberg kept: a hot file's event-time bounds are
-        // first checked by the scan's file pruner, and fetching its footer
-        // here would read a file that pruner then excludes.
-        let row_groups = self.cache_footers(&files, options).await;
-        // A hot file's row groups are unknown, so its scan keeps every partition.
-        let max_partitions = row_groups.filter(|_| self.hot_files.is_empty());
-        files.extend(self.hot_files.iter().cloned());
+        let files = self.scanned_files(state, filters).await?;
+        // The row groups of the files the pushed filters keep, whose footers
+        // were cached when the scan was sized; one not read leaves the row
+        // groups unknown and the scan every partition.
+        let pushed = crate::scan_sizing::ScanScope {
+            columns: Vec::new(),
+            filters: filters.to_vec(),
+        };
+        let kept = self.kept_files(
+            &files,
+            &crate::scan_sizing::ScanSizer::new(&pushed, &self.physical_schema),
+        );
+        let max_partitions = self
+            .cache_footers(&kept, options)
+            .await
+            .iter()
+            .map(|footer| footer.as_ref().map(|footer| footer.num_row_groups()))
+            .sum();
         hot_parquet_scan(
             files,
             HotObjects::Warehouse(Arc::clone(&self.objects)),
@@ -1513,7 +1665,7 @@ impl TableProvider for OracleTableProvider {
         // One live leaf over the discovered routes. It captures routes and the
         // closure only; fragments open at execution, after admission and the
         // audited read decision.
-        if let Some(live) = self.live.as_ref()
+        if let Some(live) = self.live.get()
             && !live.routes.is_empty()
         {
             inputs.push(Arc::new(super::live::LiveScribeExec::new(
@@ -3182,7 +3334,7 @@ pub(super) mod tests {
         let (provider, _live) = projection_closure_provider(tenant, None).await;
 
         let shape = crate::resources::OracleSessionShape::new(
-            crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
+            crate::scan_sizing::ORACLE_MIN_TARGET_PARTITIONS,
         );
         let lock = Arc::new(crate::oracle::bindings::OracleExecutionLock::new());
         let retained_config = shape.session_config().with_extension(Arc::clone(&lock));
@@ -3437,6 +3589,7 @@ pub(super) mod tests {
                         .expect("instant"),
                 )
                 .expect("hour boundary"),
+                bytes: 0,
             }],
         }
     }

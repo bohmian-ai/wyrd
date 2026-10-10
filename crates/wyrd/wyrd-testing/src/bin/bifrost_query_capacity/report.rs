@@ -310,7 +310,9 @@ impl Report {
     }
 
     /// Judges one row: errors, memory, and OOM fail it first, then `missed`
-    /// (a target miss) does. Records the step's raw latencies.
+    /// (a target miss) does. A window whose scan sizing diverged from its
+    /// scans (see [`Usage::sizing_divergence`]) is noted in the reason
+    /// without changing the verdict. Records the step's raw latencies.
     fn judge(
         &mut self,
         step: &str,
@@ -326,6 +328,7 @@ impl Report {
                 "step": step,
                 "clients": measured.clients,
                 "latencies_us": measured.latencies_us,
+                "completed_unix_ms": measured.completed_unix_ms,
             })
         );
         let usage_ = &measured.usage;
@@ -373,7 +376,10 @@ impl Report {
             } else {
                 Verdict::Pass
             },
-            reason: failure.unwrap_or(reason),
+            reason: match usage_.sizing_divergence() {
+                Some(divergence) => format!("{}; {divergence}", failure.unwrap_or(reason)),
+                None => failure.unwrap_or(reason),
+            },
         }
     }
 }

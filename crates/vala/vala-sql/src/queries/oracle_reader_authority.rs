@@ -167,6 +167,32 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         Ok(())
     }
 
+    /// Tells every Oracle node that `table`'s cut changed.
+    ///
+    /// Sends the `bifrost_cut` notification the `vala.file_list` trigger sends,
+    /// for a Forge commit that moves the catalog pointer without touching
+    /// `vala.file_list`, such as a rewrite. Without it a warm node keeps
+    /// planning against the replaced files. `NOTIFY` is transactional, so the
+    /// notification is delivered only if this owner's transaction commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when the statement fails.
+    pub async fn announce_cut_change(&mut self, table: CutTableRef<'_>) -> Result<(), SqlError> {
+        let payload = format!(
+            "{}|{}|{}",
+            self.conn.data_tenant_id().as_uuid(),
+            table.namespace_name,
+            table.table_name
+        );
+        sqlx::query("SELECT pg_catalog.pg_notify('bifrost_cut', $1)")
+            .bind(payload)
+            .execute(&mut **self.conn.transaction())
+            .await
+            .map_err(SqlError::from)?;
+        Ok(())
+    }
+
     /// Takes the table's exclusive maintenance authority and turns this owner
     /// into the capability destructive Forge work requires.
     ///

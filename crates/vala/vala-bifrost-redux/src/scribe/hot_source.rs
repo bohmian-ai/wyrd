@@ -20,8 +20,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+use parquet::arrow::arrow_reader::ArrowReaderMetadata;
+
+use crate::scan_sizing::{ScanScope, ScanSizer};
 use crate::scribe::assembly::StagedMemberId;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::WalLsn;
@@ -64,6 +67,47 @@ impl GenerationOrdinal {
     }
 }
 
+/// The footers of one staged member's runs, in run order.
+///
+/// Read once, by [`crate::scribe::member_stager::preflight_run`] when the
+/// runs are staged or recovered, so the Scribe listing sizes a scan of them
+/// through [`ScanSizer`] without touching the disk.
+#[derive(Debug, Clone, Default)]
+pub struct RunFooters(Arc<[ArrowReaderMetadata]>);
+
+impl RunFooters {
+    /// Wraps the footers of a member's runs, in run order.
+    #[must_use]
+    pub fn new(footers: Vec<ArrowReaderMetadata>) -> Self {
+        Self(footers.into())
+    }
+
+    /// Returns the bytes `scope` reads from the runs, each sized by
+    /// [`ScanSizer::footer_size`] under the first run's Arrow schema, which
+    /// every run of one member shares; no runs read no bytes.
+    #[must_use]
+    pub fn scoped_bytes(&self, scope: &ScanScope) -> u64 {
+        let Some(first) = self.0.first() else {
+            return 0;
+        };
+        let sizer = ScanSizer::new(scope, first.schema());
+        self.0
+            .iter()
+            .map(|run| sizer.footer_size(run.metadata()).bytes)
+            .fold(0_u64, u64::saturating_add)
+    }
+}
+
+/// Footers are derived from the runs, which already decide identity, so they
+/// never make two authorities differ.
+impl PartialEq for RunFooters {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for RunFooters {}
+
 /// Where one generation's rows are currently readable.
 ///
 /// The order of the variants is the order of the lifecycle, and
@@ -91,6 +135,8 @@ pub enum HotAuthority {
         runs: Vec<PathBuf>,
         /// Encoded bytes the runs occupy on the staging volume.
         bytes: u64,
+        /// The runs' footers, which size a scan of them.
+        footers: RunFooters,
         /// Inclusive WAL bounds the member covers.
         wal: (WalLsn, WalLsn),
     },
@@ -628,27 +674,37 @@ impl ScribeHotSourceRegistry {
         }))
     }
 
-    /// Returns one tenant table's keys whose staged runs still own readable rows.
+    /// Returns one tenant table's keys whose staged runs still own readable
+    /// rows, each with the bytes `scope` reads from those runs.
+    ///
+    /// Each member is sized by [`RunFooters::scoped_bytes`].
     ///
     /// # Errors
     /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
-    pub(crate) fn staged_seal_keys_for_table(
+    pub(crate) fn staged_bytes_for_table(
         &self,
         tenant: wyrd_spec::ids::DataTenantId,
         table: &crate::catalog::TableRef,
-    ) -> Result<Vec<SealKey>, HotSourceError> {
+        scope: &ScanScope,
+    ) -> Result<Vec<(SealKey, u64)>, HotSourceError> {
         Ok(self
             .lock()?
             .iter()
-            .filter(|(key, authorities)| {
-                key.tenant == tenant
-                    && key.table == *table
-                    && authorities
-                        .by_generation
-                        .values()
-                        .any(|authority| matches!(authority, HotAuthority::StagedRun { .. }))
+            .filter(|(key, _)| key.tenant == tenant && key.table == *table)
+            .filter_map(|(key, authorities)| {
+                let mut staged = authorities
+                    .by_generation
+                    .values()
+                    .filter_map(|authority| match authority {
+                        HotAuthority::StagedRun { footers, .. } => {
+                            Some(footers.scoped_bytes(scope))
+                        }
+                        _ => None,
+                    })
+                    .peekable();
+                staged.peek()?;
+                Some((key.clone(), staged.fold(0_u64, u64::saturating_add)))
             })
-            .map(|(key, _)| key.clone())
             .collect())
     }
 
@@ -687,6 +743,7 @@ impl ScribeHotSourceRegistry {
                     runs,
                     bytes,
                     wal,
+                    ..
                 } = authority
                 else {
                     continue;
@@ -861,6 +918,7 @@ mod tests {
             member: StagedMemberId::new(0, 1),
             runs: vec![run],
             bytes: 1_024,
+            footers: RunFooters::default(),
             wal: (WalLsn::new(1), WalLsn::new(9)),
         }
     }

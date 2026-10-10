@@ -17,6 +17,7 @@ use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
+use crate::scan_sizing::ScanScope;
 use crate::scribe::hot_source::StagedSourceLease;
 use crate::scribe::memtable::Memtable;
 use crate::scribe::shards::ScribeShardRuntime;
@@ -32,6 +33,10 @@ pub struct ActiveTailStream {
     pub time_partition: tail::TimePartitionWire,
     /// Exact Scribe stream incarnation serving that partition.
     pub stream: tail::TailStreamIdentity,
+    /// Live bytes the listing's [`ScanScope`] reads in this partition:
+    /// in-scope Arrow bytes of the memtable batches its filters cannot rule
+    /// out, plus the encoded bytes of the partition's staged runs.
+    pub bytes: u64,
 }
 
 /// Private tonic client for active-stream discovery on one Scribe.
@@ -55,11 +60,15 @@ impl TonicTailReadTransport {
     pub async fn list_active_streams(
         &self,
         binding: tail::TenantTableBinding,
+        scope: &ScanScope,
     ) -> Result<Vec<ActiveTailStream>, TailReadError> {
         let mut client = self.client.clone();
+        let (columns, filters) = scope.to_wire();
         let response = client
             .list_active_streams(wyrd_tonic::wyrd::v1::ListActiveStreamsRequest {
                 binding: Some(binding.into()),
+                columns,
+                filters,
             })
             .await
             .map_err(|status| tonic_error(&status))?;
@@ -68,6 +77,7 @@ impl TonicTailReadTransport {
             .streams
             .into_iter()
             .map(|stream| {
+                let bytes = stream.bytes;
                 let time_partition: tail::TimePartitionWire = stream
                     .time_partition
                     .ok_or(TailReadError::Binding)?
@@ -86,6 +96,7 @@ impl TonicTailReadTransport {
                         node_id: tail::NodeId::new(node_id),
                         writer_epoch: stream.writer_epoch,
                     },
+                    bytes,
                 })
             })
             .collect()
@@ -474,8 +485,9 @@ impl FetchLiveTailService {
     /// Lists active event-day scopes for one authenticated tenant/table.
     ///
     /// This is intentionally metadata-only: it returns the partitions this
-    /// stream still serves live, never rows. Oracle plans a live leaf per
-    /// returned partition and reads it through [`Self::open_live_batches`].
+    /// stream still serves live, each with the bytes `scope` reads there,
+    /// never rows. Oracle plans a live leaf per returned partition, sizes its
+    /// plan from the bytes, and reads it through [`Self::open_live_batches`].
     ///
     /// # Errors
     /// Returns [`TailReadError::Binding`] for an invalid wire binding and
@@ -483,10 +495,11 @@ impl FetchLiveTailService {
     pub fn list_active_streams(
         &self,
         binding: &tail::TenantTableBinding,
-    ) -> Result<Vec<(tail::TimePartitionWire, tail::TailStreamIdentity)>, TailReadError> {
+        scope: &ScanScope,
+    ) -> Result<Vec<ActiveTailStream>, TailReadError> {
         let binding = binding_from_wire(binding)?;
         let partitions = self
-            .active_partitions_for_table(binding.tenant, &binding.table_ref)
+            .active_partitions_for_table(binding.tenant, &binding.table_ref, scope)
             .map_err(|error| TailReadError::State {
                 detail: error.to_string(),
             })?;
@@ -503,21 +516,19 @@ impl FetchLiveTailService {
             })?;
         Ok(partitions
             .into_iter()
-            .map(TimePartition::to_wire)
-            .map(|partition| {
-                (
-                    partition,
-                    tail::TailStreamIdentity {
-                        node_id: tail::NodeId::new(stream.node_id.as_uuid()),
-                        writer_epoch,
-                    },
-                )
+            .map(|(partition, bytes)| ActiveTailStream {
+                time_partition: partition.to_wire(),
+                stream: tail::TailStreamIdentity {
+                    node_id: tail::NodeId::new(stream.node_id.as_uuid()),
+                    writer_epoch,
+                },
+                bytes,
             })
             .collect())
     }
 
     /// Lists the partitions of one tenant table that still have live Scribe
-    /// state, sorted and deduplicated.
+    /// state, sorted, each once with the bytes `scope` reads there.
     ///
     /// Writable, pending immutable, and staged keys are all scanned for `table`
     /// alone. The list is a point-in-time discovery cut; retirement is driven
@@ -531,33 +542,35 @@ impl FetchLiveTailService {
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
-    ) -> Result<Vec<TimePartition>, ScribeError> {
-        let mut keys = if let Some(memtable) = &self.memtable {
-            memtable.seal_keys_for_table(tenant, table)?
+        scope: &ScanScope,
+    ) -> Result<Vec<(TimePartition, u64)>, ScribeError> {
+        let mut sources = if let Some(memtable) = &self.memtable {
+            memtable.live_bytes_for_table(tenant, table, scope)?
         } else {
             self.shards
                 .as_ref()
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "tail source has no shard runtime".to_owned(),
                 })?
-                .active_seal_keys_for_table(tenant, table)?
+                .active_live_bytes_for_table(tenant, table, scope)?
         };
         if let Some(hot_sources) = &self.hot_sources {
-            keys.extend(
+            sources.extend(
                 hot_sources
-                    .staged_seal_keys_for_table(tenant, table)
+                    .staged_bytes_for_table(tenant, table, scope)
                     .map_err(|error| ScribeError::Internal {
                         detail: format!("discover staged live-tail keys: {error}"),
-                    })?,
+                    })?
+                    .into_iter()
+                    .map(|(key, bytes)| (key.partition, bytes)),
             );
         }
-        let mut partitions = keys
-            .into_iter()
-            .map(|key| key.partition)
-            .collect::<Vec<_>>();
-        partitions.sort();
-        partitions.dedup();
-        Ok(partitions)
+        let mut partitions = std::collections::BTreeMap::<TimePartition, u64>::new();
+        for (partition, bytes) in sources {
+            let total = partitions.entry(partition).or_default();
+            *total = total.saturating_add(bytes);
+        }
+        Ok(partitions.into_iter().collect())
     }
 
     /// Opens one lazily produced live read over this Scribe's stream.
@@ -697,11 +710,12 @@ impl FetchLiveTailService {
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use super::{FetchLiveTailService, TailReadError, tonic_error};
+    use super::{FetchLiveTailService, ScanScope, TailReadError, tonic_error};
     use crate::scribe::hot_source::HotAuthority;
     use crate::scribe::memtable::Memtable;
     use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
     use crate::scribe::wal::WalLsn;
+    use arrow::array::Array as _;
     use arrow::array::{Int64Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use wyrd_spec::DataTenantId;
@@ -832,10 +846,67 @@ pub(crate) mod tests {
         }
 
         let partitions = service
-            .active_partitions_for_table(tenant, &binding.table_ref)
+            .active_partitions_for_table(tenant, &binding.table_ref, &ScanScope::default())
             .expect("listing reads the memtable");
 
-        assert_eq!(partitions, vec![listed_day]);
+        assert_eq!(
+            partitions
+                .iter()
+                .map(|(partition, _)| *partition)
+                .collect::<Vec<_>>(),
+            vec![listed_day]
+        );
+        assert!(partitions[0].1 > 0, "a listed partition reports its bytes");
+    }
+
+    /// A scoped listing counts only the batches its filters cannot rule out.
+    ///
+    /// The fixture holds `[1, 2, 3]` frozen and `[4, 5]` writable. A scope that
+    /// travels the wire with `value >= 4` keeps the writable batch alone, so
+    /// the partition reports exactly that batch's bytes; the unscoped listing
+    /// reports both batches.
+    ///
+    /// # Panics
+    /// Panics when the listing fails or reports other bytes.
+    #[test]
+    fn scoped_listing_counts_only_unpruned_batches() {
+        use datafusion::prelude::{col, lit};
+
+        let tenant = DataTenantId::new_v7();
+        let day = crate::test_support::day_partition(2026, 7, 14);
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let (service, binding) = selective_tail_fixture(tenant, day, stream);
+        let scope = ScanScope {
+            columns: vec!["value".to_owned()],
+            filters: vec![col("value").gt_eq(lit(4_i64))],
+        };
+        let (columns, filters) = scope.to_wire();
+        let scope = ScanScope::from_wire(columns, &filters);
+        assert_eq!(scope.filters.len(), 1, "the conjunct survives the wire");
+        let value_bytes = |values: Vec<i64>| {
+            crate::scribe::memory::retained_arrow_bytes(
+                &arrow::record_batch::RecordBatch::try_from_iter([(
+                    "value",
+                    Arc::new(Int64Array::from(values)) as arrow::array::ArrayRef,
+                )])
+                .expect("one-column batch"),
+            )
+        };
+        let kept = value_bytes(vec![4, 5]);
+        let pruned = value_bytes(vec![1, 2, 3]);
+
+        let scoped = service
+            .active_partitions_for_table(tenant, &binding.table_ref, &scope)
+            .expect("scoped listing reads the memtable");
+        let unscoped = service
+            .active_partitions_for_table(tenant, &binding.table_ref, &ScanScope::default())
+            .expect("unscoped listing reads the memtable");
+
+        assert_eq!(scoped, vec![(day, u64::try_from(kept).expect("fits"))]);
+        assert_eq!(
+            unscoped,
+            vec![(day, u64::try_from(kept + pruned).expect("fits"))]
+        );
     }
 
     /// A listing status keeps its closed class instead of one state error.
@@ -1064,6 +1135,7 @@ pub(crate) mod tests {
                     member,
                     runs,
                     bytes: 4_096,
+                    footers: crate::scribe::hot_source::RunFooters::default(),
                     wal: (WalLsn::new(1), WalLsn::new(1)),
                 },
             )

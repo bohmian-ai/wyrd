@@ -4392,11 +4392,12 @@ async fn settle_query(
 
 /// Proves the cut is one tenant-scoped statement with one bounded retry.
 ///
-/// Cold and warm queries over one table and over a two-table join each read
-/// their whole cut in exactly one statement. One injected metadata `NotFound`
-/// after the read costs exactly one reread and the query succeeds; a second
-/// consecutive `NotFound` is terminal. A caller not granted the table is refused before any metadata read,
-/// so an armed fault stays unconsumed. Another tenant's lookup of the same name
+/// A cold query over one table or over a two-table join reads its whole cut
+/// in exactly one statement; the same query warm is served from the node's
+/// cut cache in none. One injected metadata `NotFound` after the cached read
+/// costs exactly one Postgres reread and the query succeeds; a second
+/// consecutive `NotFound` is terminal. A caller not granted the table is
+/// refused before any metadata read, so an armed fault stays unconsumed. Another tenant's lookup of the same name
 /// fails exactly as a never-registered name does, exposing no identity.
 ///
 /// # Errors
@@ -4419,25 +4420,26 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
     );
 
     reset_cut_reads_for_test();
-    for (case, sql) in [
-        ("cold one-table", &one),
-        ("warm one-table", &one),
-        ("cold join", &join),
-        ("warm join", &join),
+    for (case, sql, statements) in [
+        ("cold one-table", &one, 1),
+        ("warm one-table", &one, 0),
+        ("cold join", &join, 1),
+        ("warm join", &join, 0),
     ] {
         settle_query(&server, query_context(tenant)?, sql).await?;
         assert_eq!(
             reset_cut_reads_for_test(),
-            1,
-            "{case} reads its whole cut in one statement"
+            statements,
+            "{case} reads its whole cut in {statements} statements"
         );
     }
 
+    // Both cuts are now cached, so each count below is Postgres rereads only.
     inject_metadata_not_found_for_test(1);
     settle_query(&server, query_context(tenant)?, &join).await?;
     assert_eq!(
         reset_cut_reads_for_test(),
-        2,
+        1,
         "one missing metadata document costs exactly one reread"
     );
 
@@ -4446,7 +4448,7 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
     assert!(terminal.is_err(), "a second NotFound is terminal");
     assert_eq!(
         reset_cut_reads_for_test(),
-        2,
+        1,
         "the terminal NotFound is not retried again"
     );
 
@@ -4485,7 +4487,7 @@ async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<()
     settle_query(&server, query_context(tenant)?, &one).await?;
     assert_eq!(
         reset_cut_reads_for_test(),
-        3,
+        1,
         "the refused query read no metadata, so the armed fault fell to the next query"
     );
 

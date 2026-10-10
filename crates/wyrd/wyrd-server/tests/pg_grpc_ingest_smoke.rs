@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CompactionRegistration, TableRef};
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scan_sizing::ScanScope;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
 use vala_bifrost_redux::scribe::{replay::replay_wal_directory, tail_rpc::TonicTailReadTransport};
 use vala_bifrost_redux::tables::{DomainTable, verification::ResultsTable};
@@ -160,6 +161,7 @@ fn tail_binding(tenant: DataTenantId) -> TenantTableBinding {
 fn list_request(binding: TenantTableBinding) -> Request<ListActiveStreamsRequest> {
     Request::new(ListActiveStreamsRequest {
         binding: Some(binding.into()),
+        ..Default::default()
     })
 }
 
@@ -696,7 +698,7 @@ async fn scribe_tail_tonic_lists_seeded_partition() {
         connect_peer_channel(bind, &authority).await,
     ));
     let streams = remote
-        .list_active_streams(tail_binding(tenant))
+        .list_active_streams(tail_binding(tenant), &ScanScope::default())
         .await
         .expect("authorized discovery lists the seeded partition");
     assert_eq!(streams.len(), 1, "one live partition holds the seeded rows");

@@ -98,8 +98,15 @@ enum TimeGranularity { TIME_GRANULARITY_UNSPECIFIED = 0; TIME_GRANULARITY_HOUR =
 // granularity; a noncanonical start fails conversion.
 message TimePartition { TimeGranularity granularity = 1; sint64 start_unix_micros = 2; }
 message TailStreamIdentity { string node_id = 1; uint64 writer_epoch = 2; }
-message ListActiveStreamsRequest { TenantTableBinding binding = 1; }
-message ActiveTailStream { TimePartition time_partition = 1; TailStreamIdentity stream = 2; }
+// columns and filters scope the reported bytes to what one query reads: the
+// columns it projects and its filter conjuncts, each a DataFusion logical
+// expression in datafusion-proto bytes. Both are hints; an empty or
+// undecodable scope reports every retained byte.
+message ListActiveStreamsRequest {
+  TenantTableBinding binding = 1; repeated string columns = 2; repeated bytes filters = 3;
+}
+// bytes estimates the in-scope live bytes the stream holds for this partition.
+message ActiveTailStream { TimePartition time_partition = 1; TailStreamIdentity stream = 2; uint64 bytes = 3; }
 message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; }
 // One capture batch: tenant and destination are explicit because the caller
 // holds no token. batch_id is the deterministic UUID Scribe deduplicates on.

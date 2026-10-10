@@ -1457,6 +1457,7 @@ mod tests {
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             scratch_root: None,
             volume_roots: None,
         };
@@ -1585,10 +1586,7 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let failing_resources = failing_oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits the rewrite-failure query");
         let failing_runtime = failing_resources.execution().clone();
         let mut failing = lifecycle_over_fold(
@@ -1675,10 +1673,7 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let expired_resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits the held query");
         let expired_runtime = expired_resources.execution().clone();
         let never = Arc::clone(&held);
@@ -1722,10 +1717,7 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let settled_resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits the released query");
         let settled_runtime = settled_resources.execution().clone();
         let mut settled = lifecycle_over_fold(
@@ -1788,16 +1780,10 @@ mod tests {
     async fn analytical_stage_identity_separates_public_and_datafusion_queries() {
         let oracle = oracle_role();
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let resources_b = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits a second analytical query");
         let runtime_a = resources.execution().clone();
         let runtime_b = resources_b.execution().clone();
@@ -1937,10 +1923,7 @@ mod tests {
         let metrics_guard = metrics::set_default_local_recorder(&recorder);
         let oracle = oracle_role();
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let pool = Arc::clone(resources.execution().memory_pool());
         let runtime = resources.execution().clone();

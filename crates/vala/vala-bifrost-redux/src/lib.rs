@@ -20,6 +20,7 @@ pub mod oracle;
 mod otlp_contract;
 pub mod parquet;
 pub mod resources;
+pub mod scan_sizing;
 pub mod schema;
 pub mod scribe;
 pub mod storage;

@@ -1387,6 +1387,14 @@ pub struct BifrostResourceConfig {
     /// derives twice effective CPU, never below the portable slot-unit floor.
     #[serde(default)]
     pub oracle_query_slot_limit: Option<usize>,
+    /// Optional scanned bytes that earn one Oracle execution partition.
+    ///
+    /// Oracle sizes each query's partitions from the bytes it scans, and the
+    /// Scribe follower deals live batches by the same value. Unset keeps
+    /// 24 MiB; zero is refused.
+    /// `WYRD_BIFROST_ORACLE_PARTITION_SCAN_BYTES` overrides it.
+    #[serde(default)]
+    pub oracle_partition_scan_bytes: Option<u64>,
 }
 
 impl BifrostResourceConfig {
@@ -1410,6 +1418,7 @@ impl BifrostResourceConfig {
             scratch_limit_bytes: self.scratch_limit_bytes,
             effective_cpu: self.effective_cpu,
             oracle_query_slot_limit: self.oracle_query_slot_limit,
+            oracle_partition_scan_bytes: self.oracle_partition_scan_bytes,
             scratch_root,
             volume_roots,
         }
@@ -2854,6 +2863,10 @@ impl WyrdServerConfig {
         self.bifrost.resources.oracle_query_slot_limit = parse_optional_env(
             "WYRD_BIFROST_ORACLE_QUERY_SLOT_LIMIT",
             self.bifrost.resources.oracle_query_slot_limit,
+        )?;
+        self.bifrost.resources.oracle_partition_scan_bytes = parse_optional_env(
+            "WYRD_BIFROST_ORACLE_PARTITION_SCAN_BYTES",
+            self.bifrost.resources.oracle_partition_scan_bytes,
         )?;
         self.forge.target_file_size_bytes = parse_optional_env(
             "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
@@ -5548,6 +5561,8 @@ minimum_slots = 2
             memory_limit_bytes: oracle_bytes * 2,
             effective_cpu,
             oracle_query_slot_limit: limit,
+            oracle_partition_scan_bytes:
+                vala_bifrost_redux::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
             server_memory_min_bytes: oracle_bytes,
             managed_memory_bytes: oracle_bytes,
             scribe_enabled: false,

@@ -1096,11 +1096,12 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
         .scribe_wal_root_for_test()
         .expect("the pod composes a WAL")
         .to_path_buf();
+    // WAL payloads are compressed, so their size proves nothing about the
+    // rows; the restart below proves the whole request was durable.
     let acknowledged_segments = wal_segments(&wal_root);
-    let acknowledged_bytes: u64 = acknowledged_segments.iter().map(|(_, bytes)| bytes).sum();
     assert!(
-        acknowledged_bytes >= (MAX_REQUEST_ROWS as u64) * 8,
-        "the acknowledgement follows WAL sync of the whole request: {acknowledged_bytes} bytes"
+        !acknowledged_segments.is_empty(),
+        "the acknowledgement is WAL-backed"
     );
 
     let occupant = server

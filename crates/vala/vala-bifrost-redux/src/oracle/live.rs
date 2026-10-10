@@ -81,6 +81,9 @@ pub(crate) struct LiveScribeRoute {
     pub(crate) endpoint: String,
     /// Exact time partition the stream retains.
     pub(crate) time_partition: TimePartitionWire,
+    /// Live bytes the listing reported this query reads in the partition;
+    /// sizes the query's partitions and nothing else.
+    pub(crate) bytes: u64,
 }
 
 /// Every live route discovered for one pinned table, with its signing identity.

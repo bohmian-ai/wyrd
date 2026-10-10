@@ -14,12 +14,15 @@ pub struct DiscoveredTailRoute {
     pub time_partition: TimePartitionWire,
     /// Exact node and writer epoch returned by discovery.
     pub stream: TailStreamIdentity,
+    /// Live bytes the listing's scope reads in this partition.
+    pub bytes: u64,
 }
 
 /// Query-scoped resolver for live Scribe streams.
 #[async_trait::async_trait]
 pub trait TailStreamDiscovery: Send + Sync {
-    /// Lists active streams for one binding on exactly the frozen Scribes.
+    /// Lists active streams for one binding on exactly the frozen Scribes,
+    /// each with the bytes `scope` reads there.
     ///
     /// `scribes` is the query attempt's frozen roster; discovery never rereads
     /// membership, so every route names a participant of that one cut.
@@ -36,6 +39,7 @@ pub trait TailStreamDiscovery: Send + Sync {
     async fn discover(
         &self,
         binding: &TenantTableBinding,
+        scope: &crate::scan_sizing::ScanScope,
         scribes: &[OracleQueryParticipant],
         deadline: Instant,
     ) -> Result<Vec<DiscoveredTailRoute>, TailReadError>;

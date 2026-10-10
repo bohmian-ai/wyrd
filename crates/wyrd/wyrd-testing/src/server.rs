@@ -465,6 +465,13 @@ pub struct WyrdTestServerBuilder {
     /// capacity to be a stated number rather than whatever the injected memory
     /// envelope happens to divide into.
     oracle_query_slot_limit: Option<usize>,
+    /// Scanned bytes that earn one Oracle execution partition, replacing the
+    /// production default.
+    ///
+    /// Journey tables hold kilobytes, which the default sizes to one local
+    /// partition; a journey proving distributed execution states a smaller
+    /// value so its scans fan out.
+    oracle_partition_scan_bytes: Option<u64>,
     /// Oracle queue and deadline bounds replacing the production defaults.
     ///
     /// A journey that proves queue or total-deadline expiry states short
@@ -623,6 +630,7 @@ impl Default for WyrdTestServerBuilder {
             bifrost_data_path: None,
             system_resources: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             oracle_runtime: None,
             telemetry: None,
             bind_addrs: None,
@@ -4178,6 +4186,18 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Configure the scanned bytes that earn one Oracle execution partition.
+    ///
+    /// This is the same deployment knob production reads from
+    /// `WYRD_BIFROST_ORACLE_PARTITION_SCAN_BYTES`. A journey whose kilobyte
+    /// tables must still plan distributed sets it to one byte, so every scan
+    /// earns its full CPU-capped partition count.
+    #[must_use]
+    pub fn with_oracle_partition_scan_bytes_for_test(mut self, bytes: u64) -> Self {
+        self.oracle_partition_scan_bytes = Some(bytes);
+        self
+    }
+
     /// Configure this node's Oracle runtime bounds explicitly.
     ///
     /// These are the same values production reads from `bifrost.oracle`, such
@@ -4431,6 +4451,7 @@ impl WyrdTestServerBuilder {
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: self.oracle_query_slot_limit,
+                    oracle_partition_scan_bytes: self.oracle_partition_scan_bytes,
                     scratch_root: Some(scratch_root),
                     volume_roots,
                 },
@@ -5407,6 +5428,7 @@ mod production_composition_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                oracle_partition_scan_bytes: None,
                 scratch_root: Some(scratch.path().to_owned()),
                 volume_roots: None,
             },

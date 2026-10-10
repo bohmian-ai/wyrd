@@ -669,12 +669,16 @@ impl ScribeFragment {
             namespace: "bifrost".to_owned(),
             table: table.to_owned(),
         };
-        let (partition, stream) = scribe
+        let listed = scribe
             .tail_service()
-            .list_active_streams(&binding)?
+            .list_active_streams(
+                &binding,
+                &vala_bifrost_redux::scan_sizing::ScanScope::default(),
+            )?
             .into_iter()
             .next()
             .ok_or("the Scribe reports no live partition")?;
+        let (partition, stream) = (listed.time_partition, listed.stream);
         let schema = catalog.assignment_schema(&table_ref, tenant).await?;
         let schema_fingerprint = assignment_schema_fingerprint(&schema);
         let indices = columns

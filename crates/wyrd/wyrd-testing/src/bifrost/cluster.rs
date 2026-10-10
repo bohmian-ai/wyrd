@@ -14,6 +14,7 @@ use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
+use vala_bifrost_redux::scan_sizing::ScanScope;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -1827,7 +1828,11 @@ impl WyrdTestCluster {
         // spreads under the default, unless a journey states its own value.
         let mut oracle = self.oracle_runtime.clone().unwrap_or_default();
         oracle.file_scan_bytes_per_task.get_or_insert(1);
-        builder = builder.with_oracle_runtime_for_test(oracle);
+        builder = builder
+            .with_oracle_runtime_for_test(oracle)
+            // Likewise one scanned byte earns a partition, so a kilobyte
+            // table plans the distributed shape a production-sized one does.
+            .with_oracle_partition_scan_bytes_for_test(1);
         if let Some(root) = self.gateway_provider_root.clone() {
             builder = builder.with_gateway_provider_root_for_test(root);
         }
@@ -2126,11 +2131,11 @@ impl WyrdTestCluster {
                 .map(|runtime| runtime.tail_service())
                 .ok_or_else(|| ClusterError::Resource("Scribe tail service missing".to_owned()))?;
             let streams = source
-                .list_active_streams(&binding)
+                .list_active_streams(&binding, &ScanScope::default())
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
             if streams
                 .iter()
-                .any(|(partition, _)| partition == time_partition)
+                .any(|stream| stream.time_partition == *time_partition)
             {
                 found = true;
             }

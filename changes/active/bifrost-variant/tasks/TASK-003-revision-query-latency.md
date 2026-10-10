@@ -1647,3 +1647,195 @@ Change (REQ-035, INV-011, AC-015):
 - **Known limit:** raising `snapshot_retention` between plan and execution
   yields one no-op attempt; an idle table then waits for its next commit.
   Fails safe (retains longer).
+
+### Runs 10–13 and write runs 3–5, 2026-10-10
+
+Host: AMD Ryzen 9 9950X, 32 CPU / 91 GiB, Linux. Data root on ext4 over LVM
+over dm-crypt on one NVMe unless noted. Profiling build
+(`line-tables-only`, frame pointers). Each run is one tier of
+`bifrost_query_capacity` or its `--writes` sweep.
+
+| Run | Code | Tier |
+|---|---|---|
+| 10 | `GovernedMemoryRoot` pod-wide lock removed (`2f9e2889f`) | hot |
+| 11 | run 10 + 8 MiB chunked `sync_data` on staged Parquet (reverted) | parquet |
+| 12 | run 11 with the data root on tmpfs (diagnostic only) | parquet |
+| 13 | run 10 + ZSTD level-3 WAL payloads | parquet |
+| write-3 | run 10 code | parquet writes |
+| write-4 | ZSTD level 3 WAL | parquet writes |
+| write-5 | ZSTD level 1 WAL (`88f6e0657`) | parquet writes |
+
+#### Reads
+
+| Case | Run 9 hot | Run 10 hot | Run 11 parquet | Run 13 parquet |
+|---|---|---|---|---|
+| selective x1 | – | 519 qps, p50 1.9 ms | 539 qps, p50 1.8 ms | 524 qps, p50 1.9 ms |
+| selective peak | ~6,485 qps | 6,449 qps (x64) | 6,728 qps (x64) | 6,654 qps (x64) |
+| small-aggregate x1 | 178.6 qps | 165.1 qps | 145.0 qps | 138.1 qps |
+| small-aggregate x32 | 1,439 qps | 1,797 qps, p95 25.6 ms | 1,461 qps | 1,387 qps |
+| small-aggregate peak | 1,508 qps | 1,801 qps (x64) | 1,477 qps | 1,426 qps |
+| 1m-aggregate x8 | – | 567 qps | 379 qps | – |
+| table-aggregate x1 | – | 23.8 qps, p95 45 ms | 64.8 qps, p95 17 ms | – |
+| full-scan x1 | – | 40.6 qps | 14.3 qps | – |
+
+Run 10 server CPU at the small-aggregate peak is ~25.9 of 32 cores (run 9:
+~18). CPU per small-aggregate query rises with concurrency: 11.9 ms at x1,
+14.0 ms at x32, 14.4 ms at x64; selective 2.4 → 3.9 ms. After the lock fix
+the remaining contention is the per-query `GovernedMemoryView::lock_ledger`
+(one query's partitions contend on shrink/try_grow).
+
+#### Writes, Parquet tier
+
+| Row | Run 11 (disk) | Run 12 (tmpfs) | Run 13 (ZSTD WAL, disk) |
+|---|---|---|---|
+| write alone x4 | 637k rows/s, p99 539 ms | 1.56M rows/s, p99 58 ms | 1.26M rows/s, p99 180 ms |
+| write during small-aggregate | 673k rows/s, p99 495 ms | 1.49M rows/s, p99 64 ms | 1.18M rows/s, p99 185 ms |
+| write during 1m-aggregate | 843k rows/s, p99 274 ms | 1.48M rows/s, p99 65 ms | 958k rows/s, p99 420 ms |
+| small-aggregate while writing | 405 qps | 415 qps | 407 qps |
+
+| Writers | write-3 (raw WAL) | write-4 (ZSTD 3) | write-5 (ZSTD 1) |
+|---|---|---|---|
+| x1 | 370k rows/s, p99 106 ms | 453k, 99 ms | 466k, 69 ms |
+| x4 | 697k, 497 ms | 1.06M, 251 ms | 1.04M, 424 ms |
+| x16 | 847k, 940 ms | 2.72M, 275 ms | 2.52M, 314 ms |
+| x64 | 969k, 1,565 ms | 2.77M, 943 ms | 2.52M, 953 ms |
+| WAL fsync total (x1/x4/x16/x64) | 14.4 / 11.7 / 9.3 / 7.3 s | 5.9 / 5.8 / 2.4 / 1.8 s | 6.5 / 6.4 / 2.7 / 2.3 s |
+| ingress per batch (x1 → x64) | ~2.7 ms | 5.1 → 6.7 ms | 3.6 → 4.3 ms |
+
+write-2 (an earlier run of the same pre-compression code) measured 2.33M
+rows/s at x16; this disk varies by up to ~2.5x between runs, so only
+back-to-back runs are compared.
+
+#### Diagnosis: Parquet-tier write p99
+
+- **Symptom:** Parquet-tier write p99 374–685 ms against the hot tier's
+  86 ms, in every write row.
+- **Evidence:** run 12 (data root on tmpfs) brought p99 to 58–65 ms and
+  doubled throughput, so the wait is disk. write-3 off-CPU stacks: the
+  shard owner spends 9.1 s of an 11.8 s x16 step in
+  `WalSegment::sync_data` → `fdatasync`. Total fsync time stays 7–14 s at
+  every concurrency while the fsync count falls from 1,235 to 49, so it
+  tracks bytes made durable, not fsync count.
+- **Cause:** WAL slices were uncompressed Arrow IPC (84 B/row on the bench
+  rows), about 10x the published Parquet bytes, all fsynced on the serial
+  shard owner.
+- **Fix:** `88f6e0657` writes WAL payloads with Arrow IPC ZSTD level 1
+  (29.5 B/row). Admission reserves `wal_payload_bound`, which stays an upper
+  bound when Arrow falls back to raw buffers. Replay already decodes both
+  forms through `StreamReader`. Portable: no OS- or filesystem-specific
+  code.
+- **Rejected:** chunked `sync_data` of staged Parquet (run 11, no change;
+  reverted). Dropping the slice fsync before COMMIT: fsync time is
+  byte-bound, so it would help only small groups, and replay fails closed
+  on a CRC error inside a committed prefix.
+- **Remaining:** the write tail during 1m-aggregate reads (run 13 p99
+  420 ms). At x64 the single shard is the ceiling (~2.5–2.8M rows/s; the WAL
+  lane is busy 2.7 s of a 3.6 s step), and latency there is closed-loop
+  queueing.
+
+#### Diagnosis: write tail during 1m-aggregate (independent diagnostician, run 14)
+
+- **Symptom:** "write during 1m-aggregate" p99 500 ms (normal ~45 ms);
+  200–915 ms stalls every 20–45 batches.
+- **Evidence:** every slow window lies inside a generation's `stage_member`
+  (gen 67 52.357→53.792 holds the 52.405–52.628 stall; gen 69 57.350→58.729
+  holds 57.510–58.426; gens 68, 71, 74 likewise). Off-CPU profile 19, aligned
+  to the log via six `close_active_generation` intervals: the WAL thread spends
+  92 ms then 44 ms in `fdatasync` (`sync_segments`) at 52.439/52.531 (normal
+  3–10 ms, the only >60 ms sync in the profile), while the persistence thread
+  blocks 68 + 34 ms in `open64` (`RollingArtifactWriter::open_artifact`,
+  `File::create`) under `encode_runs`. Write-only run 5 pairs ~2.1 s WAL
+  `fdatasync` with ~0.98 s `encode_runs` `sync_all` and ~1.2 s blocking-pool
+  `sync_all` (`copy_fsynced`).
+- **Cause (kernel wait inferred, kernel stacks unresolved):** both group
+  syncs on the ACK path (`sync_group`, `append_and_sync_batch_commits`) grow the
+  un-preallocated WAL segment, so each `fdatasync` commits metadata to the
+  filesystem journal it shares with persistence. Persistence writes whole
+  generations (~512 MiB Arrow per rotation, every 1.4–2.6 s) unsynced —
+  `RollingArtifactWriter` through a `BufWriter`, then `copy_fsynced`
+  (`staging.rs`) copying each claim artifact and syncing once at the end — so
+  the WAL sync waits behind that writeback burst.
+- **Fix site:** the Scribe artifact writers — `RollingArtifactWriter`
+  (`encode_runs`, claim `encode`) and `copy_fsynced` (`stage_and_elect`).
+  Run 11 bounded only the former; runs 15/16 test both together.
+- **Undetermined:** the 54.10–54.87 stall falls outside the profile window;
+  macOS/APFS has no ordered-data journal and needs its own measurement.
+
+### Plan, 2026-10-10 (agreed)
+
+One change per comparison; each experiment runs back to back with its own
+baseline, nothing else heavy on the host during a run. Experiment switches
+(`WYRD_EXP_WRITEBACK`, `WYRD_EXP_PARTITIONS`) are throwaway and are reverted
+before any commit.
+
+1. **Partitions (runs 17/18, hot tier).** Baseline vs 8 fixed partitions per
+   query. If CPU per query at high concurrency drops, size partitions by the
+   bytes a query scans (not CPU count alone) and carry the planned shape
+   through the grant.
+2. **Write tail retest (parquet tier) — deferred until the telemetry
+   fixture (3–5) exists; retesting on the events fixture is not
+   representative.** Baseline vs bounded write-back of
+   both artifact writers (`RollingArtifactWriter`, `copy_fsynced`),
+   alternating A/B/A/B/A/B, `sync` + `fstrim` before each run, longer
+   write-during-read steps. Judge on WAL `fdatasync` stalls (>60 ms count,
+   total stall time per GB written), not end-to-end p99.
+3. **Telemetry generator.** Deterministic GenAI/HTTP spans on the native
+   `traces.spans` schema, written through OTLP ingest; exact answers per row
+   index, as today's fixture. Random 16/8-byte trace/span IDs with parent
+   trees, a few dozen services/routes/models, long-tailed durations, 1–5%
+   errors with exception text, token counts. Attributes straddle the 10%
+   shredding threshold: core keys on 60–100% of spans (incl. high-cardinality
+   `customer.id`, nested `user.{id,plan}`), mid keys on 8–25%, thousands of
+   long-tail `custom.*` keys under 1% with mixed types. Logs follow later.
+4. **Codec measurement on that data.** Size and decode time per column for
+   ZSTD-3 (current), ZSTD-1, LZ4_RAW, Snappy. If LZ4 is much larger, consider
+   LZ4 for fresh Scribe files and ZSTD on Forge compaction (storage cost sits
+   in old data).
+5. **Telemetry query benchmark.** Replace the events cases with: trace lookup
+   by `trace_id`; one service over 15 minutes; error rate per route per
+   minute; p99 duration per route; tokens per model per hour; and one
+   attribute lookup on the shredded `customer.id` within a time window. The
+   attribute case must run near the plain-column lookup and its profile must
+   show it reads the shredded column, not the whole Variant.
+6. **Per-query overhead after 1–5.** Re-measure allocator churn and
+   per-query metrics collection (`MetricsSet::aggregate_by_name`,
+   `MetricBuilder::build`); gather plan metrics only when profiling is asked.
+
+Uncommitted, commit when asked: this task log, the bench's
+`completed_unix_ms` samples.
+
+### Runs 15–18, 2026-10-10
+
+Same build (HEAD `88f6e0657` plus throwaway env switches), back to back.
+
+| Run | Tier | Switch |
+|---|---|---|
+| 15 | parquet | none |
+| 16 | parquet | `WYRD_EXP_WRITEBACK=1` (8 MiB `sync_data` in `RollingArtifactWriter` and `copy_fsynced`) |
+| 17 | hot | none |
+| 18 | hot | `WYRD_EXP_PARTITIONS=8` (`oracle_target_partitions` fixed at 8) |
+
+Write p99, parquet tier: run 14 / 15 / 16 = write alone 256 / 72 / 268 ms,
+during small-aggregate 320 / 448 / 232 ms, during 1m-aggregate 500 / 256 /
+168 ms. Baseline-to-baseline spread (14 vs 15) matches the effect; not
+conclusive. Retest per the plan, judged on `bifrost_scribe_wal_fsync_seconds`
+buckets.
+
+Hot tier, run 17 → run 18 (CPU per query = server cores / qps):
+
+| Case | Run 17 | Run 18 (8 partitions) |
+|---|---|---|
+| selective x1 | 550 qps, p50 1.8 ms | 660 qps, p50 1.5 ms |
+| selective peak | 6,419 qps (x64) | 7,100 qps (x64) |
+| small-aggregate x1 | 179 qps, p50 5.6 ms, 11.3 ms CPU/query | 276 qps, p50 3.6 ms, 4.9 ms CPU/query |
+| small-aggregate x32 | 1,806 qps, 13.9 ms CPU/query | 2,967 qps, 8.8 ms CPU/query |
+| small-aggregate peak | 1,830 qps | 3,028 qps |
+| 1m-aggregate x8 | 574 qps, p50 13.9 ms | 699 qps, p50 11.4 ms |
+| table-aggregate x1 | 24.4 qps | 25.8 qps |
+| full-scan x1 | 39.9 qps | 40.6 qps |
+| small-aggregate while writing | 527 qps | 823 qps |
+
+Fewer partitions helps every read case and costs nothing on the 10M-row
+scans, so per-query fan-out, not parallelism, dominates these queries. Not
+yet measured on the parquet tier or the 100M-row heavy fixture, where fixed
+8 partitions could under-parallelize a large scan.

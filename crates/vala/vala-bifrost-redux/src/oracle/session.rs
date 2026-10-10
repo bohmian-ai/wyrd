@@ -12,11 +12,17 @@ use std::sync::{Arc, LazyLock};
 
 use datafusion::catalog::{CatalogProviderList, MemoryCatalogProviderList};
 use datafusion::execution::context::SessionConfig;
-use datafusion::execution::{SessionState, SessionStateBuilder, SessionStateDefaults};
+use datafusion::execution::{SessionState, SessionStateBuilder, SessionStateDefaults, TaskContext};
+use datafusion::logical_expr::Expr;
+use datafusion_proto::bytes::Serializeable as _;
 
 /// The process-wide template; it holds no tables and never changes.
-static SHARED: LazyLock<OracleSessionTemplate> = LazyLock::new(|| OracleSessionTemplate {
-    template: SessionStateBuilder::new().with_default_features().build(),
+static SHARED: LazyLock<OracleSessionTemplate> = LazyLock::new(|| {
+    let template = SessionStateBuilder::new().with_default_features().build();
+    OracleSessionTemplate {
+        functions: TaskContext::from(&template),
+        template,
+    }
 });
 
 /// A default-featured session state every Oracle session is cloned from.
@@ -27,6 +33,9 @@ pub(crate) struct OracleSessionTemplate {
     /// It is never wrapped in a context and never holds a table: its catalog
     /// list is replaced in every session built from it.
     template: SessionState,
+    /// The template's function registry as a task context, the shape
+    /// `datafusion-proto` resolves a decoded expression's functions against.
+    functions: TaskContext,
 }
 
 impl OracleSessionTemplate {
@@ -34,6 +43,17 @@ impl OracleSessionTemplate {
     #[must_use]
     pub(crate) fn shared() -> &'static Self {
         &SHARED
+    }
+
+    /// Decodes one `datafusion-proto` logical expression, resolving its
+    /// functions against Oracle's default registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DataFusion` error of malformed bytes or a function the
+    /// registry lacks.
+    pub(crate) fn decode_expr(&self, bytes: &[u8]) -> datafusion::error::Result<Expr> {
+        Expr::from_bytes_with_ctx(bytes, &self.functions)
     }
 
     /// Returns one Oracle session state under `config`: a clone of the

@@ -794,8 +794,8 @@ impl OraclePeerWorker {
     ///
     /// A graph runs a whole distributed plan on this node — several stages,
     /// their exchanges, and their spill — so it charges a full query envelope.
-    /// The local ratio is zero because none of the leader's own scan work runs
-    /// here.
+    /// Its sessions run the partitions of a fully remote scan (local ratio
+    /// zero), because none of the leader's own scan work runs here.
     ///
     /// # Errors
     ///
@@ -804,10 +804,15 @@ impl OraclePeerWorker {
     fn acquire_graph_envelope(
         &self,
     ) -> Result<Box<crate::resources::OracleQueryResources>, DispatchError> {
+        let target_partitions = self
+            .oracle_resources
+            .oracle_partitioning()
+            .target_partitions(0.0)
+            .map_err(|_| DispatchError::Capacity)?;
         self.oracle_resources
             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                 QueryClass::Analytical,
-                0.0,
+                target_partitions,
             ))
             .map(Box::new)
             .map_err(|_| DispatchError::Capacity)
@@ -2284,6 +2289,7 @@ mod tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: Some(units),
+                oracle_partition_scan_bytes: None,
                 scratch_root: None,
                 volume_roots: None,
             },
@@ -2307,7 +2313,7 @@ mod tests {
         oracle
             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                 QueryClass::Interactive,
-                0.0,
+                8,
             ))
             .map(Box::new)
     }

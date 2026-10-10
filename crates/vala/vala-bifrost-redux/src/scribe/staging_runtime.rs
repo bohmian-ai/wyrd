@@ -360,6 +360,7 @@ impl ScribeStagingRuntime {
             })
             .collect();
         let bytes = staged.staged_bytes();
+        let footers = staged.footers().clone();
         let wal = staged.wal();
         let ready = self.stager.publish_ready(staged, ready_at).await?;
         {
@@ -378,6 +379,7 @@ impl ScribeStagingRuntime {
                 member,
                 runs,
                 bytes,
+                footers,
                 wal: (
                     crate::scribe::wal::WalLsn::new(wal.min),
                     crate::scribe::wal::WalLsn::new(wal.max),
@@ -665,10 +667,16 @@ impl ScribeStagingRuntime {
 
     /// Installs the durable authority of every member recovery kept.
     ///
+    /// A member still served from its staged runs is offered with the runs'
+    /// footers, read by [`crate::scribe::member_stager::preflight_run`]
+    /// exactly as staging reads them, so its scans are sized like any other
+    /// staged member's.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the registry refuses a restored
-    /// authority, which means two durable records claim the same generation.
+    /// Returns [`ScribeError::Internal`] when a staged run fails its
+    /// preflight, or the registry refuses a restored authority, which means
+    /// two durable records claim the same generation.
     fn restore_authorities(
         &self,
         key: &ScribeAssemblyKey,
@@ -707,10 +715,16 @@ impl ScribeStagingRuntime {
                 StagedMemberState::Ready
                 | StagedMemberState::Claimed { .. }
                 | StagedMemberState::Publishing { .. } => {
+                    let runs = member.run_paths();
+                    let footers = runs
+                        .iter()
+                        .map(|run| crate::scribe::member_stager::preflight_run(run))
+                        .collect::<Result<Vec<_>, _>>()?;
                     crate::scribe::hot_source::HotAuthority::StagedRun {
                         member: id,
-                        runs: member.run_paths(),
+                        runs,
                         bytes: member.record().encoded_bytes(),
+                        footers: crate::scribe::hot_source::RunFooters::new(footers),
                         wal: (
                             crate::scribe::wal::WalLsn::new(wal.min),
                             crate::scribe::wal::WalLsn::new(wal.max),
@@ -761,7 +775,7 @@ impl ScribeStagingRuntime {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "a recovered staged key names no run to read its schema from".to_owned(),
             })?;
-        let schema = run_schema(&run)?;
+        let schema = Arc::clone(crate::scribe::member_stager::preflight_run(&run)?.schema());
         if crate::parquet::footer::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
             return Err(ScribeError::Internal {
                 detail: "a recovered staged run's schema is not the schema its key names"
@@ -982,26 +996,6 @@ impl ScribeStagingRuntime {
                 detail: "staged assembly key carries no recorded encoding context".to_owned(),
             })
     }
-}
-
-/// Reads the physical schema one staged run was encoded with.
-///
-/// The run's own footer is the authority: it describes the bytes that will be
-/// merged, which is exactly what the merge must be told about.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::Internal`] when the run cannot be opened or its
-/// Parquet metadata cannot be read.
-fn run_schema(run: &Path) -> Result<SchemaRef, ScribeError> {
-    let file = std::fs::File::open(run).map_err(|error| ScribeError::Internal {
-        detail: format!("open a recovered staged run: {error}"),
-    })?;
-    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("read a recovered staged run's metadata: {error}"),
-        })?;
-    Ok(Arc::clone(builder.schema()))
 }
 
 impl std::fmt::Debug for ScribeStagingRuntime {
@@ -1336,9 +1330,10 @@ mod tests {
             .into_iter()
             .next()
             .expect("the member names a run");
-        let on_disk = run_schema(&run).expect("the run carries its schema");
+        let on_disk =
+            crate::scribe::member_stager::preflight_run(&run).expect("the run carries its schema");
         assert_eq!(
-            crate::parquet::footer::schema_fingerprint(on_disk.as_ref()),
+            crate::parquet::footer::schema_fingerprint(on_disk.schema().as_ref()),
             key.schema_fingerprint(),
             "the schema restore reads back is the schema the key names"
         );

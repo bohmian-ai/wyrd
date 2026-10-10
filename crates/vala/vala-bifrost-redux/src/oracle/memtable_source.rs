@@ -4,8 +4,9 @@
 //! `DataFusion`'s `MemorySourceConfig` accepts no filter, so a point lookup
 //! over the memtable evaluates its predicate on every row. Scribe records each
 //! append batch's exact column bounds when the batch arrives; this source
-//! hands them to `DataFusion`'s `PruningPredicate`, exactly as a Parquet scan
-//! prunes row groups by their footer statistics.
+//! prunes by them through [`BatchPruning`], the same pruning the Scribe
+//! listing sizes the query with, as a Parquet scan prunes row groups by their
+//! footer statistics.
 
 use std::fmt;
 use std::sync::Arc;
@@ -13,7 +14,6 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::Statistics;
-use datafusion::common::pruning::PrunableStatistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::config::ConfigOptions;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -23,9 +23,10 @@ use datafusion::execution::TaskContext;
 use datafusion::physical_expr::projection::ProjectionExprs;
 use datafusion::physical_expr::utils::conjunction;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
-use datafusion::physical_optimizer::pruning::PruningPredicateBuilder;
 use datafusion::physical_plan::filter_pushdown::{FilterPushdownPropagation, PushedDown};
 use datafusion::physical_plan::{DisplayFormatType, Partitioning, SendableRecordBatchStream};
+
+use crate::scan_sizing::{BatchPruning, ScanScope, ScanSizer};
 
 /// An in-memory source over memtable batches that prunes them by their bounds.
 ///
@@ -41,34 +42,55 @@ pub(super) struct MemtableSource {
     /// Exact bounds of each batch in `inner`, partition by partition, column
     /// for column with the source schema.
     statistics: Vec<Vec<Arc<Statistics>>>,
+    /// The sizing that deals batches over partitions by their Arrow bytes.
+    partitioning: crate::scan_sizing::OraclePartitioning,
 }
 
 impl MemtableSource {
-    /// Builds the source over `partitions` of batches and their bounds.
+    /// Builds the source over `batches` and their bounds, dealt round-robin
+    /// over the partitions their bytes earn under `partitioning`, at least
+    /// one and at most `cap`.
+    ///
+    /// The batches are already projected to the query's columns, so they are
+    /// sized by [`ScanSizer`] with every column covered.
     ///
     /// # Errors
     ///
     /// Returns the `DataFusion` error raised when a batch does not match
     /// `schema`.
     pub(super) fn try_new(
-        partitions: Vec<Vec<(RecordBatch, Arc<Statistics>)>>,
+        batches: Vec<(RecordBatch, Arc<Statistics>)>,
+        partitioning: crate::scan_sizing::OraclePartitioning,
+        cap: usize,
         schema: SchemaRef,
     ) -> DataFusionResult<Self> {
-        let (batches, statistics): (Vec<Vec<_>>, Vec<Vec<_>>) = partitions
-            .into_iter()
-            .map(|partition| partition.into_iter().unzip())
-            .unzip();
+        let (batches, bounds): (Vec<_>, Vec<_>) = batches.into_iter().unzip();
+        let bytes = ScanSizer::new(&ScanScope::default(), &schema).batch_bytes(&batches, &bounds);
+        let partitions = partitioning.scan_partitions(bytes, cap);
+        let mut dealt = vec![(Vec::new(), Vec::new()); partitions];
+        for (index, (batch, bounds)) in batches.into_iter().zip(bounds).enumerate() {
+            let (partition, statistics) = &mut dealt[index % partitions];
+            partition.push(batch);
+            statistics.push(bounds);
+        }
+        let (batches, statistics): (Vec<Vec<_>>, Vec<Vec<_>>) = dealt.into_iter().unzip();
         Ok(Self {
             inner: MemorySourceConfig::try_new(&batches, schema, None)?,
             statistics,
+            partitioning,
         })
     }
 
-    /// Returns this source without the batches `predicate` excludes, or
-    /// `None` when it excludes none.
+    /// Returns this source without the batches `predicate` excludes, dealt
+    /// over the partitions the kept bytes earn, or `None` when it excludes
+    /// none.
     ///
-    /// A predicate that does not plan as a pruning predicate, or a partition
-    /// whose bounds cannot be evaluated, keeps every batch it covers.
+    /// The kept batches are re-dealt round-robin over
+    /// [`crate::scan_sizing::OraclePartitioning::scan_partitions`] of their Arrow bytes,
+    /// never more than this source had, so a point lookup that keeps one
+    /// batch runs as one partition rather than one per core. A predicate that
+    /// does not plan as a pruning predicate, or a partition whose bounds
+    /// cannot be evaluated, keeps every batch it covers.
     ///
     /// # Errors
     ///
@@ -76,36 +98,27 @@ impl MemtableSource {
     /// rebuilt into a source.
     fn pruned(&self, predicate: Arc<dyn PhysicalExpr>) -> DataFusionResult<Option<Self>> {
         let schema = self.inner.original_schema();
-        let Ok(pruning) = PruningPredicateBuilder::new()
-            .with_file_schema(Arc::clone(&schema))
-            .try_build(predicate)
-        else {
+        let Some(pruning) = BatchPruning::try_new(&schema, predicate) else {
             return Ok(None);
         };
         let mut excluded = false;
-        let mut partitions = Vec::with_capacity(self.statistics.len());
+        let mut kept = Vec::new();
         for (batches, statistics) in self.inner.partitions().iter().zip(&self.statistics) {
-            let keep = pruning
-                .prune(&PrunableStatistics::new(
-                    statistics.clone(),
-                    Arc::clone(&schema),
-                ))
-                .unwrap_or_else(|_| vec![true; batches.len()]);
+            let keep = pruning.keep(statistics, batches.len());
             excluded |= keep.contains(&false);
-            partitions.push(
+            kept.extend(
                 batches
                     .iter()
                     .zip(statistics)
                     .zip(keep)
                     .filter(|(_, keep)| *keep)
-                    .map(|((batch, bounds), _)| (batch.clone(), Arc::clone(bounds)))
-                    .collect(),
+                    .map(|((batch, bounds), _)| (batch.clone(), Arc::clone(bounds))),
             );
         }
         if !excluded {
             return Ok(None);
         }
-        Self::try_new(partitions, schema).map(Some)
+        Self::try_new(kept, self.partitioning, self.statistics.len(), schema).map(Some)
     }
 }
 
@@ -245,7 +258,8 @@ mod tests {
     }
 
     /// A point lookup pushed into the memtable leaf keeps only the batch whose
-    /// bounds hold the key, and the filter above still answers exactly.
+    /// bounds hold the key, re-deals it into the one partition its bytes earn,
+    /// and the filter above still answers exactly.
     ///
     /// # Panics
     ///
@@ -256,9 +270,15 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let source = MemtableSource::try_new(
             vec![
-                vec![bounded(&[0, 1, 2]), bounded(&[10, 11, 12])],
-                vec![bounded(&[20, 21, 22])],
+                bounded(&[0, 1, 2]),
+                bounded(&[10, 11, 12]),
+                bounded(&[20, 21, 22]),
             ],
+            crate::scan_sizing::OraclePartitioning::new(
+                2,
+                crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
+            ),
+            2,
             Arc::clone(&schema),
         )
         .expect("memtable source");
@@ -293,7 +313,7 @@ mod tests {
         .await
         .expect("execute the pruned lookup");
 
-        assert_eq!(kept, Some(vec![1, 0]));
+        assert_eq!(kept, Some(vec![1]));
         assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     }
 }

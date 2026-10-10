@@ -5,9 +5,10 @@
 //! which rows a cut sees changes `vala.file_list`, and a trigger on that table
 //! sends a `bifrost_cut` notification naming the table from inside the
 //! committing transaction, so it is delivered only if the write commits.
-//! Pointer moves that leave the candidates alone — compaction rewrites,
-//! expiry, manifest rewrites — return the same rows through the older pointer,
-//! so a cached cut stays a correct answer across them.
+//! A Forge rewrite moves the pointer without touching `vala.file_list`, so its
+//! terminal transition sends the same notification: the older pointer would
+//! still answer correctly, but would keep reading the replaced files. Expiry
+//! and manifest rewrites send nothing; they change neither rows nor files.
 //!
 //! A cached cut is served only while this node is listening: before the first
 //! `LISTEN` and after any lost connection the cache is cleared and every query

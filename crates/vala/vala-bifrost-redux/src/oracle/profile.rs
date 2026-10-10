@@ -5,14 +5,14 @@
 //! stream's terminal. The Oracle's own steps are timed into `DataFusion`
 //! [`Time`] metrics registered on an [`ExecutionPlanMetricsSet`], with the
 //! same scoped-guard pattern every `DataFusion` operator uses, and the executed
-//! physical root is retained so every operator's own metrics are folded in at
-//! the end. The profile is emitted exactly once, when its last owner drops:
+//! physical root's operator metrics are folded in once the query's admission
+//! guard releases that root (see [`QueryProfile::fold_root`]). The profile is emitted exactly once, when its last owner drops:
 //! global counters for fleet-wide Pareto analysis and one DEBUG event for the
 //! single query.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, OnceLock};
+use std::sync::Mutex;
 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::{
@@ -48,12 +48,20 @@ pub(crate) struct QueryProfile {
     pub(crate) provider_setup: Time,
     /// Planning the one physical root from SQL.
     pub(crate) physical_planning: Time,
+    /// Estimating the bytes the plan scans and sizing its partitions.
+    pub(crate) scan_sizing: Time,
     /// Acquiring query admission, queueing included.
     pub(crate) admission: Time,
     /// Staging the read decision and binding sources to the retained root.
     pub(crate) audit_bind: Time,
-    /// The executed root, retained so its operators' metrics fold in on drop.
-    root: OnceLock<Arc<dyn ExecutionPlan>>,
+    /// Operator metrics folded from the executed root when its owner released
+    /// it.
+    ///
+    /// The profile holds values, never the plan: an operator such as a
+    /// `CollectLeft` hash join keeps memory reserved on its plan node, so a
+    /// profile that held the root would keep that memory alive past the
+    /// query's admission envelope.
+    operators: Mutex<BTreeMap<String, ProfileValue>>,
 }
 
 impl QueryProfile {
@@ -74,21 +82,28 @@ impl QueryProfile {
             scribe_listing: step("scribe_listing"),
             provider_setup: step("provider_setup"),
             physical_planning: step("physical_planning"),
+            scan_sizing: step("scan_sizing"),
             admission: step("admission"),
             audit_bind: step("audit_bind"),
-            root: OnceLock::new(),
+            operators: Mutex::default(),
             metrics,
         }
     }
 
-    /// Retains the root this query executes so its metrics fold in on drop.
+    /// Folds the executed root's operator metrics into this profile.
     ///
-    /// The root shares its metric handles with the running streams, so the
-    /// values read on drop are final. Only the first root is kept; an attempt
-    /// executes exactly one.
-    pub(crate) fn retain_root(&self, root: &Arc<dyn ExecutionPlan>) {
-        // An attempt executes one root; a second call has nothing to add.
-        let _ = self.root.set(Arc::clone(root));
+    /// The root's owner calls it while releasing the root, once the values
+    /// are final: the admission guard for an Interactive root, after the
+    /// query is cancelled, and an Analytical graph's metric fold for the
+    /// metric-carrier plan its follower metrics were folded into. Either
+    /// owner then drops the root before the query's envelope is released. An
+    /// attempt executes one root, so this runs at most once per profile.
+    pub(crate) fn fold_root(&self, root: &dyn ExecutionPlan) {
+        let mut operators = self
+            .operators
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::fold_plan(root, &mut operators);
     }
 
     /// Collects every event: the Oracle's steps, then each operator's metrics.
@@ -100,9 +115,13 @@ impl QueryProfile {
     fn events(&self) -> BTreeMap<String, ProfileValue> {
         let mut events = BTreeMap::new();
         ProfileValue::fold(ORACLE_EVENT, &self.metrics.clone_inner(), &mut events);
-        if let Some(root) = self.root.get() {
-            Self::fold_plan(root.as_ref(), &mut events);
-        }
+        events.extend(
+            self.operators
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .map(|(event, value)| (event.clone(), *value)),
+        );
         events
     }
 
@@ -228,10 +247,10 @@ mod tests {
         )]))));
         let root: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(lit(true), empty).expect("filter over an empty input"));
-        profile.retain_root(&root);
         collect(Arc::clone(&root), Arc::new(TaskContext::default()))
             .await
             .expect("execute the empty root");
+        profile.fold_root(root.as_ref());
 
         let events = profile.events();
 

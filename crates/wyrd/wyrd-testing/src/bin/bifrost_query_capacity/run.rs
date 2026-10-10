@@ -39,14 +39,21 @@ const PROFILE_HERTZ: u32 = 999;
 
 /// Oracle's per-query scan counters a window differences, so a step shows
 /// how much each query opened and pruned.
-const SCAN_COUNTERS: [&str; 6] = [
+const SCAN_COUNTERS: [&str; 8] = [
     "oracle_query_files_scanned_total",
     "oracle_query_partitions_scanned_total",
     "oracle_query_row_groups_scanned_total",
     "oracle_query_row_groups_pruned_total",
     "oracle_query_row_groups_pruned_bloom_total",
     "oracle_query_rows_pruned_page_index_total",
+    "oracle_query_row_groups_sized_total",
+    "bifrost_scan_sizing_fallback_total",
 ];
+
+/// Most row groups Oracle's scan sizing may keep per row group the scan
+/// reads before a window is flagged: dynamic filters let a scan read fewer
+/// than sizing could rule out, but not this many fewer.
+const SIZING_DIVERGENCE: f64 = 4.0;
 
 /// Oracle's per-query profile counter of timed events, by `event` label.
 const PROFILE_TIMES: &str = "oracle_query_profile_nanoseconds_total";
@@ -146,6 +153,10 @@ pub struct Measured {
     pub clients: usize,
     /// Latency of every successful request, microseconds.
     pub latencies_us: Vec<u64>,
+    /// Wall-clock completion of every successful request, Unix milliseconds,
+    /// index-aligned with `latencies_us` so a slow request can be matched to
+    /// server log timestamps.
+    pub completed_unix_ms: Vec<u64>,
     /// Failed requests by stable error code, `wrong-result`, or terminal.
     pub errors: BTreeMap<String, u64>,
     /// Rows acknowledged by a write step.
@@ -175,9 +186,21 @@ impl Measured {
             .map(|micros| *micros as f64 / 1_000.0)
     }
 
+    /// Records one successful request sent at `sent`, completing now.
+    fn record(&mut self, sent: Instant) {
+        self.latencies_us.push(micros(sent));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        self.completed_unix_ms.push(now);
+    }
+
     /// Folds another client's results into this one.
     fn merge(&mut self, other: Self) {
         self.latencies_us.extend(other.latencies_us);
+        self.completed_unix_ms.extend(other.completed_unix_ms);
         self.rows += other.rows;
         for (code, count) in other.errors {
             *self.errors.entry(code).or_default() += count;
@@ -214,6 +237,34 @@ pub struct Usage {
     /// CPU seconds this benchmark process used, to show the driver was not
     /// the bottleneck.
     pub driver_cpu_seconds: f64,
+}
+
+impl Usage {
+    /// Returns why this window's scan sizing diverged from its scans, or
+    /// `None` when it did not.
+    ///
+    /// Sizing diverges when it fell back (a dropped filter or an unread
+    /// footer, counted by `bifrost_scan_sizing_fallback_total`) or kept more
+    /// than [`SIZING_DIVERGENCE`] times the row groups the scans read. Either
+    /// leaves the answer exact and only mis-sizes partitions, so the report
+    /// flags it rather than failing the row.
+    pub fn sizing_divergence(&self) -> Option<String> {
+        let count = |name: &str| {
+            SCAN_COUNTERS
+                .iter()
+                .position(|counter| *counter == name)
+                .map_or(0.0, |index| self.scan_counts[index])
+        };
+        let sized = count("oracle_query_row_groups_sized_total");
+        let scanned = count("oracle_query_row_groups_scanned_total");
+        let fallbacks = count("bifrost_scan_sizing_fallback_total");
+        (fallbacks > 0.0 || sized > SIZING_DIVERGENCE * scanned.max(1.0)).then(|| {
+            format!(
+                "sizing DIVERGENT: {sized:.0} row groups sized, {scanned:.0} scanned, \
+                 {fallbacks:.0} fallbacks"
+            )
+        })
+    }
 }
 
 /// Server state at the start of a window, closed into a [`Usage`].
@@ -429,7 +480,7 @@ impl<'a> Bench<'a> {
                     let sent = Instant::now();
                     match writer.write_batch(table, &batch).await {
                         Ok(()) => {
-                            measured.latencies_us.push(micros(sent));
+                            measured.record(sent);
                             measured.rows += (last - first) as u64;
                         }
                         Err(error) => *measured.errors.entry(code(&error)).or_default() += 1,
@@ -491,7 +542,7 @@ impl<'a> Bench<'a> {
                 let (sql, expected) = self.question(*case, sequence);
                 let sent = Instant::now();
                 match ask(&self.queries, sql, &expected).await {
-                    Ok(()) => measured.latencies_us.push(micros(sent)),
+                    Ok(()) => measured.record(sent),
                     Err(error) => {
                         *measured
                             .errors
@@ -706,7 +757,7 @@ impl<'a> Bench<'a> {
                     let (sql, expected) = question(fixture, &answers, case, next);
                     let sent = Instant::now();
                     match ask(&queries, sql, &expected).await {
-                        Ok(()) => measured.latencies_us.push(micros(sent)),
+                        Ok(()) => measured.record(sent),
                         Err(error) => *measured.errors.entry(error).or_default() += 1,
                     }
                 }
@@ -948,7 +999,37 @@ fn report_write_pareto(measured: &Measured, profile: &Profile) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Measured, Usage};
+    use super::{Measured, SCAN_COUNTERS, Usage};
+
+    /// A window flags its scan sizing when sizing fell back or kept more
+    /// than four times the row groups the scans read, and only then.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a window is flagged or passed against the rule.
+    #[test]
+    fn sizing_divergence_flags_fallbacks_and_overkept_row_groups() {
+        let window = |sized: f64, scanned: f64, fallbacks: f64| {
+            let mut usage = Usage::default();
+            for (counter, value) in SCAN_COUNTERS.iter().zip(&mut usage.scan_counts) {
+                *value = match *counter {
+                    "oracle_query_row_groups_sized_total" => sized,
+                    "oracle_query_row_groups_scanned_total" => scanned,
+                    "bifrost_scan_sizing_fallback_total" => fallbacks,
+                    _ => 0.0,
+                };
+            }
+            usage.sizing_divergence()
+        };
+        assert_eq!(window(0.0, 0.0, 0.0), None, "an idle window agrees");
+        assert_eq!(window(8.0, 2.0, 0.0), None, "four times is within bounds");
+        assert_eq!(window(4.0, 0.0, 0.0), None, "no scan allows four groups");
+        assert!(
+            window(9.0, 2.0, 0.0).is_some(),
+            "over four times is flagged"
+        );
+        assert!(window(1.0, 1.0, 1.0).is_some(), "any fallback is flagged");
+    }
 
     /// Percentiles are nearest-rank and the rate counts only successes.
     ///

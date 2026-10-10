@@ -74,6 +74,7 @@ mod live;
 mod memtable_source;
 #[cfg(test)]
 mod nested_pushdown;
+mod sizing;
 #[cfg(feature = "test-support")]
 pub use live::live_source_batches_for_test;
 mod participant_cut;
@@ -856,7 +857,7 @@ struct RetainedPhysicalPlan {
     live_listing_lost: bool,
 }
 
-/// Every pinned table's discovered live routes, taken before planning.
+/// Every pinned table's discovered live routes, taken before physical planning.
 #[derive(Debug, Default)]
 struct LiveDiscovery {
     /// Reported routes keyed by canonical table name; empty tables are absent.
@@ -883,6 +884,8 @@ struct RetainedExecutionInput<'a> {
     analytical: Option<&'a analytical::AnalyticalAttemptContext>,
     /// The public running-query owner, moved onto the graph if Analytical.
     running_query: &'a mut Option<RunningQueryTerminalOwner>,
+    /// The attempt's profile, which the root's operator metrics fold into.
+    profile: &'a Arc<profile::QueryProfile>,
 }
 
 /// One executed cut's output together with the class it executed under.
@@ -1551,7 +1554,13 @@ impl Oracle {
             return Err(BifrostError::OracleRoleUnavailable);
         };
         let (mut admitted, running_query) = self
-            .admit_built_attempt(&context, &planned, &participant_cut, query_class, deadline)
+            .admit_built_attempt(
+                &context,
+                &planned,
+                &participant_cut,
+                (query_class, retained.config.target_partitions()),
+                deadline,
+            )
             .await?;
         let (session, ownership) = handle.lease_session(analytical::AnalyticalLeaseInputs {
             attempt: &attempt,
@@ -1831,7 +1840,8 @@ impl Oracle {
     /// Admission, the retained physical projections, and the running-query
     /// registration are acquired together because a failure in any of them must
     /// release the ones already taken. The class is the root-derived one; no
-    /// provisional class is ever admitted.
+    /// provisional class is ever admitted. The partitions are the ones the
+    /// retained root was planned with, so the grant's sessions run its shape.
     ///
     /// # Errors
     ///
@@ -1843,7 +1853,7 @@ impl Oracle {
         context: &AuthorizedQueryContext,
         planned: &PlannedSqlCut,
         participant_cut: &OracleQueryAttemptCut,
-        query_class: QueryClass,
+        (query_class, target_partitions): (QueryClass, usize),
         deadline: Instant,
     ) -> Result<(AdmittedQueryGuard, RunningQueryTerminalOwner), BifrostError> {
         let admission = planned.profile.admission.timer();
@@ -1851,7 +1861,7 @@ impl Oracle {
             .admit_sql_query(
                 context,
                 query_class,
-                planned.local_ratio,
+                target_partitions,
                 deadline,
                 participant_cut.attempt_id(),
             )
@@ -1992,7 +2002,13 @@ impl Oracle {
             })
             .await?;
         let (mut admitted, running_query) = self
-            .admit_built_attempt(context, &planned, &participant_cut, query_class, deadline)
+            .admit_built_attempt(
+                context,
+                &planned,
+                &participant_cut,
+                (query_class, retained.config.target_partitions()),
+                deadline,
+            )
             .await?;
         if let Some(telemetry) = query_telemetry.as_mut() {
             telemetry.admitted();
@@ -2017,7 +2033,6 @@ impl Oracle {
         // Retained here only until execution: an Analytical query moves this
         // owner onto its graph, and what is left is what the stream still owes.
         let mut running_query = Some(running_query);
-        planned.profile.retain_root(&retained.root);
         let mut execution = match self
             .execute_retained_root(RetainedExecutionInput {
                 retained,
@@ -2028,6 +2043,7 @@ impl Oracle {
                 deadline,
                 analytical: attempt.as_ref(),
                 running_query: &mut running_query,
+                profile: &planned.profile,
             })
             .await
         {
@@ -2073,6 +2089,7 @@ impl Oracle {
             deadline,
             analytical,
             running_query,
+            profile,
         } = input;
         let RetainedPhysicalPlan { config, root, .. } = retained;
         let (handle, attempt) = match query_class {
@@ -2085,6 +2102,7 @@ impl Oracle {
                 .zip(analytical)
                 .ok_or(BifrostError::OracleRoleUnavailable)?,
             QueryClass::Interactive => {
+                admitted.retain_root(&root, profile);
                 let task = admitted.execution_task(config)?;
                 let scan_stats = OracleQueryScanStats::from_plan(root.as_ref());
                 let schema = root.schema();
@@ -2132,6 +2150,7 @@ impl Oracle {
             ownership.retain_metric_fold(analytical::AnalyticalGraphMetricFold::new(
                 root,
                 scan_stats.open_distributed_scan(),
+                Arc::clone(profile),
             ))?;
         }
         Ok(CutExecution {
@@ -2329,7 +2348,7 @@ impl Oracle {
         &self,
         context: &AuthorizedQueryContext,
         query_class: QueryClass,
-        local_ratio: f64,
+        target_partitions: usize,
         deadline: Instant,
         attempt_id: QueryId,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
@@ -2339,7 +2358,7 @@ impl Oracle {
                 admission::PreparedAdmission {
                     tenant: context.data_tenant_id,
                     query_class,
-                    local_ratio,
+                    target_partitions,
                     deadline,
                     cancellation: self.shutdown.child_token(),
                 },
@@ -2528,6 +2547,11 @@ impl Oracle {
     /// query returns arrive later through the execution bindings, so a provider
     /// built here is safe to plan against before the query is admitted.
     ///
+    /// Providers start without live routes; the caller sets them once
+    /// discovery has listed each table with the logical plan's scope, and
+    /// before the physical plan reads them. Returns every registered provider
+    /// for that purpose.
+    ///
     /// # Errors
     ///
     /// Returns a mapped `DataFusion` error when local hot sources cannot be
@@ -2538,8 +2562,8 @@ impl Oracle {
         session: &SessionContext,
         context: &AuthorizedQueryContext,
         cuts: &[PinnedSealedTable],
-        live: &std::collections::HashMap<String, live::LiveTableRoutes>,
-    ) -> Result<(), BifrostError> {
+    ) -> Result<Vec<Arc<OracleTableProvider>>, BifrostError> {
+        let mut registered = Vec::with_capacity(cuts.len());
         for cut in cuts {
             let table_name = cut.binding.table_ref.fqn();
             let hot_files = self.local_hot_sources(cut)?;
@@ -2550,24 +2574,26 @@ impl Oracle {
                 hot_files = cut.hot_files.len(),
                 "oracle cut provider registration"
             );
-            let live = live.get(&table_name).cloned();
-            let provider = OracleTableProvider::try_new(OracleTableInputs {
-                table: cut.iceberg_table.clone(),
-                objects: Arc::clone(self.catalog.objects()),
-                hot_files,
-                context: context.clone(),
-                table_name,
-                live,
-            })
-            .await
-            .map_err(|error| map_datafusion_error(&error))?;
+            let provider = Arc::new(
+                OracleTableProvider::try_new(OracleTableInputs {
+                    table: cut.iceberg_table.clone(),
+                    objects: Arc::clone(self.catalog.objects()),
+                    hot_files,
+                    context: context.clone(),
+                    table_name,
+                    live: None,
+                })
+                .await
+                .map_err(|error| map_datafusion_error(&error))?,
+            );
             register_session_table(
                 session,
                 &cut.binding,
-                Arc::new(provider) as Arc<dyn TableProvider>,
+                Arc::clone(&provider) as Arc<dyn TableProvider>,
             )?;
+            registered.push(provider);
         }
-        Ok(())
+        Ok(registered)
     }
 
     /// Resolves leader-local hot file locations for one pinned cut.
@@ -2606,12 +2632,19 @@ impl Oracle {
 
     /// Builds the one physical root this query will execute.
     ///
-    /// Providers are registered on a planning-only session whose partitions
-    /// come from this pod's CPU and the cut's locality, never from memory, so
-    /// the retained root is shaped once and a later grant sizes only its memory
-    /// ceiling. When this node composed the Analytical owners the build runs
-    /// through the pinned distributed planner, which is what lets the root come
-    /// back as a `DistributedExec`; the class is then read from that root alone.
+    /// Providers are registered on a planning-only session, the statement is
+    /// lowered to its optimized logical plan, and only then are live Scribe
+    /// streams listed, each with the scope (projected columns and filters)
+    /// the plan reads from its table. The bytes the plan's scans read —
+    /// published row groups its filters keep, hot files, and the listed live
+    /// bytes — then narrow the pod's CPU- and locality-derived partitions
+    /// (see [`crate::scan_sizing::OraclePartitioning::scan_partitions`]), so a small scan
+    /// runs as one stream and a large one keeps every core. The physical root
+    /// is shaped once with that count, and the grant carries the same count,
+    /// so a later grant sizes only its memory ceiling. When this node composed
+    /// the Analytical owners the build runs through the pinned distributed
+    /// planner, which is what lets the root come back as a `DistributedExec`;
+    /// the class is then read from that root alone.
     ///
     /// Nothing here admits, reserves, publishes, or reads a row. The planning
     /// session is dropped as soon as the root and its config are retained.
@@ -2620,7 +2653,8 @@ impl Oracle {
     ///
     /// Returns [`BifrostError::QueryAdmissionRejected`] when this pod's CPU
     /// shape cannot be read, [`BifrostError::QueryTimeout`] when the deadline
-    /// passes during physical planning, or the mapped planning failure, which
+    /// passes during planning, the stable listing errors of
+    /// [`Self::discover_live_routes`], or the mapped planning failure, which
     /// is terminal for this query: there is no second build and no fallback
     /// path.
     async fn build_physical_root(
@@ -2632,14 +2666,8 @@ impl Oracle {
         deadline: Instant,
     ) -> Result<RetainedPhysicalPlan, BifrostError> {
         let cuts = planned.cuts.as_slice();
-        let target_partitions = self.admission.session_partitions(planned.local_ratio)?;
-        let listing = planned.profile.scribe_listing.timer();
-        let live = self.discover_live_routes(roster, cuts, deadline).await?;
-        listing.done();
-        let oracles = roster.oracles();
-        #[cfg(feature = "test-support")]
-        record_physical_build(&roster.fingerprint());
-        let shape = crate::resources::OracleSessionShape::new(target_partitions);
+        let cap = self.admission.session_partitions(planned.local_ratio)?;
+        let shape = crate::resources::OracleSessionShape::new(cap);
         // Installed empty before any planning happens. The lock owns no runtime
         // and no memory; it is the one place a planned leaf's concrete source,
         // grant, and drained batches arrive once, after admission.
@@ -2650,9 +2678,56 @@ impl Oracle {
             session::OracleSessionTemplate::shared().session(config),
         );
         let providers = planned.profile.provider_setup.timer();
-        self.register_cut_providers(&planning, context, cuts, &live.tables)
+        let registered = self
+            .register_cut_providers(&planning, context, cuts)
             .await?;
         providers.done();
+        let logical_planning = planned.profile.physical_planning.timer();
+        let logical = Self::before_deadline(deadline, Self::plan_logical(&planning, context, sql))
+            .await?
+            .map_err(|OracleExecutionError::Public(error)| error)?;
+        logical_planning.done();
+        let scans = sizing::OracleScans::collect(&logical);
+        let listing = planned.profile.scribe_listing.timer();
+        let live = self
+            .discover_live_routes(roster, cuts, &scans, deadline)
+            .await?;
+        listing.done();
+        for provider in &registered {
+            if let Some(routes) = live.tables.get(provider.table()) {
+                provider.set_live(routes.clone());
+            }
+        }
+        let sizing = planned.profile.scan_sizing.timer();
+        let scanned = Self::before_deadline(deadline, scans.scan_size(&planning.state()))
+            .await?
+            .map_err(|error| map_datafusion_error(&error))?;
+        // Read beside `oracle_query_row_groups_scanned_total`: sizing that
+        // keeps far more row groups than the scan reads has lost its pruning.
+        metrics::counter!("oracle_query_row_groups_sized_total").increment(scanned.row_groups);
+        let target_partitions = self
+            .admission
+            .partitioning()
+            .scan_partitions(scanned.bytes, cap);
+        planning
+            .state_ref()
+            .write()
+            .config_mut()
+            .options_mut()
+            .execution
+            .target_partitions = target_partitions;
+        sizing.done();
+        tracing::debug!(
+            target: "wyrd::oracle::planning",
+            scanned_bytes = scanned.bytes,
+            sized_row_groups = scanned.row_groups,
+            target_partitions,
+            cap,
+            "Oracle sized the query's partitions from its scanned bytes"
+        );
+        let oracles = roster.oracles();
+        #[cfg(feature = "test-support")]
+        record_physical_build(&roster.fingerprint());
         let planning = match self.analytical.as_ref() {
             Some(handle) => handle.planning_session(&planning, oracles)?,
             None => planning,
@@ -2664,13 +2739,9 @@ impl Oracle {
         let physical_planning = planned.profile.physical_planning.timer();
         // Planning reads manifests and Parquet footers, so it runs under the
         // query deadline like every other read.
-        let root = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            Self::plan_physical(&planning, context, sql),
-        )
-        .await
-        .map_err(|_| BifrostError::QueryTimeout)?
-        .map_err(|OracleExecutionError::Public(error)| error)?;
+        let root = Self::before_deadline(deadline, planning.state().create_physical_plan(&logical))
+            .await?
+            .map_err(|error| map_query_planning_error(&error))?;
         physical_planning.done();
         Ok(RetainedPhysicalPlan {
             config: planning.copied_config(),
@@ -2679,7 +2750,29 @@ impl Oracle {
         })
     }
 
-    /// Lists every pinned table's reported Scribe streams before planning.
+    /// Runs one planning step under the query deadline.
+    ///
+    /// A plain `fn` rather than an `async fn`: an `async fn` would hold `step`
+    /// as an argument and again inside the `Timeout` it is moved into, so the
+    /// caller's future would store the step twice.
+    ///
+    /// # Errors
+    ///
+    /// The returned future yields [`BifrostError::QueryTimeout`] when the
+    /// deadline passes first.
+    fn before_deadline<T>(
+        deadline: Instant,
+        step: impl std::future::Future<Output = T>,
+    ) -> impl std::future::Future<Output = Result<T, BifrostError>> {
+        futures_util::FutureExt::map(
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), step),
+            |outcome| outcome.map_err(|_| BifrostError::QueryTimeout),
+        )
+    }
+
+    /// Lists every pinned table's reported Scribe streams before physical
+    /// planning, each table under the scope `scans` reads from it, so every
+    /// route carries the live bytes the query will scan.
     ///
     /// Discovery lists exactly the attempt's frozen Scribe roster; its routes
     /// name exact Scribe incarnations and writer epochs and retain no rows. A
@@ -2705,6 +2798,7 @@ impl Oracle {
         &self,
         roster: &mut OracleQueryAttemptRoster,
         cuts: &[PinnedSealedTable],
+        scans: &sizing::OracleScans,
         deadline: Instant,
     ) -> Result<LiveDiscovery, BifrostError> {
         let (Some(discovery), Some(_)) = (
@@ -2714,19 +2808,20 @@ impl Oracle {
             return Ok(LiveDiscovery::default());
         };
         if let Some(discovered) = self
-            .list_live_routes(discovery, roster, cuts, deadline, false)
+            .list_live_routes(discovery, roster, (cuts, scans), deadline, false)
             .await?
         {
             return Ok(discovered);
         }
         tracing::info!("Oracle restarts live discovery once on a refrozen Scribe roster");
         *roster = self.refreeze_roster(roster).await?;
-        self.list_live_routes(discovery, roster, cuts, deadline, true)
+        self.list_live_routes(discovery, roster, (cuts, scans), deadline, true)
             .await?
             .ok_or(BifrostError::QueryExecutionFailed)
     }
 
-    /// Lists every pinned table once against one frozen roster.
+    /// Lists every pinned table once against one frozen roster, each under
+    /// its scope in `scans`.
     ///
     /// Returns `Ok(None)` when a Scribe answered with a stale identity and
     /// `stale_is_loss` is false, which asks the caller to refreeze and restart;
@@ -2740,15 +2835,16 @@ impl Oracle {
         &self,
         discovery: &dyn TailStreamDiscovery,
         roster: &OracleQueryAttemptRoster,
-        cuts: &[PinnedSealedTable],
+        (cuts, scans): (&[PinnedSealedTable], &sizing::OracleScans),
         deadline: Instant,
         stale_is_loss: bool,
     ) -> Result<Option<LiveDiscovery>, BifrostError> {
         let mut discovered = LiveDiscovery::default();
         for cut in cuts {
             let binding = tail_discovery::wire_binding(cut)?;
+            let scope = scans.listing_scope(&cut.binding.table_ref.fqn());
             let routes = match discovery
-                .discover(&binding, roster.scribes(), deadline)
+                .discover(&binding, &scope, roster.scribes(), deadline)
                 .await
             {
                 Ok(routes) => routes,
@@ -2797,6 +2893,7 @@ impl Oracle {
                         writer_epoch: route.stream.writer_epoch,
                         endpoint,
                         time_partition: route.time_partition,
+                        bytes: route.bytes,
                     })
                 })
                 .collect::<Result<Vec<_>, BifrostError>>()?;
@@ -2833,7 +2930,7 @@ impl Oracle {
         )
     }
 
-    /// Lowers one validated statement to its optimized physical plan.
+    /// Lowers one validated statement to its authorized, optimized logical plan.
     ///
     /// # Errors
     ///
@@ -2841,14 +2938,15 @@ impl Oracle {
     /// unsupported-feature errors. Other planning failures retain their stable
     /// public mapping without exposing dependency diagnostics.
     ///
-    /// The optimized plan passes the payload-column gate before lowering, so a
-    /// projection or filter reaching `vala.gateway.calls` payload content
-    /// without payload-read authority never becomes executable.
-    async fn plan_physical(
+    /// The optimized plan passes the payload-column gate before it is
+    /// returned, so a projection or filter reaching `vala.gateway.calls`
+    /// payload content without payload-read authority never becomes
+    /// executable.
+    async fn plan_logical(
         session: &SessionContext,
         context: &AuthorizedQueryContext,
         sql: &str,
-    ) -> Result<Arc<dyn ExecutionPlan>, OracleExecutionError> {
+    ) -> Result<datafusion::logical_expr::LogicalPlan, OracleExecutionError> {
         let frame = session
             .sql(sql)
             .await
@@ -2857,12 +2955,7 @@ impl Oracle {
             .into_optimized_plan()
             .map_err(|error| map_query_planning_error(&error))?;
         authorize_payload_columns(context, &plan)?;
-        session
-            .state()
-            .create_physical_plan(&plan)
-            .await
-            .map_err(|error| map_query_planning_error(&error))
-            .map_err(OracleExecutionError::from)
+        Ok(plan)
     }
 }
 
@@ -3964,7 +4057,7 @@ mod tests {
             "SELECT count(*) FROM vala.gateway.calls",
             "SELECT * FROM vala.logs.records",
         ] {
-            if let Err(error) = Oracle::plan_physical(&session, &metadata, sql).await {
+            if let Err(error) = Oracle::plan_logical(&session, &metadata, sql).await {
                 panic!("metadata read {sql} was refused: {error}");
             }
         }
@@ -3977,12 +4070,12 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    Oracle::plan_physical(&session, &metadata, sql).await,
+                    Oracle::plan_logical(&session, &metadata, sql).await,
                     Err(OracleExecutionError::Public(BifrostError::QueryForbidden))
                 ),
                 "{sql} reached payload without authority"
             );
-            if let Err(error) = Oracle::plan_physical(&session, &payload, sql).await {
+            if let Err(error) = Oracle::plan_logical(&session, &payload, sql).await {
                 panic!("payload authority was refused for {sql}: {error}");
             }
         }
@@ -4550,7 +4643,7 @@ mod tests {
         let admitted = oracle
             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                 QueryClass::Interactive,
-                0.0,
+                8,
             ))
             .expect("one interactive query is admitted");
 
@@ -4567,7 +4660,7 @@ mod tests {
         let filler = oracle
             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                 QueryClass::Interactive,
-                0.0,
+                8,
             ))
             .expect("a second query is admitted beneath the slot ledger");
         let filler_pool = Arc::clone(filler.execution().memory_pool());
@@ -4581,7 +4674,7 @@ mod tests {
         let refused = oracle
             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                 QueryClass::Interactive,
-                0.0,
+                8,
             ))
             .expect("a third query is admitted beneath the slot ledger");
         let refused_pool = Arc::clone(refused.execution().memory_pool());

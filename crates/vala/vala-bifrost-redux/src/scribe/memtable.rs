@@ -748,42 +748,30 @@ impl Memtable {
         Ok(buckets.keys().cloned().collect())
     }
 
-    /// Snapshot writable and pending immutable seal keys for one tenant table.
+    /// Returns, for one tenant table, every live bucket or generation's
+    /// partition with the bytes `scope` reads from it.
     ///
-    /// Only keys of `table` are collected, so a listing never copies the
-    /// tenant's other tables. The result may repeat a key held both writable
-    /// and pending; the caller deduplicates.
+    /// The bucket and generation selection is the live read's own
+    /// ([`Self::readable_sources`]), so a listing sizes exactly what the read
+    /// later scans. Each batch is pruned by its recorded bounds against the
+    /// scope's filters and a kept batch counts its covered Arrow bytes; a
+    /// source whose batches are all pruned still reports with zero bytes,
+    /// because its partition is still live. The result may repeat a partition;
+    /// the caller sums per partition.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] if either memtable lock is poisoned.
-    pub fn seal_keys_for_table(
+    pub fn live_bytes_for_table(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
-    ) -> Result<Vec<SealKey>, ScribeError> {
-        let matches = |key: &SealKey| key.tenant == tenant && key.table == *table;
-        let mut keys = self
-            .writable
-            .read()
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("memtable bucket lock poisoned: {e}"),
-            })?
-            .keys()
-            .filter(|key| matches(key))
-            .cloned()
-            .collect::<Vec<_>>();
-        let immutable = self.immutable.read().map_err(|e| ScribeError::Internal {
-            detail: format!("memtable immutable lock poisoned: {e}"),
-        })?;
-        keys.extend(
-            immutable
-                .iter()
-                .filter(|(key, entries)| {
-                    matches(key) && entries.iter().any(ImmutableEntry::is_pending)
-                })
-                .map(|(key, _)| key.clone()),
-        );
-        Ok(keys)
+        scope: &crate::scan_sizing::ScanScope,
+    ) -> Result<Vec<(crate::catalog::layout::TimePartition, u64)>, ScribeError> {
+        Ok(self
+            .readable_sources(tenant, table, None)?
+            .iter()
+            .map(|source| (source.partition_day, source.scoped_bytes(scope)))
+            .collect())
     }
 
     /// Snapshot age-expired buckets held by this shard's memtable.
@@ -928,6 +916,29 @@ impl Memtable {
         partitions: Option<&std::ops::RangeInclusive<crate::catalog::layout::TimePartition>>,
         required_columns: &[String],
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        let mut batches = Vec::new();
+        for source in self.readable_sources(tenant, table, partitions)? {
+            source.project(required_columns, &mut batches)?;
+        }
+        Ok(batches)
+    }
+
+    /// Captures every bucket and generation a live read serves for one tenant
+    /// table, optionally restricted to one partition range.
+    ///
+    /// This is the one live-selection rule: every writable bucket, and every
+    /// immutable generation not yet [`ImmutableState::Durable`]. Both maps
+    /// stay locked only while the selected sources are captured by reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] if either memtable lock is poisoned.
+    fn readable_sources(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+        partitions: Option<&std::ops::RangeInclusive<crate::catalog::layout::TimePartition>>,
+    ) -> Result<Vec<ReadableSource>, ScribeError> {
         let selects = |seal_key: &SealKey| {
             seal_key.tenant == tenant
                 && seal_key.table == *table
@@ -964,11 +975,7 @@ impl Memtable {
         }
         drop(immutable);
         drop(writable);
-        let mut batches = Vec::new();
-        for source in sources {
-            source.project(required_columns, &mut batches)?;
-        }
-        Ok(batches)
+        Ok(sources)
     }
 
     /// Return all readable batches for a table, preserving the old unit-test
@@ -1690,6 +1697,13 @@ impl ReadableSource {
             partition_day,
             generation,
         }
+    }
+
+    /// Returns the bytes `scope` reads from the captured batches, measured by
+    /// [`crate::scan_sizing::ScanSizer::batch_bytes`].
+    fn scoped_bytes(&self, scope: &crate::scan_sizing::ScanScope) -> u64 {
+        crate::scan_sizing::ScanSizer::new(scope, &self.schema)
+            .batch_bytes(&self.batches, &self.statistics)
     }
 
     /// Appends each captured batch, projected to `required_columns`, to

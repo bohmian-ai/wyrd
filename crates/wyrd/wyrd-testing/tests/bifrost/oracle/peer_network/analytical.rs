@@ -518,15 +518,10 @@ async fn coordinate_baseline(
         // Complete ownership, not a chosen subset: a graph, attempt, cleanup
         // failure, admitted or queued query, peer reservation, slot unit,
         // query memory or scratch owner, spill entry, or live gauge that this
-        // execution failed to return diverges here.
-        let ownership = cluster.ownership_snapshot(index)?;
-        if ownership != ownership_before[index] {
-            return Err(format!(
-                "Oracle {index} left ownership at {ownership:?}, not its {:?} baseline",
-                ownership_before[index]
-            )
-            .into());
-        }
+        // execution failed to return diverges here. A follower's held grant
+        // closes only once the leader's admit stream resets, after the graph
+        // lease, so the snapshot is awaited rather than read once.
+        crate::support::await_baseline(cluster, index, ownership_before[index]).await?;
     }
 
     Ok(evidence.result_digest)
@@ -800,14 +795,7 @@ async fn execute_style(
         if live != 0 {
             return Err(format!("{name} left {live} graph leases on Oracle {index}").into());
         }
-        let ownership = cluster.ownership_snapshot(index)?;
-        if ownership != ownership_before[index] {
-            return Err(format!(
-                "{name} left Oracle {index} at {ownership:?}, not its {:?} baseline",
-                ownership_before[index]
-            )
-            .into());
-        }
+        crate::support::await_baseline(cluster, index, ownership_before[index]).await?;
     }
     Ok(())
 }

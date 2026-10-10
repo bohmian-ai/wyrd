@@ -291,6 +291,62 @@ pub enum WyrdCliError {
         remediation = "Pass --uid, or pass --kind, --space, --name, and --version."
     )]
     DeleteSelectorRequiresExact,
+
+    /// This host's OS and CPU have no official Wyrd server bundle.
+    #[error("no official wyrd-server bundle for {os}/{arch}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_SERVER_HOST_UNSUPPORTED",
+        status = 400,
+        title = "Server host unsupported",
+        remediation = "Run the server on macOS or Linux (glibc) on x86_64 or aarch64, or use the official container image."
+    )]
+    ServerHostUnsupported {
+        /// Detected operating system.
+        os: &'static str,
+        /// Detected CPU architecture.
+        arch: &'static str,
+    },
+
+    /// No stable release, or no bundle for this host, could be fetched.
+    #[error("server release unavailable: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE",
+        status = 503,
+        title = "Server release unavailable",
+        remediation = "Check network access to github.com, then retry; the current installation is unchanged."
+    )]
+    ServerReleaseUnavailable {
+        /// What could not be fetched.
+        detail: String,
+    },
+
+    /// A downloaded release failed signature, digest, or extraction checks.
+    #[error("server release failed verification: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED",
+        status = 422,
+        title = "Server release unverified",
+        remediation = "Retry the install; if it fails again, report the release. The current installation is unchanged."
+    )]
+    ServerReleaseUnverified {
+        /// Which check failed.
+        detail: String,
+    },
+
+    /// The newest server release does not share this CLI's compatible version line.
+    #[error("wyrd CLI {cli} cannot run wyrd-server {server}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE",
+        status = 409,
+        title = "Server version incompatible",
+        remediation = "Upgrade the wyrd CLI to the server's version line (pip install -U wyrd, or npm install @wyrd/sdk@latest), then retry."
+    )]
+    ServerVersionIncompatible {
+        /// This CLI's version.
+        cli: semver::Version,
+        /// The server release's version.
+        server: semver::Version,
+    },
 }
 
 impl WyrdCliError {
@@ -348,14 +404,22 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             | WyrdCliError::RecordsParse { .. }
             | WyrdCliError::Parse { .. }
             | WyrdCliError::EvalSpecInvalid { .. }
-            | WyrdCliError::DeleteSelectorRequiresExact => {
+            | WyrdCliError::DeleteSelectorRequiresExact
+            | WyrdCliError::ServerHostUnsupported { .. }
+            | WyrdCliError::ServerVersionIncompatible { .. } => {
                 WyrdError::Validation { message, details }
+            }
+            WyrdCliError::ServerReleaseUnavailable { .. } => {
+                WyrdError::ClientTransportDown { message, details }
             }
             WyrdCliError::Query { .. }
             | WyrdCliError::Io { .. }
             | WyrdCliError::EvalEngine { .. }
             | WyrdCliError::Orchestrator { .. }
-            | WyrdCliError::Output { .. } => WyrdError::Internal { message, details },
+            | WyrdCliError::Output { .. }
+            | WyrdCliError::ServerReleaseUnverified { .. } => {
+                WyrdError::Internal { message, details }
+            }
         }
     }
 }

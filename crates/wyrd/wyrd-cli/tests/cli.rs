@@ -21,6 +21,9 @@ mod principal_journey;
 mod query_server_journey;
 #[path = "secret_sources.rs"]
 mod secret_sources;
+/// `wyrd server install` against a mock release service.
+#[path = "server_install.rs"]
+mod server_install;
 #[path = "workflow_journey.rs"]
 mod workflow_journey;
 

@@ -168,10 +168,10 @@ depends = ["py:setup", "ts:build", "ts:build:testing"]
 run = [
   "cargo build --locked -p wyrd-cli -p wyrd-server",
   "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads)'",
-  "scripts/postgres/with-test-postgres.sh -- python3 scripts/server/with-local-dev.py mise exec -- cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(=local_development::cli_bootstrap_saved_config_connects)'",
-  "WYRD_LOCAL_DEV_TERMINAL=interrupt scripts/postgres/with-test-postgres.sh -- python3 scripts/server/with-local-dev.py",
-  "WYRD_TEST_INSTALLED_CLI=$PWD/sdks/wyrd-sdk-python/.venv/bin/wyrd scripts/postgres/with-test-postgres.sh -- python3 scripts/server/with-local-dev.py mise exec -- bash -lc 'cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m integration tests/integration/test_local_development.py -k cli_bootstrap_saved_config'",
-  "WYRD_LOCAL_DEV_TERMINAL=decline scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs python3 scripts/server/with-local-dev.py mise exec -- bash -lc 'cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/local-development.test.ts -t cli_bootstrap_saved_config'",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]",
+  "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]",
 ]
 
 [tasks."test:wyrdstate:journey"]

@@ -325,7 +325,7 @@ async fn start_telemetry_refuses_the_applications_own_subscriber() {
 }
 
 /// A fresh SDK process authenticates from the installed CLI's saved files.
-/// Run through scripts/server/with-local-dev.py inside the Postgres wrapper.
+/// Run through the installed-CLI integration fixture inside the Postgres wrapper.
 ///
 /// # Panics
 /// Panics when bootstrap configuration or the representative write/read fails.

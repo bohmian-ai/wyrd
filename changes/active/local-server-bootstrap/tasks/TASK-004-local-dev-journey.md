@@ -466,3 +466,58 @@ The corrected executable SDK scenario commands are composed by
 `test:local-dev:journey`: the bootstrap fixture supplies the saved-file marker
 and runs the exact selected test in a fresh runtime. Running the original
 standalone SDK commands without that fixture would skip this scenario.
+
+
+### User-requested structure correction
+
+The standalone `scripts/server/with-local-dev.py` test runner is removed.
+Its process/terminal checks now live in the existing Python local-development
+integration module, selected directly by pytest from the existing focused
+mise lane. The wrapper still owns PostgreSQL, and fresh Rust/Python/TypeScript
+SDK processes still consume only the CLI's saved configuration. No new script,
+package, dependency, or runtime owner is added.
+
+The oversized `DevServer::run` body is split into startup, memory detection,
+migration, provisioning, and foreground waiting. The existing concrete server
+handle retains its process dependencies. `ProvisionedTenant` owns only parsed
+identity/credential data and pure tenant-key validation; persistence continues
+through existing GlobalConfig/CredentialsFile owners. Saved-client verification
+and terminal disclosure are invocation-scoped helpers. DevArgs preflight and
+compatible-server construction are separate from signal/lifetime coordination.
+Error text, interruption polling, retry behavior, and budgets are preserved.
+
+Verification for this correction passes; original committed evidence above
+describes the initial candidate. The direct pytest entrypoint replaces all
+historical invocations of the removed standalone script.
+
+| Correction | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Remove standalone fixture script | Existing local-development integration module owns setup, terminal interaction, SDK subprocesses, and cleanup | Direct pytest Rust/Python/TypeScript/interrupt cases in the focused journey | PASS |
+| Split oversized startup coordinator | Server lifecycle methods, pure ProvisionedTenant parsing/validation, existing persistence owners, fresh-client verification helper | Unchanged three CLI journey cases plus all SDK, terminal, and package cases | PASS |
+
+`WYRD_LOG=info mise run test:local-dev:journey` passes all seven selected
+outer cases: three CLI scenarios and four direct pytest scenarios. The nested
+Rust, Python, and TypeScript SDK cases also pass. The installed production
+Python wheel is rebuilt and its direct pytest Python scenario passes with
+`WYRD_TEST_INSTALLED_CLI=/tmp/wyrd-task004-production-python/bin/wyrd`.
+`mise run fmt`, `mise run lints`, `mise run py:format`, `mise run py:lints`,
+`mise run py:typecheck`, `mise run py:test:unit` (593 passed), and final
+`git diff --check` pass. No new contract, dependency, or generated surface
+is introduced; prior unchanged contract and documentation evidence remains.
+
+Exact scenario commands run inside the mise toolchain/environment:
+
+
+```bash
+scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads)'
+scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]
+scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]
+scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]
+scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]
+```
+
+The final tracked/untracked audit contains only the requested production
+refactor, test-runner removal, existing test module and lane updates, the Rust
+test documentation reference, and this evidence. No unrelated edits are
+changed. Commit this correction separately from the initial implementation;
+review the full range starting at `cb5656b2b913dbd88a8f6736bf4a0baaf998960c`.

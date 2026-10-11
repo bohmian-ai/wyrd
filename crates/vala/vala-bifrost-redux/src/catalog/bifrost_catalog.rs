@@ -352,9 +352,9 @@ pub fn inject_metadata_not_found_for_test(count: usize) {
 impl BifrostCatalog {
     /// Reads one query's complete cut in one read-only tenant statement.
     ///
-    /// Runs [`OracleTableCuts::read`] as one autocommit statement on a pooled
-    /// connection: the statement binds the tenant itself, so the cut costs one
-    /// round trip with no transaction. Nothing is recorded: the returned pointers stay readable for the
+    /// Runs [`OracleTableCuts::read`] as one statement inside a `TenantConn`
+    /// transaction for `tenant`, then commits the read-only transaction.
+    /// Nothing is recorded: the returned pointers stay readable for the
     /// query's deadline because Forge retains a replaced snapshot for at least
     /// the maximum query deadline.
     ///
@@ -384,14 +384,15 @@ impl BifrostCatalog {
                 table_name: &binding.table_name,
             })
             .collect::<Vec<_>>();
-        let mut conn = self.postgres.conn().await?;
-        let cut = match OracleTableCuts::new(&mut conn, tenant).read(&refs).await {
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        let cut = match OracleTableCuts::new(&mut conn).read(&refs).await {
             Err(vala_sql::SqlError::NoRows) => {
                 let names = tables.iter().map(TableRef::fqn).collect::<Vec<_>>();
                 return Err(BifrostCatalogError::TableNotFound(names.join(", ")));
             }
             other => other?,
         };
+        conn.commit().await?;
         Ok(cut)
     }
 

@@ -379,26 +379,19 @@ pub struct TableCut {
 ///
 /// A cut is one read-only SQL statement that resolves every requested table,
 /// reads each catalog pointer, and returns the unresolved hot candidates. It
-/// takes no lock and writes no row, so nothing is released afterwards. The
-/// statement binds its tenant for RLS itself, so it runs as one autocommit
-/// round trip on a plain connection, with no transaction around it.
-pub struct OracleTableCuts<'conn> {
-    /// Connection the cut statement runs on.
-    conn: &'conn mut sqlx::PgConnection,
-    /// Tenant the statement binds, scoping every row it reads.
-    data_tenant_id: DataTenantId,
+/// takes no lock and writes no row, so nothing is released afterwards. It
+/// runs inside the caller's tenant transaction; the statement re-asserts that
+/// same tenant for RLS and refuses a transaction bound to any other.
+pub struct OracleTableCuts<'conn, 'tx> {
+    /// Tenant transaction the cut statement runs in; its bound tenant scopes
+    /// every row the statement reads.
+    conn: &'conn mut TenantConn<'tx>,
 }
 
-impl<'conn> OracleTableCuts<'conn> {
-    /// Binds the owner to one connection and the tenant it reads for.
-    ///
-    /// `conn` must not be inside a transaction bound to another tenant; the
-    /// statement refuses that rather than rebinding.
-    pub fn new(conn: &'conn mut sqlx::PgConnection, data_tenant_id: DataTenantId) -> Self {
-        Self {
-            conn,
-            data_tenant_id,
-        }
+impl<'conn, 'tx> OracleTableCuts<'conn, 'tx> {
+    /// Binds the owner to one tenant transaction for the tenant it reads for.
+    pub fn new(conn: &'conn mut TenantConn<'tx>) -> Self {
+        Self { conn }
     }
 
     /// Reads a complete cut in one statement.
@@ -429,14 +422,15 @@ impl<'conn> OracleTableCuts<'conn> {
                 })
                 .collect(),
         );
+        let data_tenant_id = self.conn.data_tenant_id();
         let rows: Vec<CutDbRow> =
             sqlx::query_as("SELECT * FROM vala.oracle_read_table_cut($1::uuid, $2::jsonb)")
-                .bind(self.data_tenant_id.as_uuid())
+                .bind(data_tenant_id.as_uuid())
                 .bind(request)
-                .fetch_all(&mut *self.conn)
+                .fetch_all(&mut **self.conn.transaction())
                 .await
                 .map_err(cut_error)?;
-        group_table_cut(self.data_tenant_id, tables, rows)
+        group_table_cut(data_tenant_id, tables, rows)
     }
 }
 

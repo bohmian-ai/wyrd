@@ -267,10 +267,10 @@ pub struct ScribeImpl {
     writer_epoch: i64,
     /// Pod-global request and shard admission counters.
     admission: AdmissionController,
-    /// Control-plane pool holding the batch fences WAL recovery consults
-    /// before ending a shard chain at a bad record; `None` without
-    /// persistence, where every bad record fails closed.
-    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
+    /// Operator session holding the batch fences WAL recovery consults
+    /// before ending a shard chain at a bad record; `None` without a
+    /// persistence operator pool, where every bad record fails closed.
+    fence_operator: Option<vala_sql::OperatorPool>,
     /// Scribe-only child capability over the pod-global Bifrost governor.
     memory: crate::resources::ScribeResources,
     /// Immutable boot-selected ingest ceilings shared with Gate.
@@ -1158,6 +1158,9 @@ impl ScribeImpl {
         let control_postgres = persistence_config
             .as_ref()
             .map(|config| Arc::clone(&config.postgres));
+        let fence_operator = persistence_config
+            .as_ref()
+            .and_then(|config| config.operator_pool.clone());
         let hot_sources = Arc::new(hot_source::ScribeHotSourceRegistry::new());
         let persistence = persistence_config.map(|config| {
             Self::start_persistence(
@@ -1217,8 +1220,8 @@ impl ScribeImpl {
             recovery_ready: AtomicBool::new(true),
             recovery_cancelled: Arc::new(AtomicBool::new(false)),
             persistence,
-            admission_clock: ingress::AdmissionClock::new(control_postgres.clone()),
-            control_postgres,
+            admission_clock: ingress::AdmissionClock::new(control_postgres),
+            fence_operator,
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
@@ -2521,9 +2524,9 @@ impl ScribeImpl {
                     shard_senders: self.shards.replay_senders(),
                     memory: self.memory.clone(),
                     cancelled: Arc::clone(&self.recovery_cancelled),
-                    fences: self.control_postgres.as_ref().map(|postgres| {
+                    fences: self.fence_operator.as_ref().map(|operator| {
                         crate::scribe::replay::ReplayFences::new(
-                            Arc::clone(postgres),
+                            operator.clone(),
                             tokio::runtime::Handle::current(),
                         )
                     }),

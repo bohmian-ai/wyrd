@@ -8,7 +8,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
@@ -198,8 +197,8 @@ pub fn replay_wal_directory_stream(
 /// read. It runs only when a chain ends in a bad record.
 #[derive(Clone)]
 pub(crate) struct ReplayFences {
-    /// Control-plane pool holding the batch fences.
-    postgres: Arc<vala_sql::ValaPostgres>,
+    /// Operator session reading the batch fences, which span tenants.
+    operator: vala_sql::OperatorPool,
     /// Runtime the blocking lane drives the read on.
     runtime: tokio::runtime::Handle,
 }
@@ -213,13 +212,13 @@ impl std::fmt::Debug for ReplayFences {
 }
 
 impl ReplayFences {
-    /// Creates the lookup over the control-plane pool and its runtime.
+    /// Creates the lookup over the operator session and its runtime.
     #[must_use]
     pub(crate) const fn new(
-        postgres: Arc<vala_sql::ValaPostgres>,
+        operator: vala_sql::OperatorPool,
         runtime: tokio::runtime::Handle,
     ) -> Self {
-        Self { postgres, runtime }
+        Self { operator, runtime }
     }
 
     /// The newest acknowledgement fence of one WAL shard stream, or `None`
@@ -240,9 +239,8 @@ impl ReplayFences {
         shard: u8,
     ) -> Result<Option<crate::scribe::wal::NewestFence>, ScribeError> {
         let fence = self.runtime.block_on(async {
-            let mut conn = self.postgres.conn().await?;
             vala_sql::queries::scribe_batch_commits::newest_wal_fence(
-                &mut conn,
+                &self.operator,
                 stream.node_id.as_uuid(),
                 stream.writer_epoch.as_i64(),
                 i16::from(shard),

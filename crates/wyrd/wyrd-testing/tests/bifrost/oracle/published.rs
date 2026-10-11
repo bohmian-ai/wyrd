@@ -1099,7 +1099,10 @@ async fn prove_late_failures(
             &generic,
         ),
     ] {
-        let error = match wyrd_client::Bifrost::query_only(client).sql(&sql, &[]).await {
+        let error = match wyrd_client::Bifrost::query_only(client)
+            .sql(&sql, &[])
+            .await
+        {
             Err(error) => error,
             Ok(result) => {
                 return Err(format!("{case} returned {} rows", result.num_rows()).into());
@@ -1174,7 +1177,10 @@ async fn prove_worker_tenant_refusal(
     let sql = format!(
         "SELECT id FROM (SELECT id FROM vala.bifrost.{table} ORDER BY id LIMIT 8193) AS sorted"
     );
-    let error = match wyrd_client::Bifrost::query_only(client).sql(&sql, &[]).await {
+    let error = match wyrd_client::Bifrost::query_only(client)
+        .sql(&sql, &[])
+        .await
+    {
         Err(error) => error,
         Ok(result) => return Err(format!("{case} returned {} rows", result.num_rows()).into()),
     };

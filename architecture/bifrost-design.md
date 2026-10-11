@@ -880,10 +880,10 @@ class with no executable capacity on the pod is refused immediately. Public
 HTTP queries bypass the server's global load-shed and request-concurrency
 layers so they reach this queue; gRPC reaches it directly.
 
-Snapshot preparation has no admission gate of its own. One tenant-scoped
-autocommit statement on the bounded runtime PostgreSQL pool, binding its own
-tenant, resolves every referenced table and returns each catalog metadata
-pointer with its hot rows. The statement is read-only: it takes no lock,
+Snapshot preparation has no admission gate of its own. One read-only
+statement inside a `TenantConn` transaction on the bounded runtime
+PostgreSQL pool, re-asserting that transaction's tenant, resolves every
+referenced table and returns each catalog metadata pointer with its hot rows. The statement is read-only: it takes no lock,
 writes no row, and nothing is released at the query's terminal. Each Oracle
 node caches the returned cuts per table and serves them only while it is
 listening on the `bifrost_cut` channel, which a `vala.file_list` trigger

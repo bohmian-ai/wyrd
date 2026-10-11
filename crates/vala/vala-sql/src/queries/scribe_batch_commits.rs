@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use wyrd_spec::DataTenantId;
 
-use crate::{SqlError, TenantConn};
+use crate::{OperatorPool, SqlError, TenantConn};
 
 /// Immutable WAL identity that must match exactly for a replayed batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,15 +343,17 @@ pub async fn record(
 ///
 /// WAL recovery calls this before it ends a shard's chain at a bad record: a
 /// fence in that segment beyond the last good record means an acknowledged
-/// batch lies in the discarded region. The `vala.scribe_wal_newest_fence`
-/// security-definer function answers it from the top of one index, so the
-/// tenant-bound application role reads one WAL position and no tenant's rows.
+/// batch lies in the discarded region. A WAL shard stream spans tenants, so
+/// the read runs on the operator session; the `vala.scribe_wal_newest_fence`
+/// security-definer function answers it from the top of one index and returns
+/// one WAL position, never a tenant's rows.
 ///
 /// # Errors
 ///
 /// Returns [`SqlError`] when PostgreSQL cannot execute the read.
+// tenant-isolation: cross-tenant OperatorPool read of one WAL position per shard stream.
 pub async fn newest_wal_fence(
-    conn: &mut sqlx::PgConnection,
+    operator: &OperatorPool,
     node_id: uuid::Uuid,
     writer_epoch: i64,
     shard_id: i16,
@@ -360,7 +362,7 @@ pub async fn newest_wal_fence(
         .bind(node_id)
         .bind(writer_epoch)
         .bind(shard_id)
-        .fetch_optional(conn)
+        .fetch_optional(operator.pool())
         .await
         .map_err(SqlError::from)
 }

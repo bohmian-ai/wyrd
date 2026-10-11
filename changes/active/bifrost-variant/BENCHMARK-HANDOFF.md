@@ -7,9 +7,9 @@ the merge research in `merge-research/`.
 ## Plan
 
 1. **Finalize the merge plan.** `merge-research/RESOLUTION-MAP.md` holds the
-   human decisions recorded on 2026-10-11 (§2). One prerequisite is still open:
-   an `iceberg-compaction` fork commit with Arrow 60 and no REST catalog / Ring
-   (map §2.5).
+   human decisions recorded on 2026-10-11 (§2). The `iceberg-compaction` fork
+   prerequisite is done: `wyrd/main` at `22cd178` (Arrow 60, no REST catalog /
+   Ring), already pinned in `Cargo.toml` here (map §2.5).
 2. **Merge main with the current Variant work** on `integrate-main`. Follow map
    §4 for the procedure and §5 for the proof lanes.
 3. **Continue Bifrost benchmarking and optimization** on the merged branch.

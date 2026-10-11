@@ -180,3 +180,31 @@ def test_start_telemetry_refuses_the_applications_own_provider(
 
     assert refused.value.code == "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS"
     assert trace.get_tracer_provider() is own
+
+
+@pytest.fixture
+def cli_bootstrap_client(monkeypatch: pytest.MonkeyPatch) -> WyrdClient:
+    """The saved deployment made by scripts/server/with-local-dev.py."""
+    import os
+
+    home = os.environ.get("WYRD_LOCAL_DEV_CONFIG_HOME")
+    if home is None:
+        raise pytest.skip.Exception("requires the installed CLI local-development fixture")
+    monkeypatch.setenv("WYRD_CONFIG_HOME", home)
+    for name in (
+        "WYRD_API_KEY",
+        "WYRD_ACCESS_TOKEN",
+        "WYRD_WORKLOAD_TOKEN",
+        "WYRD_TENANT",
+        "WYRD_SERVER_URL",
+        "WYRD_GRPC_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return WyrdClient()
+
+
+def test_cli_bootstrap_saved_config(cli_bootstrap_client: WyrdClient) -> None:
+    """A fresh Python runtime writes and reads using only the CLI's saved files."""
+    cards = Cards(cli_bootstrap_client)
+    refs = register(cards, "cards/gateway_inference/ask-prompt.yaml")
+    assert cards.get(refs["ask-prompt"]).metadata.name == "ask-prompt"

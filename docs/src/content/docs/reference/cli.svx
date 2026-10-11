@@ -8,8 +8,7 @@ order: 2
 
 # CLI
 
-Reference for the `wyrd` binary. It has four command groups: `auth`, `eval`,
-`principal`, and `gateway`. The binary is built from the repo — see [Get started](/get-started/).
+Reference for the `wyrd` binary included in the Python and TypeScript packages. See [Local development](/self-hosting/local-development/) for first use.
 
 Every server-facing command reads `--server` from `WYRD_SERVER_URL` when the flag
 is omitted. No command takes a secret as an argument: server-facing commands
@@ -17,6 +16,28 @@ read their credential from the ambient chain (`WYRD_ACCESS_TOKEN`, workload
 identity, `WYRD_API_KEY`, a saved `wyrd auth login`, or
 `~/.config/wyrd/credentials.toml`), so it never lands in shell history or the
 process table. See [Client configuration](/get-started/client-configuration/#credentials).
+
+## wyrd server
+
+```bash
+wyrd server dev --tenant acme
+wyrd server dev --tenant acme --host codex
+wyrd server install
+```
+
+`dev` composes migration, foreground serving, readiness, server-owned setup,
+protected local configuration, and optional MCP installation. It requires an
+external PostgreSQL URL in `WYRD_DATABASE_URL` and a required `--tenant` slug.
+Repeat `--host` to select detected hosts. Without it, interactive runs offer a
+selection and scripts select none. Ctrl-C settles the serving child.
+
+An existing compatible release is reused. `install` explicitly downloads and
+verifies the newest stable compatible release; `dev` installs only when no
+server is installed. HTTP defaults to `127.0.0.1:8080`; `WYRD_SERVER_BIND` may
+select another loopback address with a nonzero port. The saved endpoint and
+one-time tenant key use the existing Wyrd config files. Reruns preserve an
+active tenant's key. Stage failures carry `WYRD_CLI_503_SERVER_DEV` with safe
+recovery guidance; committed server state remains.
 
 ## wyrd auth
 

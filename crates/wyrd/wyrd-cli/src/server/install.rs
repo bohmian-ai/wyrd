@@ -372,7 +372,7 @@ impl ServerInstaller {
 ///
 /// Uses Cargo's caret rule symmetrically: the same major version, the same
 /// minor while major is 0, and the same patch while both are 0.
-fn compatible(cli: &Version, server: &Version) -> bool {
+pub(super) fn compatible(cli: &Version, server: &Version) -> bool {
     cli.major == server.major
         && (cli.major != 0
             || (cli.minor == server.minor && (cli.minor != 0 || cli.patch == server.patch)))

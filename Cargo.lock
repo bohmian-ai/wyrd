@@ -11297,6 +11297,7 @@ dependencies = [
  "predicates",
  "reqwest 0.13.4",
  "rmcp",
+ "rustix",
  "secrecy",
  "semver",
  "serde",

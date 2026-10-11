@@ -1,3 +1,5 @@
+use clap::Parser as _;
+
 #[path = "auth_issue_key_journey.rs"]
 mod auth_issue_key_journey;
 #[path = "card_lifecycle.rs"]
@@ -29,6 +31,19 @@ mod secret_sources;
 mod server_install;
 #[path = "workflow_journey.rs"]
 mod workflow_journey;
+
+/// Local bootstrap is an installed CLI capability rather than a checkout script.
+///
+/// # Panics
+/// Panics when the installed CLI cannot select local startup.
+#[test]
+fn server_dev_selects_installed_local_startup() {
+    wyrd_cli::Cli::try_parse_from(["wyrd", "server", "dev", "--tenant", "local"])
+        .expect("local setup is exposed by the installed CLI");
+}
+
+/// PostgreSQL-backed installed local-server lifecycle journeys.
+mod pg_tests;
 
 /// Root of the provider-backed CLI login journey, so its exact name
 /// `cli_device_login_journey` selects it; only the Keycloak identity lane

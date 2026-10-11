@@ -6,6 +6,20 @@ use wyrd_error_derive::WyrdError;
 /// Errors raised by the `wyrd` binary.
 #[derive(Debug, Error, WyrdError)]
 pub enum WyrdCliError {
+    /// Local startup failed after zero or more committed server-owned stages.
+    #[error("local server {stage} failed: {recovery}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_503_SERVER_DEV",
+        status = 503,
+        title = "Local server setup failed",
+        remediation = "Follow the stage's recovery guidance and rerun with the same tenant and configuration directory; active tenant credentials are never reissued."
+    )]
+    ServerDev {
+        /// Failed lifecycle stage, never a URL or credential.
+        stage: &'static str,
+        /// Static recovery guidance that identifies retained partial state.
+        recovery: &'static str,
+    },
     /// Required Oracle client configuration was not supplied.
     #[error("query configuration is missing {field}")]
     #[wyrd_error(
@@ -434,6 +448,7 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
                 WyrdError::ClientConfigInvalid { message, details }
             }
             WyrdCliError::ClientTransport { .. }
+            | WyrdCliError::ServerDev { .. }
             | WyrdCliError::ServerReleaseUnavailable { .. }
             | WyrdCliError::McpProxy { .. } => WyrdError::ClientTransportDown { message, details },
             WyrdCliError::CardLoad(error) => WyrdError::from(error),

@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant-main-integration
-revision: 1
+revision: 2
 status: approved
 task_count: 1
 ---
@@ -9,14 +9,14 @@ task_count: 1
 
 ## Approval, objective, and value
 
-This revision transcribes the user's approved integration scope, not a new
-architecture proposal. On 2026-10-11 the user requested: “write this as 1
-integration task in the new branch (wyrd/bifrost-variant/integrate-main). add 1
-spec and 1 integration task,” explicitly requiring all 27 researched decisions
-and their evidence. This request adopts the preceding recommendation with the
-two explicit corrections below. It authorizes this packet and the described
-integration outcome; it does not authorize deployment, deletion of retained
-data, merging into main, pushing, or changes outside this contract.
+Revision 2 records explicit human approval of every reconciled obligation in
+this conversation: batches 1–4, 5–8, 9–12, 13–16, 17–20, 21–24 and 25–27 were
+each approved (“agree” / “agree on all 4”). These approvals include the unified
+resolutions and the user's explicit benchmark/test consolidation instruction.
+The approved scope is one spec and one integration task on the existing branch.
+No deployment, retained-data deletion, push, external fork publication, or merge
+into main is authorized by this packet. The packet is the implementation
+authority; reconciliation.md is supporting decision history, not a rival task.
 
 Produce one working integration of the rewritten Bifrost with main's current
 Wyrd product, security, verification, client, and tooling behavior. Users must
@@ -37,8 +37,12 @@ permission to omit a later consumer or split delivery into partial outcomes.
 | Common ancestor | `5ab92b0039404565e51f4a246863ce90cbd8d11f` |
 | Integration branch | `wyrd/bifrost-variant/integrate-main` |
 
-The integration branch starts from pinned main in a separate worktree. The
-implementation integrates the pinned variant while preserving provenance;
+The existing remote integration branch contains pinned main plus the other
+reviewer's research/benchmark documents and the initial packet. Research tip
+`40113bc83ba49792d24b17c7552709c4566f2af0` and packet commit
+`28b6f3b6da61874bd345464f13b735cdde41833e` are preserved. Use the existing
+worktree and branch; do not recreate or reset them. The implementation integrates
+the pinned variant while preserving provenance;
 this packet alone does not perform that merge. Refreshing either input requires
 recording and reviewing the new delta rather than silently widening scope.
 
@@ -208,10 +212,13 @@ on the shared outbox and never delays durable run settlement.
 
 ### REQ-016 — Typed Drift/Eval summaries and complete Task evidence
 
-Use source typed drift_report/eval_summary. Preserve existing details as
-nullable Variant for Task results only, using the existing AssertionResult
+Use source typed drift_report/eval_summary. Preserve nullable assertion_result
+Variant for Task results only, using the existing AssertionResult
 contract; no new Task payload type/table or duplicate summaries. Preserve
-nullable/source summary semantics and sensitivity metadata. Result run_id is
+nullable/source summary semantics and sensitivity metadata. Drift/Eval summaries
+remain typed Structs; open features inside them may be Variant. Sensitivity is
+descriptive except main's specific gateway payload-read permission; do not add
+a general elevated-read requirement for verification summaries. Result run_id is
 the application Run being judged, not the Verifier execution UUID; result and
 Verifier-run linkage remain separately attributable.
 
@@ -231,7 +238,7 @@ and cannot assume both rows share a day partition.
 | vala.logs.records | time_unix_nano | Typed event/observed instants. |
 | vala.drift.observations | created_at | Timestamp(us,+00:00); retain main window/aggregation semantics. |
 | vala.eval.observations | created_at | Variant context/media; preserve writer/Run inputs. |
-| vala.verification.results | ended_at | Source typed summaries plus Task Variant details. |
+| vala.verification.results | ended_at | Source typed summaries plus Task assertion_result Variant. |
 | vala.drift.result_features | wyrd_ingested_at | result_id join; measured window stays domain time. |
 | vala.eval.result_items | wyrd_ingested_at | Variant actual/expected; result_id join. |
 | vala.gateway.calls | started_at | request_payload/response_payload Variant, preserving payload-read authorization. |
@@ -260,7 +267,8 @@ field 9 with old error field 6 reserved. Keep main request params and other
 newer error identities. Spec, protobuf, conversions, server streams, client
 reconstruction, SDKs, CLI, and MCP must agree. Partial frames followed by failure
 cannot become success. Keep revision/body/tenant validation and no compatibility
-shim. Descriptor generation follows current main build ownership.
+shim. Python QueryTerminal.error_code returns the stable catalog code, and error_detail
+comes from the problem detail. Descriptor generation follows current main build ownership.
 
 ### REQ-021 — Shared types and narrow first-class client projections
 
@@ -268,7 +276,10 @@ Adopt source wyrd-types, schema mapper, timestamp/Variant conversions, row
 preflight, and logical JSON rendering. Keep main internal feature gates and
 renewable credential pooling identity. Adapt Service declared-table preflight
 and registration to the new mapper without dropping its before-Card-transaction
-validation/ensure semantics. Clients do not duplicate server/transport owners.
+validation/ensure semantics. Registration Created/AlreadyExists is the source
+outcome decided under its registration lock; callers must not infer it by a
+describe-before-create race. A propertyless top-level table model stays invalid;
+open column values can be Variant. Clients do not duplicate server/transport owners.
 
 ### REQ-022 — Main identity, credentials, SQL trust, and bootstrap
 
@@ -276,7 +287,8 @@ Retain main auth/credential/role/grant/revocation and human/platform separation,
 API-key OTLP authentication-before-decode, verified-principal Gate entrance,
 external Postgres credentials, and default local storage. New Bifrost SQL obeys
 TenantConn/OperatorPool and main role/RLS conventions; no naked pool/connection
-API. Keep selected local HTTP/gRPC endpoints and safe persisted client config.
+API. The narrow SECURITY DEFINER newest-WAL-fence function follows main's
+operator raise/restore and bounded search_path/privilege conventions. Keep selected local HTTP/gRPC endpoints and safe persisted client config.
 Do not revive obsolete workload/bootstrap grants or Argon2 credential behavior.
 
 ### REQ-023 — Retained product owners and ordered shutdown
@@ -311,11 +323,23 @@ task; main-owned control-plane data is never collateral cleanup.
 ### REQ-026 — Coherent native graph and retained main simplifications
 
 Take source Arrow/Parquet 60, DataFusion 55.1, object_store 0.14.2, Variant crates,
-and pinned analytical forks as a coherent graph; preserve main unrelated deps,
+and analytical forks as a coherent graph. The compaction pin must be one reachable
+immutable commit combining source compatibility with main's no-REST/Ring
+narrowing. The supplied commit is
+`22cd178d14009468bc951a14d7acf63237af808a` on the fork’s `wyrd/main`,
+already pinned by integration commit `914495674`; preserve it when importing
+source manifests. Neither old source 6965606 nor main 4e9f325 is sufficient. No
+Ring waiver is allowed. Preserve unrelated locked versions during directed graph
+resolution rather than performing a blanket dependency update; preserve main unrelated deps,
 features, profiles, pedantic rules, tier boundaries, and removed Ring/unearned
 features. Regenerate combined lock/Hakari output. Carry only shared-storage
 helpers needed by source Bifrost; retain main artifact signing/storage workflow.
-Do not restore unrelated SignerFuture churn, retired checks/family scripts,
+Preserve source query/write/ingest-client benchmark workloads, inputs, assertions,
+metrics, report meaning and usable mise entrypoints, but compile them into main's
+existing consolidated capacity target. Preserve main mixed-capacity defaults;
+retain source Host versus main scoped placement and experiment lifetime semantics.
+Do not restore per-workload source binaries, create target directories per case,
+or change the reference variant worktree. Do not restore unrelated SignerFuture churn, retired checks/family scripts,
 checked-in proto descriptor, or source review-skill/.claude changes.
 
 ### REQ-027 — Consumer-complete tests, artifacts, and documentation
@@ -370,7 +394,31 @@ records, all 148 conflicted paths, and all 76 automatically merged overlapping
 modifications receive a reviewed disposition; historical L01–L64/S1–S4 are
 reconciled rather than replayed blindly. New discoveries extend the ledger.
 
-The final immutable change review, not the task's TDD iteration, runs:
+Verification execution is mandatory for the implementer and final reviewer:
+expect substantial pedantic Clippy fallout from the source import. Fix the
+underlying code; do not add `#[allow]`, `#[expect]`, `cfg_attr` suppressions,
+workspace lint exceptions, or weaken a check to silence integration failures.
+Existing justified policy is not permission for new integration suppressions.
+
+Run lanes and the gate to completion, collecting every runnable test/check
+failure before making fixes. Preserve non-fail-fast runner behavior and exit
+status; do not cancel on the first failure or use fail-fast options. If an
+aggregate aborts early, ensure its remaining independent checks execute and
+record prerequisite-blocked checks explicitly. Compilation/setup failures can
+prevent dependent tests from running; never report those tests as passed.
+Then bucket failures by shared root cause, fix those causes, and rerun affected
+proof followed by the required final closeout.
+
+Run every lane and gate with logging and production test telemetry enabled.
+Use `WYRD_LOG=info,vala_bifrost_redux=debug`, `RUST_LOG` set to the same filter
+for runners using it, and `RUST_BACKTRACE=1`. Retain complete output, exit
+statuses, failing span/trace evidence and metric diagnostics. Environment
+filters alone do not install telemetry: preserve the owning harness subscriber,
+tracer and metrics recorder; fix a missing harness rather than diagnose blind.
+Use repository-managed telemetry; no external collector credentials are required.
+
+The final immutable change review, not the task's TDD iteration, runs with
+those logging/telemetry settings:
 
 ```bash
 mise run gate
@@ -380,8 +428,29 @@ mise run test:bifrost:journey:forge:production-geometry
 
 The extra geometry lanes prove production sizes excluded/reduced in the broad
 aggregate. Do not repeat its included component lanes as final evidence. Live
-cloud/provider and optional capacity benchmarks are not claimed as performed;
-their unavailable credentials do not replace repository-managed proof.
+cloud/provider checks are not claimed as performed; unavailable credentials do
+not replace repository-managed proof. The approved opt-in benchmark parity
+closeout is additionally required and is not covered by the correctness gate:
+
+```bash
+mise run bench:bifrost:query-capacity
+mise run bench:bifrost:query-capacity -- --fixture telemetry
+mise run bench:bifrost:write-capacity -- --fixture logs
+mise run bench:bifrost:write-capacity -- --fixture telemetry
+mise run bench:bifrost:write-capacity
+mise run bench:bifrost:client-queue
+```
+
+These entrypoints select workloads in the same consolidated target on the
+integrated tree; the source baseline packaging remains untouched. Produce
+matched exact-source baselines first where missing, using the same host,
+resources, fixtures and settings with no compilation running. Compare standard
+and telemetry reads on hot/Parquet before logs/telemetry/native writes and
+client/ingest behavior. Preserve current source verdicts and compare case qps,
+p50/p95/p99, CPU/query, peak memory and raw report provenance. Repeat suspected
+regressions, diagnose consistent degradation, and do not invent a new tolerance
+or suppress validation. Old/experimental reports are not a cfe21dc90 baseline.
+No new optimization is part of this parity work.
 
 Required strongest proof includes real SDK→server→SDK/agent journeys; Rust-only
 unit tests support pure ownership/error branches, real Postgres tests prove SQL
@@ -391,7 +460,16 @@ features, setup, expected RED and actual GREEN results belong in task evidence.
 
 ## Open material decisions and revision history
 
-None for this pinned code integration. Old populated Bifrost deployment is
+All product/architecture/security/format resolutions are approved in the seven
+batches; none remain open. The external compaction artifact prerequisite was
+fulfilled by remote integration commit `914495674`: the manifest pins
+`22cd178d14009468bc951a14d7acf63237af808a`, confirmed published on the fork’s
+`wyrd/main`. The remote research records the fork’s build/test and no-Ring
+checks; this packet does not claim those checks were independently rerun.
+Combined Wyrd lock/Hakari resolution and native verification remain implementation
+obligations, not unresolved design decisions. External fork publication is not
+performed or implicitly authorized by this Wyrd packet.
+Old populated Bifrost deployment is
 explicitly excluded, not an unanswered migration decision. Private adaptation,
 helper placement, fixture synchronization, and source test relocation are
 implementation-owned within the approved outcomes. A material contradiction
@@ -399,7 +477,8 @@ or proposed scope/contract change routes through a new spec revision.
 
 | Revision | Date | Status | Basis |
 |---|---|---|---|
-| 1 | 2026-10-11 | approved | User requested this exact 27-part recommendation as one spec/task; source retention/clamp and no agent_traces corrections retained. |
+| 1 | 2026-10-11 | superseded | Initial transcription; incomplete task recipes and conflicting earlier research choices replaced by revision 2. |
+| 2 | 2026-10-11 | approved | Explicit approval of all seven batches (1–27), unified Task/registration/error/SQL resolutions, and source workload retention with main target consolidation. |
 
 ## Authority links
 
@@ -413,4 +492,5 @@ or proposed scope/contract change routes through a new spec revision.
 - [Implementation execution](../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../architecture/references/languages/testing-workflows.md)
 - [Canonical integration evidence](evidence.md)
+- [Reconciliation decision history](reconciliation.md), superseded as execution authority by this approved revision.
 - [One integration task](tasks/TASK-001-integrate-bifrost-variant-with-main.md)

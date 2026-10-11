@@ -13,39 +13,99 @@ the merge research in `merge-research/`.
 2. **Merge main with the current Variant work** on `integrate-main`. Follow map
    §4 for the procedure and §5 for the proof lanes.
 3. **Continue Bifrost benchmarking and optimization** on the merged branch.
-   Start by proving the merge kept performance (next section): query capacity
-   first, then writes. The state and next steps are described below.
+   Start by proving the merge kept performance: reads (query capacity, hot and
+   Parquet) first, then writes. See the sections below.
 4. **Benchmark wyrd-gateway.** See the section at the end.
+
+## How this work started: reads
+
+Benchmarking on this branch began with **read latency** (TASK-003,
+`tasks/TASK-003-revision-query-latency.md` on `wyrd/bifrost-variant/TASK-003`,
+runs 1–28). The goal was ClickHouse-like query latency, with throughput coming
+from less CPU per query.
+
+The writes work came later. Run 27 showed OTLP span export at about 44k
+spans/s, below the 200k floor. That turned into the OTLP write-capacity
+work recorded further down.
+
+**Read work that landed:**
+
+| Change | Commit |
+|---|---|
+| A `RwLock` on the memtable, with projection outside the lock | `ce3474fa7` |
+| One-round-trip read cuts, cached and invalidated through LISTEN/NOTIFY, plus lower per-query planning cost | `ce3474fa7` |
+| No pod-wide lock on governed memory | `2f9e2889f` |
+| One `ScanSizer` sizing partitions from scanned bytes, for every tier | `1190c539a` |
+| Memtable column bytes recorded once at append | `05f2ba96b` |
+| The OTLP telemetry (spans) read fixture | `179bfdc11` |
+
+**Latest committed read numbers:**
+
+- **Run 24, hot tier.** See `benchmarks/pre-merge/read-standard-hot.md`.
+
+  | Case | Result |
+  |---|---|
+  | selective x1 | 633 qps, p50 1.5 ms |
+  | selective peak | 6,359 qps at x32 |
+  | small-aggregate x1 | 357 qps, p50 2.7 ms |
+  | small-aggregate x64 | 3,673 qps |
+  | 1m-aggregate x8 | 872 qps |
+  | small-aggregate while writing | 953 qps |
+
+- **Runs 25/26, Parquet tier, 24 vs 12 MiB chunk.** See the task file. The
+  24 MiB chunk stayed the default.
+
+**Read items still open in the task file:**
+
+- **Step 4:** codec measurement.
+- **Step 5:** the telemetry query benchmark (trace lookup, service window,
+  error rate, p99 per route, tokens per model, shredded `customer.id` lookup)
+  and the chunk sweep on both tiers.
+- **Step 6:** per-query overhead.
+- **Then:** the 100M-row heavy fixture.
+- **Variant key filters** were about 20–40x slower than promoted-column filters
+  in run 27/28 (a single cold check).
 
 ## First: prove the merge kept performance
 
-Resumed benchmarking starts by showing that the merged branch is at least as
-fast as the pre-merge branch, `wyrd/bifrost-variant/TASK-003` at `cfe21dc90`.
-Run everything in this order, on the same host, with nothing compiling:
+Before any new optimization, show that the merged branch is at least as fast
+as pre-merge `wyrd/bifrost-variant/TASK-003` at `cfe21dc90`. Run everything on
+the same host with nothing compiling, in this order:
 
-1. **Query capacity, hot and Parquet:** `mise run bench:bifrost:query-capacity`.
-   One invocation runs the hot (memtable) tier, then the Parquet tier under a
-   fresh Postgres.
-2. **Writes:** run these only after the query results match.
-   - `mise run bench:bifrost:write-capacity -- --fixture logs`
-   - then `-- --fixture telemetry`
+1. **Produce the pre-merge read baseline.** No read run exists at
+   `cfe21dc90`; see `benchmarks/pre-merge/README.md`.
+   - Run `mise run bench:bifrost:query-capacity` in the
+     `wyrd-bifrost-variant-task-003` worktree. One invocation runs the hot
+     (memtable) tier, then the Parquet tier under a fresh Postgres.
+   - Then run the same command with `-- --fixture telemetry`.
+   - Commit the reports to `benchmarks/pre-merge/`.
+2. **Run the same read sweeps on the merged branch** and compare them case by
+   case. Use qps, p50/p95/p99, server CPU per query and peak memory, plus the
+   per-query latency Pareto and the CPU Pareto by crate.
+3. **Writes, only after reads match:**
+   - `mise run bench:bifrost:write-capacity -- --fixture logs` (pre-merge:
+     `benchmarks/pre-merge/write-logs-run-37.md`)
+   - then `--fixture telemetry`
    - then the native sweep (no fixture)
 
-Compare each report step by step against the pre-merge report for the same
-fixture. Use rate, p50/p95/p99, server CPU and peak memory, plus the per-query
-latency Pareto and the CPU Pareto by crate.
+   Produce a pre-merge baseline for each one first, if it isn't in
+   `benchmarks/pre-merge/`.
 
-This disk's fsync time varies by up to about 2.5x between runs (run-36 vs
-run-37), so repeat a step before calling it a regression.
+Repeat a case before calling it a regression. On this disk, fsync time varies
+by up to about 2.5x between runs (run-36 vs run-37), and write rows/s varied
+25% between runs 23 and 25 on the same code.
 
-If the merged branch is worse, diagnose it against the pre-merge worktree
-`wyrd-bifrost-variant-task-003`. That worktree is kept at `cfe21dc90` as the
-reference and is not deleted until parity is proven. Diff the stage timings
-and the profiles under `target/bifrost-query-capacity/<mode>/<tier>/profiles/`
-in each worktree. Trace the regressing stage with `WYRD_LOG` before changing
-any code.
+If the merged branch is worse, diagnose it against the
+`wyrd-bifrost-variant-task-003` worktree:
 
-## Target and harness
+- That worktree is kept at `cfe21dc90` as the reference. Don't delete it until
+  parity is proven.
+- Diff the latency and CPU Paretos and the profiles under
+  `target/bifrost-query-capacity/<mode>/<tier>/profiles/` between the two
+  worktrees.
+- Trace the regressing stage with `WYRD_LOG` before changing any code.
+
+## Write-capacity target and harness
 
 - **Target:** at least 30 MiB/s of OTLP wire per server core, and at least
   200k rows/s at the fastest step. The bench judges both.
@@ -130,7 +190,7 @@ CPU Pareto at x64, run-37, by crate:
 | Fix 2: skip re-validating OTLP Variant bytes | **Dropped** | Validation already happens once, at Variant build (`EncodedVariant`). The check rejects NaN, oversize and over-deep values that OTLP can send (`non_finite_log_body_rejects_only_its_record`). |
 | Fix 5: single-pass OTLP decode | **Skipped** | The preflight pass reserves exact decode memory before allocating (`grpc/otlp.rs:668-678`). Removing it weakens memory admission for about 3.5% of CPU. |
 
-## Open items, in order (after parity is proven)
+## Write open items, in order (after parity is proven)
 
 1. **Confirm that fix 1's reuse hits.**
    - Today the Gate batch carries a `card_ref` column. Decode drops it,

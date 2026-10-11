@@ -38,9 +38,8 @@ use vala_bifrost_redux::catalog::{TableRef, TableUid};
 use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
 use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::tables::{AgentTracesTable, DomainTable};
+use vala_bifrost_redux::tables::{DomainTable, EvalObservationsTable};
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
-use vala_sql::queries::audit_staging::{append_audit, entry_hash};
 use wyrd_client::Bifrost;
 use wyrd_client::bifrost::TableConfig;
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder, WyrdJsonEncoderFactory};
@@ -56,7 +55,7 @@ use wyrd_server::verification::runner::EngineScript;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
+use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -1080,9 +1079,9 @@ async fn query_rows(
 /// column: the production result builder publishes a scored Drift, an
 /// unscored Drift, and an Eval result as the tenant SYSTEM writer; a real
 /// gateway call is captured with its request and response payloads; an
-/// agent trace is written through the public Bifrost facade; and an audit
-/// decision with a structured detail is appended to staging and moved into
-/// retained history by the server's own publisher. After a flush, whole
+/// Eval observation is written through the public Bifrost facade; and an
+/// audit decision with a structured detail is staged on the Scribe outbox and
+/// retained. After a flush, whole
 /// columns are read back through the server's query entry and every Variant
 /// cell decodes to the producer's native JSON value. A scored Drift carries
 /// only `drift_report`, an Eval only `eval_summary`, and an unscored Drift
@@ -1093,8 +1092,7 @@ async fn query_rows(
 /// values. A second gateway call the upstream refuses is captured with no
 /// resolved model: hot and published, both its `resolved_model` children
 /// read SQL null while the resolved call's read its provider and model. The
-/// retained audit row's `entry_hash` is recomputed from the stored columns,
-/// with the decoded detail re-canonicalized, and matches.
+/// retained audit row's detail decodes to the decision's canonical JSON.
 ///
 /// # Errors
 /// Returns server, seeding, gateway, publication, or query errors, or a
@@ -1106,8 +1104,8 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 
     let results = journey.publish_results().await?;
     let call = journey.gateway.capture_call().await?;
-    let trace = journey.write_agent_trace().await?;
-    let decision = journey.append_audit_decision().await?;
+    let observation = journey.write_eval_observation().await?;
+    let decision = journey.stage_audit_decision().await?;
     let children_sql = format!(
         "SELECT result_id, drift_report['method'], drift_report['verdict'], \
          drift_report['features'], to_json(drift_report['features']) IS NULL, \
@@ -1199,11 +1197,6 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     };
     expect_eq("hot gateway model children", &hot_models, &expected_models)?;
     journey.gateway.server.flush_bifrost().await?;
-    journey
-        .gateway
-        .server
-        .await_audit_published(journey.gateway.tenant)
-        .await?;
     expect_eq(
         "published summary Struct children",
         &journey.rows(children_sql).await?,
@@ -1287,49 +1280,27 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
     )?;
     expect_eq("captured response", &payload[1], &call.response)?;
 
-    // Agent trace: messages and tool IO keep their JSON types.
-    let traces = journey
+    // Eval observation: context and media keep their JSON types.
+    let observations = journey
         .rows(format!(
-            "SELECT messages, tool_io FROM vala.dev.agent_traces \
-             WHERE dev_session_id = '{}'",
-            trace.session
+            "SELECT context, media FROM {OBSERVATIONS} WHERE record_id = '{}'",
+            observation.record
         ))
         .await?;
     expect_eq(
-        "agent trace payloads",
-        &traces,
-        &vec![vec![trace.messages, trace.tool_io]],
+        "Eval observation payloads",
+        &observations,
+        &vec![vec![observation.context, observation.media]],
     )?;
 
-    // Audit: the stored detail decodes to the hashed JSON, and the staging
-    // writer's own hash over it at the stored chain position reproduces the
-    // row's entry hash.
+    // Audit: the retained detail decodes to the decision's canonical JSON.
     let audit = journey
         .rows(format!(
-            "SELECT seq, prev_hash, detail, entry_hash FROM vala.system.audit_log \
-             WHERE operation = '{}'",
-            decision.event.operation
+            "SELECT detail FROM vala.system.audit_log WHERE operation = '{}'",
+            decision.operation
         ))
         .await?;
-    let [row] = audit.as_slice() else {
-        return Err(format!("one retained decision expected: {audit:?}").into());
-    };
-    let [seq, Value::String(prev_hash), detail, stored_hash] = row.as_slice() else {
-        return Err(format!("an audit row has the wrong columns: {row:?}").into());
-    };
-    expect_eq("audit detail", detail, &decision.detail)?;
-    let recomputed = entry_hash(
-        &hex::decode(prev_hash)?,
-        seq.as_i64().ok_or("the audit seq is not an integer")?,
-        &decision.event,
-        None,
-        Some(&serde_jcs::to_string(detail)?),
-    );
-    expect_eq(
-        "audit entry hash",
-        &json!(hex::encode(recomputed)),
-        stored_hash,
-    )?;
+    expect_eq("audit detail", &audit, &vec![vec![decision.detail]])?;
 
     journey.gateway.server.shutdown().await?;
     Ok(())
@@ -1339,7 +1310,7 @@ async fn typed_builtin_payloads_are_queryable() -> Result<(), ServerJourneyError
 /// admission for a non-signal built-in and a nested signal Variant, and each
 /// malformed frame is refused with its exact catalogued error before any ACK.
 ///
-/// `vala.dev.agent_traces` covers a missing and a foreign extension marker,
+/// `vala.eval.observations` covers a missing and a foreign extension marker,
 /// the Variant marker with foreign extension metadata, invalid bytes, one
 /// container past the depth limit, a compact value nested 20,000 levels deep
 /// that is refused for depth without taking the server down, and one byte
@@ -1397,20 +1368,20 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             ),
         ]))
     };
-    let messages = || variant_field("messages", false);
-    let tool_io = || variant_field("tool_io", true);
+    let context = || variant_field("context", false);
+    let media = || variant_field("media", true);
     let limit = usize::try_from(VARIANT_MAX_ENCODED_BYTES)?;
     let unsupported = |field: &str| BifrostError::UnsupportedType {
         field: field.to_owned(),
         data_type: variant_storage_type().to_string(),
     };
-    let invalid_messages = BifrostError::VariantInvalidJson {
-        field: "messages".to_owned(),
+    let invalid_context = BifrostError::VariantInvalidJson {
+        field: "context".to_owned(),
         row: 0,
         path: String::new(),
     };
     let out_of_range = |path: &str, numeric_kind: &str| BifrostError::VariantNumericOutOfRange {
-        field: "messages".to_owned(),
+        field: "context".to_owned(),
         row: 0,
         path: path.to_owned(),
         numeric_kind: numeric_kind.to_owned(),
@@ -1433,38 +1404,38 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     EncodedVariant::from_bytes(&EMPTY_METADATA, &deepest)
         .map_err(|violation| format!("the depth-limit fixture is invalid: {violation:?}"))?;
     let too_deep = BifrostError::VariantTooDeep {
-        field: "messages".to_owned(),
+        field: "context".to_owned(),
         row: 0,
         path: "/0".repeat(usize::try_from(VARIANT_MAX_DEPTH)?),
         depth: VARIANT_MAX_DEPTH + 1,
         limit: VARIANT_MAX_DEPTH,
     };
 
-    let traces = [
+    let observations = [
         (
             "missing extension",
-            (storage_only("messages", false), valid()?),
-            unsupported("messages"),
+            (storage_only("context", false), valid()?),
+            unsupported("context"),
         ),
         (
             "foreign extension",
-            (foreign("messages"), valid()?),
-            unsupported("messages"),
+            (foreign("context"), valid()?),
+            unsupported("context"),
         ),
         (
             "foreign extension metadata",
-            (foreign_metadata("messages"), valid()?),
-            unsupported("messages"),
+            (foreign_metadata("context"), valid()?),
+            unsupported("context"),
         ),
         (
             "invalid bytes",
-            (messages(), invalid()?),
-            invalid_messages.clone(),
+            (context(), invalid()?),
+            invalid_context.clone(),
         ),
         (
             "one container past the depth limit",
             (
-                messages(),
+                context(),
                 raw_variant(&EMPTY_METADATA, &nested_lists(VARIANT_MAX_DEPTH + 1)?)?,
             ),
             too_deep.clone(),
@@ -1472,7 +1443,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a compact hostile depth",
             (
-                messages(),
+                context(),
                 raw_variant(&EMPTY_METADATA, &nested_lists(20_000)?)?,
             ),
             too_deep.clone(),
@@ -1480,76 +1451,76 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "malformed bytes below a container past the depth limit",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &(0..VARIANT_MAX_DEPTH + 5)
                         .try_fold(vec![VARIANT_MALFORMED], |value, _| variant_list(&[value]))?,
                 )?,
             ),
-            invalid_messages.clone(),
+            invalid_context.clone(),
         ),
         (
             "objects whose fields share one child at every level",
             (
-                messages(),
+                context(),
                 raw_variant(&AB_METADATA, &shared_objects(VARIANT_MAX_DEPTH)?)?,
             ),
-            invalid_messages.clone(),
+            invalid_context.clone(),
         ),
         (
             "malformed bytes after an over-deep sibling",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &variant_list(&[over_deep.clone(), vec![VARIANT_MALFORMED]])?,
                 )?,
             ),
-            invalid_messages.clone(),
+            invalid_context.clone(),
         ),
         (
             "malformed bytes before an over-deep sibling",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &variant_list(&[vec![VARIANT_MALFORMED], over_deep.clone()])?,
                 )?,
             ),
-            invalid_messages.clone(),
+            invalid_context.clone(),
         ),
         (
             "many fields sharing one large child",
-            (messages(), raw_variant(&many_names, &one_shared_child)?),
-            invalid_messages.clone(),
+            (context(), raw_variant(&many_names, &one_shared_child)?),
+            invalid_context.clone(),
         ),
         (
             "one field starting inside another",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &AB_METADATA,
                     &variant_object(&[(0, 0), (1, 1)], &[0x0c, 0x00])?,
                 )?,
             ),
-            invalid_messages.clone(),
+            invalid_context.clone(),
         ),
         (
             "two fields resolving to one name",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &variant_metadata(&["a", "a"], false)?,
                     &variant_object(&[(0, 0), (1, 1)], &[VARIANT_NULL, VARIANT_NULL])?,
                 )?,
             ),
-            invalid_messages.clone(),
+            invalid_context.clone(),
         ),
         (
             "a Decimal4",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &primitive(VARIANT_DECIMAL4, &[0, 5, 0, 0, 0]),
@@ -1560,7 +1531,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a Decimal8",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &primitive(VARIANT_DECIMAL8, &[0, 5, 0, 0, 0, 0, 0, 0, 0]),
@@ -1571,7 +1542,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a NaN double",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &primitive(VARIANT_DOUBLE, &f64::NAN.to_le_bytes()),
@@ -1582,7 +1553,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "an infinite float",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &primitive(VARIANT_FLOAT, &f32::INFINITY.to_le_bytes()),
@@ -1593,7 +1564,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a fractional decimal",
             (
-                messages(),
+                context(),
                 raw_variant(&EMPTY_METADATA, &decimal16(12_345, 2))?,
             ),
             out_of_range("", "decimal"),
@@ -1601,20 +1572,20 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         (
             "a scale-zero decimal past u64::MAX",
             (
-                messages(),
+                context(),
                 raw_variant(&EMPTY_METADATA, &decimal16(i128::from(u64::MAX) + 1, 0))?,
             ),
             out_of_range("", "decimal"),
         ),
         (
             "a scale-zero decimal within i64",
-            (messages(), raw_variant(&EMPTY_METADATA, &decimal16(5, 0))?),
+            (context(), raw_variant(&EMPTY_METADATA, &decimal16(5, 0))?),
             out_of_range("", "decimal"),
         ),
         (
             "a refused decimal after an over-deep sibling",
             (
-                messages(),
+                context(),
                 raw_variant(
                     &EMPTY_METADATA,
                     &variant_list(&[over_deep.clone(), decimal16(5, 0)])?,
@@ -1624,47 +1595,47 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         ),
         (
             "an oversized malformed value reports its size",
-            (messages(), raw_variant(&[0xff], &vec![0xff; limit])?),
+            (context(), raw_variant(&[0xff], &vec![0xff; limit])?),
             BifrostError::VariantTooLarge {
-                field: "messages".to_owned(),
+                field: "context".to_owned(),
                 row: 0,
                 bytes: VARIANT_MAX_ENCODED_BYTES + 1,
                 limit: VARIANT_MAX_ENCODED_BYTES,
             },
         ),
     ];
-    for (what, messages, expected) in traces {
-        let frame = admission.trace_frame(&refused, messages, (tool_io(), valid()?))?;
+    for (what, context, expected) in observations {
+        let frame = admission.observation_frame(&refused, context, (media(), valid()?))?;
         admission
-            .refuse(what, AGENT_TRACES, &frame, &expected)
+            .refuse(what, OBSERVATIONS, &frame, &expected)
             .await?;
     }
-    let frame = admission.trace_frame(
+    let frame = admission.observation_frame(
         &refused,
-        (messages(), invalid()?),
-        (storage_only("tool_io", true), valid()?),
+        (context(), invalid()?),
+        (storage_only("media", true), valid()?),
     )?;
     admission
         .refuse(
             "a wrong marker outranks invalid bytes",
-            AGENT_TRACES,
+            OBSERVATIONS,
             &frame,
-            &unsupported("tool_io"),
+            &unsupported("media"),
         )
         .await?;
-    let binary_model = |frame: RecordBatch| -> Result<RecordBatch, ServerJourneyError> {
+    let binary_record_id = |frame: RecordBatch| -> Result<RecordBatch, ServerJourneyError> {
         let fields = frame
             .schema()
             .fields()
             .iter()
             .map(|field| match field.name().as_str() {
-                "model" => Arc::new(Field::new("model", DataType::Binary, false)),
+                "record_id" => Arc::new(Field::new("record_id", DataType::Binary, false)),
                 _ => Arc::clone(field),
             })
             .collect::<Vec<_>>();
         let mut columns = frame.columns().to_vec();
-        columns[frame.schema().index_of("model")?] = cast(
-            frame.column_by_name("model").ok_or("no model")?,
+        columns[frame.schema().index_of("record_id")?] = cast(
+            frame.column_by_name("record_id").ok_or("no record_id")?,
             &DataType::Binary,
         )?;
         Ok(RecordBatch::try_new(
@@ -1682,9 +1653,10 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             columns,
         )?)
     };
-    let frame = admission.trace_frame(&refused, (messages(), valid()?), (tool_io(), valid()?))?;
+    let frame =
+        admission.observation_frame(&refused, (context(), valid()?), (media(), valid()?))?;
     let error = admission
-        .refusal(AGENT_TRACES, &binary_model(frame)?)
+        .refusal(OBSERVATIONS, &binary_record_id(frame)?)
         .await?;
     expect_eq(
         "a non-Variant type change",
@@ -1701,16 +1673,16 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     ];
     for (defect, bytes) in variant_defects {
         let frame = || {
-            admission.trace_frame(
+            admission.observation_frame(
                 &refused,
-                (messages(), Arc::clone(&bytes)),
-                (tool_io(), valid()?),
+                (context(), Arc::clone(&bytes)),
+                (media(), valid()?),
             )
         };
         admission
             .refuse(
                 &format!("an undeclared column outranks {defect} Variant bytes"),
-                AGENT_TRACES,
+                OBSERVATIONS,
                 &undeclared(frame()?)?,
                 &BifrostError::UndeclaredField {
                     field: "undeclared".to_owned(),
@@ -1719,7 +1691,7 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
             )
             .await?;
         let error = admission
-            .refusal(AGENT_TRACES, &binary_model(frame()?)?)
+            .refusal(OBSERVATIONS, &binary_record_id(frame()?)?)
             .await?;
         expect_eq(
             &format!("a non-Variant type change outranks {defect} Variant bytes"),
@@ -1797,24 +1769,24 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         )
         .await?;
 
-    // The accepted trace carries the one decimal form the exact numeric domain
-    // admits, which must read back with every digit, and a finite float.
+    // The accepted observation carries the one decimal form the exact numeric
+    // domain admits, which must read back with every digit, and a finite float.
     let accepted = admission.session("accepted");
-    let sentinel = admission.trace_frame(
+    let sentinel = admission.observation_frame(
         &accepted,
         (
-            messages(),
+            context(),
             raw_variant(&EMPTY_METADATA, &decimal16(i128::from(u64::MAX), 0))?,
         ),
         (
-            tool_io(),
+            media(),
             raw_variant(
                 &EMPTY_METADATA,
                 &primitive(VARIANT_FLOAT, &1.5_f32.to_le_bytes()),
             )?,
         ),
     )?;
-    admission.accept(AGENT_TRACES, &sentinel).await?;
+    admission.accept(OBSERVATIONS, &sentinel).await?;
     admission
         .accept(SPANS, &admission.spans_frame(&accepted))
         .await?;
@@ -1825,12 +1797,12 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
 
     let suffix = &admission.run;
     expect_eq(
-        "stored agent traces",
+        "stored Eval observations",
         &admission
             .journey
             .rows(format!(
-                "SELECT dev_session_id, count(*) FROM {AGENT_TRACES} \
-                 WHERE dev_session_id LIKE '%{suffix}' GROUP BY dev_session_id"
+                "SELECT session_id, count(*) FROM {OBSERVATIONS} \
+                 WHERE session_id LIKE '%{suffix}' GROUP BY session_id"
             ))
             .await?,
         &vec![vec![json!(accepted), json!(1)]],
@@ -1840,8 +1812,8 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
         &admission
             .journey
             .rows(format!(
-                "SELECT messages, tool_io FROM {AGENT_TRACES} \
-                 WHERE dev_session_id = '{accepted}'"
+                "SELECT context, media FROM {OBSERVATIONS} \
+                 WHERE session_id = '{accepted}'"
             ))
             .await?,
         &vec![vec![json!(u64::MAX), json!(1.5)]],
@@ -1873,11 +1845,9 @@ async fn builtin_variant_columns_are_refused_before_ack() -> Result<(), ServerJo
     Ok(())
 }
 
-/// The shared verdict table the typed-payload journey publishes to.
-const RESULTS: &str = "vala.verification.results";
-
-/// The non-signal built-in the Variant admission journey writes.
-const AGENT_TRACES: &str = "vala.dev.agent_traces";
+/// The non-signal built-in the Variant admission journey writes: a required
+/// `context` and a nullable `media` Variant beside fixed scalar columns.
+const OBSERVATIONS: &str = "vala.eval.observations";
 
 /// The signal built-in whose nested `events` Variant the journey writes.
 const SPANS: &str = "vala.traces.spans";
@@ -1950,7 +1920,7 @@ impl VariantAdmissionJourney {
     async fn start() -> Result<Self, ServerJourneyError> {
         let journey = TypedPayloadJourney::start().await?;
         for (namespace, name) in [
-            ("dev", "agent_traces"),
+            ("eval", "observations"),
             ("traces", "spans"),
             ("metrics", "points"),
         ] {
@@ -1985,12 +1955,12 @@ impl VariantAdmissionJourney {
         })
     }
 
-    /// Require that each JSON agent-trace row is refused before any ACK with
+    /// Require that each JSON Eval observation row is refused before any ACK with
     /// the exact Variant error the revision-13 order selects.
     ///
     /// Numeric range outranks depth in both key orders and inside the
     /// over-depth container; valid JSON nested 129 and 10,000 levels deep
-    /// is too deep rather than invalid; and a `messages` value whose built
+    /// is too deep rather than invalid; and a `context` value whose built
     /// bytes already exceed the size limit reports size beside a refused
     /// number or an over-depth sibling. Each row goes through the public
     /// facade's JSON-row path with its integer token intact, and the refusal
@@ -2006,13 +1976,13 @@ impl VariantAdmissionJourney {
         };
         let deep = nested("1", 65);
         let numeric = |path: String| BifrostError::VariantNumericOutOfRange {
-            field: "messages".to_owned(),
+            field: "context".to_owned(),
             row: 0,
             path,
             numeric_kind: "integer".to_owned(),
         };
         let too_deep = BifrostError::VariantTooDeep {
-            field: "messages".to_owned(),
+            field: "context".to_owned(),
             row: 0,
             path: "/0".repeat(64),
             depth: VARIANT_MAX_DEPTH + 1,
@@ -2024,17 +1994,17 @@ impl VariantAdmissionJourney {
         );
         // The exact byte count is whatever the shared owner built before
         // refusing; the facade must surface that size error unchanged.
-        let too_large = |messages: String| -> Result<(String, BifrostError), ServerJourneyError> {
-            let error = EncodedVariant::from_json_text(&messages)
+        let too_large = |context: String| -> Result<(String, BifrostError), ServerJourneyError> {
+            let error = EncodedVariant::from_json_text(&context)
                 .err()
                 .ok_or("the oversized row encodes")?
-                .into_error("messages", 0);
+                .into_error("context", 0);
             expect_eq(
                 "the oversized row's error",
                 &error.code(),
                 &"WYRD_VALA_413_VARIANT_TOO_LARGE",
             )?;
-            Ok((messages, error))
+            Ok((context, error))
         };
         let cases = [
             (
@@ -2056,16 +2026,16 @@ impl VariantAdmissionJourney {
             ))?,
             too_large(format!(r#"{{"big": {big}, "other": {deep}}}"#))?,
         ];
-        for (messages, expected) in cases {
+        for (context, expected) in cases {
             let bifrost = Bifrost::connect(&self.client).await?;
-            let table = bifrost.writer_table(AGENT_TRACES).await?;
+            let table = bifrost.writer_table(OBSERVATIONS).await?;
             let fields = table
                 .user_schema()
                 .fields()
                 .iter()
                 .map(|field| {
                     let value = match field.data_type() {
-                        _ if field.name() == "messages" => messages.clone(),
+                        _ if field.name() == "context" => context.clone(),
                         _ if field.is_nullable() => "null".to_owned(),
                         DataType::Timestamp(..) => format!("\"{}\"", Utc::now().to_rfc3339()),
                         _ => format!("\"{}\"", self.session("refused")),
@@ -2095,46 +2065,39 @@ impl VariantAdmissionJourney {
         format!("{outcome}-{}", self.run)
     }
 
-    /// One agent trace under `session` with the given Variant columns.
+    /// One Eval observation under `session` with the given Variant columns.
     ///
-    /// Every other column takes a fixed valid value, so a refusal can come
-    /// only from the two supplied fields or a deliberate schema change.
+    /// The row carries a fresh `record_id` and `session` as its `session_id`,
+    /// and no Card correlation, so it activates no binding. Every other column
+    /// takes a fixed valid value, so a refusal can come only from the two
+    /// supplied fields or a deliberate schema change.
     ///
     /// # Errors
     ///
     /// Returns the Arrow error when the columns do not form a batch.
-    fn trace_frame(
+    fn observation_frame(
         &self,
         session: &str,
-        messages: (Field, ArrayRef),
-        tool_io: (Field, ArrayRef),
+        context: (Field, ArrayRef),
+        media: (Field, ArrayRef),
     ) -> Result<RecordBatch, ServerJourneyError> {
         let now = Utc::now().timestamp_micros();
-        let at =
-            || Arc::new(TimestampMicrosecondArray::from(vec![now]).with_timezone(UTC_TIME_ZONE));
         let text = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
-        let mut fields = AgentTracesTable::arrow_fields();
+        let mut fields = EvalObservationsTable::arrow_fields();
         let columns: Vec<ArrayRef> = vec![
+            text(&format!("{session}-{}", uuid::Uuid::now_v7().simple())),
             text(session),
-            text("wyrd"),
-            Arc::new(StringArray::from(vec![None::<&str>])),
-            text("main"),
-            text("variant-admission"),
+            context.1,
             Arc::new(FixedSizeBinaryArray::new_null(16, 1)),
             Arc::new(FixedSizeBinaryArray::new_null(8, 1)),
-            text("assistant"),
-            text("gpt-4o"),
-            text("openai"),
-            messages.1,
-            tool_io.1,
-            at(),
-            at(),
+            Arc::new(TimestampMicrosecondArray::from(vec![now]).with_timezone(UTC_TIME_ZONE)),
+            media.1,
         ];
-        for field in [messages.0, tool_io.0] {
+        for field in [context.0, media.0] {
             let index = fields
                 .iter()
                 .position(|declared| declared.name() == field.name())
-                .ok_or("an agent trace field is undeclared")?;
+                .ok_or("an Eval observation field is undeclared")?;
             fields[index] = field;
         }
         Ok(RecordBatch::try_new(
@@ -2472,21 +2435,21 @@ struct PublishedResults {
     item: Vec<Value>,
 }
 
-/// The written agent trace and its native payloads.
-struct WrittenTrace {
-    /// Session id identifying the one written row.
-    session: String,
-    /// The trace's message list.
-    messages: Value,
-    /// The trace's tool input and output.
-    tool_io: Value,
+/// The written Eval observation and its native payloads.
+struct WrittenObservation {
+    /// Record id identifying the one written row.
+    record: String,
+    /// The observation's context payload.
+    context: Value,
+    /// The observation's media payload.
+    media: Value,
 }
 
-/// The appended audit decision and its native detail.
-struct AppendedDecision {
-    /// The staged event whose entry hash the retained row must reproduce.
-    event: AuditEvent,
-    /// The detail's canonical JSON, the value the entry hash covers.
+/// The staged audit decision and its native detail.
+struct StagedDecision {
+    /// The decision's unique operation, which selects its retained row.
+    operation: String,
+    /// The detail's canonical JSON, the value the retained row must decode to.
     detail: Value,
 }
 
@@ -2508,13 +2471,12 @@ impl TypedPayloadJourney {
     }
 
     /// Publish a scored Drift, an unscored Drift, and an Eval result through
-    /// the production payload builder as the tenant SYSTEM writer.
-    ///
-    /// Before the Eval result is written, a partial copy of its summary is
-    /// refused by the same writer.
+    /// the production payload builder, staged on the process Scribe outbox
+    /// under the tenant SYSTEM principal as the server's internal result
+    /// writer does, then flushed.
     ///
     /// # Errors
-    /// Returns a seeding, minting, payload, or write error.
+    /// Returns a seeding, payload, or flush error.
     async fn publish_results(&self) -> Result<PublishedResults, ServerJourneyError> {
         let seed = VerificationFixture::provision(
             self.gateway.server.state().postgres.wyrd(),
@@ -2534,35 +2496,6 @@ impl TypedPayloadJourney {
                 .ensure_builtin_table_for_test(self.gateway.tenant, namespace, name)
                 .await?;
         }
-        let issuer = self
-            .gateway
-            .server
-            .state()
-            .auth
-            .tenant_issuer()
-            .ok_or("the server has no tenant issuer")?;
-        let mut conn = self
-            .gateway
-            .server
-            .state()
-            .postgres
-            .wyrd()
-            .tenant_conn(self.gateway.tenant)
-            .await?;
-        let token = issuer.issue_system_token(&mut conn, &verifier).await?;
-        drop(conn);
-        let bifrost = Bifrost::connect(&wyrd_client::bifrost::client_from_options(
-            self.gateway.server.base_url(),
-            Some(token.access_token.expose_secret()),
-            self.gateway.server.grpc_url().as_deref(),
-        )?)
-        .await?;
-        let verifier_ref = CardRef {
-            uid: None,
-            ..verifier
-        }
-        .to_string();
-
         let now = Utc::now();
         let window = RunInput::DriftWindow(DriftWindow {
             start: now - chrono::Duration::hours(1),
@@ -2607,6 +2540,7 @@ impl TypedPayloadJourney {
         let eval = VerifierReport::Eval {
             report: eval_report,
             verdict: VerificationVerdict::Passed,
+            run_id: None,
         };
 
         let mut published = Vec::new();
@@ -2618,7 +2552,7 @@ impl TypedPayloadJourney {
             let result = VerificationResultId::new_v7();
             let payload = ResultPayloadBuilder::new(
                 ResultRun {
-                    run_id: VerificationRunId::new_v7(),
+                    run_id: None,
                     verifier_version: "1.0.0",
                     subject_card_uid: &subject,
                     owner_card_uid: Some(&subject),
@@ -2626,20 +2560,25 @@ impl TypedPayloadJourney {
                     trigger: None,
                     input,
                 },
-                &verifier_ref,
+                &uid,
                 result,
                 now,
                 now,
             )
             .build(report)?;
-            for batch in payload.batches() {
-                if batch.table == RESULTS && matches!(report, VerifierReport::Eval { .. }) {
-                    Self::refuse_partial_summary(&bifrost, &batch.batch).await?;
-                }
-                bifrost.write_batch(&batch.table, &batch.batch).await?;
-            }
+            self.gateway.server.state().scribe_outbox.stage(
+                self.gateway.tenant,
+                ScribeWrite::Result {
+                    payload,
+                    attribution: VerifierAttribution {
+                        verifier: verifier.clone(),
+                        principal: PrincipalId::new(seed.system_principal()),
+                    },
+                },
+            );
             published.push(result);
         }
+        self.gateway.server.flush_bifrost().await?;
         let [scored_drift, unscored_drift, eval] = published[..] else {
             return Err("three results were not published".into());
         };
@@ -2653,68 +2592,33 @@ impl TypedPayloadJourney {
         })
     }
 
-    /// Require that a copy of the Eval `results` batch whose present
-    /// `eval_summary` lacks `total_tasks` is refused before any ACK.
+    /// Write one Eval observation with nested `context` and `media` payloads
+    /// through the public Bifrost facade as a tenant administrator.
     ///
-    /// The caller writes the intact batch afterward, and the journey's hot and
-    /// published reads then find only intact rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the summary is not the declared Struct, the copy
-    /// does not assemble, or the write is acked or refused with another error.
-    async fn refuse_partial_summary(
-        bifrost: &Bifrost,
-        results: &RecordBatch,
-    ) -> Result<(), ServerJourneyError> {
-        let index = results.schema().index_of("eval_summary")?;
-        let (fields, mut children, nulls) = results
-            .column(index)
-            .as_struct_opt()
-            .ok_or("eval_summary is a Struct")?
-            .clone()
-            .into_parts();
-        children[0] = arrow::array::new_null_array(children[0].data_type(), results.num_rows());
-        let mut columns = results.columns().to_vec();
-        columns[index] = Arc::new(StructArray::try_new(fields, children, nulls)?);
-        let partial = RecordBatch::try_new(results.schema(), columns)?;
-        match bifrost.write_batch(RESULTS, &partial).await {
-            Ok(()) => Err("a partial eval_summary was acked".into()),
-            Err(error) => expect_eq(
-                "a partial eval_summary",
-                &WyrdError::from(&error).code(),
-                &"WYRD_VALA_400_SCHEMA_PARSE",
-            ),
-        }
-    }
-
-    /// Write one agent trace with nested message and tool payloads through
-    /// the public Bifrost facade as a tenant administrator.
+    /// The row names no Card, so it activates no binding.
     ///
     /// # Errors
     /// Returns a bootstrap, provisioning, encoding, or write error.
-    async fn write_agent_trace(&self) -> Result<WrittenTrace, ServerJourneyError> {
-        let Bootstrap::Machine {
-            api_key, card_ref, ..
-        } = self
+    async fn write_eval_observation(&self) -> Result<WrittenObservation, ServerJourneyError> {
+        let Bootstrap::Machine { api_key, .. } = self
             .gateway
             .server
-            .bootstrap_service("typed_trace_writer", &["admin"])
+            .bootstrap_service("typed_observation_writer", &["admin"])
             .await?
         else {
             return Err("a service bootstrap returned a user".into());
         };
         self.gateway
             .server
-            .ensure_builtin_table_for_test(self.gateway.tenant, "dev", "agent_traces")
+            .ensure_builtin_table_for_test(self.gateway.tenant, "eval", "observations")
             .await?;
-        let session = format!("typed-{}", uuid::Uuid::now_v7());
-        let messages = json!([
+        let record = format!("typed-{}", uuid::Uuid::now_v7());
+        let context = json!([
             {"role": "user", "content": "find wyrd"},
             {"role": "assistant", "content": null,
              "tool_calls": [{"name": "search", "arguments": {"q": "wyrd", "limit": 3}}]},
         ]);
-        let tool_io =
+        let media =
             json!({"search": {"input": {"q": "wyrd"}, "output": [1, 2.5, true, null, "x"]}});
         let variant = |value: &Value| -> Result<ArrayRef, ServerJourneyError> {
             let encoded = EncodedVariant::from_json(value)
@@ -2723,34 +2627,20 @@ impl TypedPayloadJourney {
             builder.append(&encoded);
             Ok(builder.finish())
         };
-        let now = Utc::now().timestamp_micros();
-        let at =
-            || Arc::new(TimestampMicrosecondArray::from(vec![now]).with_timezone(UTC_TIME_ZONE));
         let text = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
-        let mut fields = AgentTracesTable::arrow_fields();
-        fields.push(Field::new(CARD_REF, DataType::Utf8, true));
-        let uidless = CardRef {
-            uid: None,
-            ..card_ref
-        };
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(fields)),
+            Arc::new(Schema::new(EvalObservationsTable::arrow_fields())),
             vec![
-                text(&session),
-                text("wyrd"),
-                Arc::new(StringArray::from(vec![None::<&str>])),
-                text("main"),
-                text("typed-run"),
+                text(&record),
+                text("typed-session"),
+                variant(&context)?,
                 Arc::new(FixedSizeBinaryArray::new_null(16, 1)),
                 Arc::new(FixedSizeBinaryArray::new_null(8, 1)),
-                text("assistant"),
-                text("gpt-4o"),
-                text("openai"),
-                variant(&messages)?,
-                variant(&tool_io)?,
-                at(),
-                at(),
-                text(&uidless.to_string()),
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![Utc::now().timestamp_micros()])
+                        .with_timezone(UTC_TIME_ZONE),
+                ),
+                variant(&media)?,
             ],
         )?;
         let writer = wyrd_client::bifrost::client_from_options(
@@ -2760,21 +2650,21 @@ impl TypedPayloadJourney {
         )?;
         Bifrost::connect(&writer)
             .await?
-            .write_batch("vala.dev.agent_traces", &batch)
+            .write_batch(OBSERVATIONS, &batch)
             .await?;
-        Ok(WrittenTrace {
-            session,
-            messages,
-            tool_io,
+        Ok(WrittenObservation {
+            record,
+            context,
+            media,
         })
     }
 
-    /// Append one allowed decision with a structured detail through the
-    /// production staging writer; the server's publisher retains it.
+    /// Stage one allowed decision with a structured detail on the process
+    /// Scribe outbox, the one audit write path, and wait until it is retained.
     ///
     /// # Errors
-    /// Returns the Postgres failure the append or commit raised.
-    async fn append_audit_decision(&self) -> Result<AppendedDecision, ServerJourneyError> {
+    /// Returns the retention timeout or a detail encoding error.
+    async fn stage_audit_decision(&self) -> Result<StagedDecision, ServerJourneyError> {
         let operation = format!("journey.typed_detail.{}", uuid::Uuid::now_v7().simple());
         let detail = AuditDetail::OracleAdmissionRecovery {
             expired_lease_count: 2,
@@ -2786,7 +2676,7 @@ impl TypedPayloadJourney {
         let event = AuditEvent::new(
             RequestId::now_v7(),
             None,
-            operation,
+            operation.clone(),
             "vala.oracle.admission".to_owned(),
             None,
             PrincipalId::new(uuid::Uuid::now_v7()),
@@ -2795,15 +2685,14 @@ impl TypedPayloadJourney {
             AuditOutcome::Allowed,
         )
         .with_detail(detail.clone());
-        let mut conn = self
-            .gateway
+        self.gateway
             .server
-            .tenant_conn_for(self.gateway.tenant)
-            .await?;
-        append_audit(&mut conn, &event).await?;
-        conn.commit().await?;
-        Ok(AppendedDecision {
-            event,
+            .state()
+            .scribe_outbox
+            .stage(self.gateway.tenant, event);
+        self.gateway.server.await_audit_retained().await?;
+        Ok(StagedDecision {
+            operation,
             detail: serde_json::from_str(&audit_detail_canonical_json(&detail))?,
         })
     }
@@ -2840,6 +2729,7 @@ impl TypedPayloadJourney {
         .run_with(
             BifrostQueryRequest {
                 sql,
+                params: Vec::new(),
                 deadline_ms: Some(30_000),
             },
             |batch| {

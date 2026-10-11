@@ -16,7 +16,7 @@ use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::WyrdClient;
-use wyrd_runtime::builtin_roles::WORKLOAD_ROLE;
+use wyrd_runtime::builtin_roles::DEFAULT_CARD_ROLE;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdProblem;
@@ -360,6 +360,7 @@ async fn prove_planning_read_stall_times_out() -> Result<(), JourneyError> {
                 .query(&BifrostQueryRequest {
                     sql,
                     deadline_ms: Some(PLANNING_STALL_DEADLINE_MS),
+                    params: Vec::new(),
                 })
                 .await?;
             while stream.next_batch().await?.is_some() {}
@@ -987,11 +988,10 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
             .bootstrap_service_in_tenant(
                 cluster.tenant(),
                 "variant-sql-unprivileged",
-                &[WORKLOAD_ROLE],
+                &[DEFAULT_CARD_ROLE],
             )
             .await?,
-    )
-    .await?;
+    )?;
     let remote_before = RemoteWork::observe(&cluster)?;
     match run_rows(
         &unprivileged,
@@ -1099,7 +1099,7 @@ async fn prove_late_failures(
             &generic,
         ),
     ] {
-        let error = match wyrd_client::Bifrost::query_only(client).sql(&sql).await {
+        let error = match wyrd_client::Bifrost::query_only(client).sql(&sql, &[]).await {
             Err(error) => error,
             Ok(result) => {
                 return Err(format!("{case} returned {} rows", result.num_rows()).into());
@@ -1174,7 +1174,7 @@ async fn prove_worker_tenant_refusal(
     let sql = format!(
         "SELECT id FROM (SELECT id FROM vala.bifrost.{table} ORDER BY id LIMIT 8193) AS sorted"
     );
-    let error = match wyrd_client::Bifrost::query_only(client).sql(&sql).await {
+    let error = match wyrd_client::Bifrost::query_only(client).sql(&sql, &[]).await {
         Err(error) => error,
         Ok(result) => return Err(format!("{case} returned {} rows", result.num_rows()).into()),
     };
@@ -1231,6 +1231,7 @@ async fn run_rows(
         .query(&BifrostQueryRequest {
             sql: sql.to_owned(),
             deadline_ms: Some(30_000),
+            params: Vec::new(),
         })
         .await?;
     let mut rows = Vec::new();

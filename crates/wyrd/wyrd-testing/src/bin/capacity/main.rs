@@ -744,7 +744,7 @@ mod tests {
     use clap::Parser as _;
     use tokio::time::Instant;
 
-    use super::{Benchmark, Cli, Envelope, Lifetime, LocalServer};
+    use super::{Benchmark, Cli, Envelope, Lifetime, LocalServer, Placement};
 
     /// A benchmark that cannot finish fails when its measuring share ends,
     /// and a cleanup that cannot finish stops at its own reserve, so both
@@ -955,7 +955,7 @@ esac
         let mut benchmark = Benchmark::prepare(cli, lifetime).await.expect("prepare");
         benchmark.output = scratch.path().join("capacity");
         std::fs::create_dir_all(&benchmark.output).expect("output directory");
-        let replica = LocalServer::start(&server, &[], &[], Envelope::POD)
+        let replica = LocalServer::start(&server, &[], &[], Placement::Scoped(Envelope::POD))
             .await
             .expect("the stand-in serves");
         benchmark.deployment = Some(super::Deployment {

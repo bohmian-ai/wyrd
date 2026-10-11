@@ -408,7 +408,7 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
     .await
     .expect("the dedicated worker durably claims the seeded task");
 
-    let storage = Arc::clone(
+    let storage = Arc::downgrade(
         worker
             .state()
             .bifrost_storage()
@@ -425,10 +425,9 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
     worker.shutdown().await?;
     release.await?;
 
-    assert_eq!(
-        storage.inspect().lifecycle,
-        vala_bifrost_redux::storage::StorageLifecycle::Closed,
-        "ordinary shutdown settles storage after the dedicated worker joined"
+    assert!(
+        storage.upgrade().is_none(),
+        "ordinary shutdown releases storage after the dedicated worker joined"
     );
     let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
         .bind(task_id)
@@ -451,9 +450,9 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
 ///
 /// No serve task exists to drain Bifrost, so `WyrdTestServer::shutdown`
 /// cancels the shared shutdown token and settles Bifrost before the Postgres
-/// fixture is dropped. Storage is the last owner that settlement closes, after
-/// the Oracle, so a closed storage owner proves the Oracle reader epoch no
-/// longer outlives the database.
+/// fixture is dropped. The shared storage owner drops only once its last role
+/// does, so a released storage owner proves the Oracle reader epoch no longer
+/// outlives the database.
 ///
 /// # Errors
 ///
@@ -461,13 +460,13 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
 ///
 /// # Panics
 ///
-/// Panics when the token is left uncancelled or storage is left open.
+/// Panics when the token is left uncancelled or storage is still retained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn router_only_shutdown_settles_bifrost_before_fixture_release()
 -> Result<(), super::query::ServerJourneyError> {
     let server = wyrd_testing::WyrdTestServer::start_in_process().await?;
-    let storage = Arc::clone(
+    let storage = Arc::downgrade(
         server
             .state()
             .bifrost_storage()
@@ -479,9 +478,8 @@ async fn router_only_shutdown_settles_bifrost_before_fixture_release()
         cancelled.is_cancelled(),
         "shutdown cancels the shared token"
     );
-    assert_eq!(
-        storage.inspect().lifecycle,
-        vala_bifrost_redux::storage::StorageLifecycle::Closed,
+    assert!(
+        storage.upgrade().is_none(),
         "router-only shutdown settles Bifrost before the fixture is released"
     );
     Ok(())
@@ -557,7 +555,7 @@ async fn unready_roles_heartbeat_until_teardown_ends_membership_tasks()
 
     let server = wyrd_testing::WyrdTestServer::start_in_process().await?;
     let bifrost = Arc::clone(&server.state().bifrost);
-    bifrost.abort().await;
+    bifrost.abort();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while !bifrost.membership_tasks_finished_for_test() {
             tokio::task::yield_now().await;

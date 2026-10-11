@@ -3599,7 +3599,7 @@ mod tests {
             body: &[u8],
             _now: DateTime<Utc>,
         ) -> Result<AuthorizedStage, super::super::peer::PeerSecurityError> {
-            let claims = <super::super::peer::StageTicketClaims as prost::Message>::decode(
+            let claims = <super::super::peer::StageTicketClaims as wyrd_tonic::prost::Message>::decode(
                 context.claims_bytes.as_slice(),
             )
             .map_err(|_| super::super::peer::PeerSecurityError::Claims)?;

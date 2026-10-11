@@ -170,7 +170,7 @@ impl EvidenceInvestigation {
                 input: &input,
             };
             let payload =
-                ResultPayloadBuilder::new(run, uid, result_id, now, now, now).build(&report)?;
+                ResultPayloadBuilder::new(run, uid, result_id, now, now).build(&report)?;
             self.server.state().scribe_outbox.stage(
                 self.server.data_tenant_id(),
                 ScribeWrite::Result {

@@ -17,7 +17,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use bytes::Bytes;
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CompactionRegistration, TableRef};
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};

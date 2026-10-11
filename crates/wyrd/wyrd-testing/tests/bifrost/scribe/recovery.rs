@@ -54,6 +54,7 @@ async fn read_documents(client: &wyrd_client::WyrdClient, table: &str) -> Vec<(i
         .query(&wyrd_spec::vala::api::BifrostQueryRequest {
             sql: sql.clone(),
             deadline_ms: Some(120_000),
+            params: Vec::new(),
         })
         .await
         .unwrap_or_else(|error| panic!("public query `{sql}` starts: {error}"));
@@ -161,7 +162,6 @@ async fn variant_staging_restores_and_publishes_once() {
             ],
             tenant,
             physical_layout: None,
-            audit: None,
         })
         .await
         .expect("the catalog registers the Variant table");

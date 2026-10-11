@@ -370,13 +370,6 @@ mod tests {
             (BifrostError::RunningQueryNotFound, 404),
             (BifrostError::RunningQueryConflict, 409),
             (BifrostError::RunningQueryControlUnavailable, 503),
-            (BifrostError::QueryAuditUnavailable, 503),
-            (
-                BifrostError::AuditUnavailable {
-                    detail: "outbox down".to_owned(),
-                },
-                500,
-            ),
         ] {
             let sent = WyrdError::from(sent);
             let received = from_problem_json(&sent.as_problem_json());

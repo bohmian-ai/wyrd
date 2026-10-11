@@ -834,7 +834,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use arrow::array::{Array, AsArray};
-    use arrow::datatypes::{Float64Type, Int32Type, Int64Type};
+    use arrow::datatypes::{Float64Type, Int32Type, Int64Type, TimestampMicrosecondType};
     use chrono::TimeZone;
     use vala_drift::FeatureDriftReport;
     use wyrd_spec::card::drift::DriftMethod;
@@ -955,6 +955,7 @@ mod tests {
                 None,
                 drift_report(None).expect("null report builds"),
                 eval_summary(None),
+                assertion_result(None).expect("null assertion result builds"),
             )
             .expect("summary columns author")
     }

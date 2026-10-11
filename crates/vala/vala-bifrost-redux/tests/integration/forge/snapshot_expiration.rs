@@ -16,13 +16,10 @@ use iceberg::spec::{ManifestContentType, Operation};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
-use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
 use vala_bifrost_redux::forge::{
     ForgeCompactionOutcome, ForgeError, ForgeHeldTerm, ForgeTableKey, ForgeTableSettings,
     ForgeWorker, ForgeWorkerConfig,
 };
-use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_sql::queries::oracle_reader_authority::ActiveReadOwner;
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use wyrd_spec::DataTenantId;
 
@@ -1432,47 +1429,6 @@ enum UnknownExpiryOutcome {
     Rejected,
 }
 
-/// Acquires and releases one production Oracle cut, returning its pointer.
-///
-/// # Errors
-///
-/// Returns the catalog error of a refused acquisition unchanged, so a scenario
-/// can assert its public mapping.
-///
-/// # Panics
-///
-/// Panics when an hour-long deadline is already exhausted, the acquisition
-/// returns no table, or the release fails.
-async fn cut_pointer(
-    fixture: &PromotionIntegrationFixture,
-    tenant: DataTenantId,
-    table: &TableRef,
-) -> Result<String, BifrostCatalogError> {
-    let query_id = Uuid::now_v7();
-    let cut = fixture
-        .catalog
-        .acquire_active_cut(
-            tenant,
-            ActiveReadOwner {
-                query_id,
-                node_id: Uuid::now_v7(),
-                fencing_token: 1,
-            },
-            std::time::Instant::now() + std::time::Duration::from_hours(1),
-            std::slice::from_ref(table),
-        )
-        .await?
-        .expect("an hour remains before the deadline")
-        .pop()
-        .expect("one acquired table");
-    fixture
-        .catalog
-        .release_active_reads(tenant, query_id)
-        .await
-        .expect("the probe read releases");
-    Ok(cut.metadata_location)
-}
-
 /// Reads the fixture table's current catalog pointer from the real catalog.
 ///
 /// # Panics
@@ -1488,46 +1444,6 @@ async fn catalog_pointer(fixture: &PromotionIntegrationFixture) -> String {
         .metadata_location()
         .expect("a committed table has a metadata location")
         .to_owned()
-}
-
-/// Proves unresolved claims bar cuts of their own table and nothing else.
-///
-/// The claimed table's cut fails with the stable visibility-unavailable error
-/// and records no active read, while the same tenant's `ordinary` table and
-/// `other_tenant`'s same-named table both acquire.
-///
-/// # Panics
-///
-/// Panics when the claimed table acquires or maps to another error, a refused
-/// cut leaves an active read, or either unrelated table is refused.
-async fn assert_only_claimed_table_barred(
-    fixture: &PromotionIntegrationFixture,
-    barred: &TableRef,
-    ordinary: &TableRef,
-    other_tenant: DataTenantId,
-) {
-    let refused = cut_pointer(fixture, fixture.tenant, barred)
-        .await
-        .expect_err("an unresolved expiration refuses the cut");
-    assert!(
-        matches!(refused, BifrostCatalogError::UnresolvedExpiry(_)),
-        "the refusal names the unresolved expiration: {refused:?}"
-    );
-    assert_eq!(
-        refused.into_public().code(),
-        "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE"
-    );
-    let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.oracle_active_table_reads")
-        .fetch_one(fixture.operator_pool.pool())
-        .await
-        .expect("active read count");
-    assert_eq!(recorded, 0, "a refused cut records no active read");
-    cut_pointer(fixture, fixture.tenant, ordinary)
-        .await
-        .expect("the same tenant's ordinary table still acquires");
-    cut_pointer(fixture, other_tenant, barred)
-        .await
-        .expect("another tenant's same-named table still acquires");
 }
 
 /// Lapses the preparing worker's lease and reconciles the task as a new owner
@@ -1575,25 +1491,23 @@ async fn take_over_and_reconcile(
         .expect("reconciliation settles the prepared task");
 }
 
-/// Proves an unknown expiration outcome bars cuts of only its own table until
-/// reconciliation establishes the stable pointer.
+/// Proves an unknown expiration outcome retains its durable uncertainty
+/// evidence under the lease bound until takeover reconciliation settles it.
 ///
 /// A short-lease Forge leaves one expiration's acceptance unknown, either cut
 /// off by the lease bound after the catalog accepted it or by the commit
 /// timeout before the parked commit landed. The prepared claims survive and
-/// the table authority is free, yet a cut of that table fails with the stable
-/// visibility-unavailable error and records no active read. The same tenant's
-/// ordinary table and another tenant's same-named table still acquire. Once
-/// the preparing worker's lease lapses, takeover reconciliation settles the
-/// claims and the next cut returns the pointer the catalog now holds.
+/// the table authority is free. New cuts are not barred meanwhile: source
+/// cuts stay non-blocking during expiry. Once the preparing worker's lease
+/// lapses, takeover reconciliation settles the claims and the catalog holds
+/// a pointer carrying the expiration.
 ///
 /// # Panics
 ///
-/// Panics when the pass does not end as a retained reconciliation, a cut of
-/// the barred table succeeds or maps to another error, an unrelated table is
-/// refused, reconciliation does not settle the claims, or the later cut does
-/// not observe the catalog's established pointer.
-async fn unknown_expiry_outcome_bars_cuts_until_reconciled(outcome: UnknownExpiryOutcome) {
+/// Panics when the pass does not end as a retained reconciliation,
+/// reconciliation does not settle the claims, or the established pointer
+/// does not carry the expiration.
+async fn unknown_expiry_outcome_is_reconciled(outcome: UnknownExpiryOutcome) {
     let _telemetry = ForgeTelemetryCheckpoint::install();
     let name = match outcome {
         UnknownExpiryOutcome::Accepted => "expiry_unknown_accepted",
@@ -1616,16 +1530,7 @@ async fn unknown_expiry_outcome_bars_cuts_until_reconciled(outcome: UnknownExpir
         vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(Uuid::now_v7()),
     );
     let fixture = &table.fixture;
-    let barred = fixture.binding.table_ref.clone();
-    let ordinary = TableRef::new(BifrostNamespace::Bifrost, "ordinary");
-    fixture.register_and_seal_table("ordinary", 0).await;
-    let other_tenant = fixture.seed_tenant(&format!("{name}-other")).await;
-    fixture
-        .register_and_seal_table_for(other_tenant, &barred.name, 0)
-        .await;
-    let replaced = cut_pointer(fixture, fixture.tenant, &barred)
-        .await
-        .expect("an unclaimed table acquires");
+    let replaced = catalog_pointer(fixture).await;
     let snapshots_before = retained_snapshots(fixture).await;
 
     let (attempt, preparing_worker) = (Uuid::now_v7(), Uuid::now_v7());
@@ -1674,7 +1579,6 @@ async fn unknown_expiry_outcome_bars_cuts_until_reconciled(outcome: UnknownExpir
     }
     assert_uncertain_preparation_retained(fixture, task, attempt, preparing_worker).await;
 
-    assert_only_claimed_table_barred(fixture, &barred, &ordinary, other_tenant).await;
     take_over_and_reconcile(&table, &forge, outcome, task, attempt).await;
     let fixture = &table.fixture;
     let settled = expiry_state(fixture, task).await;
@@ -1684,41 +1588,37 @@ async fn unknown_expiry_outcome_bars_cuts_until_reconciled(outcome: UnknownExpir
         retained_snapshots(fixture).await < snapshots_before,
         "the established pointer carries the expiration"
     );
-    let established = cut_pointer(fixture, fixture.tenant, &barred)
-        .await
-        .expect("a reconciled table acquires");
-    assert_ne!(established, replaced);
-    assert_eq!(
-        established,
+    assert_ne!(
         catalog_pointer(fixture).await,
-        "the cut names the pointer reconciliation established"
+        replaced,
+        "reconciliation established a new pointer"
     );
     table.supervised.shutdown().await;
 }
 
-/// Proves an accepted expiration cut off at the lease bound bars cuts until
-/// reconciliation recovers it.
+/// Proves an accepted expiration cut off at the lease bound is retained as
+/// uncertain until reconciliation recovers it.
 ///
 /// # Panics
 ///
-/// Panics when [`unknown_expiry_outcome_bars_cuts_until_reconciled`] does.
+/// Panics when [`unknown_expiry_outcome_is_reconciled`] does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn accepted_expiry_past_the_lease_bound_bars_cuts_until_reconciled() {
-    Box::pin(unknown_expiry_outcome_bars_cuts_until_reconciled(
+async fn accepted_expiry_past_the_lease_bound_is_reconciled() {
+    Box::pin(unknown_expiry_outcome_is_reconciled(
         UnknownExpiryOutcome::Accepted,
     ))
     .await;
 }
 
-/// Proves an unlanded expiration of unknown outcome bars cuts until
-/// reconciliation commits it.
+/// Proves an unlanded expiration of unknown outcome is retained as uncertain
+/// until reconciliation commits it.
 ///
 /// # Panics
 ///
-/// Panics when [`unknown_expiry_outcome_bars_cuts_until_reconciled`] does.
+/// Panics when [`unknown_expiry_outcome_is_reconciled`] does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rejected_expiry_of_unknown_outcome_bars_cuts_until_reconciled() {
-    Box::pin(unknown_expiry_outcome_bars_cuts_until_reconciled(
+async fn rejected_expiry_of_unknown_outcome_is_reconciled() {
+    Box::pin(unknown_expiry_outcome_is_reconciled(
         UnknownExpiryOutcome::Rejected,
     ))
     .await;

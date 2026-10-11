@@ -738,19 +738,38 @@ impl OracleAdmission {
     }
 
     /// Closes admission, cancels queued work, and reports residual local state by a deadline.
+    ///
+    /// Waits until no query is active and no Oracle query memory is held, or
+    /// the deadline passes. Memory is awaited separately because a query's
+    /// slot returns before its torn-down child tasks drop their reservations.
+    /// Both wakeups are enabled before each check so neither is lost. Bytes
+    /// other roles hold in the shared pool are theirs to drain and never
+    /// delay or appear in this report.
     pub(crate) async fn shutdown(&self, deadline: Instant) -> OracleShutdownReport {
         self.close();
         loop {
-            let done = self
+            let admitted = self.shared.notify.notified();
+            let released = self.shared.resources.shared_memory_released();
+            tokio::pin!(admitted, released);
+            admitted.as_mut().enable();
+            released.as_mut().enable();
+            let idle = self
                 .shared
                 .state
                 .lock()
                 .map_or(true, |state| state.active_queries == 0);
+            let done = idle && self.oracle_memory_reserved() == 0;
             if done || Instant::now() >= deadline {
                 break;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let _ = tokio::time::timeout(remaining, self.shared.notify.notified()).await;
+            let _ = tokio::time::timeout(remaining, async {
+                tokio::select! {
+                    () = admitted => {}
+                    () = released => {}
+                }
+            })
+            .await;
         }
         let state = self
             .shared
@@ -760,10 +779,27 @@ impl OracleAdmission {
         OracleShutdownReport {
             active_queries: state.active_queries,
             queued_queries: u64::from(state.queued),
-            reserved_memory_bytes: u64::try_from(self.shared.resources.shared_memory_reserved())
-                .unwrap_or(u64::MAX),
+            reserved_memory_bytes: u64::try_from(self.oracle_memory_reserved()).unwrap_or(u64::MAX),
             peer_running: self.shared.resources.live_slot_units(),
         }
+    }
+
+    /// Returns the query-memory bytes Oracle executions hold in the shared pool.
+    ///
+    /// Sums the governor's Oracle query attribution and the Oracle share of
+    /// infallible headroom, both of which every Oracle pool view charges on
+    /// growth and returns on shrink, so Forge, Scribe ingest, and transport
+    /// bytes on the same pod are excluded. An untrustworthy
+    /// (poisoned) ledger reads as fully held so shutdown never reports clean.
+    fn oracle_memory_reserved(&self) -> usize {
+        self.shared
+            .resources
+            .snapshot()
+            .map_or(usize::MAX, |snapshot| {
+                snapshot
+                    .oracle_query_memory_used_bytes
+                    .saturating_add(snapshot.oracle_infallible_headroom_bytes)
+            })
     }
 
     /// Captures current local admission and peer reservations without waiting.
@@ -1362,43 +1398,6 @@ impl AdmittedQueryGuard {
         }
     }
 
-    /// Waits, bounded, for every task-owned child of this failed query's
-    /// envelope to drop before admission is released.
-    ///
-    /// Dropping a failed plan aborts its spawned `DataFusion` partition tasks,
-    /// but the runtime drops an aborted task — and the memory
-    /// reservation it holds — only on a later poll. Releasing the envelope in
-    /// that window would poison the process governor for a teardown that is
-    /// merely in progress. This first returns the reservations the guard itself
-    /// retains, exactly as [`Self::release`] would, then polls the envelope on
-    /// the same bounded schedule a follower graph drains on. A child still
-    /// alive after the wait is a real leak, and the following release poisons
-    /// as before.
-    pub(super) async fn drain_children(&mut self) {
-        self.live_reservations.clear();
-        self.physical_projections.clear();
-        for _ in 0..super::analytical::GRAPH_DRAIN_POLLS {
-            if self.children_idle() {
-                return;
-            }
-            tokio::time::sleep(super::analytical::GRAPH_DRAIN_INTERVAL).await;
-        }
-        tracing::warn!(
-            query_id = ?self.query_id,
-            "Oracle query children did not drain before admission release"
-        );
-    }
-
-    /// Reports whether the admitted envelope has no live nested child.
-    ///
-    /// A released, moved, or poisoned envelope reports idle so the caller
-    /// proceeds to release, which owns reporting those states.
-    fn children_idle(&self) -> bool {
-        self.resources
-            .as_ref()
-            .is_none_or(crate::resources::OracleQueryResources::nested_idle)
-    }
-
     /// Takes the Analytical ownership so the stream can settle it.
     ///
     /// Taking rather than borrowing is deliberate: settlement consumes the two
@@ -1778,8 +1777,17 @@ pub(in crate::oracle) mod tests {
         super::admission_owner_for_test(config, resources)
     }
 
+    /// Starts an available admission owner over Oracle-only test resources.
     fn owner(config: OracleAdmissionConfig) -> Arc<OracleAdmission> {
-        let role = RegisteredRole {
+        Arc::new(
+            OracleAdmission::with_config(oracle_role(), true, config, test_resources())
+                .expect("the test admission owner starts"),
+        )
+    }
+
+    /// The registered single-slot Oracle role every test admission owner runs as.
+    fn oracle_role() -> RegisteredRole {
+        RegisteredRole {
             key: ClusterNodeKey {
                 node_id: NodeId::new(uuid::Uuid::now_v7()),
                 role: ClusterRole::Oracle,
@@ -1796,11 +1804,7 @@ pub(in crate::oracle) mod tests {
                 supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
                 max_workers_per_query: 1,
             }),
-        };
-        Arc::new(
-            OracleAdmission::with_config(role, true, config, test_resources())
-                .expect("the test admission owner starts"),
-        )
+        }
     }
 
     /// Creates an immutable live Oracle snapshot for owner refresh tests.
@@ -2562,6 +2566,159 @@ pub(in crate::oracle) mod tests {
             .await;
         assert_eq!(clean.active_queries, 0);
         assert_eq!(clean.queued_queries, 0);
+    }
+
+    /// Oracle shutdown ignores another role's live pool bytes but waits for,
+    /// and reports, a torn-down Oracle child reservation that outlives its slot.
+    ///
+    /// # Panics
+    /// Panics when shutdown waits on Forge bytes, reports clean while the
+    /// Oracle child still holds bytes, or misses the child's late release.
+    #[tokio::test]
+    async fn oracle_shutdown_drains_only_oracle_memory() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let runtime = crate::resources::BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [
+                crate::resources::BifrostRole::Oracle,
+                crate::resources::BifrostRole::Forge,
+            ],
+        );
+        let owner = Arc::new(
+            OracleAdmission::with_config(
+                oracle_role(),
+                true,
+                OracleAdmissionConfig::default(),
+                runtime.oracle().expect("Oracle capability"),
+            )
+            .expect("the test admission owner starts"),
+        );
+        let forge = MemoryConsumer::new("forge-rewrite").register(
+            &runtime
+                .forge()
+                .expect("Forge capability")
+                .rewrite_memory_pool(),
+        );
+        forge.try_grow(1024 * 1024).expect("Forge bytes reserve");
+        let admitted = owner
+            .admit(PreparedAdmission {
+                tenant: DataTenantId::new_v7(),
+                query_class: QueryClass::Interactive,
+                target_partitions: 8,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("query admission");
+        let child = MemoryConsumer::new("oracle-child").register(
+            admitted
+                .execution()
+                .expect("admitted query execution")
+                .memory_pool(),
+        );
+        child.try_grow(4096).expect("Oracle child bytes reserve");
+        drop(admitted);
+
+        let residual = owner.shutdown(Instant::now()).await;
+        assert_eq!(residual.active_queries, 0);
+        assert_eq!(residual.reserved_memory_bytes, 4096);
+
+        let late = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            drop(child);
+        });
+        let clean = owner
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await;
+        late.await.expect("child release task");
+        assert_eq!(clean.reserved_memory_bytes, 0);
+        assert!(
+            forge.size() > 0,
+            "Forge bytes stay live through Oracle drain"
+        );
+    }
+
+    /// Oracle shutdown waits for, and reports, a torn-down Oracle child that
+    /// holds only infallible headroom after its slot returns, while Forge
+    /// bytes that fill the governed root never delay the drain.
+    ///
+    /// # Panics
+    /// Panics when the child's growth is governed rather than headroom, when
+    /// shutdown reports clean while the child holds headroom, or when the
+    /// late release does not finish the drain while Forge bytes stay live.
+    #[tokio::test]
+    async fn oracle_shutdown_drains_oracle_infallible_headroom() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+
+        let runtime = crate::resources::BifrostRuntimeResources::composed_for_test(
+            64 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [
+                crate::resources::BifrostRole::Oracle,
+                crate::resources::BifrostRole::Forge,
+            ],
+        );
+        let oracle = runtime.oracle().expect("Oracle capability");
+        let owner = Arc::new(
+            OracleAdmission::with_config(
+                oracle_role(),
+                true,
+                OracleAdmissionConfig::default(),
+                oracle.clone(),
+            )
+            .expect("the test admission owner starts"),
+        );
+        let admitted = owner
+            .admit(PreparedAdmission {
+                tenant: DataTenantId::new_v7(),
+                query_class: QueryClass::Interactive,
+                target_partitions: 8,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancellation: CancellationToken::new(),
+            })
+            .await
+            .expect("query admission");
+        let before = oracle.snapshot().expect("admitted snapshot");
+        let forge = MemoryConsumer::new("forge-rewrite").register(
+            &runtime
+                .forge()
+                .expect("Forge capability")
+                .rewrite_memory_pool(),
+        );
+        forge
+            .try_grow(before.plan.managed_memory_bytes - before.governed_memory_used_bytes)
+            .expect("Forge fills the governed root");
+        let child = MemoryConsumer::new("oracle-child").register(
+            admitted
+                .execution()
+                .expect("admitted query execution")
+                .memory_pool(),
+        );
+        child.grow(4096);
+        let grown = oracle.snapshot().expect("headroom snapshot");
+        assert_eq!(grown.oracle_query_memory_used_bytes, 0);
+        assert_eq!(grown.oracle_infallible_headroom_bytes, 4096);
+        drop(admitted);
+
+        let residual = owner.shutdown(Instant::now()).await;
+        assert_eq!(residual.active_queries, 0);
+        assert_eq!(residual.reserved_memory_bytes, 4096);
+
+        let late = tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            drop(child);
+        });
+        let clean = owner
+            .shutdown(Instant::now() + Duration::from_secs(5))
+            .await;
+        late.await.expect("child release task");
+        assert_eq!(clean.reserved_memory_bytes, 0);
+        assert!(
+            forge.size() > 0,
+            "Forge bytes stay live through Oracle drain"
+        );
     }
 
     /// One grant pass is fair and work-conserving.

@@ -3656,7 +3656,7 @@ async fn settle_attempt_output(
         mut batches,
         scan_stats,
         degraded_sources,
-        mut admitted,
+        admitted,
         running_query,
         query_class,
     } = output;
@@ -3698,7 +3698,6 @@ async fn settle_attempt_output(
         admitted.cancellation.cancel();
         drop(batches);
         admitted.distributed_settlement.join().await;
-        admitted.drain_children().await;
         return release_error(
             deadline,
             admitted,
@@ -3943,7 +3942,7 @@ async fn release_error<T>(
 async fn settle_distributed_failure<T>(
     deadline: Instant,
     batches: SendableRecordBatchStream,
-    mut admitted: AdmittedQueryGuard,
+    admitted: AdmittedQueryGuard,
     original: BifrostError,
     phase: &'static str,
 ) -> Result<T, BifrostError> {
@@ -3951,7 +3950,6 @@ async fn settle_distributed_failure<T>(
     admitted.request_cancellation.cancel();
     drop(batches);
     admitted.distributed_settlement.join().await;
-    admitted.drain_children().await;
     release_error(deadline, admitted, original, phase).await
 }
 

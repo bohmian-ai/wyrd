@@ -180,10 +180,12 @@ struct AnalyticalAttemptSlot {
 /// between them, so releasing the graph is the single act that returns it.
 struct AnalyticalGraphState {
     /// The admitted query envelope every attempt of this graph splits from.
-    resources: OracleQueryResources,
+    ///
+    /// Held only to be dropped: removing the graph returns the envelope.
+    _resources: OracleQueryResources,
     /// The query's admission permit, held for exactly as long as the graph is.
     ///
-    /// Declared after `resources` on purpose: removing the graph drops the
+    /// Declared after `_resources` on purpose: removing the graph drops the
     /// envelope first and the permit second, so admission counters never wake a
     /// queued waiter while this query's envelope is still charged. A graph that
     /// is retained as `Draining` therefore keeps both, which is what makes a
@@ -471,7 +473,7 @@ impl AnalyticalSupervisor {
         graphs.insert(
             graph,
             AnalyticalGraphEntry::Active(AnalyticalGraphState {
-                resources,
+                _resources: resources,
                 retained_admission: None,
                 running_query: None,
                 runtime,
@@ -506,51 +508,6 @@ impl AnalyticalSupervisor {
     ) -> Result<Option<CancellationToken>, BifrostError> {
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
         Ok(graphs.get(&graph).map(|entry| entry.state().cancel.clone()))
-    }
-
-    /// Reports whether one registered graph's envelope has no nested child left.
-    ///
-    /// An unregistered graph is idle by definition: there is no envelope left to
-    /// outlive. Callers use this to wait out a teardown they cannot observe
-    /// directly before releasing the graph, so a poison still means a leak.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
-    pub fn graph_children_idle(&self, graph: AnalyticalGraphKey) -> Result<bool, BifrostError> {
-        Ok(self.graph_children_debt(graph)? == 0)
-    }
-
-    /// Reports what one registered graph's envelope still owes its children.
-    ///
-    /// Returns the query-pool memory bytes a nested child still holds. An
-    /// unregistered graph owes nothing. This is what makes a drain timeout name
-    /// what stayed rather than only its existence.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
-    pub fn graph_children_debt(&self, graph: AnalyticalGraphKey) -> Result<usize, BifrostError> {
-        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        Ok(graphs
-            .get(&graph)
-            .map_or(0, |entry| entry.state().resources.nested_memory_bytes()))
-    }
-
-    /// Names the nested children one registered graph's envelope still holds.
-    ///
-    /// Paired with [`Self::graph_children_debt`] in a drain timeout, so the
-    /// warning says what stayed and not only how much. An unregistered graph
-    /// holds nothing.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
-    pub fn graph_children(&self, graph: AnalyticalGraphKey) -> Result<Vec<String>, BifrostError> {
-        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        Ok(graphs.get(&graph).map_or_else(Vec::new, |entry| {
-            entry.state().resources.nested_memory_consumers()
-        }))
     }
 
     /// Returns the number of registered graphs, for terminal-cleanup evidence.
@@ -858,11 +815,9 @@ impl AnalyticalSupervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when an attempt of the graph or a
-    /// nested child of its envelope is still live — releasing the envelope
-    /// beneath either would poison the resource root — or when a lock is
-    /// poisoned. Returns [`BifrostError::QueryExecutionFailed`] when the graph
-    /// is not registered.
+    /// Returns [`BifrostError::Internal`] when an attempt of the graph is
+    /// still live or when a lock is poisoned. Returns
+    /// [`BifrostError::QueryExecutionFailed`] when the graph is not registered.
     pub(super) fn release_graph(
         &self,
         graph: AnalyticalGraphKey,
@@ -874,16 +829,6 @@ impl AnalyticalSupervisor {
                     detail: "Oracle analytical graph still owns a live attempt".to_owned(),
                 });
             }
-        }
-        // The envelope's own nested children outlive the attempts that made
-        // them: upstream drops a follower's stage plan after the coordinator
-        // channel ends, so a cache entry, exchange buffer, or spill write can
-        // still hold this envelope for a moment. Returning it now would report
-        // a live reservation back to the process governor and poison it.
-        if !self.graph_children_idle(graph)? {
-            return Err(BifrostError::Internal {
-                detail: "Oracle analytical graph still owns a live envelope child".to_owned(),
-            });
         }
         // The graph leaves the map, its runtime leaves the registry, and its
         // envelope and permit drop, all under the graph lock, so no observer of

@@ -20,7 +20,6 @@ use crate::scribe::execution_lanes::resolve_card_uids;
 use crate::tables::fields::{fixed_binary, ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// `vala.eval.observations` — one row per committed Eval input record.
 ///
@@ -61,7 +60,7 @@ impl DomainTable for ObservationsTable {
 
     /// Daily partitions sorted newest first; rows are read by record, not by a pruned key.
     fn physical_layout() -> PhysicalLayoutWire {
-        daily_layout(vec![sort_desc(WYRD_EVENT_TIME)], &[])
+        daily_layout("created_at", vec![sort_desc("created_at")], &[])
     }
 }
 
@@ -72,26 +71,25 @@ pub struct AcknowledgedObservation {
     pub record_id: String,
     /// Observed subject Scribe stamped as the row's managed `card_uid`.
     pub card_uid: CardUid,
-    /// Managed `wyrd_event_time` Scribe committed for the row.
-    pub event_time: DateTime<Utc>,
+    /// The row's `created_at`, the table's time column.
+    pub created_at: DateTime<Utc>,
 }
 
 impl ObservationsTable {
     /// Derive each acknowledged row's activation key from its admitted frame.
     ///
-    /// Re-derives exactly what Scribe stamped: the subject UID through the same
-    /// signed-scope resolution, and the caller's `wyrd_event_time` when present
-    /// or `receipt_micros` otherwise. Rows without a subject activate nothing
-    /// and are omitted.
+    /// Re-derives the subject UID Scribe stamped through the same signed-scope
+    /// resolution, and reads each row's `created_at`. Rows without a subject
+    /// activate nothing and are omitted.
     ///
     /// # Errors
     /// Returns [`ScribeError::InvalidFrame`] when the frame does not decode or
-    /// lacks a well-typed `record_id`, and [`ScribeError::CardUnresolved`] when
-    /// a subject reference no longer resolves.
+    /// lacks a well-typed `record_id` or `created_at`, and
+    /// [`ScribeError::CardUnresolved`] when a subject reference no longer
+    /// resolves.
     pub fn acknowledged(
         frame: &[u8],
         principal: &Principal,
-        receipt_micros: i64,
     ) -> Result<Vec<AcknowledgedObservation>, ScribeError> {
         let reader = StreamReader::try_new(Cursor::new(frame), None)
             .map_err(|_| ScribeError::InvalidFrame)?;
@@ -103,22 +101,16 @@ impl ObservationsTable {
                 .column_by_name("record_id")
                 .and_then(|column| column.as_any().downcast_ref::<StringArray>())
                 .ok_or(ScribeError::InvalidFrame)?;
-            let event_times = rows
-                .column_by_name(WYRD_EVENT_TIME)
-                .map(|column| {
-                    column
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .ok_or(ScribeError::InvalidFrame)
-                })
-                .transpose()?;
+            let created = rows
+                .column_by_name("created_at")
+                .and_then(|column| column.as_any().downcast_ref::<TimestampMicrosecondArray>())
+                .ok_or(ScribeError::InvalidFrame)?;
             for (row, card_uid) in card_uids.into_iter().enumerate() {
                 let Some(card_uid) = card_uid else { continue };
-                let micros = event_times.map_or(receipt_micros, |times| times.value(row));
                 keys.push(AcknowledgedObservation {
                     record_id: records.value(row).to_owned(),
                     card_uid: card_uid.parse().map_err(|_| ScribeError::CardUnresolved)?,
-                    event_time: DateTime::from_timestamp_micros(micros)
+                    created_at: DateTime::from_timestamp_micros(created.value(row))
                         .ok_or(ScribeError::InvalidFrame)?,
                 });
             }
@@ -133,7 +125,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::{ArrayRef, StringArray, TimestampMicrosecondArray};
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::datatypes::{Field, Schema};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use uuid::Uuid;
@@ -167,13 +159,13 @@ mod tests {
         bytes
     }
 
-    /// Keys mirror Scribe's stamping: the signed subject UID, the caller event
-    /// time when supplied, the receipt otherwise, and no key without a subject.
+    /// Keys carry the signed subject UID and the row's `created_at`, and a row
+    /// without a subject yields no key.
     ///
     /// # Panics
     /// Panics when a derived key differs from what Scribe commits.
     #[test]
-    fn acknowledged_keys_mirror_scribe_stamping() {
+    fn acknowledged_keys_carry_subject_and_created_at() {
         let uid = CardUid::new(Uuid::now_v7().to_string()).expect("card uid");
         let card = CardRef {
             uid: Some(uid.clone()),
@@ -190,45 +182,28 @@ mod tests {
             PermissionSet::new(),
         );
         let card_text = card.to_string();
-        let refs: ArrayRef = Arc::new(StringArray::from(vec![Some(card_text.as_str()), None]));
-        let records: ArrayRef = Arc::new(StringArray::from(vec!["r1", "r2"]));
-        let receipt = 1_700_000_000_000_000;
-
-        let stamped = ObservationsTable::acknowledged(
+        let created = 1_700_000_000_000_000;
+        let keys = ObservationsTable::acknowledged(
             &frame(vec![
-                ("record_id", Arc::clone(&records)),
-                ("card_ref", Arc::clone(&refs)),
+                ("record_id", Arc::new(StringArray::from(vec!["r1", "r2"]))),
+                (
+                    "card_ref",
+                    Arc::new(StringArray::from(vec![Some(card_text.as_str()), None])),
+                ),
+                (
+                    "created_at",
+                    Arc::new(
+                        TimestampMicrosecondArray::from(vec![created, created + 1])
+                            .with_timezone("+00:00"),
+                    ),
+                ),
             ]),
             &principal,
-            receipt,
         )
         .expect("frame decodes");
-        assert_eq!(
-            stamped.len(),
-            1,
-            "a row without a subject activates nothing"
-        );
-        assert_eq!(stamped[0].record_id, "r1");
-        assert_eq!(stamped[0].card_uid, uid);
-        assert_eq!(stamped[0].event_time.timestamp_micros(), receipt);
-
-        let caller: ArrayRef = Arc::new(
-            TimestampMicrosecondArray::from(vec![receipt - 5, receipt - 6]).with_timezone("UTC"),
-        );
-        assert_eq!(
-            caller.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-        );
-        let supplied = ObservationsTable::acknowledged(
-            &frame(vec![
-                ("record_id", records),
-                ("card_ref", refs),
-                ("wyrd_event_time", caller),
-            ]),
-            &principal,
-            receipt,
-        )
-        .expect("frame decodes");
-        assert_eq!(supplied[0].event_time.timestamp_micros(), receipt - 5);
+        assert_eq!(keys.len(), 1, "a row without a subject activates nothing");
+        assert_eq!(keys[0].record_id, "r1");
+        assert_eq!(keys[0].card_uid, uid);
+        assert_eq!(keys[0].created_at.timestamp_micros(), created);
     }
 }

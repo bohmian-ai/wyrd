@@ -350,7 +350,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
         status = 400,
         title = "Reserved system column name",
-        remediation = "Rename the column — run_id, card_uid, principal_id, wyrd_request_id, wyrd_event_time, and wyrd_ingested_at are reserved."
+        remediation = "Rename the column — run_id, card_uid, principal_id, wyrd_request_id, and wyrd_ingested_at are reserved."
     )]
     ReservedColumn {
         /// The reserved column name that was supplied.
@@ -819,31 +819,6 @@ pub enum BifrostError {
         detail: String,
     },
 
-    /// A caller-supplied `wyrd_event_time` value falls outside the server
-    /// acceptance window evaluated against per-batch receipt time.
-    ///
-    /// The entire batch is rejected pre-admission; no rows are written. Either
-    /// supply a `wyrd_event_time` within the configured window (default: 30 days
-    /// past to 24 hours future of server receipt time) or omit the column to let
-    /// the server stamp receipt time. The window cannot be overridden per-tenant.
-    #[error("event time out of acceptance window: {value} not in [{past_bound}, {future_bound}]")]
-    #[wyrd_error(
-        code = "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE",
-        status = 400,
-        title = "Event time outside acceptance window",
-        remediation = "Supply a wyrd_event_time within the server acceptance window \
-(default 30 days past to 24 hours future of server receipt time), or omit the \
-column to let the server stamp receipt time."
-    )]
-    EventTimeOutOfRange {
-        /// The offending `wyrd_event_time` value (epoch-microseconds rendered as a string).
-        value: String,
-        /// The inclusive past bound used for this batch (epoch-microseconds rendered as a string).
-        past_bound: String,
-        /// The inclusive future bound used for this batch (epoch-microseconds rendered as a string).
-        future_bound: String,
-    },
-
     /// A register request declared a physical layout Bifrost cannot canonicalize.
     ///
     /// The fault is reported before any SQL transaction, Iceberg call, or audit
@@ -854,7 +829,7 @@ column to let the server stamp receipt time."
         code = "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
         status = 400,
         title = "Invalid Bifrost physical layout",
-        remediation = "Declare hour or day granularity, at most four unique schema columns as sort keys, and supported sort/null values."
+        remediation = "Declare hour or day granularity, an optional non-null timestamp time column, at most four unique schema columns as sort keys, and supported sort/null values."
     )]
     InvalidPhysicalLayout {
         /// Canonical `<namespace>.<name>` of the table being registered.
@@ -957,6 +932,8 @@ pub enum PhysicalLayoutField {
     NullOrder,
     /// An entry of `bloom_columns`.
     BloomColumn,
+    /// The `time_column` the table partitions and sorts on.
+    TimeColumn,
 }
 
 /// Why the declaration named by [`PhysicalLayoutField`] was rejected.
@@ -986,9 +963,10 @@ mod tests {
     use super::*;
 
     /// Every declaration slot in the public layout contract, in declaration order.
-    const ALL_FIELDS: [PhysicalLayoutField; 6] = [
+    const ALL_FIELDS: [PhysicalLayoutField; 7] = [
         PhysicalLayoutField::Partition,
         PhysicalLayoutField::Granularity,
+        PhysicalLayoutField::TimeColumn,
         PhysicalLayoutField::SortKey,
         PhysicalLayoutField::SortDirection,
         PhysicalLayoutField::NullOrder,
@@ -1018,7 +996,7 @@ mod tests {
 
         for field in ALL_FIELDS {
             for violation in ALL_VIOLATIONS {
-                for column in [None, Some("wyrd_event_time".to_owned())] {
+                for column in [None, Some("start_time_unix_nano".to_owned())] {
                     let error = BifrostError::InvalidPhysicalLayout {
                         table: "obs.events".to_owned(),
                         field,

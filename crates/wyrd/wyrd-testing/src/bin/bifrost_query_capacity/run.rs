@@ -20,16 +20,19 @@ use tokio_util::sync::CancellationToken;
 use wyrd_client::bifrost::{BifrostClientError, TableConfig};
 use wyrd_client::{Bifrost, WyrdClient};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalOutcome};
+use wyrd_tonic::otlp::logs_service::logs_service_client::LogsServiceClient;
 use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
+use wyrd_tonic::prost::Message as _;
 use wyrd_tonic::tonic::Request;
 use wyrd_tonic::tonic::transport::Channel;
 
 use crate::Result;
+use crate::logs::{self, Logs};
 use crate::telemetry::{self, Telemetry};
 use crate::workload::{self, Case, Fixture, Rows};
 use wyrd_testing::capacity::driver_cpu_seconds;
 use wyrd_testing::profile::{Capture, Profile};
-use wyrd_testing::release_server::{LocalServer, MemoryPeak};
+use wyrd_testing::release_server::{LocalServer, MemoryPeak, Metrics};
 
 /// Untimed load before each window, so connection setup is not measured.
 const WARMUP: Duration = Duration::from_secs(2);
@@ -43,7 +46,7 @@ const PROFILE_HERTZ: u32 = 999;
 
 /// Oracle's per-query scan counters a window differences, so a step shows
 /// how much each query opened and pruned.
-const SCAN_COUNTERS: [&str; 8] = [
+pub const SCAN_COUNTERS: [&str; 8] = [
     "oracle_query_files_scanned_total",
     "oracle_query_partitions_scanned_total",
     "oracle_query_row_groups_scanned_total",
@@ -59,11 +62,19 @@ const SCAN_COUNTERS: [&str; 8] = [
 /// than sizing could rule out, but not this many fewer.
 const SIZING_DIVERGENCE: f64 = 4.0;
 
-/// Oracle's per-query profile counter of timed events, by `event` label.
-const PROFILE_TIMES: &str = "oracle_query_profile_nanoseconds_total";
+/// Oracle's per-query profile: its timed-event counter, by `event` label,
+/// and its count of emitted profiles, one per settled query.
+const QUERY_PROFILE: ProfileFamily = ProfileFamily {
+    nanoseconds: "oracle_query_profile_nanoseconds_total",
+    profiles: "oracle_query_profiles_total",
+};
 
-/// Profiles Oracle has emitted, one per settled query.
-const PROFILE_COUNT: &str = "oracle_query_profiles_total";
+/// Scribe's per-request write profile: its timed-event counter, by `event`
+/// label, and its count of emitted profiles, one per settled write request.
+const WRITE_PROFILE: ProfileFamily = ProfileFamily {
+    nanoseconds: "scribe_write_profile_nanoseconds_total",
+    profiles: "scribe_write_profiles_total",
+};
 
 /// Seconds every Vala runtime-pool acquisition waited, all callers summed.
 const POOL_WAIT: &str = "vala_postgres_pool_acquire_seconds_sum";
@@ -72,41 +83,15 @@ const POOL_WAIT: &str = "vala_postgres_pool_acquire_seconds_sum";
 const POOL_ACQUIRES: &str = "vala_postgres_pool_acquire_seconds_count";
 
 /// The server's write-path series a write step differences, keyed by the
-/// name its Pareto prints: per-batch seconds (`*_seconds_sum`), the ack count
-/// that divides them, and the rows, bytes, and fsyncs the window committed.
-const WRITE_SERIES: [(&str, &str, &[&str]); 11] = [
+/// name its Pareto prints: the Gate's request seconds, and the rows, bytes,
+/// and fsyncs the window committed. Per-step times come from
+/// [`WRITE_PROFILE`].
+const WRITE_SERIES: [(&str, &str, &[&str]); 4] = [
     (
-        "Gate.write_request",
+        GATE_WRITE,
         "bifrost_gate_request_duration_seconds_sum",
         &["operation=\"write\""],
     ),
-    ("Scribe.ack", "bifrost_scribe_ack_seconds_sum", &[]),
-    (
-        "Scribe.ingress_job",
-        "bifrost_scribe_lane_job_seconds_sum",
-        &["lane=\"ingress\""],
-    ),
-    (
-        "Scribe.wal_io_job",
-        "bifrost_scribe_lane_job_seconds_sum",
-        &["lane=\"wal_io\""],
-    ),
-    (
-        "Scribe.wal_append",
-        "bifrost_scribe_wal_append_seconds_sum",
-        &[],
-    ),
-    (
-        "Scribe.wal_fsync",
-        "bifrost_scribe_wal_fsync_seconds_sum",
-        &[],
-    ),
-    (
-        "Scribe.queue_wait",
-        "bifrost_scribe_queue_wait_seconds_sum",
-        &[],
-    ),
-    (ACKS, "bifrost_scribe_ack_seconds_count", &[]),
     (FSYNCS, "bifrost_scribe_wal_fsync_seconds_count", &[]),
     (
         MEMTABLE_BYTES,
@@ -120,8 +105,9 @@ const WRITE_SERIES: [(&str, &str, &[&str]); 11] = [
     ),
 ];
 
-/// [`WRITE_SERIES`] key of the durable acks, the per-batch divisor.
-const ACKS: &str = "acks";
+/// [`WRITE_SERIES`] key of the Gate's write-request seconds, the server
+/// side of each request the write profile divides.
+const GATE_WRITE: &str = "Gate.write_request";
 
 /// [`WRITE_SERIES`] key of the WAL fsyncs.
 const FSYNCS: &str = "fsyncs";
@@ -165,6 +151,9 @@ pub struct Measured {
     pub errors: BTreeMap<String, u64>,
     /// Rows acknowledged by a write step.
     pub rows: u64,
+    /// Encoded OTLP protobuf bytes of the acknowledged export requests, the
+    /// wire volume an OTLP ingest rate is quoted in; zero for native writes.
+    pub wire_bytes: u64,
     /// Server and driver usage over the window.
     pub usage: Usage,
 }
@@ -228,10 +217,10 @@ pub struct Usage {
     pub scanned_bytes: f64,
     /// New counts of each [`SCAN_COUNTERS`] entry, in its order.
     pub scan_counts: [f64; SCAN_COUNTERS.len()],
-    /// New nanoseconds of each Oracle query profile event.
-    pub profile_ns: BTreeMap<String, f64>,
-    /// New Oracle query profiles, the divisor of `profile_ns`.
-    pub profiles: f64,
+    /// New Oracle query profile events.
+    pub query_profile: ProfileDelta,
+    /// New Scribe write profile events.
+    pub write_profile: ProfileDelta,
     /// New seconds spent waiting for a Vala runtime-pool connection.
     pub pool_wait_seconds: f64,
     /// New Vala runtime-pool acquisitions.
@@ -244,6 +233,16 @@ pub struct Usage {
 }
 
 impl Usage {
+    /// This window's new count of the [`SCAN_COUNTERS`] entry `counter`, or
+    /// zero for a name that is not one.
+    #[must_use]
+    pub fn scanned(&self, counter: &str) -> f64 {
+        SCAN_COUNTERS
+            .iter()
+            .position(|name| *name == counter)
+            .map_or(0.0, |index| self.scan_counts[index])
+    }
+
     /// Returns why this window's scan sizing diverged from its scans, or
     /// `None` when it did not.
     ///
@@ -253,21 +252,76 @@ impl Usage {
     /// leaves the answer exact and only mis-sizes partitions, so the report
     /// flags it rather than failing the row.
     pub fn sizing_divergence(&self) -> Option<String> {
-        let count = |name: &str| {
-            SCAN_COUNTERS
-                .iter()
-                .position(|counter| *counter == name)
-                .map_or(0.0, |index| self.scan_counts[index])
-        };
-        let sized = count("oracle_query_row_groups_sized_total");
-        let scanned = count("oracle_query_row_groups_scanned_total");
-        let fallbacks = count("bifrost_scan_sizing_fallback_total");
+        let sized = self.scanned("oracle_query_row_groups_sized_total");
+        let scanned = self.scanned("oracle_query_row_groups_scanned_total");
+        let fallbacks = self.scanned("bifrost_scan_sizing_fallback_total");
         (fallbacks > 0.0 || sized > SIZING_DIVERGENCE * scanned.max(1.0)).then(|| {
             format!(
                 "sizing DIVERGENT: {sized:.0} row groups sized, {scanned:.0} scanned, \
                  {fallbacks:.0} fallbacks"
             )
         })
+    }
+}
+
+/// The two counters one server profile family is scraped from.
+#[derive(Debug, Clone, Copy)]
+struct ProfileFamily {
+    /// Nanoseconds counter, labelled by `event`.
+    nanoseconds: &'static str,
+    /// Emitted-profile counter, the divisor turning an event's nanoseconds
+    /// into its mean per profiled unit.
+    profiles: &'static str,
+}
+
+impl ProfileFamily {
+    /// This family's counters in one scrape.
+    fn read(self, metrics: &Metrics) -> ProfileDelta {
+        ProfileDelta {
+            nanoseconds: metrics.by_label(self.nanoseconds, "event"),
+            profiles: metrics.sum(self.profiles, &[]),
+        }
+    }
+}
+
+/// One profile family's event nanoseconds and profile count: totals in one
+/// scrape, or their growth over a window.
+#[derive(Debug, Default)]
+pub struct ProfileDelta {
+    /// Nanoseconds of each profile event.
+    nanoseconds: BTreeMap<String, f64>,
+    /// Profiles emitted.
+    pub profiles: f64,
+}
+
+impl ProfileDelta {
+    /// The growth from `start` to these totals.
+    fn since(self, start: &Self) -> Self {
+        Self {
+            nanoseconds: self
+                .nanoseconds
+                .into_iter()
+                .map(|(event, ns)| {
+                    let before = start.nanoseconds.get(&event).copied().unwrap_or(0.0);
+                    (event, ns - before)
+                })
+                .collect(),
+            profiles: self.profiles - start.profiles,
+        }
+    }
+
+    /// Mean milliseconds per profiled unit of each event that accrued time,
+    /// largest first.
+    fn pareto(&self) -> Vec<(String, f64)> {
+        let profiles = self.profiles.max(1.0);
+        let mut events: Vec<(String, f64)> = self
+            .nanoseconds
+            .iter()
+            .filter(|(_, ns)| **ns > 0.0)
+            .map(|(event, ns)| (event.clone(), ns / profiles / 1e6))
+            .collect();
+        events.sort_by(|left, right| right.1.total_cmp(&left.1));
+        events
     }
 }
 
@@ -285,10 +339,10 @@ struct Window {
     scanned_bytes: f64,
     /// Each [`SCAN_COUNTERS`] entry at start.
     scan_counts: [f64; SCAN_COUNTERS.len()],
-    /// Each Oracle query profile event's nanoseconds at start.
-    profile_ns: BTreeMap<String, f64>,
-    /// Oracle query profiles at start.
-    profiles: f64,
+    /// Oracle query profile events at start.
+    query_profile: ProfileDelta,
+    /// Scribe write profile events at start.
+    write_profile: ProfileDelta,
     /// [`POOL_WAIT`] at start.
     pool_wait_seconds: f64,
     /// [`POOL_ACQUIRES`] at start.
@@ -313,8 +367,8 @@ impl Window {
             peak: server.memory_peak()?,
             scanned_bytes: metrics.sum("oracle_query_bytes_scanned_total", &[]),
             scan_counts: SCAN_COUNTERS.map(|name| metrics.sum(name, &[])),
-            profile_ns: metrics.by_label(PROFILE_TIMES, "event"),
-            profiles: metrics.sum(PROFILE_COUNT, &[]),
+            query_profile: QUERY_PROFILE.read(&metrics),
+            write_profile: WRITE_PROFILE.read(&metrics),
             pool_wait_seconds: metrics.sum(POOL_WAIT, &[]),
             pool_acquires: metrics.sum(POOL_ACQUIRES, &[]),
             write: WRITE_SERIES
@@ -344,15 +398,8 @@ impl Window {
             scan_counts: std::array::from_fn(|index| {
                 metrics.sum(SCAN_COUNTERS[index], &[]) - self.scan_counts[index]
             }),
-            profile_ns: metrics
-                .by_label(PROFILE_TIMES, "event")
-                .into_iter()
-                .map(|(event, ns)| {
-                    let before = self.profile_ns.get(&event).copied().unwrap_or(0.0);
-                    (event, ns - before)
-                })
-                .collect(),
-            profiles: metrics.sum(PROFILE_COUNT, &[]) - self.profiles,
+            query_profile: QUERY_PROFILE.read(&metrics).since(&self.query_profile),
+            write_profile: WRITE_PROFILE.read(&metrics).since(&self.write_profile),
             pool_wait_seconds: metrics.sum(POOL_WAIT, &[]) - self.pool_wait_seconds,
             pool_acquires: metrics.sum(POOL_ACQUIRES, &[]) - self.pool_acquires,
             write: WRITE_SERIES
@@ -480,54 +527,109 @@ impl<'a> Bench<'a> {
         .await
     }
 
-    /// Exports `spans` of the telemetry fixture through the server's OTLP
-    /// gRPC collector with the client's exchanged bearer, `writers` exporters at a time, in
-    /// [`telemetry::REQUEST_SPANS`]-span requests, as an application's
-    /// OpenTelemetry SDK batch exporters would.
+    /// Exports rows `rows` of `signal`'s fixture through the server's OTLP
+    /// gRPC collector with the client's exchanged bearer, `writers`
+    /// exporters at a time, in [`Signal::request_rows`]-row requests, as an
+    /// application's OpenTelemetry SDK batch exporters would.
     ///
     /// Each export resolves at the durable acknowledgement, so the rate is
-    /// the durable span rate. A rejected export is counted by its gRPC code,
-    /// and a partial success that drops spans as `partial-success`.
+    /// the durable row rate, and the encoded size of each acknowledged
+    /// request adds to [`Measured::wire_bytes`]. A rejected export is counted
+    /// by its gRPC code, and a partial success that drops rows as
+    /// `partial-success`.
     ///
     /// # Errors
     ///
     /// Returns the connection or evidence failure.
-    pub async fn export_spans(&self, fixture: Telemetry, writers: usize) -> Result<Measured> {
+    pub async fn export(
+        &self,
+        signal: Signal,
+        rows: std::ops::Range<i64>,
+        writers: usize,
+    ) -> Result<Measured> {
         let channel = Channel::from_shared(self.client.grpc_url().to_owned())?
             .connect()
             .await?;
-        let exporter = TraceServiceClient::new(channel);
         let auth = self.client.auth();
-        self.send_requests(
-            0..fixture.spans,
-            telemetry::REQUEST_SPANS,
-            writers,
-            CancellationToken::new(),
-            move |first, last| {
-                let (mut exporter, auth) = (exporter.clone(), Arc::clone(&auth));
-                async move {
-                    let bearer = auth.bearer().await.map_err(|_| "bearer".to_owned())?;
-                    let mut request = Request::new(fixture.request(first, last));
-                    request.metadata_mut().insert(
-                        "x-wyrd-access-token",
-                        format!("Bearer {}", bearer.expose())
-                            .parse()
-                            .map_err(|_| "bearer".to_owned())?,
-                    );
-                    let response = exporter
-                        .export(request)
-                        .await
-                        .map_err(|status| format!("{:?}", status.code()))?;
-                    match response.into_inner().partial_success {
-                        Some(partial) if partial.rejected_spans > 0 => {
-                            Err("partial-success".to_owned())
+        let wire_bytes = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&wire_bytes);
+        let mut measured = self
+            .send_requests(
+                rows,
+                signal.request_rows(),
+                writers,
+                CancellationToken::new(),
+                move |first, last| {
+                    let (channel, auth, counted) =
+                        (channel.clone(), Arc::clone(&auth), Arc::clone(&counted));
+                    async move {
+                        let bearer = auth.bearer().await.map_err(|_| "bearer".to_owned())?;
+                        let token = format!("Bearer {}", bearer.expose());
+                        let (encoded, rejected) = match signal {
+                            Signal::Spans(fixture) => {
+                                let body = fixture.request(first, last);
+                                let encoded = body.encoded_len();
+                                let response = TraceServiceClient::new(channel)
+                                    .export(authorized(body, &token)?)
+                                    .await
+                                    .map_err(|status| format!("{:?}", status.code()))?;
+                                let partial = response.into_inner().partial_success;
+                                (encoded, partial.map_or(0, |partial| partial.rejected_spans))
+                            }
+                            Signal::Logs(fixture) => {
+                                let body = fixture.request(first, last);
+                                let encoded = body.encoded_len();
+                                let response = LogsServiceClient::new(channel)
+                                    .export(authorized(body, &token)?)
+                                    .await
+                                    .map_err(|status| format!("{:?}", status.code()))?;
+                                let partial = response.into_inner().partial_success;
+                                (
+                                    encoded,
+                                    partial.map_or(0, |partial| partial.rejected_log_records),
+                                )
+                            }
+                        };
+                        if rejected > 0 {
+                            return Err("partial-success".to_owned());
                         }
-                        _ => Ok(()),
+                        counted.fetch_add(encoded as u64, Ordering::Relaxed);
+                        Ok(())
                     }
-                }
-            },
-        )
-        .await
+                },
+            )
+            .await?;
+        measured.wire_bytes = wire_bytes.load(Ordering::Relaxed);
+        Ok(measured)
+    }
+
+    /// Exports rows `rows` of `signal` from `writers` exporters, capturing
+    /// the window with `perf`.
+    ///
+    /// The OTLP counterpart of [`Self::write_step`]: it prints the same write
+    /// Pareto, with the OTLP wire rate beside the retained Arrow rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns connection, evidence, or capture failures.
+    pub async fn export_step(
+        &self,
+        signal: Signal,
+        rows: std::ops::Range<i64>,
+        writers: usize,
+    ) -> Result<Measured> {
+        let capture = self.capture(signal.name(), writers)?;
+        let measured = self.export(signal, rows, writers).await?;
+        let metadata = serde_json::json!({
+            "case": signal.name(),
+            "clients": writers,
+            "wire_bytes": measured.wire_bytes,
+            "write": measured.usage.write,
+            "profile_mean_ms": measured.usage.write_profile.pareto(),
+        });
+        let profile = capture.finish(&metadata)?;
+        report_write_pareto(&measured, &profile);
+        Ok(measured)
     }
 
     /// Sends `rows` in `chunk`-row requests from `writers` concurrent
@@ -610,6 +712,7 @@ impl<'a> Bench<'a> {
             "case": "write",
             "clients": writers,
             "write": measured.usage.write,
+            "profile_mean_ms": measured.usage.write_profile.pareto(),
         });
         let profile = capture.finish(&metadata)?;
         report_write_pareto(&measured, &profile);
@@ -683,7 +786,9 @@ impl<'a> Bench<'a> {
             .map(|(name, count)| (*name, count / queries))
             .collect();
         eprintln!("scan per query, {} x{clients}: {per_query:?}", case.name());
-        let latency = latency_pareto(&measured);
+        // Operator times sum across partitions, so an event may exceed wall
+        // time; the events are read beside the client latency, never summed.
+        let latency = measured.usage.query_profile.pareto();
         let metadata = serde_json::json!({
             "case": case.name(),
             "clients": clients,
@@ -968,24 +1073,6 @@ fn micros(sent: Instant) -> u64 {
     u64::try_from(sent.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-/// Mean milliseconds per query of each Oracle query profile event, largest
-/// first, from the window's counter deltas.
-///
-/// Operator times sum across partitions, so an event may exceed wall time;
-/// the events are read beside the client latency, never summed into it.
-fn latency_pareto(measured: &Measured) -> Vec<(String, f64)> {
-    let profiles = measured.usage.profiles.max(1.0);
-    let mut events: Vec<(String, f64)> = measured
-        .usage
-        .profile_ns
-        .iter()
-        .filter(|(_, ns)| **ns > 0.0)
-        .map(|(event, ns)| (event.clone(), ns / profiles / 1e6))
-        .collect();
-    events.sort_by(|left, right| right.1.total_cmp(&left.1));
-    events
-}
-
 /// Prints one window's latency and CPU Pareto tables, or why the CPU
 /// capture is not usable evidence.
 fn report_pareto(case: Case, measured: &Measured, latency: &[(String, f64)], profile: &Profile) {
@@ -997,7 +1084,7 @@ fn report_pareto(case: Case, measured: &Measured, latency: &[(String, f64)], pro
         case.name(),
         measured.clients,
         measured.percentile_ms(50.0).unwrap_or_default(),
-        measured.usage.profiles
+        measured.usage.query_profile.profiles
     );
     for (event, ms) in latency.iter().take(PARETO_ROWS) {
         eprintln!(
@@ -1050,15 +1137,15 @@ fn report_off_cpu(queries: f64, profile: &Profile) {
     }
 }
 
-/// Prints one write window's per-batch stage times, throughput, and CPU
+/// Prints one write window's per-request step times, throughput, and CPU
 /// Pareto, or why the CPU capture is not usable evidence.
 ///
-/// Stage times are the server's histogram sums divided by its durable acks,
-/// so they are mean seconds per batch. Stages overlap (the ack contains the
-/// others), so they are read beside the client latency, never summed.
+/// Step times are the Scribe write profile's mean per request. Its steps
+/// are serial, so they sum to the request's time inside Scribe; the Gate's
+/// write request contains them, and the client latency contains the Gate.
 fn report_write_pareto(measured: &Measured, profile: &Profile) {
     let write = &measured.usage.write;
-    let acks = write.get(ACKS).copied().unwrap_or(0.0).max(1.0);
+    let acks = measured.usage.write_profile.profiles.max(1.0);
     let batches = measured.latencies_us.len().max(1) as f64;
     let client_mean_ms = measured.latencies_us.iter().sum::<u64>() as f64 / batches / 1_000.0;
     let megabytes = write.get(MEMTABLE_BYTES).copied().unwrap_or(0.0) / 1e6;
@@ -1070,10 +1157,23 @@ fn report_write_pareto(measured: &Measured, profile: &Profile) {
         megabytes / cores.max(f64::EPSILON),
         write.get(MEMTABLE_ROWS).copied().unwrap_or(0.0) / measured.usage.seconds.max(f64::EPSILON),
     );
-    for (key, _, _) in WRITE_SERIES.iter().take(7) {
-        let ms = write.get(key).copied().unwrap_or(0.0) * 1e3 / acks;
+    if measured.wire_bytes > 0 {
+        let wire = measured.wire_bytes as f64 / f64::from(1 << 20);
         eprintln!(
-            "  {ms:8.3} ms {:5.1}%  {key}",
+            "  OTLP wire: {:.1} MiB/s, {:.1} MiB/s per server core, {:.0} B per row",
+            wire / measured.usage.seconds.max(f64::EPSILON),
+            wire / cores.max(f64::EPSILON),
+            measured.wire_bytes as f64 / measured.rows.max(1) as f64,
+        );
+    }
+    let gate_ms = write.get(GATE_WRITE).copied().unwrap_or(0.0) * 1e3 / acks;
+    eprintln!(
+        "  {gate_ms:8.3} ms {:5.1}%  {GATE_WRITE}, {acks:.0} profiles",
+        100.0 * gate_ms / client_mean_ms.max(f64::EPSILON)
+    );
+    for (event, ms) in measured.usage.write_profile.pareto() {
+        eprintln!(
+            "  {ms:8.3} ms {:5.1}%  {event}",
             100.0 * ms / client_mean_ms.max(f64::EPSILON)
         );
     }
@@ -1098,6 +1198,69 @@ fn report_write_pareto(measured: &Measured, profile: &Profile) {
             cpu_ms * percent / 100.0
         );
     }
+}
+
+/// The OTLP signal an export step sends: which fixture, collector service,
+/// and Bifrost table the rows go through.
+#[derive(Debug, Clone, Copy)]
+pub enum Signal {
+    /// Telemetry spans through the trace service into `vala.traces.spans`.
+    Spans(Telemetry),
+    /// Bulky Kubernetes logs through the logs service into
+    /// `vala.logs.records`.
+    Logs(Logs),
+}
+
+impl Signal {
+    /// The step and profile label of this signal.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Spans(_) => "otlp spans",
+            Self::Logs(_) => "otlp logs",
+        }
+    }
+
+    /// Rows per export request: the SDK batch processors' export size.
+    #[must_use]
+    pub const fn request_rows(self) -> i64 {
+        match self {
+            Self::Spans(_) => telemetry::REQUEST_SPANS,
+            Self::Logs(_) => logs::REQUEST_RECORDS,
+        }
+    }
+
+    /// The output directory of this signal's `--writes` sweep.
+    #[must_use]
+    pub const fn mode(self) -> &'static str {
+        match self {
+            Self::Spans(_) => "telemetry-writes",
+            Self::Logs(_) => "logs-writes",
+        }
+    }
+
+    /// Rows in this signal's fixture.
+    #[must_use]
+    pub const fn rows(self) -> i64 {
+        match self {
+            Self::Spans(fixture) => fixture.spans,
+            Self::Logs(fixture) => fixture.records,
+        }
+    }
+}
+
+/// Wraps `body` in a gRPC request carrying the `x-wyrd-access-token` bearer.
+///
+/// # Errors
+///
+/// Returns `bearer` when `token` is not a valid metadata value.
+fn authorized<T>(body: T, token: &str) -> std::result::Result<Request<T>, String> {
+    let mut request = Request::new(body);
+    request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        token.parse().map_err(|_| "bearer".to_owned())?,
+    );
+    Ok(request)
 }
 
 #[cfg(test)]

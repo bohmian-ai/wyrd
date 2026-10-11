@@ -29,7 +29,9 @@ use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest};
+use wyrd_spec::vala::api::{
+    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, PhysicalLayoutWire,
+};
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::WyrdTestCluster;
 use wyrd_testing::bifrost::write::BifrostWriter;
@@ -133,6 +135,54 @@ pub(crate) async fn register_table_with(
     table: &str,
     user_fields: Vec<Field>,
 ) -> Result<(), JourneyError> {
+    register(server, tenant, table, user_fields, None).await
+}
+
+/// Register one tenant-owned Redux table with the [`journey_schema`] fields
+/// plus [`EVENT_TIME`], partitioned hourly on that column.
+///
+/// A live row placed through [`timed_schema`] then lands in the hour
+/// partition its caller chose rather than the one its ingest instant names.
+///
+/// # Errors
+///
+/// Returns the catalog error when registration is refused.
+///
+/// # Panics
+///
+/// Panics when the server composes no Bifrost catalog.
+pub(crate) async fn register_timed_table(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+) -> Result<(), JourneyError> {
+    let fields = timed_schema(&journey_schema())
+        .fields()
+        .iter()
+        .map(|field| field.as_ref().clone())
+        .collect();
+    register(server, tenant, table, fields, Some(timed_layout())).await
+}
+
+/// Register one tenant-owned Redux table through the server-owned catalog.
+///
+/// The one registration path every journey table shares; `physical_layout`
+/// is the caller's declaration, or `None` for the server default.
+///
+/// # Errors
+///
+/// Returns the catalog error when registration is refused.
+///
+/// # Panics
+///
+/// Panics when the server composes no Bifrost catalog.
+pub(crate) async fn register(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+    user_fields: Vec<Field>,
+    physical_layout: Option<PhysicalLayoutWire>,
+) -> Result<(), JourneyError> {
     server
         .state()
         .bifrost_catalog()
@@ -141,11 +191,52 @@ pub(crate) async fn register_table_with(
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             user_fields,
             tenant,
-            physical_layout: None,
+            physical_layout,
             audit: None,
         })
         .await?;
     Ok(())
+}
+
+/// The user time column every caller-placed journey table declares.
+pub(crate) const EVENT_TIME: &str = "event_time";
+
+/// Returns the non-null microsecond UTC [`EVENT_TIME`] field.
+pub(crate) fn event_time_field() -> Field {
+    Field::new(
+        EVENT_TIME,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )
+}
+
+/// Returns `schema` with [`event_time_field`] appended.
+///
+/// The registration and the batches of one caller-placed table both derive
+/// from this, so the declared and written schemas cannot drift apart.
+pub(crate) fn timed_schema(schema: &Schema) -> arrow::datatypes::SchemaRef {
+    let mut fields = schema.fields().iter().cloned().collect::<Vec<_>>();
+    fields.push(Arc::new(event_time_field()));
+    Arc::new(Schema::new(fields))
+}
+
+/// Returns the hourly layout that partitions on [`EVENT_TIME`] with
+/// `sort_keys` and `bloom_columns`.
+pub(crate) fn timed_layout_with(
+    sort_keys: Vec<wyrd_spec::vala::api::SortKeyWire>,
+    bloom_columns: Vec<String>,
+) -> PhysicalLayoutWire {
+    PhysicalLayoutWire {
+        partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Hour,
+        time_column: Some(EVENT_TIME.to_owned()),
+        sort_keys,
+        bloom_columns,
+    }
+}
+
+/// Returns the hourly layout that partitions on [`EVENT_TIME`] alone.
+pub(crate) fn timed_layout() -> PhysicalLayoutWire {
+    timed_layout_with(Vec::new(), Vec::new())
 }
 /// Build one authenticated public client for the fixture tenant.
 pub(crate) async fn client(
@@ -352,14 +443,14 @@ pub(crate) async fn seed_foreign_hot_row(
                 TimestampMicrosecondArray::from(vec![1_000_000_i64])
                     .with_data_type(schema.field(7).data_type().clone()),
             ),
-            Arc::new(
-                TimestampMicrosecondArray::from(vec![1_000_001_i64])
-                    .with_data_type(schema.field(8).data_type().clone()),
-            ),
         ],
     )?;
     let mut parquet = Vec::new();
-    let properties = bifrost_writer_properties_with_metadata(vec![tenant_key_value(foreign)], &[]);
+    let properties = bifrost_writer_properties_with_metadata(
+        vec![tenant_key_value(foreign)],
+        wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT,
+        &[],
+    );
     let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
     writer.write(&batch)?;
     writer.close()?;

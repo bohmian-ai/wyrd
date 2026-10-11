@@ -75,7 +75,8 @@ pub enum Cell {
     Text(String),
     /// A 32-bit integer value.
     Int32(i32),
-    /// A 64-bit integer value.
+    /// A 64-bit integer value, or a raw instant in a timestamp column's own
+    /// unit, such as the Unix nanoseconds of an `OTLP` instant.
     Int64(i64),
     /// A double value.
     Float64(f64),
@@ -134,6 +135,13 @@ pub fn batch(schema: &SchemaRef, rows: &[Row]) -> RecordBatch {
 }
 
 /// Build one described column across every fixture row.
+///
+/// A timestamp column takes [`Cell::Int64`] values as raw instants in its own
+/// unit, so a fixture names an `OTLP` instant by its Unix nanoseconds.
+///
+/// # Panics
+///
+/// Panics when a cell does not fit the column's type.
 fn column(field: &Field, rows: &[Row]) -> ArrayRef {
     let cells: Vec<Cell> = rows
         .iter()
@@ -169,7 +177,7 @@ fn column(field: &Field, rows: &[Row]) -> ArrayRef {
             }
             Arc::new(builder.finish())
         }
-        DataType::Int64 => {
+        DataType::Int64 | DataType::Timestamp(_, _) => {
             let mut builder = Int64Builder::new();
             for cell in &cells {
                 match cell {
@@ -178,7 +186,9 @@ fn column(field: &Field, rows: &[Row]) -> ArrayRef {
                     other => panic!("column {} cannot take {other:?}", field.name()),
                 }
             }
-            Arc::new(builder.finish())
+            let raw: ArrayRef = Arc::new(builder.finish());
+            arrow::compute::cast(&raw, field.data_type())
+                .expect("an Int64 cell is a raw value in the column's own unit")
         }
         DataType::Float64 => {
             let mut builder = Float64Builder::new();
@@ -354,7 +364,7 @@ fn default_cell(field: &Field) -> Cell {
     match field.data_type() {
         DataType::Utf8 => Cell::Text(String::new()),
         DataType::Int32 => Cell::Int32(0),
-        DataType::Int64 => Cell::Int64(0),
+        DataType::Int64 | DataType::Timestamp(_, _) => Cell::Int64(0),
         DataType::Float64 => Cell::Float64(0.0),
         DataType::Boolean => Cell::Bool(false),
         DataType::Binary | DataType::FixedSizeBinary(_) => Cell::Bytes(Vec::new()),

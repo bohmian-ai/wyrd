@@ -24,6 +24,23 @@ pub use vala_bifrost_redux::scribe::promotion::ScribePublishedHotFileV1;
 /// Version of the canonical production-workload contract.
 pub const SCRIBE_PRODUCTION_WORKLOAD_VERSION: u16 = 1;
 
+/// The time column every workload table declares, so a run's rows land in
+/// the partition its record fixes rather than the one its arrival falls in.
+const WORKLOAD_TIME_COLUMN: &str = "event_time";
+
+/// The non-null UTC microsecond [`WORKLOAD_TIME_COLUMN`] field every workload
+/// table registers and every workload batch carries.
+fn workload_time_field() -> arrow::datatypes::Field {
+    arrow::datatypes::Field::new(
+        WORKLOAD_TIME_COLUMN,
+        arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ),
+        false,
+    )
+}
+
 /// Whether the run is executed with the read cache absent or present.
 ///
 /// A boot input, not a label. The cluster resolves the production storage
@@ -1103,13 +1120,21 @@ impl crate::WyrdTestServer {
                             namespace_of(table)?,
                             &table.name,
                         ),
-                        user_fields: vec![arrow::datatypes::Field::new(
-                            "value",
-                            arrow::datatypes::DataType::Int64,
-                            false,
-                        )],
+                        user_fields: vec![
+                            arrow::datatypes::Field::new(
+                                "value",
+                                arrow::datatypes::DataType::Int64,
+                                false,
+                            ),
+                            workload_time_field(),
+                        ],
                         tenant,
-                        physical_layout: None,
+                        physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
+                            partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Hour,
+                            time_column: Some(WORKLOAD_TIME_COLUMN.to_owned()),
+                            sort_keys: Vec::new(),
+                            bloom_columns: Vec::new(),
+                        }),
                         audit: None,
                     },
                 )
@@ -1189,11 +1214,11 @@ impl crate::WyrdTestServer {
 
     /// Appends one fixed-identity batch through the public gRPC ingest route.
     ///
-    /// Every row carries `event_time_micros` as its caller-supplied
-    /// `wyrd_event_time`. The server would otherwise stamp each row with its
-    /// receipt time, which places a run's rows in whichever time partition the
-    /// wall clock happens to be in, so two runs of the same record could
-    /// publish different file layouts.
+    /// Every row carries `event_time_micros` as its [`WORKLOAD_TIME_COLUMN`],
+    /// the workload table's time column. Partitioning by receipt time instead
+    /// would place a run's rows in whichever time partition the wall clock
+    /// happens to be in, so two runs of the same record could publish
+    /// different file layouts.
     ///
     /// # Errors
     ///
@@ -1210,14 +1235,7 @@ impl crate::WyrdTestServer {
         let client = self.workload_client(tenant).await?;
         let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
-            arrow::datatypes::Field::new(
-                wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-                arrow::datatypes::DataType::Timestamp(
-                    arrow::datatypes::TimeUnit::Microsecond,
-                    Some("UTC".into()),
-                ),
-                false,
-            ),
+            workload_time_field(),
         ]));
         let batch = arrow::record_batch::RecordBatch::try_new(
             std::sync::Arc::clone(&schema),

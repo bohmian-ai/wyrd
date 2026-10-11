@@ -25,7 +25,7 @@ pub struct LogRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<DateTime<Utc>>,
     /// `observed_time_unix_nano` — server-set at ingest; always present, and the
-    /// source of `wyrd_event_time` when `time` is absent.
+    /// stored `time_unix_nano` when `time` is absent.
     pub observed_time: DateTime<Utc>,
     /// OTel SeverityNumber 0..=24. `None` or `Some(0)` = UNSPECIFIED.
     #[serde(default, skip_serializing_if = "Option::is_none")]

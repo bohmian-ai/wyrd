@@ -12,6 +12,8 @@
 mod every_iceberg_column_type;
 #[path = "bifrost/register_a_table_from_a_model.rs"]
 mod register_a_table_from_a_model;
+#[path = "bifrost/table_time_column.rs"]
+mod table_time_column;
 #[path = "bifrost/three_timestamp_types.rs"]
 mod three_timestamp_types;
 #[path = "pg_bifrost_e2e/variant_tables.rs"]
@@ -1093,16 +1095,15 @@ mod pg_tests {
             "the description publishes the registry's exact canonical fingerprint"
         );
 
-        let described_schema = wyrd_types::schema::writable_schema(&canonical, true)
+        let described_schema = wyrd_types::schema::writable_schema(&canonical)
             .expect("the canonical description projects an Arrow schema");
         let physical = (definition.schema)();
         for stored in physical.fields() {
             let name = stored.name().as_str();
             // Server-resolved columns are not a writer's to supply, so they are
-            // deliberately absent from every description; `wyrd_event_time` and
-            // `run_id` are the two the writer may still send.
+            // deliberately absent from every description; `run_id` is the one
+            // the writer may still send.
             if vala_bifrost_redux::tables::managed_columns::is_managed_column(name)
-                && name != "wyrd_event_time"
                 && name != "run_id"
             {
                 continue;
@@ -1151,7 +1152,7 @@ mod pg_tests {
             Some(wyrd_spec::vala::api::INPUT_CLASS_GATE_CORRELATION),
             "card_ref is a resolved Gate input, not a stored column"
         );
-        for name in ["card_ref", "run_id", "wyrd_event_time"] {
+        for name in ["card_ref", "run_id"] {
             assert_eq!(
                 described_schema
                     .fields()
@@ -1174,7 +1175,7 @@ mod pg_tests {
             "a dynamic table publishes no canonical physical fingerprint"
         );
         assert!(
-            wyrd_types::schema::writable_schema(&dynamic, false)
+            wyrd_types::schema::writable_schema(&dynamic)
                 .expect("the dynamic description projects an Arrow schema")
                 .field_with_name("card_ref")
                 .expect("the Gate correlation input is described")

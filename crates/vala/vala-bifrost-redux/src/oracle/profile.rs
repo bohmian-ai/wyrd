@@ -6,18 +6,19 @@
 //! [`Time`] metrics registered on an [`ExecutionPlanMetricsSet`], with the
 //! same scoped-guard pattern every `DataFusion` operator uses, and the executed
 //! physical root's operator metrics are folded in once the query's admission
-//! guard releases that root (see [`QueryProfile::fold_root`]). The profile is emitted exactly once, when its last owner drops:
-//! global counters for fleet-wide Pareto analysis and one DEBUG event for the
-//! single query.
+//! guard releases that root (see [`QueryProfile::fold_root`]). The profile is
+//! emitted exactly once, when its last owner drops, as
+//! [`ProfileFamily::ORACLE_QUERY`].
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::{
     ExecutionPlanMetricsSet, MetricBuilder, MetricValue, Time,
 };
+
+use crate::profile::{ProfileFamily, ProfileValue};
 
 /// Prefix naming the Oracle's own steps among the operator events.
 const ORACLE_EVENT: &str = "Oracle";
@@ -137,85 +138,11 @@ impl QueryProfile {
 }
 
 impl Drop for QueryProfile {
-    /// Emits the profile once: global counters and one DEBUG event.
-    ///
-    /// Counters are `oracle_query_profile_nanoseconds_total{event}` for times
-    /// and `oracle_query_profile_count_total{event}` for counts, beside
-    /// `oracle_query_profiles_total`, so a scrape delta divided by the profile
-    /// count is the mean per query.
+    /// Emits the profile once as [`ProfileFamily::ORACLE_QUERY`]: global
+    /// counters, divided by the profile count for the mean per query, and
+    /// one DEBUG event.
     fn drop(&mut self) {
-        let events = self.events();
-        let mut rendered = String::new();
-        for (event, value) in &events {
-            let (family, amount, unit) = match *value {
-                ProfileValue::Nanoseconds(amount) => {
-                    ("oracle_query_profile_nanoseconds_total", amount, "ns")
-                }
-                ProfileValue::Count(amount) => ("oracle_query_profile_count_total", amount, ""),
-            };
-            metrics::counter!(family, "event" => event.clone()).increment(amount);
-            let _ = write!(rendered, "{event}={amount}{unit} ");
-        }
-        metrics::counter!("oracle_query_profiles_total").increment(1);
-        tracing::debug!(profile = rendered.trim_end(), "Oracle query profile");
-    }
-}
-
-/// One profile event's accumulated value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProfileValue {
-    /// Summed `DataFusion` time, in nanoseconds.
-    Nanoseconds(u64),
-    /// Summed `DataFusion` count.
-    Count(u64),
-}
-
-impl ProfileValue {
-    /// Classifies one `DataFusion` metric, keeping only additive times and counts.
-    fn of(value: &MetricValue) -> Option<Self> {
-        let amount = u64::try_from(value.as_usize()).unwrap_or(u64::MAX);
-        match value {
-            MetricValue::ElapsedCompute(_) | MetricValue::Time { .. } => {
-                Some(Self::Nanoseconds(amount))
-            }
-            MetricValue::OutputRows(_)
-            | MetricValue::OutputBytes(_)
-            | MetricValue::OutputBatches(_)
-            | MetricValue::SpillCount(_)
-            | MetricValue::SpilledBytes(_)
-            | MetricValue::SpilledRows(_)
-            | MetricValue::Count { .. } => Some(Self::Count(amount)),
-            _ => None,
-        }
-    }
-
-    /// Adds every additive metric of one operator under `<operator>.<metric>`.
-    fn fold(
-        operator: &str,
-        metrics: &datafusion::physical_plan::metrics::MetricsSet,
-        events: &mut BTreeMap<String, Self>,
-    ) {
-        for metric in metrics.iter() {
-            let value = metric.value();
-            let Some(addition) = Self::of(value) else {
-                continue;
-            };
-            events
-                .entry(format!("{operator}.{}", value.name()))
-                .and_modify(|current| *current = current.plus(addition))
-                .or_insert(addition);
-        }
-    }
-
-    /// Sums two values of the same kind, saturating; a kind clash keeps `self`.
-    const fn plus(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Nanoseconds(left), Self::Nanoseconds(right)) => {
-                Self::Nanoseconds(left.saturating_add(right))
-            }
-            (Self::Count(left), Self::Count(right)) => Self::Count(left.saturating_add(right)),
-            (kept, _) => kept,
-        }
+        ProfileFamily::ORACLE_QUERY.emit(&self.events());
     }
 }
 
@@ -230,7 +157,8 @@ mod tests {
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::{ExecutionPlan, collect};
 
-    use super::{ProfileValue, QueryProfile};
+    use super::QueryProfile;
+    use crate::profile::ProfileValue;
 
     /// A timed Oracle step and the executed root's operators both appear,
     /// keyed by operator and metric name.

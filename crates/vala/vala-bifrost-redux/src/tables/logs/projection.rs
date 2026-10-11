@@ -26,8 +26,9 @@ use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
     ExceptionPromotions, OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope,
     any_value_variant, attributes_variant, bool_column, checked_i64, entity_refs_column,
-    fixed_binary_opt_column, fixed_row_bytes, i32_column, i64_column, projected_signal_schema,
-    span_id_bytes, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, variant_column,
+    fixed_binary_opt_column, fixed_row_bytes, i32_column, otlp_instant_column,
+    projected_signal_schema, span_id_bytes, trace_id_bytes, u32_as_i64_column, utf8_column,
+    utf8_opt_column, variant_column,
 };
 use wyrd_spec::reference::CardRefScope;
 
@@ -211,8 +212,14 @@ impl LogColumns {
         } else {
             Some(span_id_bytes(&record.span_id)?.to_vec())
         };
-        let time_unix_nano = checked_i64(record.time_unix_nano)?;
         let observed_time_unix_nano = checked_i64(record.observed_time_unix_nano)?;
+        // OTLP leaves `time_unix_nano` 0 when the source recorded no event
+        // time; the time column then holds the collector's observed time, as
+        // the OpenTelemetry ClickHouse exporter stores it.
+        let time_unix_nano = match record.time_unix_nano {
+            0 => observed_time_unix_nano,
+            time => checked_i64(time)?,
+        };
         let body = record
             .body
             .as_ref()
@@ -302,11 +309,11 @@ impl LogColumns {
     /// assembled columns do not match the canonical schema.
     fn finish(self) -> Result<RecordBatch, TableError> {
         let columns: Vec<ArrayRef> = vec![
-            i64_column(self.time_unix_nano),
-            i64_column(self.observed_time_unix_nano),
+            otlp_instant_column(self.time_unix_nano),
+            otlp_instant_column(self.observed_time_unix_nano),
             i32_column(self.severity_number),
-            utf8_column(self.severity_text),
-            utf8_opt_column(self.event_name),
+            utf8_column(&self.severity_text),
+            utf8_opt_column(&self.event_name),
             variant_column(self.body.iter().map(Option::as_ref)),
             fixed_binary_opt_column(16, &self.trace_id).map_err(internal)?,
             fixed_binary_opt_column(8, &self.span_id).map_err(internal)?,
@@ -316,23 +323,23 @@ impl LogColumns {
             bool_column(self.resource_present),
             variant_column(self.resource_attributes.iter().map(Some)),
             u32_as_i64_column(self.resource_dropped_attributes_count),
-            utf8_column(self.resource_schema_url),
+            utf8_column(&self.resource_schema_url),
             entity_refs_column(&self.entity_refs, &self.entity_ref_lengths)?,
             bool_column(self.scope_present),
-            utf8_column(self.scope_name),
-            utf8_column(self.scope_version),
+            utf8_column(&self.scope_name),
+            utf8_column(&self.scope_version),
             variant_column(self.scope_attributes.iter().map(Some)),
             u32_as_i64_column(self.scope_dropped_attributes_count),
-            utf8_column(self.scope_schema_url),
-            utf8_opt_column(self.service_name),
-            utf8_opt_column(self.service_version),
-            utf8_opt_column(self.deployment_environment),
-            utf8_opt_column(self.exception_type),
-            utf8_opt_column(self.exception_message),
-            utf8_opt_column(self.exception_stacktrace),
-            utf8_opt_column(self.body_text),
-            utf8_opt_column(self.card_ref),
-            utf8_opt_column(self.run_id),
+            utf8_column(&self.scope_schema_url),
+            utf8_opt_column(&self.service_name),
+            utf8_opt_column(&self.service_version),
+            utf8_opt_column(&self.deployment_environment),
+            utf8_opt_column(&self.exception_type),
+            utf8_opt_column(&self.exception_message),
+            utf8_opt_column(&self.exception_stacktrace),
+            utf8_opt_column(&self.body_text),
+            utf8_opt_column(&self.card_ref),
+            utf8_opt_column(&self.run_id),
         ];
         RecordBatch::try_new(projected_signal_schema(LOG_FIELDS), columns)
             .map_err(|error| TableError::Internal(format!("canonical log batch: {error}")))

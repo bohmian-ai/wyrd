@@ -6,7 +6,7 @@
 //! error). Reuses the same key/verifier setup as `router_smoke.rs`.
 
 use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CompactionRegistration, TableRef};
 use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
@@ -108,35 +108,19 @@ fn mint_user_jwt(state: &AppState, tenant: DataTenantId, roles: &[&str]) -> Stri
         .expect("test jwt mints")
 }
 
-/// The instant the private-tail fixture writes its rows at.
+/// Builds two logical rows of the private-tail fixture.
 ///
-/// Production Scribe admission bounds event time to a window around now, so a
-/// frozen literal would age out of the accepted range and start failing.
-fn fixture_event_time() -> DateTime<Utc> {
-    Utc::now()
-}
-
-/// Builds two logical rows on the private-tail fixture's UTC event day.
+/// The fixture table declares no time column, so both rows partition on the
+/// one `wyrd_ingested_at` Scribe stamps on their request and share one live
+/// partition.
 fn non_empty_tail_batch() -> RecordBatch {
-    let timestamp = fixture_event_time().timestamp_micros();
-    let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            wyrd_spec::vala::WYRD_EVENT_TIME,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-        Field::new("value", DataType::Int64, false),
-    ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(
-                TimestampMicrosecondArray::from(vec![timestamp, timestamp]).with_timezone("UTC"),
-            ),
-            Arc::new(Int64Array::from(vec![11, 22])),
-        ],
-    )
-    .expect("private-tail fixture batch is valid")
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![11, 22]))])
+        .expect("private-tail fixture batch is valid")
 }
 
 /// The caller-owned logical table the private-tail fixtures read.
@@ -179,9 +163,8 @@ fn test_principal(tenant: DataTenantId) -> Principal {
 /// Seeds two logical rows through the production embedded Scribe boundary.
 ///
 /// The frame is the one a transport request would carry: an authenticated
-/// tenant, the Gate-owned allow/success audit event, the projected `value`-only
-/// source fingerprint (`wyrd_event_time` is server-managed and never part of
-/// schema identity), and the measured wire size.
+/// tenant, the Gate-owned allow/success audit event, the `value`-only source
+/// fingerprint, and the measured wire size.
 ///
 /// # Panics
 ///
@@ -976,15 +959,24 @@ impl SystemWriterHarness {
         .to_string()
     }
 
-    /// Staged `bifrost.record.write` decisions since start, in order.
+    /// Staged `bifrost.record.write` decisions since start, in order, once
+    /// the non-blocking audit outbox has committed every staged decision.
     ///
     /// Each row is `(is the SYSTEM writer, principal kind, resource, outcome)`.
     ///
     /// # Panics
     ///
-    /// Panics when audit staging cannot be read or a decision names a
-    /// permission other than `bifrost:record:write`.
+    /// Panics when the outbox does not drain within ten seconds, audit staging
+    /// cannot be read, or a decision names a permission other than
+    /// `bifrost:record:write`.
     async fn write_decisions(&self) -> Vec<(bool, String, String, String)> {
+        assert_eq!(
+            self.server
+                .wait_audit_staged(std::time::Duration::from_secs(10))
+                .await,
+            0,
+            "audit outbox drains"
+        );
         let decisions: Vec<(uuid::Uuid, String, String, String, String)> = sqlx::query_as(
             "SELECT principal_id, principal_kind, resource, permission, outcome \
              FROM vala.audit_staging \

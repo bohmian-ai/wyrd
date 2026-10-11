@@ -11,7 +11,6 @@ use wyrd_types::variant::variant_field;
 use crate::tables::fields::{float64, int32, int64, ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// `vala.verification.results` — exactly one row per completed Verifier run.
 ///
@@ -115,7 +114,8 @@ impl DomainTable for ResultsTable {
     /// Daily partitions sorted newest first, Bloom-pruned on result id, subject, and binding lookups.
     fn physical_layout() -> PhysicalLayoutWire {
         daily_layout(
-            vec![sort_desc(WYRD_EVENT_TIME)],
+            "ended_at",
+            vec![sort_desc("ended_at")],
             &["result_id", "subject_card_uid", "binding_id"],
         )
     }

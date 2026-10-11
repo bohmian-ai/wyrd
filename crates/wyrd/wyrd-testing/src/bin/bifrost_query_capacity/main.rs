@@ -20,6 +20,13 @@
 //! one Scribe shard, each step profiled, reported in retained Arrow MB/s, MB/s
 //! per server core, and rows/s (`mise run bench:bifrost:write-capacity`).
 //!
+//! `--fixture telemetry --writes` and `--fixture logs --writes` run the same
+//! sweep over OTLP: each step exports a fresh [`OTLP_SWEEP_ROWS`]-row range
+//! of the telemetry spans or the bulky Kubernetes logs through the gRPC
+//! collector, additionally reported in OTLP wire MiB/s and wire MiB/s per
+//! server core, the unit OTLP ingest capacity is quoted in. The sweep is
+//! judged on its fastest step.
+//!
 //! `--fixture telemetry` writes the telemetry fixture instead: 10 million
 //! GenAI/HTTP spans exported through the OTLP gRPC collector into
 //! `vala.traces.spans`, settled into the tier, checked against exact answers,
@@ -35,6 +42,7 @@
 //! `target/bifrost-query-capacity/{standard,heavy}/{hot,parquet}/`; each row
 //! prints as it is judged. Exits nonzero when any row fails.
 
+mod logs;
 mod report;
 mod run;
 mod telemetry;
@@ -48,8 +56,9 @@ use tokio_util::sync::CancellationToken;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::{GlobalConfig, WyrdClient};
 
+use logs::Logs;
 use report::Report;
-use run::Bench;
+use run::{Bench, Signal};
 use telemetry::Telemetry;
 use workload::{Case, Fixture, TABLE};
 use wyrd_testing::capacity::{install_tracing, release_binary};
@@ -63,6 +72,13 @@ const SWEEP: [usize; 6] = [1, 4, 8, 16, 32, 64];
 
 /// Writer counts of the `--writes` sweep, one step each.
 const WRITE_SWEEP: [usize; 4] = [1, 4, 16, 64];
+
+/// Spans or log records each OTLP `--writes` step exports.
+///
+/// Smaller than the 10M native step so the one-exporter step stays within
+/// minutes; every step exports its own range, since a repeated range would
+/// derive the same batch ids and be suppressed as a retry.
+const OTLP_SWEEP_ROWS: i64 = 2_000_000;
 
 /// Read clients beside the writer in the reads-while-writing steps.
 ///
@@ -138,11 +154,27 @@ impl Tier {
 ///
 /// Returns an error for a heavy hot run, or the server, client, or evidence
 /// failure that stopped the tier.
-async fn benchmark(heavy: bool, writes: bool, spans: bool, tier: Tier) -> Result<bool> {
-    if spans && (heavy || writes) {
-        return Err("--fixture telemetry runs alone, without --heavy or --writes".into());
+async fn benchmark(heavy: bool, writes: bool, otlp: Option<&str>, tier: Tier) -> Result<bool> {
+    let spans = otlp == Some("telemetry");
+    let signal = match otlp {
+        None => None,
+        Some("telemetry") => Some(Signal::Spans(Telemetry {
+            spans: OTLP_SWEEP_ROWS,
+        })),
+        Some("logs") => Some(Signal::Logs(Logs {
+            records: OTLP_SWEEP_ROWS,
+        })),
+        Some(other) => return Err(format!("--fixture {other}: expected telemetry|logs").into()),
+    };
+    if signal.is_some() && heavy {
+        return Err("--fixture runs without --heavy".into());
     }
-    let (fixture, mode) = if spans {
+    if signal.is_some() && !spans && !writes {
+        return Err("--fixture logs runs only with --writes".into());
+    }
+    let (fixture, mode) = if let Some(signal) = signal.filter(|_| writes) {
+        (Fixture::standard(), signal.mode())
+    } else if spans {
         (Fixture::standard(), "telemetry")
     } else if writes {
         (Fixture::standard(), "writes")
@@ -161,6 +193,9 @@ async fn benchmark(heavy: bool, writes: bool, spans: bool, tier: Tier) -> Result
         std::fs::remove_dir_all(&output)?;
     }
     std::fs::create_dir_all(&output)?;
+    if let Some(signal) = signal.filter(|_| writes) {
+        return otlp_sweep(fixture, signal, tier, &output).await;
+    }
     if writes {
         return write_sweep(fixture, tier, &output).await;
     }
@@ -197,6 +232,52 @@ async fn write_sweep(fixture: Fixture, tier: Tier, output: &Path) -> Result<bool
         report.write(&format!("write x{writers}"), &written, files, bytes);
         first += fixture.rows;
     }
+    report.shutdown(&server.stop(&output.join("server.log")).map_err(Into::into));
+    report.write_to(output)?;
+    Ok(report.passed())
+}
+
+/// The OTLP `--writes` journey: start the server, export a fresh
+/// [`OTLP_SWEEP_ROWS`]-row range of `signal` per [`WRITE_SWEEP`] step, judge
+/// the fastest step, stop.
+///
+/// Returns whether the sweep passed.
+///
+/// # Errors
+///
+/// Returns a server, client, capture, or evidence failure that stopped it.
+async fn otlp_sweep(fixture: Fixture, signal: Signal, tier: Tier, output: &Path) -> Result<bool> {
+    let server =
+        LocalServer::start(&release_binary()?, &["bench"], tier.env(), Placement::Host).await?;
+    let client = WyrdClient::with_config(ClientConfig {
+        credential: Some(server.api_key().clone()),
+        ..ClientConfig::from_global_with_overrides(&GlobalConfig::default(), Some(SERVER_URL), None)
+    })?;
+    let bench = Bench::new(&server, &client, fixture, &[], output.join("profiles"));
+    let label = format!(
+        "{} {} rows per step, {}",
+        tier.name(),
+        signal.name(),
+        server.describe()
+    );
+    let mut report = Report::new(fixture, label, server.memory_limit_bytes());
+    let mut points = Vec::with_capacity(WRITE_SWEEP.len());
+    let mut first = 0;
+    for writers in WRITE_SWEEP {
+        let written = bench
+            .export_step(signal, first..first + signal.rows(), writers)
+            .await?;
+        let (files, bytes) = parquet_files(&server.storage_dir());
+        report.export(
+            &format!("{} x{writers}", signal.name()),
+            &written,
+            files,
+            bytes,
+        );
+        points.push(written);
+        first += signal.rows();
+    }
+    report.export_target(&format!("{} target", signal.name()), &points);
     report.shutdown(&server.stop(&output.join("server.log")).map_err(Into::into));
     report.write_to(output)?;
     Ok(report.passed())
@@ -285,7 +366,7 @@ async fn journey(fixture: Fixture, heavy: bool, tier: Tier, output: &Path) -> Re
 
 /// The telemetry journey: start the server, export the span fixture over
 /// OTLP gRPC, put the spans in `tier`, check answers, judge the Parquet
-/// tier's Variant shredding, stop.
+/// tier's Variant shredding and span-time pruning, stop.
 ///
 /// Returns whether every row passed.
 ///
@@ -304,7 +385,9 @@ async fn telemetry_journey(fixture: Fixture, tier: Tier, output: &Path) -> Resul
     let label = format!("{} telemetry spans, {}", tier.name(), server.describe());
     let mut report = Report::new(fixture, label, server.memory_limit_bytes());
 
-    let written = bench.export_spans(spans, run::WRITERS).await?;
+    let written = bench
+        .export(Signal::Spans(spans), 0..spans.spans, run::WRITERS)
+        .await?;
     let (files, bytes) = parquet_files(&server.storage_dir());
     report.write("export spans", &written, files, bytes);
     report.tier("spans in tier", settle(&server, tier).await?);
@@ -313,6 +396,12 @@ async fn telemetry_journey(fixture: Fixture, tier: Tier, output: &Path) -> Resul
         report.tier(
             "variant shredding",
             telemetry::judge_shredding(&parquet_paths(&server.storage_dir())),
+        );
+        let all = bench.check(vec![spans.all_spans()]).await?;
+        let window = bench.check(vec![spans.span_window()]).await?;
+        report.tier(
+            "span-time pruning",
+            telemetry::judge_pruning(&all.usage, &window.usage),
         );
     }
 
@@ -468,9 +557,10 @@ async fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().collect();
     let heavy = arguments.iter().any(|argument| argument == "--heavy");
     let writes = arguments.iter().any(|argument| argument == "--writes");
-    let spans = arguments
+    let otlp = arguments
         .windows(2)
-        .any(|pair| pair[0] == "--fixture" && pair[1] == "telemetry");
+        .find(|pair| pair[0] == "--fixture")
+        .map(|pair| pair[1].as_str());
     let tier = arguments
         .iter()
         .position(|argument| argument == "--tier")
@@ -479,7 +569,7 @@ async fn main() -> ExitCode {
             Tier::parse(name)
         });
     let outcome = match tier {
-        Ok(tier) => benchmark(heavy, writes, spans, tier).await,
+        Ok(tier) => benchmark(heavy, writes, otlp, tier).await,
         Err(error) => Err(error),
     };
     match outcome {

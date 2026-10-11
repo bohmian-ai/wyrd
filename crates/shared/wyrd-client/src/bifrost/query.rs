@@ -1769,11 +1769,6 @@ mod tests {
                 { "name": "run_id", "data_type": "Utf8", "nullable": true,
                   "metadata": { "PARQUET:field_id": "1000" } }
             ],
-            "managed_candidates": [
-                { "name": "wyrd_event_time",
-                  "data_type": { "Timestamp": { "unit": "Microsecond", "tz": "UTC" } },
-                  "nullable": false, "metadata": { "PARQUET:field_id": "1004" } }
-            ],
             "canonical_physical_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "physical_layout": { "partition_granularity": "hour" }
         }"#;
@@ -1794,7 +1789,7 @@ mod tests {
             "a canonical table publishes its exact physical fingerprint"
         );
 
-        let writable = wyrd_types::schema::writable_schema(&described, true)
+        let writable = wyrd_types::schema::writable_schema(&described)
             .expect("the description projects an Arrow schema");
         assert_eq!(
             writable
@@ -1802,8 +1797,8 @@ mod tests {
                 .iter()
                 .map(|field| field.name().as_str())
                 .collect::<Vec<_>>(),
-            ["trace_id", "card_ref", "run_id", "wyrd_event_time"],
-            "user fields precede correlation inputs, then the managed candidate"
+            ["trace_id", "card_ref", "run_id"],
+            "user fields precede correlation inputs and no managed column is writable"
         );
         assert!(
             writable
@@ -1811,14 +1806,6 @@ mod tests {
                 .iter()
                 .all(|field| field.metadata().is_empty()),
             "no writable column repeats the server-owned field id back on the wire"
-        );
-        assert_eq!(
-            wyrd_types::schema::writable_schema(&described, false)
-                .expect("event time is optional")
-                .fields()
-                .len(),
-            3,
-            "a writer that supplies no event time declares no event-time column"
         );
 
         let builder = wyrd_queue::RowPreflight::from_description(&described)

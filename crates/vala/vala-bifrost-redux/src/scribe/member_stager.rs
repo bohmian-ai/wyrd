@@ -445,7 +445,7 @@ mod tests {
     fn frozen_member(tenant: DataTenantId, rows: usize) -> FrozenMemtable {
         let row_count = i64::try_from(rows).expect("test row count fits i64");
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]));
@@ -473,19 +473,6 @@ mod tests {
             closed_at: std::time::Instant::now(),
             arrow_bytes,
         }
-    }
-
-    /// Resolves the registered hourly layout every fixture is encoded under.
-    fn member_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::resolve(
-            "vala.bifrost.test",
-            schema,
-            Some(&crate::tables::hourly_layout(
-                vec![crate::tables::sort_asc("wyrd_event_time")],
-                &["wyrd_event_time"],
-            )),
-        )
-        .expect("test schema carries the built-in hourly layout")
     }
 
     /// Builds the origin facts a rotating shard contributes to one member.
@@ -520,7 +507,7 @@ mod tests {
         let frozen = frozen_member(tenant, 512);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
-        let layout = member_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let member = stager
             .encode_runs(StageMemberRequest {
                 frozen: &frozen,
@@ -581,7 +568,7 @@ mod tests {
         let frozen = frozen_member(tenant, 64);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
-        let layout = member_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let request = || StageMemberRequest {
             frozen: &frozen,
             binding: &binding,
@@ -620,7 +607,7 @@ mod tests {
         let frozen = frozen_member(tenant, 64);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
-        let layout = member_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let request = || StageMemberRequest {
             frozen: &frozen,
             binding: &binding,

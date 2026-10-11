@@ -2,13 +2,12 @@
 //!
 //! Gate hands every Eval observation frame Scribe has durably acknowledged to
 //! [`ObservationEnqueue`], which derives each row's exact `record_id`, subject,
-//! and committed `wyrd_event_time` and enqueues one run per active
+//! and `created_at`, the table's time column, and enqueues one run per active
 //! `observations_ready` binding in a tracked background task. The step is not
 //! part of Scribe's batch transaction and keeps no outbox or retry queue: a
 //! failure is logged and counted, the observation stays acknowledged, and no
 //! run exists for it. Gate hands over only the acknowledgement that first
-//! committed a batch, so a suppressed replay never enqueues and its later
-//! receipt instant can never be frozen as the run's event time.
+//! committed a batch, so a suppressed replay never enqueues a second run.
 
 use std::sync::Arc;
 
@@ -64,9 +63,8 @@ impl ObservationEnqueue {
         tenant: DataTenantId,
         principal: &Principal,
         frame: &[u8],
-        receipt_micros: i64,
     ) -> Result<usize, String> {
-        let keys = EvalObservationsTable::acknowledged(frame, principal, receipt_micros)
+        let keys = EvalObservationsTable::acknowledged(frame, principal)
             .map_err(|error| error.to_string())?;
         if keys.is_empty() {
             return Ok(0);
@@ -78,7 +76,7 @@ impl ObservationEnqueue {
             .map_err(|error| error.to_string())?;
         let observations: Vec<_> = keys
             .iter()
-            .map(|key| (&key.card_uid, key.record_id.as_str(), key.event_time))
+            .map(|key| (&key.card_uid, key.record_id.as_str(), key.created_at))
             .collect();
         let outcomes = self
             .queue
@@ -97,7 +95,7 @@ impl ObservationAck for ObservationEnqueue {
     /// tenant and request and counted in
     /// `verification_observation_enqueue_failures_total`; the acknowledged
     /// observation is never affected.
-    fn acknowledged(&self, auth: &AuthContext, frame: Bytes, receipt_micros: i64) {
+    fn acknowledged(&self, auth: &AuthContext, frame: Bytes) {
         let (tenant, request_id) = (auth.tenant, auth.request_id.clone());
         let Ok(permit) = Arc::clone(&self.pending).try_acquire_owned() else {
             record_failure(
@@ -116,9 +114,7 @@ impl ObservationAck for ObservationEnqueue {
                 request_id,
                 armed: true,
             };
-            let result = owner
-                .enqueue(tenant, &principal, &frame, receipt_micros)
-                .await;
+            let result = owner.enqueue(tenant, &principal, &frame).await;
             lost.armed = false;
             if let Err(error) = result {
                 record_failure(tenant, lost.request_id.as_str(), &error);

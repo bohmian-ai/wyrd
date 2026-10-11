@@ -19,7 +19,6 @@ use crate::tables::{
     sort_desc,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// Element declaration of an explicit-bucket count collection.
 pub static BUCKET_COUNT_ELEMENT: F = F::payload(iceberg::spec::LIST_FIELD_NAME, T::Int64, false);
@@ -84,7 +83,7 @@ pub static QUANTILE_VALUE_ELEMENT: F = F::payload(
 /// An exemplar carries filtered caller attributes and the correlation ids of
 /// the originating span, so the whole subtree is access-gated payload.
 pub static EXEMPLAR_FIELDS: [F; 6] = [
-    F::sensitive("time_unix_nano", T::Int64, false),
+    F::sensitive("time_unix_nano", signal::OTLP_INSTANT, false),
     F::sensitive("int_value", T::Int64, true),
     F::sensitive("double_value", T::Float64, true),
     F::sensitive("filtered_attributes", T::Variant, false),
@@ -113,8 +112,8 @@ pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::meta("unit", T::Utf8, false),
     F::sensitive("metadata", T::Variant, false),
     F::meta("metric_type", T::Utf8, false),
-    F::meta("time_unix_nano", T::Int64, false),
-    F::meta("start_time_unix_nano", T::Int64, false),
+    F::meta("time_unix_nano", signal::OTLP_INSTANT, false),
+    F::meta("start_time_unix_nano", signal::OTLP_INSTANT, false),
     F::meta("flags", T::Int64, false),
     F::sensitive("attributes", T::Variant, false),
     F::meta("int_value", T::Int64, true),
@@ -186,7 +185,8 @@ impl DomainTable for PointsTable {
 
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(
-            vec![sort_desc(WYRD_EVENT_TIME), sort_asc("metric_name")],
+            "time_unix_nano",
+            vec![sort_desc("time_unix_nano"), sort_asc("metric_name")],
             &["metric_name", "metric_type"],
         )
     }

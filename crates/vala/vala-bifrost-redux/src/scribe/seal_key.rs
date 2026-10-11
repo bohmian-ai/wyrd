@@ -5,15 +5,15 @@
 //! seal-key. A `ScribeIngressFrame` that spans multiple partitions is split into
 //! per-key slices before WAL writes; a seal-key never crosses a partition.
 //!
-//! The partition granularity is not a property of this module: it comes from the
-//! table's canonical `PhysicalLayout` and is passed in by the admission path, so
-//! an hourly table and a daily table use exactly the same code with different
-//! bucket boundaries.
+//! The time axis — the time column and its partition granularity — is not a
+//! property of this module: it comes from the table's canonical
+//! `PhysicalLayout` and is passed in by the admission path, so every table uses
+//! exactly the same code with its own column and bucket boundaries.
 //!
 //! `TableRef` lives in `crate::catalog::table_ref` and is re-exported through
 //! `crate::catalog` — this module only owns the seal-key composition.
 
-use arrow::array::{Array, TimestampMicrosecondArray, UInt32Array};
+use arrow::array::UInt32Array;
 use arrow::compute::take;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
@@ -21,8 +21,8 @@ use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
 use crate::catalog::TenantTableBinding;
-use crate::catalog::layout::TimeGranularity;
 pub use crate::catalog::layout::TimePartition;
+use crate::catalog::layout::{TimeAxis, TimeColumnValues, TimeGranularity};
 use crate::contracts::ScribeError;
 
 /// Durable identity shared by every object one assembly claim publishes.
@@ -158,7 +158,7 @@ pub(crate) const MAX_TIME_PARTITIONS: usize = crate::gate::limits::OTLP_WIRE_LIM
 /// The plan is built by one non-retaining counting pass so the producer can
 /// materialize partitions lazily, one at a time, without holding a per-partition
 /// row collection.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct TimePartitionPlan {
     /// Sorted partition descriptors.
     partitions: [Option<TimePartition>; MAX_TIME_PARTITIONS],
@@ -166,6 +166,8 @@ pub(crate) struct TimePartitionPlan {
     counts: [usize; MAX_TIME_PARTITIONS],
     /// Live descriptor count.
     partition_count: usize,
+    /// Time axis the counting pass bucketed by, reused by materialization.
+    axis: TimeAxis,
 }
 
 impl TimePartitionPlan {
@@ -200,14 +202,10 @@ impl TimePartitionPlan {
         if self.partition_count == 1 {
             return Ok((partition, batch.clone()));
         }
-        let ts_array = event_time_array(batch)?;
+        let values = time_values(batch, &self.axis)?;
         let mut indices = Vec::with_capacity(expected_rows);
-        for row in 0..ts_array.len() {
-            let timestamp = chrono::DateTime::from_timestamp_micros(ts_array.value(row))
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "invalid event timestamp during planned split".to_owned(),
-                })?;
-            if bucket(partition.granularity(), timestamp)? == partition {
+        for row in 0..values.len() {
+            if bucket(partition.granularity(), values, row)? == partition {
                 indices.push(u32::try_from(row).map_err(|_| ScribeError::Internal {
                     detail: "record batch row index exceeds u32::MAX".to_owned(),
                 })?);
@@ -278,82 +276,78 @@ impl ExactSizeIterator for TimePartitionSlices<'_> {}
 /// Returns [`ScribeError`] for a missing, null, mistyped, or invalid event-time
 /// column, a row index beyond `u32`, or more than
 /// [`MAX_TIME_PARTITIONS`] distinct partitions.
-pub(crate) fn split_batch_by_time_partition(
-    batch: &RecordBatch,
-    granularity: TimeGranularity,
-) -> Result<TimePartitionSlices<'_>, ScribeError> {
+pub(crate) fn split_batch_by_time_partition<'a>(
+    batch: &'a RecordBatch,
+    axis: &TimeAxis,
+) -> Result<TimePartitionSlices<'a>, ScribeError> {
     Ok(TimePartitionSlices {
         batch,
-        plan: plan_time_partitions(batch, granularity)?,
+        plan: plan_time_partitions(batch, axis)?,
         current: 0,
     })
 }
 
-/// Borrows the required microsecond event-time column.
+/// Borrows the required time column of one admitted batch.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::Internal`] when the column is absent or is not a
-/// microsecond timestamp array.
-fn event_time_array(batch: &RecordBatch) -> Result<&TimestampMicrosecondArray, ScribeError> {
-    batch
-        .column_by_name(wyrd_spec::vala::WYRD_EVENT_TIME)
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "missing wyrd_event_time column".to_owned(),
-        })?
-        .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "wyrd_event_time must be TimestampMicrosecond".to_owned(),
-        })
+/// microsecond or nanosecond timestamp, which a stamped batch of a registered
+/// table never is.
+fn time_values<'a>(
+    batch: &'a RecordBatch,
+    axis: &TimeAxis,
+) -> Result<TimeColumnValues<'a>, ScribeError> {
+    axis.values(batch).ok_or_else(|| ScribeError::Internal {
+        detail: format!(
+            "time column {} is missing or not a microsecond or nanosecond timestamp",
+            axis.column()
+        ),
+    })
 }
 
-/// Buckets one event instant into its exact partition.
+/// Buckets row `index` of the time column into its exact partition.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::Internal`] when truncation to the partition boundary
-/// is not representable, which no admitted event time can reach.
+/// Returns [`ScribeError::InvalidFrame`] for a null instant and for an instant
+/// whose partition is not representable — its boundaries outside chrono's
+/// range or its Iceberg transform value outside `i32` — so such a request is
+/// refused whole rather than written.
 fn bucket(
     granularity: TimeGranularity,
-    event_time: DateTime<Utc>,
+    values: TimeColumnValues<'_>,
+    index: usize,
 ) -> Result<TimePartition, ScribeError> {
+    let micros = values
+        .floor_micros(index)
+        .ok_or(ScribeError::InvalidFrame)?;
+    let instant =
+        DateTime::<Utc>::from_timestamp_micros(micros).ok_or(ScribeError::InvalidFrame)?;
     granularity
-        .bucket(event_time)
-        .map_err(|error| ScribeError::Internal {
-            detail: format!("event time cannot be bucketed: {error}"),
-        })
+        .bucket(instant)
+        .map_err(|_| ScribeError::InvalidFrame)
 }
 
 /// Counts one current source into an owned fixed-capacity partition plan.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError`] for a missing, null, mistyped, or invalid event-time
-/// column, checked row-count overflow, or more than [`MAX_TIME_PARTITIONS`]
-/// distinct partitions.
+/// Returns [`ScribeError::Internal`] for a missing or mistyped time column and
+/// checked row-count overflow, and [`ScribeError::InvalidFrame`] for a null or
+/// unrepresentable instant or more than [`MAX_TIME_PARTITIONS`] distinct
+/// partitions, so nothing of the request is written.
 pub(crate) fn plan_time_partitions(
     batch: &RecordBatch,
-    granularity: TimeGranularity,
+    axis: &TimeAxis,
 ) -> Result<TimePartitionPlan, ScribeError> {
-    let ts_array = event_time_array(batch)?;
+    let values = time_values(batch, axis)?;
 
     let mut partitions: [Option<TimePartition>; MAX_TIME_PARTITIONS] = [None; MAX_TIME_PARTITIONS];
     let mut counts = [0_usize; MAX_TIME_PARTITIONS];
     let mut partition_count = 0_usize;
-    for index in 0..ts_array.len() {
-        if ts_array.is_null(index) {
-            return Err(ScribeError::Internal {
-                detail: "wyrd_event_time cannot be null".to_string(),
-            });
-        }
-        let micros = ts_array.value(index);
-        let timestamp = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
-            ScribeError::Internal {
-                detail: format!("invalid timestamp micros: {micros}"),
-            }
-        })?;
-        let partition = bucket(granularity, timestamp)?;
+    for index in 0..values.len() {
+        let partition = bucket(axis.granularity(), values, index)?;
         let position = partitions[..partition_count]
             .binary_search_by(|candidate| {
                 candidate.map_or(std::cmp::Ordering::Less, |value| value.cmp(&partition))
@@ -386,6 +380,7 @@ pub(crate) fn plan_time_partitions(
         partitions,
         counts,
         partition_count,
+        axis: axis.clone(),
     })
 }
 
@@ -406,12 +401,20 @@ mod tests {
         TimePartition::new(granularity, start).expect("fixture timestamp is a boundary")
     }
 
-    /// Builds a two-column batch whose event times are the supplied micros.
+    /// Time column every fixture batch partitions on.
+    const TIME_COLUMN: &str = "started_at";
+
+    /// Builds the fixture time axis at `granularity`.
+    fn axis(granularity: TimeGranularity) -> TimeAxis {
+        TimeAxis::new(TIME_COLUMN, granularity)
+    }
+
+    /// Builds a two-column batch whose time-column values are the supplied micros.
     fn batch_with_event_times(micros: Vec<i64>) -> RecordBatch {
         let values: Vec<i64> = (0..micros.len().try_into().expect("row count fits i64")).collect();
         let schema = Arc::new(Schema::new(vec![
             Field::new(
-                "wyrd_event_time",
+                TIME_COLUMN,
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
@@ -467,7 +470,7 @@ mod tests {
     fn one_partition_split_reuses_arrow_value_buffers() {
         let source = batch_with_event_times(vec![1_784_040_000_000_000, 1_784_040_060_000_000]);
 
-        let slices = split_batch_by_time_partition(&source, TimeGranularity::Hour)
+        let slices = split_batch_by_time_partition(&source, &axis(TimeGranularity::Hour))
             .expect("split plan")
             .collect::<Result<Vec<_>, _>>()
             .expect("split");
@@ -487,7 +490,7 @@ mod tests {
             1_784_019_660_000_000,
         ]);
 
-        let hourly = split_batch_by_time_partition(&source, TimeGranularity::Hour)
+        let hourly = split_batch_by_time_partition(&source, &axis(TimeGranularity::Hour))
             .expect("hourly plan")
             .collect::<Result<Vec<_>, _>>()
             .expect("hourly split");
@@ -497,7 +500,7 @@ mod tests {
         assert_ne!(hourly[0].0, hourly[1].0);
         assert!(hourly[0].0 < hourly[1].0);
 
-        let daily = split_batch_by_time_partition(&source, TimeGranularity::Day)
+        let daily = split_batch_by_time_partition(&source, &axis(TimeGranularity::Day))
             .expect("daily plan")
             .collect::<Result<Vec<_>, _>>()
             .expect("daily split");
@@ -506,9 +509,9 @@ mod tests {
     }
 
     /// Exactly 32 distinct partitions are admitted from one source and the
-    /// thirty-third is rejected before any WAL work.
+    /// thirty-third refuses the whole request before any WAL work.
     #[test]
-    fn thirty_two_partitions_are_admitted_and_thirty_three_are_rejected() {
+    fn thirty_three_partitions_refuse_the_request() {
         let hour_micros = 3_600_000_000_i64;
         let base = 1_784_016_000_000_000_i64;
 
@@ -517,8 +520,8 @@ mod tests {
                 .map(|index| base + hour_micros * i64::try_from(index).expect("index fits i64"))
                 .collect(),
         );
-        let plan =
-            plan_time_partitions(&admitted, TimeGranularity::Hour).expect("32 partitions admitted");
+        let plan = plan_time_partitions(&admitted, &axis(TimeGranularity::Hour))
+            .expect("32 partitions admitted");
         assert_eq!(plan.len(), MAX_TIME_PARTITIONS);
 
         let rejected = batch_with_event_times(
@@ -527,8 +530,51 @@ mod tests {
                 .collect(),
         );
         assert!(matches!(
-            plan_time_partitions(&rejected, TimeGranularity::Hour),
+            plan_time_partitions(&rejected, &axis(TimeGranularity::Hour)),
             Err(ScribeError::InvalidFrame)
         ));
+    }
+
+    /// Any representable instant is accepted at either precision, years from
+    /// now in both directions, while an instant whose partition cannot be
+    /// represented is refused as an invalid frame instead of panicking.
+    #[test]
+    fn any_representable_instant_is_bucketed_and_extremes_are_refused() {
+        let year_micros = 365 * 86_400 * 1_000_000_i64;
+        let now = 1_784_016_000_000_000_i64;
+        let far = batch_with_event_times(vec![now - 40 * year_micros, now + 40 * year_micros]);
+        let plan = plan_time_partitions(&far, &axis(TimeGranularity::Hour))
+            .expect("instants decades away are accepted");
+        assert_eq!(plan.len(), 2);
+
+        let nanos = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                TIME_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                false,
+            )])),
+            vec![Arc::new(
+                arrow::array::TimestampNanosecondArray::from(vec![-1_i64, 0])
+                    .with_timezone("+00:00"),
+            )],
+        )
+        .expect("nanosecond batch builds");
+        let plan = plan_time_partitions(&nanos, &axis(TimeGranularity::Hour))
+            .expect("nanosecond instants are accepted");
+        assert_eq!(
+            plan.len(),
+            2,
+            "one nanosecond before the epoch is the prior hour"
+        );
+
+        for extreme in [i64::MIN, i64::MAX] {
+            assert!(matches!(
+                plan_time_partitions(
+                    &batch_with_event_times(vec![extreme]),
+                    &axis(TimeGranularity::Hour)
+                ),
+                Err(ScribeError::InvalidFrame)
+            ));
+        }
     }
 }

@@ -45,8 +45,7 @@ use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuthMethod, NodeId, NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire,
-    TimeGranularityWire,
+    AuthMethod, NodeId, NullOrderWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass, QueryTerminalOutcome, QueryWarning};
 use wyrd_spec::vala::error::BifrostError;
@@ -1036,46 +1035,34 @@ async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, Journey
     Ok(ids)
 }
 
-/// Appends one journey row carrying a caller-chosen managed event time.
+/// Appends one journey row through public IPC ingest on `client`'s node.
 ///
-/// The write door refuses to declare `wyrd_event_time`, but public IPC ingest
-/// accepts a supplied value and Scribe lifts it verbatim into the managed
-/// slot, which is how a live row is placed in a chosen time partition.
+/// Raw IPC ingest lands the row in the Scribe of the node `client` targets,
+/// which is how a case places a live row on a chosen owner. With
+/// `event_time_micros`, the row also carries [`EVENT_TIME`] and the table must
+/// be one [`register_timed_table`] registered, so the value decides the hour
+/// partition; without it the row partitions on its ingest instant.
 ///
 /// # Errors
 ///
 /// Returns an error when the client cannot connect or ingest refuses the row.
-async fn append_event_time_row(
+async fn append_live_row(
     client: &WyrdClient,
     table: &str,
     id: i64,
-    event_time_micros: i64,
+    event_time_micros: Option<i64>,
 ) -> Result<(), JourneyError> {
-    let mut fields = journey_schema()
-        .fields()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    fields.push(Arc::new(arrow::datatypes::Field::new(
-        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-        arrow::datatypes::DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            Some("UTC".into()),
-        ),
-        false,
-    )));
-    let batch = RecordBatch::try_new(
-        Arc::new(arrow::datatypes::Schema::new(fields)),
+    let mut batch = RecordBatch::try_new(
+        journey_schema(),
         vec![
             Arc::new(arrow::array::Int64Array::from(vec![id])),
             Arc::new(arrow::array::StringArray::from(vec!["live"])),
             Arc::new(arrow::array::StringArray::from(vec![unused_payload(id)])),
-            Arc::new(
-                arrow::array::TimestampMicrosecondArray::from(vec![event_time_micros])
-                    .with_timezone("UTC"),
-            ),
         ],
     )?;
+    if let Some(micros) = event_time_micros {
+        batch = with_event_time(&batch, vec![micros])?;
+    }
     let mut ipc = Vec::new();
     let mut ipc_writer =
         arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())?;
@@ -1137,16 +1124,16 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
     let table = unique_table("oracle_live_routes");
     let table_fqn = format!("vala.bifrost.{table}");
     let first = cluster.server(0).ok_or("missing node 0")?;
-    register_table(first, tenant, &table).await?;
+    register_timed_table(first, tenant, &table).await?;
     let now = chrono::Utc::now();
-    // A week back is inside ingest's accepted window yet in a live partition
-    // the one-hour event-time floor below provably excludes.
+    // A week back is a live partition the one-hour event-time floor below
+    // provably excludes.
     let stale = (now - chrono::Duration::days(7)).timestamp_micros();
     let now = now.timestamp_micros();
     for (index, id, event_time) in [(0_usize, 1_i64, now), (1, 2, now), (2, 3, stale)] {
         let server = cluster.server(index).ok_or("missing writer node")?;
         let writer = client(server, &format!("live-writer-{index}")).await?;
-        append_event_time_row(&writer, &table_fqn, id, event_time).await?;
+        append_live_row(&writer, &table_fqn, id, Some(event_time)).await?;
     }
     cluster.refresh_oracle_snapshots().await?;
     let reader = client(first, "live-route-reader").await?;
@@ -1155,9 +1142,7 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
     let before = scribe_fragment_executions(&cluster)?;
     let pruned = query_ids(
         &reader,
-        format!(
-            "SELECT id FROM {table_fqn} WHERE wyrd_event_time >= TIMESTAMP '{floor}' ORDER BY id"
-        ),
+        format!("SELECT id FROM {table_fqn} WHERE {EVENT_TIME} >= TIMESTAMP '{floor}' ORDER BY id"),
     )
     .await?;
     let pruned_delta = execution_delta(&before, &scribe_fragment_executions(&cluster)?);
@@ -1504,9 +1489,8 @@ async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), Journ
     let writer_node = cluster.server(0).ok_or("missing node 0")?;
     register_table(writer_node, tenant, &table).await?;
     let writer = client(writer_node, "live-lifetime-writer").await?;
-    let now = chrono::Utc::now().timestamp_micros();
     for id in 1..=3 {
-        append_event_time_row(&writer, &table_fqn, id, now).await?;
+        append_live_row(&writer, &table_fqn, id, None).await?;
     }
     cluster.refresh_oracle_snapshots().await?;
     let leader = cluster.server(1).ok_or("missing node 1")?;
@@ -1620,9 +1604,8 @@ async fn seed_published_and_live(
     }
     published_node.flush_bifrost().await?;
     let live = client(live_node, "seed-live-writer").await?;
-    let now = chrono::Utc::now().timestamp_micros();
     for id in 101..=103 {
-        append_event_time_row(&live, &table_fqn, id, now).await?;
+        append_live_row(&live, &table_fqn, id, None).await?;
     }
     cluster.refresh_oracle_snapshots().await?;
     Ok(table_fqn)
@@ -2026,13 +2009,7 @@ async fn remote_staged_footer_refusal_fails_closed() -> Result<(), JourneyError>
     let scribe = cluster.server(1).ok_or("missing node 1")?;
     register_table(leader, tenant, &table).await?;
     let writer = client(scribe, "staged-refusal-writer").await?;
-    append_event_time_row(
-        &writer,
-        &table_fqn,
-        1,
-        chrono::Utc::now().timestamp_micros(),
-    )
-    .await?;
+    append_live_row(&writer, &table_fqn, 1, None).await?;
     scribe.seal_bifrost_writable_for_test().await?;
     let runs = staged_runs(scribe, tenant, &table).await?;
     let foreign = cluster.add_tenant("oracle-staged-foreign").await?;
@@ -2114,8 +2091,10 @@ async fn staged_runs(
 
 /// Rewrites one staged run in place so its footer names `foreign` as tenant.
 ///
-/// Rows, schema and every other footer key are copied unchanged, so the
-/// footer tenant proof is the only check the rewritten run can fail.
+/// Rows, schema and every other footer key are copied unchanged, and the
+/// writer recipe is the one for the journey table's `wyrd_ingested_at` time
+/// column, so the footer tenant proof is the only check the rewritten run can
+/// fail.
 ///
 /// # Errors
 ///
@@ -2136,7 +2115,11 @@ fn rewrite_footer_tenant(run: &Path, foreign: DataTenantId) -> Result<(), Journe
     let schema = builder.schema().clone();
     let batches = builder.build()?.collect::<Result<Vec<_>, _>>()?;
     let mut parquet = Vec::new();
-    let properties = bifrost_writer_properties_with_metadata(metadata, &[]);
+    let properties = bifrost_writer_properties_with_metadata(
+        metadata,
+        wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT,
+        &[],
+    );
     let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
     for batch in &batches {
         writer.write(batch)?;
@@ -2697,15 +2680,15 @@ impl FilteringFixture {
                 .await?;
             fixture
                 .writer
-                .write_batch("vala.traces.spans", &fixture.spans_batch(spans, file)?)
+                .write_batch("vala.traces.spans", &fixture.spans_batch(spans, file))
                 .await?;
             fixture
                 .writer
-                .write_batch("vala.logs.records", &fixture.records_batch(records, file)?)
+                .write_batch("vala.logs.records", &fixture.records_batch(records, file))
                 .await?;
             fixture
                 .writer
-                .write_batch("vala.metrics.points", &fixture.points_batch(points, file)?)
+                .write_batch("vala.metrics.points", &fixture.points_batch(points, file))
                 .await?;
             server.flush_bifrost().await?;
         }
@@ -2718,21 +2701,22 @@ impl FilteringFixture {
     /// # Errors
     ///
     /// Returns the registration or describe error, and an error when the
-    /// resolved partition, sort order, or Bloom columns differ from the
-    /// declaration.
+    /// resolved partition, time column, sort order, or Bloom columns differ
+    /// from the declaration.
     async fn register_custom(&self) -> Result<(), JourneyError> {
         let declared_sort = vec![SortKeyWire {
             column: "key_id".to_owned(),
             direction: SortDirectionWire::Asc,
             null_order: NullOrderWire::Last,
         }];
-        let config =
-            wyrd_client::bifrost::TableConfig::from_arrow(&self.custom_fqn(), custom_schema())?
-                .with_layout(PhysicalLayoutWire {
-                    partition_granularity: TimeGranularityWire::Hour,
-                    sort_keys: declared_sort.clone(),
-                    bloom_columns: vec![CUSTOM_BLOOM_COLUMN.to_owned()],
-                });
+        let config = wyrd_client::bifrost::TableConfig::from_arrow(
+            &self.custom_fqn(),
+            timed_schema(&custom_schema()),
+        )?
+        .with_layout(timed_layout_with(
+            declared_sort.clone(),
+            vec![CUSTOM_BLOOM_COLUMN.to_owned()],
+        ));
         wyrd_client::Bifrost::connect_with_table(self.writer.client(), config)
             .await?
             .register()
@@ -2742,6 +2726,7 @@ impl FilteringFixture {
             .await?
             .physical_layout;
         if resolved.partition_granularity != TimeGranularityWire::Hour
+            || resolved.time_column.as_deref() != Some(EVENT_TIME)
             || resolved.sort_keys != declared_sort
             || !resolved
                 .bloom_columns
@@ -2770,15 +2755,18 @@ impl FilteringFixture {
         self.hour + file * FILTER_SLICE_MICROS
     }
 
-    /// The half-open SQL event-time predicate selecting `file`'s slice.
+    /// The half-open SQL predicate selecting `file`'s slice on `time_column`.
+    ///
+    /// `time_column` is the table's declared time column, so the predicate is
+    /// the one partition and statistics pruning act on.
     ///
     /// # Errors
     ///
     /// Returns an error when a slice bound is not a representable timestamp.
-    fn slice_filter(&self, file: i64) -> Result<String, JourneyError> {
+    fn slice_filter(&self, time_column: &str, file: i64) -> Result<String, JourneyError> {
         let start = self.slice_start(file);
         Ok(format!(
-            "wyrd_event_time >= TIMESTAMP '{}' AND wyrd_event_time < TIMESTAMP '{}'",
+            "{time_column} >= TIMESTAMP '{}' AND {time_column} < TIMESTAMP '{}'",
             sql_timestamp(start)?,
             sql_timestamp(start + FILTER_SLICE_MICROS)?
         ))
@@ -2789,9 +2777,12 @@ impl FilteringFixture {
         self.slice_start(key / CUSTOM_ROWS_PER_FILE) + (key % CUSTOM_ROWS_PER_FILE) * 10_000
     }
 
-    /// The event time of signal row `row` of `file`, inside the file's slice.
-    fn signal_event_time(&self, file: i64, row: i64) -> i64 {
-        self.slice_start(file) + row * 1_000_000
+    /// The `OTLP` instant of signal row `row` of `file`, in Unix nanoseconds.
+    ///
+    /// It lies inside the file's slice and is the row's identity: it is the
+    /// signal table's time column, ascending with `file` and `row`.
+    fn signal_instant(&self, file: i64, row: i64) -> i64 {
+        (self.slice_start(file) + row * 1_000_000) * 1_000
     }
 
     /// One custom slice, written in descending key order so the sealed file's
@@ -2833,13 +2824,13 @@ impl FilteringFixture {
     /// ordinals inside a file's range are never written, which is where the
     /// absent Bloom probe is drawn from. Even rows are roots.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns the Arrow error when the event-time column does not attach.
-    fn spans_batch(&self, schema: &SchemaRef, file: i64) -> Result<RecordBatch, JourneyError> {
+    /// Panics when the described schema does not assemble the rows.
+    fn spans_batch(&self, schema: &SchemaRef, file: i64) -> RecordBatch {
         let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
             .map(|row| {
-                let id = signal_id(file, row);
+                let id = self.signal_instant(file, row);
                 let mut cells = Row::from([
                     (
                         "trace_id",
@@ -2871,24 +2862,19 @@ impl FilteringFixture {
                 cells
             })
             .collect();
-        with_event_time(
-            &batch(schema, &rows),
-            (0..SIGNAL_ROWS_PER_FILE)
-                .map(|row| self.signal_event_time(file, row))
-                .collect(),
-        )
+        batch(schema, &rows)
     }
 
     /// One log slice: even rows are uncorrelated (null `trace_id`) and row 0
     /// carries no event name; severity rises with the row.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns the Arrow error when the event-time column does not attach.
-    fn records_batch(&self, schema: &SchemaRef, file: i64) -> Result<RecordBatch, JourneyError> {
+    /// Panics when the described schema does not assemble the rows.
+    fn records_batch(&self, schema: &SchemaRef, file: i64) -> RecordBatch {
         let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
             .map(|row| {
-                let id = signal_id(file, row);
+                let id = self.signal_instant(file, row);
                 let mut cells = Row::from([
                     ("time_unix_nano", Cell::Int64(id)),
                     ("observed_time_unix_nano", Cell::Int64(id)),
@@ -2911,24 +2897,19 @@ impl FilteringFixture {
                 cells
             })
             .collect();
-        with_event_time(
-            &batch(schema, &rows),
-            (0..SIGNAL_ROWS_PER_FILE)
-                .map(|row| self.signal_event_time(file, row))
-                .collect(),
-        )
+        batch(schema, &rows)
     }
 
     /// One point slice: even rows are integer sums and odd rows are double
     /// gauges, so `int_value` is null on exactly the odd rows.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns the Arrow error when the event-time column does not attach.
-    fn points_batch(&self, schema: &SchemaRef, file: i64) -> Result<RecordBatch, JourneyError> {
+    /// Panics when the described schema does not assemble the rows.
+    fn points_batch(&self, schema: &SchemaRef, file: i64) -> RecordBatch {
         let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
             .map(|row| {
-                let id = signal_id(file, row);
+                let id = self.signal_instant(file, row);
                 let mut cells = Row::from([
                     ("metric_name", Cell::Text(metric_name(file, row))),
                     ("unit", Cell::Text("1".to_owned())),
@@ -2950,12 +2931,7 @@ impl FilteringFixture {
                 cells
             })
             .collect();
-        with_event_time(
-            &batch(schema, &rows),
-            (0..SIGNAL_ROWS_PER_FILE)
-                .map(|row| self.signal_event_time(file, row))
-                .collect(),
-        )
+        batch(schema, &rows)
     }
 
     /// The four tables the fixture writes, as `(namespace, table)`.
@@ -3056,9 +3032,16 @@ impl FilteringFixture {
                 )
                 .into());
             }
-            let objects =
-                SealedObject::read_tier(cluster, server, tenant, namespace, table, cut.tier())
-                    .await?;
+            let objects = SealedObject::read_tier(
+                cluster,
+                server,
+                tenant,
+                namespace,
+                table,
+                filter_time_column(namespace),
+                cut.tier(),
+            )
+            .await?;
             let forge_outputs = objects
                 .iter()
                 .filter(|object| object.path.contains(FORGE_DATA_SEGMENT))
@@ -3311,7 +3294,7 @@ impl FilteringFixture {
                 name: "custom event-time slice".to_owned(),
                 sql: format!(
                     "SELECT key_id AS id FROM {custom} WHERE {} ORDER BY id",
-                    self.slice_filter(2)?
+                    self.slice_filter(EVENT_TIME, 2)?
                 ),
                 expected: custom_keys(2).collect(),
             },
@@ -3328,7 +3311,10 @@ impl FilteringFixture {
         for (name, filter, expected) in [
             (
                 "custom mixed key/time match",
-                format!("label = 'label-04' AND {}", self.slice_filter(1)?),
+                format!(
+                    "label = 'label-04' AND {}",
+                    self.slice_filter(EVENT_TIME, 1)?
+                ),
                 custom_where(&|key| {
                     key / CUSTOM_ROWS_PER_FILE == 1
                         && custom_label(key).as_deref() == Some("label-04")
@@ -3336,7 +3322,10 @@ impl FilteringFixture {
             ),
             (
                 "custom mixed key/time miss",
-                format!("key_id = {CUSTOM_PROBE_KEY} AND {}", self.slice_filter(2)?),
+                format!(
+                    "key_id = {CUSTOM_PROBE_KEY} AND {}",
+                    self.slice_filter(EVENT_TIME, 2)?
+                ),
                 Vec::new(),
             ),
             (
@@ -3456,12 +3445,13 @@ impl FilteringFixture {
             (0..FILTER_FILES)
                 .flat_map(|file| (0..SIGNAL_ROWS_PER_FILE).map(move |row| (file, row)))
                 .filter(|(file, row)| keep(*file, *row))
-                .map(|(file, row)| signal_id(file, row))
+                .map(|(file, row)| self.signal_instant(file, row))
                 .collect()
         };
         let trace = |file: i64, ordinal: i64| hex::encode(fixture_trace_id(file, ordinal));
 
-        for (table, id) in [
+        // Each signal row's identity is its time column's Unix nanoseconds.
+        for (table, time) in [
             ("vala.traces.spans", "start_time_unix_nano"),
             ("vala.logs.records", "time_unix_nano"),
             ("vala.metrics.points", "time_unix_nano"),
@@ -3471,7 +3461,7 @@ impl FilteringFixture {
                 reader,
                 FilterCase {
                     name: format!("{table} unfiltered"),
-                    sql: format!("SELECT {id} AS id FROM {table} ORDER BY id"),
+                    sql: format!("SELECT CAST({time} AS BIGINT) AS id FROM {table} ORDER BY id"),
                     expected: signals(&|_, _| true),
                 },
             )
@@ -3483,8 +3473,8 @@ impl FilteringFixture {
                 FilterCase {
                     name: format!("{table} event-time slice"),
                     sql: format!(
-                        "SELECT {id} AS id FROM {table} WHERE {} ORDER BY id",
-                        self.slice_filter(0)?
+                        "SELECT CAST({time} AS BIGINT) AS id FROM {table} WHERE {} ORDER BY id",
+                        self.slice_filter(time, 0)?
                     ),
                     expected: signals(&|file, _| file == 0),
                 },
@@ -3499,7 +3489,7 @@ impl FilteringFixture {
             FilterCase {
                 name: "spans absent trace id within bounds".to_owned(),
                 sql: format!(
-                    "SELECT start_time_unix_nano AS id FROM vala.traces.spans \
+                    "SELECT CAST(start_time_unix_nano AS BIGINT) AS id FROM vala.traces.spans \
                      WHERE trace_id = X'{}' ORDER BY id",
                     hex::encode(probes.span_probe)
                 ),
@@ -3524,7 +3514,9 @@ impl FilteringFixture {
         )?;
         expect_measure("spans absent trace", "bloom", absent.bloom_pruned, 1.0)?;
 
-        for (name, table, id, filter, expected) in [
+        let spans_time = |file| self.slice_filter("start_time_unix_nano", file);
+        let signal_time = |file| self.slice_filter("time_unix_nano", file);
+        for (name, table, time, filter, expected) in [
             (
                 "spans trace present",
                 "vala.traces.spans",
@@ -3536,22 +3528,14 @@ impl FilteringFixture {
                 "spans mixed trace/time match",
                 "vala.traces.spans",
                 "start_time_unix_nano",
-                format!(
-                    "trace_id = X'{}' AND {}",
-                    trace(2, 4),
-                    self.slice_filter(2)?
-                ),
+                format!("trace_id = X'{}' AND {}", trace(2, 4), spans_time(2)?),
                 signals(&|file, row| file == 2 && row == 2),
             ),
             (
                 "spans mixed trace/time miss",
                 "vala.traces.spans",
                 "start_time_unix_nano",
-                format!(
-                    "trace_id = X'{}' AND {}",
-                    trace(2, 4),
-                    self.slice_filter(0)?
-                ),
+                format!("trace_id = X'{}' AND {}", trace(2, 4), spans_time(0)?),
                 Vec::new(),
             ),
             (
@@ -3586,7 +3570,7 @@ impl FilteringFixture {
                 "records uncorrelated in slice",
                 "vala.logs.records",
                 "time_unix_nano",
-                format!("trace_id IS NULL AND {}", self.slice_filter(1)?),
+                format!("trace_id IS NULL AND {}", signal_time(1)?),
                 signals(&|file, row| file == 1 && row % 2 == 0),
             ),
             (
@@ -3614,7 +3598,7 @@ impl FilteringFixture {
                 "points mixed type/time",
                 "vala.metrics.points",
                 "time_unix_nano",
-                format!("metric_type = 'sum' AND {}", self.slice_filter(2)?),
+                format!("metric_type = 'sum' AND {}", signal_time(2)?),
                 signals(&|file, row| file == 2 && row % 2 == 0),
             ),
         ] {
@@ -3623,7 +3607,9 @@ impl FilteringFixture {
                 reader,
                 FilterCase {
                     name: name.to_owned(),
-                    sql: format!("SELECT {id} AS id FROM {table} WHERE {filter} ORDER BY id"),
+                    sql: format!(
+                        "SELECT CAST({time} AS BIGINT) AS id FROM {table} WHERE {filter} ORDER BY id"
+                    ),
                     expected,
                 },
             )
@@ -3703,8 +3689,8 @@ struct SealedObject {
 }
 
 impl SealedObject {
-    /// Reads every object of one table in `tier`, ordered by its first event
-    /// time.
+    /// Reads every object of one table in `tier`, ordered by the earliest
+    /// value of the table's `time_column`.
     ///
     /// Hot objects are the table's unpromoted `vala.file_list` rows; Iceberg
     /// objects are the data files the table's current snapshot plans.
@@ -3718,6 +3704,7 @@ impl SealedObject {
         tenant: DataTenantId,
         namespace: BifrostNamespace,
         table: &str,
+        time_column: &str,
         tier: PhysicalTier,
     ) -> Result<Vec<Self>, JourneyError> {
         let catalog = server
@@ -3766,26 +3753,39 @@ impl SealedObject {
         }
         let mut keyed = objects
             .into_iter()
-            .map(|object| object.first_event_time().map(|first| (first, object)))
+            .map(|object| {
+                object
+                    .first_instant(time_column)
+                    .map(|first| (first, object))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         keyed.sort_by_key(|(first, _)| *first);
         Ok(keyed.into_iter().map(|(_, object)| object).collect())
     }
 
-    /// The earliest `wyrd_event_time` this object holds.
+    /// The earliest raw value of `time_column` this object holds, in the
+    /// column's own unit.
+    ///
+    /// The value only orders one table's objects, so the unit never has to be
+    /// compared across tables.
     ///
     /// # Errors
     ///
-    /// Returns an error when the column is missing, mistyped, or empty.
-    fn first_event_time(&self) -> Result<i64, JourneyError> {
+    /// Returns an error when the column is missing, not a timestamp, or empty.
+    fn first_instant(&self, time_column: &str) -> Result<i64, JourneyError> {
         let column = self
             .rows
-            .column_by_name(wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME)
-            .ok_or_else(|| format!("{}: no event-time column", self.path))?
+            .column_by_name(time_column)
+            .ok_or_else(|| format!("{}: no {time_column} column", self.path))?;
+        if !matches!(column.data_type(), DataType::Timestamp(_, _)) {
+            return Err(format!("{}: {time_column} is not a timestamp", self.path).into());
+        }
+        let raw = arrow::compute::cast(column, &DataType::Int64)?;
+        let raw = raw
             .as_any()
-            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-            .ok_or_else(|| format!("{}: event time is not microseconds", self.path))?;
-        arrow::compute::min(column).ok_or_else(|| format!("{}: no event time", self.path).into())
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| format!("{}: {time_column} did not cast to Int64", self.path))?;
+        arrow::compute::min(raw).ok_or_else(|| format!("{}: no {time_column}", self.path).into())
     }
 
     /// Requires the rows to be in `keys` order.
@@ -4074,8 +4074,21 @@ pub(crate) fn expect_measure(
     Ok(())
 }
 
+/// The time column a filtering-fixture table in `namespace` declares.
+///
+/// The custom dataset declares [`EVENT_TIME`]; each signal table declares its
+/// built-in `OTLP` instant.
+fn filter_time_column(namespace: BifrostNamespace) -> &'static str {
+    match namespace {
+        BifrostNamespace::Traces => "start_time_unix_nano",
+        BifrostNamespace::Logs | BifrostNamespace::Metrics => "time_unix_nano",
+        _ => EVENT_TIME,
+    }
+}
+
 /// The custom dataset's user schema: a sort key, a nullable Bloom key, and a
-/// value column with neither.
+/// value column with neither. Registration and batches append [`EVENT_TIME`]
+/// through [`timed_schema`].
 fn custom_schema() -> SchemaRef {
     Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("key_id", arrow::datatypes::DataType::Int64, false),
@@ -4094,11 +4107,6 @@ fn custom_keys(file: i64) -> Range<i64> {
 /// file's bounds without ever being written.
 fn custom_label(key: i64) -> Option<String> {
     (key % 10 != 0).then(|| format!("label-{:02}", 2 * (key % 8)))
-}
-
-/// The row identity of signal row `row` of `file`.
-fn signal_id(file: i64, row: i64) -> i64 {
-    file * 100 + row + 1
 }
 
 /// A fixture trace id whose last two bytes are `file` and `ordinal`.
@@ -4144,27 +4152,21 @@ fn sql_timestamp(micros: i64) -> Result<String, JourneyError> {
     )
 }
 
-/// Appends a caller-supplied `wyrd_event_time` to `batch`.
+/// Appends a caller-supplied [`EVENT_TIME`] column to `batch`.
+///
+/// The result has [`timed_schema`] of the batch's schema, which is what a
+/// table registered with [`timed_layout`] declares.
 ///
 /// # Errors
 ///
 /// Returns the Arrow error when the column count differs from the rows.
 fn with_event_time(batch: &RecordBatch, micros: Vec<i64>) -> Result<RecordBatch, JourneyError> {
-    let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
-    fields.push(Arc::new(arrow::datatypes::Field::new(
-        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-        arrow::datatypes::DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            Some("UTC".into()),
-        ),
-        false,
-    )));
     let mut columns = batch.columns().to_vec();
     columns.push(Arc::new(
         arrow::array::TimestampMicrosecondArray::from(micros).with_timezone("UTC"),
     ));
     Ok(RecordBatch::try_new(
-        Arc::new(arrow::datatypes::Schema::new(fields)),
+        timed_schema(&batch.schema()),
         columns,
     )?)
 }
@@ -4219,12 +4221,9 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
         direction: SortDirectionWire::Asc,
         null_order: NullOrderWire::Last,
     }];
-    let config = wyrd_client::bifrost::TableConfig::from_arrow(&fqn, binary_key_schema())?
-        .with_layout(PhysicalLayoutWire {
-            partition_granularity: TimeGranularityWire::Hour,
-            sort_keys: sort_keys.clone(),
-            bloom_columns: Vec::new(),
-        });
+    let config =
+        wyrd_client::bifrost::TableConfig::from_arrow(&fqn, timed_schema(&binary_key_schema()))?
+            .with_layout(timed_layout_with(sort_keys.clone(), Vec::new()));
     wyrd_client::Bifrost::connect_with_table(rows.client(), config)
         .await?
         .register()
@@ -4261,6 +4260,7 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
         tenant,
         BifrostNamespace::Datasets,
         &table,
+        EVENT_TIME,
         PhysicalTier::Iceberg,
     )
     .await?;
@@ -4297,7 +4297,7 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
         (
             "fixed-size key and time",
             format!(
-                "fixed_key = X'{probe_fixed}' AND wyrd_event_time >= TIMESTAMP '{}'",
+                "fixed_key = X'{probe_fixed}' AND {EVENT_TIME} >= TIMESTAMP '{}'",
                 sql_timestamp(event_time(BINARY_PROBE_ROW))?
             ),
         ),

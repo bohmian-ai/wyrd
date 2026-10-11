@@ -149,9 +149,8 @@ pub fn fieldspec_to_arrow(fields: &[FieldSpec]) -> Result<Schema, BifrostError> 
 /// Build the Arrow schema a writer sends for one described table.
 ///
 /// The layout is the table's own `user_fields`, then its declared correlation
-/// inputs in description order, then — only when `include_event_time` — the
-/// managed candidates the writer chooses to supply itself. Everything else on
-/// the physical table is server-stamped and must not appear on the wire.
+/// inputs in description order. Every managed column on the physical table is
+/// server-stamped and must not appear on the wire.
 ///
 /// Use this for a direct Arrow writer; `wyrd_queue::RowPreflight::from_description`
 /// is the JSON-row path and appends correlation itself.
@@ -159,21 +158,13 @@ pub fn fieldspec_to_arrow(fields: &[FieldSpec]) -> Result<Schema, BifrostError> 
 /// # Errors
 ///
 /// Returns [`BifrostError::SchemaParse`] when the description declares a
-/// column name twice across its three field classes, which would make the
-/// batch ambiguous.
-pub fn writable_schema(
-    description: &BifrostTableDescription,
-    include_event_time: bool,
-) -> Result<Schema, BifrostError> {
+/// column name twice across its two field classes, which would make the batch
+/// ambiguous.
+pub fn writable_schema(description: &BifrostTableDescription) -> Result<Schema, BifrostError> {
     let declared = description
         .user_fields
         .iter()
-        .chain(&description.correlation_fields)
-        .chain(if include_event_time {
-            description.managed_candidates.as_slice()
-        } else {
-            &[]
-        });
+        .chain(&description.correlation_fields);
     let mut fields = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for spec in declared {

@@ -23,7 +23,7 @@ use wyrd_spec::DataTenantId;
 
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
-use crate::catalog::layout::TimePartition;
+use crate::catalog::layout::{TimePartition, TimePrecision};
 use crate::contracts::ScribeError;
 use crate::parquet::footer::BifrostFooterIdentity;
 use crate::parquet::variant_residual::{VariantWriter, variant_residual_share};
@@ -224,9 +224,9 @@ pub struct BoundedParquetArtifact {
 pub struct RowGroupStats {
     /// Number of rows in this row group.
     pub row_count: usize,
-    /// Minimum `wyrd_event_time` timestamp (microseconds since epoch).
+    /// Time-column minimum, floored to epoch microseconds.
     pub min_event_time: Option<i64>,
-    /// Maximum `wyrd_event_time` timestamp (microseconds since epoch).
+    /// Time-column maximum, ceiled to epoch microseconds.
     pub max_event_time: Option<i64>,
 }
 
@@ -619,6 +619,7 @@ impl<'a> RollingArtifactWriter<'a> {
             physical,
             Some(bifrost_writer_properties_with_metadata(
                 Vec::new(),
+                self.plan.layout.time_column(),
                 self.plan.layout.bloom_columns(),
             )),
         )
@@ -680,6 +681,7 @@ impl<'a> RollingArtifactWriter<'a> {
             &scratch_path,
             schema.as_ref(),
             &object_identity,
+            self.plan.layout.time_column(),
             self.plan.tenant,
             file_size,
         )?;
@@ -784,7 +786,7 @@ fn sort_batch(batch: &RecordBatch, layout: &PhysicalLayout) -> Result<RecordBatc
 /// metrics are taken from that single read rather than from two passes that
 /// could disagree.
 struct SealedArtifactEvidence {
-    /// Per-row-group event-time statistics in write order.
+    /// Per-row-group time-column statistics in write order.
     row_group_stats: Vec<RowGroupStats>,
     /// Iceberg-ready metrics for the whole object.
     data_file_metrics: crate::scribe::promotion::ScribeDataFileV1,
@@ -797,7 +799,7 @@ struct SealedArtifactEvidence {
 /// Validates one sealed artifact and returns everything its footer proves.
 ///
 /// The footer must parse, carry this artifact's schema fingerprint and object
-/// identity, and give every row group event-time statistics. Row-group and
+/// identity, and give every row group time-column statistics. Row-group and
 /// footer sizes are not checked: they follow from soft writer targets, and a
 /// large accepted row is valid data rather than a defect.
 ///
@@ -810,6 +812,7 @@ fn inspect_sealed_artifact(
     path: &Path,
     expected_schema: &Schema,
     expected_object_identity: &str,
+    time_column: &str,
     tenant: DataTenantId,
     file_size: u64,
 ) -> Result<SealedArtifactEvidence, ScribeError> {
@@ -826,10 +829,17 @@ fn inspect_sealed_artifact(
     BifrostFooterIdentity::new(expected_schema, expected_object_identity, tenant)
         .and_then(|identity| identity.verify(metadata.file_metadata()))
         .map_err(|detail| ScribeError::Internal { detail })?;
+    let precision = expected_schema
+        .field_with_name(time_column)
+        .ok()
+        .and_then(|field| TimePrecision::of(field.data_type()))
+        .ok_or_else(|| ScribeError::Internal {
+            detail: format!("artifact schema has no time column {time_column}"),
+        })?;
     let mut row_group_stats = Vec::new();
 
     for rg in metadata.row_groups() {
-        row_group_stats.push(extract_row_group_time_range(rg)?);
+        row_group_stats.push(extract_row_group_time_range(rg, time_column, precision)?);
     }
 
     let data_file_metrics = derive_data_file_metrics(
@@ -912,53 +922,40 @@ fn checksum_file(path: &Path) -> Result<String, ScribeError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Extract min/max event time from a single row group.
+/// Extracts one row group's row count and inclusive time-column interval.
+///
+/// The interval is read from the footer's typed `INT64` statistics of the
+/// top-level `time_column` leaf and narrowed to epoch microseconds through
+/// `precision`, so a nanosecond column yields the same conservative interval
+/// every other reader derives.
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] if column stats are missing.
-fn extract_row_group_time_range(rg: &RowGroupMetaData) -> Result<RowGroupStats, ScribeError> {
-    // Parquet row-group `num_rows()` is i64; RowGroupStats.row_count is usize.
-    // A negative row count would be a Parquet-writer invariant violation.
+/// Returns [`ScribeError::Internal`] when the row count is negative or the
+/// time column is absent from the row group or carries no `INT64` statistics.
+fn extract_row_group_time_range(
+    rg: &RowGroupMetaData,
+    time_column: &str,
+    precision: TimePrecision,
+) -> Result<RowGroupStats, ScribeError> {
     let row_count = usize::try_from(rg.num_rows()).map_err(|_| ScribeError::Internal {
         detail: format!("row group has invalid num_rows: {}", rg.num_rows()),
     })?;
-
-    // Find wyrd_event_time column index (column order matches Arrow schema order)
     let time_col = rg
         .columns()
         .iter()
-        .find(|col| col.column_descr().name() == "wyrd_event_time")
+        .find(|col| col.column_descr().path().parts() == [time_column])
         .ok_or_else(|| ScribeError::Internal {
-            detail: "wyrd_event_time column not found in row group".to_string(),
+            detail: format!("time column {time_column} not found in row group"),
         })?;
-
-    let stats = time_col.statistics().ok_or_else(|| ScribeError::Internal {
-        detail: "wyrd_event_time column has no statistics".to_string(),
-    })?;
-
-    // Extract min/max as i64 (TimestampMicrosecondType)
-    let min = if let Some(min_val) = stats.min_bytes_opt() {
-        min_val.get(0..8).and_then(|b| {
-            let arr: [u8; 8] = b.try_into().ok()?;
-            Some(i64::from_le_bytes(arr))
-        })
-    } else {
-        None
+    let Some(parquet::file::statistics::Statistics::Int64(stats)) = time_col.statistics() else {
+        return Err(ScribeError::Internal {
+            detail: format!("time column {time_column} has no INT64 statistics"),
+        });
     };
-
-    let max = if let Some(max_val) = stats.max_bytes_opt() {
-        max_val.get(0..8).and_then(|b| {
-            let arr: [u8; 8] = b.try_into().ok()?;
-            Some(i64::from_le_bytes(arr))
-        })
-    } else {
-        None
-    };
-
     Ok(RowGroupStats {
         row_count,
-        min_event_time: min,
-        max_event_time: max,
+        min_event_time: stats.min_opt().map(|min| precision.floor_micros(*min)),
+        max_event_time: stats.max_opt().map(|max| precision.ceil_micros(*max)),
     })
 }
 
@@ -1099,30 +1096,6 @@ mod tests {
         assert_candidates_cover_batches_within_bounds(&second.1, &second_candidates);
     }
 
-    /// Builds the canonical hourly write recipe for a test schema.
-    ///
-    /// Tests exercise the same resolution path production uses: declare the
-    /// built-in hourly layout, then let `PhysicalLayout::resolve` union the
-    /// managed Bloom floor.
-    ///
-    /// The fixture schema carries none of the floor columns, so the Bloom
-    /// intent is declared explicitly. `wyrd_event_time` is a legal declared
-    /// Bloom column and is not constant within a file.
-    ///
-    /// # Panics
-    /// Panics when the schema cannot carry the built-in declaration.
-    fn test_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::resolve(
-            "vala.bifrost.test",
-            schema,
-            Some(&crate::tables::hourly_layout(
-                vec![crate::tables::sort_asc("wyrd_event_time")],
-                &["wyrd_event_time"],
-            )),
-        )
-        .expect("test schema carries the built-in hourly layout")
-    }
-
     fn build_test_frozen(
         seal_partition: TimePartition,
         seal_tenant: DataTenantId,
@@ -1132,7 +1105,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("service", DataType::Utf8, false),
             Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
@@ -1174,7 +1147,7 @@ mod tests {
         tenant: DataTenantId,
     ) -> (tempfile::TempDir, ParquetEncoded) {
         let scratch = tempfile::tempdir().expect("test scratch");
-        let layout = test_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let encoded = encode_batch(
             frozen,
             binding,
@@ -1193,7 +1166,7 @@ mod tests {
         let row_count = i64::try_from(rows).expect("test row count fits i64");
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             )])),
@@ -1211,7 +1184,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let day = crate::test_support::day_partition(2026, 7, 14);
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]));
@@ -1257,7 +1230,7 @@ mod tests {
     /// either, so the encoded size tracks the row count.
     fn incompressible_frozen(tenant: DataTenantId, rows: usize) -> FrozenMemtable {
         let mut fields = vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )];
@@ -1312,7 +1285,7 @@ mod tests {
         scratch_dir: &Path,
         target_object_bytes: u64,
     ) -> Result<ParquetEncoded, ScribeError> {
-        let layout = test_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         ParquetBatchEncoder {
             frozen,
             binding,
@@ -1746,7 +1719,7 @@ mod tests {
             .expect("encoded row group")
             .expect("encoded batch");
         let times = batch
-            .column_by_name("wyrd_event_time")
+            .column_by_name("event_time")
             .expect("event time")
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -1779,7 +1752,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("service", DataType::Utf8, false),
             Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
@@ -1884,7 +1857,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let day = crate::test_support::day_partition(2026, 7, 14);
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]));
@@ -1925,7 +1898,7 @@ mod tests {
         assert_encoded_rows(&encoded, tenant, &[10, 20, 30, 40]);
 
         let mismatch_scratch = tempfile::tempdir().expect("mismatch scratch");
-        let layout = test_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let error = encode_batch(
             &frozen,
             &binding,
@@ -1991,7 +1964,7 @@ mod tests {
             .unwrap();
 
         let time_col = batch
-            .column_by_name("wyrd_event_time")
+            .column_by_name("event_time")
             .unwrap()
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -2040,7 +2013,7 @@ mod tests {
         let col = rg
             .columns()
             .iter()
-            .find(|column| column.column_descr().name() == "wyrd_event_time")
+            .find(|column| column.column_descr().name() == "event_time")
             .unwrap();
         assert!(
             col.bloom_filter_offset().is_some(),
@@ -2103,7 +2076,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("service", DataType::Utf8, false),
             arrow::datatypes::Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
                 false,
             ),
@@ -2117,7 +2090,7 @@ mod tests {
         )
         .unwrap();
 
-        let layout = test_layout(batch.schema().as_ref());
+        let layout = crate::tables::hourly_test_layout(batch.schema().as_ref());
         let sorted = sort_batch(&batch, &layout).unwrap();
         let services = sorted
             .column_by_name("service")
@@ -2126,7 +2099,7 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         let times = sorted
-            .column_by_name("wyrd_event_time")
+            .column_by_name("event_time")
             .unwrap()
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -2138,7 +2111,7 @@ mod tests {
 
     /// A real sealed file proves the writer recipe on its own footer rather
     /// than on the builder that produced it: the low-cardinality
-    /// `service` column encodes through a dictionary, `wyrd_event_time`
+    /// `service` column encodes through a dictionary, `event_time`
     /// encodes as `DELTA_BINARY_PACKED` with no dictionary page, and every row
     /// decodes back exactly as written.
     #[test]
@@ -2179,16 +2152,16 @@ mod tests {
                         "low-cardinality {name} must be dictionary-encoded, saw {encodings:?}"
                     );
                 }
-                if name == "wyrd_event_time" {
+                if name == "event_time" {
                     saw_event_time = true;
                     assert!(
                         encodings.contains(&parquet::basic::Encoding::DELTA_BINARY_PACKED),
-                        "wyrd_event_time must be DELTA_BINARY_PACKED, saw {encodings:?}"
+                        "event_time must be DELTA_BINARY_PACKED, saw {encodings:?}"
                     );
                     assert!(
                         !encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
                             && !encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
-                        "wyrd_event_time must not carry a dictionary page, saw {encodings:?}"
+                        "event_time must not carry a dictionary page, saw {encodings:?}"
                     );
                 }
             }
@@ -2210,7 +2183,7 @@ mod tests {
         let mut decoded_times = Vec::with_capacity(decoded_rows);
         for batch in &batches {
             let column = batch
-                .column_by_name("wyrd_event_time")
+                .column_by_name("event_time")
                 .expect("decoded event-time column")
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
@@ -2234,7 +2207,7 @@ mod tests {
             TenantTableBinding::resolve((binding_tenant, frozen.seal_key.table.clone())).unwrap();
 
         let scratch = tempfile::tempdir().unwrap();
-        let layout = test_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let error = encode_batch(
             &frozen,
             &binding,
@@ -2264,7 +2237,7 @@ mod tests {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new(
-                    "wyrd_event_time",
+                    "event_time",
                     DataType::Timestamp(TimeUnit::Microsecond, None),
                     false,
                 ),
@@ -2374,7 +2347,7 @@ mod tests {
             crate::scribe::claim_sample::ClaimVariantSample::new(claim, runs, &schema)
                 .layout()
                 .expect("claim sample");
-        let layout = test_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         encode_ordered_claim(
             claim_plan(scratch, &layout, tenant),
             &crate::resources::ScribeResources::for_test(),
@@ -2469,5 +2442,62 @@ mod tests {
         assert_eq!(samples.len(), 1, "one writer series: {samples:?}");
         assert!(samples[0].0.contains("scribe"), "{samples:?}");
         assert_eq!(samples[0].1.count, 1, "one final object");
+    }
+
+    /// Row-group bounds are read from the table's own time column, and a
+    /// nanosecond column narrows to the microsecond interval containing it.
+    ///
+    /// The fixture also carries an unrelated earlier timestamp, so a reader
+    /// keyed on any other column would report the wrong interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be encoded or the bounds are not the
+    /// floored minimum and ceiled maximum of `start_time_unix_nano`.
+    #[test]
+    fn row_group_bounds_read_the_time_column() {
+        let time_column = "start_time_unix_nano";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                time_column,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(
+                "wyrd_ingested_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(
+                    arrow::array::TimestampNanosecondArray::from(vec![1_500_i64, 7_001])
+                        .with_timezone("+00:00"),
+                ),
+                Arc::new(TimestampMicrosecondArray::from(vec![0_i64, 0]).with_timezone("+00:00")),
+            ],
+        )
+        .expect("time-column fixture");
+        let mut bytes = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            &mut bytes,
+            Arc::clone(&schema),
+            Some(crate::parquet::writer_properties::bifrost_writer_properties(time_column, &[])),
+        )
+        .expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).expect("footer");
+        let stats = extract_row_group_time_range(
+            reader.metadata().row_group(0),
+            time_column,
+            TimePrecision::Nanos,
+        )
+        .expect("the time column carries INT64 statistics");
+        assert_eq!(stats.row_count, 2);
+        assert_eq!(stats.min_event_time, Some(1));
+        assert_eq!(stats.max_event_time, Some(8));
     }
 }

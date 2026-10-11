@@ -19,13 +19,6 @@ name = "integration"
 path = "tests/integration/main.rs"
 required-features = ["test-support"]
 
-# `mise run bench:bifrost:reads`; see the bench's module docs.
-[[bench]]
-name = "bifrost_reads"
-path = "benches/bifrost_reads/main.rs"
-harness = false
-required-features = ["test-support", "bench-support"]
-
 [features]
 default = []
 bench-support = []
@@ -115,9 +108,6 @@ wyrd-telemetry = { workspace = true, features = ["test-support"] }
 iceberg-catalog-sql = { workspace = true }
 datafusion-distributed = { workspace = true }
 url = { workspace = true }
-# The bench installs the allocator the server ships with, so its timings are
-# the production build's.
-mimalloc = { workspace = true }
 
 [lints]
 workspace = true

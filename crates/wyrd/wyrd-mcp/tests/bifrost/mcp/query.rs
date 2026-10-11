@@ -474,13 +474,14 @@ mod pg_tests {
 
         // One bounded read-only trace query returns one complete result. The
         // canonical span ledger stores the OTLP status as its numeric
-        // `status_code` and the start instant as `start_time_unix_nano`, so the
-        // window is expressed in nanoseconds rather than as a timestamp.
+        // `status_code` and the start instant as the nanosecond timestamp
+        // `start_time_unix_nano`, the table's time column, so the window binds
+        // nanosecond instants.
         let minute_nanos = 60_000_000_000_i64;
         let lower = start - minute_nanos;
         let upper = start + minute_nanos;
         let sql = format!(
-            "SELECT name, status_code FROM {table} WHERE status_code = 2 AND start_time_unix_nano >= {lower} AND start_time_unix_nano < {upper}"
+            "SELECT name, status_code FROM {table} WHERE status_code = 2 AND start_time_unix_nano >= to_timestamp_nanos({lower}) AND start_time_unix_nano < to_timestamp_nanos({upper})"
         );
         let result = client
             .call_tool(query(serde_json::json!({"sql": sql, "max_rows": 10})))

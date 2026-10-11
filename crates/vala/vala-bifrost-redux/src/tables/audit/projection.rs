@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::Schema;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -11,7 +11,6 @@ use vala_sql::row_types::audit_staging::AuditStagingRow;
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::AuditLogTable;
 use crate::tables::DomainTable;
@@ -33,8 +32,8 @@ pub struct AuditProjection {
     /// so every replica and every crash replay of the same frozen range
     /// presents Scribe the same identity and lands on its durable batch fence.
     pub batch_id: Uuid,
-    /// The 14 content fields declared by [`AuditLogTable`], plus the
-    /// `wyrd_event_time` the decision was stamped with in Postgres.
+    /// The 15 content fields declared by [`AuditLogTable`], ending with the
+    /// `created_at` the decision was stamped with in Postgres.
     pub rows: RecordBatch,
 }
 
@@ -230,23 +229,11 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         .map(|row| row.permission.clone())
         .collect::<Vec<_>>();
     let detail_values = detail_column(rows)?;
-    // The decision instant travels as the event time rather than as content, so
-    // a retained row partitions by when the boundary decided, not by when the
-    // publisher happened to ship it.
-    let event_time_values = rows
+    let created_at_values = rows
         .iter()
         .map(|row| row.created_at.timestamp_micros())
         .collect::<Vec<_>>();
-    let mut fields = AuditLogTable::arrow_fields();
-    fields.push(Field::new(
-        WYRD_EVENT_TIME,
-        DataType::Timestamp(
-            TimeUnit::Microsecond,
-            Some(iceberg::arrow::UTC_TIME_ZONE.into()),
-        ),
-        false,
-    ));
-    let schema = Arc::new(Schema::new(fields));
+    let schema = Arc::new(Schema::new(AuditLogTable::arrow_fields()));
     let columns: Vec<ArrayRef> = vec![
         Arc::new(Int64Array::from(seq_values)),
         Arc::new(StringArray::from(entry_hash_values)),
@@ -263,7 +250,7 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         detail_values,
         Arc::new(StringArray::from(credential_id_values)),
         Arc::new(
-            TimestampMicrosecondArray::from(event_time_values)
+            TimestampMicrosecondArray::from(created_at_values)
                 .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
         ),
     ];
@@ -399,13 +386,12 @@ mod tests {
         assert_eq!(projection.rows.num_columns(), 15);
         assert_eq!(
             projection.rows.schema().field(14).name(),
-            WYRD_EVENT_TIME,
-            "the decision instant travels as the managed event time"
+            crate::tables::audit::CREATED_AT,
+            "the decision instant travels as the created_at time column"
         );
         assert_eq!(
             projection.rows.schema().field(13).name(),
             crate::tables::audit::CREDENTIAL_ID,
-            "the credential column is the appended content column, ahead of the managed one"
         );
 
         let hashes = projection

@@ -304,14 +304,13 @@ async fn start_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(Strin
 /// Panics when the outbox does not drain within ten seconds or the audit rows
 /// cannot be read.
 async fn execute_decisions(server: &WyrdTestServer, principal: Uuid) -> Vec<(String, String)> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    while server.state().audit_outbox.pending() != 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "audit outbox drains"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    assert_eq!(
+        server
+            .wait_audit_staged(std::time::Duration::from_secs(10))
+            .await,
+        0,
+        "audit outbox drains"
+    );
     decisions(server, "verification.execute", principal).await
 }
 

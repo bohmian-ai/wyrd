@@ -47,20 +47,30 @@ non-null columns:
 
 - `wyrd_request_id`: server-minted or validated request correlation, the
   join key to audit and to the batch-commit fence;
-- `wyrd_event_time`: when the observed thing happened — the caller's value,
-  validated against the acceptance window, or `wyrd_ingested_at` when the
-  caller supplies none;
-- `wyrd_ingested_at`: when Wyrd accepted the batch. Scribe reads it once per
-  batch from PostgreSQL (`statement_timestamp()`) at admission, stamps the same
-  value on every row, and stores it on the batch's
+- `wyrd_ingested_at`: when Wyrd accepted the batch. Scribe takes it once per
+  batch at admission from a PostgreSQL-anchored clock: each node reads
+  `statement_timestamp()` once, carries it forward on its local monotonic
+  clock, and re-reads it every minute, never consulting its wall clock. Scribe
+  stamps the same value on every row and stores it on the batch's
   `vala.scribe_batch_commits` fence. A caller can never supply it.
 
 The column names, types, stable ids, and order are declared once, in
 `vala_bifrost_redux::tables::managed_columns::MANAGED_COLUMNS`; every physical
 schema and every reserved-name check derives from that declaration.
 `wyrd_ingested_at` comes from the database clock, so it is comparable across
-replicas, but it is the admission instant, not a commit order, and is not an
+replicas to within one anchor's monotonic drift, but it is the admission instant, not a commit order, and is not an
 incremental-read checkpoint.
+
+Every table has exactly one time column: a non-null `Timestamp` in
+microseconds or nanoseconds, with or without a zone. A registration declares
+it as `time_column` on its physical layout, and omitting it selects
+`wyrd_ingested_at`. The time column alone drives the hour or day partition
+transform, the default first sort key (descending), hot and published time
+bounds, and `COUNT(*)`. Built-in tables declare their own: OTLP spans
+`start_time_unix_nano`, OTLP logs and metrics `time_unix_nano`, gateway and
+agent traces `started_at`, Drift and Eval observations and
+`vala.system.audit_log` `created_at`, and `vala.verification.results`
+`ended_at`. Every caller-supplied `wyrd_*` column is reserved and refused.
 
 The tenant is not a row column. It is a property of the physical table, of
 each Parquet file, and of each in-memory Scribe bucket, all bound from the
@@ -425,11 +435,24 @@ validate and split by canonical physical partition
   -> acknowledgement
 ```
 
-Caller-supplied `wyrd_event_time` is accepted only within the server window,
-defaulting to 30 days before through 24 hours after the batch's
-`wyrd_ingested_at`. An out-of-window value fails with
-`WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`; Scribe never clamps or normalizes it.
-When the column is absent, the server stamps `wyrd_ingested_at` into it.
+A shard commits admitted requests in groups. One group cycle writes every
+SLICE record, appends each complete batch's COMMIT record, and makes both
+durable with one sync over every segment the cycle touched before it records
+the batch fences. No request is acknowledged before that sync and its fence
+commit.
+
+Each write request carries one profile in the Oracle query-profile pattern,
+emitted once when the request settles as
+`scribe_write_profile_nanoseconds_total{event}` and
+`scribe_write_profiles_total`. Its own steps are `Scribe.admission`,
+`Scribe.decode`, `Scribe.preprocess`, and `Scribe.shard_wait`; each group
+stage, `Scribe.group_write`, `group_commit`, `group_sync`, `group_fence`, and
+`group_insert`, is timed once per cycle and charged to every request the cycle
+acknowledged.
+
+Every time-column value is accepted; no acceptance window exists. One request
+may touch at most 32 time partitions of its table; a request touching more is
+refused whole with the existing invalid-frame error and stores nothing.
 
 Each shard projects WAL bytes, Arrow and metadata ownership, age, and resource
 pressure before append. Rotation closes the shard generation when any validated
@@ -508,6 +531,12 @@ Startup replays WAL using the recorded shard ID, validates staged files and
 manifests, rebuilds source and claim indexes, and reconciles publishing
 operation IDs against `file_list` before opening admission. Unknown versions,
 checksum mismatch, contradictory lineage, or ambiguous authority fail closed.
+Because SLICE and COMMIT records share one sync, a crash may leave a complete
+but invalid record in a shard's unsynced tail. Replay ends that shard's chain
+at the first such record in its last segment, as it does a torn tail, only
+when the shard stream's newest durable batch fence lies before it; a bad
+record preceding an acknowledged COMMIT, in an earlier segment, or with no
+fence authority available fails closed.
 
 Shutdown closes admission and mailboxes, rotates nonempty generations, stages
 immutable ownership, and drains admitted work within the server deadline. It
@@ -590,11 +619,9 @@ Struct access stays exact `get_field` and Variant access stays semantic
 `variant_get`. A literal comparison, `IN`, or null test on such a path filters
 while decoding. It skips row groups or pages only when a Variant path's
 residual is all-null and its type matches, or a Struct field's statistics are
-complete; otherwise the predicate is evaluated on the decoded values. `mise run bench:bifrost:reads` times
-native DataFusion against Oracle over the same hot file and the same published
-Iceberg snapshot, asserting identical rows before timing. Unshredded against
-shredded Variant reads are DataFusion's behavior, timed by DataFusion's
-`parquet_variant_query` benchmark.
+complete; otherwise the predicate is evaluated on the decoded values.
+Unshredded against shredded Variant reads are DataFusion's behavior, timed by
+DataFusion's `parquet_variant_query` benchmark.
 
 ### Distributed analytical execution
 
@@ -959,10 +986,10 @@ rather than days.
 The five verification tables — `vala.drift.observations`,
 `vala.eval.observations`, `vala.verification.results`,
 `vala.drift.result_features`, and `vala.eval.result_items` — also partition by
-UTC day on `wyrd_event_time`, never by Verifier, subject, binding, or tenant
-ID. Every row of one Verification Result carries the same server-chosen event
-time, so a result and its detail rows never split across day partitions. A
-Drift schedule window does not determine partition size.
+UTC day on each table's time column — `created_at` for observations,
+`ended_at` for results, and `wyrd_ingested_at` for result features and items —
+never by Verifier, subject, binding, or tenant ID. A Drift schedule window does
+not determine partition size.
 
 ## Maintenance: Forge
 

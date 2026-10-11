@@ -29,7 +29,7 @@ use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, evidence_from_json};
 use wyrd_client::WyrdClient;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::NodeId;
+use wyrd_spec::vala::api::{NodeId, PhysicalLayoutWire, TimeGranularityWire};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::object_reads::ReadStall;
 use wyrd_testing::bifrost::write::RawIngest;
@@ -551,6 +551,10 @@ impl CloseoutJourney {
 
     /// Registers the payload schema through the retained server catalog harness.
     ///
+    /// The table partitions hourly on its [`EVENT_TIME`] column, so a
+    /// [`GeometryWorkload`]'s pinned event time keeps every request in one
+    /// physical partition.
+    ///
     /// # Panics
     /// Panics if registration or tenant-qualified identity validation fails.
     async fn register_payload_table(&self, tenant: DataTenantId, name: String) -> JourneyTable {
@@ -559,11 +563,17 @@ impl CloseoutJourney {
             .create_bifrost_table_for_test(CreateTableRequest {
                 table: table_ref.clone(),
                 tenant,
-                user_fields: vec![
-                    Field::new("value", DataType::Int64, false),
-                    Field::new("payload", DataType::Binary, false),
-                ],
-                physical_layout: None,
+                user_fields: payload_schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect(),
+                physical_layout: Some(PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    time_column: Some(EVENT_TIME.to_owned()),
+                    sort_keys: Vec::new(),
+                    bloom_columns: Vec::new(),
+                }),
                 audit: None,
             })
             .await
@@ -1043,6 +1053,23 @@ impl CloseoutJourney {
     }
 }
 
+/// The user time column every payload table declares.
+const EVENT_TIME: &str = "event_time";
+
+/// The payload table's user schema: the asserted `value`, an incompressible
+/// `payload`, and the non-null microsecond UTC [`EVENT_TIME`] it partitions on.
+fn payload_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new("payload", DataType::Binary, false),
+        Field::new(
+            EVENT_TIME,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]))
+}
+
 /// Owns bounded, deterministic incompressible data and its acknowledged row set.
 struct GeometryWorkload {
     /// Pinned event time keeps every request in one physical partition.
@@ -1118,15 +1145,7 @@ impl GeometryWorkload {
             payload.append_value(block);
         }
         RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new("payload", DataType::Binary, false),
-                Field::new(
-                    "wyrd_event_time",
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                    false,
-                ),
-            ])),
+            payload_schema(),
             vec![
                 Arc::new(Int64Array::from(values.to_vec())),
                 Arc::new(payload.finish()),

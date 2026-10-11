@@ -10,23 +10,16 @@
 //! from the same configuration, which is what lets planning observe an unbound
 //! lock and execution observe the admitted one without rebuilding the root.
 
-#[cfg(all(feature = "test-support", feature = "bench-support"))]
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-#[cfg(all(feature = "test-support", feature = "bench-support"))]
-use datafusion::prelude::SessionConfig;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::vala::api::QueryClass;
 use wyrd_spec::vala::error::BifrostError;
 
 use super::live::LiveDispatch;
 use super::{DegradedSourceAccumulator, QueryCatalogError};
-#[cfg(all(feature = "test-support", feature = "bench-support"))]
-use crate::resources::OracleSessionShape;
-use crate::scan_sizing::oracle_target_partitions;
 
 /// The admitted execution governance every leaf resolves from its task.
 ///
@@ -215,7 +208,7 @@ pub(super) fn bind_test_session(
 /// # Panics
 ///
 /// Panics when the fresh lock refuses its first binding, which cannot happen.
-#[cfg(any(test, all(feature = "test-support", feature = "bench-support")))]
+#[cfg(test)]
 fn with_test_grant(
     config: datafusion::prelude::SessionConfig,
     grant: OracleExecutionGrant,
@@ -233,30 +226,7 @@ fn with_test_grant(
     config.with_extension(lock)
 }
 
-/// Returns a production Oracle session configuration for local files, bound
-/// with a live Interactive grant, so a benchmark session executes
-/// leader-local Oracle leaves without admission.
-///
-/// The shape is the one a production leader derives: one partition per core
-/// for wholly local data ([`oracle_target_partitions`] at locality 1.0), with
-/// Oracle's fixed Parquet read options.
-///
-/// # Panics
-///
-/// Panics when the partition count overflows, which a host's core count
-/// cannot cause.
-#[cfg(all(feature = "test-support", feature = "bench-support"))]
-pub(crate) fn bench_session_config() -> SessionConfig {
-    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let partitions =
-        oracle_target_partitions(cores, 1.0).expect("a host's core count yields a partition count");
-    with_test_grant(
-        OracleSessionShape::new(partitions).session_config(),
-        OracleExecutionGrant::for_test(QueryClass::Interactive),
-    )
-}
-
-#[cfg(any(test, all(feature = "test-support", feature = "bench-support")))]
+#[cfg(test)]
 impl OracleExecutionGrant {
     /// Builds one live grant for a leaf-level test.
     ///

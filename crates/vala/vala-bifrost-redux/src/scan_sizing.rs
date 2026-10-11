@@ -509,14 +509,20 @@ impl BatchPruning {
     /// Returns, per batch of `batches` many, whether its `statistics` leave it
     /// possibly matching.
     ///
-    /// Bounds not index-aligned with the batches, as in a hand-built test
-    /// generation, or bounds that cannot be evaluated keep every batch.
+    /// No batch keeps nothing without evaluating the predicate. Bounds not
+    /// index-aligned with the batches, as in a hand-built test generation, or
+    /// bounds that cannot be evaluated keep every batch.
     #[must_use]
     pub(crate) fn keep(
         &self,
         statistics: &[Arc<datafusion::common::Statistics>],
         batches: usize,
     ) -> Vec<bool> {
+        if batches == 0 {
+            // DataFusion cannot build a statistics array from zero
+            // containers, and nothing is left to keep.
+            return Vec::new();
+        }
         if statistics.len() != batches {
             return vec![true; batches];
         }

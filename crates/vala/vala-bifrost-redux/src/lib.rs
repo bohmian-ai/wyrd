@@ -19,6 +19,7 @@ pub mod namespaces;
 pub mod oracle;
 mod otlp_contract;
 pub mod parquet;
+pub(crate) mod profile;
 pub mod resources;
 pub mod scan_sizing;
 pub mod schema;

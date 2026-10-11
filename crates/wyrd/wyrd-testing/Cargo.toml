@@ -167,11 +167,11 @@ name = "verification_capacity"
 path = "src/bin/verification_capacity/main.rs"
 bench = false
 
-# The opt-in client ingest capacity benchmark (AC-041). Run only through
-# `mise run bench:bifrost:ingest-capacity`; only its unit tests run in a lane.
+# The opt-in client queue benchmark (AC-041). Run only through
+# `mise run bench:bifrost:client-queue`; only its unit tests run in a lane.
 [[bin]]
-name = "bifrost_ingest_capacity"
-path = "src/bin/bifrost_ingest_capacity/main.rs"
+name = "bifrost_client_queue"
+path = "src/bin/bifrost_client_queue/main.rs"
 bench = false
 
 # The opt-in Forge capacity benchmark. Run only through

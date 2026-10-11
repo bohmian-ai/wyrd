@@ -4,10 +4,9 @@
 //! schemas of `vala.verification.results`, `vala.drift.result_features`, and
 //! `vala.eval.result_items`, taken from the tables' own declarations so the
 //! payload can never drift from the registered contract. Every batch also
-//! carries the three correlation columns Scribe admits from a native payload:
-//! `card_ref` (the Verifier, resolved against the SYSTEM token's signed scope),
-//! `run_id` (the Verifier run), and `wyrd_event_time` (the one server-chosen
-//! event time shared by the summary and every detail row).
+//! carries the two correlation columns Scribe admits from a native payload:
+//! `card_ref` (the Verifier, resolved against the SYSTEM token's signed scope)
+//! and `run_id` (the Verifier run).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +16,7 @@ use arrow::array::{
     TimestampMicrosecondArray,
 };
 use arrow::buffer::NullBuffer;
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
@@ -31,7 +30,7 @@ use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::ids::{BindingId, CardUid, VerificationResultId, VerificationRunId};
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::UTC_TIME_ZONE;
-use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID, WYRD_EVENT_TIME};
+use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID};
 use wyrd_spec::verification::{DriftWindow, FrozenTarget, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput};
 
@@ -168,8 +167,8 @@ impl<'a> From<&'a ClaimedRun> for ResultRun<'a> {
 /// Maps one completed run's report onto its result batches.
 ///
 /// Owns the identities every row repeats — result, run, Verifier reference,
-/// subject, owner, binding — plus the execution interval and the single
-/// server-chosen event time, so each table mapping reads them from one place.
+/// subject, owner, binding — plus the execution interval, so each table
+/// mapping reads them from one place.
 #[derive(Debug, Clone, Copy)]
 pub struct ResultPayloadBuilder<'a> {
     /// The run whose frozen identities and input the rows record.
@@ -178,8 +177,6 @@ pub struct ResultPayloadBuilder<'a> {
     verifier_ref: &'a str,
     /// The new result's identity.
     result_id: VerificationResultId,
-    /// The one event time shared by every row of this result.
-    event_time: DateTime<Utc>,
     /// Verifier execution start.
     started_at: DateTime<Utc>,
     /// Verifier execution end.
@@ -188,16 +185,11 @@ pub struct ResultPayloadBuilder<'a> {
 
 impl<'a> ResultPayloadBuilder<'a> {
     /// Build a mapper for one result of `run`.
-    ///
-    /// `event_time` is chosen by the server once and stamped on the summary
-    /// and every detail row, so a result and its details share one UTC-day
-    /// partition.
     #[must_use]
     pub fn new(
         run: ResultRun<'a>,
         verifier_ref: &'a str,
         result_id: VerificationResultId,
-        event_time: DateTime<Utc>,
         started_at: DateTime<Utc>,
         ended_at: DateTime<Utc>,
     ) -> Self {
@@ -205,7 +197,6 @@ impl<'a> ResultPayloadBuilder<'a> {
             run,
             verifier_ref,
             result_id,
-            event_time,
             started_at,
             ended_at,
         }
@@ -520,8 +511,8 @@ impl<'a> ResultPayloadBuilder<'a> {
     /// Every authored column must fill exactly one of `fields` by name; the
     /// arrays are placed in the order of `fields`, never in authoring order,
     /// so a reordered declaration keeps each value under its own name. The
-    /// schema is `fields` followed by `card_ref`, `run_id`, and
-    /// `wyrd_event_time`, each repeated for the authored row count.
+    /// schema is `fields` followed by `card_ref` and `run_id`, each repeated
+    /// for the authored row count.
     ///
     /// # Errors
     /// Returns [`ResultPayloadError::ColumnMismatch`] with problem
@@ -543,7 +534,7 @@ impl<'a> ResultPayloadBuilder<'a> {
                 });
             }
         }
-        let mut arrays = Vec::with_capacity(fields.len() + 3);
+        let mut arrays = Vec::with_capacity(fields.len() + 2);
         for field in &fields {
             let array = named.remove(field.name().as_str()).ok_or_else(|| {
                 ResultPayloadError::ColumnMismatch {
@@ -562,18 +553,12 @@ impl<'a> ResultPayloadBuilder<'a> {
         fields.extend([
             Field::new(CARD_REF, DataType::Utf8, true),
             Field::new(RUN_ID, DataType::Utf8, true),
-            Field::new(
-                WYRD_EVENT_TIME,
-                DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
-                false,
-            ),
         ]);
         arrays.push(text(std::iter::repeat_n(Some(self.verifier_ref), rows)));
         arrays.push(text(std::iter::repeat_n(
             Some(self.run.run_id.to_string()),
             rows,
         )));
-        arrays.push(timestamps(std::iter::repeat_n(Some(self.event_time), rows)));
         Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)?)
     }
 
@@ -792,7 +777,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use arrow::array::{Array, AsArray};
-    use arrow::datatypes::{Float64Type, Int32Type, Int64Type, TimestampMicrosecondType};
+    use arrow::datatypes::{Float64Type, Int32Type, Int64Type};
     use chrono::TimeZone;
     use vala_drift::FeatureDriftReport;
     use wyrd_spec::card::drift::DriftMethod;
@@ -881,7 +866,6 @@ mod tests {
             run.view(),
             "prod/Verifier/check@1.2.0",
             VerificationResultId::new_v7(),
-            at(30),
             at(10),
             at(20),
         )
@@ -946,18 +930,8 @@ mod tests {
             .as_struct()
     }
 
-    /// Read every row's event time.
-    fn event_times(batch: &RecordBatch) -> Vec<i64> {
-        batch
-            .column_by_name(WYRD_EVENT_TIME)
-            .expect("event time column exists")
-            .as_primitive::<TimestampMicrosecondType>()
-            .values()
-            .to_vec()
-    }
-
     /// A two-feature Drift report writes its features before the summary, all
-    /// rows share one event time and identity, and NaN scores become null.
+    /// rows share one identity, and NaN scores become null.
     #[test]
     fn drift_result_writes_features_then_summary_with_nan_as_null() {
         let run = drift_run();
@@ -996,10 +970,6 @@ mod tests {
         assert_eq!(summary.num_rows(), 1);
         let result_id = payload.result_id().to_string();
         for batch in [features, summary] {
-            assert_eq!(
-                event_times(batch),
-                vec![at(30).timestamp_micros(); batch.num_rows()]
-            );
             for row in 0..batch.num_rows() {
                 assert_eq!(
                     cell(batch, "result_id", row).as_deref(),
@@ -1191,7 +1161,6 @@ mod tests {
             run.view(),
             "prod/Verifier/check@1.2.0",
             VerificationResultId::new_v7(),
-            at(30),
             at(10),
             at(20),
         )
@@ -1230,7 +1199,7 @@ mod tests {
         let expected: Vec<_> = reversed
             .iter()
             .map(|field| field.name().clone())
-            .chain([CARD_REF, RUN_ID, WYRD_EVENT_TIME].map(str::to_owned))
+            .chain([CARD_REF, RUN_ID].map(str::to_owned))
             .collect();
         assert_eq!(order, expected);
         for field in ResultsTable::arrow_fields() {

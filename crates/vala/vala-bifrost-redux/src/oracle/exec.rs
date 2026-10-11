@@ -70,10 +70,10 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::BifrostError;
 
 use crate::catalog::iceberg_storage::BifrostIcebergStorage;
+use crate::catalog::{TimeAxis, TimePrecision};
 use crate::scribe::hot_source::StagedSourceLease;
 use crate::storage::error_chain_contains_not_found;
 use wyrd_spec::vala::api::{QueryClass, WorkerScanStats};
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::live::LiveScribeExec;
 use super::{AuthorizedQueryContext, QueryCatalogError};
@@ -995,7 +995,9 @@ pub(crate) enum HotObjects {
 ///
 /// The scan carries no predicate; `DataFusion`'s `FilterPushdown` places the
 /// query's predicate in it, and the file pruner then skips a file whose
-/// event-time bounds (see [`HotFileSource::statistics`]) exclude it.
+/// `time_column` bounds (see [`HotFileSource::statistics`]) exclude it.
+/// `time_column` is `None` when no file in `files` declares bounds, as for a
+/// Scribe follower's staged runs.
 ///
 /// The scan's `ObjectStoreUrl` is the always-registered local one; it is never
 /// resolved to a store, because the reader factory carries the real store.
@@ -1009,6 +1011,7 @@ pub(super) fn hot_parquet_scan(
     objects: HotObjects,
     tenant: DataTenantId,
     schema: &SchemaRef,
+    time_column: Option<&str>,
     options: &Arc<ConfigOptions>,
     max_partitions: Option<usize>,
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -1046,7 +1049,7 @@ pub(super) fn hot_parquet_scan(
     let files = files
         .into_iter()
         .map(|file| {
-            let statistics = file.statistics(schema);
+            let statistics = file.statistics(schema, time_column);
             let path = match &warehouse {
                 Some(store) => store
                     .relativize(&file.location)
@@ -1176,7 +1179,7 @@ pub(crate) struct HotFileSource {
     /// split a hot scan as it does for a listing table, and `count(*)` still
     /// opens the file and proves its footer.
     pub(crate) row_count: Option<u64>,
-    /// Immutable `wyrd_event_time` interval this object declares, or the exact
+    /// Immutable time-column interval this object declares, or the exact
     /// reason it declares none.
     ///
     /// Carried from the durable `vala.file_list` row so a scan can decide the
@@ -1189,12 +1192,13 @@ impl HotFileSource {
     /// `None` when the file declares neither a row count nor usable bounds.
     ///
     /// The row count is inexact, so `count(*)` still opens the file. Bounded
-    /// event time becomes exact `wyrd_event_time` min/max, which
-    /// `DataFusion`'s file pruner requires to skip the file before its footer
-    /// is read; [`hot_parquet_scan`] makes every merged statistic inexact so
-    /// only that pruner sees them. A `schema` without `wyrd_event_time` as
-    /// microsecond timestamps carries no bounds, and the file is kept.
-    fn statistics(&self, schema: &Schema) -> Option<Statistics> {
+    /// statistics become exact `time_column` min/max through
+    /// [`set_time_bounds`], which `DataFusion`'s file pruner requires to skip
+    /// the file before its footer is read; [`hot_parquet_scan`] makes every
+    /// merged statistic inexact so only that pruner sees them. A `schema`
+    /// without `time_column`, or no `time_column` at all, carries no bounds,
+    /// and the file is kept.
+    fn statistics(&self, schema: &Schema, time_column: Option<&str>) -> Option<Statistics> {
         let mut statistics = Statistics::new_unknown(schema);
         if let Some(rows) = self.row_count {
             statistics.num_rows = Precision::Inexact(usize::try_from(rows).unwrap_or(usize::MAX));
@@ -1203,39 +1207,53 @@ impl HotFileSource {
             min_micros,
             max_micros,
         } = self.event_time
+            && let Some(time_column) = time_column
         {
-            set_event_time_bounds(&mut statistics, schema, min_micros, max_micros);
+            set_time_bounds(&mut statistics, schema, time_column, min_micros, max_micros);
         }
         (statistics != Statistics::new_unknown(schema)).then_some(statistics)
     }
 }
 
-/// Records exact `wyrd_event_time` min/max (inclusive microseconds) in
-/// `statistics`, which describe one container under `schema`.
+/// Records exact min/max of `time_column` in `statistics`, which describe one
+/// container under `schema`, from an inclusive microsecond interval.
 ///
 /// Exact bounds are what `DataFusion`'s pruning requires to exclude a
-/// container. A `schema` without `wyrd_event_time` as microsecond timestamps
+/// container. A nanosecond column is widened through [`TimePrecision`] to the
+/// first and last instant the interval covers, so the injected bounds still
+/// contain every stored value. A `schema` whose `time_column` is absent or not
+/// a time-column type, or an interval not representable at its precision,
 /// leaves `statistics` unchanged, so the container is kept.
-pub(super) fn set_event_time_bounds(
+pub(super) fn set_time_bounds(
     statistics: &mut Statistics,
     schema: &Schema,
+    time_column: &str,
     min_micros: i64,
     max_micros: i64,
 ) {
-    if let Ok(index) = schema.index_of(WYRD_EVENT_TIME)
-        && let arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, zone) =
-            schema.field(index).data_type()
-    {
-        let column = &mut statistics.column_statistics[index];
-        column.min_value = Precision::Exact(datafusion::scalar::ScalarValue::TimestampMicrosecond(
-            Some(min_micros),
-            zone.clone(),
-        ));
-        column.max_value = Precision::Exact(datafusion::scalar::ScalarValue::TimestampMicrosecond(
-            Some(max_micros),
-            zone.clone(),
-        ));
-    }
+    use datafusion::scalar::ScalarValue;
+    let Ok(index) = schema.index_of(time_column) else {
+        return;
+    };
+    let arrow::datatypes::DataType::Timestamp(_, zone) = schema.field(index).data_type() else {
+        return;
+    };
+    let Some(precision) = TimePrecision::of(schema.field(index).data_type()) else {
+        return;
+    };
+    let (Some(min), Some(max)) = (
+        precision.lower_from_micros(min_micros),
+        precision.upper_from_micros(max_micros),
+    ) else {
+        return;
+    };
+    let scalar = |value| match precision {
+        TimePrecision::Micros => ScalarValue::TimestampMicrosecond(Some(value), zone.clone()),
+        TimePrecision::Nanos => ScalarValue::TimestampNanosecond(Some(value), zone.clone()),
+    };
+    let column = &mut statistics.column_statistics[index];
+    column.min_value = Precision::Exact(scalar(min));
+    column.max_value = Precision::Exact(scalar(max));
 }
 
 /// Complete immutable inputs for constructing one authenticated table provider.
@@ -1264,6 +1282,10 @@ pub(crate) struct OracleTableProvider {
     objects: Arc<BifrostIcebergStorage>,
     /// Full physical schema, which is also the caller-visible schema.
     physical_schema: SchemaRef,
+    /// The table's time axis, read from its own partition spec: the column
+    /// whose bounds prune files and live routes and that a zero-column scan
+    /// reads for row counts.
+    time_axis: TimeAxis,
     /// Authenticated request context whose tenant every scanned footer must name.
     context: AuthorizedQueryContext,
     /// Canonical table name included in scrubbed security diagnostics.
@@ -1350,12 +1372,18 @@ impl OracleTableProvider {
             table_name,
             live,
         } = inputs;
+        let time_axis = TimeAxis::of_iceberg(table.metadata()).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "table {table_name} has no time partition field in its partition spec"
+            ))
+        })?;
         let iceberg = IcebergStaticTableProvider::try_new_from_table(table)
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let physical_schema = iceberg.schema();
         Ok(Self {
             iceberg,
+            time_axis,
             hot_files,
             objects,
             physical_schema,
@@ -1531,7 +1559,7 @@ impl OracleTableProvider {
             .iter()
             .map(|file| {
                 Arc::new(
-                    file.statistics(&self.physical_schema)
+                    file.statistics(&self.physical_schema, Some(self.time_axis.column()))
                         .unwrap_or_else(|| Statistics::new_unknown(&self.physical_schema)),
                 )
             })
@@ -1604,6 +1632,7 @@ impl OracleTableProvider {
             HotObjects::Warehouse(Arc::clone(&self.objects)),
             self.context.data_tenant_id,
             required_schema,
+            Some(self.time_axis.column()),
             options,
             max_partitions,
         )
@@ -1656,7 +1685,11 @@ impl TableProvider for OracleTableProvider {
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         // One closure, derived once, governs every leaf below and every
         // operator above. Nothing downstream recomputes a column set or order.
-        let scan_projection = OracleScanProjection::try_new(&self.physical_schema, projection)?;
+        let scan_projection = OracleScanProjection::try_new(
+            &self.physical_schema,
+            self.time_axis.column(),
+            projection,
+        )?;
         let required_schema = Arc::clone(&scan_projection.required_schema);
         let mut inputs = vec![
             self.persisted_input(state, &required_schema, filters)
@@ -1670,6 +1703,7 @@ impl TableProvider for OracleTableProvider {
         {
             inputs.push(Arc::new(super::live::LiveScribeExec::new(
                 live.clone(),
+                self.time_axis.clone(),
                 super::assignment_schema_fingerprint(&self.physical_schema),
                 scan_projection.required_columns.clone(),
                 Arc::clone(&required_schema),
@@ -1726,9 +1760,9 @@ fn scan_output_names(
 ///
 /// A closure is never empty. A request that reads no column, such as
 /// `COUNT(*)`, still needs every leaf to report row counts, so it reads the
-/// always-present non-null `wyrd_event_time` instead of producing zero-column
-/// batches across Iceberg, Parquet, IPC, and distributed frames.
-fn required_columns_closure(output_names: &[String]) -> Vec<String> {
+/// table's always-present non-null time column instead of producing
+/// zero-column batches across Iceberg, Parquet, IPC, and distributed frames.
+fn required_columns_closure(output_names: &[String], time_column: &str) -> Vec<String> {
     let mut required = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for name in output_names.iter().cloned() {
@@ -1737,7 +1771,7 @@ fn required_columns_closure(output_names: &[String]) -> Vec<String> {
         }
     }
     if required.is_empty() {
-        required.push(WYRD_EVENT_TIME.to_owned());
+        required.push(time_column.to_owned());
     }
     required
 }
@@ -1817,9 +1851,13 @@ impl OracleScanProjection {
     /// Returns a `DataFusion` plan error when a requested ordinal is out of
     /// range, when the complete physical schema is ambiguous, or when a closure
     /// name is absent from it.
-    fn try_new(physical_schema: &Schema, projection: Option<&[usize]>) -> DataFusionResult<Self> {
+    fn try_new(
+        physical_schema: &Schema,
+        time_column: &str,
+        projection: Option<&[usize]>,
+    ) -> DataFusionResult<Self> {
         let output_names = scan_output_names(physical_schema, projection)?;
-        let required_columns = required_columns_closure(&output_names);
+        let required_columns = required_columns_closure(&output_names, time_column);
         let (required_schema, _) = select_schema_by_name(physical_schema, &required_columns)?;
         Ok(Self {
             output_names,
@@ -1916,8 +1954,10 @@ pub(super) mod tests {
     use super::*;
     use crate::oracle::bindings::{OracleExecutionBindingInputs, OracleExecutionBindings};
     use crate::oracle::nested_pushdown::FileReadPlan;
-    use arrow::array::{ArrayRef, FixedSizeBinaryArray, Int64Array, StringArray};
-    use arrow::datatypes::DataType;
+    use arrow::array::{
+        ArrayRef, FixedSizeBinaryArray, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::{DataType, TimeUnit};
     use bytes::Bytes;
     use datafusion::common::tree_node::TreeNode;
     use datafusion::datasource::memory::MemorySourceConfig;
@@ -1973,6 +2013,9 @@ pub(super) mod tests {
     pub(in crate::oracle) static FIXTURE_TENANT: std::sync::LazyLock<DataTenantId> =
         std::sync::LazyLock::new(DataTenantId::new_v7);
 
+    /// The time column every Oracle fixture table declares.
+    pub(in crate::oracle) const FIXTURE_TIME_COLUMN: &str = "event_time";
+
     /// Builds the production writer recipe with a footer proving
     /// [`FIXTURE_TENANT`], the way every Bifrost producer writes.
     pub(in crate::oracle) fn fixture_writer_properties(
@@ -1980,6 +2023,7 @@ pub(super) mod tests {
     ) -> WriterProperties {
         crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
             vec![crate::parquet::footer::tenant_key_value(*FIXTURE_TENANT)],
+            FIXTURE_TIME_COLUMN,
             bloom_columns,
         )
     }
@@ -2480,6 +2524,7 @@ pub(super) mod tests {
             HotObjects::Warehouse(warehouse_objects(root)),
             tenant,
             schema,
+            Some(FIXTURE_TIME_COLUMN),
             &Arc::new(options.clone()),
             None,
         )
@@ -2621,6 +2666,7 @@ pub(super) mod tests {
             HotObjects::Warehouse(warehouse_objects(root.path())),
             *FIXTURE_TENANT,
             &schema,
+            Some(FIXTURE_TIME_COLUMN),
             &Arc::new(options),
             Some(6),
         )
@@ -2976,7 +3022,7 @@ pub(super) mod tests {
         let upper = 1_787_497_200_000_000_i64;
         let zone: Arc<str> = "UTC".into();
         let schema = Arc::new(Schema::new(vec![Field::new(
-            WYRD_EVENT_TIME,
+            FIXTURE_TIME_COLUMN,
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some(zone.clone())),
             false,
         )]));
@@ -3018,9 +3064,9 @@ pub(super) mod tests {
                 Some(zone.clone()),
             ))
         };
-        let filter = col(WYRD_EVENT_TIME)
+        let filter = col(FIXTURE_TIME_COLUMN)
             .gt_eq(bound(lower))
-            .and(col(WYRD_EVENT_TIME).lt_eq(bound(upper)));
+            .and(col(FIXTURE_TIME_COLUMN).lt_eq(bound(upper)));
         let plan = pushed_filter(
             fixture_hot_scan(root.path(), files, *FIXTURE_TENANT, &schema, &options),
             &filter,
@@ -3162,41 +3208,44 @@ pub(super) mod tests {
         let physical_schema = Schema::new(vec![
             Field::new("service_name", DataType::Utf8, true),
             Field::new("duration_ms", DataType::Int64, true),
-            Field::new("wyrd_event_time", DataType::Int64, true),
+            Field::new("event_time", DataType::Int64, true),
         ]);
         // Projection-closure order: requested scan output, stably deduplicated.
         let projection = vec![
             physical_schema.index_of("duration_ms").unwrap(),
-            physical_schema.index_of("wyrd_event_time").unwrap(),
+            physical_schema.index_of("event_time").unwrap(),
             physical_schema.index_of("duration_ms").unwrap(),
         ];
         let closure = required_columns_closure(
             &scan_output_names(&physical_schema, Some(&projection)).expect("valid ordinals"),
+            FIXTURE_TIME_COLUMN,
         );
         assert_eq!(
             closure,
-            vec!["duration_ms".to_string(), "wyrd_event_time".to_string()]
+            vec!["duration_ms".to_string(), "event_time".to_string()]
         );
 
         // A `None` projection closes over every table column.
         let full_closure = required_columns_closure(
             &scan_output_names(&physical_schema, None).expect("full projection"),
+            FIXTURE_TIME_COLUMN,
         );
         assert_eq!(
             full_closure,
             vec![
                 "service_name".to_string(),
                 "duration_ms".to_string(),
-                "wyrd_event_time".to_string(),
+                "event_time".to_string(),
             ]
         );
 
         // A `count(*)` scan requests no column, so its closure reads the
-        // always-present event time rather than producing zero-column leaves.
+        // always-present time column rather than producing zero-column leaves.
         let count_closure = required_columns_closure(
             &scan_output_names(&physical_schema, Some(&Vec::new())).expect("empty projection"),
+            FIXTURE_TIME_COLUMN,
         );
-        assert_eq!(count_closure, vec!["wyrd_event_time".to_string()]);
+        assert_eq!(count_closure, vec!["event_time".to_string()]);
     }
 
     /// Only a missing pinned object is classified as a stale-object race; any
@@ -3450,12 +3499,24 @@ pub(super) mod tests {
                 optional(1, "unused_payload", PrimitiveType::String),
                 optional(2, "duration_ms", PrimitiveType::Long),
                 optional(3, "status_code", PrimitiveType::String),
+                Arc::new(NestedField::required(
+                    4,
+                    FIXTURE_TIME_COLUMN,
+                    IcebergType::Primitive(PrimitiveType::Timestamptz),
+                )),
             ])
             .build()
             .expect("fixture Iceberg schema");
         let metadata = TableMetadataBuilder::new(
             schema,
-            UnboundPartitionSpec::builder().build(),
+            UnboundPartitionSpec::builder()
+                .add_partition_field(
+                    4,
+                    format!("{FIXTURE_TIME_COLUMN}_hour"),
+                    iceberg::spec::Transform::Hour,
+                )
+                .expect("fixture hour partition field")
+                .build(),
             SortOrder::unsorted_order(),
             "memory:///projection-fixture".to_owned(),
             FormatVersion::V2,
@@ -3505,8 +3566,10 @@ pub(super) mod tests {
 
     /// Builds the pinned wide-table provider the closure owner scans.
     ///
-    /// The live batch carries the full three-column physical schema —
-    /// `unused_payload`, `duration_ms`, `status_code` — with one
+    /// The table partitions hourly on [`FIXTURE_TIME_COLUMN`], as every
+    /// Bifrost table partitions on its time column. The live batch carries the
+    /// full four-column physical schema — `unused_payload`, `duration_ms`,
+    /// `status_code`, and the time column — with one
     /// `STATUS_CODE_ERROR` row and one `STATUS_CODE_OK` row, read as `tenant`. Keeping fixture construction here leaves the owning test to
     /// assert only closure behavior.
     ///
@@ -3538,6 +3601,11 @@ pub(super) mod tests {
             Field::new("unused_payload", DataType::Utf8, true),
             Field::new("duration_ms", DataType::Int64, true),
             Field::new("status_code", DataType::Utf8, true),
+            Field::new(
+                FIXTURE_TIME_COLUMN,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
         ]));
         let live = RecordBatch::try_new(
             Arc::clone(&live_schema),
@@ -3548,6 +3616,10 @@ pub(super) mod tests {
                     "STATUS_CODE_ERROR",
                     "STATUS_CODE_OK",
                 ])) as ArrayRef,
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![1_700_000_000_000_000_i64; 2])
+                        .with_timezone("+00:00"),
+                ) as ArrayRef,
             ],
         )
         .expect("live fixture batch");
@@ -3943,5 +4015,34 @@ pub(super) mod tests {
                 url::Url::parse("http://worker-1.invalid:50051").expect("fixture worker URL"),
             ])
         }
+    }
+
+    /// Container bounds on a nanosecond time column are injected as
+    /// nanosecond scalars spanning the whole microsecond interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the injected bounds are not the widened nanosecond
+    /// interval in the column's own zone.
+    #[test]
+    fn nanosecond_time_bounds_cover_the_microsecond_interval() {
+        use datafusion::scalar::ScalarValue;
+        let zone: Option<Arc<str>> = Some("+00:00".into());
+        let schema = Schema::new(vec![arrow::datatypes::Field::new(
+            FIXTURE_TIME_COLUMN,
+            DataType::Timestamp(TimeUnit::Nanosecond, zone.clone()),
+            false,
+        )]);
+        let mut statistics = Statistics::new_unknown(&schema);
+        set_time_bounds(&mut statistics, &schema, FIXTURE_TIME_COLUMN, 1, 2);
+        let column = &statistics.column_statistics[0];
+        assert_eq!(
+            column.min_value,
+            Precision::Exact(ScalarValue::TimestampNanosecond(Some(1_000), zone.clone()))
+        );
+        assert_eq!(
+            column.max_value,
+            Precision::Exact(ScalarValue::TimestampNanosecond(Some(2_999), zone))
+        );
     }
 }

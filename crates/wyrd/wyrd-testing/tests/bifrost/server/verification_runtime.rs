@@ -62,7 +62,7 @@ use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::vala::eval::operator::ComparisonOperator;
 use wyrd_spec::vala::eval::result::AssertionResult;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
+    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT,
 };
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
@@ -201,13 +201,12 @@ async fn runner_without_local_scribe_publishes_through_the_ingest_endpoint()
                 "SELECT f.result_id FROM vala.drift.result_features f \
                  JOIN vala.verification.results r \
                    ON f.result_id = r.result_id AND f.{RUN_ID} = r.{RUN_ID} \
-                  AND f.{WYRD_EVENT_TIME} = r.{WYRD_EVENT_TIME} \
                   AND f.{PRINCIPAL_ID} = r.{PRINCIPAL_ID} AND f.{CARD_UID} = r.{CARD_UID} \
                  WHERE {}",
                 identity("f.")
             ),
             2,
-            "every feature joins its summary on result, run, writer, Verifier, and event time",
+            "every feature joins its summary on result, run, writer, and Verifier",
         ),
     ];
     for (sql, expected, what) in checks {
@@ -518,8 +517,10 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
 }
 
 /// One Drift observation `record` of `card_ref` at `event_time`: a drifting
-/// `score` and a `latency` feature, as the SDK's tall projection writes them,
-/// with a caller `wyrd_event_time` that Scribe keeps verbatim.
+/// `score` and a `latency` feature, as the SDK's tall projection writes them.
+///
+/// `event_time` is the rows' `created_at`, the observation table's time
+/// column, which Scribe keeps verbatim.
 ///
 /// # Errors
 /// Returns an Arrow error when the batch cannot be assembled.
@@ -537,9 +538,7 @@ fn observation_batch(
         Field::new("session_id", DataType::Utf8, true),
         Field::new("created_at", utc(), false),
         Field::new(CARD_REF, DataType::Utf8, true),
-        Field::new(WYRD_EVENT_TIME, utc(), false),
     ]));
-    let now = Utc::now().timestamp_micros();
     let event = event_time.timestamp_micros();
     Ok(RecordBatch::try_new(
         schema,
@@ -549,9 +548,8 @@ fn observation_batch(
             Arc::new(Float64Array::from(vec![3.0, 120.0])),
             Arc::new(StringArray::from(vec![None::<&str>, None])),
             Arc::new(StringArray::from(vec![None::<&str>, None])),
-            Arc::new(TimestampMicrosecondArray::from(vec![now, now]).with_timezone("UTC")),
-            Arc::new(StringArray::from(vec![card_ref, card_ref])),
             Arc::new(TimestampMicrosecondArray::from(vec![event, event]).with_timezone("UTC")),
+            Arc::new(StringArray::from(vec![card_ref, card_ref])),
         ],
     )?)
 }
@@ -564,8 +562,8 @@ fn observation_batch(
 /// whose summary is acknowledged on the next, a Drift result whose event time
 /// is the previous UTC day, and an Eval result. Each result's details are
 /// retrieved by `result_id` alone from both daily partitions; the straddling
-/// result's summary and details share one `wyrd_event_time` though their
-/// `wyrd_ingested_at` fall on different days. Every published Parquet file of
+/// result's summary partitions on its `ended_at` while its details partition
+/// on a `wyrd_ingested_at` that falls on a different day. Every published Parquet file of
 /// the three tables carries a physical Bloom filter for its declared and
 /// managed-floor columns, and Oracle's scan metrics show a day-range
 /// predicate dropping the previous day's file and a `result_id` lookup
@@ -609,14 +607,22 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
         return Err(format!("the Eval result retrieves its one item: {items:?}").into());
     }
 
-    let times = |table: &str| {
+    // The summary's time column is `ended_at`; the details declare none, so
+    // they partition on their own receipt instant. Each projects its time
+    // column first and its receipt instant second.
+    let times = |time_column: &str, table: &str| {
         format!(
-            "SELECT CAST({WYRD_EVENT_TIME} AS BIGINT), CAST({WYRD_INGESTED_AT} AS BIGINT) \
+            "SELECT CAST({time_column} AS BIGINT) AS time, \
+             CAST({WYRD_INGESTED_AT} AS BIGINT) AS ingested \
              FROM {table} WHERE result_id = '{straddling}'"
         )
     };
-    let summary = journey.texts(times("vala.verification.results")).await?;
-    let details = journey.texts(times("vala.drift.result_features")).await?;
+    let summary = journey
+        .texts(times("ended_at", "vala.verification.results"))
+        .await?;
+    let details = journey
+        .texts(times(WYRD_INGESTED_AT, "vala.drift.result_features"))
+        .await?;
     let micros = |value: &Option<String>| -> Result<i64, ServerJourneyError> {
         Ok(value.as_deref().ok_or("null timestamp")?.parse()?)
     };
@@ -624,13 +630,13 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
     let [summary] = summary.as_slice() else {
         return Err(format!("one straddling summary expected, saw {summary:?}").into());
     };
+    if micros(&summary[0])? != now.timestamp_micros() {
+        return Err(format!(
+            "the summary must partition on its own ended_at: {summary:?} ended {now}"
+        )
+        .into());
+    }
     for detail in &details {
-        if micros(&detail[0])? != micros(&summary[0])? {
-            return Err(format!(
-                "result and details must share one event time: {summary:?} {details:?}"
-            )
-            .into());
-        }
         if day(micros(&detail[1])?) == day(micros(&summary[1])?) {
             return Err(format!(
                 "the details and summary ACKs must fall on different receipt days: \
@@ -658,7 +664,7 @@ async fn result_layout_partitions_blooms_and_prunes_by_result() -> Result<(), Se
         .scan(
             format!(
                 "SELECT result_id FROM vala.verification.results \
-                 WHERE {WYRD_EVENT_TIME} >= TIMESTAMP '{today}'"
+                 WHERE ended_at >= TIMESTAMP '{today}'"
             ),
             2,
         )
@@ -774,8 +780,9 @@ impl<'a> ResultLayoutJourney<'a> {
         })
     }
 
-    /// Publish one result with `event_time` through the production payload
-    /// builder and flush it into its own file; returns its `result_id`.
+    /// Publish one result that starts and ends at `event_time` through the
+    /// production payload builder and flush it into its own file; returns its
+    /// `result_id`. The summary's `ended_at` therefore names its partition.
     ///
     /// With `straddle`, Scribe's receipt clock moves one day ahead after the
     /// detail batch is acknowledged and before the summary is sent, so the
@@ -839,7 +846,6 @@ impl<'a> ResultLayoutJourney<'a> {
             },
             &verifier_ref,
             result,
-            event_time,
             event_time,
             event_time,
         )
@@ -2594,7 +2600,6 @@ impl TypedPayloadJourney {
                 result,
                 now,
                 now,
-                now,
             )
             .build(report)?;
             for batch in payload.batches() {
@@ -2688,14 +2693,12 @@ impl TypedPayloadJourney {
             builder.append(&encoded);
             Ok(builder.finish())
         };
-        let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into()));
         let now = Utc::now().timestamp_micros();
         let at =
             || Arc::new(TimestampMicrosecondArray::from(vec![now]).with_timezone(UTC_TIME_ZONE));
         let text = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
         let mut fields = AgentTracesTable::arrow_fields();
         fields.push(Field::new(CARD_REF, DataType::Utf8, true));
-        fields.push(Field::new(WYRD_EVENT_TIME, utc(), false));
         let uidless = CardRef {
             uid: None,
             ..card_ref
@@ -2718,7 +2721,6 @@ impl TypedPayloadJourney {
                 at(),
                 at(),
                 text(&uidless.to_string()),
-                at(),
             ],
         )?;
         let writer = wyrd_client::bifrost::client_from_options(

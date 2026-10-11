@@ -64,7 +64,19 @@ with ordinary SQL semantics (`(attributes ->> 'retries')::bigint`). `->` and
 
 **Namespace:** `vala.traces`, `vala.metrics`, `vala.logs`, `vala.dev`, `vala.drift`, `vala.eval`, `vala.verification`
 
-**Partitioning:** one time transform on `wyrd_event_time`. The OpenTelemetry tables (`vala.traces.spans`, `vala.metrics.points`, `vala.logs.records`) and `vala.dev.agent_traces` partition by UTC hour. The five verification tables (`vala.drift.observations`, `vala.eval.observations`, `vala.verification.results`, `vala.drift.result_features`, `vala.eval.result_items`) partition by UTC day, so a Verification Result and its detail rows, which share one event time, never split across partitions. Bifrost has no bucket, identity, or tenant partition transform.
+**Partitioning:** one time transform on the table's time column, which also leads the default sort order (descending) and bounds every time-range read.
+
+| Table | Time column | Granularity |
+|---|---|---|
+| `vala.traces.spans` | `start_time_unix_nano` | UTC hour |
+| `vala.logs.records`, `vala.metrics.points` | `time_unix_nano` | UTC hour |
+| gateway and `vala.dev.agent_traces` | `started_at` | UTC hour |
+| `vala.drift.observations`, `vala.eval.observations` | `created_at` | UTC day |
+| `vala.verification.results` | `ended_at` | UTC day |
+| `vala.drift.result_features`, `vala.eval.result_items` | `wyrd_ingested_at` | UTC day |
+| `vala.system.audit_log` | `created_at` | UTC day |
+
+OTLP instants are `Timestamp(ns, +00:00)`; a log record whose `time_unix_nano` is unset takes its observed time. Bifrost has no bucket, identity, or tenant partition transform.
 
 **Tenant isolation:** tenant-qualified physical table + per-file footer tenant proof
 
@@ -74,7 +86,7 @@ Each tenant writes to its own tenant-qualified physical table. Every Parquet fil
 
 **Namespace:** `vala.datasets.<tenant_uuid>.<name>`
 
-**Partitioning:** the hour or day transform on `wyrd_event_time` declared at registration; hourly when the registration declares no layout
+**Partitioning:** the hour or day transform on the `time_column` declared at registration, a non-null `Timestamp` in µs or ns; hourly on `wyrd_ingested_at` when the registration declares none
 
 **Tenant isolation:** Physical namespace + per-file footer tenant proof
 
@@ -88,10 +100,9 @@ User-defined datasets for high-volume custom observability writes. Each tenant g
 | `card_uid` | `Utf8` (nullable) | Correlation: owning Card |
 | `principal_id` | `Utf8` | Correlation: emitting principal |
 | `wyrd_request_id` | `Utf8` | Admitting request identity |
-| `wyrd_event_time` | `Timestamp(µs, +00:00)` | When the observed thing happened: the caller's value, or `wyrd_ingested_at` when absent; partitions and windows the table |
 | `wyrd_ingested_at` | `Timestamp(µs, +00:00)` | When Wyrd accepted the batch: one PostgreSQL timestamp per batch, read at admission; never caller-supplied |
 
-Tables registered with `CorrelationPolicy::None` (for example `vala.system.audit_log`) carry only `wyrd_event_time` and `wyrd_ingested_at`; `CorrelationPolicy::CodeAxis` tables declare their own `run_id`.
+Tables registered with `CorrelationPolicy::None` (for example `vala.system.audit_log`) carry only `wyrd_ingested_at`; `CorrelationPolicy::CodeAxis` tables declare their own `run_id`.
 
 ## vala.traces.spans
 

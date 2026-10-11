@@ -4,10 +4,6 @@
 //! type, nullability, stable id, order, and which tables append it — lives in
 //! one place, `vala_bifrost_redux::tables::managed_columns::MANAGED_COLUMNS`.
 
-/// Arrow column name for when the observed thing happened, in microseconds UTC.
-///
-/// A writer may supply it; otherwise it equals [`WYRD_INGESTED_AT`].
-pub const WYRD_EVENT_TIME: &str = "wyrd_event_time";
 /// Arrow column name for when Wyrd accepted the row, in microseconds UTC.
 ///
 /// Read once per batch from PostgreSQL at admission; never writer-supplied.

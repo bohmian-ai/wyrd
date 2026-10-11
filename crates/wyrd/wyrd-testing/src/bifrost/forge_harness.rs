@@ -1546,14 +1546,28 @@ fn day_partition_start(day: chrono::NaiveDate) -> chrono::DateTime<chrono::Utc> 
         .and_utc()
 }
 
+/// The time column every Forge fixture table declares.
+const FIXTURE_TIME_COLUMN: &str = "event_time";
+
+/// The non-null UTC microsecond [`FIXTURE_TIME_COLUMN`] field every Forge
+/// fixture table registers and every fixture batch carries.
+fn fixture_time_field() -> Field {
+    Field::new(
+        FIXTURE_TIME_COLUMN,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )
+}
+
 /// Daily layout declaration every Forge fixture table registers with.
 ///
-/// Bifrost's default is `hour(wyrd_event_time)`; these fixtures seed day-granular
-/// rows, so they declare the matching daily partition rather than letting the
-/// default disagree with the rows Scribe writes.
+/// The fixtures seed day-granular rows whose [`FIXTURE_TIME_COLUMN`] selects
+/// their day, so they declare it the daily time column rather than letting
+/// the hourly `wyrd_ingested_at` default place rows by arrival.
 fn daily_layout_declaration() -> wyrd_spec::vala::api::PhysicalLayoutWire {
     wyrd_spec::vala::api::PhysicalLayoutWire {
         partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+        time_column: Some(FIXTURE_TIME_COLUMN.to_owned()),
         sort_keys: Vec::new(),
         bloom_columns: Vec::new(),
     }
@@ -1561,19 +1575,14 @@ fn daily_layout_declaration() -> wyrd_spec::vala::api::PhysicalLayoutWire {
 
 /// User-visible ingress schema for one Forge fixture table.
 ///
-/// Carries `wyrd_event_time` explicitly so the fixture selects its own event
-/// day; Scribe lifts that column into the managed slot verbatim and stamps
-/// every other managed column itself.
+/// Carries [`FIXTURE_TIME_COLUMN`] so the fixture selects its own event day;
+/// Scribe stamps every managed column itself.
 fn fixture_ingress_schema(schema_variant: bool) -> Arc<ArrowSchema> {
     let mut fields = vec![Field::new("value", DataType::Int64, false)];
     if schema_variant {
         fields.push(Field::new("schema_variant", DataType::Int64, false));
     }
-    fields.push(Field::new(
-        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
-        false,
-    ));
+    fields.push(fixture_time_field());
     Arc::new(ArrowSchema::new(fields))
 }
 
@@ -1775,6 +1784,7 @@ async fn create_fixture_table(
     if schema_variant {
         fields.push(Field::new("schema_variant", DataType::Int64, false));
     }
+    fields.push(fixture_time_field());
     bifrost_catalog
         .create_table(CreateTableRequest {
             table: binding.table_ref.clone(),

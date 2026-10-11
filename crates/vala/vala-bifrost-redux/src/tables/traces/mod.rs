@@ -10,7 +10,7 @@ pub use spans::SpansTable;
 mod tests {
     use arrow::array::{
         Array, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray, StringArray,
-        StructArray,
+        StructArray, TimestampNanosecondArray,
     };
     use arrow::record_batch::RecordBatch;
     use serde_json::json;
@@ -256,11 +256,11 @@ mod tests {
             span::SpanKind::Server as i32
         );
         assert_eq!(
-            typed::<Int64Array>(&batch, "start_time_unix_nano").value(0),
+            typed::<TimestampNanosecondArray>(&batch, "start_time_unix_nano").value(0),
             1_700_000_000_000_000_000
         );
         assert_eq!(
-            typed::<Int64Array>(&batch, "end_time_unix_nano").value(0),
+            typed::<TimestampNanosecondArray>(&batch, "end_time_unix_nano").value(0),
             1_700_000_000_000_000_500
         );
         assert_eq!(typed::<Int64Array>(&batch, "duration_nano").value(0), 500);
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(event_names.value(1), "second");
         let event_times = events
             .column_by_name("time_unix_nano")
-            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .and_then(|column| column.as_any().downcast_ref::<TimestampNanosecondArray>())
             .expect("event time column");
         assert_eq!(event_times.value(0), 1_700_000_000_000_000_100);
         assert_eq!(event_times.value(1), 1_700_000_000_000_000_200);

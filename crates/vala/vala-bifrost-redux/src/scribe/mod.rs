@@ -21,6 +21,7 @@ pub mod memtable;
 pub mod parquet_writer;
 pub mod persistence;
 pub mod preprocess;
+pub(crate) mod profile;
 pub mod promotion;
 pub mod registry;
 pub mod replay;
@@ -79,7 +80,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
-use vala_sql::ValaPostgres;
 
 /// Awaits one already-signalled Scribe cleanup phase within the caller deadline.
 ///
@@ -267,6 +267,10 @@ pub struct ScribeImpl {
     writer_epoch: i64,
     /// Pod-global request and shard admission counters.
     admission: AdmissionController,
+    /// Control-plane pool holding the batch fences WAL recovery consults
+    /// before ending a shard chain at a bad record; `None` without
+    /// persistence, where every bad record fails closed.
+    control_postgres: Option<Arc<vala_sql::ValaPostgres>>,
     /// Scribe-only child capability over the pod-global Bifrost governor.
     memory: crate::resources::ScribeResources,
     /// Immutable boot-selected ingest ceilings shared with Gate.
@@ -316,11 +320,9 @@ pub struct ScribeImpl {
     recovery_cancelled: Arc<AtomicBool>,
     /// Optional server-provisioned immutable persistence runtime.
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
-    /// Control-plane `PostgreSQL`, the clock of record for `wyrd_ingested_at`.
-    ///
-    /// `None` only for an engine built without persistence, which has no
-    /// durable control state and stamps admission from the system clock.
-    control_postgres: Option<Arc<ValaPostgres>>,
+    /// The `PostgreSQL`-anchored clock every admitted batch is stamped from
+    /// as `wyrd_ingested_at`.
+    admission_clock: ingress::AdmissionClock,
     /// Test-tier barrier installed at the public ingest seam, if any.
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
@@ -631,7 +633,7 @@ impl ScribeEmbeddedConfig {
 ///
 /// Panics when the embedded admission configuration cannot form a shared cap
 /// above the default server headroom, which is a construction invariant.
-fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::ScribeResources {
+fn embedded_scribe_resources(config: AdmissionConfig) -> crate::resources::ScribeResources {
     let cap = config.memory_limit_bytes.max(1);
     let memory_limit_bytes = cap.saturating_add(crate::resources::DEFAULT_SERVER_MEMORY_MIN_BYTES);
     let runtime =
@@ -676,7 +678,7 @@ fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::Scri
 /// Scribe root can own.
 #[cfg(test)]
 pub(crate) fn otlp_decode_owner_for_test(bytes: usize) -> crate::contracts::OtlpDecodeOwner {
-    let resources = embedded_scribe_resources(&AdmissionConfig::default());
+    let resources = embedded_scribe_resources(AdmissionConfig::default());
     let memory = resources
         .try_reserve_ingress(memory::MemoryCategory::Decode, bytes)
         .expect("test OTLP decode owner must fit the embedded Scribe root");
@@ -691,7 +693,7 @@ pub(crate) fn otlp_decode_owner_for_test(bytes: usize) -> crate::contracts::Otlp
 #[cfg(feature = "test-support")]
 #[must_use]
 pub fn tail_resources_for_test() -> crate::resources::ScribeResources {
-    embedded_scribe_resources(&AdmissionConfig::default())
+    embedded_scribe_resources(AdmissionConfig::default())
 }
 
 impl ScribeImpl {
@@ -768,7 +770,7 @@ impl ScribeImpl {
         catalog: Arc<BifrostCatalog>,
     ) -> Self {
         let admission = AdmissionConfig::default();
-        let resources = embedded_scribe_resources(&admission);
+        let resources = embedded_scribe_resources(admission);
         Self::new_for_embedded_with_runtime_config_and_admission_and_memory(
             operator,
             wal,
@@ -830,7 +832,7 @@ impl ScribeImpl {
         sync_delay: std::time::Duration,
         admission: AdmissionConfig,
     ) -> Result<Self, String> {
-        let resources = embedded_scribe_resources(&admission);
+        let resources = embedded_scribe_resources(admission);
         Self::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
             operator,
             wal,
@@ -975,7 +977,7 @@ impl ScribeImpl {
         admission: AdmissionConfig,
         coordination_runtime: Handle,
     ) -> Self {
-        let resources = embedded_scribe_resources(&admission);
+        let resources = embedded_scribe_resources(admission);
         Self::new_for_embedded_with_runtime_config_and_admission_and_memory(
             operator,
             wal,
@@ -1214,6 +1216,7 @@ impl ScribeImpl {
             recovery_ready: AtomicBool::new(true),
             recovery_cancelled: Arc::new(AtomicBool::new(false)),
             persistence,
+            admission_clock: ingress::AdmissionClock::new(control_postgres.clone()),
             control_postgres,
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
@@ -1276,7 +1279,7 @@ impl ScribeImpl {
         // Leak temp_dir to keep WAL files for the test lifetime
         std::mem::forget(temp_dir);
 
-        let resources = embedded_scribe_resources(&admission_config);
+        let resources = embedded_scribe_resources(admission_config);
         let geometry = geometry::ScribeGeometry::for_uniform_shard_rotation(
             wal.segment_bytes(),
             memtable::MEMTABLE_ROTATION_BYTES,
@@ -1849,7 +1852,6 @@ impl Scribe for ScribeImpl {
                     | ScribeError::DecodedPayloadTooLarge { .. }
                     | ScribeError::InvalidFrame
                     | ScribeError::ContractViolation(_)
-                    | ScribeError::EventTimeOutOfRange { .. }
                     | ScribeError::FingerprintMismatch { .. }
                     | ScribeError::TableNotFound { .. }
                     | ScribeError::CardScopeDenied
@@ -2026,7 +2028,7 @@ mod constructor_rotation_tests {
                 admission,
                 coordination_runtime: Handle::current(),
                 persistence: None,
-                resources: embedded_scribe_resources(&admission),
+                resources: embedded_scribe_resources(admission),
                 staging_file_publisher: None,
                 geometry_for_test: Some(
                     geometry::ScribeGeometry::for_uniform_shard_rotation(
@@ -2515,6 +2517,12 @@ impl ScribeImpl {
                     shard_senders: self.shards.replay_senders(),
                     memory: self.memory.clone(),
                     cancelled: Arc::clone(&self.recovery_cancelled),
+                    fences: self.control_postgres.as_ref().map(|postgres| {
+                        crate::scribe::replay::ReplayFences::new(
+                            Arc::clone(postgres),
+                            tokio::runtime::Handle::current(),
+                        )
+                    }),
                 },
             )
             .await;

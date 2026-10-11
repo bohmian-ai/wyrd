@@ -3,9 +3,9 @@
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 
 use super::support::{
-    append_batch, append_values, append_values_at, await_persistence_drained, hour_start,
-    published_rows, read_sql, register_table, sorted_values, start_scribe_server, tenant_client,
-    unique_table,
+    EVENT_TIME, append_batch, append_values_at, await_persistence_drained, hour_start,
+    published_rows, read_sql, register_timed_table, sorted_values, start_scribe_server,
+    tenant_client, unique_table,
 };
 
 /// One table name is three independent fences.
@@ -14,7 +14,8 @@ use super::support::{
 /// and Scribe has to keep all three separations exact at once. Two tenants may
 /// register the identical name and neither may ever observe the other's rows.
 /// One tenant's rows split across physical partitions by the event time the
-/// client supplied, not by when Scribe happened to see them. And a batch whose
+/// client supplied in the table's declared time column, not by when Scribe
+/// happened to see them. And a batch whose
 /// ingress schema is not the registered schema is refused outright rather than
 /// half-written.
 ///
@@ -49,9 +50,10 @@ async fn scribe_tenant_partition_schema_fencing() {
         .await
         .expect("the second tenant is seeded");
     let name = unique_table("fencing");
-    let table = register_table(&server, first_tenant, BifrostNamespace::Datasets, &name).await;
+    let table =
+        register_timed_table(&server, first_tenant, BifrostNamespace::Datasets, &name).await;
     let neighbour_table =
-        register_table(&server, second_tenant, BifrostNamespace::Datasets, &name).await;
+        register_timed_table(&server, second_tenant, BifrostNamespace::Datasets, &name).await;
     assert_eq!(
         table, neighbour_table,
         "both tenants must be registering the identical table name"
@@ -59,13 +61,20 @@ async fn scribe_tenant_partition_schema_fencing() {
     let client = tenant_client(&server, first_tenant).await;
     let neighbour = tenant_client(&server, second_tenant).await;
 
+    // Any instant is a valid event time, so the two partitions are fixed
+    // adjacent hours rather than a window around now.
+    let late = chrono::DateTime::parse_from_rfc3339("2024-03-01T12:30:00Z")
+        .expect("the later event time is valid RFC 3339")
+        .with_timezone(&chrono::Utc);
+    let early = late - chrono::Duration::hours(1);
+
     // Tenant fence: identical name, disjoint rows, neither read crossing.
     let mine: Vec<i64> = (0..16).collect();
     let theirs: Vec<i64> = (100..116).collect();
-    append_values(&client, &table, uuid::Uuid::now_v7(), &mine)
+    append_values_at(&client, &table, uuid::Uuid::now_v7(), &mine, late)
         .await
         .expect("the first tenant's append is acknowledged");
-    append_values(&neighbour, &table, uuid::Uuid::now_v7(), &theirs)
+    append_values_at(&neighbour, &table, uuid::Uuid::now_v7(), &theirs, late)
         .await
         .expect("the second tenant's append is acknowledged");
     assert_eq!(
@@ -79,15 +88,27 @@ async fn scribe_tenant_partition_schema_fencing() {
         "the neighbouring tenant must read exactly its own rows"
     );
 
-    // Schema fence: the registered schema is one Int64 column, and a batch
-    // that adds a column is not that table's data.
+    // Schema fence: the registered schema is `value` plus the event time, and
+    // a batch that adds a column is not that table's data.
     let widened = arrow::record_batch::RecordBatch::try_new(
         std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
             arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new(
+                EVENT_TIME,
+                arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                ),
+                false,
+            ),
             arrow::datatypes::Field::new("extra", arrow::datatypes::DataType::Utf8, false),
         ])),
         vec![
             std::sync::Arc::new(arrow::array::Int64Array::from(vec![900_i64])),
+            std::sync::Arc::new(
+                arrow::array::TimestampMicrosecondArray::from(vec![late.timestamp_micros()])
+                    .with_timezone("UTC"),
+            ),
             std::sync::Arc::new(arrow::array::StringArray::from(vec!["unregistered"])),
         ],
     )
@@ -101,7 +122,7 @@ async fn scribe_tenant_partition_schema_fencing() {
         "a refused schema may not leave any of its rows behind"
     );
 
-    // Publish the fence rows first. They share the current-hour key, so left
+    // Publish the fence rows first. They share the later-hour key, so left
     // staged they would stretch the later member's WAL envelope below every
     // interleaved append and no earlier envelope could enclose it.
     server
@@ -110,15 +131,11 @@ async fn scribe_tenant_partition_schema_fencing() {
         .expect("the tenant fence rows publish");
 
     // Partition fence: the client's own event time decides the partition.
-    // Ingest fences event time to a window around now, so the two partitions
-    // are the current hour and the one before it rather than fixed literals.
     //
     // The two partitions are appended alternately so the node-global WAL
     // counter interleaves them. That is what makes the earlier partition's
     // published bounds enclose WAL positions the later partition owns, which is
     // the topology a cut must read as "not mine" rather than as ownership.
-    let late = chrono::Utc::now();
-    let early = late - chrono::Duration::hours(1);
     let early_rows: Vec<i64> = (200..208).collect();
     let late_rows: Vec<i64> = (300..312).collect();
     for (index, chunk) in early_rows.chunks(4).zip(late_rows.chunks(6)).enumerate() {
@@ -154,7 +171,7 @@ async fn scribe_tenant_partition_schema_fencing() {
         .expect("the earlier event time has an hour partition");
     let late_partition = vala_bifrost_redux::catalog::TimeGranularity::Hour
         .bucket(late)
-        .expect("the current event time has an hour partition");
+        .expect("the later event time has an hour partition");
     assert!(
         server
             .publish_bifrost_partition_for_test(early_partition)
@@ -234,12 +251,12 @@ async fn scribe_tenant_partition_schema_fencing() {
     assert_eq!(
         partition_rows(hour_start(late)),
         (mine.len() + late_rows.len()) as u64,
-        "rows carrying the current event time belong to the current hour partition"
+        "rows carrying the later event time belong to the later hour partition"
     );
     let mut before_this_hour = read_sql(
         &client,
         &format!(
-            "SELECT value FROM {table} WHERE wyrd_event_time < TIMESTAMP '{}'",
+            "SELECT value FROM {table} WHERE {EVENT_TIME} < TIMESTAMP '{}'",
             hour_start(late).format("%Y-%m-%d %H:%M:%S")
         ),
     )

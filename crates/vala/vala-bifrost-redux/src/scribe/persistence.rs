@@ -3087,7 +3087,7 @@ mod tests {
         fn fixture_schema() -> Arc<arrow::datatypes::Schema> {
             Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(
-                    wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+                    "event_time",
                     arrow::datatypes::DataType::Timestamp(
                         arrow::datatypes::TimeUnit::Microsecond,
                         None,
@@ -3102,14 +3102,14 @@ mod tests {
         ///
         /// The fixture drives the persistence worker directly rather than through
         /// the catalog, so it owns the one registration the worker requires. The
-        /// layout is the canonical omission default, matching a table registered
-        /// without a declaration.
+        /// layout partitions daily on the fixture's `event_time`, matching the
+        /// day partition the generation seals into.
         async fn register_control_row(&self, table: &crate::catalog::TableRef) {
             let fqn = table.fqn();
             let layout = crate::catalog::layout::PhysicalLayout::resolve(
                 &fqn,
                 &Self::fixture_schema(),
-                None,
+                Some(&crate::tables::daily_layout("event_time", Vec::new(), &[])),
             )
             .expect("the fixture schema resolves");
             let mut conn = self

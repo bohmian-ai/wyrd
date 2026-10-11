@@ -6,7 +6,6 @@ use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterPropertiesBuilder};
 use parquet::schema::types::ColumnPath;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// Estimated encoded bytes at which a Bifrost writer closes a row group.
 ///
@@ -41,9 +40,10 @@ const BLOOM_FPP: f64 = 0.01;
 /// Dictionary encoding is on by default so low-cardinality string and
 /// identifier columns encode as `RLE_DICTIONARY`; parquet-rs owns dictionary
 /// page overflow at [`BIFROST_DICTIONARY_PAGE_BYTES`] and the fallback to
-/// `PLAIN`, so no sampler or cardinality estimate is computed here. `wyrd_event_time` is the one column that opts
-/// out: it is monotonic microsecond data that `DELTA_BINARY_PACKED` encodes
-/// strictly better than a dictionary would.
+/// `PLAIN`, so no sampler or cardinality estimate is computed here. The table's
+/// `time_column` is the one column that opts out: it is near-monotonic
+/// timestamp data that `DELTA_BINARY_PACKED` encodes strictly better than a
+/// dictionary would.
 ///
 /// Bloom filters are enabled only for `bloom_columns`, the canonical union the
 /// registered physical layout resolved from the managed floor and the table's
@@ -52,14 +52,14 @@ const BLOOM_FPP: f64 = 0.01;
 ///
 /// # Panics
 /// Never panics — ZSTD level 3 is always valid.
-pub fn bifrost_writer_properties(bloom_columns: &[String]) -> WriterProperties {
-    bifrost_writer_properties_with_metadata(Vec::new(), bloom_columns)
+pub fn bifrost_writer_properties(time_column: &str, bloom_columns: &[String]) -> WriterProperties {
+    bifrost_writer_properties_with_metadata(Vec::new(), time_column, bloom_columns)
 }
 
 /// Parquet properties carrying caller-supplied footer metadata.
 ///
-/// Dictionary encoding is enabled globally and disabled for
-/// [`WYRD_EVENT_TIME`], which keeps `DELTA_BINARY_PACKED` as its actual
+/// Dictionary encoding is enabled globally and disabled for the table's
+/// `time_column`, which keeps `DELTA_BINARY_PACKED` as its actual
 /// encoding. Both calls are required: parquet-rs treats a per-column encoding
 /// request as a *fallback* used only after a dictionary overflows, so
 /// `set_column_encoding` alone would leave the column dictionary-encoded.
@@ -75,9 +75,10 @@ pub fn bifrost_writer_properties(bloom_columns: &[String]) -> WriterProperties {
 #[must_use]
 pub fn bifrost_writer_properties_with_metadata(
     metadata: Vec<KeyValue>,
+    time_column: &str,
     bloom_columns: &[String],
 ) -> WriterProperties {
-    let mut builder = recipe_builder(bloom_columns);
+    let mut builder = recipe_builder(time_column, bloom_columns);
     if !metadata.is_empty() {
         builder = builder.set_key_value_metadata(Some(metadata));
     }
@@ -121,10 +122,11 @@ pub const BIFROST_VARIANT_SHREDDING: VariantShreddingPolicy = VariantShreddingPo
 #[must_use]
 pub fn bifrost_rewrite_writer_properties(
     row_group_target_bytes: u64,
+    time_column: &str,
     bloom_columns: &[String],
     tenant: DataTenantId,
 ) -> WriterProperties {
-    recipe_builder(bloom_columns)
+    recipe_builder(time_column, bloom_columns)
         .set_max_row_group_bytes(Some(
             usize::try_from(row_group_target_bytes).unwrap_or(usize::MAX),
         ))
@@ -145,7 +147,7 @@ pub fn bifrost_rewrite_writer_properties(
 /// # Panics
 ///
 /// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
-fn recipe_builder(bloom_columns: &[String]) -> WriterPropertiesBuilder {
+fn recipe_builder(time_column: &str, bloom_columns: &[String]) -> WriterPropertiesBuilder {
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
@@ -153,11 +155,8 @@ fn recipe_builder(bloom_columns: &[String]) -> WriterPropertiesBuilder {
         .set_max_row_group_bytes(Some(BIFROST_ROW_GROUP_TARGET_BYTES))
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(BIFROST_DICTIONARY_PAGE_BYTES)
-        .set_column_dictionary_enabled(ColumnPath::from(WYRD_EVENT_TIME), false)
-        .set_column_encoding(
-            ColumnPath::from(WYRD_EVENT_TIME),
-            Encoding::DELTA_BINARY_PACKED,
-        )
+        .set_column_dictionary_enabled(ColumnPath::from(time_column), false)
+        .set_column_encoding(ColumnPath::from(time_column), Encoding::DELTA_BINARY_PACKED)
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_offset_index_disabled(false);
 
@@ -177,6 +176,9 @@ mod tests {
 
     use super::*;
 
+    /// The time column every recipe fixture declares.
+    const TIME_COLUMN: &str = "event_time";
+
     /// The canonical union a traces table resolves: managed floor plus the
     /// declaration-only correlation columns.
     fn declared_recipe() -> Vec<String> {
@@ -188,13 +190,13 @@ mod tests {
 
     /// The one writer recipe every Bifrost producer builds: dictionary
     /// encoding on by default so low-cardinality columns compress, bounded at
-    /// the per-lookup dictionary decode size, and off for `wyrd_event_time` so
+    /// the per-lookup dictionary decode size, and off for the time column so
     /// `DELTA_BINARY_PACKED` is its real encoding rather than a post-overflow
     /// fallback.
     #[test]
     fn writer_recipe_encoding_contract() {
         let bloom_columns = declared_recipe();
-        let properties = bifrost_writer_properties(&bloom_columns);
+        let properties = bifrost_writer_properties(TIME_COLUMN, &bloom_columns);
 
         for column in ["service_name", "run_id", "message", "card_uid"] {
             let path = ColumnPath::from(column);
@@ -215,10 +217,10 @@ mod tests {
             "dictionary pages overflow at the bounded per-lookup decode size"
         );
 
-        let event_time = ColumnPath::from(WYRD_EVENT_TIME);
+        let event_time = ColumnPath::from(TIME_COLUMN);
         assert!(
             !properties.dictionary_enabled(&event_time),
-            "wyrd_event_time must opt out of dictionary encoding"
+            "the time column must opt out of dictionary encoding"
         );
         assert_eq!(
             properties.encoding(&event_time),
@@ -236,8 +238,8 @@ mod tests {
     #[test]
     fn writer_recipe_metadata_is_deterministic() {
         let bloom_columns = declared_recipe();
-        let properties = bifrost_writer_properties(&bloom_columns);
-        let timestamp = ColumnPath::from("wyrd_event_time");
+        let properties = bifrost_writer_properties(TIME_COLUMN, &bloom_columns);
+        let timestamp = ColumnPath::from(TIME_COLUMN);
 
         assert_eq!(
             properties.compression(&timestamp),
@@ -302,7 +304,7 @@ mod tests {
     #[test]
     fn writer_recipe_blooms_exactly_the_resolved_union() {
         let floor = ["card_uid".to_owned(), "run_id".to_owned()];
-        let properties = bifrost_writer_properties(&floor);
+        let properties = bifrost_writer_properties(TIME_COLUMN, &floor);
         for column in &floor {
             assert!(
                 properties
@@ -311,7 +313,7 @@ mod tests {
                 "resolved column {column} must have a bloom filter"
             );
         }
-        for column in ["trace_id", "span_id", "wyrd_event_time"] {
+        for column in ["trace_id", "span_id", TIME_COLUMN] {
             assert!(
                 properties
                     .bloom_filter_properties(&ColumnPath::from(column))
@@ -336,8 +338,9 @@ mod tests {
     #[test]
     fn bloom_capacity_uses_row_group_limit_for_scribe_and_forge() {
         let columns = declared_recipe();
-        let scribe = bifrost_writer_properties_with_metadata(Vec::new(), &columns);
-        let forge = bifrost_rewrite_writer_properties(1_024, &columns, DataTenantId::new_v7());
+        let scribe = bifrost_writer_properties_with_metadata(Vec::new(), TIME_COLUMN, &columns);
+        let forge =
+            bifrost_rewrite_writer_properties(1_024, TIME_COLUMN, &columns, DataTenantId::new_v7());
         for properties in [&scribe, &forge] {
             assert_eq!(
                 properties.max_row_group_row_count(),
@@ -393,6 +396,7 @@ mod tests {
             schema,
             Some(bifrost_rewrite_writer_properties(
                 target,
+                TIME_COLUMN,
                 &[],
                 wyrd_spec::DataTenantId::new_v7(),
             )),

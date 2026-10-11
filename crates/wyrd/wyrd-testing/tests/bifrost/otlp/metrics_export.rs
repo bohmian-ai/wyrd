@@ -214,9 +214,12 @@ mod pg_tests {
             support::expected_attributes(&support::metric_metadata()),
             "{transport} keeps metric metadata distinct from point attributes"
         );
-        assert_eq!(column::<Int64Array>(row, "time_unix_nano").value(0), time);
         assert_eq!(
-            column::<Int64Array>(row, "start_time_unix_nano").value(0),
+            column::<arrow::array::TimestampNanosecondArray>(row, "time_unix_nano").value(0),
+            time
+        );
+        assert_eq!(
+            column::<arrow::array::TimestampNanosecondArray>(row, "start_time_unix_nano").value(0),
             time - METRIC_START_OFFSET_NANOS
         );
         assert_eq!(column::<Int64Array>(row, "flags").value(0), METRIC_FLAGS);
@@ -297,7 +300,7 @@ mod pg_tests {
             let time = anchor + offset;
             let rows = journey
                 .query(&format!(
-                    "SELECT * FROM {METRICS_TABLE} WHERE time_unix_nano = {time}"
+                    "SELECT * FROM {METRICS_TABLE} WHERE time_unix_nano = to_timestamp_nanos({time})"
                 ))
                 .await;
             let stored: Vec<String> = rows
@@ -340,7 +343,8 @@ mod pg_tests {
                 .expect("exemplars are stored as structs");
             assert_eq!(exemplars.len(), 1, "{transport} stores the one exemplar");
             assert_eq!(
-                child::<Int64Array>(exemplars, "time_unix_nano").value(0),
+                child::<arrow::array::TimestampNanosecondArray>(exemplars, "time_unix_nano")
+                    .value(0),
                 time + METRIC_EXEMPLAR_OFFSET_NANOS
             );
             assert_eq!(

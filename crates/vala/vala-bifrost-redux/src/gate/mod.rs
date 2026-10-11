@@ -38,7 +38,7 @@ use crate::namespaces::BifrostNamespace;
 use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use crate::scribe::execution_lanes::require_card_scope;
-use crate::scribe::preprocess::{correlation_data_identity, logical_data_identity};
+use crate::scribe::preprocess::{LogicalIdentity, correlation_data_identity};
 use crate::tables::{
     CallsTable, DomainTable, ResultFeaturesTable, ResultItemsTable, ResultsTable, TableError,
 };
@@ -128,10 +128,11 @@ fn otlp_batch_id(
     tenant: DataTenantId,
     principal: PrincipalId,
     table: &TableRef,
-    batch: &RecordBatch,
+    identity: &LogicalIdentity,
 ) -> Result<Uuid, IngestError> {
-    let (logical_digest, _) = logical_data_identity(batch).map_err(IngestError::from_scribe)?;
-    let correlation_digest = correlation_data_identity(batch).map_err(IngestError::from_scribe)?;
+    let logical_digest = identity.digest();
+    let correlation_digest =
+        correlation_data_identity(identity.rows()).map_err(IngestError::from_scribe)?;
     let mut digest = Sha256::new();
     digest.update(b"wyrd.otlp.batch-id.v1");
     digest.update(tenant.as_uuid().as_bytes());
@@ -254,30 +255,24 @@ pub fn initialize_gate_metrics() {
     metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").set(0.0);
 }
 
-/// Durable sink for the write-authorization decisions Gate reaches.
+/// Sink for the write-authorization decisions Gate reaches.
 ///
 /// Gate evaluates the RBAC permission but owns no database, so the composition
-/// root supplies the tenant-scoped writer. The append is mandatory: a decision
-/// that cannot be recorded refuses the write rather than admitting it unaudited.
+/// root supplies the writer. The permission check blocks; its audit does not:
+/// the sink stages each decision on the process audit outbox and returns
+/// without IO, so no write waits on an audit commit.
 ///
 /// The trait exists because the writer lives in a crate Gate must not depend
 /// on, not because the sink is chosen at runtime: [`Gate`] is parameterized over
-/// it, so the server composes its Postgres writer and crate-local tests compose
+/// it, so the server composes its outbox writer and crate-local tests compose
 /// their recording double, both statically.
-#[wyrd_tonic::tonic::async_trait]
 pub trait GateAudit: Send + Sync {
-    /// Records one `bifrost_record:write` decision for `auth` on `resource`.
+    /// Stages one `bifrost_record:write` decision for `auth` on `resource`
+    /// without waiting for its commit.
     ///
-    /// # Errors
-    ///
-    /// Returns [`IngestError::AuditUnavailable`] when the row cannot be
-    /// committed; the caller must then refuse the write.
-    async fn append_write_decision(
-        &self,
-        auth: &AuthContext,
-        resource: &str,
-        outcome: AuditOutcome,
-    ) -> Result<(), IngestError>;
+    /// A decision the outbox cannot commit is logged and counted by the
+    /// writer, never returned: audit does not block ingest.
+    fn stage_write_decision(&self, auth: &AuthContext, resource: &str, outcome: AuditOutcome);
 }
 
 /// Receives Eval observation frames after Scribe has durably acknowledged them.
@@ -294,10 +289,8 @@ pub trait GateAudit: Send + Sync {
 pub trait ObservationAck: Send + Sync {
     /// Accepts one acknowledged `vala.eval.observations` frame.
     ///
-    /// `frame` is the exact Arrow IPC payload Scribe admitted and
-    /// `receipt_micros` the receipt instant it stamped on rows without a
-    /// caller `wyrd_event_time`.
-    fn acknowledged(&self, auth: &AuthContext, frame: bytes::Bytes, receipt_micros: i64);
+    /// `frame` is the exact Arrow IPC payload Scribe admitted.
+    fn acknowledged(&self, auth: &AuthContext, frame: bytes::Bytes);
 }
 
 /// The concrete Bifrost write boundary.
@@ -470,19 +463,22 @@ impl<A: GateAudit + 'static> Gate<A> {
         self
     }
 
-    /// Evaluates the table-scoped write permission and durably records the decision.
+    /// Evaluates the table-scoped write permission and stages its decision on
+    /// the audit outbox.
     ///
     /// The verification result tables accept only the scoped SYSTEM writer, and
     /// `vala.gateway.calls` accepts only the reserved gateway capture principal.
-    /// Every allowed or denied decision is recorded before admission proceeds.
+    /// Every allowed or denied decision is staged before admission proceeds;
+    /// the write never waits for that decision's commit.
     ///
     /// `native_frame` supplies the Arrow IPC payload for native writes. OTLP
     /// callers pass `None` because they cannot write verification results.
     ///
     /// # Errors
     ///
-    /// Returns the permission or reserved-table refusal, an audit failure, or
-    /// a mapped destination error when the table cannot be resolved.
+    /// Returns the permission or reserved-table refusal,
+    /// [`IngestError::AuditUnavailable`] when Gate was composed without a
+    /// sink, or a mapped destination error when the table cannot be resolved.
     async fn authorize_record_write(
         &self,
         auth: &AuthContext,
@@ -499,9 +495,7 @@ impl<A: GateAudit + 'static> Gate<A> {
         } else {
             AuditOutcome::Denied
         };
-        audit
-            .append_write_decision(auth, &table.fqn(), outcome)
-            .await?;
+        audit.stage_write_decision(auth, &table.fqn(), outcome);
         decision
     }
 
@@ -912,11 +906,15 @@ impl<A: GateAudit + 'static> Gate<A> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        let batch_id = otlp_batch_id(auth.tenant, auth.principal.id, &table, &batch)?;
-        let payload = IngressPayload::Canonical(match owner {
-            Some(owner) => CanonicalIngress::new(vec![batch], owner),
-            None => CanonicalIngress::unreserved(vec![batch]),
-        });
+        let identity = LogicalIdentity::of(&batch).map_err(IngestError::from_scribe)?;
+        let batch_id = otlp_batch_id(auth.tenant, auth.principal.id, &table, &identity)?;
+        let payload = IngressPayload::Canonical(
+            match owner {
+                Some(owner) => CanonicalIngress::new(vec![batch], owner),
+                None => CanonicalIngress::unreserved(vec![batch]),
+            }
+            .with_logical_identity(identity),
+        );
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         scribe
             .ingest_frame(ScribeIngressFrame {
@@ -1022,10 +1020,10 @@ impl<A: GateAudit + 'static> Gate<A> {
         metrics::counter!("bifrost_gate_frames_total", "status" => "accepted").increment(1);
         metrics::histogram!("bifrost_gate_resolution_seconds")
             .record(resolution_started.elapsed().as_secs_f64());
-        // Only the attempt that inserted the batch activates runs: a suppressed
-        // replay carries its own receipt instant, not the one stored on the rows.
+        // Only the attempt that inserted the batch activates runs, so a
+        // suppressed replay never enqueues a run twice.
         if let Some((hook, frame)) = observed.filter(|_| admission.first_commit) {
-            hook.acknowledged(auth, frame, admission.receipt_micros);
+            hook.acknowledged(auth, frame);
         }
         Ok(admission.rows_accepted)
     }
@@ -1522,19 +1520,16 @@ mod tests {
         }
     }
 
-    #[wyrd_tonic::tonic::async_trait]
     impl GateAudit for RecordingAudit {
-        async fn append_write_decision(
-            &self,
-            _auth: &AuthContext,
-            resource: &str,
-            outcome: AuditOutcome,
-        ) -> Result<(), IngestError> {
+        /// Records the staged decision in memory for assertion.
+        ///
+        /// # Panics
+        /// Panics when a recording thread poisoned the decision lock.
+        fn stage_write_decision(&self, _auth: &AuthContext, resource: &str, outcome: AuditOutcome) {
             self.decisions
                 .lock()
                 .expect("recording audit lock is uncontended")
                 .push((resource.to_owned(), outcome));
-            Ok(())
         }
     }
 
@@ -2989,7 +2984,9 @@ mod otlp_batch_id_tests {
         let spans = TableRef::new(BifrostNamespace::Traces, "spans");
         let records = TableRef::new(BifrostNamespace::Logs, "records");
         let id = |tenant, principal, table: &TableRef, values: &[i32], run| {
-            otlp_batch_id(tenant, principal, table, &batch(values, run))
+            let identity = crate::scribe::preprocess::LogicalIdentity::of(&batch(values, run))
+                .expect("the fixture batch has a logical identity");
+            otlp_batch_id(tenant, principal, table, &identity)
                 .expect("the fixture batch has an identity")
         };
 

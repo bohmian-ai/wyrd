@@ -270,9 +270,16 @@ impl ForgeManagedRewrite {
                 .get(crate::catalog::layout::BLOOM_COLUMNS_PROPERTY),
         )
         .map_err(|detail| ForgeError::InvalidConfig { detail })?;
+        let time_axis =
+            crate::catalog::TimeAxis::of_iceberg(table.metadata()).ok_or_else(|| {
+                ForgeError::InvalidConfig {
+                    detail: "table partition spec has no time partition field".to_owned(),
+                }
+            })?;
         let config = policy.to_core_config(
             CompactionPlanningConfig::default(),
             self.attempt_id.to_string(),
+            time_axis.column(),
             &bloom_columns,
             self.core.config.max_concurrent_reads,
             self.binding.tenant,

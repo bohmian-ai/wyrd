@@ -650,7 +650,8 @@ impl BifrostReader {
     }
 
     /// Read one committed observation of `subject` by its record ID, pruned
-    /// to the UTC day of its frozen server `event_time`.
+    /// to the UTC day of its `created_at`, the table's time column, which the
+    /// run froze as `event_time`.
     ///
     /// # Errors
     /// Returns [`ReadError::Admission`] when Bifrost refuses the read at
@@ -668,8 +669,8 @@ impl BifrostReader {
                 "SELECT record_id, session_id, context, trace_id, span_id, created_at, media \
                  FROM vala.eval.observations \
                  WHERE card_uid = '{}' AND record_id = '{}' \
-                   AND wyrd_event_time >= TIMESTAMP '{start}' \
-                   AND wyrd_event_time < TIMESTAMP '{end}' \
+                   AND created_at >= TIMESTAMP '{start}' \
+                   AND created_at < TIMESTAMP '{end}' \
                  LIMIT 1",
                 quoted(subject),
                 quoted(record_id),
@@ -718,9 +719,12 @@ impl BifrostReader {
         .map_err(|error| format!("record {record_id} does not decode: {error}").into())
     }
 
-    /// Read the visible spans of `trace_id` received from the start of the
-    /// day before the record's day to the end of the day containing
+    /// Read the visible spans of `trace_id` that started from the start of
+    /// the day before the record's day to the end of the day containing
     /// `event_time + window`, in start-time then span-ID order.
+    ///
+    /// The range is on `start_time_unix_nano`, the span table's time column,
+    /// so it prunes to the partitions and files the range covers.
     ///
     /// The one total order makes positional selectors such as `$.spans[0]`
     /// reproducible across retries and restarts. At most
@@ -752,8 +756,8 @@ impl BifrostReader {
                         links, dropped_links_count, scope_name, service_name \
                  FROM vala.traces.spans \
                  WHERE trace_id = X'{}' \
-                   AND wyrd_event_time >= TIMESTAMP '{start}' \
-                   AND wyrd_event_time < TIMESTAMP '{end}' \
+                   AND start_time_unix_nano >= TIMESTAMP '{start}' \
+                   AND start_time_unix_nano < TIMESTAMP '{end}' \
                  ORDER BY start_time_unix_nano, span_id \
                  LIMIT {}",
                 trace_id.to_hex(),

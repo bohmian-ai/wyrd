@@ -7,10 +7,13 @@ use crate::scribe::memory::MemoryCategory;
 use crate::scribe::preprocess::{
     AdmittedAppend, AdmittedRows, NativeAdmittedRows, PreparedAppend, prepare_append,
 };
+use crate::scribe::profile::WriteProfile;
 use crate::tables::AuditLogTable;
 
 use std::sync::Arc;
 use std::time::Instant;
+
+use vala_sql::ValaPostgres;
 
 use iceberg::spec::Schema;
 use wyrd_spec::DataTenantId;
@@ -104,8 +107,6 @@ struct AdmittedRowContext {
     receipt_micros: i64,
     /// Fixed material ceiling admitted for the current slice.
     material_limit: usize,
-    /// Native event-time acceptance window.
-    event_time_window: crate::scribe::admission::EventTimeWindow,
     /// Server-owned built-in whose declared physical contract the decode must
     /// preserve, including its correlation policy.
     ///
@@ -126,8 +127,8 @@ struct AdmittedRowContext {
 struct LogicalFrameContract {
     /// Catalog fingerprint required of the caller-owned source schema.
     expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
-    /// Registered partition granularity every slice of this frame is bucketed to.
-    partition_granularity: crate::catalog::TimeGranularity,
+    /// Registered time axis every slice of this frame is bucketed by.
+    time_axis: crate::catalog::TimeAxis,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
@@ -139,8 +140,8 @@ struct LogicalFrameContract {
 struct RootAdmission {
     /// Catalog fingerprint required of the caller-owned source schema.
     expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
-    /// Registered partition granularity applied to every prepared slice.
-    partition_granularity: crate::catalog::TimeGranularity,
+    /// Registered time axis applied to every prepared slice.
+    time_axis: crate::catalog::TimeAxis,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
@@ -162,11 +163,12 @@ impl ScribeImpl {
     /// Resolves one authenticated logical frame under the Scribe catalog owner.
     ///
     /// The catalog owner is authoritative for both halves of the contract: a
-    /// caller-supplied fingerprint is honored as an override, but the partition
-    /// granularity always comes from the registered canonical layout so no
-    /// ingest path can invent one. Only the embedded engine seam, which has no
-    /// catalog owner, falls back to the default hourly granularity, and it must
-    /// supply its own fingerprint.
+    /// caller-supplied fingerprint is honored as an override, but the time
+    /// axis always comes from the registered canonical layout so no ingest path
+    /// can invent one. The embedded engine seam has no catalog owner: it takes
+    /// a built-in table's axis from the built-in layout, falls back to hourly
+    /// `wyrd_ingested_at` for any other table, and must supply its own
+    /// fingerprint.
     ///
     /// # Errors
     ///
@@ -177,6 +179,7 @@ impl ScribeImpl {
         &self,
         frame: &ScribeIngressFrame,
     ) -> Result<LogicalFrameContract, ScribeError> {
+        let builtin = Self::builtin_definition(&frame.table);
         let Some(catalog) = self.catalog.as_ref() else {
             let expected_schema_fingerprint =
                 frame
@@ -186,19 +189,19 @@ impl ScribeImpl {
                     })?;
             return Ok(LogicalFrameContract {
                 expected_schema_fingerprint,
-                partition_granularity: crate::catalog::TimeGranularity::Hour,
+                time_axis: builtin.map_or_else(
+                    || {
+                        crate::catalog::TimeAxis::new(
+                            wyrd_spec::vala::WYRD_INGESTED_AT,
+                            crate::catalog::TimeGranularity::Hour,
+                        )
+                    },
+                    |definition| crate::catalog::TimeAxis::of_wire(&(definition.physical_layout)()),
+                ),
                 registered_schema: None,
             });
         };
-        if let Some(definition) = crate::tables::builtin_table(
-            frame
-                .table
-                .namespace
-                .as_str()
-                .strip_prefix("vala.")
-                .unwrap_or_default(),
-            &frame.table.name,
-        ) {
+        if let Some(definition) = builtin {
             catalog
                 .ensure_builtin(frame.authenticated_tenant, definition)
                 .await
@@ -216,9 +219,7 @@ impl ScribeImpl {
             expected_schema_fingerprint: frame
                 .expected_schema_fingerprint
                 .unwrap_or(registered_fingerprint),
-            partition_granularity: crate::catalog::TimeGranularity::from_wire(
-                layout.partition_granularity,
-            ),
+            time_axis: crate::catalog::TimeAxis::of_wire(&layout),
             registered_schema: Some(registered_schema),
         })
     }
@@ -329,7 +330,6 @@ impl ScribeImpl {
             batch_id,
             receipt_micros,
             material_limit,
-            event_time_window,
             definition,
             registered_schema,
         } = context;
@@ -341,14 +341,15 @@ impl ScribeImpl {
                     expected_schema_fingerprint,
                     request_id,
                     batch_id,
-                    event_time_window,
                     receipt_micros,
                     definition,
                     registered_schema,
+                    conform: Arc::clone(self.ingress_cpu.conform_plans()),
                     expanded_limit_bytes: self.ingest_limits.expanded_bytes(),
                 })))
             }
-            IngressPayload::Canonical(canonical) => {
+            IngressPayload::Canonical(mut canonical) => {
+                let known = canonical.logical_identity.take();
                 let rows = self
                     .ingress_cpu
                     .decode(
@@ -358,7 +359,6 @@ impl ScribeImpl {
                             expected_schema_fingerprint,
                             request_id,
                             receipt_micros,
-                            window: event_time_window,
                             definition,
                             registered_schema,
                         },
@@ -371,7 +371,10 @@ impl ScribeImpl {
                         limit: material_limit,
                     });
                 }
-                Ok(AdmittedRows::Projected(rows))
+                // Only an identity whose inputs survived decode travels on, so
+                // a cast column's original buffers are released here.
+                let known = known.filter(|known| known.for_rows(&rows).is_some());
+                Ok(AdmittedRows::Projected(rows, known))
             }
         }
     }
@@ -396,7 +399,7 @@ impl ScribeImpl {
         let decode_owner = take_transport_decode_owner(&mut frame.payload);
         let LogicalFrameContract {
             expected_schema_fingerprint,
-            partition_granularity,
+            time_axis,
             registered_schema,
         } = self.resolve_logical_frame(frame).await?;
         let receipt_micros = self.admission_instant(frame.principal.tenant_id).await?;
@@ -423,7 +426,7 @@ impl ScribeImpl {
         self.pause_admitted_ingest_for_test().await;
         Ok(RootAdmission {
             expected_schema_fingerprint,
-            partition_granularity,
+            time_axis,
             registered_schema,
             receipt_micros,
             material_plan,
@@ -435,28 +438,16 @@ impl ScribeImpl {
 
     /// Reads the one ingestion instant a transport frame is admitted under.
     ///
-    /// `PostgreSQL` is the clock of record: the instant is read once per batch,
-    /// stamped on every row as `wyrd_ingested_at`, used as `wyrd_event_time`
-    /// for rows that supply none, anchors the event-time window, and is stored
-    /// on the batch-commit fence. An engine without control `PostgreSQL` has no
-    /// durable state to agree with and reads the system clock. A test-support
-    /// owner adds the offset installed by `shift_receipt_clock_for_test`.
+    /// The instant comes from [`AdmissionClock`], is read once per batch,
+    /// stamped on every row as `wyrd_ingested_at`, and stored on the
+    /// batch-commit fence. A test-support owner adds the offset installed by
+    /// `shift_receipt_clock_for_test`.
     ///
     /// # Errors
     ///
-    /// Returns the `PostgreSQL` acquisition or read error, or an internal error
-    /// when the system clock is unreadable.
+    /// Returns the clock's `PostgreSQL` or system-clock error.
     async fn admission_instant(&self, tenant: DataTenantId) -> Result<i64, ScribeError> {
-        let micros = match &self.control_postgres {
-            Some(postgres) => {
-                let mut conn = postgres.tenant_conn(tenant).await?;
-                let instant =
-                    vala_sql::queries::scribe_batch_commits::ingest_instant(&mut conn).await?;
-                conn.commit().await?;
-                instant.timestamp_micros()
-            }
-            None => crate::scribe::execution_lanes::current_receipt_micros()?,
-        };
+        let micros = self.admission_clock.now_micros(tenant).await?;
         #[cfg(any(test, feature = "test-support"))]
         let micros = micros.saturating_add(
             self.receipt_offset_micros_for_test
@@ -518,7 +509,9 @@ impl ScribeImpl {
     /// Prepares one request and dispatches its owned packet to its fixed shard.
     ///
     /// The global item reservation is acquired before decoding and remains
-    /// attached to the `AdmittedAppend`. The ingress CPU lane bounds decoding,
+    /// attached to the `AdmittedAppend`. The request's [`WriteProfile`] times
+    /// admission, decode, and preprocessing here, travels with the append to
+    /// its shard, and is emitted once this waiter and the shard both drop it. The ingress CPU lane bounds decoding,
     /// while the bounded shard mailbox controls retained work.
     ///
     /// # Errors
@@ -537,9 +530,11 @@ impl ScribeImpl {
         mut frame: ScribeIngressFrame,
     ) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
+        let profile = Arc::new(WriteProfile::default());
+        let admission = profile.admission.timer();
         let RootAdmission {
             expected_schema_fingerprint,
-            partition_granularity,
+            time_axis,
             registered_schema,
             receipt_micros,
             material_plan,
@@ -547,6 +542,8 @@ impl ScribeImpl {
             binding,
             reservation,
         } = self.admit_transport_frame(&mut frame).await?;
+        admission.done();
+        let decode = profile.decode.timer();
         let tenant = frame.principal.tenant_id;
         let builtin_definition = Self::builtin_definition(&frame.table);
         let request_id = uuid::Uuid::parse_str(frame.request_id.as_str()).map_err(|error| {
@@ -564,13 +561,13 @@ impl ScribeImpl {
                     batch_id: frame.batch_id,
                     receipt_micros,
                     material_limit: material_plan.current_material_bytes,
-                    event_time_window: self.admission.config().event_time_window,
                     definition: builtin_definition,
                     registered_schema,
                 },
             )
             .await?;
         Self::mark_memory_prepared(&mut memory)?;
+        decode.done();
 
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
         let admitted = AdmittedAppend {
@@ -583,12 +580,15 @@ impl ScribeImpl {
             memory,
             tenant,
             table: binding.table_ref,
-            partition_granularity,
+            time_axis,
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
+            profile: Arc::clone(&profile),
         };
+        let preprocess = profile.preprocess.timer();
         let mut prepared = self.preprocess(admitted).await?;
         self.charge_prepared(&mut prepared)?;
+        preprocess.done();
         self.shards
             .try_send(prepared)
             .inspect_err(|_| super::record_scribe_rejection("queue"))?;
@@ -763,6 +763,90 @@ fn scribe_catalog_error(error: crate::catalog::BifrostCatalogError) -> ScribeErr
     }
 }
 
+/// How long one `PostgreSQL` clock anchor serves admission before it is
+/// re-read, bounding how far the local monotonic clock can drift from it.
+const ADMISSION_CLOCK_REANCHOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The node's admission clock: `PostgreSQL` time, read once and carried
+/// forward on the local monotonic clock.
+///
+/// `PostgreSQL` is the clock of record for `wyrd_ingested_at`, but reading
+/// `statement_timestamp()` per batch costs a pool acquire and a round trip on
+/// every request. The clock instead reads it once, pairs it with a local
+/// [`Instant`], and answers each later admission with the anchor plus the
+/// monotonic time elapsed since. The node's wall clock is never consulted, so
+/// replicas still agree to within one anchor's drift, and the anchor is
+/// re-read after [`ADMISSION_CLOCK_REANCHOR`] so that drift stays bounded. An
+/// engine without control `PostgreSQL` has no durable state to agree with and
+/// reads the system clock.
+pub(super) struct AdmissionClock {
+    /// Control-plane `PostgreSQL`; `None` for an engine built without
+    /// persistence.
+    postgres: Option<Arc<ValaPostgres>>,
+    /// The last `PostgreSQL` instant in epoch microseconds and the local
+    /// monotonic instant it was observed at, or `None` before the first read.
+    anchor: std::sync::Mutex<Option<(i64, Instant)>>,
+}
+
+impl AdmissionClock {
+    /// Builds a clock over `postgres` with no anchor read yet.
+    pub(super) fn new(postgres: Option<Arc<ValaPostgres>>) -> Self {
+        Self {
+            postgres,
+            anchor: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Returns the current admission instant in epoch microseconds.
+    ///
+    /// A fresh anchor answers from memory. A missing or expired one is
+    /// re-read through `tenant`'s connection; `statement_timestamp()` is
+    /// server-wide, so any tenant's read anchors every tenant. Concurrent
+    /// callers that find the anchor expired may each re-read it; the last
+    /// write wins and every value read is `PostgreSQL` time.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `PostgreSQL` acquisition or read error, or an internal
+    /// error when the system clock is unreadable or the instant leaves the
+    /// microsecond range.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the anchor lock is poisoned, which needs a panic while the
+    /// lock is held; the critical sections only copy a pair.
+    async fn now_micros(&self, tenant: DataTenantId) -> Result<i64, ScribeError> {
+        let Some(postgres) = &self.postgres else {
+            return crate::scribe::execution_lanes::current_receipt_micros();
+        };
+        let anchor = *self
+            .anchor
+            .lock()
+            .expect("admission clock lock is not poisoned");
+        let (micros, observed) = match anchor {
+            Some(anchor) if anchor.1.elapsed() < ADMISSION_CLOCK_REANCHOR => anchor,
+            _ => {
+                let mut conn = postgres.tenant_conn(tenant).await?;
+                let instant =
+                    vala_sql::queries::scribe_batch_commits::ingest_instant(&mut conn).await?;
+                conn.commit().await?;
+                let anchor = (instant.timestamp_micros(), Instant::now());
+                *self
+                    .anchor
+                    .lock()
+                    .expect("admission clock lock is not poisoned") = Some(anchor);
+                anchor
+            }
+        };
+        i64::try_from(observed.elapsed().as_micros())
+            .ok()
+            .and_then(|elapsed| micros.checked_add(elapsed))
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "admission instant exceeds the microsecond range".to_owned(),
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -786,6 +870,36 @@ mod tests {
     use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
+
+    /// After its first `PostgreSQL` read the admission clock answers from its
+    /// anchor: a later admission needs no database trip and never runs
+    /// backwards.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot start, the first read fails, or the
+    /// clock reaches `PostgreSQL` again after its pool is closed.
+    #[tokio::test]
+    async fn admission_clock_answers_from_its_anchor() {
+        let database = wyrd_dev_fixtures::pg::PgFixture::start()
+            .await
+            .expect("Postgres fixture");
+        let postgres = Arc::new(database.vala_postgres().clone());
+        let clock = super::AdmissionClock::new(Some(Arc::clone(&postgres)));
+        let tenant = database.data_tenant_id();
+
+        let first = clock
+            .now_micros(tenant)
+            .await
+            .expect("anchors on PostgreSQL");
+        postgres.pool().close().await;
+        let second = clock
+            .now_micros(tenant)
+            .await
+            .expect("answers from the anchor");
+
+        assert!(second >= first, "{second} precedes {first}");
+    }
 
     /// The Scribe ingress boundary carries no OTLP signal payload (S4).
     ///
@@ -881,7 +995,7 @@ mod tests {
     ) -> ScribeIngressFrame {
         let schema = Arc::new(Schema::new(vec![
             Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(
                     TimeUnit::Microsecond,
                     Some(iceberg::arrow::UTC_TIME_ZONE.into()),

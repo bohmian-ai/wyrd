@@ -14,15 +14,15 @@ use wyrd_runtime::Principal;
 use wyrd_spec::request_id::RequestId;
 
 use crate::catalog::TableRef;
-use crate::catalog::TimeGranularity;
+use crate::catalog::TimeAxis;
 use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::resources::ScribeMemoryLease;
 use crate::schema::SchemaFingerprint;
-use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::admission::InflightFrameReservation;
 use crate::scribe::admission::REQUEST_OVERHEAD_BYTES;
 use crate::scribe::memory::MemoryCategory;
+use crate::scribe::profile::WriteProfile;
 use crate::scribe::seal_key::{
     SealKey, TimePartitionPlan, plan_time_partitions, split_batch_by_time_partition,
 };
@@ -57,19 +57,23 @@ pub(crate) struct AdmittedAppend {
     pub memory: ScribeMemoryLease,
     pub tenant: DataTenantId,
     pub table: TableRef,
-    /// Registered partition granularity every slice of this append is bucketed to.
-    pub partition_granularity: TimeGranularity,
+    /// Registered time axis every slice of this append is bucketed by.
+    pub time_axis: TimeAxis,
     pub queued_at: Instant,
     /// Completion channel answered once the append is durable in the WAL, or
     /// with the typed error that refused it; `None` for fire-and-forget appends.
     pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
+    /// The request's write profile, shared with its ingress waiter and
+    /// emitted once both have dropped it.
+    pub profile: Arc<WriteProfile>,
 }
 
 /// Root-owned row source entering current-only persistence preprocessing.
 #[derive(Debug)]
 pub(crate) enum AdmittedRows {
-    /// One already-stamped projected batch.
-    Projected(RecordBatch),
+    /// One already-stamped projected batch, with the logical identity Gate
+    /// computed when the batch still holds its inputs.
+    Projected(RecordBatch, Option<LogicalIdentity>),
     /// One native stream decoded a record batch at a time on the persistence lane.
     Native(Box<NativeAdmittedRows>),
 }
@@ -87,8 +91,6 @@ pub(crate) struct NativeAdmittedRows {
     pub(crate) request_id: RequestId,
     /// Stable batch identity keying every produced slice.
     pub(crate) batch_id: Uuid,
-    /// Immutable event-time acceptance window.
-    pub(crate) event_time_window: EventTimeWindow,
     /// One receipt instant reused by planning, projection, and WAL identity.
     pub(crate) receipt_micros: i64,
     /// Canonical built-in whose physical identity every source must preserve.
@@ -98,11 +100,14 @@ pub(crate) struct NativeAdmittedRows {
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
     pub(crate) registered_schema: Option<Arc<Schema>>,
+    /// The ingress lane's remembered conform plans, shared so a native source
+    /// conforms each batch as the lane's decode does.
+    pub(crate) conform: Arc<crate::scribe::execution_lanes::ConformPlans>,
     /// Expanded-data ceiling the decoded, stamped output must fit before WAL.
     pub(crate) expanded_limit_bytes: usize,
 }
 
-/// A request after deterministic event-day splitting and serialization.
+/// A request after deterministic time-partition splitting and serialization.
 #[derive(Debug)]
 pub(crate) struct PreparedAppend {
     /// Stable batch identity keying every produced slice and the commit fence.
@@ -118,6 +123,12 @@ pub(crate) struct PreparedAppend {
     /// Completion channel carried from the queued append, answered once the
     /// prepared frame is durable or refused; `None` for fire-and-forget appends.
     pub durable_ack: Option<oneshot::Sender<Result<DurableCompletion, ScribeError>>>,
+    /// The request's write profile, charged its shard wait and group stages
+    /// by the shard that acknowledges it.
+    pub profile: Arc<WriteProfile>,
+    /// When preprocessing finished; the shard wait runs from here until the
+    /// append's group starts.
+    pub prepared_at: Instant,
 }
 
 /// Closed prepared-slice source used by the shard owner.
@@ -154,8 +165,8 @@ pub(crate) struct NativeSliceProducer {
     tenant: DataTenantId,
     /// Logical table used by every produced seal key.
     table: TableRef,
-    /// Registered partition granularity used to bucket every produced slice.
-    partition_granularity: TimeGranularity,
+    /// Registered time axis used to bucket every produced slice.
+    time_axis: TimeAxis,
 }
 
 /// One decoded native source and its fixed time-partition cursor.
@@ -179,7 +190,7 @@ impl NativeSliceProducer {
         request_id: Uuid,
         tenant: DataTenantId,
         table: TableRef,
-        partition_granularity: TimeGranularity,
+        time_axis: TimeAxis,
     ) -> Self {
         let pending = Buffer::from(Bytes::clone(&source.bytes));
         Self {
@@ -193,7 +204,7 @@ impl NativeSliceProducer {
             output_bytes: 0,
             tenant,
             table,
-            partition_granularity,
+            time_axis,
         }
     }
 
@@ -259,6 +270,7 @@ impl NativeSliceProducer {
                         },
                         partition,
                         rows,
+                        None,
                     )?;
                     slice
                         .wal_append
@@ -291,7 +303,7 @@ impl NativeSliceProducer {
                 });
             }
             let rows = stamp_native_source(&rows, &self.source)?;
-            let partitions = plan_time_partitions(&rows, self.partition_granularity)?;
+            let partitions = plan_time_partitions(&rows, &self.time_axis)?;
             self.current = Some(NativeCurrentSource {
                 rows,
                 partitions,
@@ -327,10 +339,10 @@ fn stamp_native_source(
             principal: &source.principal,
             expected_schema_fingerprint: source.expected_schema_fingerprint,
             request_id: &source.request_id,
-            window: source.event_time_window,
             receipt_micros: source.receipt_micros,
             definition: source.definition,
-            registered_schema: source.registered_schema.as_deref(),
+            registered_schema: source.registered_schema.as_ref(),
+            conform: Some(&source.conform),
         },
     )
 }
@@ -419,6 +431,111 @@ pub(crate) fn correlation_data_identity(rows: &RecordBatch) -> Result<[u8; 32], 
     Ok(digest.finalize().into())
 }
 
+/// A logical identity already computed over one batch, reusable for any rows
+/// that still hold that batch's exact identity inputs.
+///
+/// Gate derives the OTLP batch id from [`logical_data_identity`] over its
+/// projected batch, and Scribe needs the same digest for every WAL slice it
+/// cuts from the decoded rows. Decode re-types and stamps columns but, for a
+/// batch already in its registered layout, keeps every user column's buffers;
+/// an undivided slice then holds the same buffers again. [`Self::for_rows`]
+/// hands the digest back only when every input the digest reads is
+/// pointer-identical, so the reused value always equals a recomputation.
+#[derive(Debug, Clone)]
+pub(crate) struct LogicalIdentity {
+    /// SHA-256 digest from [`logical_data_identity`].
+    digest: [u8; 32],
+    /// Buffer length from [`logical_data_identity`].
+    len: u32,
+    /// The rows the digest was computed over, holding its inputs alive.
+    rows: RecordBatch,
+}
+
+impl LogicalIdentity {
+    /// Computes the logical identity of `rows` and keeps the rows it covers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`logical_data_identity`] failure.
+    pub(crate) fn of(rows: &RecordBatch) -> Result<Self, ScribeError> {
+        let (digest, len) = logical_data_identity(rows)?;
+        Ok(Self {
+            digest,
+            len,
+            rows: rows.clone(),
+        })
+    }
+
+    /// The logical digest.
+    pub(crate) const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    /// The rows the identity covers.
+    pub(crate) const fn rows(&self) -> &RecordBatch {
+        &self.rows
+    }
+
+    /// Returns this identity for `rows` when `rows` hold exactly its inputs:
+    /// the same non-managed column names in the same order, each with the
+    /// same length, offset, validity bytes, data buffers, and children by
+    /// address. Any difference returns `None`, and the caller recomputes.
+    pub(crate) fn for_rows(&self, rows: &RecordBatch) -> Option<([u8; 32], u32)> {
+        let inputs = |batch: &RecordBatch| {
+            let schema = batch.schema();
+            schema
+                .fields()
+                .iter()
+                .zip(batch.columns())
+                .filter(|(field, _)| {
+                    !crate::tables::managed_columns::is_managed_column(field.name())
+                })
+                .map(|(field, column)| (field.name().clone(), column.to_data()))
+                .collect::<Vec<_>>()
+        };
+        let (known, offered) = (inputs(&self.rows), inputs(rows));
+        let same = known.len() == offered.len()
+            && known
+                .iter()
+                .zip(&offered)
+                .all(|((left_name, left), (right_name, right))| {
+                    left_name == right_name && same_identity_inputs(left, right)
+                });
+        same.then_some((self.digest, self.len))
+    }
+}
+
+/// Reports whether two arrays present [`digest_array_data`] the same bytes by
+/// address: length, offset, validity bytes, every data buffer, and every
+/// child, recursively.
+///
+/// Comparing slices with [`std::ptr::eq`] compares both their start and their
+/// length, so equal here means the digest reads the very same memory.
+fn same_identity_inputs(left: &ArrayData, right: &ArrayData) -> bool {
+    left.len() == right.len()
+        && left.offset() == right.offset()
+        && match (
+            left.nulls().map(|nulls| nulls.buffer().as_slice()),
+            right.nulls().map(|nulls| nulls.buffer().as_slice()),
+        ) {
+            (Some(left), Some(right)) => std::ptr::eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+        && left.buffers().len() == right.buffers().len()
+        && left
+            .buffers()
+            .iter()
+            .zip(right.buffers())
+            .all(|(left, right)| std::ptr::eq(left.as_slice(), right.as_slice()))
+        && left.child_data().len() == right.child_data().len()
+        && left
+            .child_data()
+            .iter()
+            .zip(right.child_data())
+            .all(|(left, right)| same_identity_inputs(left, right))
+}
+
 /// Computes the stable logical Arrow identity used only for retained retries.
 ///
 /// Server-generated request and time columns change across a legitimate client
@@ -485,8 +602,8 @@ struct PreparedRowsContext {
     tenant: DataTenantId,
     /// Logical table used by every seal key.
     table: TableRef,
-    /// Registered partition granularity used to bucket every slice.
-    partition_granularity: TimeGranularity,
+    /// Registered time axis used to bucket every slice.
+    time_axis: TimeAxis,
     /// Root bytes retained while the prepared source is live.
     memory_bytes: usize,
 }
@@ -509,11 +626,11 @@ fn prepare_rows(
         request_id,
         tenant,
         table,
-        partition_granularity,
+        time_axis,
         memory_bytes,
     } = context;
     match rows {
-        AdmittedRows::Projected(rows) => {
+        AdmittedRows::Projected(rows, known) => {
             let mut slices = Vec::new();
             append_prepared_slices(
                 &mut slices,
@@ -523,8 +640,9 @@ fn prepare_rows(
                     tenant,
                     table: &table,
                 },
-                partition_granularity,
+                &time_axis,
                 &rows,
+                known.as_ref(),
             )?;
             let slice_count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
                 detail: "Scribe batch exceeds the v6 WAL slice-count bound".to_owned(),
@@ -544,7 +662,7 @@ fn prepare_rows(
         }
         AdmittedRows::Native(native) => {
             let mut producer =
-                NativeSliceProducer::new(*native, request_id, tenant, table, partition_granularity);
+                NativeSliceProducer::new(*native, request_id, tenant, table, time_axis);
             let mut slices = Vec::new();
             while let Some(slice) = producer.next_slice()? {
                 slices.push(slice);
@@ -598,9 +716,10 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         mut memory,
         tenant,
         table,
-        partition_granularity,
+        time_axis,
         queued_at,
         mut durable_ack,
+        profile,
     } = admitted;
 
     metrics::histogram!("bifrost_scribe_queue_wait_seconds")
@@ -613,7 +732,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             request_id,
             tenant,
             table: table.clone(),
-            partition_granularity,
+            time_axis,
             memory_bytes: memory.bytes(),
         },
     );
@@ -639,6 +758,8 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         reservation,
         memory: Some(memory),
         durable_ack,
+        profile,
+        prepared_at: Instant::now(),
     })
 }
 
@@ -674,12 +795,13 @@ fn prepared_slice_bytes(slices: &[PreparedSlice], limit: usize) -> Result<usize,
 fn append_prepared_slices(
     slices: &mut Vec<PreparedSlice>,
     context: SliceContext<'_>,
-    partition_granularity: TimeGranularity,
+    time_axis: &TimeAxis,
     rows: &RecordBatch,
+    known: Option<&LogicalIdentity>,
 ) -> Result<(), ScribeError> {
-    for slice in split_batch_by_time_partition(rows, partition_granularity)? {
+    for slice in split_batch_by_time_partition(rows, time_axis)? {
         let (partition, partition_rows) = slice?;
-        slices.push(prepare_slice(context, partition, partition_rows)?);
+        slices.push(prepare_slice(context, partition, partition_rows, known)?);
     }
     Ok(())
 }
@@ -699,13 +821,19 @@ struct SliceContext<'a> {
 
 /// Builds one exact-capacity WAL slice from the current materialized day.
 ///
+/// The slice's logical identity is taken from `known` when the slice still
+/// holds its inputs ([`LogicalIdentity::for_rows`]), as an undivided canonical
+/// batch does, and is computed otherwise.
+///
 /// # Errors
 ///
-/// Returns [`ScribeError`] when Arrow IPC encoding fails.
+/// Returns [`ScribeError`] when Arrow IPC encoding fails or the logical
+/// identity cannot be represented.
 fn prepare_slice(
     context: SliceContext<'_>,
     partition: TimePartition,
     rows: RecordBatch,
+    known: Option<&LogicalIdentity>,
 ) -> Result<PreparedSlice, ScribeError> {
     let seal_key = SealKey::new(context.tenant, context.table.clone(), partition);
     let data_payload = encode_ipc(&rows)?;
@@ -715,7 +843,10 @@ fn prepare_slice(
         table = %context.table.fqn(),
     );
     let (logical_data_digest, logical_data_len) =
-        identity_span.in_scope(|| logical_data_identity(&rows))?;
+        match known.and_then(|known| known.for_rows(&rows)) {
+            Some(identity) => identity,
+            None => identity_span.in_scope(|| logical_data_identity(&rows))?,
+        };
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
@@ -885,13 +1016,11 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::managed_columns::{WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
+    use wyrd_spec::vala::managed_columns::{WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
-    use super::{
-        EventTimeWindow, NativeAdmittedRows, NativeSliceProducer, encode_ipc, logical_data_identity,
-    };
+    use super::{NativeAdmittedRows, NativeSliceProducer, encode_ipc, logical_data_identity};
     use crate::catalog::TableRef;
-    use crate::catalog::TimeGranularity;
+    use crate::catalog::{TimeAxis, TimeGranularity};
     use crate::contracts::ScribeError;
     use crate::namespaces::BifrostNamespace;
     use crate::schema::SchemaFingerprint;
@@ -916,7 +1045,7 @@ mod tests {
         (Bytes::from(bytes), fingerprint)
     }
 
-    /// Builds a producer over `bytes` with an unrestricted event window.
+    /// Builds a producer over `bytes` partitioning daily on `wyrd_ingested_at`.
     ///
     /// # Panics
     ///
@@ -926,6 +1055,7 @@ mod tests {
         let source = NativeAdmittedRows {
             definition: None,
             registered_schema: None,
+            conform: Arc::default(),
             expanded_limit_bytes: crate::gate::limits::IngestLimits::default().expanded_bytes(),
             bytes,
             principal: Principal {
@@ -939,7 +1069,6 @@ mod tests {
             expected_schema_fingerprint: fingerprint,
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
-            event_time_window: EventTimeWindow::default(),
             receipt_micros: 0,
         };
         NativeSliceProducer::new(
@@ -947,7 +1076,7 @@ mod tests {
             uuid::Uuid::now_v7(),
             tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
-            TimeGranularity::Day,
+            TimeAxis::new(WYRD_INGESTED_AT, TimeGranularity::Day),
         )
     }
 
@@ -1135,7 +1264,6 @@ mod tests {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int64, false),
                 Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
-                Field::new(WYRD_EVENT_TIME, DataType::Int64, false),
                 Field::new(WYRD_INGESTED_AT, DataType::Int64, false),
             ]));
             RecordBatch::try_new(
@@ -1143,7 +1271,6 @@ mod tests {
                 vec![
                     Arc::new(Int64Array::from(vec![value])),
                     Arc::new(StringArray::from(vec![request])),
-                    Arc::new(Int64Array::from(vec![receipt])),
                     Arc::new(Int64Array::from(vec![receipt])),
                 ],
             )
@@ -1155,6 +1282,54 @@ mod tests {
         let changed = logical_data_identity(&rows(8, "request-c", 30)).expect("changed identity");
         assert_eq!(first, fresh);
         assert_ne!(first, changed);
+    }
+
+    /// A known logical identity is reused only for rows holding its exact
+    /// inputs, and the reused value equals a recomputation.
+    ///
+    /// Restamping the managed columns, as decode does, keeps the identity;
+    /// the same values in fresh buffers and a partition `take` both fall back
+    /// to recomputation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture batch does not build, the restamped rows do not
+    /// reuse the identity or reuse a wrong one, or copied or taken rows do.
+    #[test]
+    fn known_identity_is_reused_only_for_its_exact_inputs() {
+        let batch = |values: ArrayRef, request: &str| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("value", DataType::Int64, true),
+                    Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
+                ])),
+                vec![values, Arc::new(StringArray::from(vec![request; 3]))],
+            )
+            .expect("identity batch")
+        };
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
+        let gate = batch(Arc::clone(&values), "gate");
+        let known = super::LogicalIdentity::of(&gate).expect("known identity");
+
+        let stamped = batch(Arc::clone(&values), "scribe");
+        assert_eq!(
+            known.for_rows(&stamped),
+            Some(logical_data_identity(&stamped).expect("recomputed identity")),
+            "restamped managed columns keep the known identity"
+        );
+
+        let copied = batch(
+            Arc::new(Int64Array::from(vec![Some(1), None, Some(3)])),
+            "gate",
+        );
+        assert_eq!(known.for_rows(&copied), None, "fresh buffers recompute");
+
+        let indices = arrow::array::UInt32Array::from(vec![0_u32, 1, 2]);
+        let taken = batch(
+            arrow::compute::take(values.as_ref(), &indices, None).expect("take"),
+            "gate",
+        );
+        assert_eq!(known.for_rows(&taken), None, "a partition take recomputes");
     }
 
     /// The WAL payload is an Arrow stream within its bound that Arrow reads back.

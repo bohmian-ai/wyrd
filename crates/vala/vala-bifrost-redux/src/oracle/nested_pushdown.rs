@@ -556,6 +556,7 @@ pub(super) mod tests {
                 HotObjects::Warehouse(warehouse_objects(self.root.path())),
                 *FIXTURE_TENANT,
                 &self.schema,
+                None,
                 &Arc::new(options.clone()),
                 None,
             )

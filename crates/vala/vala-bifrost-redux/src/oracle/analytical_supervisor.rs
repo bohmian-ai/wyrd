@@ -852,6 +852,10 @@ impl AnalyticalSupervisor {
 
     /// Releases one graph's runtime and admitted envelope.
     ///
+    /// The graph's removal and the return of its envelope and permit are one
+    /// step under the graph lock, so `live_graphs` reaching zero implies every
+    /// released envelope is already back with the resource root.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when an attempt of the graph or a
@@ -881,17 +885,31 @@ impl AnalyticalSupervisor {
                 detail: "Oracle analytical graph still owns a live envelope child".to_owned(),
             });
         }
-        let removed = {
+        // The graph leaves the map, its runtime leaves the registry, and its
+        // envelope and permit drop, all under the graph lock, so no observer of
+        // `live_graphs` sees the graph gone while its envelope is still
+        // charged. The registry lock is a leaf, so nesting it here is safe.
+        let (running_query, attempt) = {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-            graphs.remove(&graph)
+            let Some(mut removed) = graphs.remove(&graph) else {
+                return Err(BifrostError::QueryExecutionFailed);
+            };
+            let state = removed.state_mut();
+            // Handed back rather than dropped here: dropping the owner would
+            // retire the entry as failed, and only the caller knows this
+            // graph's terminal.
+            let running_query = state.running_query.take();
+            // An attempt ownership left on the permit would re-enter this
+            // supervisor when dropped, so it is dropped after the lock.
+            let attempt = state
+                .retained_admission
+                .as_mut()
+                .and_then(super::admission::AdmittedQueryGuard::take_analytical);
+            self.registry.invalidate(graph)?;
+            drop(removed);
+            (running_query, attempt)
         };
-        let Some(mut removed) = removed else {
-            return Err(BifrostError::QueryExecutionFailed);
-        };
-        // Handed back rather than dropped here: dropping the owner would retire
-        // the entry as failed, and only the caller knows this graph's terminal.
-        let running_query = removed.state_mut().running_query.take();
-        self.registry.invalidate(graph)?;
+        drop(attempt);
         tracing::debug!(
             public_query_id = %graph.public_query_id,
             datafusion_query_id = %graph.datafusion_query_id,

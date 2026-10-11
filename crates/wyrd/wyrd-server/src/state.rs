@@ -28,7 +28,7 @@ use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
-use crate::bifrost::gate_audit::PostgresGateAudit;
+use crate::bifrost::gate_audit::OutboxGateAudit;
 use crate::boot::ServerBootError;
 use crate::boot::data_root::BifrostDataRoot;
 use crate::components::auth::{ServerAuth, ServerAuthz};
@@ -321,7 +321,7 @@ pub struct BifrostTestControls {
 ///
 /// Fixing the audit sink keeps [`Bifrost`] and [`AppState`] non-generic while
 /// the Gate itself stays generic over its sink.
-pub type ServerGate = Gate<PostgresGateAudit>;
+pub type ServerGate = Gate<OutboxGateAudit>;
 
 /// Ordered local lifecycle states for one independently fenced role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,15 +477,6 @@ impl Oracle {
     #[must_use]
     pub fn process_shutdown_observed_for_test(&self) -> bool {
         self.role_shutdown.is_cancelled() && self.engine.process_shutdown_observed_for_test()
-    }
-
-    /// Returns the audit outbox writer this role stages its decisions on.
-    ///
-    /// [`AppState::new`] shares it so one writer per process carries every
-    /// non-blocking decision.
-    #[must_use]
-    pub(crate) const fn audit(&self) -> &Arc<crate::oracle::OracleQueryAudit> {
-        &self.audit
     }
 
     /// Returns the exact registered Oracle role identity and fence.
@@ -1546,6 +1537,11 @@ pub struct Bifrost {
     query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Lifecycle routing retained by every query ingress, regardless of local role.
     query_controls: Option<crate::oracle::RunningQueryControls>,
+    /// The process audit outbox Gate and Oracle stage their decisions on.
+    ///
+    /// `None` only for the ownerless unit-test shell, which composes no role;
+    /// [`AppState::new`] then starts one for the process.
+    audit_outbox: Option<Arc<crate::oracle::OracleQueryAudit>>,
     /// Read-only proof handle for test-tier inspection of the production graph.
     #[cfg(feature = "test-support")]
     test_resources: Option<BifrostRoleResources>,
@@ -1584,6 +1580,8 @@ pub(crate) struct BifrostComposition {
     pub(crate) query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Shared local controls or remote-only routing for a forwarding ingress.
     pub(crate) query_controls: Option<crate::oracle::RunningQueryControls>,
+    /// The one process audit outbox Gate and Oracle stage their decisions on.
+    pub(crate) audit_outbox: Arc<crate::oracle::OracleQueryAudit>,
     /// Already-composed production resources exposed only to the test tier.
     #[cfg(feature = "test-support")]
     pub(crate) resources: Option<BifrostRoleResources>,
@@ -1602,6 +1600,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder,
             query_controls,
+            audit_outbox,
             #[cfg(feature = "test-support")]
             resources,
         } = composition;
@@ -1615,6 +1614,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder,
             query_controls,
+            audit_outbox: Some(audit_outbox),
             #[cfg(feature = "test-support")]
             test_resources: resources,
             #[cfg(feature = "test-support")]
@@ -1641,6 +1641,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder: None,
             query_controls: None,
+            audit_outbox: None,
             test_resources: None,
             test_catalog: None,
         })
@@ -1674,6 +1675,7 @@ impl Bifrost {
             token_verifier,
             query_forwarder: None,
             query_controls: None,
+            audit_outbox: None,
             test_resources: None,
             test_catalog: Some(catalog),
         })
@@ -2131,9 +2133,8 @@ pub struct AppState {
     /// Non-blocking audit outbox writer every request-path decision of this
     /// process stages on without waiting for its commit.
     ///
-    /// The Oracle role's writer when this process runs Oracle, otherwise one
-    /// built for the process; drained by `BoundServer::run` after Bifrost
-    /// shutdown.
+    /// The writer boot composed into Bifrost, shared by Gate and Oracle;
+    /// drained by `BoundServer::run` after Bifrost shutdown.
     pub audit_outbox: Arc<crate::oracle::OracleQueryAudit>,
     /// Model providers Eval judges call, in queued runs and direct execution.
     ///
@@ -2151,8 +2152,8 @@ pub struct AppState {
 impl AppState {
     /// Build runtime state from production-ready Postgres handles.
     ///
-    /// Shares the Oracle role's audit outbox writer when `bifrost` runs
-    /// Oracle, and otherwise starts one for the process.
+    /// Shares the audit outbox writer boot composed into `bifrost`, and
+    /// starts one for the process only for the ownerless test shell.
     ///
     /// # Panics
     /// Panics when called outside a Tokio runtime without an Oracle role,
@@ -2165,9 +2166,9 @@ impl AppState {
         shutdown_token: CancellationToken,
     ) -> Self {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
-        let audit_outbox = bifrost.oracle().map_or_else(
+        let audit_outbox = bifrost.audit_outbox.as_ref().map_or_else(
             || crate::oracle::OracleQueryAudit::new(postgres.vala().clone()),
-            |oracle| Arc::clone(oracle.audit()),
+            Arc::clone,
         );
         let gateway_capture = Arc::new(crate::components::gateway::GatewayCapture::for_bifrost(
             &bifrost,

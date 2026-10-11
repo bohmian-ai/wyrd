@@ -121,9 +121,6 @@ pub struct BifrostTableDescription {
     /// the server then stores the row with its authenticated `principal_id` and
     /// a null `card_uid`.
     pub correlation_fields: Vec<FieldSpec>,
-    /// Managed columns a writer may supply itself rather than let the server
-    /// stamp: non-null `wyrd_event_time: Timestamp(Microsecond, UTC)`.
-    pub managed_candidates: Vec<FieldSpec>,
     /// Lower-case 64-character hex of the complete canonical physical
     /// fingerprint, present only for a canonical `OTel` signal built-in.
     ///
@@ -351,7 +348,7 @@ pub const INPUT_CLASS_GATE_CORRELATION: &str = "gate_correlation";
 
 /// Time-partition granularity on the wire.
 ///
-/// Bifrost v1 partitions every table on `wyrd_event_time` and admits exactly
+/// Bifrost partitions every table on its one time column and admits exactly
 /// these two Iceberg-native transforms; nothing else is representable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -406,18 +403,27 @@ pub struct SortKeyWire {
 /// at least one key and the Bloom list begins with the schema-present managed
 /// floor.
 ///
-/// The partition itself is system-owned. Every table is partitioned on
-/// `wyrd_event_time`, so the declaration carries only the granularity and no
-/// wire field names a partition column.
+/// Every table is partitioned on exactly one time column: a non-null
+/// microsecond or nanosecond timestamp column of the table's own content,
+/// named by `time_column`, or the managed `wyrd_ingested_at` when the
+/// declaration names none. The column is the source of the table's one
+/// Iceberg `hour` or `day` partition field.
 ///
 /// On the request path an omitted `sort_keys` and an explicit empty `sort_keys`
 /// resolve identically, because the server injects nothing ahead of a declared
-/// key and defaults an empty order to `wyrd_event_time` descending.
+/// key and defaults an empty order to the time column descending.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct PhysicalLayoutWire {
-    /// Required partition granularity on the managed `wyrd_event_time` column.
+    /// Required partition granularity on the time column.
     pub partition_granularity: TimeGranularityWire,
+    /// The table's time column: a non-null `TIMESTAMP_LTZ` or `TIMESTAMP_NTZ`
+    /// column at microsecond or nanosecond precision.
+    ///
+    /// Omitted on a request, the time column is `wyrd_ingested_at`. The
+    /// canonical form in a description and the control row always names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_column: Option<String>,
     /// Ordered sort keys; at most four may be declared.
     #[serde(default)]
     pub sort_keys: Vec<SortKeyWire>,
@@ -438,8 +444,8 @@ pub struct RegisterTableRequest {
     pub fields: Vec<FieldSpec>,
     /// Optional physical layout declaration.
     ///
-    /// Omitting the field entirely resolves to `hour(wyrd_event_time)`,
-    /// `wyrd_event_time` descending nulls-last, and the managed Bloom floor.
+    /// Omitting the field entirely resolves to `hour(wyrd_ingested_at)`,
+    /// `wyrd_ingested_at` descending nulls-last, and the managed Bloom floor.
     /// Supplying the object requires `partition_granularity`; within it, an
     /// explicit empty `sort_keys` resolves exactly as an omitted one does, and
     /// an explicit empty `bloom_columns` means "managed floor only".
@@ -2480,6 +2486,7 @@ mod bifrost_wire_tests {
     fn bifrost_wire_physical_layout_has_no_partition_column_field() {
         let layout = PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Hour,
+            time_column: None,
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         };
@@ -2575,20 +2582,12 @@ mod bifrost_wire_tests {
                     )]),
                 },
             ],
-            managed_candidates: vec![FieldSpec {
-                name: "wyrd_event_time".to_string(),
-                data_type: DataTypeSpec::Timestamp {
-                    unit: TimeUnit::Microsecond,
-                    tz: Some("UTC".to_string()),
-                },
-                nullable: false,
-                metadata: BTreeMap::from([(PARQUET_FIELD_ID_KEY.to_string(), "1004".to_string())]),
-            }],
             canonical_physical_fingerprint: None,
             physical_layout: PhysicalLayoutWire {
                 partition_granularity: TimeGranularityWire::Hour,
+                time_column: Some("wyrd_ingested_at".to_string()),
                 sort_keys: vec![SortKeyWire {
-                    column: "wyrd_event_time".to_string(),
+                    column: "wyrd_ingested_at".to_string(),
                     direction: SortDirectionWire::Desc,
                     null_order: NullOrderWire::Last,
                 }],
@@ -2610,8 +2609,9 @@ mod bifrost_wire_tests {
         });
         bifrost_wire_round_trip(&PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Day,
+            time_column: Some("created_at".to_string()),
             sort_keys: vec![SortKeyWire {
-                column: "wyrd_event_time".to_string(),
+                column: "created_at".to_string(),
                 direction: SortDirectionWire::Desc,
                 null_order: NullOrderWire::Last,
             }],

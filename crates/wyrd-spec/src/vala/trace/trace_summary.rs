@@ -32,7 +32,7 @@ pub struct TraceSummaryRecord {
     ///
     /// Backs the catalog's `trace_bounds_lookup` index for `trace_summaries`.
     /// Not a partition key — partitioning is the hidden Iceberg
-    /// `day(wyrd_event_time)` transform. Default bucket width is 1 minute;
+    /// `day` transform of the table's time column. Default bucket width is 1 minute;
     /// callers must floor `start_time` to the bucket boundary before
     /// constructing.
     pub bucket_time: DateTime<Utc>,

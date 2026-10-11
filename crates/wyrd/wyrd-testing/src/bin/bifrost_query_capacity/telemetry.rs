@@ -9,8 +9,8 @@
 //! 25-90% of spans, mid keys on 6-25%, and thousands of long-tail `custom.*`
 //! keys each on about 0.1%, so a published file shows which keys shredded.
 //!
-//! The server stamps OTLP spans' `wyrd_event_time` with their ingest time,
-//! so a span-time window prunes only by `start_time_unix_nano` statistics.
+//! `start_time_unix_nano` is the table's time column, so a span-time window
+//! prunes by its hourly partitions before any file statistics.
 
 use std::collections::BTreeMap;
 
@@ -22,6 +22,7 @@ use wyrd_tonic::otlp::trace::v1::status::StatusCode;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
+use crate::run::Usage;
 use crate::workload::{DAY_HOURS, DAY_START_MS, HOUR_MS, Rows, mix};
 
 /// The canonical span table OTLP trace ingest writes.
@@ -101,6 +102,10 @@ pub const TAIL_PREFIX: &str = "custom.";
 
 /// `start_time_unix_nano` of the first trace: the events fixture's day start.
 const DAY_START_NANOS: i64 = DAY_START_MS * 1_000_000;
+
+/// The one-hour span-time window the pruning question reads: the seventh
+/// hour of the fixture day, as an offset from its start.
+const WINDOW_START_HOUR: i64 = 6;
 
 /// Nanoseconds between consecutive spans' starts within one trace.
 const SPAN_STAGGER_NANOS: i64 = 50_000;
@@ -334,12 +339,12 @@ pub const fn status_code(index: i64) -> Option<i64> {
 }
 
 /// One string attribute.
-fn text(key: &str, value: impl Into<String>) -> KeyValue {
+pub(crate) fn text(key: &str, value: impl Into<String>) -> KeyValue {
     attribute(key, Value::StringValue(value.into()))
 }
 
 /// One attribute of any value.
-fn attribute(key: &str, value: Value) -> KeyValue {
+pub(crate) fn attribute(key: &str, value: Value) -> KeyValue {
     KeyValue {
         key: key.to_owned(),
         value: Some(AnyValue { value: Some(value) }),
@@ -579,6 +584,39 @@ impl Telemetry {
         attributes
     }
 
+    /// Counts every span: the unbounded read the window is compared with.
+    #[must_use]
+    pub fn all_spans(self) -> (&'static str, String, Rows) {
+        (
+            "spans",
+            format!("SELECT COUNT(*) FROM {TABLE}"),
+            vec![vec![self.spans]],
+        )
+    }
+
+    /// Counts the spans starting in one hour of the fixture day, bounded on
+    /// the table's time column `start_time_unix_nano`.
+    ///
+    /// The bound is a nanosecond instant, so Oracle prunes by the hourly
+    /// partitions and file bounds before reading a row.
+    #[must_use]
+    pub fn span_window(self) -> (&'static str, String, Rows) {
+        let lower = DAY_START_NANOS + WINDOW_START_HOUR * HOUR_MS * 1_000_000;
+        let upper = lower + HOUR_MS * 1_000_000;
+        let inside = (0..self.spans)
+            .filter(|index| (lower..upper).contains(&self.start_nanos(*index)))
+            .count();
+        (
+            "span window",
+            format!(
+                "SELECT COUNT(*) FROM {TABLE} \
+                 WHERE start_time_unix_nano >= to_timestamp_nanos({lower}) \
+                 AND start_time_unix_nano < to_timestamp_nanos({upper})"
+            ),
+            vec![vec![inside as i64]],
+        )
+    }
+
     /// The exact-answer statements of the written spans, each with its name
     /// and the answer computed from the span functions.
     ///
@@ -596,11 +634,8 @@ impl Telemetry {
         let lookup_spans = lookup * SPANS_PER_TRACE..(lookup + 1) * SPANS_PER_TRACE;
         let customer = customer(lookup * SPANS_PER_TRACE + 1).unwrap_or_default();
         vec![
-            (
-                "spans",
-                format!("SELECT COUNT(*) FROM {TABLE}"),
-                vec![vec![self.spans]],
-            ),
+            self.all_spans(),
+            self.span_window(),
             (
                 "one service",
                 format!(
@@ -648,6 +683,30 @@ impl Telemetry {
                 count(&|index| region(index) == Some("eu-west")),
             ),
         ]
+    }
+}
+
+/// Judges span-time pruning: the one-hour window must scan fewer files or
+/// fewer row groups than the unbounded count over the same published spans.
+///
+/// Returns the judged outcome with both reads' scan counts.
+pub fn judge_pruning(all: &Usage, window: &Usage) -> std::result::Result<String, String> {
+    let scanned = |usage: &Usage| {
+        (
+            usage.scanned("oracle_query_files_scanned_total"),
+            usage.scanned("oracle_query_row_groups_scanned_total"),
+        )
+    };
+    let (all_files, all_groups) = scanned(all);
+    let (window_files, window_groups) = scanned(window);
+    let summary = format!(
+        "window scanned {window_files:.0} files and {window_groups:.0} row groups, \
+         unbounded {all_files:.0} and {all_groups:.0}"
+    );
+    if window_files < all_files || window_groups < all_groups {
+        Ok(summary)
+    } else {
+        Err(format!("{summary}; the window pruned nothing"))
     }
 }
 
@@ -734,6 +793,37 @@ fn shredded_keys(path: &std::path::Path) -> std::result::Result<Option<Vec<Strin
 mod tests {
     use super::*;
 
+    /// Usage whose window scanned `files` files and `groups` row groups.
+    fn scanning(files: f64, groups: f64) -> Usage {
+        let mut usage = Usage::default();
+        for (counter, value) in [
+            ("oracle_query_files_scanned_total", files),
+            ("oracle_query_row_groups_scanned_total", groups),
+        ] {
+            let index = crate::run::SCAN_COUNTERS
+                .iter()
+                .position(|name| *name == counter)
+                .expect("the counter is a scan counter");
+            usage.scan_counts[index] = value;
+        }
+        usage
+    }
+
+    /// The window passes when it scans fewer files or fewer row groups than
+    /// the unbounded read, and fails when it scans as much.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the judge passes an unpruned window or fails a pruned one.
+    #[test]
+    fn span_window_pruning_needs_fewer_files_or_row_groups() {
+        let all = scanning(24.0, 96.0);
+
+        assert!(judge_pruning(&all, &scanning(1.0, 4.0)).is_ok());
+        assert!(judge_pruning(&all, &scanning(24.0, 90.0)).is_ok());
+        assert!(judge_pruning(&all, &scanning(24.0, 96.0)).is_err());
+    }
+
     /// Share of the first `spans` spans for which `keep` holds.
     fn share(spans: i64, keep: impl Fn(i64) -> bool) -> f64 {
         (0..spans).filter(|index| keep(*index)).count() as f64 / spans as f64
@@ -809,9 +899,9 @@ mod tests {
         let questions = fixture.questions();
         assert_eq!(questions[0].2, vec![vec![8_000]]);
         let errors = (0..8_000).filter(|index| is_error(*index)).count() as i64;
-        assert_eq!(questions[3].2, vec![vec![errors]]);
+        assert_eq!(questions[4].2, vec![vec![errors]]);
         assert!(
-            questions[6].2[0][0] >= 1,
+            questions[7].2[0][0] >= 1,
             "the looked-up trace's customer is counted"
         );
     }

@@ -284,7 +284,7 @@ mod tests {
             .expect("fixture tenant parses");
         let required_columns = vec![
             "service_name".to_string(),
-            "wyrd_event_time".to_string(),
+            "wyrd_ingested_at".to_string(),
             "data_tenant_id".to_string(),
         ];
         (fingerprint, tenant_uuid, required_columns)
@@ -322,7 +322,7 @@ mod tests {
         let mut other_start = cut.clone();
         other_start.start_partition = hour_partition(1_787_490_000_000_000);
         let reordered = vec![
-            "wyrd_event_time".to_string(),
+            "wyrd_ingested_at".to_string(),
             "service_name".to_string(),
             "data_tenant_id".to_string(),
         ];

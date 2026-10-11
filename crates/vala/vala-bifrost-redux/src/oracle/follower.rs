@@ -468,6 +468,7 @@ impl<T> ScribeTailResolver<T> {
                     super::exec::HotObjects::Staged(lease),
                     assignment.binding.tenant_id,
                     required_schema,
+                    None,
                     session.config().options(),
                     Some(runs),
                 )
@@ -891,7 +892,7 @@ where
         target_fence: wyrd_spec::vala::api::FencingToken,
     ) -> Result<(), PhysicalPlanFollowerError> {
         // The leader never signs an empty closure: a scan that reads no
-        // column still reads `wyrd_event_time` for its row counts.
+        // column still reads the time column for its row counts.
         if assignment.required_columns.is_empty() {
             return Err(PhysicalPlanFollowerError::Preflight(
                 "assignment projection closure is empty".to_owned(),
@@ -1327,7 +1328,7 @@ pub(crate) mod tests {
             batches: Vec::new(),
         });
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Utf8,
             true,
         )]));
@@ -1343,7 +1344,7 @@ pub(crate) mod tests {
             binding: binding.clone(),
             scribe_provider_cut: Some(cut()),
             schema_fingerprint: fingerprint.clone(),
-            required_columns: vec!["wyrd_event_time".to_owned()],
+            required_columns: vec!["event_time".to_owned()],
         };
         let session = SessionContext::new_with_config(
             crate::resources::OracleSessionShape::for_test().session_config(),
@@ -1400,7 +1401,7 @@ pub(crate) mod tests {
             WriterEpoch::new(2),
         );
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Utf8,
             true,
         )]));
@@ -1422,7 +1423,7 @@ pub(crate) mod tests {
             binding: binding.clone(),
             scribe_provider_cut: Some(cut()),
             schema_fingerprint: super::super::assignment_schema_fingerprint(schema.as_ref()),
-            required_columns: vec!["wyrd_event_time".to_owned()],
+            required_columns: vec!["event_time".to_owned()],
         };
         let session = SessionContext::new_with_config(
             crate::resources::OracleSessionShape::for_test().session_config(),
@@ -1523,7 +1524,7 @@ pub(crate) mod tests {
             },
             scribe_provider_cut: cut.then(self::cut),
             schema_fingerprint: "shape".to_owned(),
-            required_columns: vec!["wyrd_event_time".to_owned()],
+            required_columns: vec!["event_time".to_owned()],
         };
 
         require_scannable_work(&[assignment(true)]).expect("scannable fragment");
@@ -1728,7 +1729,7 @@ pub(crate) mod tests {
     async fn scribe_provider_is_active_plus_all_unretired_immutable() {
         let tenant_id = DataTenantId::new_v7();
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Utf8,
             true,
         )]));
@@ -1762,7 +1763,7 @@ pub(crate) mod tests {
                     // The resolver now projects the assignment's own closure,
                     // so this fixture names the single column its memtable
                     // schema actually carries.
-                    required_columns: vec!["wyrd_event_time".to_owned()],
+                    required_columns: vec!["event_time".to_owned()],
                 },
                 &session,
             )

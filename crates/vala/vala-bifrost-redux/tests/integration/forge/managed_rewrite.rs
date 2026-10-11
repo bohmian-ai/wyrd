@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicUsize;
 
 use arrow::array::{Array as _, AsArray as _, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
 use arrow::util::display::array_value_to_string;
 use futures_util::TryStreamExt as _;
 use iceberg::metadata_columns::{
@@ -35,7 +35,6 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::tables::builtin_tables;
 use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 use wyrd_types::variant::variant_field;
 
 use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
@@ -1621,11 +1620,7 @@ fn variant_batch(day: i64, docs: &[VariantRow]) -> RecordBatch {
             Field::new("value", DataType::Int64, false),
             variant_field("v", true),
             events_field(),
-            Field::new(
-                WYRD_EVENT_TIME,
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
+            super::support::fixture_time_field(),
         ])),
         vec![
             Arc::new(Int64Array::from_iter_values(

@@ -78,13 +78,12 @@ If a tenant has redaction enabled (server-side policy), Scribe zeroes the sensit
 Scribe stamps, once per batch at admission:
 
 - `wyrd_ingested_at`: when Wyrd accepted the batch, read once from PostgreSQL (`statement_timestamp()`) and identical on every row of the batch. The same value is stored on the batch's durable commit fence. A caller can never supply it.
-- `wyrd_event_time`: when the observed thing happened. A row may supply it; the value must fall inside the acceptance window around `wyrd_ingested_at`. A row that supplies none gets `wyrd_ingested_at`.
 - `wyrd_request_id`: the request that wrote the row, for point lookups and joins to audit.
 - `run_id`, `card_uid`, `principal_id`: from the row's optional `Correlation` and the authenticated principal.
 
 The batch's `wyrd_batch_id` is the request's idempotency key; it is not stored on rows.
 
-Callers cannot override the other system columns. Any batch that contains rows with system column values set is rejected with `400 WYRD_VALA_400_SYSTEM_COLUMN_VIOLATION`.
+Every `wyrd_*` column name is reserved: a caller can never supply one. Any batch that contains rows with system column values set is rejected with `400 WYRD_VALA_400_SYSTEM_COLUMN_VIOLATION`.
 
 ## Schema validation
 

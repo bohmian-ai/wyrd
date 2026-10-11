@@ -31,7 +31,7 @@ use vala_bifrost_redux::oracle::{
 use vala_bifrost_redux::resources::{
     BifrostRole, BifrostRoleResources, BifrostRuntimeResources, OracleClassSplit,
 };
-use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
+use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
@@ -614,16 +614,6 @@ pub async fn compose_bifrost(
         // server. One initializer makes that divergence unrepresentable.
         let admission_defaults = AdmissionConfig {
             memory_limit_bytes: pod_memory_limit,
-            event_time_window: EventTimeWindow {
-                past: scribe_config
-                    .event_time_past_window_secs
-                    .map(Duration::from_secs)
-                    .unwrap_or_else(|| Duration::from_secs(30 * 24 * 60 * 60)),
-                future: scribe_config
-                    .event_time_future_window_secs
-                    .map(Duration::from_secs)
-                    .unwrap_or_else(|| Duration::from_secs(24 * 60 * 60)),
-            },
         };
         #[cfg(feature = "test-support")]
         let admission = test_controls
@@ -846,9 +836,12 @@ pub async fn compose_bifrost(
         None
     };
 
+    // One non-blocking audit outbox per process: Gate's write decisions and
+    // the Oracle role's read decisions stage on the same writer.
+    let audit_outbox = OracleQueryAudit::new(postgres.vala().clone());
     let query_audit = roles
         .contains(&BifrostRuntimeRole::Oracle)
-        .then(|| OracleQueryAudit::new(postgres.vala().clone()));
+        .then(|| Arc::clone(&audit_outbox));
     let scribe = if let Some(parts) = scribe {
         let fragment_security_audit = Arc::new(
             crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres)
@@ -944,9 +937,9 @@ pub async fn compose_bifrost(
     .with_query_dispatch(
         Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
     )
-    .with_audit(Arc::new(
-        crate::bifrost::gate_audit::PostgresGateAudit::new(postgres.as_ref().clone()),
-    ))
+    .with_audit(Arc::new(crate::bifrost::gate_audit::OutboxGateAudit::new(
+        Arc::clone(&audit_outbox),
+    )))
     .with_observation_ack(Arc::new(
         crate::verification::observations::ObservationEnqueue::new(postgres.wyrd().clone()),
     ));
@@ -961,6 +954,7 @@ pub async fn compose_bifrost(
             token_verifier,
             query_forwarder: Some(query_forwarder),
             query_controls: Some(query_controls),
+            audit_outbox,
             #[cfg(feature = "test-support")]
             resources: Some(bifrost_resources.clone()),
         }),

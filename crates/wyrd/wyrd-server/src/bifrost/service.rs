@@ -550,6 +550,7 @@ mod pg_tests {
             let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
             req.physical_layout = Some(PhysicalLayoutWire {
                 partition_granularity: TimeGranularityWire::Day,
+                time_column: None,
                 sort_keys: Vec::new(),
                 bloom_columns: vec!["absent_column".to_owned()],
             });

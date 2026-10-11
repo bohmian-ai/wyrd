@@ -18,7 +18,6 @@ use crate::tables::{
 };
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// The canonical `vala.logs.records` ledger.
 ///
@@ -33,8 +32,8 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 /// filtered without decoding; each is null when its source is absent or
 /// carries the wrong type, and `body_text` is set only for a string body.
 pub static LOG_FIELDS: &[CanonicalField] = &[
-    F::meta("time_unix_nano", T::Int64, false),
-    F::meta("observed_time_unix_nano", T::Int64, false),
+    F::meta("time_unix_nano", signal::OTLP_INSTANT, false),
+    F::meta("observed_time_unix_nano", signal::OTLP_INSTANT, false),
     F::meta("severity_number", T::Int32, false),
     F::meta("severity_text", T::Utf8, false),
     F::meta("event_name", T::Utf8, true),
@@ -96,8 +95,9 @@ impl DomainTable for RecordsTable {
 
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(
+            "time_unix_nano",
             vec![
-                sort_desc(WYRD_EVENT_TIME),
+                sort_desc("time_unix_nano"),
                 sort_asc_nulls_first("event_name"),
             ],
             &["severity_number", "trace_id"],

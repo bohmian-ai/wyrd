@@ -653,5 +653,74 @@ mod pg_tests {
             );
             assert_eq!(publication_rows, 0, "replay resolution must not publish");
         }
+
+        /// WAL recovery reads the newest fence of one shard stream across
+        /// every tenant through the tenant-bound application role.
+        ///
+        /// Two tenants fence batches on the same stream; the newest WAL
+        /// position is the other tenant's, and a plain application-role
+        /// connection with no tenant bound still sees it. Another shard of the
+        /// same stream has no fence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture or a connection cannot start, a fence does
+        /// not commit, or the lookup misses the newest cross-tenant fence.
+        #[tokio::test]
+        async fn newest_wal_fence_spans_tenants_on_one_stream() {
+            let (fixture, _superuser, tenant_a) = setup().await;
+            let tenant_b = DataTenantId::new_v7();
+            fixture
+                .seed_additional_tenant_with_uuid(
+                    tenant_b,
+                    &format!("test-{}", tenant_b.as_uuid().simple()),
+                )
+                .await
+                .unwrap();
+            let node_id = Uuid::now_v7();
+            for (tenant, segment, lsn) in [(tenant_a, 2, 20), (tenant_b, 3, 31)] {
+                let commit = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                    tenant,
+                    logical_table_fqn: "bifrost.fenced".to_owned(),
+                    batch_id: Uuid::now_v7(),
+                    slice_set_digest: [7; 32],
+                    slice_count: 1,
+                    wal_node_id: node_id,
+                    wal_writer_epoch: 5,
+                    wal_shard_id: 1,
+                    wal_segment_sequence: segment,
+                    wal_lsn_min: lsn - 1,
+                    wal_lsn_max: lsn,
+                    request_id: Uuid::now_v7(),
+                };
+                let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                    .await
+                    .expect("tenant connection");
+                vala_sql::queries::scribe_batch_commits::record(
+                    &mut conn,
+                    &commit,
+                    chrono::Utc::now(),
+                )
+                .await
+                .expect("fence records");
+                conn.commit().await.expect("fence commits");
+            }
+
+            let mut app = fixture.app_pool().acquire().await.expect("app connection");
+            assert_eq!(
+                vala_sql::queries::scribe_batch_commits::newest_wal_fence(&mut app, node_id, 5, 1)
+                    .await
+                    .expect("newest fence reads"),
+                Some((3, 31)),
+                "the newest fence on the stream is found whichever tenant owns it"
+            );
+            assert_eq!(
+                vala_sql::queries::scribe_batch_commits::newest_wal_fence(&mut app, node_id, 5, 2)
+                    .await
+                    .expect("unfenced shard reads"),
+                None,
+                "a shard with no fence has no newest fence"
+            );
+        }
     }
 }

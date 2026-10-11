@@ -668,10 +668,9 @@ Consequences, stated so they stop drifting:
   validates the client-generated UUIDv7 `wyrd_batch_id` request field (the
   idempotency key; it is not a row column), stamps request-scoped
   `wyrd_request_id` and `wyrd_ingested_at` — the PostgreSQL admission instant,
-  read once per batch and never caller-supplied — and validates
-  caller-supplied `wyrd_event_time` against a bounded acceptance window around
-  that instant, rejecting out-of-range values (never clamping or normalizing
-  them). A row without `wyrd_event_time` takes `wyrd_ingested_at`. Row
+  read once per batch and never caller-supplied. Each table partitions on its
+  one declared time column, `wyrd_ingested_at` unless the registration names
+  another non-null timestamp column; any time value is accepted. Row
   identity is batch-level; no per-row position is stamped.
 
 - **`card_ref` is optional and authorized, not trusted.** Its absence is valid

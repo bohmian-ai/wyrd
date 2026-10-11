@@ -3642,8 +3642,10 @@ async fn settle_attempt_output(
 /// Classifies typed planning refusals through context/diagnostic wrappers.
 ///
 /// Resource refusals take precedence; all other failures retain their complete
-/// original chain for the general mapper. No dependency diagnostic is exposed.
+/// original chain for the general mapper. No dependency diagnostic is exposed
+/// to the caller; the complete chain is traced at debug level for operators.
 fn map_query_planning_error(error: &DataFusionError) -> BifrostError {
+    tracing::debug!(%error, "Oracle query planning refused");
     if datafusion_resources_exhausted(error) {
         return map_datafusion_error(error);
     }

@@ -778,7 +778,7 @@ mod tests {
     #[test]
     fn generation_ownership_moves_exact_category_bytes() {
         let resources =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let ownership = ScribeOwnership::new(&resources).expect("generation owner");
         let category =
             |category: MemoryCategory| resources.memory_snapshot().categories[category as usize];
@@ -810,7 +810,7 @@ mod tests {
     #[test]
     fn replay_identity_adoption_and_rollback_are_net_zero() {
         let resources =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let ownership = ScribeOwnership::new(&resources).expect("generation owner");
         let baseline = resources.snapshot().expect("baseline snapshot");
         let lease = resources

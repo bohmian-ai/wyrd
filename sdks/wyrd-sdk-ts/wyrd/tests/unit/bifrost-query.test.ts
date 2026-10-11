@@ -191,10 +191,10 @@ describe("bifrost public typing", () => {
         },
       ],
       correlation_fields: [],
-      managed_candidates: [],
       canonical_physical_fingerprint: "canonical-fp",
       physical_layout: {
         partition_granularity: "Hour",
+        time_column: "start_time_unix_nano",
         sort_keys: [{ column: "trace_id", direction: "Ascending", null_order: "Last" }],
         bloom_columns: ["trace_id"],
       },

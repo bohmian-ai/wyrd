@@ -101,9 +101,15 @@ export interface SortKey {
   readonly null_order: string;
 }
 
-/** A table's server-resolved partitioning, sort order, and Bloom columns. */
+/**
+ * A table's server-resolved partitioning, sort order, and Bloom columns.
+ *
+ * `partition_granularity` applies to `time_column`, which is `wyrd_ingested_at`
+ * unless the table declared its own.
+ */
 export interface PhysicalLayout {
   readonly partition_granularity: string;
+  readonly time_column: string;
   readonly sort_keys: readonly SortKey[];
   readonly bloom_columns: readonly string[];
 }
@@ -111,8 +117,8 @@ export interface PhysicalLayout {
 /**
  * The server's projection of one registered table's stored physical schema.
  *
- * A writer declares `user_fields`, supplies `correlation_fields`, and may
- * supply `managed_candidates`. `canonical_physical_fingerprint` is present only
+ * A writer declares `user_fields` and supplies `correlation_fields`.
+ * `canonical_physical_fingerprint` is present only
  * for a canonical signal table; `compaction_target_file_size_bytes` only when
  * the table declared an explicit Forge compaction file target, and
  * `compaction_type` only when it declared an explicit compaction type.
@@ -121,7 +127,6 @@ export interface TableDescription {
   readonly entry: TableEntry;
   readonly user_fields: readonly FieldDescription[];
   readonly correlation_fields: readonly FieldDescription[];
-  readonly managed_candidates: readonly FieldDescription[];
   readonly canonical_physical_fingerprint?: string;
   readonly physical_layout: PhysicalLayout;
   readonly compaction_target_file_size_bytes?: number;
@@ -455,9 +460,13 @@ export class BifrostQueryStream
  *
  * Sort keys reuse {@link SortKey} — the same shape the describe route returns —
  * so a layout read back from the server can be declared again unchanged.
+ * `timeColumn` names the non-null timestamp column that partitions the table
+ * and leads its default sort order; omitted, it is `wyrd_ingested_at`. Any
+ * instant is accepted.
  */
 export interface TableLayout {
   partitionGranularity?: "hour" | "day";
+  timeColumn?: string;
   sortKeys?: readonly SortKey[];
   bloomColumns?: readonly string[];
 }
@@ -480,6 +489,7 @@ function layoutJson(layout?: TableLayout): string | undefined {
   }
   return JSON.stringify({
     partition_granularity: layout.partitionGranularity ?? "hour",
+    time_column: layout.timeColumn,
     sort_keys: layout.sortKeys ?? [],
     bloom_columns: layout.bloomColumns ?? [],
   });

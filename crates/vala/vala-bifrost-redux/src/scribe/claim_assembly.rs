@@ -319,7 +319,7 @@ mod tests {
     /// Physical schema the fixtures stage, merge, and assemble under.
     fn assembly_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]))
@@ -358,19 +358,6 @@ mod tests {
             closed_at: std::time::Instant::now(),
             arrow_bytes,
         }
-    }
-
-    /// Resolves the hourly layout every fixture member is encoded under.
-    fn assembly_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::resolve(
-            "vala.bifrost.test",
-            schema,
-            Some(&crate::tables::hourly_layout(
-                vec![crate::tables::sort_asc("wyrd_event_time")],
-                &["wyrd_event_time"],
-            )),
-        )
-        .expect("fixture schema carries the built-in hourly layout")
     }
 
     /// Stages two interleaving members of one key and claims them together.
@@ -456,7 +443,7 @@ mod tests {
         let stager = ScribeMemberStager::new(Arc::clone(&stage));
         let tenant = DataTenantId::new_v7();
         let schema = assembly_schema();
-        let layout = assembly_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let ready_at = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("fixture instant");
 
         let claim = stage_two_members(&stager, tenant, &layout, ready_at).await;
@@ -533,7 +520,7 @@ mod tests {
         );
     }
 
-    /// Reads `wyrd_event_time` from sealed objects in publication order after
+    /// Reads `event_time` from sealed objects in publication order after
     /// proving each object's footer records `tenant`.
     ///
     /// # Panics
@@ -556,7 +543,7 @@ mod tests {
             for batch in reader {
                 let batch = batch.expect("sealed object batch");
                 let column = batch
-                    .column_by_name("wyrd_event_time")
+                    .column_by_name("event_time")
                     .expect("event time column")
                     .as_any()
                     .downcast_ref::<TimestampMicrosecondArray>()

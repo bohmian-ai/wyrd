@@ -371,8 +371,9 @@ impl VerifierRunner {
 
     /// Publish `report` as the run's result and map the attempt to a transition.
     ///
-    /// Mints one result ID and one producer event time shared by every row —
-    /// a result fact this process observes, not a coordination instant —
+    /// Mints one result ID and the execution `ended_at`, the results table's
+    /// time column — a result fact this process observes, not a coordination
+    /// instant —
     /// writes every batch through the publisher, and completes only after the
     /// summary is acknowledged. An encoding failure terminates `errored`; an
     /// unacknowledged or timed-out publication retries.
@@ -385,7 +386,7 @@ impl VerifierRunner {
         started_at: DateTime<Utc>,
     ) -> Transition {
         let result_id = VerificationResultId::new_v7();
-        let event_time = Utc::now();
+        let ended_at = Utc::now();
         let verifier_ref = CardRef {
             uid: None,
             ..verifier.clone()
@@ -395,9 +396,8 @@ impl VerifierRunner {
             ResultRun::from(run),
             &verifier_ref,
             result_id,
-            event_time,
             started_at,
-            event_time,
+            ended_at,
         )
         .build(report)
         {

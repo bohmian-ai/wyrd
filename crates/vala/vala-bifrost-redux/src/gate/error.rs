@@ -110,23 +110,6 @@ pub enum IngestError {
     /// contract; the catalogued error is the public identity.
     #[error("ingest contract violation: {0}")]
     ContractViolation(BifrostError),
-    /// A caller-supplied `wyrd_event_time` value falls outside the server
-    /// acceptance window evaluated against per-batch receipt time.
-    ///
-    /// The whole batch is rejected; no rows are written. The caller must
-    /// either supply an in-window event time or omit the column.
-    #[error(
-        "wyrd_event_time {value_micros} µs outside acceptance window \
-         [{past_bound_micros}, {future_bound_micros}] µs"
-    )]
-    EventTimeOutOfRange {
-        /// The offending `wyrd_event_time` in epoch-microseconds.
-        value_micros: i64,
-        /// Inclusive past bound (receipt − past window) in epoch-microseconds.
-        past_bound_micros: i64,
-        /// Inclusive future bound (receipt + future window) in epoch-microseconds.
-        future_bound_micros: i64,
-    },
     /// The authorization decision could not be durably recorded.
     ///
     /// Fail-closed: the write is refused rather than admitted unaudited.
@@ -191,10 +174,9 @@ impl IngestError {
             | Self::CardScopeDenied { .. }
             | Self::CardUnresolved { .. } => "permission",
             Self::PayloadTooLarge { .. } => "payload_limit",
-            Self::RequestValidation(_)
-            | Self::Decode(_)
-            | Self::ContractViolation(_)
-            | Self::EventTimeOutOfRange { .. } => "validation",
+            Self::RequestValidation(_) | Self::Decode(_) | Self::ContractViolation(_) => {
+                "validation"
+            }
             Self::TableNotFound { .. } | Self::SchemaMismatch { .. } => "catalog",
             Self::IngressClosed => "role_unavailable",
             Self::IngestBusy { .. } | Self::WalDiskFull => "scribe_admission",
@@ -274,16 +256,6 @@ impl IngestError {
             }
             .into(),
             Self::WalDiskFull => BifrostError::WalDiskFull.into(),
-            Self::EventTimeOutOfRange {
-                value_micros,
-                past_bound_micros,
-                future_bound_micros,
-            } => BifrostError::EventTimeOutOfRange {
-                value: value_micros.to_string(),
-                past_bound: past_bound_micros.to_string(),
-                future_bound: future_bound_micros.to_string(),
-            }
-            .into(),
             Self::AuditUnavailable(detail) => BifrostError::AuditUnavailable {
                 detail: detail.clone(),
             }
@@ -325,15 +297,6 @@ impl IngestError {
             crate::contracts::ScribeError::ContractViolation(error) => {
                 Self::ContractViolation(error)
             }
-            crate::contracts::ScribeError::EventTimeOutOfRange {
-                value_micros,
-                past_bound_micros,
-                future_bound_micros,
-            } => Self::EventTimeOutOfRange {
-                value_micros,
-                past_bound_micros,
-                future_bound_micros,
-            },
             crate::contracts::ScribeError::CardScopeDenied => Self::CardScopeDenied {
                 card_ref: "<server-validation>".to_owned(),
             },
@@ -621,39 +584,6 @@ mod tests {
                 Code::Internal,
             ),
         ]
-    }
-
-    /// `from_scribe` maps `EventTimeOutOfRange` to the distinct `IngestError` variant,
-    /// and `to_wyrd_error` maps it to `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE` — not
-    /// to `OtlpRequestMalformed`.
-    #[test]
-    fn event_time_out_of_range_maps_through_gate_without_identity_collapse() {
-        let scribe_err = ScribeError::EventTimeOutOfRange {
-            value_micros: -1_000_000_i64,
-            past_bound_micros: 0_i64,
-            future_bound_micros: 1_000_000_i64,
-        };
-        let ingest_err = IngestError::from_scribe(scribe_err);
-        assert!(
-            matches!(
-                ingest_err,
-                IngestError::EventTimeOutOfRange {
-                    value_micros: -1_000_000,
-                    ..
-                }
-            ),
-            "from_scribe must produce IngestError::EventTimeOutOfRange, got {ingest_err}"
-        );
-
-        let public = ingest_err.to_wyrd_error("vala.traces.spans");
-        assert_eq!(
-            public.code(),
-            "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE",
-            "to_wyrd_error must produce the stable EventTimeOutOfRange code"
-        );
-        assert_eq!(public.status(), 400, "status must be 400");
-        // Must NOT collapse to OtlpRequestMalformed.
-        assert_ne!(public.code(), "WYRD_VALA_400_OTLP_REQUEST_MALFORMED");
     }
 
     /// Assert that every ingest condition has one Wyrd identity and matching

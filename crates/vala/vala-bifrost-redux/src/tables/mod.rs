@@ -17,7 +17,7 @@ use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
+use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
 use wyrd_types::is_extension_key;
 use wyrd_types::variant::is_variant;
 
@@ -117,40 +117,76 @@ pub fn sort_desc(column: &str) -> SortKeyWire {
     }
 }
 
-/// Builds one built-in physical-layout declaration on daily
-/// `wyrd_event_time`.
+/// Builds one built-in physical-layout declaration partitioned daily on
+/// `time_column`.
 ///
-/// The five verification tables partition by UTC day rather than by hour: one
-/// Verification Result and every one of its detail rows share one
-/// server-chosen event time, and a Drift analysis window is chosen by a
-/// schedule rather than by ingest rate, so an hourly partition would only
-/// fragment the objects a windowed scan reads. Like [`hourly_layout`], the
-/// declaration names only what is specific to the table; the catalog unions
-/// the managed Bloom floor when it resolves.
+/// The verification tables and the audit log partition by UTC day rather than
+/// by hour: a Drift analysis window is chosen by a schedule rather than by
+/// ingest rate, and a Verification Result's detail rows are read by
+/// `result_id`, so an hourly partition would only fragment the objects a
+/// windowed scan reads. Like [`hourly_layout`], the declaration names only
+/// what is specific to the table; the catalog unions the managed Bloom floor
+/// when it resolves.
 #[must_use]
-pub fn daily_layout(sort_keys: Vec<SortKeyWire>, bloom_columns: &[&str]) -> PhysicalLayoutWire {
+pub fn daily_layout(
+    time_column: &str,
+    sort_keys: Vec<SortKeyWire>,
+    bloom_columns: &[&str],
+) -> PhysicalLayoutWire {
     PhysicalLayoutWire {
         partition_granularity: TimeGranularityWire::Day,
+        time_column: Some(time_column.to_owned()),
         sort_keys,
         bloom_columns: bloom_columns.iter().map(|c| (*c).to_owned()).collect(),
     }
 }
 
-/// Builds one built-in physical-layout declaration on hourly
-/// `wyrd_event_time`.
+/// Builds one built-in physical-layout declaration partitioned hourly on
+/// `time_column`.
 ///
-/// Every built-in partitions hourly; only its sort keys and Bloom columns
-/// differ. The catalog resolves the result through the one
+/// The catalog resolves the result through the one
 /// [`crate::catalog::PhysicalLayout::resolve`] entry point a caller
 /// registration uses, which unions the managed Bloom floor, so a built-in
 /// declares only what is specific to it.
 #[must_use]
-pub fn hourly_layout(sort_keys: Vec<SortKeyWire>, bloom_columns: &[&str]) -> PhysicalLayoutWire {
+pub fn hourly_layout(
+    time_column: &str,
+    sort_keys: Vec<SortKeyWire>,
+    bloom_columns: &[&str],
+) -> PhysicalLayoutWire {
     PhysicalLayoutWire {
         partition_granularity: TimeGranularityWire::Hour,
+        time_column: Some(time_column.to_owned()),
         sort_keys,
         bloom_columns: bloom_columns.iter().map(|c| (*c).to_owned()).collect(),
     }
+}
+
+/// The one hourly layout Scribe's unit fixtures encode under.
+///
+/// Fixture schemas carry a non-null `event_time` timestamp as their time
+/// column; the layout is resolved through [`PhysicalLayout::resolve`], the
+/// path every registered table takes, so the managed Bloom floor is unioned
+/// exactly as in production.
+///
+/// # Panics
+///
+/// Panics when `schema` has no non-null `event_time` timestamp column, which
+/// is a fixture bug.
+#[cfg(test)]
+pub(crate) fn hourly_test_layout(
+    schema: &arrow::datatypes::Schema,
+) -> crate::catalog::PhysicalLayout {
+    crate::catalog::PhysicalLayout::resolve(
+        "vala.bifrost.test",
+        schema,
+        Some(&hourly_layout(
+            "event_time",
+            vec![sort_asc("event_time")],
+            &["event_time"],
+        )),
+    )
+    .expect("fixture schema carries a non-null event_time time column")
 }
 
 /// A table-owned value validator: Scribe's one validation seam for built-ins.
@@ -175,8 +211,6 @@ pub struct BuiltinTableDefinition {
     pub payload_class: PayloadClass,
     /// Sensitive payload columns.
     pub sensitive_payload_columns: &'static [&'static str],
-    /// Whether a row may carry an event time older than the ordinary window.
-    pub past_event_time_exempt: bool,
     /// User schema constructor.
     pub arrow_fields: fn() -> Vec<Field>,
     /// User schema fingerprint constructor.
@@ -436,14 +470,6 @@ pub trait DomainTable: Send + Sync + 'static {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Standard;
     /// Sensitive payload fields.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[];
-    /// Whether this table accepts event times below the ordinary past window.
-    ///
-    /// A caller-facing signal is refused a stale event time so a
-    /// misconfigured clock cannot backfill history. A server-owned backlog
-    /// that carries its own original decision time sets this instead, because
-    /// the alternative is a backlog that becomes permanently unpublishable
-    /// once it ages past the window.
-    const PAST_EVENT_TIME_EXEMPT: bool = false;
 
     /// The canonical signal ledger, when this table owns an `OTel` signal.
     ///
@@ -517,11 +543,11 @@ pub trait DomainTable: Send + Sync + 'static {
 
     /// Engine-owned physical-layout declaration.
     ///
-    /// Defaults to hourly `wyrd_event_time` with no additional Bloom intent,
-    /// which resolves to `wyrd_event_time DESC NULLS LAST` and the managed
+    /// Defaults to hourly `wyrd_ingested_at` with no additional Bloom intent,
+    /// which resolves to `wyrd_ingested_at DESC NULLS LAST` and the managed
     /// Bloom floor.
     fn physical_layout() -> PhysicalLayoutWire {
-        hourly_layout(vec![sort_desc(WYRD_EVENT_TIME)], &[])
+        hourly_layout(WYRD_INGESTED_AT, Vec::new(), &[])
     }
 }
 
@@ -1149,7 +1175,6 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         correlation_policy: T::CORRELATION_POLICY,
         payload_class: T::PAYLOAD_CLASS,
         sensitive_payload_columns: T::SENSITIVE_PAYLOAD_COLUMNS,
-        past_event_time_exempt: T::PAST_EVENT_TIME_EXEMPT,
         arrow_fields: T::arrow_fields,
         schema_fingerprint: T::schema_fingerprint,
         schema: T::schema,
@@ -1290,12 +1315,13 @@ mod tests {
         );
     }
 
-    /// Every built-in keeps its managed columns, a stable fingerprint, and the
-    /// partition granularity pinned for its namespace and name.
+    /// Every built-in keeps its managed columns and a stable fingerprint, and
+    /// carries no tenant row column.
     ///
     /// # Panics
     ///
-    /// Panics when a built-in declares no pinned granularity or drifts from it.
+    /// Panics when a built-in's fingerprint is unset or unstable, or its
+    /// physical schema lacks `wyrd_ingested_at` or carries a tenant column.
     #[test]
     fn every_builtin_has_stable_schema_fingerprint_and_physical_columns() {
         for definition in builtin_tables() {
@@ -1308,34 +1334,75 @@ mod tests {
             );
             assert_eq!(fingerprint, fingerprint_fields(&fields));
             let schema = (definition.schema)();
-            assert!(schema.field_with_name(WYRD_EVENT_TIME).is_ok());
+            assert!(schema.field_with_name(WYRD_INGESTED_AT).is_ok());
             assert!(schema.field_with_name("data_tenant_id").is_err());
-            // Continuous high-rate OTel signals and gateway calls partition hourly. Retained
-            // audit history and the five verification tables partition daily:
-            // both are low-rate, both are read over date ranges rather than a
-            // recent window, and a Verification Result plus all of its detail
-            // rows share one event time and must never split across partitions.
-            let expected = match (definition.namespace, definition.name) {
-                ("traces", "spans")
-                | ("metrics", "points")
-                | ("logs", "records")
-                | ("dev", "agent_traces")
-                | ("gateway", "calls") => TimeGranularityWire::Hour,
-                ("system", "audit_log")
-                | ("drift", "observations" | "result_features")
-                | ("eval", "observations" | "result_items")
-                | ("verification", "results") => TimeGranularityWire::Day,
-                (namespace, name) => {
-                    panic!("vala.{namespace}.{name} declares no pinned partition granularity")
+        }
+    }
+
+    /// Every built-in partitions and sorts on its pinned time column.
+    ///
+    /// Continuous high-rate `OTel` signals, agent traces, and gateway calls
+    /// partition hourly; retained audit history and the five verification
+    /// tables are low-rate, read over date ranges, and partition daily. Each
+    /// table's time column is a non-null timestamp in its own schema, OTLP
+    /// instants are nanosecond UTC, and the resolved layout leads its sort
+    /// order with that column descending.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a built-in declares no pinned time column, or drifts from
+    /// its pinned column, granularity, type, or leading sort key.
+    #[test]
+    fn every_builtin_partitions_and_sorts_on_its_time_column() {
+        let otlp_instant = DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("+00:00".into()));
+        for definition in builtin_tables() {
+            let fqn = format!("vala.{}.{}", definition.namespace, definition.name);
+            let (column, granularity) = match (definition.namespace, definition.name) {
+                ("traces", "spans") => ("start_time_unix_nano", TimeGranularityWire::Hour),
+                ("metrics", "points") | ("logs", "records") => {
+                    ("time_unix_nano", TimeGranularityWire::Hour)
                 }
+                ("dev", "agent_traces") | ("gateway", "calls") => {
+                    ("started_at", TimeGranularityWire::Hour)
+                }
+                ("drift" | "eval", "observations") | ("system", "audit_log") => {
+                    ("created_at", TimeGranularityWire::Day)
+                }
+                ("verification", "results") => ("ended_at", TimeGranularityWire::Day),
+                ("drift", "result_features") | ("eval", "result_items") => {
+                    (WYRD_INGESTED_AT, TimeGranularityWire::Day)
+                }
+                _ => panic!("{fqn} declares no pinned time column"),
             };
-            assert_eq!(
-                (definition.physical_layout)().partition_granularity,
-                expected,
-                "{}.{}",
-                definition.namespace,
-                definition.name
+            let declared = (definition.physical_layout)();
+            assert_eq!(declared.time_column.as_deref(), Some(column), "{fqn}");
+            assert_eq!(declared.partition_granularity, granularity, "{fqn}");
+            let schema = (definition.schema)();
+            let field = schema
+                .field_with_name(column)
+                .unwrap_or_else(|_| panic!("{fqn} has its time column {column}"));
+            assert!(!field.is_nullable(), "{fqn}.{column} is non-null");
+            assert!(
+                crate::catalog::TimePrecision::of(field.data_type()).is_some(),
+                "{fqn}.{column} is a µs or ns timestamp"
             );
+            if definition.namespace == "traces"
+                || definition.namespace == "metrics"
+                || definition.namespace == "logs"
+            {
+                assert_eq!(field.data_type(), &otlp_instant, "{fqn}.{column}");
+            }
+            let resolved =
+                crate::catalog::layout::PhysicalLayout::resolve(&fqn, &schema, Some(&declared))
+                    .unwrap_or_else(|error| panic!("{fqn} resolves: {error}"));
+            assert_eq!(resolved.time_column(), column, "{fqn}");
+            let first = resolved.sort_keys().first().expect("a leading sort key");
+            assert_eq!(
+                first.column(),
+                column,
+                "{fqn} sorts first on its time column"
+            );
+            assert!(first.is_descending(), "{fqn} sorts newest first");
         }
     }
 
@@ -1484,8 +1551,8 @@ mod tests {
     ///
     /// This is the `CorrelationPolicy::Observation` envelope the Bifrost design
     /// fixes for every table: nullable `run_id` and `card_uid`, the required
-    /// publisher `principal_id`, and the required request, event-time, and
-    /// ingestion-time columns. The tenant is a property of
+    /// publisher `principal_id`, and the required request and ingestion-time
+    /// columns. The tenant is a property of
     /// the physical table and of each Parquet footer, never a row column, and
     /// Bifrost stamps no per-row position.
     fn verification_managed_envelope() -> Vec<Field> {
@@ -1494,7 +1561,6 @@ mod tests {
             utf8(CARD_UID, true),
             utf8(PRINCIPAL_ID, false),
             utf8(wyrd_spec::vala::WYRD_REQUEST_ID, false),
-            ts_us_utc(WYRD_EVENT_TIME, false),
             ts_us_utc(WYRD_INGESTED_AT, false),
         ]
     }
@@ -1626,8 +1692,18 @@ mod tests {
     fn physical_layout_contract_all_builtins() {
         let dynamic_schema = Schema::new(vec![
             Field::new(
-                WYRD_EVENT_TIME,
+                "event_time",
+                DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(
+                "updated_at",
                 DataType::Timestamp(ArrowTimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                WYRD_INGESTED_AT,
+                DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("+00:00".into())),
                 false,
             ),
             Field::new(RUN_ID, DataType::Utf8, true),
@@ -1724,10 +1800,11 @@ mod tests {
     /// built-ins use.
     ///
     /// Covers the three legal shapes: omission resolving to the hourly
-    /// event-time default with the managed floor, an explicit empty declaration
-    /// resolving to the same sort order as omission because the system injects
-    /// nothing, and a custom declaration keeping its own order while unioning
-    /// the managed floor.
+    /// `wyrd_ingested_at` default with the managed floor, an explicit empty
+    /// declaration resolving to the same time column and sort order as
+    /// omission because the system injects nothing, and a custom declaration
+    /// naming its own nanosecond time column and keeping its own order while
+    /// unioning the managed floor.
     ///
     /// # Panics
     ///
@@ -1736,8 +1813,8 @@ mod tests {
         // Dynamic declarations share the same resolution. The fixture schema
         // carries the full managed floor plus one user column.
 
-        // Omission resolves to the hourly event-time default with the managed
-        // floor and nothing else.
+        // Omission resolves to the hourly `wyrd_ingested_at` default, sorted
+        // newest first, with the managed floor and nothing else.
         let omitted = crate::catalog::layout::PhysicalLayout::resolve(table, dynamic_schema, None)
             .expect("omitted layout resolves to the default");
         assert_eq!(
@@ -1750,8 +1827,10 @@ mod tests {
                 .iter()
                 .map(|key| key.column().to_owned())
                 .collect::<Vec<_>>(),
-            vec![WYRD_EVENT_TIME.to_owned()]
+            vec![WYRD_INGESTED_AT.to_owned()]
         );
+        assert_eq!(omitted.time_column(), WYRD_INGESTED_AT);
+        assert!(omitted.sort_keys()[0].is_descending());
         assert_eq!(
             omitted.bloom_columns(),
             crate::catalog::layout::MANAGED_BLOOM_FLOOR
@@ -1765,6 +1844,7 @@ mod tests {
         // the sort order, because nothing is injected ahead of a declared key.
         let explicit_empty = PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Day,
+            time_column: None,
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         };
@@ -1778,6 +1858,7 @@ mod tests {
             empty.granularity(),
             crate::catalog::layout::TimeGranularity::Day
         );
+        assert_eq!(empty.time_column(), omitted.time_column());
         assert_eq!(empty.sort_keys(), omitted.sort_keys());
         assert_eq!(empty.bloom_columns(), omitted.bloom_columns());
 
@@ -1785,7 +1866,8 @@ mod tests {
         // unions rather than replaces the managed Bloom floor.
         let custom = PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Hour,
-            sort_keys: vec![sort_desc("customer"), sort_asc(WYRD_EVENT_TIME)],
+            time_column: Some("event_time".to_owned()),
+            sort_keys: vec![sort_desc("customer"), sort_asc("event_time")],
             bloom_columns: vec!["customer".to_owned()],
         };
         let resolved =
@@ -1798,8 +1880,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             sort_columns,
-            vec!["customer".to_owned(), WYRD_EVENT_TIME.to_owned()]
+            vec!["customer".to_owned(), "event_time".to_owned()]
         );
+        assert_eq!(resolved.time_column(), "event_time");
         assert!(resolved.bloom_columns().contains(&"customer".to_owned()));
         for column in crate::catalog::layout::MANAGED_BLOOM_FLOOR {
             assert!(resolved.bloom_columns().contains(&column.to_owned()));
@@ -1825,6 +1908,7 @@ mod tests {
                 "unknown sort column",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: vec![sort_asc("absent")],
                     bloom_columns: Vec::new(),
                 },
@@ -1833,6 +1917,7 @@ mod tests {
                 "duplicate sort column",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: vec![sort_asc("customer"), sort_desc("customer")],
                     bloom_columns: Vec::new(),
                 },
@@ -1841,8 +1926,9 @@ mod tests {
                 "a fifth declared sort key",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: vec![
-                        sort_asc(WYRD_EVENT_TIME),
+                        sort_asc("event_time"),
                         sort_asc(RUN_ID),
                         sort_asc("customer"),
                         sort_asc(CARD_UID),
@@ -1855,6 +1941,7 @@ mod tests {
                 "unknown bloom column",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: Vec::new(),
                     bloom_columns: vec!["absent".to_owned()],
                 },
@@ -1863,8 +1950,36 @@ mod tests {
                 "duplicate bloom column",
                 PhysicalLayoutWire {
                     partition_granularity: TimeGranularityWire::Hour,
+                    time_column: None,
                     sort_keys: Vec::new(),
                     bloom_columns: vec!["customer".to_owned(), "customer".to_owned()],
+                },
+            ),
+            (
+                "unknown time column",
+                PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    time_column: Some("absent".to_owned()),
+                    sort_keys: Vec::new(),
+                    bloom_columns: Vec::new(),
+                },
+            ),
+            (
+                "non-timestamp time column",
+                PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    time_column: Some("customer".to_owned()),
+                    sort_keys: Vec::new(),
+                    bloom_columns: Vec::new(),
+                },
+            ),
+            (
+                "nullable time column",
+                PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    time_column: Some("updated_at".to_owned()),
+                    sort_keys: Vec::new(),
+                    bloom_columns: Vec::new(),
                 },
             ),
         ];
@@ -1875,13 +1990,16 @@ mod tests {
                 Some(&declared),
             )
             .expect_err(label);
-            assert!(
-                matches!(
-                    error,
-                    wyrd_spec::vala::BifrostError::InvalidPhysicalLayout { .. }
-                ),
-                "{label} must fail as an invalid physical layout, got {error:?}"
-            );
+            let wyrd_spec::vala::BifrostError::InvalidPhysicalLayout { field, .. } = error else {
+                panic!("{label} must fail as an invalid physical layout, got {error:?}");
+            };
+            if label.ends_with("time column") {
+                assert_eq!(
+                    field,
+                    wyrd_spec::vala::PhysicalLayoutField::TimeColumn,
+                    "{label} must name the time_column field"
+                );
+            }
         }
     }
 

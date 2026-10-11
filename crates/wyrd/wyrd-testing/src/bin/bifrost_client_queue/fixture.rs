@@ -64,7 +64,7 @@ impl Tenant {
                 "/auth/issue-key",
                 Some(&IssueKeyRequest {
                     card_ref: service.root.clone(),
-                    label: Some("bifrost-ingest-capacity".to_owned()),
+                    label: Some("bifrost-client-queue".to_owned()),
                     expires_in_seconds: None,
                 }),
             )

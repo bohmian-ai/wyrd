@@ -104,11 +104,11 @@ pub(super) fn assert_maximal_span_row(row: &RecordBatch, start: i64, identity: S
     assert_eq!(column::<StringArray>(row, "name").value(0), SPAN_NAME);
     assert_eq!(column::<Int32Array>(row, "kind").value(0), SPAN_KIND);
     assert_eq!(
-        column::<Int64Array>(row, "start_time_unix_nano").value(0),
+        column::<arrow::array::TimestampNanosecondArray>(row, "start_time_unix_nano").value(0),
         start
     );
     assert_eq!(
-        column::<Int64Array>(row, "end_time_unix_nano").value(0),
+        column::<arrow::array::TimestampNanosecondArray>(row, "end_time_unix_nano").value(0),
         start + SPAN_DURATION_NANOS
     );
     assert_eq!(
@@ -235,7 +235,7 @@ fn assert_events(row: &RecordBatch, start: i64) {
         .downcast_ref::<StructArray>()
         .expect("an event element is a struct");
     assert_eq!(
-        child::<Int64Array>(events, "time_unix_nano").value(0),
+        child::<arrow::array::TimestampNanosecondArray>(events, "time_unix_nano").value(0),
         start + EVENT_OFFSET_NANOS
     );
     assert_eq!(child::<StringArray>(events, "name").value(0), EVENT_NAME);
@@ -361,7 +361,7 @@ mod pg_tests {
         journey.publish().await;
         let row = journey
             .query_one_row(&format!(
-                "SELECT * FROM {SPANS_TABLE} WHERE start_time_unix_nano = {start}"
+                "SELECT * FROM {SPANS_TABLE} WHERE start_time_unix_nano = to_timestamp_nanos({start})"
             ))
             .await;
         assert_maximal_span_row(&row, start, GRPC_SPAN);
@@ -372,7 +372,7 @@ mod pg_tests {
         let rows = journey
             .query_as(
                 &reader,
-                &format!("SELECT * FROM {SPANS_TABLE} WHERE start_time_unix_nano = {start}"),
+                &format!("SELECT * FROM {SPANS_TABLE} WHERE start_time_unix_nano = to_timestamp_nanos({start})"),
             )
             .await;
         assert_eq!(

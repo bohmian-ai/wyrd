@@ -18,7 +18,6 @@ use crate::tables::{
     CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// Redacted request payload Variant column, readable only with payload authority.
 pub const REQUEST_PAYLOAD: &str = "request_payload";
@@ -144,10 +143,11 @@ impl DomainTable for CallsTable {
         ]
     }
 
-    /// Partitions hourly on event time and clusters by call identity.
+    /// Partitions hourly on `started_at` and clusters by call identity.
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(
-            vec![sort_desc(WYRD_EVENT_TIME), sort_asc("call_id")],
+            "started_at",
+            vec![sort_desc("started_at"), sort_asc("call_id")],
             &["call_id", "caller_principal_id"],
         )
     }
@@ -159,9 +159,7 @@ mod tests {
 
     use super::{CallsTable, RESOLVED_MODEL};
     use crate::tables::{DomainTable, builtin_table};
-    use wyrd_spec::vala::{
-        CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
-    };
+    use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
     /// Pins the exact contract columns, their nullability, the two model
     /// Structs' child nullability, and the envelope.
@@ -208,7 +206,6 @@ mod tests {
                 (CARD_UID, true),
                 (PRINCIPAL_ID, false),
                 (WYRD_REQUEST_ID, false),
-                (WYRD_EVENT_TIME, false),
                 (WYRD_INGESTED_AT, false),
             ]
         );

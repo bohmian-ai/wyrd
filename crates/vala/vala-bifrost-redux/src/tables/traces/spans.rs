@@ -20,14 +20,13 @@ use crate::tables::{
 };
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// Ordered fields of one nested span event.
 ///
 /// Everything an event carries is caller content, so the whole subtree is
 /// sensitive payload and is skipped by a metadata-only projection.
 pub static SPAN_EVENT_FIELDS: [F; 4] = [
-    F::sensitive("time_unix_nano", T::Int64, false),
+    F::sensitive("time_unix_nano", signal::OTLP_INSTANT, false),
     F::sensitive("name", T::Utf8, false),
     F::sensitive("attributes", T::Variant, false),
     F::sensitive("dropped_attributes_count", T::Int64, false),
@@ -75,8 +74,8 @@ pub static SPAN_FIELDS: &[F] = &[
     F::meta("flags", T::Int64, false),
     F::meta("name", T::Utf8, false),
     F::meta("kind", T::Int32, false),
-    F::meta("start_time_unix_nano", T::Int64, false),
-    F::meta("end_time_unix_nano", T::Int64, false),
+    F::meta("start_time_unix_nano", signal::OTLP_INSTANT, false),
+    F::meta("end_time_unix_nano", signal::OTLP_INSTANT, false),
     F::meta("duration_nano", T::Int64, false),
     F::meta("status_present", T::Bool, false),
     F::meta("status_code", T::Int32, true),
@@ -149,7 +148,8 @@ impl DomainTable for SpansTable {
 
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(
-            vec![sort_desc(WYRD_EVENT_TIME), sort_asc("trace_id")],
+            "start_time_unix_nano",
+            vec![sort_desc("start_time_unix_nano"), sort_asc("trace_id")],
             &["trace_id", "span_id", "service_name"],
         )
     }

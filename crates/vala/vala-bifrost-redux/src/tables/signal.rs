@@ -12,7 +12,7 @@
 
 use arrow::array::{
     ArrayRef, BooleanArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
-    StringArray, StructArray,
+    StringBuilder, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -196,11 +196,29 @@ fn append_object(builder: &mut impl VariantBuilderExt, entries: &[KeyValue]) {
 }
 
 /// Build one Variant column from encoded values; `None` is a null row.
+///
+/// The values are walked once to total their `metadata` and `value` bytes, so
+/// the column's child buffers are allocated once at their final size.
 #[must_use]
 pub fn variant_column<'a>(
-    values: impl ExactSizeIterator<Item = Option<&'a EncodedVariant>>,
+    values: impl ExactSizeIterator<Item = Option<&'a EncodedVariant>> + Clone,
 ) -> ArrayRef {
-    values.collect::<VariantColumnBuilder>().finish()
+    let (metadata_bytes, value_bytes) =
+        values
+            .clone()
+            .flatten()
+            .fold((0_usize, 0_usize), |(metadata, value), encoded| {
+                (
+                    metadata.saturating_add(encoded.metadata().len()),
+                    value.saturating_add(encoded.value().len()),
+                )
+            });
+    let mut builder =
+        VariantColumnBuilder::with_byte_capacity(values.len(), metadata_bytes, value_bytes);
+    for value in values {
+        builder.append_option(value);
+    }
+    builder.finish()
 }
 
 /// Build one `resource_entity_refs` list column from flattened references.
@@ -226,19 +244,25 @@ pub fn entity_refs_column(
             .iter()
             .map(|entity| Some(select(entity).len()))
             .collect();
-        list_column(&key_element, utf8_column(values), &lengths).map_err(internal)
+        list_column(&key_element, utf8_column(&values), &lengths).map_err(internal)
     };
     let element = ENTITY_REF_ELEMENT.to_arrow();
     let entities = struct_column(
         &nested_fields(&element)?,
         vec![
-            utf8_column(refs.iter().map(|entity| entity.r#type.clone()).collect()),
+            utf8_column(
+                &refs
+                    .iter()
+                    .map(|entity| entity.r#type.clone())
+                    .collect::<Vec<_>>(),
+            ),
             keys(|entity| &entity.id_keys)?,
             keys(|entity| &entity.description_keys)?,
             utf8_column(
-                refs.iter()
+                &refs
+                    .iter()
                     .map(|entity| entity.schema_url.clone())
-                    .collect(),
+                    .collect::<Vec<_>>(),
             ),
         ],
         None,
@@ -685,14 +709,33 @@ pub fn without_correlation_columns(batch: &RecordBatch) -> Result<RecordBatch, T
 
 /// Build a non-nullable UTF-8 column.
 #[must_use]
-pub fn utf8_column(values: Vec<String>) -> ArrayRef {
-    Arc::new(StringArray::from(values))
+pub fn utf8_column(values: &[String]) -> ArrayRef {
+    utf8_opt_column_from(values.iter().map(|value| Some(value.as_str())))
 }
 
 /// Build a nullable UTF-8 column.
 #[must_use]
-pub fn utf8_opt_column(values: Vec<Option<String>>) -> ArrayRef {
-    Arc::new(StringArray::from(values))
+pub fn utf8_opt_column(values: &[Option<String>]) -> ArrayRef {
+    utf8_opt_column_from(values.iter().map(Option::as_deref))
+}
+
+/// Build a UTF-8 column whose offsets and bytes are allocated once.
+///
+/// The values are walked once to total their bytes, then appended into a
+/// builder of that exact capacity; a column without nulls carries no validity
+/// buffer, as Arrow's own constructors produce.
+fn utf8_opt_column_from<'a>(
+    values: impl ExactSizeIterator<Item = Option<&'a str>> + Clone,
+) -> ArrayRef {
+    let bytes = values
+        .clone()
+        .flatten()
+        .fold(0_usize, |total, value| total.saturating_add(value.len()));
+    let mut builder = StringBuilder::with_capacity(values.len(), bytes);
+    for value in values {
+        builder.append_option(value);
+    }
+    Arc::new(builder.finish())
 }
 
 /// Build a non-nullable fixed-width binary column of the declared width.
@@ -754,6 +797,25 @@ pub fn u32_as_i64_column(values: Vec<u32>) -> ArrayRef {
 #[must_use]
 pub fn i64_column(values: Vec<i64>) -> ArrayRef {
     Arc::new(Int64Array::from(values))
+}
+
+/// The canonical type of every instant `OTLP` carries as Unix nanoseconds.
+///
+/// `TIMESTAMP_LTZ` at nanosecond precision in Iceberg's own `+00:00` spelling,
+/// so a span start, log time, or point time is a time column the layout can
+/// partition, sort, and prune on. Durations are not instants and stay `Int64`.
+pub const OTLP_INSTANT: T = T::Timestamp(
+    arrow::datatypes::TimeUnit::Nanosecond,
+    Some(iceberg::arrow::UTC_TIME_ZONE),
+);
+
+/// Build a non-nullable [`OTLP_INSTANT`] column from Unix nanoseconds.
+#[must_use]
+pub fn otlp_instant_column(values: Vec<i64>) -> ArrayRef {
+    Arc::new(
+        arrow::array::TimestampNanosecondArray::from(values)
+            .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
+    )
 }
 
 /// Widen one unsigned 64-bit protocol value into the declared signed column.

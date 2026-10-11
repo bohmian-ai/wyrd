@@ -132,11 +132,12 @@ mod pg_tests {
             let time = anchor + offset;
             let row = journey
                 .query_one_row(&format!(
-                    "SELECT * FROM {LOGS_TABLE} WHERE time_unix_nano = {time}"
+                    "SELECT * FROM {LOGS_TABLE} WHERE time_unix_nano = to_timestamp_nanos({time})"
                 ))
                 .await;
             assert_eq!(
-                column::<Int64Array>(&row, "observed_time_unix_nano").value(0),
+                column::<arrow::array::TimestampNanosecondArray>(&row, "observed_time_unix_nano")
+                    .value(0),
                 time + LOG_OBSERVED_OFFSET_NANOS,
                 "{transport} keeps the observed instant distinct from the record instant"
             );
@@ -218,7 +219,9 @@ mod pg_tests {
         let rows = journey
             .query_as(
                 &reader,
-                &format!("SELECT * FROM {LOGS_TABLE} WHERE time_unix_nano = {anchor}"),
+                &format!(
+                    "SELECT * FROM {LOGS_TABLE} WHERE time_unix_nano = to_timestamp_nanos({anchor})"
+                ),
             )
             .await;
         assert_eq!(

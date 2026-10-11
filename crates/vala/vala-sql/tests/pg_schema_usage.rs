@@ -20,10 +20,11 @@ mod pg_tests {
     ///
     /// The catalog column is opaque JSON to `vala-sql`; these tests only need a
     /// value that matches the wire contract the server persists, so they build
-    /// the `hour(wyrd_event_time)` default rather than a bespoke shape.
+    /// the hourly `wyrd_ingested_at` default rather than a bespoke shape.
     fn layout_fixture() -> serde_json::Value {
         serde_json::json!({
-            "partition": { "column": "wyrd_event_time", "granularity": "hour" },
+            "partition_granularity": "hour",
+            "time_column": "wyrd_ingested_at",
             "sort_keys": [],
             "bloom_columns": []
         })

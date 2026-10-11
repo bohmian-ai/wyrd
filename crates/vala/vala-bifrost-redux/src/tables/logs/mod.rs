@@ -10,7 +10,7 @@ pub use records::RecordsTable;
 mod tests {
     use arrow::array::{
         Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray,
-        StringArray, StructArray,
+        StringArray, StructArray, TimestampNanosecondArray,
     };
     use arrow::datatypes::DataType;
     use arrow::record_batch::RecordBatch;
@@ -67,12 +67,17 @@ mod tests {
         ]
     }
 
+    /// The observed time of the fixture's uncorrelated record, whose OTLP
+    /// `time_unix_nano` is unset.
+    const UNSET_TIME_OBSERVED_AT: u64 = 1_700_000_000_555_000_000;
+
     /// Build the maximal supported resource-log fixture.
     ///
     /// The first scope carries one correlated, fully populated record per body
     /// form; the trailing scope carries an uncorrelated record with an absent
     /// body, an absent resource, and an absent scope so presence and
-    /// nullability distinctions are exercised in the same batch.
+    /// nullability distinctions are exercised in the same batch. That record
+    /// sets only its observed time, which its unset time falls back to.
     fn maximal_resource_logs() -> Vec<ResourceLogs> {
         let correlated: Vec<LogRecord> = body_forms()
             .into_iter()
@@ -132,7 +137,10 @@ mod tests {
                 resource: None,
                 scope_logs: vec![ScopeLogs {
                     scope: None,
-                    log_records: vec![LogRecord::default()],
+                    log_records: vec![LogRecord {
+                        observed_time_unix_nano: UNSET_TIME_OBSERVED_AT,
+                        ..LogRecord::default()
+                    }],
                     schema_url: String::new(),
                 }],
                 schema_url: String::new(),
@@ -280,10 +288,20 @@ mod tests {
     fn assert_record_scalars(batch: &RecordBatch, correlated: usize) {
         let flags = typed::<Int64Array>(batch, "flags");
         assert_eq!(flags.value(0), 0xdead_beef, "raw flag word is not decoded");
-        let time = typed::<Int64Array>(batch, "time_unix_nano");
+        let time = typed::<TimestampNanosecondArray>(batch, "time_unix_nano");
         assert_eq!(time.value(0), 1_700_000_000_123_456_789);
-        let observed = typed::<Int64Array>(batch, "observed_time_unix_nano");
+        let observed = typed::<TimestampNanosecondArray>(batch, "observed_time_unix_nano");
         assert_eq!(observed.value(0), 1_700_000_000_987_654_321);
+        // An unset OTLP `time_unix_nano` stores the observed time, and the
+        // observed time keeps its own value.
+        assert_eq!(
+            time.value(correlated).cast_unsigned(),
+            UNSET_TIME_OBSERVED_AT
+        );
+        assert_eq!(
+            observed.value(correlated).cast_unsigned(),
+            UNSET_TIME_OBSERVED_AT
+        );
         assert_eq!(typed::<Int32Array>(batch, "severity_number").value(0), 9);
         assert_eq!(
             typed::<StringArray>(batch, "severity_text").value(0),

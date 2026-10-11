@@ -19,6 +19,10 @@ const MEMORY_HEADROOM_BYTES: u64 = 1 << 30;
 /// Durable acknowledged rows per second every write step must reach.
 const MIN_WRITE_ROWS_PER_SECOND: f64 = 200_000.0;
 
+/// OTLP wire MiB per second per server core an export sweep's peak step must
+/// reach: the upper end of published per-core OTLP ingest figures.
+const MIN_EXPORT_WIRE_MIB_PER_CORE: f64 = 30.0;
+
 /// The report table's header.
 const HEADER: &str = "| step | clients | rate | p50/p95/p99 ms | errors | server CPU | peak memory | driver CPU | verdict | reason |\n|---|---|---|---|---|---|---|---|---|---|";
 
@@ -110,26 +114,67 @@ impl Report {
     /// [`MIN_WRITE_ROWS_PER_SECOND`]. `files` and `bytes` are the Parquet
     /// objects the table holds afterwards.
     pub fn write(&mut self, step: &str, measured: &Measured, files: u64, bytes: u64) {
-        let rate = measured.rows as f64 / measured.usage.seconds.max(f64::EPSILON);
-        let megabytes = measured
-            .usage
-            .write
-            .get(crate::run::MEMTABLE_BYTES)
-            .copied()
-            .unwrap_or(0.0)
-            / 1e6;
-        let shape = format!(
-            "{} rows in {:.1}s, {:.1} MB/s, {:.1} MB/s per server core; {files} files, avg {:.1} MiB",
-            measured.rows,
-            measured.usage.seconds,
-            megabytes / measured.usage.seconds.max(f64::EPSILON),
-            megabytes / measured.usage.server_cpu_seconds.max(f64::EPSILON),
-            bytes as f64 / files.max(1) as f64 / f64::from(1 << 20),
-        );
+        let rate = rows_per_second(measured);
         let missed = (rate < MIN_WRITE_ROWS_PER_SECOND)
             .then(|| format!("{rate:.0} rows/s < {MIN_WRITE_ROWS_PER_SECOND:.0}"));
+        let shape = write_shape(measured, files, bytes);
         let row = self.judge(step, measured, format!("{rate:.0} rows/s"), missed, shape);
         self.add(row);
+    }
+
+    /// Adds one OTLP export sweep point: reported, failed only on an error,
+    /// and judged with the rest by [`Self::export_target`].
+    pub fn export(&mut self, step: &str, measured: &Measured, files: u64, bytes: u64) {
+        let rate = format!("{:.0} rows/s", rows_per_second(measured));
+        let shape = write_shape(measured, files, bytes);
+        let mut row = self.judge(step, measured, rate, None, shape);
+        if row.verdict == Verdict::Pass {
+            row.verdict = Verdict::Measured;
+        }
+        self.add(row);
+    }
+
+    /// Adds the export sweep's summary: its fastest point must durably
+    /// acknowledge [`MIN_WRITE_ROWS_PER_SECOND`] and carry
+    /// [`MIN_EXPORT_WIRE_MIB_PER_CORE`] of OTLP wire per server core. Lower
+    /// concurrency points only locate saturation.
+    pub fn export_target(&mut self, step: &str, points: &[Measured]) {
+        let peak = points
+            .iter()
+            .max_by(|left, right| rows_per_second(left).total_cmp(&rows_per_second(right)));
+        let summary = peak.map_or(Err("no points".to_owned()), |peak| {
+            let rate = rows_per_second(peak);
+            let per_core = peak.wire_bytes as f64
+                / f64::from(1 << 20)
+                / peak.usage.server_cpu_seconds.max(f64::EPSILON);
+            let shape = format!(
+                "peak x{}: {rate:.0} rows/s, {per_core:.1} MiB/s OTLP wire per server core",
+                peak.clients
+            );
+            if rate < MIN_WRITE_ROWS_PER_SECOND {
+                Err(format!("{shape}; < {MIN_WRITE_ROWS_PER_SECOND:.0} rows/s"))
+            } else if per_core < MIN_EXPORT_WIRE_MIB_PER_CORE {
+                Err(format!(
+                    "{shape}; < {MIN_EXPORT_WIRE_MIB_PER_CORE:.0} MiB/s per core"
+                ))
+            } else {
+                Ok(shape)
+            }
+        });
+        self.add(Row {
+            step: step.to_owned(),
+            clients: "-".to_owned(),
+            rate: "-".to_owned(),
+            latency: "-".to_owned(),
+            errors: "-".to_owned(),
+            usage: None,
+            verdict: if summary.is_ok() {
+                Verdict::Pass
+            } else {
+                Verdict::Fail
+            },
+            reason: summary.unwrap_or_else(|missed| missed),
+        });
     }
 
     /// Adds the exact-answer check.
@@ -483,6 +528,43 @@ fn missed(target: &Target, measured: &Measured) -> Option<String> {
         }
     }
     None
+}
+
+/// Durable acknowledged rows per second of a write or export step.
+fn rows_per_second(measured: &Measured) -> f64 {
+    measured.rows as f64 / measured.usage.seconds.max(f64::EPSILON)
+}
+
+/// A write or export step's shape: retained Arrow MB/s overall and per
+/// server core, the Parquet files the table holds afterwards, and, for an
+/// OTLP export, its wire MB/s and rows/s per server core.
+fn write_shape(measured: &Measured, files: u64, bytes: u64) -> String {
+    let megabytes = measured
+        .usage
+        .write
+        .get(crate::run::MEMTABLE_BYTES)
+        .copied()
+        .unwrap_or(0.0)
+        / 1e6;
+    let mut shape = format!(
+        "{} rows in {:.1}s, {:.1} MB/s, {:.1} MB/s per server core; {files} files, avg {:.1} MiB",
+        measured.rows,
+        measured.usage.seconds,
+        megabytes / measured.usage.seconds.max(f64::EPSILON),
+        megabytes / measured.usage.server_cpu_seconds.max(f64::EPSILON),
+        bytes as f64 / files.max(1) as f64 / f64::from(1 << 20),
+    );
+    if measured.wire_bytes > 0 {
+        let wire = measured.wire_bytes as f64 / f64::from(1 << 20);
+        let _ = write!(
+            shape,
+            "; OTLP wire {:.1} MiB/s, {:.1} MiB/s and {:.0} rows/s per server core",
+            wire / measured.usage.seconds.max(f64::EPSILON),
+            wire / measured.usage.server_cpu_seconds.max(f64::EPSILON),
+            measured.rows as f64 / measured.usage.server_cpu_seconds.max(f64::EPSILON),
+        );
+    }
+    shape
 }
 
 #[cfg(test)]

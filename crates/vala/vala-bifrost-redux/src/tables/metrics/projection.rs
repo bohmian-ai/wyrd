@@ -36,9 +36,9 @@ use crate::tables::signal::{
     OutputBudget, RecordCorrelation, ResourceEnvelope, ScopeEnvelope, attributes_variant,
     bool_column, bool_opt_column, checked_i64, entity_refs_column, f64_column, f64_opt_column,
     fixed_binary_opt_column, fixed_row_bytes, i32_opt_column, i64_column, i64_opt_column, internal,
-    list_column, nested_fields, projected_signal_schema, span_id_bytes, struct_column,
-    trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, validate_canonical_user_batch,
-    variant_column,
+    list_column, nested_fields, otlp_instant_column, projected_signal_schema, span_id_bytes,
+    struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
+    validate_canonical_user_batch, variant_column,
 };
 use crate::tables::{TableError, refuse_partial_structs};
 use wyrd_spec::reference::CardRefScope;
@@ -1093,7 +1093,7 @@ impl PointColumns {
         let exemplars = struct_column(
             &nested_fields(&EXEMPLAR_ELEMENT.to_arrow())?,
             vec![
-                i64_column(std::mem::take(&mut self.exemplar_time)),
+                otlp_instant_column(std::mem::take(&mut self.exemplar_time)),
                 i64_opt_column(std::mem::take(&mut self.exemplar_int)),
                 f64_opt_column(std::mem::take(&mut self.exemplar_double)),
                 variant_column(self.exemplar_attributes.iter().map(Some)),
@@ -1124,13 +1124,13 @@ impl PointColumns {
     fn finish(mut self) -> Result<RecordBatch, TableError> {
         let nested = self.nested_columns()?;
         let columns: Vec<ArrayRef> = vec![
-            utf8_column(self.metric_name),
-            utf8_column(self.description),
-            utf8_column(self.unit),
+            utf8_column(&self.metric_name),
+            utf8_column(&self.description),
+            utf8_column(&self.unit),
             variant_column(self.metadata.iter().map(Some)),
-            utf8_column(self.metric_type),
-            i64_column(self.time_unix_nano),
-            i64_column(self.start_time_unix_nano),
+            utf8_column(&self.metric_type),
+            otlp_instant_column(self.time_unix_nano),
+            otlp_instant_column(self.start_time_unix_nano),
             u32_as_i64_column(self.flags),
             variant_column(self.attributes.iter().map(Some)),
             i64_opt_column(self.int_value),
@@ -1175,19 +1175,19 @@ impl PointColumns {
             bool_column(self.resource_present),
             variant_column(self.resource_attributes.iter().map(Some)),
             u32_as_i64_column(self.resource_dropped_attributes_count),
-            utf8_column(self.resource_schema_url),
+            utf8_column(&self.resource_schema_url),
             entity_refs_column(&self.entity_refs, &self.entity_ref_lengths)?,
             bool_column(self.scope_present),
-            utf8_column(self.scope_name),
-            utf8_column(self.scope_version),
+            utf8_column(&self.scope_name),
+            utf8_column(&self.scope_version),
             variant_column(self.scope_attributes.iter().map(Some)),
             u32_as_i64_column(self.scope_dropped_attributes_count),
-            utf8_column(self.scope_schema_url),
-            utf8_opt_column(self.service_name),
-            utf8_opt_column(self.service_version),
-            utf8_opt_column(self.deployment_environment),
-            utf8_opt_column(self.card_ref),
-            utf8_opt_column(self.run_id),
+            utf8_column(&self.scope_schema_url),
+            utf8_opt_column(&self.service_name),
+            utf8_opt_column(&self.service_version),
+            utf8_opt_column(&self.deployment_environment),
+            utf8_opt_column(&self.card_ref),
+            utf8_opt_column(&self.run_id),
         ];
         RecordBatch::try_new(projected_signal_schema(METRIC_FIELDS), columns)
             .map_err(|error| TableError::Internal(format!("canonical metric batch: {error}")))

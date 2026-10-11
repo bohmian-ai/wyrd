@@ -20,7 +20,7 @@
 //! unshredded Arrow storage: a struct of non-null `metadata` and `value`
 //! binary children under the `arrow.parquet.variant` extension.
 
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -563,9 +563,19 @@ impl VariantColumnBuilder {
     /// Start an empty column sized for `rows` values.
     #[must_use]
     pub fn with_capacity(rows: usize) -> Self {
+        Self::with_byte_capacity(rows, 0, 0)
+    }
+
+    /// Start an empty column sized for `rows` values whose `metadata` and
+    /// `value` child bytes total `metadata_bytes` and `value_bytes`.
+    ///
+    /// A producer that knows its encoded values up front sizes both child
+    /// buffers once, so appending never reallocates them.
+    #[must_use]
+    pub fn with_byte_capacity(rows: usize, metadata_bytes: usize, value_bytes: usize) -> Self {
         Self {
-            metadata: BinaryBuilder::with_capacity(rows, 0),
-            value: BinaryBuilder::with_capacity(rows, 0),
+            metadata: BinaryBuilder::with_capacity(rows, metadata_bytes),
+            value: BinaryBuilder::with_capacity(rows, value_bytes),
             validity: Vec::with_capacity(rows),
         }
     }
@@ -652,22 +662,31 @@ impl<V: Borrow<EncodedVariant>> FromIterator<Option<V>> for VariantColumnBuilder
     }
 }
 
-/// RFC 6901 JSON Pointer under construction during a walk.
-#[derive(Debug, Default)]
-struct JsonPointer {
-    /// Escaped reference tokens from the root.
-    tokens: Vec<String>,
+/// One unescaped RFC 6901 reference token.
+///
+/// Tokens stay raw while a walk descends, so a walk that finds no violation
+/// never allocates or escapes a pointer; [`JsonPointer::render`] escapes them
+/// only when a violation is reported.
+#[derive(Debug)]
+enum PointerToken<'a> {
+    /// One object key, borrowed from the walked value when it can be.
+    Key(Cow<'a, str>),
+    /// One array index.
+    Index(usize),
 }
 
-impl JsonPointer {
-    /// Descend into one object key, escaping `~` and `/`.
-    fn push_key(&mut self, key: &str) {
-        self.tokens.push(Self::escape(key));
-    }
+/// RFC 6901 JSON Pointer under construction during a walk.
+#[derive(Debug, Default)]
+struct JsonPointer<'a> {
+    /// Unescaped reference tokens from the root.
+    tokens: Vec<PointerToken<'a>>,
+}
 
-    /// Return the reference token of one object key, escaping `~` and `/`.
-    fn escape(key: &str) -> String {
-        key.replace('~', "~0").replace('/', "~1")
+impl JsonPointer<'_> {
+    /// Descend into one object key.
+    fn push_key(&mut self, key: &str) {
+        self.tokens
+            .push(PointerToken::Key(Cow::Owned(key.to_owned())));
     }
 
     /// Return to the ancestor `depth` tokens below the root.
@@ -680,7 +699,7 @@ impl JsonPointer {
 
     /// Descend into one array index.
     fn push_index(&mut self, index: usize) {
-        self.tokens.push(index.to_string());
+        self.tokens.push(PointerToken::Index(index));
     }
 
     /// Return to the parent.
@@ -688,11 +707,15 @@ impl JsonPointer {
         self.tokens.pop();
     }
 
-    /// Render the pointer; the root is the empty string.
+    /// Render the pointer, escaping `~` and `/` in each key; the root is the
+    /// empty string.
     fn render(&self) -> String {
         self.tokens.iter().fold(String::new(), |mut out, token| {
             out.push('/');
-            out.push_str(token);
+            match token {
+                PointerToken::Key(key) => out.push_str(&key.replace('~', "~0").replace('/', "~1")),
+                PointerToken::Index(index) => out.push_str(&index.to_string()),
+            }
             out
         })
     }
@@ -967,7 +990,7 @@ fn scan_numbers(
 ) {
     let base = path.tokens.len();
     // Each pending value carries its parent's pointer depth and its token.
-    let mut pending: Vec<(usize, Option<String>, usize)> = vec![(base, None, root)];
+    let mut pending: Vec<(usize, Option<PointerToken<'static>>, usize)> = vec![(base, None, root)];
     while found.numeric.is_none() {
         let Some((parent, token, node)) = pending.pop() else {
             break;
@@ -979,18 +1002,18 @@ fn scan_numbers(
         let here = path.tokens.len();
         let start = pending.len();
         match tree.kind(node) {
-            Some(b'{') => match tree.entries(node) {
-                Some(entries) => pending.extend(
-                    entries
-                        .into_iter()
-                        .map(|(key, child)| (here, Some(JsonPointer::escape(&key)), child)),
-                ),
-                None => found.record(invalid(path)),
-            },
+            Some(b'{') => {
+                match tree.entries(node) {
+                    Some(entries) => pending.extend(entries.into_iter().map(|(key, child)| {
+                        (here, Some(PointerToken::Key(Cow::Owned(key))), child)
+                    })),
+                    None => found.record(invalid(path)),
+                }
+            }
             Some(b'[') => pending.extend(
                 tree.items(node)
                     .enumerate()
-                    .map(|(index, item)| (here, Some(index.to_string()), item)),
+                    .map(|(index, item)| (here, Some(PointerToken::Index(index)), item)),
             ),
             Some(b'"' | b't' | b'f' | b'n') => {}
             _ => {
@@ -1128,13 +1151,18 @@ fn scan_encoded(metadata: VariantMetadata<'_>, value: &[u8]) -> VariantViolation
                     }
                     previous = Some(name);
                     let child = Variant::new_with_metadata(object.metadata.clone(), slot);
-                    pending.push((here, Some(JsonPointer::escape(name)), depth, child));
+                    pending.push((
+                        here,
+                        Some(PointerToken::Key(Cow::Borrowed(name))),
+                        depth,
+                        child,
+                    ));
                 }
             }
             Variant::List(list) => {
                 let (depth, _) = enter_container(depth, &path, &mut found);
                 for (index, child) in list.iter().enumerate() {
-                    pending.push((here, Some(index.to_string()), depth, child));
+                    pending.push((here, Some(PointerToken::Index(index)), depth, child));
                 }
             }
             Variant::Decimal4(_) | Variant::Decimal8(_) => {
@@ -1479,6 +1507,23 @@ mod tests {
             EncodedVariant::from_json_text(&nested_text("18446744073709551616", 10_000)),
             Err(VariantViolation::NumericOutOfRange {
                 path: "/0".repeat(10_000),
+                numeric_kind: "integer",
+            })
+        );
+    }
+
+    /// A reported pointer escapes `~` and `/` in keys and renders indexes,
+    /// although the walk itself keeps its tokens raw.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refused number is not reported at the escaped pointer.
+    #[test]
+    fn violation_pointer_escapes_keys_only_when_rendered() {
+        assert_eq!(
+            EncodedVariant::from_json_text(r#"{"a/b": {"c~d": [0, 18446744073709551616]}}"#),
+            Err(VariantViolation::NumericOutOfRange {
+                path: "/a~1b/c~0d/1".to_owned(),
                 numeric_kind: "integer",
             })
         );

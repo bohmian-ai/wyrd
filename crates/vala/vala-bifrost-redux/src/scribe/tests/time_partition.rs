@@ -19,7 +19,7 @@ use crate::scribe::seal_key::{MAX_TIME_PARTITIONS, SealKey, plan_time_partitions
 use crate::scribe::stream_identity::NodeId;
 use crate::scribe::wal::{WalConfig, WalWriter};
 
-/// Builds one Arrow source whose `wyrd_event_time` values are the given
+/// Builds one Arrow source whose `event_time` values are the given
 /// epoch-microsecond instants.
 fn batch_with_event_times(micros: Vec<i64>) -> arrow::record_batch::RecordBatch {
     use std::sync::Arc;
@@ -30,7 +30,7 @@ fn batch_with_event_times(micros: Vec<i64>) -> arrow::record_batch::RecordBatch 
     let rows = micros.len();
     let schema = Arc::new(Schema::new(vec![
         Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         ),
@@ -66,8 +66,11 @@ fn time_partition_wal_tail_exact_once() {
             .map(|index| base + hour_micros * i64::try_from(index).expect("index fits i64"))
             .collect(),
     );
-    let plan = plan_time_partitions(&admitted, TimeGranularity::Hour)
-        .expect("the per-source ceiling is admitted");
+    let plan = plan_time_partitions(
+        &admitted,
+        &crate::catalog::TimeAxis::new("event_time", TimeGranularity::Hour),
+    )
+    .expect("the per-source ceiling is admitted");
     assert_eq!(plan.len(), MAX_TIME_PARTITIONS);
 
     // One partition past it is refused, and refusal happens during planning,
@@ -78,14 +81,21 @@ fn time_partition_wal_tail_exact_once() {
             .collect(),
     );
     assert!(
-        plan_time_partitions(&refused, TimeGranularity::Hour).is_err(),
+        plan_time_partitions(
+            &refused,
+            &crate::catalog::TimeAxis::new("event_time", TimeGranularity::Hour)
+        )
+        .is_err(),
         "one partition past the per-source ceiling must be refused"
     );
 
     // The bound is on partitions, not on days: the same instants that open
     // `MAX_TIME_PARTITIONS` hours open a single day.
-    let daily = plan_time_partitions(&admitted, TimeGranularity::Day)
-        .expect("the same source is one day at daily granularity");
+    let daily = plan_time_partitions(
+        &admitted,
+        &crate::catalog::TimeAxis::new("event_time", TimeGranularity::Day),
+    )
+    .expect("the same source is one day at daily granularity");
     assert!(daily.len() < plan.len());
 
     // Every appended partition survives a WAL v6 round trip with its exact

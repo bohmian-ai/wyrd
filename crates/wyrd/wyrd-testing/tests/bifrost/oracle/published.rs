@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, Int64Array};
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
@@ -126,9 +126,9 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
 
     // 2. Concurrent and repeated reads. A second object is published; two
     //    concurrent identical queries and a repeat must read the same exact
-    //    rows. The event-time floor excludes the phase-1 object before its
-    //    footer. Scribe stamps event time from PostgreSQL, so the floor is
-    //    read from that same clock.
+    //    rows. The `wyrd_ingested_at` floor excludes the phase-1 object
+    //    before its footer. Scribe stamps `wyrd_ingested_at` from PostgreSQL,
+    //    so the floor is read from that same clock.
     let since_phase_one: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(&cluster.pg_fixture().superuser_pool().await?)
         .await?;
@@ -697,9 +697,11 @@ async fn prove_query_stream_telemetry(
     Ok(())
 }
 
-/// Reads one table's `id` column, optionally floored on event time.
+/// Reads one table's `id` column, optionally floored on `wyrd_ingested_at`.
 ///
-/// The floor is what lets a phase name exactly one object: an object whose
+/// Every journey table here declares no time column, so `wyrd_ingested_at`
+/// is the time column its partitions and object bounds follow. The floor is
+/// what lets a phase name exactly one object: an object whose
 /// declared bounds end before it is excluded before its footer is opened.
 ///
 /// # Errors
@@ -712,7 +714,7 @@ async fn query_ids(
 ) -> Result<Vec<i64>, JourneyError> {
     let filter = since.map_or_else(String::new, |floor| {
         format!(
-            " WHERE wyrd_event_time >= TIMESTAMP '{}'",
+            " WHERE wyrd_ingested_at >= TIMESTAMP '{}'",
             floor.format("%Y-%m-%d %H:%M:%S%.6f")
         )
     });
@@ -723,7 +725,7 @@ async fn query_ids(
     .await
 }
 
-/// Reads one table's `id` column inside a closed event-time interval.
+/// Reads one table's `id` column inside a closed `wyrd_ingested_at` interval.
 ///
 /// # Errors
 /// Returns the same failures as [`query_ids`].
@@ -738,8 +740,8 @@ async fn query_ids_between(
     collect_ids(
         client,
         format!(
-            "SELECT id FROM {table} WHERE wyrd_event_time >= TIMESTAMP '{lower}' \
-             AND wyrd_event_time <= TIMESTAMP '{upper}' ORDER BY id"
+            "SELECT id FROM {table} WHERE wyrd_ingested_at >= TIMESTAMP '{lower}' \
+             AND wyrd_ingested_at <= TIMESTAMP '{upper}' ORDER BY id"
         ),
     )
     .await
@@ -1506,5 +1508,187 @@ async fn prove_pushdown_cut(
             structs.row_groups_pruned,
         )?;
     }
+    Ok(())
+}
+
+/// `2026-10-06T00:00:01Z` in microseconds: row 1's time-column value.
+const FIRST_ROW_MICROS: i64 = 1_791_244_801_000_000;
+/// Five hours in microseconds: row 2 lies this far after row 1.
+const FIVE_HOURS_MICROS: i64 = 5 * 3_600_000_000;
+
+/// A range on a declared time column prunes hot and published files for every
+/// time-column type.
+///
+/// One table per `timestamp`, `timestamptz`, `timestamp_ns`, and
+/// `timestamptz_ns` time column holds two rows five hours apart. Each table is
+/// read while its objects are hot, then again after Forge publishes them: a
+/// one-hour range returns exactly the row inside it, an unbounded read returns
+/// both, and a range no row overlaps returns nothing without reading any
+/// object, which holds only when partition values and file bounds decode for
+/// that type.
+///
+/// # Panics
+///
+/// Panics when a read on either tier returns other rows or opens an excluded
+/// object.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn time_column_range_prunes_published_files() {
+    prove_time_column_pruning()
+        .await
+        .expect("every time-column type prunes on both tiers");
+}
+
+/// Registers, writes, and reads one table per time-column type on both tiers.
+///
+/// Promotion is parked before each table's writes so the first reads see hot
+/// objects, then released and driven to completion so the second reads see
+/// only published ones.
+///
+/// # Errors
+///
+/// Returns a registration, ingest, Forge, query, or cluster error.
+///
+/// # Panics
+///
+/// Panics when a read returns other rows or opens an excluded object.
+async fn prove_time_column_pruning() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
+        ForgeConfig::default(),
+        false,
+        true,
+    )
+    .await?;
+    let promotion = cluster
+        .commit_uncertainty_catalog()
+        .ok_or("the pod wraps its Forge catalog in the commit seam")?;
+    let server = cluster
+        .server(0)
+        .ok_or("the one-pod cluster runs one server")?;
+    let tenant = cluster.data_tenant_id();
+    let writer = writer_for_tenant(server, tenant, "time-column-pruning").await?;
+    for (unit, tz) in [
+        (TimeUnit::Microsecond, None),
+        (TimeUnit::Microsecond, Some("+00:00")),
+        (TimeUnit::Nanosecond, None),
+        (TimeUnit::Nanosecond, Some("+00:00")),
+    ] {
+        let time_type = DataType::Timestamp(unit, tz.map(Into::into));
+        let table = unique_table("oracle_time_column");
+        let fqn = format!("vala.bifrost.{table}");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(EVENT_TIME, time_type.clone(), false),
+        ]));
+        register(
+            server,
+            tenant,
+            &table,
+            schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect(),
+            Some(timed_layout()),
+        )
+        .await?;
+
+        promotion.pause_before_commit();
+        for (id, micros) in [
+            (1, FIRST_ROW_MICROS),
+            (2, FIRST_ROW_MICROS + FIVE_HOURS_MICROS),
+        ] {
+            let scale = if unit == TimeUnit::Nanosecond {
+                1_000
+            } else {
+                1
+            };
+            let time = arrow::compute::cast(&Int64Array::from(vec![micros * scale]), &time_type)?;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![id])), time],
+            )?;
+            writer.write_batch(&fqn, &batch).await?;
+            server.flush_bifrost().await?;
+        }
+        tokio::time::timeout(Duration::from_secs(30), promotion.wait_for_before_commit())
+            .await
+            .map_err(|_| "the first promotion never reached the parked commit")?;
+        cluster.refresh_oracle_snapshots().await?;
+        let (_, hot) = file_tier_counts(&cluster, tenant, &table).await?;
+        assert!(
+            hot >= 2,
+            "{time_type}: both rows are hot before promotion, saw {hot}"
+        );
+        prove_time_range_reads(server, writer.client(), &fqn, &time_type, "hot").await?;
+
+        promotion.release_paused_before_commit();
+        compact_sealed_batch(&cluster, tenant, &table, hot).await?;
+        cluster.refresh_oracle_snapshots().await?;
+        let (_, hot) = file_tier_counts(&cluster, tenant, &table).await?;
+        assert_eq!(hot, 0, "{time_type}: every object is published");
+        prove_time_range_reads(server, writer.client(), &fqn, &time_type, "published").await?;
+    }
+    cluster.shutdown_and_inspect().await?;
+    Ok(())
+}
+
+/// Reads `fqn` unbounded, over row 2's hour, and over an interval no row
+/// overlaps, and asserts the rows and that the last read opens no object.
+///
+/// # Errors
+///
+/// Returns a query error.
+///
+/// # Panics
+///
+/// Panics when a read returns other rows or the disjoint read opens an
+/// object.
+async fn prove_time_range_reads(
+    server: &WyrdTestServer,
+    client: &WyrdClient,
+    fqn: &str,
+    time_type: &DataType,
+    tier: &str,
+) -> Result<(), JourneyError> {
+    let between = |lower: &str, upper: &str| {
+        format!(
+            "SELECT id FROM {fqn} WHERE {EVENT_TIME} >= TIMESTAMP '{lower}' \
+             AND {EVENT_TIME} < TIMESTAMP '{upper}' ORDER BY id"
+        )
+    };
+    let all = collect_ids(client, format!("SELECT id FROM {fqn} ORDER BY id")).await?;
+    let in_hour = collect_ids(
+        client,
+        between("2026-10-06 05:00:00", "2026-10-06 06:00:00"),
+    )
+    .await?;
+    let reads_before = server.object_reads_for_test().ranged_reads();
+    let disjoint = collect_ids(
+        client,
+        between("1970-01-01 00:00:00", "1970-01-02 00:00:00"),
+    )
+    .await?;
+
+    assert_eq!(
+        all,
+        vec![1, 2],
+        "{tier} {time_type}: an unbounded read returns both rows"
+    );
+    assert_eq!(
+        in_hour,
+        vec![2],
+        "{tier} {time_type}: the range returns exactly its row"
+    );
+    assert!(
+        disjoint.is_empty(),
+        "{tier} {time_type}: a disjoint range returns no rows"
+    );
+    assert_eq!(
+        server.object_reads_for_test().ranged_reads(),
+        reads_before,
+        "{tier} {time_type}: an object outside the range is never opened"
+    );
     Ok(())
 }

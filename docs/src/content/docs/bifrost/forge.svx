@@ -150,7 +150,7 @@ For each bin Forge:
 3. Records the leased tenant in the output file's footer, so the rewrite carries the same tenant proof as its inputs.
 4. Projects fields by name into the registered Iceberg schema. It does not rely
    on column position when the schemas differ.
-5. Sorts the output by `wyrd_event_time`.
+5. Sorts the output by the table's sort keys, led by its time column.
 6. Writes one Parquet data file under the same table prefix and checks its row
    count and partition.
 

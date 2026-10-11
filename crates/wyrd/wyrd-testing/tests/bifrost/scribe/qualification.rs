@@ -7,7 +7,10 @@ use vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES
 use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 
-use super::support::{append_batch, read_sql, start_scribe_server, tenant_client, unique_table};
+use super::support::{
+    append_batch, event_time_field, read_sql, register, start_scribe_server, tenant_client,
+    timed_layout, unique_table,
+};
 
 /// Bytes of incompressible payload each row carries.
 ///
@@ -216,25 +219,30 @@ async fn scribe_512_mib_physical_object_qualifies() {
 ///
 /// The `value` column is what every read asserts on; the `payload` column is
 /// only there to make rows physically large enough that the production staging
-/// target is reachable without an unreasonable row count.
+/// target is reachable without an unreasonable row count. The event-time column
+/// is the table's hourly time column, so the case pins every row to one
+/// partition.
+///
+/// # Panics
+///
+/// Panics when the catalog refuses the registration.
 async fn register_payload_table(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     name: &str,
 ) -> String {
-    server
-        .create_bifrost_table_for_test(vala_bifrost_redux::catalog::CreateTableRequest {
-            table: vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, name),
-            user_fields: vec![
-                arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
-                arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Binary, false),
-            ],
-            tenant,
-            physical_layout: None,
-            audit: None,
-        })
-        .await
-        .expect("the catalog registers the payload table");
+    register(
+        server,
+        tenant,
+        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, name),
+        vec![
+            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Binary, false),
+            event_time_field(),
+        ],
+        Some(timed_layout()),
+    )
+    .await;
     format!("{}.{name}", BifrostNamespace::Datasets.as_str())
 }
 
@@ -247,14 +255,7 @@ fn payload_batch(
     let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
         arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Binary, false),
-        arrow::datatypes::Field::new(
-            wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-            arrow::datatypes::DataType::Timestamp(
-                arrow::datatypes::TimeUnit::Microsecond,
-                Some("UTC".into()),
-            ),
-            false,
-        ),
+        event_time_field(),
     ]));
     let mut payloads = arrow::array::BinaryBuilder::with_capacity(
         values.len(),

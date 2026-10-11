@@ -1244,7 +1244,7 @@ mod tests {
             schema_fingerprint: "0".repeat(64),
             required_columns: vec![
                 "service_name".into(),
-                "wyrd_event_time".into(),
+                "time_unix_nano".into(),
                 "data_tenant_id".into(),
             ],
         };

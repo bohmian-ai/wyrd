@@ -1177,7 +1177,7 @@ mod tests {
     /// fixture bug rather than staged-namespace behavior.
     fn fixture_key() -> ScribeAssemblyKey {
         let schema = Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]);

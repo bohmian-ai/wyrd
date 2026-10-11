@@ -346,14 +346,6 @@ mod tests {
                 },
                 500,
             ),
-            (
-                BifrostError::EventTimeOutOfRange {
-                    value: "100".to_owned(),
-                    past_bound: "200".to_owned(),
-                    future_bound: "300".to_owned(),
-                },
-                400,
-            ),
         ] {
             let sent = WyrdError::from(sent);
             let received = from_problem_json(&sent.as_problem_json());

@@ -109,6 +109,9 @@ pub struct CanonicalIngress {
     pub batches: Vec<RecordBatch>,
     /// Move-only reservation that already covers `batches`, when Gate held one.
     pub(crate) owner: Option<OtlpDecodeOwner>,
+    /// The logical identity Gate already computed over the one batch, so
+    /// Scribe reuses it for slices that still hold that batch's buffers.
+    pub(crate) logical_identity: Option<crate::scribe::preprocess::LogicalIdentity>,
 }
 
 impl CanonicalIngress {
@@ -118,6 +121,7 @@ impl CanonicalIngress {
         Self {
             batches,
             owner: Some(owner),
+            logical_identity: None,
         }
     }
 
@@ -130,7 +134,18 @@ impl CanonicalIngress {
         Self {
             batches,
             owner: None,
+            logical_identity: None,
         }
+    }
+
+    /// Attaches the logical identity Gate computed over the one batch.
+    #[must_use]
+    pub(crate) fn with_logical_identity(
+        mut self,
+        identity: crate::scribe::preprocess::LogicalIdentity,
+    ) -> Self {
+        self.logical_identity = Some(identity);
+        self
     }
 }
 
@@ -224,7 +239,7 @@ pub struct FrameAdmission {
     /// Number of rows durably admitted into the active ingest pipeline.
     pub rows_accepted: u64,
     /// Server receipt instant, in epoch microseconds, Scribe stamped as
-    /// `wyrd_event_time` on every row whose caller supplied none.
+    /// `wyrd_ingested_at` on every row.
     pub receipt_micros: i64,
     /// Whether this attempt is the one that made the batch query-visible.
     ///
@@ -289,25 +304,6 @@ pub enum ScribeError {
     #[error("ingest contract violation: {0}")]
     ContractViolation(BifrostError),
 
-    /// A caller-supplied `wyrd_event_time` value falls outside the server
-    /// acceptance window evaluated against per-batch receipt time.
-    ///
-    /// The entire batch is rejected pre-admission; no rows are written. The
-    /// caller must supply a value within the configured window or omit the
-    /// column to let the server stamp receipt time.
-    #[error(
-        "wyrd_event_time {value_micros} µs is outside acceptance window \
-         [{past_bound_micros}, {future_bound_micros}] µs"
-    )]
-    EventTimeOutOfRange {
-        /// The offending `wyrd_event_time` value in epoch-microseconds.
-        value_micros: i64,
-        /// The inclusive past bound (receipt − past window) in epoch-microseconds.
-        past_bound_micros: i64,
-        /// The inclusive future bound (receipt + future window) in epoch-microseconds.
-        future_bound_micros: i64,
-    },
-
     #[error("ingest card scope validation failed")]
     CardScopeDenied,
 
@@ -356,15 +352,6 @@ impl ScribeError {
             },
             Self::InvalidFrame => Self::InvalidFrame,
             Self::ContractViolation(error) => Self::ContractViolation(error.clone()),
-            Self::EventTimeOutOfRange {
-                value_micros,
-                past_bound_micros,
-                future_bound_micros,
-            } => Self::EventTimeOutOfRange {
-                value_micros: *value_micros,
-                past_bound_micros: *past_bound_micros,
-                future_bound_micros: *future_bound_micros,
-            },
             Self::CardScopeDenied => Self::CardScopeDenied,
             Self::CardUnresolved => Self::CardUnresolved,
             Self::IngressClosed => Self::IngressClosed,

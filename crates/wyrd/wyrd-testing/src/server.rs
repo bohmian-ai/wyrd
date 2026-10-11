@@ -1696,25 +1696,19 @@ impl WyrdTestServer {
         Ok(paths)
     }
 
-    /// Wait until no Oracle audit outbox commit is still in flight.
+    /// Wait until no audit outbox commit is still in flight.
     ///
-    /// Oracle stages each read decision in `vala.audit_staging` from a
-    /// background task, so a journey that asserts on staging first waits for
+    /// Gate write decisions, Oracle read decisions, and direct verification
+    /// decisions all stage in `vala.audit_staging` through the one process
+    /// outbox writer, so a journey that asserts on staging first waits for
     /// those commits. The returned count is the real residual; a nonzero
     /// return within `budget` means commits did not finish.
-    ///
-    /// # Errors
-    ///
-    /// Returns a start error when this server does not host an Oracle role.
-    pub async fn wait_oracle_audit_staged(
-        &self,
-        budget: std::time::Duration,
-    ) -> Result<u64, WyrdTestServerError> {
+    pub async fn wait_audit_staged(&self, budget: std::time::Duration) -> usize {
         let deadline = std::time::Instant::now() + budget;
         loop {
-            let pending = self.oracle_runtime_inspection()?.audit_pending;
+            let pending = self.state().audit_outbox.pending();
             if pending == 0 || std::time::Instant::now() >= deadline {
-                return Ok(pending);
+                return pending;
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -1941,9 +1935,8 @@ impl WyrdTestServer {
     ///
     /// This is synchronization, never an assertion source: it settles the
     /// server-owned publisher so a following retained-history read sees every
-    /// decision committed so far. Oracle's read-decision commits are tracked
-    /// tasks that land in staging slightly after the query returns, so those
-    /// are drained first; the chain head then reports the publisher's own
+    /// decision committed so far. Outbox decisions land in staging slightly
+    /// after the request returns, so those are drained first; the chain head then reports the publisher's own
     /// progress as `published_seq` catching up to `last_seq`. A tenant with no
     /// chain-head row has appended nothing and owes nothing.
     ///
@@ -1954,14 +1947,12 @@ impl WyrdTestServer {
         &self,
         tenant: DataTenantId,
     ) -> Result<(), WyrdTestServerError> {
-        if self.oracle_runtime_inspection().is_ok() {
-            let pending = self.wait_oracle_audit_staged(RETAINED_AUDIT_BUDGET).await?;
-            if pending != 0 {
-                return Err(WyrdTestServerError::Audit(format!(
-                    "read-audit commits did not finish: {pending} pending after \
-                     {RETAINED_AUDIT_BUDGET:?}"
-                )));
-            }
+        let pending = self.wait_audit_staged(RETAINED_AUDIT_BUDGET).await;
+        if pending != 0 {
+            return Err(WyrdTestServerError::Audit(format!(
+                "audit outbox commits did not finish: {pending} pending after \
+                 {RETAINED_AUDIT_BUDGET:?}"
+            )));
         }
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         let deadline = std::time::Instant::now() + RETAINED_AUDIT_BUDGET;

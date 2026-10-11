@@ -198,10 +198,10 @@ fn description(fqn: &str, fields: Vec<Field>) -> BifrostTableDescription {
                 metadata: [(PARQUET_FIELD_ID_KEY.to_owned(), "1000".to_owned())].into(),
             },
         ],
-        managed_candidates: Vec::new(),
         canonical_physical_fingerprint: None,
         physical_layout: wyrd_spec::vala::api::PhysicalLayoutWire {
             partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+            time_column: None,
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         },

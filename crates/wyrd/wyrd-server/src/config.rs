@@ -321,20 +321,6 @@ pub struct ScribeRuntimeConfig {
     /// WAL IO worker count.
     #[serde(default = "default_scribe_wal_io_threads")]
     pub wal_io_threads: usize,
-    /// Optional past-window bound (seconds) for caller-supplied `wyrd_event_time` validation.
-    ///
-    /// A caller-supplied `wyrd_event_time` older than this many seconds before server receipt
-    /// time is rejected with `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`. When absent the D85
-    /// default of 30 days applies. Per-tenant overrides are not supported.
-    #[serde(default)]
-    pub event_time_past_window_secs: Option<u64>,
-    /// Optional future-window bound (seconds) for caller-supplied `wyrd_event_time` validation.
-    ///
-    /// A caller-supplied `wyrd_event_time` more than this many seconds ahead of server receipt
-    /// time is rejected with `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`. When absent the D85
-    /// default of 24 hours applies. Per-tenant overrides are not supported.
-    #[serde(default)]
-    pub event_time_future_window_secs: Option<u64>,
     /// Maximum encoded bytes accepted for one native or OTLP request.
     ///
     /// Scribe reserves a replayable envelope for one request of this size at
@@ -1506,8 +1492,6 @@ impl Default for ScribeRuntimeConfig {
             ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
             persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
             wal_io_threads: default_scribe_wal_io_threads(),
-            event_time_past_window_secs: None,
-            event_time_future_window_secs: None,
             ingest_request_bytes: default_ingest_request_bytes(),
             mem_table_bucket_num: default_scribe_mem_table_bucket_num(),
             max_file_size_on_disk: default_scribe_max_file_size_on_disk(),

@@ -24,12 +24,12 @@ pub struct HotFileRow {
     pub file_size: i64,
     /// Number of rows in the file.
     pub row_count: i64,
-    /// Inclusive lower `wyrd_event_time` bound the writer recorded for this
+    /// Inclusive lower time-column bound the writer recorded for this
     /// object, projected so a reader can exclude a non-overlapping file before
     /// any footer or data I/O. `None` means the bound is unavailable and the
     /// file must be retained (fail-open), never that the interval is empty.
     pub min_event_time: Option<DateTime<Utc>>,
-    /// Inclusive upper `wyrd_event_time` bound paired with
+    /// Inclusive upper time-column bound paired with
     /// [`Self::min_event_time`]. The pair is only usable for pruning when both
     /// are present and `min <= max`.
     pub max_event_time: Option<DateTime<Utc>>,

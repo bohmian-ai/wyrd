@@ -207,8 +207,10 @@ impl TableConfig {
 
     /// Declare the physical layout the register call should request.
     ///
-    /// Omitted, the server resolves `hour(wyrd_event_time)`, `wyrd_event_time`
-    /// descending nulls-last, and the managed Bloom floor.
+    /// Omitted, the server resolves `hour(wyrd_ingested_at)`,
+    /// `wyrd_ingested_at` descending nulls-last, and the managed Bloom floor.
+    /// A layout's `time_column` names the non-null timestamp column that
+    /// partitions the table and leads its default sort order.
     #[must_use]
     pub fn with_layout(mut self, layout: PhysicalLayoutWire) -> Self {
         self.physical_layout = Some(layout);

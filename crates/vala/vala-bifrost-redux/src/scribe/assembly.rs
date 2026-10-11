@@ -1191,7 +1191,7 @@ mod tests {
     /// Builds the physical schema every fixture layout resolves against.
     fn fixture_schema() -> Schema {
         Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )])
@@ -1207,6 +1207,7 @@ mod tests {
         let schema = fixture_schema();
         let declared = granularity.map(|partition_granularity| PhysicalLayoutWire {
             partition_granularity,
+            time_column: Some("event_time".to_owned()),
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         });

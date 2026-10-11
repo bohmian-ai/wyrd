@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use arrow::array::{
     ArrayRef, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
-    StructArray, TimestampMicrosecondArray,
+    StructArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
@@ -70,7 +70,6 @@ use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_bench::BenchmarkRecorder;
 use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 use wyrd_telemetry::{TelemetryGuard, TestTraceCapture};
 use wyrd_types::variant::is_variant;
 
@@ -987,7 +986,7 @@ impl PromotionIntegrationFixture {
     /// Start Postgres, compose the production graph, register `user_fields`,
     /// and seal one hot object per batch.
     ///
-    /// Each batch carries its own `wyrd_event_time`, so the caller decides
+    /// Each batch carries its own [`FIXTURE_TIME_COLUMN`], so the caller decides
     /// which closed day, and therefore which Forge plan, every object joins.
     ///
     /// # Panics
@@ -2787,17 +2786,27 @@ pub(crate) fn fixture_day() -> chrono::NaiveDate {
     Utc::now().date_naive() - chrono::Duration::days(1)
 }
 
-/// User-visible ingress schema for the fixture table.
+/// The time column every dynamic fixture table declares.
 ///
-/// `wyrd_event_time` is carried explicitly so the fixture selects its own event
-/// day; Scribe lifts that column into the managed slot verbatim.
-fn ingress_schema() -> Arc<ArrowSchema> {
-    let mut fields = value_fields();
-    fields.push(Field::new(
-        WYRD_EVENT_TIME,
+/// It partitions the table by day, so the value a batch carries selects the
+/// closed day, and therefore the Forge plan, that batch joins.
+pub(crate) const FIXTURE_TIME_COLUMN: &str = "event_time";
+
+/// The non-null UTC microsecond [`FIXTURE_TIME_COLUMN`] field that
+/// [`create_table`] appends to every dynamic fixture table's user fields.
+pub(crate) fn fixture_time_field() -> Field {
+    Field::new(
+        FIXTURE_TIME_COLUMN,
         DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         false,
-    ));
+    )
+}
+
+/// User-visible ingress schema for the fixture table: its `value` column and
+/// the time column [`create_table`] declares.
+fn ingress_schema() -> Arc<ArrowSchema> {
+    let mut fields = value_fields();
+    fields.push(fixture_time_field());
     Arc::new(ArrowSchema::new(fields))
 }
 
@@ -2811,8 +2820,7 @@ fn value_fields() -> Vec<Field> {
 /// `file_number` separates the batches so each sealed object carries a distinct
 /// value and lands `file_number` days before the fixture day. One file per
 /// partition gives Forge's per-partition planner one plan per sealed file, so
-/// multi-plan scenarios stay multi-plan; Scribe's 30-day acceptance window
-/// bounds a fixture table to 29 files.
+/// multi-plan scenarios stay multi-plan.
 ///
 /// # Panics
 ///
@@ -2840,14 +2848,15 @@ fn ingress_batch(schema: &Arc<ArrowSchema>, file_number: i64) -> RecordBatch {
 /// Every authored column is populated, including nullable ones, so a rewrite
 /// that mixed rows up would be visible in any column. Struct columns recurse
 /// into their children and Variant columns hold one distinct JSON object per
-/// row. `wyrd_event_time` is appended explicitly and places the whole batch at
-/// noon of the day `file_number` days before the fixture day, as
-/// [`ingress_batch`] does.
+/// row. Every timestamp column, the built-in's time column among them, places
+/// the whole batch at noon of the day `file_number` days before the fixture
+/// day, as [`ingress_batch`] does.
 ///
 /// # Panics
 ///
 /// Panics when a field is not a string, integer, float, boolean, UTC
-/// microsecond timestamp, Variant, or Struct of those, or when the batch
+/// microsecond or nanosecond timestamp, Variant, or Struct of those, or when
+/// the batch
 /// cannot be assembled.
 fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> RecordBatch {
     let noon = (fixture_day() - chrono::Duration::days(file_number))
@@ -2856,17 +2865,11 @@ fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> Record
         .and_utc()
         .timestamp_micros();
     let offsets: Vec<i64> = (0..i64::try_from(rows).expect("bounded fixture rows")).collect();
-    let mut schema_fields = fields.to_vec();
-    schema_fields.push(Field::new(
-        WYRD_EVENT_TIME,
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        false,
-    ));
-    let columns: Vec<ArrayRef> = schema_fields
+    let columns: Vec<ArrayRef> = fields
         .iter()
         .map(|field| fixture_column(field, file_number, noon, &offsets))
         .collect();
-    RecordBatch::try_new(Arc::new(ArrowSchema::new(schema_fields)), columns)
+    RecordBatch::try_new(Arc::new(ArrowSchema::new(fields.to_vec())), columns)
         .expect("fixture built-in batch")
 }
 
@@ -2874,7 +2877,7 @@ fn flat_builtin_batch(fields: &[Field], file_number: i64, rows: usize) -> Record
 ///
 /// Values derive from the field name, `file_number`, and each row offset, so
 /// every cell of every file is distinct; timestamps are `noon` plus the row
-/// offset.
+/// offset in microseconds, at the column's own precision.
 ///
 /// # Panics
 ///
@@ -2914,6 +2917,12 @@ fn fixture_column(field: &Field, file_number: i64, noon: i64, offsets: &[i64]) -
             TimestampMicrosecondArray::from_iter_values(offsets.iter().map(|row| noon + row))
                 .with_timezone(Arc::clone(zone)),
         ),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(zone)) => Arc::new(
+            TimestampNanosecondArray::from_iter_values(
+                offsets.iter().map(|row| (noon + row) * 1_000),
+            )
+            .with_timezone(Arc::clone(zone)),
+        ),
         DataType::Struct(children) => Arc::new(StructArray::new(
             children.clone(),
             children
@@ -2945,7 +2954,8 @@ fn ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
     bytes::Bytes::from(ipc)
 }
 
-/// Registers the fixture table with `user_fields` through the real catalog and
+/// Registers the fixture table with `user_fields` plus [`fixture_time_field`]
+/// through the real catalog, declaring that field its daily time column, and
 /// returns its binding.
 ///
 /// # Panics
@@ -2955,8 +2965,9 @@ async fn create_table(
     catalog: &BifrostCatalog,
     tenant: DataTenantId,
     table_name: &str,
-    user_fields: Vec<Field>,
+    mut user_fields: Vec<Field>,
 ) -> TenantTableBinding {
+    user_fields.push(fixture_time_field());
     let binding =
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table_name)))
             .expect("fixture table binding");
@@ -2967,6 +2978,7 @@ async fn create_table(
             tenant,
             physical_layout: Some(wyrd_spec::vala::api::PhysicalLayoutWire {
                 partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+                time_column: Some(FIXTURE_TIME_COLUMN.to_owned()),
                 sort_keys: Vec::new(),
                 bloom_columns: Vec::new(),
             }),

@@ -1,4 +1,4 @@
-//! Bifrost client ingest capacity benchmark (AC-041, Scenario A5).
+//! Bifrost client queue benchmark (AC-041, Scenario A5).
 //!
 //! An operator starts one release `wyrd-server` the way the
 //! local-development guide says (`migrate`, serve, `setup`) over the RustFS
@@ -17,11 +17,11 @@
 //! - `max-in-flight-N`: the sustained step per `--max-in-flight` value,
 //!   reporting the smallest that passes.
 //!
-//! The report in `target/bifrost-ingest-capacity/` carries achieved rate,
+//! The report in `target/bifrost-client-queue/` carries achieved rate,
 //! refusals, client bytes, drain time, durable rows, batch count and mean
 //! size, Gate write latency, and client and server CPU per row, under the
 //! host fingerprint its `envelope` records. Run through
-//! `mise run bench:bifrost:ingest-capacity`. Exits nonzero when any gating
+//! `mise run bench:bifrost:client-queue`. Exits nonzero when any gating
 //! check fails.
 
 mod fixture;
@@ -82,10 +82,10 @@ struct Cli {
 /// Returns a server, provisioning, step, or report failure that stopped the
 /// run.
 async fn benchmark(cli: Cli) -> Result<bool> {
-    let output = PathBuf::from("target/bifrost-ingest-capacity");
+    let output = PathBuf::from("target/bifrost-client-queue");
     std::fs::create_dir_all(&output)?;
     let work = tempfile::Builder::new()
-        .prefix("wyrd-ingest-capacity-")
+        .prefix("wyrd-client-queue-")
         .tempdir()?;
     let binary = match cli.server_binary {
         Some(binary) => std::fs::canonicalize(binary)?,
@@ -268,7 +268,7 @@ async fn main() -> ExitCode {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {
-            eprintln!("bifrost ingest capacity benchmark failed: {error}");
+            eprintln!("bifrost client queue benchmark failed: {error}");
             ExitCode::FAILURE
         }
     }

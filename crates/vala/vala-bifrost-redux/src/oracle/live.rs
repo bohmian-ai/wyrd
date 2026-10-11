@@ -57,6 +57,7 @@ use super::dispatcher::{
 };
 use super::exec::RemoteScanMetrics;
 use super::{DegradedPartition, DegradedSourceAccumulator, QueryCatalogError};
+use crate::catalog::TimeAxis;
 
 /// Stable degraded-reason label for a live source lost before its first row.
 const LIVE_TAIL_UNAVAILABLE: &str = "live_tail_unavailable";
@@ -101,15 +102,16 @@ pub(crate) struct LiveTableRoutes {
 impl LiveTableRoutes {
     /// Returns the routes `predicate` cannot exclude, in discovery order.
     ///
-    /// Each route is one container whose exact `wyrd_event_time` bounds are
-    /// its time partition, inclusive start to exclusive end, so `DataFusion`'s
+    /// Each route is one container whose exact `time_column` bounds are its
+    /// time partition, inclusive start to exclusive end, so `DataFusion`'s
     /// `PruningPredicate` decides it as it decides a file. A predicate that
-    /// does not plan as a pruning predicate, or does not constrain event time,
-    /// keeps every route.
+    /// does not plan as a pruning predicate, or does not constrain the time
+    /// column, keeps every route.
     pub(super) fn selected_by(
         &self,
         predicate: &Arc<dyn PhysicalExpr>,
         schema: &SchemaRef,
+        time_column: &str,
     ) -> Self {
         let statistics = self
             .routes
@@ -118,9 +120,10 @@ impl LiveTableRoutes {
                 let partition =
                     crate::catalog::layout::TimePartition::from_wire(route.time_partition);
                 let mut statistics = Statistics::new_unknown(schema);
-                super::exec::set_event_time_bounds(
+                super::exec::set_time_bounds(
                     &mut statistics,
                     schema,
+                    time_column,
                     partition.start_unix_micros(),
                     partition.end_utc().timestamp_micros().saturating_sub(1),
                 );
@@ -207,6 +210,8 @@ pub(super) fn record_live_tail_unavailable(degraded: &DegradedSourceAccumulator)
 pub(super) struct LiveScribeExec {
     /// Table binding and the selected routes, dealt across output partitions.
     routes: Arc<LiveTableRoutes>,
+    /// The table's time axis, whose column pushed filters prune routes by.
+    time_axis: TimeAxis,
     /// Fingerprint of the table's complete physical schema.
     schema_fingerprint: String,
     /// Signed projection closure, in closure order.
@@ -238,6 +243,7 @@ impl LiveScribeExec {
     /// each partition then ends empty.
     pub(super) fn new(
         routes: LiveTableRoutes,
+        time_axis: TimeAxis,
         schema_fingerprint: String,
         required_columns: Vec<String>,
         schema: SchemaRef,
@@ -246,6 +252,7 @@ impl LiveScribeExec {
         let partitions = partitions.max(1);
         Self {
             routes: Arc::new(routes),
+            time_axis,
             schema_fingerprint,
             required_columns,
             properties: Arc::new(PlanProperties::new(
@@ -402,7 +409,11 @@ impl ExecutionPlan for LiveScribeExec {
         }
         let predicate = conjunction(filters);
         let mut leaf = self.clone();
-        leaf.routes = Arc::new(self.routes.selected_by(&predicate, &self.schema()));
+        leaf.routes = Arc::new(self.routes.selected_by(
+            &predicate,
+            &self.schema(),
+            self.time_axis.column(),
+        ));
         leaf.predicate = Some(predicate);
         Ok(propagation.with_updated_node(Arc::new(leaf)))
     }
@@ -953,6 +964,10 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let leaf = Arc::new(LiveScribeExec::new(
             crate::oracle::exec::tests::one_live_route(wyrd_spec::DataTenantId::new_v7()),
+            crate::catalog::TimeAxis::new(
+                crate::oracle::exec::tests::FIXTURE_TIME_COLUMN,
+                crate::catalog::TimeGranularity::Hour,
+            ),
             "f".repeat(64),
             vec!["v".to_owned()],
             Arc::clone(&schema),
@@ -989,18 +1004,19 @@ mod tests {
         );
     }
 
-    /// An event-time predicate keeps only the routes whose hour it can match,
-    /// and a predicate on any other column keeps every route.
+    /// A time-column predicate keeps only the routes whose hour it can match,
+    /// at microsecond and nanosecond precision, and a predicate on any other
+    /// column keeps every route.
     ///
     /// # Panics
     /// Panics when a fixture partition cannot be built or the selection keeps
     /// the wrong routes.
     #[test]
-    fn event_time_predicate_selects_only_overlapping_routes() {
+    fn time_predicate_selects_only_overlapping_routes() {
+        use super::super::exec::tests::FIXTURE_TIME_COLUMN;
         use arrow::datatypes::TimeUnit;
         use datafusion::physical_expr::expressions::{BinaryExpr, Column, Literal};
         use datafusion::scalar::ScalarValue;
-        use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
         /// One hour in microseconds, the width of each fixture route's
         /// time partition.
@@ -1019,7 +1035,7 @@ mod tests {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("v", DataType::Int64, false),
             Field::new(
-                WYRD_EVENT_TIME,
+                FIXTURE_TIME_COLUMN,
                 DataType::Timestamp(TimeUnit::Microsecond, zone.clone()),
                 false,
             ),
@@ -1033,18 +1049,58 @@ mod tests {
         };
 
         let in_later_hour = at_least(
-            WYRD_EVENT_TIME,
+            FIXTURE_TIME_COLUMN,
             1,
-            ScalarValue::TimestampMicrosecond(Some(first_hour + HOUR_MICROS), zone),
+            ScalarValue::TimestampMicrosecond(Some(first_hour + HOUR_MICROS), zone.clone()),
         );
         assert_eq!(
-            routes.selected_by(&in_later_hour, &schema).routes,
+            routes
+                .selected_by(&in_later_hour, &schema, FIXTURE_TIME_COLUMN)
+                .routes,
+            vec![later.clone()]
+        );
+
+        // The last nanosecond of the first hour still matches it, so the
+        // nanosecond bounds cover the whole partition.
+        let nanos_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new(
+                FIXTURE_TIME_COLUMN,
+                DataType::Timestamp(TimeUnit::Nanosecond, zone.clone()),
+                false,
+            ),
+        ]));
+        let last_nano_of_first_hour = at_least(
+            FIXTURE_TIME_COLUMN,
+            1,
+            ScalarValue::TimestampNanosecond(
+                Some((first_hour + HOUR_MICROS) * 1_000 - 1),
+                zone.clone(),
+            ),
+        );
+        assert_eq!(
+            routes
+                .selected_by(&last_nano_of_first_hour, &nanos_schema, FIXTURE_TIME_COLUMN)
+                .routes,
+            routes.routes
+        );
+        let in_later_hour_nanos = at_least(
+            FIXTURE_TIME_COLUMN,
+            1,
+            ScalarValue::TimestampNanosecond(Some((first_hour + HOUR_MICROS) * 1_000), zone),
+        );
+        assert_eq!(
+            routes
+                .selected_by(&in_later_hour_nanos, &nanos_schema, FIXTURE_TIME_COLUMN)
+                .routes,
             vec![later]
         );
 
         let unrelated = at_least("v", 0, ScalarValue::Int64(Some(3)));
         assert_eq!(
-            routes.selected_by(&unrelated, &schema).routes,
+            routes
+                .selected_by(&unrelated, &schema, FIXTURE_TIME_COLUMN)
+                .routes,
             routes.routes
         );
     }
@@ -1259,6 +1315,10 @@ mod tests {
                     },
                     routes: Vec::new(),
                 },
+                crate::catalog::TimeAxis::new(
+                    crate::oracle::exec::tests::FIXTURE_TIME_COLUMN,
+                    crate::catalog::TimeGranularity::Hour,
+                ),
                 "f".repeat(64),
                 vec!["v".to_owned()],
                 Arc::clone(&schema),

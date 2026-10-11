@@ -1081,7 +1081,7 @@ mod tests {
     /// Physical schema the fixture member is staged and merged under.
     pub(super) fn runtime_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]))
@@ -1119,19 +1119,6 @@ mod tests {
             closed_at: std::time::Instant::now(),
             arrow_bytes,
         }
-    }
-
-    /// Resolves the hourly layout the fixture member is encoded under.
-    pub(super) fn runtime_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::resolve(
-            "vala.bifrost.test",
-            schema,
-            Some(&crate::tables::hourly_layout(
-                vec![crate::tables::sort_asc("wyrd_event_time")],
-                &["wyrd_event_time"],
-            )),
-        )
-        .expect("fixture schema carries the built-in hourly layout")
     }
 
     /// Builds the publisher the runtime owns, over lazy and in-memory owners.
@@ -1182,7 +1169,7 @@ mod tests {
 
         let tenant = DataTenantId::new_v7();
         let schema = runtime_schema();
-        let layout = runtime_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let frozen = frozen_member(tenant, 1_024, 1);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
@@ -1277,7 +1264,7 @@ mod tests {
 
         let tenant = DataTenantId::new_v7();
         let schema = runtime_schema();
-        let layout = runtime_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let frozen = frozen_member(tenant, 512, 3);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
@@ -1361,7 +1348,7 @@ mod tests {
         );
 
         let schema = runtime_schema();
-        let layout = runtime_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let staged_at = chrono::Utc::now();
         let mut keys = Vec::new();
         for (shard, generation) in [(1_u8, 7_u64), (2, 8)] {
@@ -1459,7 +1446,7 @@ mod tests {
         .with_hot_sources(Arc::clone(&hot_sources));
 
         let schema = runtime_schema();
-        let layout = runtime_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let tenant = DataTenantId::new_v7();
         let frozen = frozen_member(tenant, 256, 1);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
@@ -1713,7 +1700,7 @@ mod tests {
         ready_at: DateTime<Utc>,
     ) -> (ScribeAssemblyKey, Vec<StagedMemberId>) {
         let schema = &runtime_schema();
-        let layout = &runtime_layout(schema.as_ref());
+        let layout = &crate::tables::hourly_test_layout(schema.as_ref());
         let mut key = None;
         let mut member_ids = Vec::new();
         for shard in shards {
@@ -2314,9 +2301,7 @@ mod tests {
 /// Postgres-backed recovery proofs for the staged backlog gauges.
 #[cfg(test)]
 mod pg_tests {
-    use super::tests::{
-        move_claim, publisher, runtime_layout, runtime_schema, stage_durable_members,
-    };
+    use super::tests::{move_claim, publisher, runtime_schema, stage_durable_members};
     use super::*;
     use crate::scribe::stream_identity::NodeId;
     use num_traits::ToPrimitive as _;
@@ -2339,7 +2324,7 @@ mod pg_tests {
             uuid::Uuid::now_v7().as_bytes(),
             &fqn,
             &[0_u8; 32],
-            &serde_json::to_value(runtime_layout(schema.as_ref()).to_wire())
+            &serde_json::to_value(crate::tables::hourly_test_layout(schema.as_ref()).to_wire())
                 .expect("fixture layout encodes"),
         )
         .await

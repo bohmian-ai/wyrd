@@ -14,7 +14,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 
 use super::support::{
-    append_batch, append_values_at, read_sql, register_table, sorted_values, span_batch,
+    append_batch, append_values_at, read_sql, register_timed_table, sorted_values, span_batch,
     start_scribe_server, tenant_client, unique_table, until_admitted,
 };
 
@@ -265,7 +265,7 @@ async fn build_participants(server: &WyrdTestServer) -> Vec<Participant> {
             .expect("the built-in traces table is provisioned");
         let dynamic_name = unique_table("sustained");
         let dynamic_table =
-            register_table(server, tenant, BifrostNamespace::Datasets, &dynamic_name).await;
+            register_timed_table(server, tenant, BifrostNamespace::Datasets, &dynamic_name).await;
         participants.push(Participant {
             tenant,
             client: Arc::new(tenant_client(server, tenant).await),

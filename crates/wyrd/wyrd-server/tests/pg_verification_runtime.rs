@@ -201,11 +201,20 @@ impl Harness {
     }
 
     /// Every Gate write decision staged for the tenant since the floor, as
-    /// `(principal_kind, resource, outcome)` in staging order.
+    /// `(principal_kind, resource, outcome)` in staging order, once the
+    /// non-blocking audit outbox has committed every staged decision.
     ///
     /// # Panics
-    /// Panics when the staging read fails.
+    /// Panics when the outbox does not drain within ten seconds or the
+    /// staging read fails.
     async fn writes(&self) -> Vec<(String, String, String)> {
+        assert_eq!(
+            self.server
+                .wait_audit_staged(std::time::Duration::from_secs(10))
+                .await,
+            0,
+            "audit outbox drains"
+        );
         sqlx::query_as(
             "SELECT principal_kind, resource, outcome FROM vala.audit_staging \
              WHERE data_tenant_id = $1 AND operation = 'bifrost.record.write' AND seq > $2 \

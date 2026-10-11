@@ -38,6 +38,7 @@ impl DomainTable for AgentTracesTable {
 
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(
+            "started_at",
             vec![sort_desc("started_at"), sort_asc("dev_session_id")],
             &["dev_session_id", "repo"],
         )

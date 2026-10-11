@@ -377,7 +377,8 @@ mod pg_tests {
     /// Canonical layout JSON one registration needs; its shape is opaque here.
     fn layout() -> serde_json::Value {
         serde_json::json!({
-            "partition": { "column": "wyrd_event_time", "granularity": "hour" },
+            "partition_granularity": "hour",
+            "time_column": "wyrd_ingested_at",
             "sort_keys": [],
             "bloom_columns": []
         })

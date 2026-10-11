@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::{Array, ArrayRef, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use iceberg::spec::Schema as IcebergSchema;
@@ -17,7 +17,6 @@ use crate::catalog::TenantTableBinding;
 use crate::contracts::{IngressPayload, ScribeError};
 use crate::resources::ScribeResources;
 use crate::schema::fingerprint::SchemaFingerprint;
-use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::replay::ReplayedSealKey;
 use crate::scribe::seal_key::SealKey;
@@ -31,11 +30,13 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    CARD_REF, CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
 use crate::tables::CorrelationPolicy;
-use crate::tables::managed_columns::{ensure_managed_columns, is_managed_column};
+use crate::tables::managed_columns::{
+    ensure_managed_columns, is_managed_column, is_reserved_column,
+};
 
 #[cfg(test)]
 const INGRESS_QUEUE_ITEMS: usize = 256;
@@ -152,9 +153,17 @@ pub struct ScribeIngressCpuPool {
     saturation_events: Arc<AtomicU64>,
     drained: Arc<Notify>,
     capacity: usize,
+    /// Conform plans shared by every decode this lane runs.
+    conform: Arc<ConformPlans>,
 }
 
 impl ScribeIngressCpuPool {
+    /// The conform plans this lane's decodes remember, shared with native
+    /// sources that conform on the persistence lane.
+    pub(crate) const fn conform_plans(&self) -> &Arc<ConformPlans> {
+        &self.conform
+    }
+
     /// Closes admission to the ingress lane without waiting for active Rayon work.
     pub(crate) fn close(&self) {
         self.permits.close();
@@ -197,21 +206,16 @@ impl ScribeIngressCpuPool {
             saturation_events: Arc::new(AtomicU64::new(0)),
             drained: Arc::new(Notify::new()),
             capacity,
+            conform: Arc::default(),
         })
     }
 
     /// Submit one native decode without waiting for an application queue slot.
     ///
-    /// The `window` argument carries the pod-wide event-time acceptance bounds
-    /// sourced from `AdmissionConfig` by the caller. It is passed by value
-    /// into the Rayon closure so no heap allocation is required.
-    ///
     /// # Errors
     ///
     /// Returns [`ScribeError::IngestBusy`] when the ingress queue is saturated,
-    /// and propagates any error produced by the free [`decode`] function,
-    /// including [`ScribeError::EventTimeOutOfRange`] when a present
-    /// `wyrd_event_time` value falls outside the acceptance window.
+    /// and propagates any error produced by the free [`decode`] function.
     pub(crate) async fn decode(
         &self,
         payload: IngressPayload,
@@ -222,7 +226,6 @@ impl ScribeIngressCpuPool {
             expected_schema_fingerprint,
             request_id,
             receipt_micros,
-            window,
             definition,
             registered_schema,
         } = inputs;
@@ -242,6 +245,7 @@ impl ScribeIngressCpuPool {
         let panics = Arc::clone(&self.panics);
         let completed = Arc::clone(&self.completed);
         let failed = Arc::clone(&self.failed);
+        let conform = Arc::clone(&self.conform);
         self.pool.spawn_fifo(move || {
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
@@ -253,10 +257,10 @@ impl ScribeIngressCpuPool {
                         principal: &principal,
                         expected_schema_fingerprint,
                         request_id: &request_id,
-                        window,
                         receipt_micros,
                         definition,
-                        registered_schema: registered_schema.as_deref(),
+                        registered_schema: registered_schema.as_ref(),
+                        conform: Some(&conform),
                     },
                 )
             }));
@@ -387,37 +391,29 @@ impl ScribeIngressCpuPool {
 /// Decode one admitted Arrow payload, validate its projected schema and card
 /// scope, then stamp the server-owned physical columns before persistence.
 ///
-/// Native payloads may carry one nullable Utf8 `run_id` correlation field and
-/// MAY additionally carry an optional caller-supplied `wyrd_event_time` column.
-/// When present, that column MUST be exactly the managed physical type
-/// (`Timestamp(Microsecond, "+00:00")`), MUST NOT be nullable-with-nulls, and MUST
-/// NOT be duplicated; it is then validated against the acceptance `window` and,
-/// if in range, preserved verbatim as the authoritative event time. When absent,
-/// the server stamps `wyrd_event_time` with the ingest receipt time. Projected
-/// payloads retain their event-time field as supplied; a present projected
-/// `wyrd_event_time` is also validated against the same window.
+/// Native payloads may carry one nullable Utf8 `run_id` correlation field. The
+/// table's time column is ordinary content the writer supplies. Every managed
+/// column (`wyrd_ingested_at`, `wyrd_request_id`, principal, and card columns)
+/// is unconditionally server-owned and is rejected when supplied.
 ///
-/// In either mode, user schema fingerprinting excludes correlation and managed
-/// columns, so accepting a caller event-time column never perturbs a
-/// registered-schema fingerprint.
-///
-/// All other managed columns (`wyrd_ingested_at`, `wyrd_request_id`,
-/// principal, and card columns) remain
-/// unconditionally server-owned and are rejected when supplied.
+/// A [`IngressPayload::Canonical`] payload is server-built: Gate's projection
+/// already validated every Variant it encoded, and replay and the audit
+/// publisher carry rows admitted that way. Its values are therefore trusted
+/// and the built-in value validator is skipped; the reserved-column refusal
+/// and the fingerprint check still bind its shape. A native IPC payload is
+/// the trust boundary and is validated in full.
 ///
 /// # Errors
 /// Returns [`ScribeError::InvalidFrame`] for malformed IPC, a reserved
-/// server-owned column supplied by the caller, a `wyrd_event_time` column with
-/// the wrong Arrow type, unit, timezone, nullability with nulls, or a duplicate
-/// managed field, and for failed physical assembly; returns
-/// [`ScribeError::EventTimeOutOfRange`] when a present `wyrd_event_time` value
-/// falls outside the acceptance `window`; returns [`ScribeError::FingerprintMismatch`]
+/// server-owned column supplied by the caller, a duplicate field, and for
+/// failed physical assembly; returns [`ScribeError::FingerprintMismatch`]
 /// or authorization errors when the admitted payload does not match the registered
 /// table contract.
 fn decode(
     payload: IngressPayload,
     context: &DecodeContext<'_>,
 ) -> Result<RecordBatch, ScribeError> {
+    let trusted = matches!(payload, IngressPayload::Canonical(_));
     let batches = match payload {
         IngressPayload::ArrowIpc(bytes) => {
             let reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(bytes), None)
@@ -440,7 +436,7 @@ fn decode(
     } else {
         arrow::compute::concat_batches(&schema, &batches).map_err(|_| ScribeError::InvalidFrame)?
     };
-    decode_rows(&rows, context)
+    decode_rows(&rows, context, trusted)
 }
 
 /// Validates and stamps one current native record batch.
@@ -450,13 +446,13 @@ fn decode(
 ///
 /// # Errors
 ///
-/// Returns the same schema, scope, event-time, row, and managed-column errors
+/// Returns the same schema, scope, row, and managed-column errors
 /// as the ordinary ingress decode path.
 pub(crate) fn decode_native_batch(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
 ) -> Result<RecordBatch, ScribeError> {
-    decode_rows(rows, context)
+    decode_rows(rows, context, false)
 }
 
 /// The owned decode inputs one ingress frame hands to the bounded CPU lane.
@@ -470,11 +466,8 @@ pub(crate) struct IngressDecodeInputs {
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: RequestId,
-    /// Admission instant stamped as `wyrd_ingested_at` and anchoring the
-    /// event-time window.
+    /// Admission instant stamped as `wyrd_ingested_at`.
     pub(crate) receipt_micros: i64,
-    /// Accepted caller event-time window.
-    pub(crate) window: EventTimeWindow,
     /// Canonical built-in whose physical identity the decode must preserve.
     pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
     /// Registered Iceberg schema whose field ids every stamped batch carries.
@@ -496,12 +489,8 @@ pub(crate) struct DecodeContext<'a> {
     pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
     pub(crate) request_id: &'a RequestId,
-    /// Accepted caller event-time window.
-    pub(crate) window: EventTimeWindow,
-    /// Admission instant in epoch microseconds, read once per batch.
-    ///
-    /// Stamped as `wyrd_ingested_at`, used as `wyrd_event_time` when the caller
-    /// supplies none, and the anchor of the event-time acceptance window.
+    /// Admission instant in epoch microseconds, read once per batch and
+    /// stamped as `wyrd_ingested_at`.
     pub(crate) receipt_micros: i64,
     /// Canonical built-in whose physical identity this decode must preserve.
     ///
@@ -513,7 +502,10 @@ pub(crate) struct DecodeContext<'a> {
     ///
     /// `None` only for the embedded engine seam, which has no catalog owner
     /// and writes objects that no registered table promotes.
-    pub(crate) registered_schema: Option<&'a IcebergSchema>,
+    pub(crate) registered_schema: Option<&'a Arc<IcebergSchema>>,
+    /// The ingress lane's remembered conform plans; `None` builds the plan
+    /// for every batch.
+    pub(crate) conform: Option<&'a ConformPlans>,
 }
 
 /// Applies source-contract validation and server-managed stamping to one batch.
@@ -528,11 +520,14 @@ pub(crate) struct DecodeContext<'a> {
 /// field when the context carries that schema, so the WAL, staged runs, and
 /// sealed objects all number their columns exactly as the table does.
 ///
+/// `trusted` marks server-built rows; it is forwarded to
+/// [`enforce_builtin_source_contract`], which then skips the value walk.
+///
 /// # Errors
 ///
 /// Returns a stable Scribe refusal for a duplicated column name, reserved
-/// columns, fingerprint mismatch, card-scope failure, invalid event
-/// time, or managed column construction failure, a fingerprint mismatch
+/// columns, fingerprint mismatch, card-scope failure, or managed column
+/// construction failure, a fingerprint mismatch
 /// when a stamped field has no registered counterpart, and
 /// [`ScribeError::ContractViolation`] carrying the catalogued error when a
 /// built-in's declared Variant arrives without its extension, or when any
@@ -540,6 +535,7 @@ pub(crate) struct DecodeContext<'a> {
 fn decode_rows(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
+    trusted: bool,
 ) -> Result<RecordBatch, ScribeError> {
     let mut seen = std::collections::HashSet::with_capacity(rows.schema().fields().len());
     for field in rows.schema().fields() {
@@ -552,27 +548,28 @@ fn decode_rows(
         if !seen.insert(field.name().as_str()) {
             return Err(ScribeError::InvalidFrame);
         }
-        // A caller MAY supply `wyrd_event_time` as the authoritative event
-        // time; it is then validated and preserved in
-        // `stamp_correlation_columns`. `run_id` is caller correlation that this
-        // function relinquishes and restamps exactly once in its slot. Every
-        // other managed column is unconditionally server-owned, so supplying
-        // one is a refusal rather than an override.
+        // `run_id` is caller correlation that this function relinquishes and
+        // restamps exactly once in its slot. Every other reserved column is
+        // unconditionally server-owned, so supplying one is a refusal rather
+        // than an override.
         let name = field.name().as_str();
-        if is_managed_column(name) && name != WYRD_EVENT_TIME && name != RUN_ID {
+        if is_reserved_column(name) && name != RUN_ID {
             return Err(ScribeError::InvalidFrame);
         }
     }
     let conformed;
     let rows = match context.registered_schema {
         Some(registered) => {
-            conformed = conform_to_registered(rows, registered)?;
+            conformed = match context.conform {
+                Some(plans) => plans.conform(rows, registered)?,
+                None => conform_to_registered(rows, registered)?,
+            };
             &conformed
         }
         None => rows,
     };
     if let Some(definition) = context.definition {
-        enforce_builtin_source_contract(rows, definition)?;
+        enforce_builtin_source_contract(rows, definition, trusted)?;
     }
     let actual_source_fingerprint =
         source_schema_fingerprint(rows.schema().as_ref(), correlation_policy(context));
@@ -633,59 +630,185 @@ fn conform_to_registered(
     rows: &RecordBatch,
     registered: &IcebergSchema,
 ) -> Result<RecordBatch, ScribeError> {
-    let mismatch = || ScribeError::FingerprintMismatch {
-        table: "resolved ingress table".to_owned(),
-    };
-    let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| mismatch())?;
-    let schema = rows.schema();
-    let registered_columns = target
-        .fields()
-        .iter()
-        .filter_map(|wanted| Some((schema.index_of(wanted.name()).ok()?, Some(wanted))));
-    let unregistered = (0..schema.fields().len())
-        .filter(|&index| target.field_with_name(schema.field(index).name()).is_err())
-        .map(|index| (index, None));
-    let mut fields = Vec::with_capacity(schema.fields().len());
-    let mut columns = Vec::with_capacity(rows.num_columns());
-    for (index, wanted) in registered_columns.chain(unregistered) {
-        let (sent, column) = (&schema.fields()[index], rows.column(index));
-        let Some(wanted) = wanted else {
-            fields.push(Arc::clone(sent));
-            columns.push(Arc::clone(column));
-            continue;
-        };
-        if crate::tables::same_iceberg_type(sent, wanted) {
-            if layout(sent.data_type()) == layout(wanted.data_type()) {
-                fields.push(Arc::clone(sent));
-                columns.push(Arc::clone(column));
-            } else {
-                columns.push(
-                    arrow::compute::cast(column, wanted.data_type()).map_err(|_| mismatch())?,
-                );
-                fields.push(Arc::new(
-                    sent.as_ref()
-                        .clone()
-                        .with_data_type(wanted.data_type().clone()),
-                ));
+    ConformPlan::build(&rows.schema(), registered)?.apply(rows)
+}
+
+/// How every batch of one sent Arrow schema conforms to one registered
+/// Iceberg schema.
+///
+/// The decision is a pure function of the two schemas, so it is made once by
+/// [`Self::build`] and then applied to each batch of that shape by
+/// [`Self::apply`], which only moves or casts columns.
+#[derive(Debug)]
+struct ConformPlan {
+    /// The conformed schema every applied batch carries.
+    schema: SchemaRef,
+    /// Each output column's sent index, with the registered type it is cast
+    /// to when the sent spelling differs.
+    columns: Vec<(usize, Option<DataType>)>,
+}
+
+impl ConformPlan {
+    /// Decides the conformance of `sent` to `registered`, as documented on
+    /// [`conform_to_registered`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::ContractViolation`] carrying
+    /// [`BifrostError::UnsupportedType`] for a Variant identity mismatch and
+    /// [`ScribeError::FingerprintMismatch`] when the registered schema has no
+    /// Arrow form.
+    fn build(sent: &Schema, registered: &IcebergSchema) -> Result<Self, ScribeError> {
+        let target = iceberg::arrow::schema_to_arrow_schema(registered).map_err(|_| {
+            ScribeError::FingerprintMismatch {
+                table: "resolved ingress table".to_owned(),
             }
-        } else if SchemaFingerprint::from_fields([sent]) == SchemaFingerprint::from_fields([wanted])
-        {
-            return Err(ScribeError::ContractViolation(
-                BifrostError::UnsupportedType {
-                    field: sent.name().clone(),
-                    data_type: sent.data_type().to_string(),
-                },
-            ));
-        } else {
-            fields.push(Arc::clone(sent));
-            columns.push(Arc::clone(column));
+        })?;
+        let registered_columns = target
+            .fields()
+            .iter()
+            .filter_map(|wanted| Some((sent.index_of(wanted.name()).ok()?, Some(wanted))));
+        let unregistered = (0..sent.fields().len())
+            .filter(|&index| target.field_with_name(sent.field(index).name()).is_err())
+            .map(|index| (index, None));
+        let mut fields = Vec::with_capacity(sent.fields().len());
+        let mut columns = Vec::with_capacity(sent.fields().len());
+        for (index, wanted) in registered_columns.chain(unregistered) {
+            let field = &sent.fields()[index];
+            let cast = match wanted {
+                Some(wanted) if crate::tables::same_iceberg_type(field, wanted) => {
+                    (layout(field.data_type()) != layout(wanted.data_type()))
+                        .then(|| wanted.data_type().clone())
+                }
+                Some(wanted)
+                    if SchemaFingerprint::from_fields([field])
+                        == SchemaFingerprint::from_fields([wanted]) =>
+                {
+                    return Err(ScribeError::ContractViolation(
+                        BifrostError::UnsupportedType {
+                            field: field.name().clone(),
+                            data_type: field.data_type().to_string(),
+                        },
+                    ));
+                }
+                _ => None,
+            };
+            fields.push(match &cast {
+                Some(data_type) => {
+                    Arc::new(field.as_ref().clone().with_data_type(data_type.clone()))
+                }
+                None => Arc::clone(field),
+            });
+            columns.push((index, cast));
         }
+        Ok(Self {
+            schema: Arc::new(Schema::new_with_metadata(fields, sent.metadata().clone())),
+            columns,
+        })
     }
-    RecordBatch::try_new(
-        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
-        columns,
-    )
-    .map_err(|_| ScribeError::InvalidFrame)
+
+    /// Moves each column of `rows` into its conformed place, casting the ones
+    /// whose sent spelling differs from the registered type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::FingerprintMismatch`] when Arrow cannot cast an
+    /// equivalent column and [`ScribeError::InvalidFrame`] when Arrow refuses
+    /// the conformed batch, which duplicate-free input cannot cause.
+    fn apply(&self, rows: &RecordBatch) -> Result<RecordBatch, ScribeError> {
+        let columns = self
+            .columns
+            .iter()
+            .map(|(index, cast)| {
+                let column = rows.column(*index);
+                match cast {
+                    Some(data_type) => arrow::compute::cast(column, data_type).map_err(|_| {
+                        ScribeError::FingerprintMismatch {
+                            table: "resolved ingress table".to_owned(),
+                        }
+                    }),
+                    None => Ok(Arc::clone(column)),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        RecordBatch::try_new(Arc::clone(&self.schema), columns)
+            .map_err(|_| ScribeError::InvalidFrame)
+    }
+}
+
+/// The conform plan of each registered schema the ingress lane decoded
+/// against, for the sent schema shape it saw last.
+///
+/// A registered table's schema never changes and the catalog keeps its one
+/// `Arc` for the node's life, so the plans grow with registered tables, never
+/// with writes. Writers of one table send one shape in practice; a different
+/// shape replaces the remembered plan, so alternating shapes only rebuild.
+/// A refusal is never remembered.
+#[derive(Debug, Default)]
+pub(crate) struct ConformPlans {
+    /// Plans keyed by the registered schema's address; each entry holds that
+    /// `Arc`, so the address cannot be reused while the entry exists.
+    plans: std::sync::RwLock<std::collections::HashMap<usize, RememberedPlan>>,
+}
+
+/// One remembered plan with the two schemas it was built for.
+#[derive(Debug)]
+struct RememberedPlan {
+    /// Registered schema the plan conforms to, held to pin its address.
+    registered: Arc<IcebergSchema>,
+    /// Sent schema the plan was built from.
+    sent: SchemaRef,
+    /// The plan itself.
+    plan: Arc<ConformPlan>,
+}
+
+impl ConformPlans {
+    /// Conforms `rows` to `registered`, building and remembering the plan
+    /// only when this registered schema has none for the sent shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ConformPlan::build`] refusal for a non-conforming shape
+    /// and the [`ConformPlan::apply`] failure for a failed cast.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the plan lock is poisoned, which no holder can cause: it
+    /// is held only to clone or insert one entry.
+    fn conform(
+        &self,
+        rows: &RecordBatch,
+        registered: &Arc<IcebergSchema>,
+    ) -> Result<RecordBatch, ScribeError> {
+        let sent = rows.schema();
+        let key = Arc::as_ptr(registered).addr();
+        let remembered = self
+            .plans
+            .read()
+            .expect("the conform plan lock is never poisoned")
+            .get(&key)
+            .filter(|entry| {
+                Arc::ptr_eq(&entry.registered, registered)
+                    && (Arc::ptr_eq(&entry.sent, &sent) || entry.sent == sent)
+            })
+            .map(|entry| Arc::clone(&entry.plan));
+        if let Some(plan) = remembered {
+            return plan.apply(rows);
+        }
+        let plan = Arc::new(ConformPlan::build(&sent, registered)?);
+        self.plans
+            .write()
+            .expect("the conform plan lock is never poisoned")
+            .insert(
+                key,
+                RememberedPlan {
+                    registered: Arc::clone(registered),
+                    sent,
+                    plan: Arc::clone(&plan),
+                },
+            );
+        plan.apply(rows)
+    }
 }
 
 /// Fingerprints one Arrow type's exact layout, nested names included.
@@ -752,6 +875,10 @@ fn enforce_dynamic_variants(
 /// writer building from the published description neither supplies them nor
 /// can be wrong about them.
 ///
+/// `trusted` marks server-built rows whose values were validated when they
+/// were built; for them the reserved-column refusal still runs but the value
+/// validator does not walk the batch a second time.
+///
 /// # Errors
 ///
 /// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column,
@@ -761,6 +888,7 @@ fn enforce_dynamic_variants(
 fn enforce_builtin_source_contract(
     rows: &RecordBatch,
     definition: &'static crate::tables::BuiltinTableDefinition,
+    trusted: bool,
 ) -> Result<(), ScribeError> {
     let canonical = (definition.canonical_fields)().is_some();
     let schema = rows.schema();
@@ -768,9 +896,12 @@ fn enforce_builtin_source_contract(
         && schema
             .fields()
             .iter()
-            .any(|field| field.name().starts_with("wyrd_") && field.name() != WYRD_EVENT_TIME)
+            .any(|field| field.name().starts_with("wyrd_"))
     {
         return Err(ScribeError::InvalidFrame);
+    }
+    if trusted {
+        return Ok(());
     }
     let policy = definition.correlation_policy;
     let user = RecordBatch::try_new(
@@ -969,32 +1100,15 @@ fn caller_run_id_column(rows: &RecordBatch) -> Result<Option<ArrayRef>, ScribeEr
 /// field; it is removed from the user projection and reinserted exactly once as
 /// the canonical nullable physical column. Omitted native values become null.
 ///
-/// Event time is governed by presence, identically for both payload modes: when
-/// the admitted batch already carries `wyrd_event_time` the caller value is
-/// first validated against the managed physical type (native path only), then
-/// checked against the bounded acceptance `window`, and — if accepted — the
-/// column is removed from the user projection and its array is reinserted
-/// verbatim (never re-stamped) in the canonical managed slot by
-/// [`append_managed_columns`]; when the column is absent the server stamps
-/// `wyrd_event_time` with the admission instant in that same slot. Either way
-/// `wyrd_event_time` is written exactly once in its declared slot, so the
-/// stamped batch's managed field order is the
+/// The stamped batch's managed field order is the
 /// [`MANAGED_COLUMNS`](crate::tables::managed_columns::MANAGED_COLUMNS) order in
-/// every payload mode (D88). `wyrd_ingested_at` is always the admission instant
-/// regardless of caller event time. Projected payloads retain their remaining
-/// correlation values unchanged.
-///
-/// The `window` check and both time columns use the one admission instant in
-/// `context`, read once per batch at admission.
+/// every payload mode (D88). `wyrd_ingested_at` is the one admission instant in
+/// `context`, read once per batch at admission. Projected payloads retain
+/// their remaining correlation values unchanged.
 ///
 /// # Errors
-/// Returns [`ScribeError::InvalidFrame`] when a native payload supplies a
-/// `wyrd_event_time` column that is not exactly `Timestamp(Microsecond, "+00:00")`,
-/// contains any null, or is duplicated. Returns [`ScribeError::EventTimeOutOfRange`]
-/// when a present `wyrd_event_time` value (either mode) falls outside the
-/// acceptance `window`. Returns a typed Scribe error when correlation resolution,
-/// timestamp construction, managed-array construction, or final batch validation
-/// fails.
+/// Returns a typed Scribe error when correlation resolution, timestamp
+/// construction, managed-array construction, or final batch validation fails.
 fn stamp_correlation_columns(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
@@ -1002,34 +1116,10 @@ fn stamp_correlation_columns(
     let DecodeContext {
         principal,
         request_id,
-        window,
         receipt_micros,
         ..
     } = context;
-    let (principal, request_id, window) = (*principal, *request_id, *window);
-    let receipt_micros = *receipt_micros;
-    // Type/null/duplicate checks come first (T38). A malformed column stays
-    // `InvalidFrame` regardless of window membership.
-    validate_native_event_time(rows)?;
-    // Enforce the acceptance window for a present caller column.
-    if rows.schema().index_of(WYRD_EVENT_TIME).is_ok() {
-        let past_exempt = context
-            .definition
-            .is_some_and(|definition| definition.past_event_time_exempt);
-        enforce_event_time_window(rows, window, receipt_micros, past_exempt)?;
-    }
-    // A present `wyrd_event_time` (validated above for native payloads and
-    // window-checked above for both modes) is always lifted out of the user
-    // projection here and reinserted verbatim in its managed slot by
-    // `managed_arrays`, never re-stamped. When absent, the server stamps the
-    // admission instant into that slot instead. Decoupling "exclude from the
-    // user block" from "stamp the admission value" keeps the stamped field
-    // order equal to the managed-column declaration in every payload mode (D88).
-    let caller_event_time = rows
-        .schema()
-        .index_of(WYRD_EVENT_TIME)
-        .ok()
-        .map(|index| Arc::clone(rows.column(index)));
+    let (principal, request_id, receipt_micros) = (*principal, *request_id, *receipt_micros);
     let caller_run_id = caller_run_id_column(rows)?;
     let policy = correlation_policy(context);
     let mut fields = user_fields(rows, policy);
@@ -1042,7 +1132,6 @@ fn stamp_correlation_columns(
             request_id,
             receipt_micros,
             caller_run_id,
-            caller_event_time,
         },
         policy,
     )?);
@@ -1091,133 +1180,11 @@ fn stamp_correlation_columns(
     Ok(stamped)
 }
 
-/// Validates a caller-supplied native `wyrd_event_time` column before it is
-/// trusted as the authoritative event time.
-///
-/// Native ingest MAY carry `wyrd_event_time`, but only when it is exactly the
-/// managed physical type that [`append_managed_columns`] stamps —
-/// `Timestamp(Microsecond)` with Iceberg's `+00:00` UTC zone — appears exactly once, and
-/// contains no nulls. This mirrors how the server-stamped column is
-/// constructed so caller and server values are physically interchangeable, and
-/// keeps the day-partition splitter able to derive a non-null partition day for
-/// every row. A batch with no `wyrd_event_time` column is valid (the server
-/// stamps the value) and returns `Ok(())`.
-///
-/// Value-range checking is a separate concern handled by
-/// [`enforce_event_time_window`], which runs after this function for the native
-/// path and independently for the projected path.
-///
-/// # Errors
-/// Returns [`ScribeError::InvalidFrame`] when the column is duplicated, is not
-/// `Timestamp(Microsecond, "+00:00")`, or contains any null value.
-fn validate_native_event_time(rows: &RecordBatch) -> Result<(), ScribeError> {
-    let schema = rows.schema();
-    let mut matched = None;
-    for (index, field) in schema.fields().iter().enumerate() {
-        if field.name() != WYRD_EVENT_TIME {
-            continue;
-        }
-        if matched.replace((index, field)).is_some() {
-            return Err(ScribeError::InvalidFrame);
-        }
-    }
-    let Some((index, field)) = matched else {
-        return Ok(());
-    };
-    let expected = DataType::Timestamp(
-        TimeUnit::Microsecond,
-        Some(iceberg::arrow::UTC_TIME_ZONE.into()),
-    );
-    if field.data_type() != &expected {
-        return Err(ScribeError::InvalidFrame);
-    }
-    if rows.column(index).null_count() != 0 {
-        return Err(ScribeError::InvalidFrame);
-    }
-    Ok(())
-}
-
-/// Enforces the bounded acceptance `window` for a present `wyrd_event_time`
-/// column against a single per-batch `receipt_micros` instant.
-///
-/// This helper is the single enforcement point for both the native Arrow IPC
-/// and projected OTLP surfaces. It must be called only when the schema already
-/// contains `WYRD_EVENT_TIME` (the caller checks presence before calling).
-/// For the native path, [`validate_native_event_time`] must run first so only
-/// well-typed, non-null values reach this function.
-///
-/// On the first out-of-range element the function returns immediately with
-/// [`ScribeError::EventTimeOutOfRange`] carrying that element's value and both
-/// bound instants. The entire batch is therefore rejected pre-admission and no
-/// rows are written.
-///
-/// # Errors
-/// Returns [`ScribeError::EventTimeOutOfRange`] when any non-null element of
-/// the `wyrd_event_time` column falls outside the inclusive window
-/// `[receipt_micros − past, receipt_micros + future]`. A `past_exempt` table
-/// drops the lower bound and keeps the future bound, so an aged backlog stays
-/// publishable while a forward clock skew is still refused. Returns
-/// [`ScribeError::Internal`] when the column cannot be downcast to
-/// `TimestampMicrosecondArray` (which would imply a caller error on the
-/// projected path that bypassed type validation).
-fn enforce_event_time_window(
-    rows: &RecordBatch,
-    window: EventTimeWindow,
-    receipt_micros: i64,
-    past_exempt: bool,
-) -> Result<(), ScribeError> {
-    let index = rows
-        .schema()
-        .index_of(WYRD_EVENT_TIME)
-        .map_err(|_| ScribeError::Internal {
-            detail: "enforce_event_time_window called without wyrd_event_time column".to_owned(),
-        })?;
-    let column = rows.column(index);
-    let array = column
-        .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "wyrd_event_time column is not TimestampMicrosecondArray".to_owned(),
-        })?;
-    // Compute bounds once for the whole batch.
-    let past_micros = i64::try_from(window.past.as_micros()).unwrap_or(i64::MAX);
-    let future_micros = i64::try_from(window.future.as_micros()).unwrap_or(i64::MAX);
-    let lo = if past_exempt {
-        i64::MIN
-    } else {
-        receipt_micros.saturating_sub(past_micros)
-    };
-    let hi = receipt_micros.saturating_add(future_micros);
-    for idx in 0..array.len() {
-        if array.is_null(idx) {
-            // The window check is value-level and only range-checks non-null
-            // values, so it tolerates nulls here. The native path already
-            // rejects nulls upstream in validate_native_event_time. A present
-            // projected event-time column is later lifted verbatim into the
-            // non-nullable canonical managed slot (D88), so a null value there
-            // fails batch construction rather than being range-checked.
-            continue;
-        }
-        let value = array.value(idx);
-        if value < lo || value > hi {
-            return Err(ScribeError::EventTimeOutOfRange {
-                value_micros: value,
-                past_bound_micros: lo,
-                future_bound_micros: hi,
-            });
-        }
-    }
-    Ok(())
-}
-
 /// Reports whether `name` is excluded from the user projection.
 ///
 /// Every managed column is unconditionally excluded from the user projection
 /// and materialized in its declared slot by [`managed_arrays`], regardless of
-/// whether the caller supplied it. In particular `wyrd_event_time` is always
-/// excluded: when the caller supplied a valid value it is reinserted verbatim
-/// in its slot, and when it is absent the server stamps the admission instant
-/// there. `run_id` is excluded for the same reason, so the canonical nullable
+/// whether the caller supplied it. `run_id` is excluded for the same reason, so the canonical nullable
 /// physical column is stamped exactly once — unless `policy` declares
 /// `run_id` as table content, in which case it stays in the user block in its
 /// declared position. `card_ref` is a Gate input that resolves to `card_uid`
@@ -1345,17 +1312,14 @@ struct ManagedValues<'a> {
     receipt_micros: i64,
     /// Caller `run_id` column lifted out of the user projection, if supplied.
     caller_run_id: Option<ArrayRef>,
-    /// Validated caller `wyrd_event_time` column, if supplied.
-    caller_event_time: Option<ArrayRef>,
 }
 
 /// Builds one array per managed column `policy` appends, in declared order.
 ///
 /// The layout — which columns, in which order, with which type — comes from
 /// [`MANAGED_COLUMNS`](crate::tables::managed_columns::MANAGED_COLUMNS); this
-/// function supplies only each column's values. `wyrd_event_time` is the
-/// caller's validated array verbatim when supplied, otherwise the admission
-/// instant, and `wyrd_ingested_at` is always the admission instant.
+/// function supplies only each column's values; `wyrd_ingested_at` is the
+/// admission instant.
 ///
 /// # Errors
 ///
@@ -1393,10 +1357,6 @@ fn managed_arrays(
                     values.request_id.as_str();
                     row_count
                 ])),
-                WYRD_EVENT_TIME => values
-                    .caller_event_time
-                    .as_ref()
-                    .map_or_else(|| Arc::clone(&admitted_at), Arc::clone),
                 WYRD_INGESTED_AT => Arc::clone(&admitted_at),
                 other => {
                     return Err(ScribeError::Internal {
@@ -1824,6 +1784,9 @@ pub(crate) enum ScribeWalIoOp {
         memory: ScribeResources,
         /// Cooperative shutdown flag checked between replay records and settlements.
         cancelled: Arc<AtomicBool>,
+        /// Acknowledgement fences that let a shard chain end at a bad record
+        /// in its unacknowledged tail; `None` fails every bad record closed.
+        fences: Option<crate::scribe::replay::ReplayFences>,
     },
     RetireWal {
         wal: WalHandle,
@@ -2118,6 +2081,7 @@ fn execute_wal_io(
             shard_senders,
             memory,
             cancelled,
+            fences,
         } => execute_replay_directory_stream(
             &path,
             wal.as_ref(),
@@ -2125,6 +2089,7 @@ fn execute_wal_io(
             &shard_senders,
             &memory,
             &cancelled,
+            fences.as_ref(),
         ),
         ScribeWalIoOp::RetireWal { wal, segments } => {
             wal.retire_segments(&segments)?;
@@ -2142,7 +2107,7 @@ fn execute_wal_io(
 /// # Errors
 ///
 /// Returns [`ScribeError`] for discovery, admission, corruption, cancellation,
-/// channel closure, or shard restoration failure.
+/// channel closure, shard restoration failure, or a failed fence lookup.
 fn execute_replay_directory_stream(
     path: &Path,
     wal: &crate::scribe::wal::WalWriter,
@@ -2150,8 +2115,10 @@ fn execute_replay_directory_stream(
     shard_senders: &[mpsc::Sender<crate::scribe::shards::ShardCommand>],
     memory: &ScribeResources,
     cancelled: &AtomicBool,
+    fences: Option<&crate::scribe::replay::ReplayFences>,
 ) -> Result<ScribeWalIoResult, ScribeError> {
     let mut restored = 0_usize;
+    let lookup = |stream, shard| fences.map_or(Ok(None), |fences| fences.newest(stream, shard));
     let mut retirement_settlement = ReplayRetirementSettlement::new(path);
     crate::scribe::replay::replay_wal_directory_stream_accounted(
         path,
@@ -2159,6 +2126,7 @@ fn execute_replay_directory_stream(
         Some(memory),
         Some(wal),
         Some(cancelled),
+        fences.map(|_| &lookup as crate::scribe::wal::FenceLookup<'_>),
         |chunk| {
             if cancelled.load(Ordering::Acquire) {
                 return Err(ScribeError::Internal {
@@ -2314,7 +2282,7 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::managed_columns::{
-        CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+        CARD_REF, CARD_UID, PRINCIPAL_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
     };
 
     use bytes::Bytes;
@@ -2328,7 +2296,6 @@ mod tests {
     use crate::contracts::{IngressPayload, ScribeError};
     use crate::resources::{BifrostRole, BifrostRuntimeResources, ScribeMemoryCategory};
     use crate::schema::SchemaFingerprint;
-    use crate::scribe::admission::EventTimeWindow;
     use crate::scribe::replay::ReplayedSealKey;
     use crate::scribe::seal_key::SealKey;
     use crate::scribe::stream_identity::StreamIdentity;
@@ -2360,9 +2327,9 @@ mod tests {
             principal,
             expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
             request_id,
-            window: EventTimeWindow::default(),
             receipt_micros: receipt_now(),
             registered_schema: None,
+            conform: None,
         }
     }
 
@@ -2449,10 +2416,10 @@ mod tests {
                 principal: &principal(),
                 expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: Some(definition),
                 registered_schema: None,
+                conform: None,
             },
         )
         .expect("a declared CodeAxis batch decodes");
@@ -2512,25 +2479,23 @@ mod tests {
                     CorrelationPolicy::Observation,
                 ),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: None,
-                registered_schema: Some(&registered),
+                registered_schema: Some(&Arc::new(registered)),
+                conform: None,
             },
         )
     }
 
     /// One valid row and one null row of narrower spellings for every
-    /// [`cast_table_columns`] column, plus a caller `wyrd_event_time` of
-    /// `event_micros` in Arrow's `UTC` zone. The `ts` column holds the
-    /// instant `1` labelled `ts_zone`, or a naive reading when it is `None`.
+    /// [`cast_table_columns`] column. The `ts` column holds the instant `1`
+    /// labelled `ts_zone`, or a naive reading when it is `None`.
     ///
     /// The writer sends `Int8`, `UInt32`, a `UTC` zone, `LargeUtf8`, `Binary`,
     /// a `List<Int16>` with Arrow's default `item` element, and a `List<Int64>`
     /// differing only in that element name.
-    fn narrow_spellings(event_micros: i64, ts_zone: Option<&str>) -> RecordBatch {
+    fn narrow_spellings(ts_zone: Option<&str>) -> RecordBatch {
         let item = |data_type| DataType::List(Arc::new(Field::new("item", data_type, true)));
-        let utc = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
         let mut items = arrow::array::ListBuilder::new(arrow::array::Int16Builder::new());
         items.values().append_value(7);
         items.append(true);
@@ -2541,7 +2506,6 @@ mod tests {
         renamed.append(false);
         batch(
             vec![
-                Field::new(WYRD_EVENT_TIME, utc.clone(), false),
                 Field::new("i", DataType::Int8, true),
                 Field::new("u", DataType::UInt32, true),
                 Field::new(
@@ -2555,9 +2519,6 @@ mod tests {
                 Field::new("n", item(DataType::Int64), true),
             ],
             vec![
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![event_micros; 2]).with_timezone("UTC"),
-                ),
                 Arc::new(arrow::array::Int8Array::from(vec![Some(-3), None])),
                 Arc::new(arrow::array::UInt32Array::from(vec![Some(u32::MAX), None])),
                 Arc::new(
@@ -2574,6 +2535,40 @@ mod tests {
         )
     }
 
+    /// Remembered conform plans conform exactly as a fresh plan does, and a
+    /// second batch of the same sent shape reuses the first one's plan.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the registered schema does not convert, a batch is
+    /// refused, the remembered result differs from the fresh one, or the
+    /// second batch rebuilds the plan.
+    #[test]
+    fn remembered_conform_plan_matches_a_fresh_plan_and_is_reused() {
+        let registered = Arc::new(
+            crate::tables::iceberg_schema_for(&Schema::new(cast_table_columns()))
+                .expect("the registered schema converts to Iceberg"),
+        );
+        let plans = super::ConformPlans::default();
+
+        let first = plans
+            .conform(&narrow_spellings(Some("UTC")), &registered)
+            .expect("the first batch conforms");
+        let second = plans
+            .conform(&narrow_spellings(Some("UTC")), &registered)
+            .expect("the second batch conforms");
+
+        assert_eq!(
+            first,
+            super::conform_to_registered(&narrow_spellings(Some("UTC")), &registered)
+                .expect("a fresh plan conforms")
+        );
+        assert!(
+            Arc::ptr_eq(&first.schema(), &second.schema()),
+            "the second batch of one sent shape reuses the remembered plan"
+        );
+    }
+
     /// Spellings Iceberg stores as the registered column type are cast to it.
     ///
     /// Each [`narrow_spellings`] column decodes to exactly the registered
@@ -2585,7 +2580,7 @@ mod tests {
     /// value is lost.
     #[test]
     fn same_iceberg_type_spellings_cast_to_the_registered_type() {
-        let stamped = decode_for_cast_table(narrow_spellings(receipt_now(), Some("UTC")))
+        let stamped = decode_for_cast_table(narrow_spellings(Some("UTC")))
             .expect("same-Iceberg-type spellings are accepted");
 
         for declared in &cast_table_columns() {
@@ -2617,28 +2612,6 @@ mod tests {
         assert_eq!(ints.value(0), i64::from(u32::MAX));
     }
 
-    /// A caller `wyrd_event_time` sent with Arrow's `UTC` zone is cast to the
-    /// managed `+00:00` form before the event-time check, keeping its value.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the batch is refused or the event time changes zone or
-    /// value.
-    #[test]
-    fn a_caller_utc_event_time_casts_to_the_managed_zone() {
-        let event_micros = receipt_now();
-
-        let stamped = decode_for_cast_table(narrow_spellings(event_micros, Some("UTC")))
-            .expect("a `UTC` event time is accepted");
-
-        let event_time = stamped
-            .column_by_name(WYRD_EVENT_TIME)
-            .and_then(|column| column.as_any().downcast_ref::<TimestampMicrosecondArray>())
-            .expect("the caller event time is kept");
-        assert_eq!(event_time.timezone(), Some(iceberg::arrow::UTC_TIME_ZONE));
-        assert_eq!(event_time.value(0), event_micros);
-    }
-
     /// A zoned timestamp in any display zone is stored as the same instant
     /// under the `+00:00` label.
     ///
@@ -2648,7 +2621,7 @@ mod tests {
     #[test]
     fn a_zone_label_never_changes_the_instant() {
         for zone in ["America/Chicago", "-05:00", "+09:00"] {
-            let stamped = decode_for_cast_table(narrow_spellings(receipt_now(), Some(zone)))
+            let stamped = decode_for_cast_table(narrow_spellings(Some(zone)))
                 .unwrap_or_else(|error| panic!("`{zone}` is accepted: {error:?}"));
 
             let ts = stamped
@@ -2669,7 +2642,7 @@ mod tests {
     #[test]
     fn a_naive_timestamp_is_refused_for_a_zoned_column() {
         assert!(matches!(
-            decode_for_cast_table(narrow_spellings(receipt_now(), None)),
+            decode_for_cast_table(narrow_spellings(None)),
             Err(ScribeError::FingerprintMismatch { .. })
         ));
     }
@@ -2712,15 +2685,15 @@ mod tests {
         let rows = RecordBatch::new_empty(Arc::new(Schema::new(fields)));
 
         let refusal = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
+            ipc_payload(&rows),
             &DecodeContext {
                 principal: &principal(),
                 expected_schema_fingerprint: SchemaFingerprint((definition.schema_fingerprint)()),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: Some(definition),
                 registered_schema: None,
+                conform: None,
             },
         )
         .expect_err("an undeclared column is refused");
@@ -3151,10 +3124,10 @@ mod tests {
                     CorrelationPolicy::Observation,
                 ),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: None,
                 registered_schema: None,
+                conform: None,
             },
         )
         .expect("projected run_id is correlation data");
@@ -3199,10 +3172,10 @@ mod tests {
                     CorrelationPolicy::Observation,
                 ),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: None,
                 registered_schema: None,
+                conform: None,
             },
         )
     }
@@ -3330,10 +3303,10 @@ mod tests {
                     CorrelationPolicy::Observation,
                 ),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: None,
                 registered_schema: None,
+                conform: None,
             },
         )
         .expect_err("card outside scope");
@@ -3379,10 +3352,10 @@ mod tests {
                     CorrelationPolicy::Observation,
                 ),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: None,
                 registered_schema: None,
+                conform: None,
             },
         )
         .expect_err("a duplicated column name fails closed before WAL");
@@ -3420,10 +3393,10 @@ mod tests {
                     CorrelationPolicy::Observation,
                 ),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: None,
                 registered_schema: None,
+                conform: None,
             },
         )
         .expect("schema is valid");
@@ -3475,17 +3448,17 @@ mod tests {
                     CorrelationPolicy::Observation,
                 ),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: None,
                 registered_schema: None,
+                conform: None,
             },
         )
         .expect("schema is valid");
         assert!(decoded.schema().index_of("data_tenant_id").is_err());
         assert!(decoded.schema().index_of(PRINCIPAL_ID).is_ok());
         assert!(decoded.schema().index_of("wyrd_batch_id").is_err());
-        assert!(decoded.schema().index_of(WYRD_EVENT_TIME).is_ok());
+        assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
         assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
         assert!(decoded.schema().index_of(WYRD_REQUEST_ID).is_ok());
     }
@@ -3520,22 +3493,6 @@ mod tests {
         IngressPayload::ArrowIpc(payload.into())
     }
 
-    /// Constructs the managed physical `wyrd_event_time` field and matching array.
-    fn managed_event_time(values: Vec<i64>) -> (Field, ArrayRef) {
-        let field = Field::new(
-            WYRD_EVENT_TIME,
-            DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some(iceberg::arrow::UTC_TIME_ZONE.into()),
-            ),
-            false,
-        );
-        let array = Arc::new(
-            TimestampMicrosecondArray::from(values).with_timezone(iceberg::arrow::UTC_TIME_ZONE),
-        ) as ArrayRef;
-        (field, array)
-    }
-
     /// Field names of a stamped batch, in physical order.
     fn stamped_field_names(batch: &RecordBatch) -> Vec<String> {
         batch
@@ -3558,67 +3515,15 @@ mod tests {
         .collect()
     }
 
-    /// D88: a stamped native payload that carries a valid caller `wyrd_event_time`
-    /// has the full canonical field order, with `wyrd_event_time` lifted out of
-    /// the user block into the managed slot (between `wyrd_request_id` and
-    /// `wyrd_ingested_at`) — the order the Oracle's pinned sealed-fragment
-    /// fingerprint requires. Before D88 the caller column stayed in the user block
-    /// and diverged from [`ensure_managed_columns`], breaking every sealed read.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the caller event time is refused or when the stamped field order
-    /// differs from the canonical managed order.
-    #[test]
-    fn native_caller_event_time_lands_in_canonical_managed_slot() {
-        let (principal, card) = scoped_service_principal();
-        let (event_field, event_array) =
-            managed_event_time(vec![now_micros_offset(-60), now_micros_offset(-120)]);
-        let rows = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-                event_field,
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
-                Arc::new(StringArray::from(vec![card.to_string(), card.to_string()])),
-                event_array,
-            ],
-        );
-        let decoded = decode(
-            ipc_payload(&rows),
-            &DecodeContext {
-                principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("native caller event time is accepted");
-        assert_eq!(
-            stamped_field_names(&decoded),
-            canonical_managed_order(),
-            "caller event time must yield the canonical managed field order",
-        );
-    }
-
-    /// D88: a stamped native payload WITHOUT a caller `wyrd_event_time` (server
-    /// stamps receipt time) has the identical canonical field order — the
-    /// event-time value source does not perturb the physical layout.
+    /// A stamped native payload has the canonical managed field order the
+    /// Oracle's pinned sealed-fragment fingerprint requires.
     ///
     /// # Panics
     ///
     /// Panics when the payload is refused or when the stamped field order differs
     /// from the canonical managed order.
     #[test]
-    fn native_server_stamped_event_time_lands_in_canonical_managed_slot() {
+    fn native_stamping_lands_in_canonical_managed_order() {
         let (principal, card) = scoped_service_principal();
         let rows = batch(
             vec![
@@ -3639,817 +3544,23 @@ mod tests {
                     CorrelationPolicy::Observation,
                 ),
                 request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
                 receipt_micros: receipt_now(),
                 definition: None,
                 registered_schema: None,
+                conform: None,
             },
         )
-        .expect("native ingest without event time is server-stamped");
+        .expect("native ingest is stamped");
         assert_eq!(
             stamped_field_names(&decoded),
             canonical_managed_order(),
-            "server-stamped event time must yield the canonical managed field order",
+            "stamping must yield the canonical managed field order",
         );
     }
 
-    /// D88: a stamped projected payload with a preserved caller `wyrd_event_time`
-    /// also produces the canonical managed field order (`run_id` retained as
-    /// correlation data, event time lifted into the managed slot).
-    ///
-    /// # Panics
-    ///
-    /// Panics when the projected event time is refused or when the stamped field
-    /// order differs from the canonical managed order.
-    #[test]
-    fn projected_preserved_event_time_lands_in_canonical_managed_slot() {
-        let (event_field, event_array) = managed_event_time(vec![now_micros_offset(-3600)]);
-        let rows = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new("run_id", DataType::Utf8, true),
-                event_field,
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![Some("client-run")])),
-                event_array,
-            ],
-        );
-        let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
-                rows.clone(),
-            ])),
-            &DecodeContext {
-                principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("projected preserved event time is accepted");
-        assert_eq!(
-            stamped_field_names(&decoded),
-            canonical_managed_order(),
-            "projected preserved event time must yield the canonical managed field order",
-        );
-    }
-
-    /// D88: a caller-supplied event time is preserved verbatim in the canonical
-    /// slot and is never re-stamped — it is distinct from the receipt-time
-    /// `wyrd_ingested_at`, proving the managed slot holds the caller value, not a
-    /// server-stamped one.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the caller event time is refused, when either time column is
-    /// missing or not a microsecond timestamp, when the event time differs from the
-    /// caller value, or when it equals the receipt time.
-    #[test]
-    fn caller_event_time_value_is_verbatim_not_receipt_time() {
-        let (principal, card) = scoped_service_principal();
-        // A distinctive in-window instant well clear of "now" so it cannot
-        // coincide with the receipt timestamp stamped into wyrd_ingested_at.
-        let caller = now_micros_offset(-6 * 60 * 60);
-        let (event_field, event_array) = managed_event_time(vec![caller]);
-        let rows = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-                event_field,
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
-                event_array,
-            ],
-        );
-        let decoded = decode(
-            ipc_payload(&rows),
-            &DecodeContext {
-                principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("native caller event time is accepted");
-        let event = decoded
-            .column_by_name(WYRD_EVENT_TIME)
-            .expect("event time column present")
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("event time is TimestampMicrosecond");
-        assert_eq!(
-            event.value(0),
-            caller,
-            "caller event time is preserved verbatim"
-        );
-        let ingested = decoded
-            .column_by_name(WYRD_INGESTED_AT)
-            .expect("ingested_at column present")
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("ingested_at is TimestampMicrosecond");
-        assert_ne!(
-            event.value(0),
-            ingested.value(0),
-            "caller event time must not be re-stamped with the receipt time",
-        );
-    }
-
-    /// A native payload MAY carry a valid caller `wyrd_event_time`: its values
-    /// survive decode+stamp unchanged, exactly once, and the user-schema
-    /// fingerprint is identical to the same payload without the column.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the user-schema fingerprints differ, when the caller event time
-    /// is refused, or when the decoded event-time column is missing, mistyped, or
-    /// not the caller's values.
-    #[test]
-    fn native_caller_event_time_is_preserved_without_fingerprint_drift() {
-        let (principal, card) = scoped_service_principal();
-        // Use recent timestamps within the default window (within 1 day of now).
-        let recent_a = now_micros_offset(-60); // 60 seconds ago
-        let recent_b = now_micros_offset(-120); // 120 seconds ago
-        let (event_field, event_array) = managed_event_time(vec![recent_a, recent_b]);
-        let rows_with = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-                event_field,
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
-                Arc::new(StringArray::from(vec![card.to_string(), card.to_string()])),
-                event_array,
-            ],
-        );
-        let rows_without = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64, 2_i64])),
-                Arc::new(StringArray::from(vec![card.to_string(), card.to_string()])),
-            ],
-        );
-        assert_eq!(
-            source_schema_fingerprint(rows_with.schema().as_ref(), CorrelationPolicy::Observation),
-            source_schema_fingerprint(
-                rows_without.schema().as_ref(),
-                CorrelationPolicy::Observation
-            ),
-            "caller event time must not perturb the registered-schema fingerprint",
-        );
-
-        let decoded = decode(
-            ipc_payload(&rows_with),
-            &DecodeContext {
-                principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows_with.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("native caller event time is accepted");
-        assert_eq!(
-            decoded
-                .schema()
-                .fields()
-                .iter()
-                .filter(|field| field.name() == WYRD_EVENT_TIME)
-                .count(),
-            1,
-            "caller event time must not be duplicated",
-        );
-        let event = decoded
-            .column_by_name(WYRD_EVENT_TIME)
-            .expect("event time column present")
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("event time is TimestampMicrosecond");
-        assert_eq!(event.value(0), recent_a);
-        assert_eq!(event.value(1), recent_b);
-    }
-
-    /// A native payload WITHOUT `wyrd_event_time` is still server-stamped exactly
-    /// as before, and `wyrd_ingested_at` remains the server receipt time.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the payload is refused, when the server-stamped event time is
-    /// missing, mistyped, or nullable, or when no ingestion time is stamped.
-    #[test]
-    fn native_without_event_time_is_server_stamped() {
-        let (principal, card) = scoped_service_principal();
-        let rows = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
-            ],
-        );
-        let decoded = decode(
-            ipc_payload(&rows),
-            &DecodeContext {
-                principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("native ingest without event time is server-stamped");
-        let event_field = decoded
-            .schema()
-            .field_with_name(WYRD_EVENT_TIME)
-            .expect("server-stamped event time exists")
-            .clone();
-        assert_eq!(
-            event_field.data_type(),
-            &DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some(iceberg::arrow::UTC_TIME_ZONE.into())
-            ),
-        );
-        assert!(!event_field.is_nullable());
-        assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
-    }
-
-    /// A native `wyrd_event_time` with the wrong Arrow type, unit, timezone,
-    /// nulls, or a duplicate field fails closed with `InvalidFrame`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when any malformed event-time variant is accepted or refused with
-    /// anything other than `InvalidFrame`.
-    #[test]
-    fn native_event_time_physical_type_is_validated() {
-        let (principal, card) = scoped_service_principal();
-        let card_column = || Arc::new(StringArray::from(vec![card.to_string()])) as ArrayRef;
-
-        let wrong_type = batch(
-            vec![
-                Field::new(WYRD_EVENT_TIME, DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-            ],
-            vec![Arc::new(Int64Array::from(vec![1_i64])), card_column()],
-        );
-        let wrong_unit = batch(
-            vec![
-                Field::new(
-                    WYRD_EVENT_TIME,
-                    DataType::Timestamp(
-                        TimeUnit::Nanosecond,
-                        Some(iceberg::arrow::UTC_TIME_ZONE.into()),
-                    ),
-                    false,
-                ),
-                Field::new(CARD_REF, DataType::Utf8, false),
-            ],
-            vec![
-                Arc::new(
-                    arrow::array::TimestampNanosecondArray::from(vec![1_i64])
-                        .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
-                ),
-                card_column(),
-            ],
-        );
-        let missing_timezone = batch(
-            vec![
-                Field::new(
-                    WYRD_EVENT_TIME,
-                    DataType::Timestamp(TimeUnit::Microsecond, None),
-                    false,
-                ),
-                Field::new(CARD_REF, DataType::Utf8, false),
-            ],
-            vec![
-                Arc::new(TimestampMicrosecondArray::from(vec![1_i64])),
-                card_column(),
-            ],
-        );
-        let null_value = batch(
-            vec![
-                Field::new(
-                    WYRD_EVENT_TIME,
-                    DataType::Timestamp(
-                        TimeUnit::Microsecond,
-                        Some(iceberg::arrow::UTC_TIME_ZONE.into()),
-                    ),
-                    true,
-                ),
-                Field::new(CARD_REF, DataType::Utf8, false),
-            ],
-            vec![
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![None::<i64>])
-                        .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
-                ),
-                card_column(),
-            ],
-        );
-        let (dup_field_a, dup_array_a) = managed_event_time(vec![1_i64]);
-        let (dup_field_b, dup_array_b) = managed_event_time(vec![2_i64]);
-        let duplicated = batch(
-            vec![
-                dup_field_a,
-                dup_field_b,
-                Field::new(CARD_REF, DataType::Utf8, false),
-            ],
-            vec![dup_array_a, dup_array_b, card_column()],
-        );
-
-        for rows in [
-            wrong_type,
-            wrong_unit,
-            missing_timezone,
-            null_value,
-            duplicated,
-        ] {
-            let error = decode(
-                ipc_payload(&rows),
-                &DecodeContext {
-                    principal: &principal,
-                    expected_schema_fingerprint: source_schema_fingerprint(
-                        rows.schema().as_ref(),
-                        CorrelationPolicy::Observation,
-                    ),
-                    request_id: &RequestId::now_v7(),
-                    window: EventTimeWindow::default(),
-                    receipt_micros: receipt_now(),
-                    definition: None,
-                    registered_schema: None,
-                },
-            )
-            .expect_err("invalid native event time fails closed");
-            assert!(matches!(error, ScribeError::InvalidFrame), "{error:?}");
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Event-time acceptance window tests (T42 / D85)
-    // -----------------------------------------------------------------------
-
-    /// Computes epoch-microseconds for `now + offset_secs` without panicking.
-    fn now_micros_offset(offset_secs: i64) -> i64 {
-        let now_u128 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock is post-epoch")
-            .as_micros();
-        let now = i64::try_from(now_u128).unwrap_or(i64::MAX);
-        now.saturating_add(offset_secs.saturating_mul(1_000_000))
-    }
-
-    /// A narrow window used by several tests: 2 days past, 2 hours future.
-    fn narrow_window() -> EventTimeWindow {
-        const SECS_PER_HOUR: u64 = 3_600;
-        const SECS_PER_DAY: u64 = 86_400;
-        EventTimeWindow {
-            past: std::time::Duration::from_secs(2 * SECS_PER_DAY),
-            future: std::time::Duration::from_secs(2 * SECS_PER_HOUR),
-        }
-    }
-
-    /// Native batch with event times inside the default window is accepted and
-    /// the values are preserved verbatim.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the in-window value is refused or when the decoded event time is
-    /// missing, mistyped, or not the caller value.
-    #[test]
-    fn native_event_time_within_window_accepted() {
-        let (principal, card) = scoped_service_principal();
-        let t = now_micros_offset(-3600); // 1 hour ago
-        let (event_field, event_array) = managed_event_time(vec![t]);
-        let rows = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-                event_field,
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
-                event_array,
-            ],
-        );
-        let decoded = decode(
-            ipc_payload(&rows),
-            &DecodeContext {
-                principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("in-window native event time is accepted");
-        let arr = decoded
-            .column_by_name(WYRD_EVENT_TIME)
-            .expect("event time present")
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("TimestampMicrosecond");
-        assert_eq!(arr.value(0), t, "value is preserved verbatim");
-    }
-
-    /// Value exactly at the past edge (receipt − past) is accepted (inclusive).
-    ///
-    /// # Panics
-    ///
-    /// Panics when a value exactly at the past bound is refused.
-    #[test]
-    fn native_event_time_past_edge_accepted() {
-        let (principal, card) = scoped_service_principal();
-        let window = narrow_window();
-        // past_secs − 1 s safety margin to absorb any clock tick between
-        // the test value computation and the window enforcement.
-        let edge = now_micros_offset(-(2 * 24 * 60 * 60 - 1));
-        let (event_field, event_array) = managed_event_time(vec![edge]);
-        let rows = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-                event_field,
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
-                event_array,
-            ],
-        );
-        decode(
-            ipc_payload(&rows),
-            &DecodeContext {
-                principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window,
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("past-edge value is accepted (inclusive bound)");
-    }
-
-    /// Value exactly at the future edge (receipt + future) is accepted (inclusive).
-    ///
-    /// # Panics
-    ///
-    /// Panics when a value exactly at the future bound is refused.
-    #[test]
-    fn native_event_time_future_edge_accepted() {
-        let (principal, card) = scoped_service_principal();
-        let window = narrow_window();
-        // future_secs − 1 s safety margin.
-        let edge = now_micros_offset(2 * 60 * 60 - 1);
-        let (event_field, event_array) = managed_event_time(vec![edge]);
-        let rows = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-                event_field,
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
-                event_array,
-            ],
-        );
-        decode(
-            ipc_payload(&rows),
-            &DecodeContext {
-                principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window,
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("future-edge value is accepted (inclusive bound)");
-    }
-
-    /// A value older than the past bound is rejected with `EventTimeOutOfRange`.
-    /// The whole batch is refused; no partial write occurs.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the value older than the past bound is not refused with
-    /// `EventTimeOutOfRange`.
-    #[test]
-    fn native_event_time_before_past_bound_rejected() {
-        let (principal, card) = scoped_service_principal();
-        // 31 days ago, well outside the default 30-day past window.
-        let old = now_micros_offset(-(31 * 24 * 60 * 60));
-        let (event_field, event_array) = managed_event_time(vec![old]);
-        let rows = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-                event_field,
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
-                event_array,
-            ],
-        );
-        let err = decode(
-            ipc_payload(&rows),
-            &DecodeContext {
-                principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect_err("31-day-old value must be rejected");
-        assert!(
-            matches!(
-                err,
-                ScribeError::EventTimeOutOfRange {
-                    value_micros,
-                    ..
-                } if value_micros == old
-            ),
-            "expected EventTimeOutOfRange with the offending value; got {err:?}"
-        );
-    }
-
-    /// A value further in the future than the future bound is rejected with
-    /// `EventTimeOutOfRange`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the value beyond the future bound is not refused with
-    /// `EventTimeOutOfRange`.
-    #[test]
-    fn native_event_time_after_future_bound_rejected() {
-        let (principal, card) = scoped_service_principal();
-        // 25 hours ahead, outside the default 24-hour future window.
-        let future = now_micros_offset(25 * 60 * 60);
-        let (event_field, event_array) = managed_event_time(vec![future]);
-        let rows = batch(
-            vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(CARD_REF, DataType::Utf8, false),
-                event_field,
-            ],
-            vec![
-                Arc::new(Int64Array::from(vec![1_i64])),
-                Arc::new(StringArray::from(vec![card.to_string()])),
-                event_array,
-            ],
-        );
-        let err = decode(
-            ipc_payload(&rows),
-            &DecodeContext {
-                principal: &principal,
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect_err("25-hour-future value must be rejected");
-        assert!(
-            matches!(
-                err,
-                ScribeError::EventTimeOutOfRange {
-                    value_micros,
-                    ..
-                } if value_micros == future
-            ),
-            "expected EventTimeOutOfRange with the offending value; got {err:?}"
-        );
-    }
-
-    /// A projected (OTLP) batch with an in-window event time is accepted.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the in-window projected value is refused or when the decoded
-    /// event time is missing, mistyped, or not the caller value.
-    #[test]
-    fn projected_event_time_within_window_accepted() {
-        let t = now_micros_offset(-3600);
-        let (event_field, event_array) = managed_event_time(vec![t]);
-        let rows = batch(
-            vec![Field::new("value", DataType::Int64, false), event_field],
-            vec![Arc::new(Int64Array::from(vec![1_i64])), event_array],
-        );
-        let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
-                rows.clone(),
-            ])),
-            &DecodeContext {
-                principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("projected in-window event time is accepted");
-        let arr = decoded
-            .column_by_name(WYRD_EVENT_TIME)
-            .expect("event time present")
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("TimestampMicrosecond");
-        assert_eq!(arr.value(0), t, "projected value is preserved verbatim");
-    }
-
-    /// A projected (OTLP) batch with an out-of-range event time is rejected with
-    /// `EventTimeOutOfRange` — proving both paths share enforcement.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the out-of-range projected value is not refused with
-    /// `EventTimeOutOfRange`.
-    #[test]
-    fn projected_event_time_out_of_range_rejected() {
-        let old = now_micros_offset(-(31 * 24 * 60 * 60));
-        let (event_field, event_array) = managed_event_time(vec![old]);
-        let rows = batch(
-            vec![Field::new("value", DataType::Int64, false), event_field],
-            vec![Arc::new(Int64Array::from(vec![1_i64])), event_array],
-        );
-        let err = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
-                rows.clone(),
-            ])),
-            &DecodeContext {
-                principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: EventTimeWindow::default(),
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect_err("projected out-of-range event time must be rejected");
-        assert!(
-            matches!(
-                err,
-                ScribeError::EventTimeOutOfRange {
-                    value_micros,
-                    ..
-                } if value_micros == old
-            ),
-            "expected EventTimeOutOfRange; got {err:?}"
-        );
-    }
-
-    /// When `wyrd_event_time` is absent the server stamps receipt time and no
-    /// window check runs — behavior is byte-identical to the prior contract.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the payload is refused or when the server-stamped event time is
-    /// missing, mistyped, or null.
-    #[test]
-    fn absent_event_time_unchanged_regression() {
-        let rows = batch(
-            vec![Field::new("value", DataType::Int64, false)],
-            vec![Arc::new(Int64Array::from(vec![1_i64]))],
-        );
-        // Very tight window (1 second past/future) to confirm no spurious check.
-        let tight_window = EventTimeWindow {
-            past: std::time::Duration::from_secs(1),
-            future: std::time::Duration::from_secs(1),
-        };
-        let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
-                rows.clone(),
-            ])),
-            &DecodeContext {
-                principal: &principal(),
-                expected_schema_fingerprint: source_schema_fingerprint(
-                    rows.schema().as_ref(),
-                    CorrelationPolicy::Observation,
-                ),
-                request_id: &RequestId::now_v7(),
-                window: tight_window,
-                receipt_micros: receipt_now(),
-                definition: None,
-                registered_schema: None,
-            },
-        )
-        .expect("absent event time is server-stamped without window check");
-        assert!(
-            decoded.schema().index_of(WYRD_EVENT_TIME).is_ok(),
-            "server-stamped event time must be present"
-        );
-        // Confirm it is NOT the tight_window that rejected it.
-        let arr = decoded
-            .column_by_name(WYRD_EVENT_TIME)
-            .expect("event time stamped")
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("TimestampMicrosecond");
-        assert!(!arr.is_null(0), "server-stamped event time is non-null");
-    }
-
-    /// `EventTimeWindow::contains` arithmetic — boundary and overflow cases.
-    #[test]
-    fn event_time_window_contains_boundary_and_overflow() {
-        let window = EventTimeWindow {
-            past: std::time::Duration::from_secs(1),
-            future: std::time::Duration::from_millis(500),
-        };
-        let receipt = 2_000_000_i64;
-        // Inclusive past edge.
-        assert!(window.contains(1_000_000, receipt));
-        // Inclusive future edge.
-        assert!(window.contains(2_500_000, receipt));
-        // One µs before past edge → rejected.
-        assert!(!window.contains(999_999, receipt));
-        // One µs after future edge → rejected.
-        assert!(!window.contains(2_500_001, receipt));
-        // Saturating arithmetic at i64 boundaries must not panic.
-        // Duration::MAX saturates past_micros/future_micros to i64::MAX,
-        // so lo = receipt.saturating_sub(i64::MAX) and hi = receipt.saturating_add(i64::MAX).
-        // With receipt = 0: lo = i64::MIN + 1, hi = i64::MAX.
-        let wide = EventTimeWindow {
-            past: std::time::Duration::MAX,
-            future: std::time::Duration::MAX,
-        };
-        // i64::MIN is excluded because lo = i64::MIN + 1 after saturating_sub.
-        assert!(!wide.contains(i64::MIN, 0));
-        // i64::MIN + 1 is the lowest accepted value.
-        assert!(wide.contains(i64::MIN + 1, 0));
-        // i64::MAX is always accepted.
-        assert!(wide.contains(i64::MAX, 0));
-    }
-
-    /// Managed columns other than `wyrd_event_time` remain reserved and are
-    /// rejected when a native payload supplies them.
+    /// Every server-owned column and any other `wyrd_*` name, such as the
+    /// unmanaged `wyrd_custom`, is reserved and rejected when a native
+    /// payload supplies it.
     ///
     /// # Panics
     ///
@@ -4458,7 +3569,12 @@ mod tests {
     #[test]
     fn native_other_reserved_columns_still_rejected() {
         let (principal, card) = scoped_service_principal();
-        for reserved in [WYRD_INGESTED_AT, WYRD_REQUEST_ID, PRINCIPAL_ID] {
+        for reserved in [
+            WYRD_INGESTED_AT,
+            WYRD_REQUEST_ID,
+            PRINCIPAL_ID,
+            "wyrd_custom",
+        ] {
             let rows = batch(
                 vec![
                     Field::new(reserved, DataType::Utf8, false),
@@ -4478,10 +3594,10 @@ mod tests {
                         CorrelationPolicy::Observation,
                     ),
                     request_id: &RequestId::now_v7(),
-                    window: EventTimeWindow::default(),
                     receipt_micros: receipt_now(),
                     definition: None,
                     registered_schema: None,
+                    conform: None,
                 },
             )
             .expect_err("server-owned managed columns are reserved");

@@ -72,13 +72,9 @@ Before any new optimization, show that the merged branch is at least as fast
 as pre-merge `wyrd/bifrost-variant/TASK-003` at `cfe21dc90`. Run everything on
 the same host with nothing compiling, in this order:
 
-1. **Produce the pre-merge read baseline.** No read run exists at
-   `cfe21dc90`; see `benchmarks/pre-merge/README.md`.
-   - Run `mise run bench:bifrost:query-capacity` in the
-     `wyrd-bifrost-variant-task-003` worktree. One invocation runs the hot
-     (memtable) tier, then the Parquet tier under a fresh Postgres.
-   - Then run the same command with `-- --fixture telemetry`.
-   - Commit the reports to `benchmarks/pre-merge/`.
+1. **The pre-merge read baseline is recorded.** The standard and telemetry
+   fixtures, hot and Parquet tiers, were run on a clean `cfe21dc90` tree on
+   2026-10-11. See `benchmarks/pre-merge/`.
 2. **Run the same read sweeps on the merged branch** and compare them case by
    case. Use qps, p50/p95/p99, server CPU per query and peak memory, plus the
    per-query latency Pareto and the CPU Pareto by crate.

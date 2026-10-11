@@ -43,6 +43,9 @@ struct DevServer {
     installed: InstalledServer,
     /// Effective loopback listener supplied to the normal serving path.
     bind: SocketAddr,
+    /// Effective loopback public gRPC listener, supplied to every child and
+    /// saved as the fresh-client gRPC destination.
+    grpc: SocketAddr,
     /// HTTP endpoint shared by setup, readiness, clients, and MCP hosts.
     endpoint: String,
     /// macOS memory detected once and supplied only to child processes.
@@ -63,8 +66,8 @@ impl DevArgs {
     /// # Panics
     /// Panics if the compile-time package version is not valid semver.
     pub async fn run(self) -> Result<ExitCode, WyrdCliError> {
-        let bind = local_bind()?;
-        self.validate_local_config(&format!("http://{bind}"))?;
+        let (bind, grpc) = local_binds()?;
+        let configured = self.validate_local_config(&format!("http://{bind}"))?;
         let installer = ServerInstaller::official()?;
         let interrupted = interruption();
         tokio::pin!(interrupted);
@@ -81,14 +84,14 @@ impl DevArgs {
                 }
             } => installed?,
         };
-        let mut server = DevServer::new(installed, bind)?;
+        let mut server = DevServer::new(installed, bind, grpc)?;
         let result = tokio::select! {
             biased;
             signal = &mut interrupted => {
                 eprintln!("Local startup stopped. Committed setup steps remain; rerun the same command. An active tenant's key is never reissued.");
                 signal.map(|()| ExitCode::from(130)).map_err(|source| WyrdCliError::Io { source })
             }
-            result = server.run(&self) => result,
+            result = server.run(&self, configured) => result,
         };
         let settled = server.stop().await;
         match result {
@@ -100,13 +103,18 @@ impl DevArgs {
         }
     }
 
-    /// Refuse unsafe local files or an unrelated saved identity before setup.
+    /// Refuse unsafe local files or an unrelated saved identity before setup,
+    /// and report whether an earlier run already completed local setup.
+    ///
+    /// Completed setup means this endpoint and a protected key were saved
+    /// before this invocation wrote anything. It only suppresses the automatic
+    /// host offer; the saved key is still verified after provisioning.
     ///
     /// # Errors
     /// Returns protected-file, configuration, or saved-login validation errors.
-    fn validate_local_config(&self, endpoint: &str) -> Result<(), WyrdCliError> {
+    fn validate_local_config(&self, endpoint: &str) -> Result<bool, WyrdCliError> {
         // Check local files before any server operation can issue a key.
-        GlobalConfig::local_api_key(&Environment::Process).map_err(map_client_error)?;
+        let key = GlobalConfig::local_api_key(&Environment::Process).map_err(map_client_error)?;
         let global = GlobalConfig::load().map_err(|_| dev_error("local config", "config.toml is invalid; correct it or use a separate WYRD_CONFIG_HOME; no server setup has run"))?;
         if let Some(dir) = Environment::Process.config_dir() {
             let origin = canonical_origin(endpoint).map_err(map_client_error)?;
@@ -121,7 +129,7 @@ impl DevArgs {
                 ));
             }
         }
-        Ok(())
+        Ok(key.is_some() && global.client.http_url.as_deref() == Some(endpoint))
     }
 }
 
@@ -133,7 +141,11 @@ impl DevServer {
     ///
     /// # Panics
     /// Panics if the compile-time package version is not valid semver.
-    fn new(installed: InstalledServer, bind: SocketAddr) -> Result<Self, WyrdCliError> {
+    fn new(
+        installed: InstalledServer,
+        bind: SocketAddr,
+        grpc: SocketAddr,
+    ) -> Result<Self, WyrdCliError> {
         let cli = semver::Version::parse(env!("CARGO_PKG_VERSION"))
             .expect("the CLI package version is semver");
         if !compatible(&cli, &installed.version) {
@@ -145,6 +157,7 @@ impl DevServer {
         Ok(Self {
             installed,
             bind,
+            grpc,
             endpoint: format!("http://{bind}"),
             memory: None,
             child: None,
@@ -153,12 +166,14 @@ impl DevServer {
 
     /// Construct each child with the same local inputs, leaving database and
     /// storage URLs in the environment and preserving production hardening.
+    /// The selected listeners override any server-file setting.
     fn command(&self) -> Command {
         let mut command = Command::new(self.installed.binary());
         command
             .kill_on_drop(true)
             .stdin(Stdio::null())
-            .env("WYRD_SERVER_BIND", self.bind.to_string());
+            .env("WYRD_SERVER_BIND", self.bind.to_string())
+            .env("WYRD_GRPC_BIND", self.grpc.to_string());
         if let Some(memory) = &self.memory {
             command.env("WYRD_BIFROST_MEMORY_LIMIT_BYTES", memory);
         }
@@ -167,22 +182,38 @@ impl DevServer {
 
     /// Migrate, serve, provision, persist, authenticate a new client, and wait.
     ///
+    /// Only first setup offers detected hosts; `configured` restarts skip the
+    /// offer unless hosts were selected explicitly. The serving child stays
+    /// observed during the offer: its exit cancels any unanswered question.
+    ///
     /// # Errors
     /// Returns a stage-specific recovery message without child secret output.
     /// Committed server operations survive a failed later stage. The child
     /// remains owned by this handle and is settled by `stop` on every exit.
-    async fn run(&mut self, args: &DevArgs) -> Result<ExitCode, WyrdCliError> {
+    ///
+    /// # Panics
+    /// Panics if the serving child is not retained after readiness.
+    async fn run(&mut self, args: &DevArgs, configured: bool) -> Result<ExitCode, WyrdCliError> {
         self.start().await?;
         let tenant = self.provision(&args.tenant).await?;
-        save_local_tenant(&tenant, &args.tenant, &self.endpoint)?;
+        save_local_tenant(&tenant, &args.tenant, &self.endpoint, self.grpc)?;
         drop(tenant);
         verify_saved_client().await?;
-        mcp::offer_local(&args.hosts, &self.endpoint).await?;
+        let Self {
+            child, endpoint, ..
+        } = self;
+        let child = child.as_mut().expect("the server is retained after readiness");
+        if !configured || !args.hosts.is_empty() {
+            tokio::select! {
+                offered = mcp::offer_local(&args.hosts, endpoint) => offered?,
+                exited = Self::exited(child) => return exited,
+            }
+        }
         println!(
-            "Local Wyrd ready at {} for tenant {}. The saved endpoint and credential are available to fresh clients; press Ctrl-C to stop.",
-            self.endpoint, args.tenant
+            "Local Wyrd ready at {endpoint} for tenant {}. The saved endpoint and credential are available to fresh clients; press Ctrl-C to stop.",
+            args.tenant
         );
-        self.wait().await
+        Self::exited(child).await
     }
 
     /// Reserve HTTP through migration, then start and await the ordinary server.
@@ -298,16 +329,12 @@ impl DevServer {
     }
 
     /// Observe the owned foreground server; every unsolicited exit is a failure.
+    /// The reaped status stays cached on `child`, so `stop` still settles it.
     ///
     /// # Errors
     /// Returns redacted recovery guidance if waiting fails or the server exits.
-    ///
-    /// # Panics
-    /// Panics if called before the server has started.
-    async fn wait(&mut self) -> Result<ExitCode, WyrdCliError> {
-        self.child
-            .as_mut()
-            .expect("the server is retained after readiness")
+    async fn exited(child: &mut Child) -> Result<ExitCode, WyrdCliError> {
+        child
             .wait()
             .await
             .map_err(|_| {
@@ -327,6 +354,9 @@ impl DevServer {
     /// # Errors
     /// Returns a redacted readiness failure if the child exits or is not ready
     /// within the existing two-minute local-server readiness budget.
+    ///
+    /// # Panics
+    /// Panics if called before `start` has spawned and retained the child.
     async fn ready(&mut self) -> Result<(), WyrdCliError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
@@ -475,11 +505,12 @@ fn disclose_root(printed: &str) {
     }
 }
 
-/// Validate external PostgreSQL and loopback HTTP inputs before installation.
+/// Validate external PostgreSQL and loopback HTTP and public gRPC inputs
+/// before installation, returning the selected HTTP and gRPC listeners.
 ///
 /// # Errors
 /// Refuses absent/invalid database URLs and non-loopback or zero-port binds.
-fn local_bind() -> Result<SocketAddr, WyrdCliError> {
+fn local_binds() -> Result<(SocketAddr, SocketAddr), WyrdCliError> {
     let database = SecretString::from(std::env::var("WYRD_DATABASE_URL").unwrap_or_default());
     if database.expose_secret().is_empty()
         || !url::Url::parse(database.expose_secret())
@@ -490,25 +521,39 @@ fn local_bind() -> Result<SocketAddr, WyrdCliError> {
             "set WYRD_DATABASE_URL to an externally managed PostgreSQL database; the migration login must own its objects",
         ));
     }
-    let bind: SocketAddr = std::env::var("WYRD_SERVER_BIND")
-        .unwrap_or_else(|_| "127.0.0.1:8080".to_owned())
-        .parse()
-        .map_err(|_| {
-            dev_error(
-                "input",
-                "WYRD_SERVER_BIND must be a loopback socket address with a nonzero port",
-            )
-        })?;
-    if !bind.ip().is_loopback() || bind.port() == 0 {
-        return Err(dev_error(
-            "input",
+    Ok((
+        loopback(
+            "WYRD_SERVER_BIND",
+            "127.0.0.1:8080",
             "WYRD_SERVER_BIND must be a loopback socket address with a nonzero port",
-        ));
-    }
-    Ok(bind)
+        )?,
+        loopback(
+            "WYRD_GRPC_BIND",
+            "127.0.0.1:50051",
+            "WYRD_GRPC_BIND must be a loopback socket address with a nonzero port",
+        )?,
+    ))
 }
 
-/// Commit the validated key before its endpoint through existing file owners.
+/// Select one listener from `variable`, else the ordinary loopback default.
+///
+/// # Errors
+/// Returns `refusal` for an unparsable, non-loopback, or zero-port address.
+fn loopback(
+    variable: &str,
+    default: &str,
+    refusal: &'static str,
+) -> Result<SocketAddr, WyrdCliError> {
+    std::env::var(variable)
+        .unwrap_or_else(|_| default.to_owned())
+        .parse::<SocketAddr>()
+        .ok()
+        .filter(|bind| bind.ip().is_loopback() && bind.port() != 0)
+        .ok_or_else(|| dev_error("input", refusal))
+}
+
+/// Commit the validated key before its HTTP and gRPC endpoints through
+/// existing file owners.
 ///
 /// # Errors
 /// Refuses conflicting keys or unsafe persistence; committed setup remains.
@@ -516,6 +561,7 @@ fn save_local_tenant(
     tenant: &ProvisionedTenant,
     name: &TenantSlug,
     endpoint: &str,
+    grpc: SocketAddr,
 ) -> Result<(), WyrdCliError> {
     let saved = GlobalConfig::local_api_key(&Environment::Process).map_err(map_client_error)?;
     let candidate = tenant.credential(saved.as_ref())?;
@@ -526,6 +572,7 @@ fn save_local_tenant(
     GlobalConfig::save_local(
             &Environment::Process,
             endpoint,
+            &format!("http://{grpc}"),
             candidate,
         )
             .map_err(|_| dev_error("local persistence", "the tenant may already be active; restore safe local file permissions and rerun. If its one-time key was not saved, use explicit platform tenant recover-admin; rerunning never replaces it"))?;

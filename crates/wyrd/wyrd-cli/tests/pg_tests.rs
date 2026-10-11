@@ -232,6 +232,10 @@ impl LocalDev {
     }
 
     /// Credentials-test environment containing no exported key or endpoint.
+    ///
+    /// # Panics
+    /// Panics if the temporary home path is not UTF-8, which the fixture's
+    /// `tempfile` location never produces on supported hosts.
     fn environment(&self) -> Environment {
         Environment::from([(
             "WYRD_CONFIG_HOME",

@@ -731,6 +731,9 @@ pub(super) async fn prompt_local_selection(
 }
 
 /// Render the same detected-host menu for both terminal input paths.
+///
+/// # Errors
+/// Propagates any write failure on `output`; nothing is flushed here.
 fn show_hosts(detected: &[McpHost], output: &mut impl Write) -> io::Result<()> {
     writeln!(output, "Detected MCP hosts:")?;
     for (index, host) in detected.iter().enumerate() {
@@ -746,6 +749,10 @@ fn show_hosts(detected: &[McpHost], output: &mut impl Write) -> io::Result<()> {
 }
 
 /// Flush the question before either reader waits for input.
+///
+/// # Errors
+/// Propagates a write or flush failure on `output`, so no reader waits on a
+/// question the user never saw.
 fn show_question(output: &mut impl Write) -> io::Result<()> {
     write!(
         output,

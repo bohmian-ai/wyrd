@@ -91,8 +91,10 @@ impl GlobalConfig {
         CredentialsFile::api_key(&document)
     }
 
-    /// Save local setup's endpoint and expected tenant key in
+    /// Save local setup's HTTP and gRPC endpoints and expected tenant key in
     /// the existing protected files, preserving comments and other settings.
+    /// Both endpoints are replaced together so a fresh client never pairs the
+    /// local key with a stale endpoint from another deployment.
     ///
     /// An existing different default key is never overwritten. The credential
     /// is committed first: a later endpoint failure leaves the key recoverable
@@ -104,6 +106,7 @@ impl GlobalConfig {
     pub fn save_local(
         environment: &Environment,
         server: &str,
+        grpc: &str,
         credential: Option<&SecretString>,
     ) -> Result<(), WyrdClientError> {
         let dir = environment
@@ -139,6 +142,7 @@ impl GlobalConfig {
             credentials.replace(&keys)?;
         }
         settings["client"]["http_url"] = toml_edit::value(server);
+        settings["client"]["grpc_url"] = toml_edit::value(grpc);
         config.replace(&settings)
     }
 
@@ -221,19 +225,19 @@ mod tests {
             Environment::from([("WYRD_CONFIG_HOME", dir.path().to_str().expect("UTF-8 path"))]);
         fs::write(
             dir.path().join("config.toml"),
-            "# retain this comment\n[client.token_cache]\nkind = 'disk'\n",
+            "# retain this comment\n[client]\ngrpc_url = 'https://stale.example.com:50051'\n[client.token_cache]\nkind = 'disk'\n",
         )
         .expect("config fixture");
         let key = SecretString::from("first-key".to_owned());
-        GlobalConfig::save_local(&environment, "http://127.0.0.1:8080", Some(&key))
+        GlobalConfig::save_local(&environment, "http://127.0.0.1:8080", "http://127.0.0.1:50051", Some(&key))
             .expect("first save");
         let credentials_path = dir.path().join("credentials.toml");
         let mut retained = fs::read_to_string(&credentials_path).expect("credentials saved");
         retained.push_str("# retained cache\naccess_token = 'cached-token'\naccess_expires_at = '2099-01-01T00:00:00Z'\n");
         fs::write(&credentials_path, retained).expect("cache fixture");
         let credentials = fs::read(&credentials_path).expect("cached credentials");
-        GlobalConfig::save_local(&environment, "http://127.0.0.1:8080", Some(&key)).expect("retry");
-        assert!(GlobalConfig::save_local(&environment, "http://127.0.0.1:9090", None).is_err());
+        GlobalConfig::save_local(&environment, "http://127.0.0.1:8080", "http://127.0.0.1:50051", Some(&key)).expect("retry");
+        assert!(GlobalConfig::save_local(&environment, "http://127.0.0.1:9090", "http://127.0.0.1:50052", None).is_err());
         assert_eq!(
             fs::read(dir.path().join("credentials.toml")).expect("credentials retained"),
             credentials
@@ -256,6 +260,7 @@ mod tests {
             GlobalConfig::save_local(
                 &environment,
                 "http://127.0.0.1:9090",
+                "http://127.0.0.1:50052",
                 Some(&SecretString::from("other-key".to_owned()))
             )
             .is_err()
@@ -264,14 +269,9 @@ mod tests {
             fs::read(dir.path().join("credentials.toml")).expect("original key retained"),
             credentials
         );
-        assert_eq!(
-            GlobalConfig::load_in(&environment)
-                .expect("loads")
-                .client
-                .http_url
-                .as_deref(),
-            Some("http://127.0.0.1:8080")
-        );
+        let saved = GlobalConfig::load_in(&environment).expect("loads").client;
+        assert_eq!(saved.http_url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(saved.grpc_url.as_deref(), Some("http://127.0.0.1:50051"));
     }
 
     #[test]

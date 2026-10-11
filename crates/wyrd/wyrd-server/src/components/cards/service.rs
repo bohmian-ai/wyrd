@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use wyrd_queue::json_schema_to_fieldspec;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
 use wyrd_spec::DataTenantId;
@@ -71,6 +70,7 @@ use wyrd_sql::row_types::cards::{CardRow, ParsedCardRow};
 use wyrd_storage::StorageError;
 use wyrd_storage::service::{upload_abort, upload_init};
 use wyrd_storage::tenant_path;
+use wyrd_types::json_schema_to_fieldspec;
 
 use crate::bifrost::service::register_table;
 use crate::components::auth::Caller;

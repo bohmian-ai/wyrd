@@ -1922,25 +1922,21 @@ impl Bifrost {
     /// Drains every selected subsystem against one absolute deadline.
     ///
     /// The order is fixed and load-bearing: readiness and public admission
-    /// close first, Forge supervision must already be quiesced, the Oracle and
-    /// then the Scribe owner and registry drain, the membership poller stops,
-    /// and only then is the storage owner closed. The poller outlives every
-    /// role because draining roles and the earlier Scribe outbox drain read
-    /// membership. Storage is last because work a role already admitted may
-    /// still need object I/O to finish; closing it first would fail that work
-    /// rather than let it complete.
+    /// close first, Forge supervision must already be quiesced, then the
+    /// Oracle and then the Scribe owner and registry drain, and the membership
+    /// poller stops last because draining roles and the earlier Scribe outbox
+    /// drain read membership. Storage has no drain step: the shared storage
+    /// owner simply drops once its last role does, so work a role already
+    /// admitted keeps its object I/O until it finishes.
     ///
-    /// Any failure along the way — unquiesced Forge supervision, a role drain
-    /// error, or a storage owner that does not settle by the deadline — runs
-    /// the abort path for both roles *and* storage before returning, so a
-    /// failed shutdown never leaves the metadata cache open, decoded entries
-    /// retained, or object I/O admissible. A successful report is therefore
-    /// only ever produced when storage is closed and settled.
+    /// Any failure along the way — unquiesced Forge supervision or a role
+    /// drain error — runs the abort path for every selected role before
+    /// returning, so a failed shutdown never leaves admission open.
     ///
     /// # Errors
     /// Returns a stable lifecycle failure when a selected role cannot remove
     /// readiness or drain by the deadline, or when Forge supervision has not
-    /// joined.
+    /// joined, or when the membership poller does not stop by the deadline.
     pub async fn shutdown(
         &self,
         deadline: Instant,
@@ -1999,16 +1995,9 @@ impl Bifrost {
         } else {
             false
         };
-    /// close first, Forge supervision must already be quiesced, the Oracle and
-    /// then the Scribe owner and registry drain, and the membership poller
-    /// stops last because draining roles and the earlier Scribe outbox drain
-    /// read membership. Storage has no drain step: the shared storage owner
-    /// simply drops once its last role does, so work a role already admitted
-    /// keeps its object I/O until it finishes.
-    ///
-    /// Any failure along the way — unquiesced Forge supervision or a role
-    /// drain error — runs the abort path for every selected role before
-    /// returning, so a failed shutdown never leaves admission open.
+        if let Some(poller) = &self.membership_poller {
+            stop_role_task(poller, deadline, "membership poller").await?;
+        }
         Ok(BifrostShutdownReport {
             scribe_drained,
             forge_drained,
@@ -2040,7 +2029,7 @@ impl Bifrost {
             forge.begin_shutdown();
         }
         if let Some(poller) = &self.membership_poller {
-            stop_role_task(poller, deadline, "membership poller").await?;
+            poller.abort();
         }
     }
 }
@@ -2160,9 +2149,6 @@ pub struct AppState {
     pub verification: Arc<VerificationHealth>,
     /// Key-encryption keys that seal and open Operator connection credentials.
     pub operator_keys: Arc<OperatorKeys>,
-        if let Some(poller) = &self.membership_poller {
-            poller.abort();
-        }
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,

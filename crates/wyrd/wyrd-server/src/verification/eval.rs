@@ -32,8 +32,8 @@ use vala_eval::sampling::RecordSample;
 use vala_eval::{
     EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,
 };
-use wyrd_runtime::principal::PrincipalId;
 use wyrd_queue::variant::variant_cell_to_json;
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
 use wyrd_spec::card::eval::EvalSpec;

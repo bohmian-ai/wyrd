@@ -910,12 +910,8 @@ fn enforce_builtin_source_contract(
     if trusted {
         return Ok(());
     }
-    let policy = definition.correlation_policy;
-    let user = RecordBatch::try_new(
-        Arc::new(Schema::new(user_fields(rows, policy))),
-        user_columns(rows, policy),
-    )
-    .map_err(|_| ScribeError::InvalidFrame)?;
+    let user = RecordBatch::try_new(Arc::new(Schema::new(user_fields(rows))), user_columns(rows))
+        .map_err(|_| ScribeError::InvalidFrame)?;
     (definition.canonical_validator)(&user).map_err(ScribeError::ContractViolation)?;
     Ok(())
 }
@@ -2256,9 +2252,11 @@ mod tests {
             vec![Field::new("value", DataType::Int64, false)],
             vec![Arc::clone(&value)],
         );
-        let stamped =
-            stamp_correlation_columns(&rows, &stamping_context(&principal(), None, &RequestId::now_v7()))
-                .expect("stamp");
+        let stamped = stamp_correlation_columns(
+            &rows,
+            &stamping_context(&principal(), None, &RequestId::now_v7()),
+        )
+        .expect("stamp");
         let value_index = stamped.schema().index_of("value").expect("value column");
         assert!(Arc::ptr_eq(&value, stamped.column(value_index)));
     }
@@ -2277,9 +2275,11 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64]))],
         );
 
-        let stamped =
-            stamp_correlation_columns(&rows, &stamping_context(&principal(), None, &RequestId::now_v7()))
-                .expect("stamp native batch");
+        let stamped = stamp_correlation_columns(
+            &rows,
+            &stamping_context(&principal(), None, &RequestId::now_v7()),
+        )
+        .expect("stamp native batch");
 
         let run_id = stamped.schema().index_of("run_id").expect("run_id field");
         assert!(stamped.schema().field(run_id).is_nullable());
@@ -2336,7 +2336,9 @@ mod tests {
                     .card_ref_scope()
                     .map(CardRefScope::uids)
                     .as_deref(),
-                expected_schema_fingerprint: source_schema_fingerprint(&Schema::new(cast_table_columns())),
+                expected_schema_fingerprint: source_schema_fingerprint(&Schema::new(
+                    cast_table_columns(),
+                )),
                 request_id: &RequestId::now_v7(),
                 receipt_micros: receipt_now(),
                 definition: None,

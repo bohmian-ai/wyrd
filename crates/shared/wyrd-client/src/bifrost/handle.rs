@@ -194,7 +194,7 @@ impl WriterPool {
         card_uid: Option<CardUid>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.insert_rows(table, schema, vec![json], card_uid, run_id, None)
+        self.insert_rows(table, schema, vec![json], card_uid, run_id)
     }
 
     /// Enqueue every row of one logical record, or none of them, propagating
@@ -204,12 +204,6 @@ impl WriterPool {
     /// projects to several rows sharing one correlation, such as a Drift
     /// observation's tall feature rows. A refusal admits no row, so the caller
     /// may resubmit the whole record without duplicating a prefix.
-    ///
-    /// `event_time_micros` is the record's `wyrd_event_time` (microseconds
-    /// since the Unix epoch, UTC), carried unchanged through batching, linger,
-    /// retry, and flush. Observations pass the client clock read at emit; a
-    /// plain write passes `None`, and the server stamps its receipt instant.
-    /// A row whose own JSON carries `wyrd_event_time` keeps that value instead.
     ///
     /// # Errors
     /// Returns any [`wyrd_queue::RowPreflight::prepare`] refusal of any row
@@ -225,10 +219,9 @@ impl WriterPool {
         rows: Vec<Vec<u8>>,
         card_uid: Option<CardUid>,
         run_id: Option<RunId>,
-        event_time_micros: Option<i64>,
     ) -> Result<(), WyrdQueueError> {
         self.producer_for(table, schema)?
-            .enqueue_rows(rows, card_uid, run_id, event_time_micros)
+            .enqueue_rows(rows, card_uid, run_id)
     }
 
     /// Enqueue one owned Arrow batch for `table` without awaiting publication.

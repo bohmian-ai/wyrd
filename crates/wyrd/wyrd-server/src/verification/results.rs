@@ -1298,7 +1298,11 @@ mod tests {
             serde_json::to_value(&result).expect("result encodes")
         );
         for column in [DRIFT_REPORT, EVAL_SUMMARY] {
-            assert!(row.column_by_name(column).expect("summary column").is_null(0));
+            assert!(
+                row.column_by_name(column)
+                    .expect("summary column")
+                    .is_null(0)
+            );
         }
     }
 

@@ -50,7 +50,9 @@ use clap::Parser;
 use secrecy::ExposeSecret as _;
 use tokio::time::{Instant, Interval};
 use wyrd_testing::bifrost::peer_ca::BifrostPeerCa;
-use wyrd_testing::release_server::{CPUS, Envelope, LocalServer, MEMORY_BYTES, STOP_GRACE};
+use wyrd_testing::release_server::{
+    CPUS, Envelope, LocalServer, MEMORY_BYTES, Placement, STOP_GRACE,
+};
 
 use evidence::Queue;
 use fixture::Tenant;
@@ -494,7 +496,13 @@ impl Benchmark {
     /// seeded observations already written stay in the database and store;
     /// a retry starts a fresh database through the Postgres wrapper.
     async fn provision(&mut self) -> Result<()> {
-        let first = LocalServer::start(&self.binary, &TENANTS, &self.env(0), Envelope::POD).await?;
+        let first = LocalServer::start(
+            &self.binary,
+            &TENANTS,
+            &self.env(0),
+            Placement::Scoped(Envelope::POD),
+        )
+        .await?;
         let mut tenants = Vec::new();
         for setup in first.tenants() {
             self.auth_pace.tick().await;

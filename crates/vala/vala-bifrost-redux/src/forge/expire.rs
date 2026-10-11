@@ -1273,8 +1273,7 @@ impl Forge {
                     .await?
             }
             ForgeExpirationSettlement::Committed => {
-                let evidence = self
-                    .retry_committed_expiry(lease, expiry, table, stop)
+                self.retry_committed_expiry(lease, expiry, table, stop)
                     .await?
             }
         };

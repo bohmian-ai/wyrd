@@ -48,12 +48,9 @@ pub fn project_audit_event(
 ) -> Result<RecordBatch, AuditProjectionError> {
     let text = |value: Option<String>| Arc::new(StringArray::from(vec![value])) as ArrayRef;
     let detail = event.detail.as_ref().map(audit_detail_canonical_json);
-    let detail = VariantColumnBuilder::encode(
-        DETAIL,
-        [detail.as_deref()],
-        EncodedVariant::from_json_text,
-    )
-    .map_err(AuditProjectionError::InvalidDetail)?;
+    let detail =
+        VariantColumnBuilder::encode(DETAIL, [detail.as_deref()], EncodedVariant::from_json_text)
+            .map_err(AuditProjectionError::InvalidDetail)?;
     let columns = vec![
         text(Some(event.request_id.as_str().to_owned())),
         text(event.trace_id.clone()),

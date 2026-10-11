@@ -347,15 +347,12 @@ impl ScribeRefusal {
 
     /// Classifies an in-process Scribe refusal.
     ///
-    /// Backpressure and a full WAL are saturation; a closed, failing, or
-    /// object-store-blocked writer is unavailable; anything else refuses this
-    /// frame for good.
+    /// Backpressure and a full WAL are saturation; a closed or failing writer
+    /// is unavailable; anything else refuses this frame for good.
     pub(crate) fn from_scribe(error: &ScribeError) -> Self {
         match error {
             ScribeError::IngestBusy { .. } | ScribeError::WalDiskFull => Self::Saturated,
-            ScribeError::IngressClosed
-            | ScribeError::ObjectStorePutFailed(_)
-            | ScribeError::Internal { .. } => Self::Unavailable,
+            ScribeError::IngressClosed | ScribeError::Internal { .. } => Self::Unavailable,
             _ => Self::Rejected,
         }
     }

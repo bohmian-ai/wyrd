@@ -950,7 +950,7 @@ impl WyrdTestServer {
                 );
             if !drained {
                 tracing::warn!("Bifrost did not drain within the teardown budget; awaiting abort");
-                bifrost.abort().await;
+                bifrost.abort();
             }
             self.bifrost_settled = true;
         }
@@ -3752,7 +3752,7 @@ impl WyrdTestServer {
         tenant: DataTenantId,
         age: Duration,
     ) -> Result<(), WyrdTestServerError> {
-        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let pool = self.inner.fixture.superuser_pool().map_err(sql)?;
         let millis = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
         sqlx::query(
             "UPDATE vala.forge_snapshot_supersessions \

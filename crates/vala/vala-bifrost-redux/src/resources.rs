@@ -757,12 +757,6 @@ pub struct ResourceSnapshot {
     pub oracle_analytical_queries: u32,
     /// Aggregate memory retained specifically by Oracle query owners.
     pub oracle_query_memory_used_bytes: usize,
-    /// Share of [`Self::infallible_headroom_bytes`] Oracle pools hold.
-    ///
-    /// Oracle shutdown adds this to the governed Oracle query bytes so a
-    /// child holding only infallible overshoot still delays its drain, while
-    /// headroom other roles hold never does.
-    pub oracle_infallible_headroom_bytes: usize,
     /// Bytes `DataFusion`'s infallible growth path holds above the shared cap.
     ///
     /// These are real, retained bytes accounted as server headroom rather than
@@ -864,8 +858,6 @@ struct ResourceState {
     /// Live Analytical queries and follower graphs; each holds one slot unit.
     oracle_analytical_queries: u32,
     oracle_query_memory_used_bytes: usize,
-    /// Oracle-held share of `infallible_headroom_bytes`.
-    oracle_infallible_headroom_bytes: usize,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     scribe_shard_bytes: BTreeMap<usize, usize>,
     /// Advances only when Oracle slot units return to the ledger.
@@ -1793,14 +1785,6 @@ impl OracleResources {
         self.memory_root.reserved()
     }
 
-    /// Returns a future that resolves on the next byte return to the shared pool.
-    ///
-    /// Callers enable it before reading [`Self::shared_memory_reserved`] so a
-    /// release between the read and the await is not lost.
-    pub(crate) fn shared_memory_released(&self) -> tokio::sync::futures::Notified<'_> {
-        self.memory_root.released.notified()
-    }
-
     /// Returns the cooperative maximum the shared memory pool arbitrates.
     #[must_use]
     pub fn shared_memory_limit(&self) -> usize {
@@ -2118,9 +2102,8 @@ impl BifrostResourceGovernor {
     ///
     /// Returns [`BifrostResourceError::InvalidPlan`] when an override inflates a
     /// detected resource, weakens a minimum floor, or checked plan arithmetic
-    /// cannot fit every enabled role. Private to this module so the runtime
-    /// resources owner is the only place a root governor is built.
-    fn from_snapshot(
+    /// cannot fit every enabled role.
+    pub(crate) fn from_snapshot(
         snapshot: SystemResourceSnapshot,
         policy: BifrostResourcePolicy,
     ) -> Result<Self, BifrostResourceError> {
@@ -2267,7 +2250,6 @@ impl BifrostResourceGovernor {
             oracle_interactive_queries: state.oracle_interactive_queries,
             oracle_analytical_queries: state.oracle_analytical_queries,
             oracle_query_memory_used_bytes: state.oracle_query_memory_used_bytes,
-            oracle_infallible_headroom_bytes: state.oracle_infallible_headroom_bytes,
             infallible_headroom_bytes: state.infallible_headroom_bytes,
             oracle_query_active: state.oracle_active_queries() > 0,
         })
@@ -2547,6 +2529,7 @@ impl BifrostResourceGovernor {
             MemoryHolder::Oracle,
             granted_memory_bytes,
             &memory_peak_bytes,
+            &memory_consumers,
         );
         let execution = OracleExecution::issue(
             spill,
@@ -2589,6 +2572,7 @@ impl BifrostResourceGovernor {
             query_class: request.query_class,
             execution,
             memory_peak_bytes,
+            memory_consumers,
             governor: self.clone(),
             released: false,
             admission_charge: None,
@@ -2836,8 +2820,7 @@ impl BifrostResourceGovernor {
         }
         let mut state = self.lock_state()?;
         let query_underflow = holder == MemoryHolder::Oracle
-            && (state.oracle_query_memory_used_bytes < charge.governed_bytes
-                || state.oracle_infallible_headroom_bytes < charge.headroom_bytes);
+            && state.oracle_query_memory_used_bytes < charge.governed_bytes;
         if state.infallible_headroom_bytes < charge.headroom_bytes || query_underflow {
             return Err(self.poison_locked(&mut state, "pool memory release underflow"));
         }
@@ -3525,6 +3508,7 @@ impl GovernedMemoryRoot {
             ceiling_bytes,
             ledger: Mutex::new(GovernedMemoryLedger::default()),
             peak_bytes: Arc::clone(peak_bytes),
+            live_consumers: Arc::clone(live_consumers),
         })
     }
 
@@ -3620,8 +3604,6 @@ impl GovernedMemoryRoot {
             tracing::error!(%error, "Oracle memory release could not be reconciled");
         }
         ledger.total = ledger.total.saturating_sub(shrink);
-        drop(ledger);
-        self.released.notify_waiters();
     }
 }
 
@@ -3988,11 +3970,7 @@ impl OracleQueryResources {
         )
     }
 
-    /// Releases the query envelope's slot.
-    ///
-    /// A nested child that is still being torn down keeps its own reference to
-    /// the query's memory view, so its bytes return through the shared root as
-    /// it shrinks; the view's drop is what poisons on bytes that never return.
+    /// Releases the query envelope only after every nested child is gone.
     ///
     /// Slot units return under the governor lock; the attached admission
     /// charge is then dropped outside it, and only after both is the Oracle
@@ -4001,7 +3979,8 @@ impl OracleQueryResources {
     ///
     /// # Errors
     ///
-    /// Returns a poison error when root counters diverge.
+    /// Returns a poison error while retaining root capacity when nested memory
+    /// ownership survives, or when root counters diverge.
     fn release(&mut self) -> Result<(), BifrostResourceError> {
         if self.released {
             return Ok(());
@@ -5724,7 +5703,6 @@ mod tests {
                 oracle_interactive_queries: 0,
                 oracle_analytical_queries: 0,
                 oracle_query_memory_used_bytes: 0,
-                oracle_infallible_headroom_bytes: 0,
                 infallible_headroom_bytes: 0,
                 oracle_query_active: false,
             }
@@ -6538,7 +6516,7 @@ mod tests {
         drop((analytical, interactive));
     }
 
-    /// Query release is exact, idempotent, and outlived safely by a late child.
+    /// Query release is exact, idempotent, and fail-closed on surviving children.
     #[test]
     fn oracle_release_paths_are_exact_and_idempotent() {
         let roles = BifrostRuntimeResources::composed_for_test(
@@ -6569,7 +6547,7 @@ mod tests {
             0
         );
 
-        let late_roles = BifrostRuntimeResources::composed_for_test(
+        let poisoned_roles = BifrostRuntimeResources::composed_for_test(
             1024 * MIB,
             512 * MIB as u64,
             [BifrostRole::Oracle],
@@ -6583,20 +6561,10 @@ mod tests {
             .expect("surviving child");
         drop(owner);
         assert_eq!(
-            late_roles.health().reason(),
-            None,
-            "a child still being torn down does not poison its owner's release"
+            poisoned_roles.health().reason(),
+            Some(BifrostResourcePoisonReason::Accounting)
         );
         drop(child);
-        assert_eq!(late_roles.health().reason(), None);
-        assert_eq!(
-            late_oracle
-                .snapshot()
-                .expect("a late child leaves an unpoisoned root")
-                .oracle_query_memory_used_bytes,
-            0,
-            "the late child returns its bytes through the shared root"
-        );
 
         let underflow_roles = BifrostRuntimeResources::composed_for_test(
             1024 * MIB,

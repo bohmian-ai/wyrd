@@ -2757,14 +2757,12 @@ impl Oracle {
             .await?;
         providers.done();
         let logical_planning = planned.profile.physical_planning.timer();
-        let logical = Self::before_deadline(deadline, Self::plan_logical(
-            &planning,
-            context,
-            &request.sql,
-            &request.params,
-        ))
-            .await?
-            .map_err(|OracleExecutionError::Public(error)| error)?;
+        let logical = Self::before_deadline(
+            deadline,
+            Self::plan_logical(&planning, context, &request.sql, &request.params),
+        )
+        .await?
+        .map_err(|OracleExecutionError::Public(error)| error)?;
         logical_planning.done();
         let scans = sizing::OracleScans::collect(&logical);
         let listing = planned.profile.scribe_listing.timer();
@@ -3658,7 +3656,7 @@ async fn settle_attempt_output(
         mut batches,
         scan_stats,
         degraded_sources,
-        admitted,
+        mut admitted,
         running_query,
         query_class,
     } = output;
@@ -3700,6 +3698,7 @@ async fn settle_attempt_output(
         admitted.cancellation.cancel();
         drop(batches);
         admitted.distributed_settlement.join().await;
+        admitted.drain_children().await;
         return release_error(
             deadline,
             admitted,
@@ -3944,7 +3943,7 @@ async fn release_error<T>(
 async fn settle_distributed_failure<T>(
     deadline: Instant,
     batches: SendableRecordBatchStream,
-    admitted: AdmittedQueryGuard,
+    mut admitted: AdmittedQueryGuard,
     original: BifrostError,
     phase: &'static str,
 ) -> Result<T, BifrostError> {
@@ -3952,6 +3951,7 @@ async fn settle_distributed_failure<T>(
     admitted.request_cancellation.cancel();
     drop(batches);
     admitted.distributed_settlement.join().await;
+    admitted.drain_children().await;
     release_error(deadline, admitted, original, phase).await
 }
 

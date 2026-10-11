@@ -1271,7 +1271,7 @@ impl NativeBifrostQueryStream {
 fn telemetry_schema(schema_json: &str) -> StdResult<SchemaRef, BifrostClientError> {
     let schema: Value = serde_json::from_str(schema_json)
         .map_err(|error| validation_error(format!("invalid JSON schema: {error}"), "schema"))?;
-    Ok(Arc::new(wyrd_queue::json_schema_to_arrow(&schema)?))
+    Ok(Arc::new(wyrd_types::json_schema_to_arrow(&schema)?))
 }
 
 /// Parses the optional per-row correlation at the Node boundary.

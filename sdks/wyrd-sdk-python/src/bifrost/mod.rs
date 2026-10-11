@@ -498,28 +498,16 @@ impl PyQueryTerminal {
             .collect()
     }
 
-    /// Stable failure code for a failed terminal, otherwise `None`.
-    ///
-    /// # Errors
-    ///
-    /// Raises `WyrdError` when the code has no wire name.
+    /// Stable `WyrdError` code of a failed terminal's problem, otherwise `None`.
     #[getter]
-    fn error_code(&self) -> WyrdPyResult<Option<String>> {
-        self.0
-            .error
-            .as_ref()
-            .map(|error| wire_name(&error.code))
-            .transpose()
+    fn error_code(&self) -> Option<&str> {
+        self.0.error.as_ref().map(|error| error.code.as_str())
     }
 
-    /// Scrubbed failure diagnostic for a failed terminal, when the server sent one.
+    /// Scrubbed problem detail of a failed terminal, otherwise `None`.
     #[getter]
     fn error_detail(&self) -> Option<&str> {
-        self.0
-            .error
-            .as_ref()
-            .and_then(|error| error.detail.as_ref())
-            .map(wyrd_spec::vala::api::QueryErrorDetail::as_str)
+        self.0.error.as_ref().map(|error| error.detail.as_str())
     }
 
     /// Compact debugging representation naming outcome, class, and rows.

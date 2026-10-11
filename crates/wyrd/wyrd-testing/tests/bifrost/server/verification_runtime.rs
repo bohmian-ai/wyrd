@@ -36,8 +36,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{TableRef, TableUid};
 use vala_bifrost_redux::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
-use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::oracle::AuthorizedQueryContext;
+use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::tables::{AgentTracesTable, DomainTable};
 use vala_eval::executor::{EvalReport, SkipReason, TaskRunOutcome};
 use vala_sql::queries::audit_staging::{append_audit, entry_hash};
@@ -66,9 +66,7 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::eval::TaskId;
 use wyrd_spec::vala::eval::operator::ComparisonOperator;
 use wyrd_spec::vala::eval::result::AssertionResult;
-use wyrd_spec::vala::managed_columns::{
-    CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT,
-};
+use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT};
 use wyrd_spec::vala::{AuditDetail, BifrostError, audit_detail_canonical_json};
 use wyrd_spec::verification::{DriftWindow, VerificationVerdict};
 use wyrd_sql::queries::verifier_runs::RunInput;

@@ -1,19 +1,12 @@
 //! Attempt-scoped supervision for Oracle's Analytical execution path.
 //!
-//! The leader query stream owns the complete lifetime of a distributed graph.
-//! Its [`super::analytical`] graph lifecycle revokes every follower grant,
-//! closes the graph's exchanges, and aborts local drivers synchronously when
-//! the stream ends. The stream releases the query's active-read claim only
-//! after that revocation.
-//! Remote IO that has already lost its consumer may finish after that
-//! revocation; it can no longer deliver a result or extend the claim.
-//!
-//! This module does not own query lifetime. It indexes and routes the state a
-//! follower needs between separate stage operations: it registers the
-//! attempt's query-owned runtime, splits the attempt's exchange children from
-//! the query admission already charged, hands out a cancellation child, and
-//! settles each attempt exactly once. A graph whose cleanup cannot be confirmed
-//! stays here as charged capacity residue rather than as a free slot.
+//! A distributed graph fans work out across followers, so nothing about its
+//! cleanup is implied by a leader stream ending. This module owns the one place
+//! that knows an attempt exists: it registers the attempt's query-owned runtime,
+//! splits the attempt's exchange children from the query admission already
+//! charged, hands out a cancellation child, retains every driver future
+//! started under that attempt, and releases all of it exactly once on every
+//! terminal path — success, retry, cancellation, deadline, error, or shutdown.
 //!
 //! Two properties are structural rather than conventional:
 //!
@@ -187,12 +180,10 @@ struct AnalyticalAttemptSlot {
 /// between them, so releasing the graph is the single act that returns it.
 struct AnalyticalGraphState {
     /// The admitted query envelope every attempt of this graph splits from.
-    ///
-    /// Held only to be dropped: removing the graph returns the envelope.
-    _resources: OracleQueryResources,
+    resources: OracleQueryResources,
     /// The query's admission permit, held for exactly as long as the graph is.
     ///
-    /// Declared after `_resources` on purpose: removing the graph drops the
+    /// Declared after `resources` on purpose: removing the graph drops the
     /// envelope first and the permit second, so admission counters never wake a
     /// queued waiter while this query's envelope is still charged. A graph that
     /// is retained as `Draining` therefore keeps both, which is what makes a
@@ -480,7 +471,7 @@ impl AnalyticalSupervisor {
         graphs.insert(
             graph,
             AnalyticalGraphEntry::Active(AnalyticalGraphState {
-                _resources: resources,
+                resources,
                 retained_admission: None,
                 running_query: None,
                 runtime,
@@ -867,8 +858,10 @@ impl AnalyticalSupervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when an attempt of the graph is
-    /// still live or when a lock is poisoned. Returns [`BifrostError::QueryExecutionFailed`] when the graph
+    /// Returns [`BifrostError::Internal`] when an attempt of the graph or a
+    /// nested child of its envelope is still live — releasing the envelope
+    /// beneath either would poison the resource root — or when a lock is
+    /// poisoned. Returns [`BifrostError::QueryExecutionFailed`] when the graph
     /// is not registered.
     pub(super) fn release_graph(
         &self,
@@ -1900,8 +1893,8 @@ mod tests {
     /// resolves to the query's own `RuntimeEnv` and pool rather than a process
     /// default, that the exchange child is charged against that pool, and that a
     /// second settlement of the same key is refused without returning any byte
-    /// twice — proven by the query owner returning its whole envelope at the
-    /// end.
+    /// twice — proven by the query owner releasing cleanly at the end, which it
+    /// refuses to do while a nested child survives.
     ///
     /// Required mutation RED: substitute a process runtime in
     /// [`AnalyticalSupervisor::spawn_attempt`] and the pool-identity assertion
@@ -2012,7 +2005,8 @@ mod tests {
                 .expect("a released query owner leaves an unpoisoned root")
                 .oracle_query_memory_used_bytes,
             0,
-            "the query owner returns its whole envelope"
+            "the query owner returns its whole envelope, which it refuses to do \
+             while a nested exchange child survives"
         );
         drop(metrics_guard);
 

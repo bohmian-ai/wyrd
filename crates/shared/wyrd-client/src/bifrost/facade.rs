@@ -514,30 +514,23 @@ impl Bifrost {
         rows: Vec<Vec<u8>>,
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
-        self.writer
-            .insert_rows(
-                table.fqn(),
-                table.user_schema(),
-                rows,
-                correlation.card_uid,
-                correlation.run_id,
-                None,
-            )
-            .map_err(Into::into)
+        self.insert_observation(table, rows, correlation)
     }
 
     /// Enqueue every JSON row of one observation into a described table, or
-    /// none of them, stamped with this client's clock at emit.
+    /// none of them.
     ///
-    /// The observation counterpart to [`Self::insert_rows_into`]: every row
-    /// gets one `wyrd_event_time` read now, so batching, linger, retry, and
-    /// flush never move it. A row whose own JSON carries `wyrd_event_time`
-    /// keeps that value. Plain writes stay unstamped and take the server's
-    /// receipt instant.
+    /// The crate-owned path behind [`Self::insert_rows_into`] that `observe`
+    /// emits through without the `internal` feature. Each row carries its own
+    /// time column, such as `created_at`, which the observation projection
+    /// mints at emit, so batching, linger, retry, and flush never move it.
     ///
     /// # Errors
     ///
-    /// As [`Self::insert_rows_into`].
+    /// Returns [`BifrostClientError::Queue`] with `WYRD_CLIENT_429_QUEUE_FULL`
+    /// when the producer cannot admit every row now, and with
+    /// `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE` when the record has more rows than
+    /// one producer can ever admit at once.
     pub(crate) fn insert_observation(
         &self,
         table: &WriterTable,
@@ -551,7 +544,6 @@ impl Bifrost {
                 rows,
                 correlation.card_uid,
                 correlation.run_id,
-                Some(chrono::Utc::now().timestamp_micros()),
             )
             .map_err(Into::into)
     }

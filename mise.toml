@@ -162,6 +162,19 @@ hide = true
 description = "Run the real-server CLI Card lifecycle journey with its lifecycle already provisioned"
 run = "cargo test --locked -p wyrd-cli --test cli -- --nocapture --test-threads=1"
 
+[tasks."test:local-dev:journey"]
+description = "Installed CLI bootstrap and fresh saved-config Rust, Python, TypeScript, and MCP callers"
+depends = ["py:setup", "ts:build", "ts:build:testing"]
+run = [
+  "cargo build --locked -p wyrd-cli -p wyrd-server",
+  "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads)'",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[exit]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]",
+  "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]",
+]
+
 [tasks."test:wyrdstate:journey"]
 description = "Run the real-server CLI and Rust SDK typed WyrdState and gateway administration journeys"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:wyrdstate:journey:inner'"
@@ -448,7 +461,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 [tasks."test:bifrost:journey:observe:inner"]
 hide = true
 description = "wyrd-sdk-rust observe_a_run, query_bifrost, otel_export, local_development, and support_desk stories"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development|support_desk)::/)'"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development|support_desk)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'"
 
 [tasks."test:bifrost:journey:drift"]
 description = "Tier-1 journeys: Verifiers judge in real time, and a failed scheduled drift run alerts its Operator"
@@ -619,19 +632,19 @@ description = """Complete Python SDK gate: fmt, Clippy, codegen, Python format/l
 every Python test tier. py:test:integration selects every integration-marked test, so it already runs the Bifrost,
 gateway, Card, WyrdState, and story journeys. The identity journeys need Keycloak and Dex, which one run owns at a
 time, so every verify task shares the one test:identity:journey dependency and gate runs it once."""
-depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "test:identity:journey"]
+depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "test:identity:journey", "test:local-dev:journey"]
 
 [tasks."verify:rust-sdk"]
 description = """Complete Rust SDK gate: fmt, Clippy, the wyrd-sdk-rust unit tests and every story journey on one
 Postgres lifecycle, plus the shared identity journeys (see verify:python-sdk)."""
-depends = ["check", "test:identity:journey"]
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/)'\""
+depends = ["check", "test:identity:journey", "test:local-dev:journey"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'\""
 
 [tasks."verify:typescript-sdk"]
 description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit
 tests, every integration journey (Bifrost, gateway, and story journeys), plus the shared identity journeys (see
 verify:python-sdk)."""
-depends = ["check", "codegen:check", "ts:napi:check", "ts:pack:check", "ts:format:check", "ts:lints", "ts:typecheck", "ts:test:unit", "ts:test:integration", "test:identity:journey"]
+depends = ["check", "codegen:check", "ts:napi:check", "ts:pack:check", "ts:format:check", "ts:lints", "ts:typecheck", "ts:test:unit", "ts:test:integration", "test:identity:journey", "test:local-dev:journey"]
 
 [tasks."test:rust"]
 description = """Aggregate Rust test gate: the family lanes + storage emulator matrix. Every workspace crate belongs to

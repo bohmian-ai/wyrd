@@ -339,7 +339,7 @@ pub struct UnmigratedDatabase {
     /// so it drops before the database is removed.
     migrator: PgPool,
     /// Database owner whose drop removes the isolated database.
-    _test_db: TestDatabase,
+    test_db: TestDatabase,
 }
 
 impl UnmigratedDatabase {
@@ -351,16 +351,26 @@ impl UnmigratedDatabase {
     pub async fn create() -> Result<Self, FixtureError> {
         let test_db = TestDatabase::create_empty().await?;
         let migrator = test_db.owner_pool().await?;
-        Ok(Self {
-            migrator,
-            _test_db: test_db,
-        })
+        Ok(Self { migrator, test_db })
     }
 
     /// The platform-login operator pool, which owns DDL on this database.
     #[must_use]
     pub fn migrator_pool(&self) -> &PgPool {
         &self.migrator
+    }
+
+    /// The platform-login URL of this database, for a deployment process
+    /// that migrates and serves it as `WYRD_DATABASE_URL`.
+    ///
+    /// The URL stays valid only while this value is alive; dropping it
+    /// removes the database.
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when the serving DSNs are unset or cannot be
+    /// rewritten for this database.
+    pub fn url(&self) -> Result<SecretString, FixtureError> {
+        Ok(self.test_db.resolved_dsns()?.platform_login().clone())
     }
 }
 

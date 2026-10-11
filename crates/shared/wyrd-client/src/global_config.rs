@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use wyrd_spec::card::workflow::ExternalGatewayBindingConfig;
 use wyrd_spec::ids::CredentialBindingName;
 
+use crate::credentials_file::CredentialsFile;
 use crate::environment::Environment;
 use crate::error::WyrdClientError;
 
@@ -68,6 +70,82 @@ pub enum TokenCacheKind {
 }
 
 impl GlobalConfig {
+    /// Read the protected file-floor key for local setup without consulting
+    /// environment credentials or saved human logins.
+    ///
+    /// # Errors
+    /// Refuses unsafe or corrupt credential storage and an unresolved directory.
+    pub fn local_api_key(
+        environment: &Environment,
+    ) -> Result<Option<SecretString>, WyrdClientError> {
+        let dir = environment
+            .config_dir()
+            .ok_or_else(|| WyrdClientError::Config {
+                field: "config_home".to_owned(),
+                reason: "set WYRD_CONFIG_HOME, XDG_CONFIG_HOME, or HOME".to_owned(),
+            })?;
+        let store = CredentialsFile::at(dir.clone());
+        let _lock = store.lock()?;
+        CredentialsFile::config_at(dir).document()?;
+        let document = store.document()?;
+        CredentialsFile::api_key(&document)
+    }
+
+    /// Save local setup's HTTP and gRPC endpoints and expected tenant key in
+    /// the existing protected files, preserving comments and other settings.
+    /// Both endpoints are replaced together so a fresh client never pairs the
+    /// local key with a stale endpoint from another deployment.
+    ///
+    /// An existing different default key is never overwritten. The credential
+    /// is committed first: a later endpoint failure leaves the key recoverable
+    /// by rerunning with the same configuration directory.
+    ///
+    /// # Errors
+    /// Refuses unsafe or corrupt files, a conflicting key, and IO failures.
+    /// After a configuration-write failure the credential may already be saved.
+    pub fn save_local(
+        environment: &Environment,
+        server: &str,
+        grpc: &str,
+        credential: Option<&SecretString>,
+    ) -> Result<(), WyrdClientError> {
+        let dir = environment
+            .config_dir()
+            .ok_or_else(|| WyrdClientError::Config {
+                field: "config_home".to_owned(),
+                reason: "set WYRD_CONFIG_HOME, XDG_CONFIG_HOME, or HOME".to_owned(),
+            })?;
+        let credentials = CredentialsFile::at(dir.clone());
+        let _lock = credentials.lock()?;
+        let config = CredentialsFile::config_at(dir);
+        let mut settings = config.document()?;
+        let mut keys = credentials.document()?;
+        toml::from_str::<Self>(&settings.to_string()).map_err(|_| WyrdClientError::Config {
+            field: "global_config".to_owned(),
+            reason: "config.toml contains invalid settings".to_owned(),
+        })?;
+        let existing = CredentialsFile::api_key(&keys)?;
+        if existing.as_ref().is_some_and(|key| {
+            credential.is_none_or(|expected| key.expose_secret() != expected.expose_secret())
+        }) {
+            return Err(WyrdClientError::Config {
+                field: "credentials".to_owned(),
+                reason: "an existing default key is preserved; use a separate WYRD_CONFIG_HOME for this deployment".to_owned(),
+            });
+        }
+        if let Some(credential) = credential.filter(|_| existing.is_none()) {
+            keys["default"]["api_key"] = toml_edit::value(credential.expose_secret());
+            if let Some(profile) = keys["default"].as_table_like_mut() {
+                profile.remove("access_token");
+                profile.remove("access_expires_at");
+            }
+            credentials.replace(&keys)?;
+        }
+        settings["client"]["http_url"] = toml_edit::value(server);
+        settings["client"]["grpc_url"] = toml_edit::value(grpc);
+        config.replace(&settings)
+    }
+
     /// Load `config.toml` from the resolved Wyrd config directory.
     ///
     /// A missing directory or file is equivalent to an empty configuration.
@@ -126,11 +204,94 @@ impl GlobalConfig {
 
 #[cfg(test)]
 mod tests {
+    use crate::credentials_file::private_tempdir;
+    use crate::environment::Environment;
+    use secrecy::SecretString;
     use std::fs;
 
     use tempfile::tempdir;
 
     use super::{GlobalConfig, TokenCacheKind};
+
+    /// Local bootstrap preserves unrelated settings and refuses to replace a
+    /// different default key; a rerun with the saved key is harmless.
+    ///
+    /// # Panics
+    /// Panics when persistence changes unrelated content or accepts a conflict.
+    #[test]
+    fn local_setup_preserves_content_and_existing_key() {
+        let dir = private_tempdir();
+        let environment =
+            Environment::from([("WYRD_CONFIG_HOME", dir.path().to_str().expect("UTF-8 path"))]);
+        fs::write(
+            dir.path().join("config.toml"),
+            "# retain this comment\n[client]\ngrpc_url = 'https://stale.example.com:50051'\n[client.token_cache]\nkind = 'disk'\n",
+        )
+        .expect("config fixture");
+        let key = SecretString::from("first-key".to_owned());
+        GlobalConfig::save_local(
+            &environment,
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:50051",
+            Some(&key),
+        )
+        .expect("first save");
+        let credentials_path = dir.path().join("credentials.toml");
+        let mut retained = fs::read_to_string(&credentials_path).expect("credentials saved");
+        retained.push_str("# retained cache\naccess_token = 'cached-token'\naccess_expires_at = '2099-01-01T00:00:00Z'\n");
+        fs::write(&credentials_path, retained).expect("cache fixture");
+        let credentials = fs::read(&credentials_path).expect("cached credentials");
+        GlobalConfig::save_local(
+            &environment,
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:50051",
+            Some(&key),
+        )
+        .expect("retry");
+        assert!(
+            GlobalConfig::save_local(
+                &environment,
+                "http://127.0.0.1:9090",
+                "http://127.0.0.1:50052",
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(dir.path().join("credentials.toml")).expect("credentials retained"),
+            credentials
+        );
+        assert!(
+            fs::read_to_string(dir.path().join("config.toml"))
+                .expect("config saved")
+                .contains("# retain this comment")
+        );
+        assert_eq!(
+            GlobalConfig::load_in(&environment)
+                .expect("loads")
+                .client
+                .token_cache
+                .expect("cache retained")
+                .kind,
+            Some(TokenCacheKind::Disk)
+        );
+        assert!(
+            GlobalConfig::save_local(
+                &environment,
+                "http://127.0.0.1:9090",
+                "http://127.0.0.1:50052",
+                Some(&SecretString::from("other-key".to_owned()))
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(dir.path().join("credentials.toml")).expect("original key retained"),
+            credentials
+        );
+        let saved = GlobalConfig::load_in(&environment).expect("loads").client;
+        assert_eq!(saved.http_url.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(saved.grpc_url.as_deref(), Some("http://127.0.0.1:50051"));
+    }
 
     #[test]
     fn missing_file_returns_default() {

@@ -214,3 +214,40 @@ impl InstallArgs {
         }
     }
 }
+
+/// Offer the existing host installer after a local deployment is usable.
+/// Scripts select no hosts implicitly; no detected hosts is a harmless skip.
+///
+/// # Errors
+/// Returns the same per-host failures as independent MCP installation.
+pub(crate) async fn offer_local(hosts: &[McpHost], server: &str) -> Result<(), WyrdCliError> {
+    if hosts.is_empty()
+        && (!io::stdin().is_terminal()
+            || HostInstaller::from_process(Some(server))
+                .detected()
+                .is_empty())
+    {
+        println!("MCP setup skipped; connect a host later with wyrd mcp install.");
+        return Ok(());
+    }
+    let mut chosen = hosts.to_vec();
+    #[cfg(unix)]
+    if chosen.is_empty() {
+        chosen = hosts::prompt_local_selection(
+            &HostInstaller::from_process(Some(server)).detected(),
+            &mut io::stdout(),
+        )
+        .await
+        .map_err(|source| WyrdCliError::Io { source })?;
+        if chosen.is_empty() {
+            println!("No host selected; nothing changed.");
+            return Ok(());
+        }
+    }
+    InstallArgs {
+        hosts: chosen,
+        server: Some(server.to_owned()),
+    }
+    .run()?;
+    Ok(())
+}

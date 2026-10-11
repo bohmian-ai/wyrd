@@ -8,124 +8,83 @@ order: 9
 
 # Local development
 
-This journey runs the same one-process boot path production uses: an external
-PostgreSQL, a one-off migration, and a server. Locally one ordinary login in
-`WYRD_DATABASE_URL` does all three. Everything lives on your machine and
-survives restarts.
-The next steps up are a [development server on Kubernetes](/self-hosting/kubernetes-development/)
-and a [production server on Kubernetes](/self-hosting/kubernetes-production/).
-
-<Aside title="Just want a throwaway server?">
-
-`mise run dev:backend` runs the same migrate-then-serve sequence against a
-throwaway Postgres that is **deleted when the server exits**. Nothing you create there survives a restart, so use
-the steps below for anything you want to keep.
-
-</Aside>
+`wyrd server dev --tenant acme` starts a local Wyrd server and saves its tenant credential and endpoint for fresh CLI and SDK processes. Supply PostgreSQL first and start the command from a directory you will keep: local artifacts and Bifrost state live under `.wyrd/` there.
 
 ## Prerequisites
 
-- A repository checkout with [`mise`](https://mise.jdx.dev/) (it pins the Rust toolchain).
-- Docker, for the local PostgreSQL 16 container.
-- `openssl`, for the signing key.
+- macOS or glibc Linux, on x86_64 or arm64.
+- An installed Python or TypeScript Wyrd package, which includes `wyrd`.
+- PostgreSQL 16 with an ordinary login that owns the database objects. The server refuses superuser and `BYPASSRLS` logins.
 
-## Environment
+The command uses an existing installed compatible server. When none exists, it downloads and verifies the newest stable release. It never updates an existing installation implicitly; `wyrd server install` is the explicit update command. Before the first official release, a download cannot succeed. An existing development installation can exercise the journey, but the CLI does not fall back to building a server from a checkout.
 
-| Variable | When | Value in this journey | Source |
-| --- | --- | --- | --- |
-| `WYRD_DATABASE_URL` | Required | `postgresql://wyrd:…@127.0.0.1:5432/wyrd` | The login you create below. It owns the database, migrates, and serves. |
-| `WYRD_PLATFORM_DATABASE_URL` | Not used | unset | Set it only to separate the platform login, as [production](/self-hosting/database/#serving) does. When unset, it defaults to `WYRD_DATABASE_URL`. |
-| `WYRD_STORAGE_URL` | Optional | unset | When unset, storage is `.wyrd/storage` under the working directory, created on first start. A development object store such as MinIO also works: see [Storage](/self-hosting/storage/). |
-| `WYRD_BIFROST_DATA_DIR` | Recommended | `$PWD/.wyrd-dev/bifrost` | Scribe WAL, staging, and stable node identity. It defaults to `.wyrd/bifrost` under the working directory, so set it to stay independent of where you start the server. |
-| `APP_ENV` | Optional | `development` (the default) | Relaxes the production gates below. |
-| `WYRD_SIGNING_KEY_FILE` | Optional in development | `$PWD/.wyrd-dev/signing.pem` | Generated below. When unset, development mints an **ephemeral** key on each boot, so access tokens stop verifying after a restart. API keys stay valid either way. |
-| `WYRD_TARGET` | Optional | unset (`all`) | One process runs Scribe, Oracle, and Forge. |
-| `WYRD_PEER_ADDRESS`, `WYRD_PEER_TLS_DIR` | Not used | unset | Only for [peer mode](/self-hosting/configuration/#peer-mode). The default `all` process makes every Bifrost call in-process and opens no private listener. |
+## Start local Wyrd
 
-The server binds HTTP on `0.0.0.0:8080` and gRPC on `127.0.0.1:50051`. Clients
-derive gRPC from the server URL (same host, port `50051`).
-
-## 1. Durable PostgreSQL
+Set the URL of your external database; replace the login and password with yours:
 
 ```bash
-mkdir -p .wyrd-dev
-docker volume create wyrd-dev-pg
-docker run -d --name wyrd-dev-pg -p 127.0.0.1:5432:5432 \
-  -e POSTGRES_PASSWORD=admin-dev-pw \
-  -v wyrd-dev-pg:/var/lib/postgresql/data postgres:16
-until docker exec wyrd-dev-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
-docker exec wyrd-dev-pg psql -U postgres -v ON_ERROR_STOP=1 \
-  -c "CREATE ROLE wyrd LOGIN PASSWORD 'wyrd-dev-pw'" \
-  -c "CREATE DATABASE wyrd OWNER wyrd"
+export WYRD_DATABASE_URL="postgresql://wyrd:YOUR_PASSWORD@127.0.0.1:5432/wyrd"
+wyrd server dev --tenant acme
 ```
 
-The named volume keeps the database across container restarts. The container's
-`postgres` superuser only creates the login; the server refuses to run as a
-superuser, which row-level security cannot scope. See
-[Database](/self-hosting/database/) for the two logins production uses.
+The command migrates the database, starts the ordinary server, waits for readiness, and provisions `acme` through the server. On macOS it supplies the same host-memory input as the repository's development launcher when you have not set `WYRD_BIFROST_MEMORY_LIMIT_BYTES`.
 
-## 2. Build, migrate, and generate a stable signing key
+The default HTTP endpoint is `http://127.0.0.1:8080`. To use a different local port, set `WYRD_SERVER_BIND` to a loopback address before starting. The public gRPC listener defaults to `127.0.0.1:50051`; set `WYRD_GRPC_BIND` to another loopback address to move it. Non-loopback addresses are refused before setup, and these selections override a server config file.
+
+On first use, the tenant key is saved in `credentials.toml`, with owner-only permissions. The HTTP and gRPC endpoints are saved in `config.toml`, replacing any earlier endpoints there. Both files use the existing Wyrd config directory (`WYRD_CONFIG_HOME`, otherwise `XDG_CONFIG_HOME/wyrd` or `~/.config/wyrd`). Unrelated settings and comments remain intact; another tenant's default key is never overwritten. Use a separate `WYRD_CONFIG_HOME` for another local deployment.
+
+If the platform root is newly initialized, its one-time administrative credential is disclosed only to the invoking terminal. Store it securely. When no terminal is available, the command prints recovery guidance without printing the root credential to stdout or stderr. Tenant credentials are never printed.
+
+The first interactive setup offers detected MCP hosts. Select the hosts you want, or decline and keep using the CLI and SDKs. Later starts find the saved configuration and skip the question, even after a decline; use `wyrd mcp install` to connect hosts later. Scripts connect no hosts unless selected explicitly, on any start:
 
 ```bash
-mise exec -- cargo build -p wyrd-server -p wyrd-cli
-
-export WYRD_DATABASE_URL="postgresql://wyrd:wyrd-dev-pw@127.0.0.1:5432/wyrd"
-./target/debug/wyrd-server migrate
-# -> Wyrd and Vala schemas are migrated and valid.
-
-openssl genpkey -algorithm ed25519 -out .wyrd-dev/signing.pem
+wyrd server dev --tenant acme --host codex
 ```
 
-## 3. Serve
+Keep this process running. After the `Local Wyrd ready at …` message, open a second terminal with the same configuration directory:
 
 ```bash
-export APP_ENV=development
-export WYRD_DATABASE_URL="postgresql://wyrd:wyrd-dev-pw@127.0.0.1:5432/wyrd"
-export WYRD_BIFROST_DATA_DIR="$PWD/.wyrd-dev/bifrost"
-export WYRD_SIGNING_KEY_FILE="$PWD/.wyrd-dev/signing.pem"
-
-./target/debug/wyrd-server
+wyrd list
 ```
 
-In a second terminal:
+A new tenant has no Cards, so the list is empty. No exported API key or server URL is needed. Explicit credentials and endpoint overrides still take precedence for ordinary clients; remove unrelated overrides when testing the saved local configuration.
+
+## Stop and restart
+
+Press Ctrl-C in the server terminal. The CLI forwards termination and waits for the server to drain. Restart from the same working directory, database, tenant, and config directory:
 
 ```bash
-curl -s http://127.0.0.1:8080/healthz   # -> ok (the process is up)
-curl -s http://127.0.0.1:8080/readyz    # 200 once the schema, storage, and Bifrost roles are ready
+wyrd server dev --tenant acme
 ```
 
-## 4. First-use setup
+A restart asks no questions. Migrations are safe to rerun. An active tenant keeps its existing key, and the installed release is retained. PostgreSQL, `.wyrd/`, and the config directory must all survive if you want to keep the deployment. Without a configured persistent signing key, a restart invalidates previously issued access tokens; clients can exchange the saved API key again.
 
-Run setup once, from a terminal with the same `WYRD_DATABASE_URL` exported:
+## Recover a failed setup
+
+`WYRD_CLI_503_SERVER_DEV` identifies the failed stage and a redacted recovery action. The CLI stops its serving child on failure. Committed migrations or tenant provisioning remain.
+
+| Failed stage | Recovery |
+| --- | --- |
+| Input or listener | Set the database URL or choose an available loopback address, then rerun. |
+| Migration | Check connectivity and that the migration login owns the database objects. Rerun with the same database. |
+| Readiness | Read the server's diagnostics, correct its configuration, and rerun. Production hardening still applies when `APP_ENV=production`. |
+| Local persistence | Restore safe directory/file permissions and rerun. A key already saved before an endpoint-write failure is retained. |
+| Saved credential | Restore the requested tenant's original key. Rerunning never issues a replacement for an active tenant. Use explicit platform tenant administration recovery if the one-time key was lost. |
+
+If the root exists but tenant creation failed, rerun with the stored `WYRD_PLATFORM_CREDENTIAL`. `wyrd-server recover-root` restores lost platform access. Tenant recovery is an explicit administrative action. Start the installed server directly with the same database and local settings, because a failed `server dev` command stops its child. For direct recovery on macOS, also set `WYRD_BIFROST_MEMORY_LIMIT_BYTES` to the output of `sysctl -n hw.memsize`; the automatic local launcher supplies this only to its children. For the default config directory:
 
 ```bash
-./target/debug/wyrd-server setup --tenant acme
+export WYRD_SERVER_BIND=127.0.0.1:8080
+~/.config/wyrd/server/current/wyrd-server
 ```
 
-On a fresh database it creates the platform root, prints the root credential
-(`wyrd_global_…`), creates tenant `acme` through the running server, and prints
-the tenant's `admin_credential: wyrd_sk_…`. Each credential is shown exactly
-once and never written to the server log. Store both now. Rerunning setup for
-an existing tenant changes nothing and discloses nothing. To create another
-tenant after the root exists, export the root credential as
-`WYRD_PLATFORM_CREDENTIAL` first.
-
-## 5. An authenticated client request
+In a second terminal, export the same database URL. If the platform credential was lost, run the installed server's `recover-root` command and store its one-time output securely. Set `WYRD_PLATFORM_CREDENTIAL` to that credential without putting it in command arguments. Use the tenant UUID printed before the persistence failure:
 
 ```bash
-export WYRD_SERVER_URL=http://127.0.0.1:8080
-export WYRD_API_KEY=wyrd_sk_…            # the admin_credential from setup
-
-mkdir -p hello && cat > hello/card.yaml <<'YAML'
-apiVersion: wyrd/v1
-kind: Prompt
-metadata: {name: hello-prompt, version: 1.0.0, space: default}
-spec: {provider: openai, model: gpt-4o, messages: [hello]}
-YAML
-
-./target/debug/wyrd apply hello             # write: register the Card
-./target/debug/wyrd list --kind Prompt      # read it back
+wyrd platform tenant recover-admin --tenant YOUR_TENANT_UUID --server http://127.0.0.1:8080
 ```
+
+This intentionally issues a replacement credential for the existing administrator and prints it once. Restore `[default].api_key` in `credentials.toml` using an editor with `umask 077`, and verify the file mode is `0600`. Remove any old `access_token` and `access_expires_at` values. Stop the directly started server before rerunning `wyrd server dev --tenant acme`. With `WYRD_CONFIG_HOME` or `XDG_CONFIG_HOME`, use that directory's `server/current/wyrd-server` instead of the default path. Automatic retries never perform recovery.
 
 ## 6. The whole workflow with the admin key
 
@@ -146,7 +105,7 @@ from wyrd.client import WyrdClient
 from wyrd.gateway import GatewayAuth
 from wyrd.state import WyrdState
 
-client = WyrdClient()                       # WYRD_SERVER_URL and WYRD_API_KEY
+client = WyrdClient()                       # saved endpoint and tenant key
 cards = Cards(client)
 cards.register_from_path("assistant.yaml")  # a Service and the Cards it binds
 bundle = cards.hydrate(CardRef("Service", "assistant", "1.0.0"), "bundle").destination
@@ -186,36 +145,8 @@ login, refreshing it as each access token expires. The Rust (`otel` feature,
 `wyrd_sdk::otel`) and TypeScript (`@wyrd/sdk/otel`, `gatewayFetch`) SDKs
 provide the same adapters.
 
-## Restart persistence
-
-Stop the server (`Ctrl-C`) and start it again with the same environment. The
-Card is still listed, the API key still works, and access tokens issued before
-the restart still verify because the signing key is stable. Postgres
-persists in the `wyrd-dev-pg` volume; artifacts and Bifrost state persist under
-`.wyrd-dev/`. Deleting either one loses that data. Without
-`WYRD_SIGNING_KEY_FILE`, only already-issued access tokens are lost on restart;
-clients exchange their API key again.
-
-## Failure and recovery
-
-| Symptom | Cause | Recovery |
-| --- | --- | --- |
-| Boot fails with `WYRD_SQL_503_SCHEMA_NOT_READY` | The schema is unmigrated or from another build, its policies drifted, or the login is a superuser. The error names the cause. | Run step 2's `migrate` with the same URL, then start again. |
-| `migrate` reports a conflict | Another migrator holds the database-wide migration lease. | Wait for it to finish, then rerun. `migrate` is idempotent. |
-| `setup` asks for `WYRD_PLATFORM_CREDENTIAL` | The platform root already exists. | Export the stored root credential. If it is lost, run `wyrd-server recover-root` against the same database. |
-| Startup names a missing `WYRD_DATABASE_URL` | The required database URL is unset. | Export it and start again. |
-
-To start over, stop the server, `docker rm -f wyrd-dev-pg && docker volume rm wyrd-dev-pg`, and delete `.wyrd-dev/`.
-
-## What changes outside development
-
-`APP_ENV=production` requires a real signing key and gRPC reflection off. A
-single standalone process may keep a durable `file://` store, but peer-mode
-replicas need one shared object store. Continue with
-[Development server on Kubernetes](/self-hosting/kubernetes-development/).
-
 ## Related
 
-- [Configuration](/self-hosting/configuration/): every variable.
-- [Database](/self-hosting/database/): roles, migrations, and readiness checks.
-- [Authentication](/self-hosting/authentication/): token exchange and key rotation.
+- [Configuration](/self-hosting/configuration/): server variables and production requirements.
+- [Database](/self-hosting/database/): roles and migration ownership.
+- [Authentication](/self-hosting/authentication/): platform recovery and tenant keys.

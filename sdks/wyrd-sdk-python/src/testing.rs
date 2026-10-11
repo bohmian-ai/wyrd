@@ -21,7 +21,10 @@ use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_testing::human_login::{HUMAN_PUBLIC_ORIGIN, HumanSso};
-use wyrd_testing::{Bootstrap, WyrdTestServer as TestServer, WyrdTestServerError};
+use wyrd_testing::{
+    Bootstrap, UnmigratedDatabase as EmptyDatabase, WyrdTestServer as TestServer,
+    WyrdTestServerError,
+};
 use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 /// Serializes every harness mutation of the `WYRD_*` endpoint variables.
@@ -760,10 +763,79 @@ fn not_started() -> WyrdPyError {
     harness_error("WyrdTestServer not started (use as context manager)")
 }
 
-/// Registers [`WyrdTestServer`] on the `wyrd._wyrd.testing` submodule.
+/// Python context manager over one isolated, unmigrated database.
+///
+/// Entering creates the database through the Rust fixture owner on the shared
+/// runtime; exiting drops it. A deployment process under test receives
+/// [`UnmigratedDatabase::url`] as its database URL and migrates it itself,
+/// so the database lives exactly as long as the `with` block.
+#[pyclass(module = "wyrd._wyrd.testing")]
+pub struct UnmigratedDatabase {
+    /// Created database while entered; dropping it removes the database.
+    database: Option<EmptyDatabase>,
+    /// Platform-login URL of the entered database.
+    url: Option<SecretString>,
+}
+
+#[pymethods]
+impl UnmigratedDatabase {
+    /// Creates an unentered handle; `__enter__` creates the database.
+    #[new]
+    #[pyo3(signature = ())]
+    fn __new__() -> Self {
+        Self {
+            database: None,
+            url: None,
+        }
+    }
+
+    /// Create the empty database and resolve its platform-login URL.
+    ///
+    /// # Errors
+    /// Raises the harness error when the repository-managed test Postgres
+    /// variables are unset or the database cannot be created.
+    fn __enter__(mut slf: PyRefMut<'_, Self>) -> WyrdPyResult<PyRefMut<'_, Self>> {
+        let database = wyrd_runtime::runtime()
+            .block_on(EmptyDatabase::create())
+            .map_err(harness_error)?;
+        slf.url = Some(database.url().map_err(harness_error)?);
+        slf.database = Some(database);
+        Ok(slf)
+    }
+
+    /// Drop the database, terminating any remaining connections to it.
+    ///
+    /// Never suppresses an exception raised inside the `with` block.
+    fn __exit__(
+        &mut self,
+        _exc_type: Option<Bound<'_, PyAny>>,
+        _exc_value: Option<Bound<'_, PyAny>>,
+        _traceback: Option<Bound<'_, PyAny>>,
+    ) -> bool {
+        self.url = None;
+        let _runtime = wyrd_runtime::runtime().enter();
+        self.database = None;
+        false
+    }
+
+    /// Platform-login URL of the entered database.
+    ///
+    /// # Errors
+    /// Raises the harness error outside the context manager.
+    #[getter]
+    fn url(&self) -> WyrdPyResult<String> {
+        self.url
+            .as_ref()
+            .map(|url| url.expose_secret().to_owned())
+            .ok_or_else(|| harness_error("UnmigratedDatabase not entered (use as context manager)"))
+    }
+}
+
+/// Registers the testing classes on the `wyrd._wyrd.testing` submodule.
 ///
 /// # Errors
-/// Returns a Python error when the class cannot be added.
+/// Returns a Python error when a class cannot be added.
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<WyrdTestServer>()
+    module.add_class::<WyrdTestServer>()?;
+    module.add_class::<UnmigratedDatabase>()
 }

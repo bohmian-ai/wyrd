@@ -662,6 +662,79 @@ pub(super) fn prompt_selection(
     input: &mut impl BufRead,
     output: &mut impl Write,
 ) -> io::Result<Vec<McpHost>> {
+    show_hosts(detected, output)?;
+    loop {
+        show_question(output)?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "no host selection was entered",
+            ));
+        }
+        if let Some(chosen) = selected_hosts(detected, &answer) {
+            return Ok(chosen);
+        }
+        writeln!(output, "Enter numbers between 1 and {}.", detected.len())?;
+    }
+}
+
+/// Local startup must remain interruptible while offering hosts. Open the
+/// actual tty device: macOS kqueue cannot watch the `/dev/tty` alias.
+///
+/// # Errors
+/// Propagates terminal open, registration, input, UTF-8, and output failures.
+#[cfg(unix)]
+pub(super) async fn prompt_local_selection(
+    detected: &[McpHost],
+    output: &mut impl Write,
+) -> io::Result<Vec<McpHost>> {
+    use rustix::fs::{Mode, OFlags};
+    use tokio::io::unix::AsyncFd;
+
+    let path = rustix::termios::ttyname(io::stdin(), Vec::new())?;
+    let terminal = AsyncFd::new(rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)?;
+    show_hosts(detected, output)?;
+    loop {
+        show_question(output)?;
+        let mut answer = Vec::new();
+        loop {
+            let mut ready = terminal.readable().await?;
+            let mut byte = [0];
+            let Ok(read) = ready
+                .try_io(|fd| rustix::io::read(fd.get_ref(), &mut byte).map_err(io::Error::from))
+            else {
+                continue;
+            };
+            if read? == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "no host selection was entered",
+                ));
+            }
+            answer.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        let answer = String::from_utf8(answer)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if let Some(chosen) = selected_hosts(detected, &answer) {
+            return Ok(chosen);
+        }
+        writeln!(output, "Enter numbers between 1 and {}.", detected.len())?;
+    }
+}
+
+/// Render the same detected-host menu for both terminal input paths.
+///
+/// # Errors
+/// Propagates any write failure on `output`; nothing is flushed here.
+fn show_hosts(detected: &[McpHost], output: &mut impl Write) -> io::Result<()> {
     writeln!(output, "Detected MCP hosts:")?;
     for (index, host) in detected.iter().enumerate() {
         writeln!(
@@ -672,37 +745,37 @@ pub(super) fn prompt_selection(
             host.name()
         )?;
     }
-    loop {
-        write!(
-            output,
-            "Connect which hosts to Wyrd? [numbers, all, or empty for none]: "
-        )?;
-        output.flush()?;
-        let mut answer = String::new();
-        if input.read_line(&mut answer)? == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "no host selection was entered",
-            ));
-        }
-        let answer = answer.trim();
-        if answer.eq_ignore_ascii_case("all") {
-            return Ok(detected.to_vec());
-        }
-        let chosen: Option<Vec<McpHost>> = answer
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                part.parse::<usize>()
-                    .ok()
-                    .and_then(|number| detected.get(number.checked_sub(1)?).copied())
-            })
-            .collect();
-        match chosen {
-            Some(chosen) => return Ok(chosen),
-            None => writeln!(output, "Enter numbers between 1 and {}.", detected.len())?,
-        }
+    Ok(())
+}
+
+/// Flush the question before either reader waits for input.
+///
+/// # Errors
+/// Propagates a write or flush failure on `output`, so no reader waits on a
+/// question the user never saw.
+fn show_question(output: &mut impl Write) -> io::Result<()> {
+    write!(
+        output,
+        "Connect which hosts to Wyrd? [numbers, all, or empty for none]: "
+    )?;
+    output.flush()
+}
+
+/// Interpret one answer with the installer's existing selection grammar.
+fn selected_hosts(detected: &[McpHost], answer: &str) -> Option<Vec<McpHost>> {
+    let answer = answer.trim();
+    if answer.eq_ignore_ascii_case("all") {
+        return Some(detected.to_vec());
     }
+    answer
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<usize>()
+                .ok()
+                .and_then(|number| detected.get(number.checked_sub(1)?).copied())
+        })
+        .collect()
 }
 
 /// Unit coverage for selection parsing and in-memory host edits.

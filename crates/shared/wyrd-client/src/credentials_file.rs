@@ -53,6 +53,8 @@ struct DefaultProfile {
 pub(crate) struct CredentialsFile {
     /// `{wyrd_config_dir}`, or a caller-chosen directory.
     dir: PathBuf,
+    /// Protected sibling file selected by its existing owner.
+    filename: &'static str,
 }
 
 /// An exclusive hold on the configuration directory's OS lock, released on
@@ -71,7 +73,38 @@ impl CredentialsFile {
 
     /// The credential file `dir/credentials.toml`.
     pub(crate) fn at(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            filename: CREDENTIALS_FILE,
+        }
+    }
+
+    /// Apply the credential store's ownership, locking, and atomic-write
+    /// protections to the sibling global configuration file.
+    pub(crate) fn config_at(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            filename: "config.toml",
+        }
+    }
+
+    /// Validate the existing default profile and read its key without exposing
+    /// malformed credential values in an error.
+    ///
+    /// # Errors
+    /// Returns a redacted corrupt-store error for an invalid profile.
+    pub(crate) fn api_key(
+        document: &toml_edit::DocumentMut,
+    ) -> Result<Option<SecretString>, WyrdClientError> {
+        let profile =
+            toml::from_str::<DefaultProfileFile>(&document.to_string()).map_err(|_| {
+                saved_login("corrupt", "credentials.toml has an invalid default profile")
+            })?;
+        Ok(profile
+            .default
+            .and_then(|profile| profile.api_key)
+            .filter(|key| !key.is_empty())
+            .map(SecretString::from))
     }
 
     /// The access token cached beside `[default].api_key`, with its expiry,
@@ -174,9 +207,9 @@ impl CredentialsFile {
         sync_dir(&self.dir)
     }
 
-    /// Path of `credentials.toml`.
+    /// Path of the selected protected sibling file.
     pub(crate) fn path(&self) -> PathBuf {
-        self.dir.join(CREDENTIALS_FILE)
+        self.dir.join(self.filename)
     }
 
     /// Check the configuration directory, creating it private to the user
@@ -239,13 +272,15 @@ impl CredentialsFile {
         }
     }
 
-    /// The text of `credentials.toml`, `None` when it or the configuration
+    /// The selected file text, `None` when it or the configuration
     /// directory does not exist.
     ///
     /// # Errors
     /// Returns [`WyrdClientError::SavedLogin`] with reason `unsafe_store`
     /// when the directory is unsafe or the file is not a regular file owned
-    /// by and private to the user (`0600`), and `io` when it cannot be read.
+    /// by the user, or has forbidden mode bits. Credentials must be private
+    /// (`0600`); config may be readable but never writable by others. Returns
+    /// `io` when the file cannot be read.
     pub(crate) fn read_text(&self) -> Result<Option<String>, WyrdClientError> {
         if !self.check_dir(false)? {
             return Ok(None);
@@ -259,7 +294,15 @@ impl CredentialsFile {
         if !metadata.is_file() {
             return Err(unsafe_store(&path, "is not a regular file"));
         }
-        check_owned(&path, &metadata, 0o077)?;
+        check_owned(
+            &path,
+            &metadata,
+            if self.filename == CREDENTIALS_FILE {
+                0o077
+            } else {
+                0o022
+            },
+        )?;
         std::fs::read_to_string(&path)
             .map(Some)
             .map_err(|error| io_failure(&error))

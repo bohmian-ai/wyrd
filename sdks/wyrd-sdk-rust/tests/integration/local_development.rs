@@ -323,3 +323,21 @@ async fn start_telemetry_refuses_the_applications_own_subscriber() {
     assert_eq!(refusal.code(), "WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS");
     local.deployment.shutdown().await;
 }
+
+/// A fresh SDK process authenticates from the installed CLI's saved files.
+/// Run through the installed-CLI integration fixture inside the Postgres wrapper.
+///
+/// # Panics
+/// Panics when bootstrap configuration or the representative write/read fails.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires the installed CLI local-development fixture"]
+async fn cli_bootstrap_saved_config_connects() {
+    let client = WyrdClient::from_global().expect("saved endpoint and credential");
+    let cards = Cards::with_client(client);
+    let receipt = register(&cards, "cards/gateway_inference/ask-prompt.yaml").await;
+    let card = cards
+        .get(wyrd_sdk::cards::CardSelector::exact(receipt.root))
+        .await
+        .expect("saved-config client reads its write");
+    assert_eq!(card.metadata.name.as_str(), "ask-prompt");
+}

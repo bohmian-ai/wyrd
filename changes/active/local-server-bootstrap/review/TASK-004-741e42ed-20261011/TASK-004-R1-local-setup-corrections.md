@@ -114,3 +114,36 @@ The last command is the exact two-case regression reproduction: both tests must 
 Run `mise run fmt` and `mise run lints` for the Rust write set, plus `mise run py:format`, `mise run py:lints`, and `mise run py:typecheck` for the Python testing projection and fixture. Regenerate typing through its existing source/generator and run `mise run codegen:check`; never hand-edit generated stubs. Run `mise run check:deps` and `mise run check:py-wheel-no-testing` to preserve test-only dependency/package boundaries, `mise run docs:check` for the first-setup/restart documentation, and `git diff --check`. Do not require full user-journey suites, all Bifrost/SDK suites, or `mise run gate` for this remediation. Final integrated change review owns those broader journeys once.
 
 Record exact commands, selected test counts, traces/diagnoses, closure against each FIND ID, and the separately identified user-directed first-use prompting behavior. A later `$wyrd-task-review` audits the original task, this verdict/ledger, this remediation, the explicit user instruction, and the complete cumulative fixed candidate.
+
+## Implementation evidence
+
+Status: `IMPLEMENTED` on `local-server-bootstrap-task-004` (commits `a3ba519f3`..HEAD over reviewed `741e42ed9`).
+
+Reuse map: per-test databases use the existing `wyrd_dev_fixtures::pg::UnmigratedDatabase` owner (gap: no URL accessor, no Python projection). Added `UnmigratedDatabase::url()`, which also replaced hand-built URL code in `pg_tests.rs`, a `wyrd-testing` re-export, and a `testing`-feature `wyrd.testing.UnmigratedDatabase` context manager whose stub source is `stubs/testing.pyi`. gRPC selection reuses the existing `local_bind` input boundary (now `local_binds` + `loopback`) and the locked `GlobalConfig::save_local` writer. Child-exit observation reuses `DevServer`'s retained child (`exited`). Detection of completed setup reuses `validate_local_config`'s protected key and config reads.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| FIND-TASK-004-1 | `test_local_development.py` `local_deployment` owns `UnmigratedDatabase` + temp files for the test; `installed_local_cli` runs within it and restarts reuse it; `sdks/wyrd-sdk-python/src/testing.rs` `UnmigratedDatabase`; `pg.rs` `url()` | Exact pair `[python]`+`[interrupt]` (+`[exit]`) in one wrapper: 3 passed. `[rust]`,`[typescript]`,`[python]`,`[interrupt]` + `test_admin_key_completes_the_local_workflow` in one wrapper: 5 passed. Collection: 8 tests incl. 5 `test_installed_cli_bootstrap` cases. `check:py-wheel-no-testing`, `check:deps`, `codegen:check` pass | PASS |
+| FIND-TASK-004-2 | `dev.rs` `DevServer::run` selects the offer against `Self::exited(child)` | `test_installed_cli_bootstrap[exit]`: SIGTERM to the serving child at an unanswered offer. CLI exits non-0/130 with `server exit`, no ready line, secret-free stderr, listener settled; restart reuses state and becomes ready. `[interrupt]`/`[typescript]` decline unchanged | PASS |
+| FIND-TASK-004-3 | `dev.rs` `local_binds`/`loopback`, `command()` sets `WYRD_GRPC_BIND`, `save_local_tenant` passes `http://{grpc}`; `global_config.rs` `save_local` writes `grpc_url` | `pg_tests::server_dev_first_run_is_client_ready`: stale saved gRPC listener gets no connection; custom loopback port + non-loopback `~/.config/wyrd/server.toml`; saved `grpc_url` matches; fresh saved client Bifrost gRPC write then read returns the row; comment preserved. `pg_tests::server_dev_repeat_and_partial_failure_preserve_state`: `WYRD_GRPC_BIND=0.0.0.0:50051` refused, `WYRD_GRPC_BIND` guidance, no credentials file. `global_config::tests::local_setup_preserves_content_and_existing_key` (stale grpc replaced) | PASS |
+| FIND-TASK-004-4 | `hosts.rs` `show_hosts`/`show_question` `# Errors`; `dev.rs` `ready` `# Panics`; `pg_tests.rs` `LocalDev::environment` `# Panics` | Source inspection; `mise run fmt`, `mise run lints` | PASS |
+| User-directed first-use prompting | `validate_local_config` returns prior completed setup (saved key + matching saved endpoint before writing); `run` skips the offer unless first setup or explicit `--host` | `[typescript]` decline then restart: no offer, ready, credentials/config/codex files byte-identical. `[interrupt]` and `[exit]` restart: no offer, ready. Explicit `--host codex` on a later start in `server_dev_repeat_and_partial_failure_preserve_state`. Docs: `local-development.svx`, `reference/cli.svx` | PASS |
+
+Commands (all exit 0):
+
+```bash
+mise exec -- cargo build --locked -p wyrd-cli -p wyrd-server && mise run py:setup && mise run ts:build
+WYRD_LOG=info scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads)'   # 3 passed, 46 skipped
+mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=global_config::tests::local_setup_preserves_content_and_existing_key)'   # 1 passed
+WYRD_LOG=info scripts/postgres/with-test-postgres.sh -- mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration 'tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]' 'tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]' 'tests/integration/test_local_development.py::test_installed_cli_bootstrap[exit]'   # 3 passed
+WYRD_LOG=info scripts/postgres/with-test-postgres.sh -- mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration 'tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]' 'tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]' 'tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]' 'tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]' 'tests/integration/test_local_development.py::test_admin_key_completes_the_local_workflow'   # 5 passed
+mise run fmt; mise run lints; mise run py:format; mise run py:lints; mise run py:typecheck; mise run codegen:check; mise run check:deps; mise run check:py-wheel-no-testing; mise run docs:check; git diff --check
+```
+
+Additional selector: `test_installed_cli_bootstrap[exit]` (FIND-TASK-004-2 child exit at the first-setup offer). It is added to `test:local-dev:journey`; no selector was excluded.
+
+Limits:
+- The server-file check runs with `WYRD_GRPC_BIND` set in the fixture environment, which the child would also inherit. Covering the unset/default path would need the fixed port 50051, so it relies on `command()` always exporting the selection.
+- The Bifrost read-back succeeded immediately after the acknowledged gRPC drain, with no polling.
+
+Non-goals remain excluded: no supervisor, restart, setup marker, preference file, new command, transport, TLS, or lane exclusion. No unrelated files changed.

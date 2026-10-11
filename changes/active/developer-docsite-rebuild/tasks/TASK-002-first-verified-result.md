@@ -137,3 +137,13 @@ The task stays open until Stage B passes.
   the real behavior. If no supported path completes the loop, return
   `SPEC_REVISION_REQUIRED`; do not publish a partial quickstart or create
   server or SDK functionality under this docs task.
+
+## Local setup prerequisite update
+
+The local-server-bootstrap TASK-004 update rewrites the existing draft setup
+page around `wyrd server dev --tenant <slug>` and its saved tenant credential
+and endpoint. The Quickstart page does not exist yet in this worktree; when
+its tutorial is authored, link its prerequisites to `/get-started/setup/` and
+use fresh clients with the saved Wyrd configuration, without requiring API-key
+or endpoint exports. Keep the verdict workflow and its example implementation
+within this task rather than adding an empty Quickstart page for bootstrap.

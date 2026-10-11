@@ -8,11 +8,11 @@ draft: true
 status: partial
 ---
 
-Match the code or message you see below. This page covers server installation and database failures for now.
+Match the code or message you see below. This page covers server installation, local setup recovery, and database failures.
 
 ## Server installation
 
-`wyrd server install` prints a stable code. None of these failures changes the server you already have installed: it stays at `~/.config/wyrd/server/current` and keeps running.
+`wyrd server install` prints a stable code. None of these failures changes the server you already have installed: it stays under the existing Wyrd config directory's `server/current` and keeps running.
 
 | Code | Cause | Fix |
 | --- | --- | --- |
@@ -20,6 +20,34 @@ Match the code or message you see below. This page covers server installation an
 | `WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE` | GitHub could not be reached, a download broke off, no stable release is published, or the newest release has no bundle for this machine | Check access to `github.com` and retry. The message says which one |
 | `WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED` | The signature on `checksums.txt` is missing or wrong, the download does not match its signed SHA-256, or the bundle did not unpack into a runnable server | Retry once. If it fails again, do not work around it: report the release |
 | `WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE` | The newest server is on a different version line than your `wyrd` CLI | Upgrade the CLI (`pip install -U wyrd` or `npm install @wyrd/sdk@latest`), then rerun |
+
+## Local startup
+
+`WYRD_CLI_503_SERVER_DEV` identifies the failed stage and a redacted recovery action. The CLI stops its serving child on failure. Committed migrations or tenant provisioning remain.
+
+| Failed stage | Recovery |
+| --- | --- |
+| Input or listener | Set the database URL or choose an available loopback address, then rerun. |
+| Migration | Check connectivity and that the migration login owns the database objects. Rerun with the same database. |
+| Readiness | Read the server's diagnostics, correct its configuration, and rerun. Production hardening still applies when `APP_ENV=production`. |
+| Local persistence | Restore safe directory/file permissions and rerun. A key already saved before an endpoint-write failure is retained. |
+| Saved credential | Restore the requested tenant's original key. Rerunning never issues a replacement for an active tenant. Use explicit platform tenant administration recovery if the one-time key was lost. |
+
+If the root exists but tenant creation failed, rerun with the stored `WYRD_PLATFORM_CREDENTIAL`. `wyrd-server recover-root` restores lost platform access. Tenant recovery is an explicit administrative action. Start the installed server directly with the same database and local settings, because a failed `server dev` command stops its child. For direct recovery on macOS, also set `WYRD_BIFROST_MEMORY_LIMIT_BYTES` to the output of `sysctl -n hw.memsize`; the automatic local launcher supplies this only to its children. For the default config directory:
+
+```bash
+export WYRD_SERVER_BIND=127.0.0.1:8080
+~/.config/wyrd/server/current/wyrd-server
+```
+
+In a second terminal, export the same database URL. If the platform credential was lost, run the installed server's `recover-root` command and store its one-time output securely. Set `WYRD_PLATFORM_CREDENTIAL` to that credential without putting it in command arguments. Use the tenant UUID printed before the persistence failure:
+
+```bash
+wyrd platform tenant recover-admin --tenant YOUR_TENANT_UUID --server http://127.0.0.1:8080
+```
+
+This intentionally issues a replacement credential for the existing administrator and prints it once. Restore `[default].api_key` in `credentials.toml` using an editor with `umask 077`, and verify the file mode is `0600`. Remove any old `access_token` and `access_expires_at` values. Stop the directly started server before rerunning `wyrd server dev --tenant acme`. With `WYRD_CONFIG_HOME` or `XDG_CONFIG_HOME`, use that directory's `server/current/wyrd-server` instead of the default path. Automatic retries never perform recovery.
+
 
 ## Database
 

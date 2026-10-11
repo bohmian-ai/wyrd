@@ -456,7 +456,7 @@ Candidate: merge `b356c948f` (M `8a8813a7` + S `cfe21dc9`) plus commits
 | Criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
 | TASK-001-C01 cohesive engine | S catalog/oracle/scribe/forge/storage owners imported; S-deleted owners stay deleted (`analytical_scan.rs`, `pruning.rs`, `fixed_ipc.rs`, `storage/cache.rs`, `storage/telemetry.rs`, `wyrd-queue/src/schema.rs`); M consumers adapted in `597533616`/`cac9c4969` (results via `ScribeOutbox::stage`, audit via staged `AuditEvent`, eval observations via admin write) | `cargo check --workspace --all-features --all-targets` clean; `mise run lints` (incl. release `wyrd-server` bin) | PASS |
-| TASK-001-C02 S02/S03/S04/S20/S22 | S retention/deadline (S02), cut cache (S03), group commit/fences (S04), v3 rewrite (S20); REQ-022: cut read inside `TenantConn` (`oracle_reader_authority.rs`, `bifrost_catalog.rs::read_cut`), WAL fence via `OperatorPool` (`scribe_batch_commits::newest_wal_fence`, `ReplayFences`); REQ-024: `olap_minimal.sql` restored to M bytes, three S forward migrations without GRANT/REVOKE, `operator_access` policy, plpgsql SECURITY DEFINER `scribe_wal_newest_fence` | P02, P03, P04, P06, P22, P27, P28 below | PASS |
+| TASK-001-C02 S02/S03/S04/S20/S22 (S03/S20/S22 verification-only, see Limits) | S retention/deadline (S02), cut cache (S03), group commit/fences (S04), v3 rewrite (S20); REQ-022: cut read inside `TenantConn` (`oracle_reader_authority.rs`, `bifrost_catalog.rs::read_cut`), WAL fence via `OperatorPool` (`scribe_batch_commits::newest_wal_fence`, `ReplayFences`); REQ-024: `olap_minimal.sql` restored to M bytes, three S forward migrations without GRANT/REVOKE, `operator_access` policy, plpgsql SECURITY DEFINER `scribe_wal_newest_fence` | P02, P03, P04, P06, P22, P27, P28 below | PASS |
 | TASK-001-C03 ten tables / time axes | `builtin_tables() -> [_; 10]`; no `vala.dev.agent_traces`/`CodeAxis` in crates, sdks, docs, architecture (grep empty); consumers moved to `created_at`/`ended_at`/`started_at`/`wyrd_ingested_at` (`4f9a5c1d1`: capacity load, `observe_ingest`, security posture, schema.svx) | P01; `observe_ingest::observations_store_the_client_emit_time` adapted | PASS |
 | TASK-001-C04 graph | `iceberg-compaction-core` rev `22cd178d14009468bc951a14d7acf63237af808a`; lock/Hakari regenerated; `ring` only via M's `jsonwebtoken` (present in M lock) | `mise run check:workspace-hack` ("no operations to perform"), `mise run check:deps` | PASS |
 | TASK-001-C05 dispositions | [dispositions.tsv](../dispositions.tsv): every one of 527 B→S records with class, disposition, owner task, note | Generated from `git diff --name-status -M B S`, `git merge-tree M S` and HEAD blobs | PASS |
@@ -572,11 +572,27 @@ with `80b29eb2a`.
 
 ### Limits and non-goals
 
-- Unported source assertion: `newest_wal_fence_spans_tenants_on_one_stream`
-  (deleted with main's `pg_audit_staging.rs`). It covered the SQL fence lookup
-  across tenants. The adapted SECURITY DEFINER function is applied by P28; P04
-  covers replay semantics with injected fences. The cross-tenant SQL lookup
-  itself has no executable proof in this task's selected recipes.
+- Source assertion `newest_wal_fence_spans_tenants_on_one_stream` (deleted
+  with main's `pg_audit_staging.rs`) is rehomed to
+  `crates/vala/vala-sql/tests/integration/pg_stream_identity.rs`, adapted to
+  the `OperatorPool` lookup:
+  `mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-sql --test integration -E 'test(=pg_stream_identity::pg_tests::newest_wal_fence_spans_tenants_on_one_stream)'`
+  PASS.
+- Oracle shutdown drain (REQ-007): the merged tree keeps the source drain
+  unchanged. Main's Oracle-only late-child/headroom drain and its two tests
+  (`oracle_shutdown_drains_only_oracle_memory`,
+  `oracle_shutdown_drains_oracle_infallible_headroom`, removed in
+  `597533616`) are adapted to the source resources by TASK-002 (REQ-007/S07,
+  TASK-002 reuse table: "S drain ignores Oracle headroom and includes Forge
+  memory → Adapt M owner-specific settlement to S resources").
+- S03 watcher lifecycle and S20 incompatible-format refusal: verification-only
+  by user decision. The source code (`cut_cache.rs` watcher `reset(false)` on
+  stop; `bifrost_catalog.rs::validate_physical_table` v3/schema refusal) is
+  imported unchanged, the merge does not touch either seam, and neither branch
+  has a test to rehome; P02 and P06 cover the preserved behavior.
+- S22 upgrade from pinned main: verification-only by user decision. Main's
+  migration bytes are unchanged (P27), the three source forward migrations
+  only add objects, and P28 replays the full set and main's upgrade owners.
 - Not done here (owned by TASK-002 through TASK-006): Forge cut barriers and
   Oracle memory, audit, observations/results, public journeys, workload ports.
   None were implemented in this task.

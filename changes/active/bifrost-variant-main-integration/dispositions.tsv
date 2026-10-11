@@ -336,7 +336,7 @@ crates/vala/vala-sql/src/queries/oracle_reader_authority.rs	M	C	adapted	TASK-001
 crates/vala/vala-sql/src/queries/scribe_batch_commits.rs	M		adapted	TASK-001	
 crates/vala/vala-sql/src/row_types/file_list.rs	M		preserved	TASK-001	
 crates/vala/vala-sql/src/row_types/oracle_reader_authority.rs	M		preserved	TASK-001	
-crates/vala/vala-sql/tests/pg_audit_staging.rs	M	C	retired	TASK-003	Main retired audit staging. Unported source assertion newest_wal_fence_spans_tenants_on_one_stream (REQ-004 SQL fence lookup); see Limits.
+crates/vala/vala-sql/tests/pg_audit_staging.rs	M	C	retired	TASK-003	Main retired audit staging. Source assertion newest_wal_fence_spans_tenants_on_one_stream rehomed to vala-sql tests/integration/pg_stream_identity.rs.
 crates/vala/vala-sql/tests/pg_forge_operations.rs	M	A	retired	TASK-001	Rehomed to the single tests/integration binary (L03/S3).
 crates/vala/vala-sql/tests/pg_forge_tasks.rs	M	A	retired	TASK-001	Rehomed to the single tests/integration binary (L03/S3).
 crates/vala/vala-sql/tests/pg_olap_catalog.rs	M	A	retired	TASK-001	Rehomed to the single tests/integration binary (L03/S3).

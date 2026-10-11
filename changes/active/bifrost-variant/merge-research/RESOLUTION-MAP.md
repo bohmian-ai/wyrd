@@ -47,7 +47,15 @@ at origin/main. Each area's full per-file table is in its group report:
 - **D4:** `created_at = decided_at`.
 - **D5:** a new compaction fork commit (Arrow 60, no REST catalog/Ring).
 
-Items 2.6 are still open. The agents' original analysis follows.
+**Decided 2026-10-11 (human), items 2.6:**
+- Delete `CorrelationPolicy::CodeAxis`, and drop `vala.dev.agent_traces` from REQ-037.
+- `register_dataset` keeps ours: it returns `RegisterTableResponse` with the outcome decided under the registration lock. This is internal only; both sides share the wire types.
+- Task-Verifier results go in a typed `assertion_result` Variant column, not main's generic `details`.
+- In the WAL fence lookup, `scribe_wal_newest_fence` copies main's SECURITY DEFINER operator raise/restore pattern.
+- Python `QueryTerminal.error_code` returns the catalog code.
+- Eval observation key time uses `created_at`.
+
+The agents' original analysis follows.
 
 The agents' recommendation is shown for each. **[split]** marks a decision where the agents disagree.
 
@@ -80,7 +88,7 @@ The agents' recommendation is shown for each. **[split]** marks a decision where
 6. **Smaller decisions**, each with the agents' recommendation:
    - Delete `CorrelationPolicy::CodeAxis`: yes.
    - Eval observation key time: use `created_at`.
-   - `register_dataset` return type: ours' `RegisterOutcome` vs main's `TableUid`. No recommendation; it is wire-visible.
+   - `register_dataset` return type: ours' `RegisterOutcome` vs main's `TableUid`. Not wire-visible: both sides define the same `RegisterTableResponse`.
    - Task-Verifier results: main's generic `details` column vs a typed `assertion_result` Variant column. No recommendation.
    - WAL fence lookup: SECURITY DEFINER plus main's operator raise/restore pattern, or `OperatorPool`.
    - Python `QueryTerminal.error_code`: becomes the catalog code (`WYRD_VALA_500_…`). This is a public Python property.

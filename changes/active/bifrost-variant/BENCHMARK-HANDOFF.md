@@ -55,16 +55,7 @@ work recorded further down.
 - **Runs 25/26, Parquet tier, 24 vs 12 MiB chunk.** See the task file. The
   24 MiB chunk stayed the default.
 
-**Read items still open in the task file:**
-
-- **Step 4:** codec measurement.
-- **Step 5:** the telemetry query benchmark (trace lookup, service window,
-  error rate, p99 per route, tokens per model, shredded `customer.id` lookup)
-  and the chunk sweep on both tiers.
-- **Step 6:** per-query overhead.
-- **Then:** the 100M-row heavy fixture.
-- **Variant key filters** were about 20–40x slower than promoted-column filters
-  in run 27/28 (a single cold check).
+See "Open optimization opportunities" below for what is still open.
 
 ## First: prove the merge kept performance
 
@@ -186,7 +177,83 @@ CPU Pareto at x64, run-37, by crate:
 | Fix 2: skip re-validating OTLP Variant bytes | **Dropped** | Validation already happens once, at Variant build (`EncodedVariant`). The check rejects NaN, oversize and over-deep values that OTLP can send (`non_finite_log_body_rejects_only_its_record`). |
 | Fix 5: single-pass OTLP decode | **Skipped** | The preflight pass reserves exact decode memory before allocating (`grpc/otlp.rs:668-678`). Removing it weakens memory admission for about 3.5% of CPU. |
 
-## Write open items, in order (after parity is proven)
+## Open optimization opportunities
+
+Start these only after parity is proven. Each one comes from a profile, not a
+guess. Before changing code, re-profile it on the merged branch and make one
+change per run.
+
+The read evidence comes from the pre-merge baseline at `cfe21dc90`
+(`benchmarks/pre-merge/`). Its profiles are in the TASK-003 worktree under
+`target/bifrost-query-capacity-premerge-cfe21dc90/`, and its logs hold the
+latency, CPU and off-CPU Paretos for every case.
+
+### Reads, in order
+
+1. **Variant key filters.**
+   - Evidence:
+     - On the spans fixture, `attributes ->> 'customer.id'` and
+       `attributes ->> 'region'` take 825 and 921 ms on hot, and 286 and
+       260 ms on Parquet.
+     - The promoted-column queries on the same table take 4–98 ms.
+     - Parquet shreds the core keys in 24 of 24 span files ("variant
+       shredding" row).
+   - Opportunity: find out whether the filter reads the shredded column or
+     decodes the whole Variant, and push the key filter down to the shredded
+     column. This is the largest per-query gap measured.
+   - This is the telemetry query benchmark: task step 5. Its case should run
+     close to the plain-column lookup.
+2. **ZSTD decompression on Parquet reads.**
+   - Evidence: `c:ZSTD` is 29% of CPU on selective x1, 56% on 1m-aggregate x8
+     (11.2 of 19.9 ms per query) and 24% on full-scan.
+   - Opportunity: task step 4, measuring codecs on the telemetry data (ZSTD-3
+     today vs ZSTD-1, LZ4_RAW, Snappy) for size and decode time. One option is
+     a faster codec for fresh Scribe files and ZSTD on Forge compaction, since
+     storage cost sits in old data.
+3. **Hot selective: fragment open and planning.**
+   - Evidence: of a 1.54 ms mean, `LiveScribeExec.fragment_open_time` is
+     0.55 ms (36%), `Oracle.physical_planning` 0.31 ms (20%) and
+     `Oracle.scribe_listing` 0.14 ms.
+   - Opportunity: the local memtable fragment still opens through
+     `ScribeFragmentExecutor`. Find out what that hop costs when the data is
+     in the same process.
+4. **Postgres pool wait.**
+   - Evidence: hot selective x1 makes 0.50 pool acquires per query with a
+     0.68 ms mean wait. Small-aggregate makes 0.84 acquires with 0.56 ms.
+   - The read cut itself is cached: `Oracle.cut_read` is 0.002 ms.
+   - Unknown: which path acquires the connection. Trace it with `WYRD_LOG`
+     first. If it's on the query's critical path, it's comparable to all of
+     planning.
+5. **Physical planning on every small query.**
+   - Evidence: 0.31–1.06 ms, 18–27% of latency for selective and
+     small-aggregate on both tiers.
+   - Opportunity: per-query planning cost, together with step 6.
+6. **Per-query CPU grows with concurrency.**
+   - Evidence: hot small-aggregate CPU per query is 2.86 ms at x1 and 7.14 ms
+     at x64. `core`, `alloc` and `c:mi` together are about 35% at x64.
+   - Opportunity: task step 6, allocator churn and per-query metrics
+     collection (gather plan metrics only when profiling is asked for).
+7. **Large hot scans.**
+   - Evidence: table-aggregate uses 57.7 ms CPU per query for 39.8 ms
+     latency, of which `datafusion_physical_plan` is 33%, `arrow_ord` 22% and
+     kernel 15%. Full-scan uses 34.0 ms CPU, with `datafusion_functions` at
+     37% and kernel 23%.
+   - Not diagnosed yet. Look at the symbol-level profile first.
+8. **Parquet full-scan.**
+   - Evidence: 687 ms CPU per query, made up of `c:ZSTD` 24%, kernel 24% and
+     `parquet` 12%.
+   - The kernel share is not diagnosed yet: check the off-CPU and symbol
+     profile for page faults or reads.
+9. **Parquet chunk size.**
+   - Evidence: 1m-aggregate x8 runs at 408 qps, p50 20.7 ms with the 24 MiB
+     chunk. In runs 25/26 a 12 MiB chunk gave 500 qps at p50 14.8 ms, but
+     doubled the CPU on table-aggregate and full-scan.
+   - Opportunity: the chunk sweep on the telemetry benchmark, both tiers (task
+     step 5).
+10. **Unmeasured:** the 100M-row heavy fixture (`-- --heavy`), and native IPC
+    Variant validation cost (no native profile yet).
+
+### Writes, in order
 
 1. **Confirm that fix 1's reuse hits.**
    - Today the Gate batch carries a `card_ref` column. Decode drops it,
@@ -203,13 +270,17 @@ CPU Pareto at x64, run-37, by crate:
    - The `Gate.write_request` profile is recorded (about 3,900 profiles), but
      its time reads 0.000 ms. The Gate/transport stage timing is not captured.
    - Measure that first, then attribute the remaining time.
+   - The same per-request ack latency caps span export. In the pre-merge read
+     baseline, 4 OTLP exporters reach about 60k spans/s at p50 42 ms, about
+     0.8–1.2 server cores, so the server is not CPU-bound there. Throughput
+     is roughly exporters × 512 spans / ack latency.
 3. **Group commit at x64.**
    - `shard_wait`, `group_sync` and `group_fence` take about 60 ms of the
      125.6 ms client mean.
    - Pick the next target from a profile, not by guessing. `group_sync`
      varies between runs (run-36 vs run-37), so compare several runs.
-4. **ZSTD is the largest CPU item** (18–24% across steps).
-   - It is level 1 already.
+4. **ZSTD is the largest write CPU item** (18–24% across steps).
+   - It is WAL ZSTD level 1 already.
    - Any change is a durability/space trade-off and needs evidence first.
 5. **Hot-only and Parquet-only runs** of the same sweep, plus the telemetry
    (spans) and metrics fixtures.

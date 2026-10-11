@@ -290,16 +290,21 @@ latency, CPU and off-CPU Paretos for every case.
      bytes-per-core target penalizes small rows.
    - At x64, server CPU is 10.0 ms per batch. `wyrd_server` is 24.8% of it,
      mostly OTLP protobuf decode, and `parquet_variant` is 6.9%.
-   - Where decode CPU goes, from the x64 spans profile
+   - Where server CPU goes, from the x64 spans profile
      (`telemetry-writes/parquet/profiles/03-otlp spans-64/report.txt` in the
      preserved pre-merge profiles):
 
-     | Bucket | Share |
-     |---|---|
-     | Wire scanner: `WireFields::next` 10.86% + `read_varint` 6.90% | 17.8% |
-     | Typed-struct build: `from_utf8`, `fixed_string`, `String::clone`, `push_mut`, `decode_*` | ~5.8% |
-     | Projection re-walk: `project_resource_spans`, `unique_keys`, IndexMap and hashing | ~4.3% |
-     | Preflight | 0.7% |
+     Inclusive CPU per stage, from `perf report --no-inline --children` on
+     that `perf.data`. Self-time listings understate stages: the preflight is
+     0.7% self but 8.2% inclusive.
+
+     | Stage | Inclusive share | Biggest parts |
+     |---|---|---|
+     | OTLP decode (`TraceRequestDecoder::decode`) | 28.1% | `decode_trace_protobuf` 19.7%, `preflight_trace_protobuf` 8.2%; `WireFields::next` + `read_varint` 17.8% self across both |
+     | Projection (`project_resource_spans`) | 30.7% | `attributes_variant` 20.8%: Variant build (`append_object`) 11.7%, then `finish_variant` 9.7%, of which `EncodedVariant::validate` is 8.2% |
+     | Scribe ingress pool | 14.6% | `prepare_append` 10.2%: Arrow IPC encode 6.5% (WAL ZSTD 5.8%), `stamp_correlation_columns` 2.3%, `logical_data_identity` 1.7%; `decode_rows` 3.2% |
+     | Scribe persistence pool | 13.7% | Parquet `encode_batch` 13.4%: sort `take` 2.5%, Parquet ZSTD 3.1%, byte-array encode |
+     | Gate dispatch (`dispatch_canonical`) | 4.3% | `LogicalIdentity::of` 1.8% |
 
    - The scanner cost is mostly repeated scanning of the same bytes, in
      `crates/wyrd/wyrd-server/src/otlp_decode.rs`:
@@ -333,21 +338,40 @@ latency, CPU and off-CPU Paretos for every case.
         prost uses the same trick. Targets part of the 6.9%.
      3. **Decode straight into the projection's Arrow/Variant builders**,
         skipping the intermediate `Span` / `KeyValue` / `String` structs.
-        - This removes most of the ~10% in the build and re-walk buckets.
+        - This removes the typed-struct build and drop (`from_utf8`, `String`
+          allocation, `Vec` pushes and drops) and the projection's walk over
+          those structs. Its share is not separated in the profile.
         - It is larger than 1 and 2: `OtlpDecodePlan.decode_bytes` is defined
           as the size of those structs, so the reservation accounting has to
           be redesigned. Do 1 and 2 first.
-     - The preflight stays in every case. It is the memory-admission guard and
-       costs 0.7%.
-   - **Decode alone will not reach 30 MiB/s per core.**
+     - The preflight stays in every case. It is the memory-admission guard.
+       It costs 8.2% inclusive and runs on the same `WireFields` scanner, so
+       lever 2 also speeds it up.
+   - **Levers outside decode**, from the same profile:
+     4. **Stop fully re-validating Variants the server just built.**
+        - `finish_variant` (`tables/signal.rs`) passes the bytes it just built
+          from `VariantBuilder` through `EncodedVariant::from_bytes`. That runs
+          the full raw-bytes gate: the `scan_encoded` walk plus upstream
+          full validation. It costs 8.2% for input the server constructed
+          itself.
+        - The size limit is a length check. The depth limit can be tracked
+          while building, or proved from the OTLP preflight depth limit.
+        - Condition: the Variant size and depth limits must still hold exactly.
+     5. **Compute the logical identity once.** Gate's `LogicalIdentity::of`
+        (1.8%) and Scribe's `logical_data_identity` (1.7%) both SHA-256 the
+        same batch. This is write item 1, fix 1's reuse not hitting.
+     6. **WAL ZSTD (5.8%)** is write item 4. **Parquet encode (13.4%)** is
+        flush work on the persistence pool, so it is per-row CPU but off the
+        request path.
+   - **Can spans reach 30 MiB/s per core?**
      - At ~340 B per row, that target means about 92k rows/s per core, against
        about 51k today. That needs roughly 45% less CPU per row.
-     - All of decode, including the projection re-walk, is about 28%.
-     - So it is still open whether small signals are judged per row or per
-       byte. Spans already clear the 200k rows/s floor, at 426k.
-     - Other large items in the same profile: `sha2` (3.7%), Variant
-       validation (`EncodedVariant::validate` plus `Variant::try_new_*`,
-       ~2.8%), and ZSTD.
+     - Decode plus projection is 59% of CPU. Levers 1, 2, 4 and 5 add up to
+       roughly 20–25% (about 10–13% from 1, part of the scanner from 2, about
+       8% from 4, about 1.7% from 5). These are estimates, not measurements.
+     - So the per-byte target needs lever 3 and more on top, and it
+       is still open whether small signals are judged per row or per byte.
+       Spans already clear the 200k rows/s floor, at 426k.
 6. **Native write tail.** Native passes at 3.31M rows/s at x64, but p99 is
    667 ms at x16 and 717 ms at x64. Not diagnosed yet.
 7. **Hot-only and Parquet-only write runs** of the same sweeps, plus a metrics

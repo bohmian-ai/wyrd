@@ -85,6 +85,22 @@ The agents' recommendation is shown for each. **[split]** marks a decision where
    - A dry merge in the fork is clean (tree ab95e99b).
    - A new fork commit must be pushed before the Wyrd merge can build.
    - The alternative is a time-boxed Ring-ban exception.
+   - **Done 2026-10-11.** `bohmian-ai/iceberg-compaction` commit `22cd178`
+     merges `4e9f325` (no REST catalog) into `696560602` (Arrow 60). There
+     were no conflicts.
+     - The fork's `Cargo.lock` change only moves `iceberg-catalog-rest` from core
+       to the rest-catalog example.
+     - Main's Ring check (`rustls feature "ring"`) finds no match in the merged
+       core.
+     - `cargo check --locked --workspace --all-targets` passes, and
+       `cargo test -p iceberg-compaction-core` passes 153 tests.
+   - **One fork branch.** `wyrd/main` is the only branch Wyrd uses, and every
+     Wyrd pin must be a commit on it.
+     - The six older `wyrd/*` branches are deleted.
+     - Two commits that older Wyrd commits pin, but `wyrd/main` does not
+       contain, are kept as tags: `wyrd-pin/no-rest-catalog-in-core`
+       (`170bf8e`) and `wyrd-pin/bifrost-v1-resource-parity` (`a75947c`).
+     - A fresh clone can still fetch every revision any Wyrd commit pins.
 6. **Smaller decisions**, each with the agents' recommendation:
    - Delete `CorrelationPolicy::CodeAxis`: yes.
    - Eval observation key time: use `created_at`.
@@ -146,7 +162,11 @@ Signature and API changes:
 
 ## 4. Procedure, once the decisions are made
 
-1. Push the compaction fork commit (decision 5).
+1. ~~Push the compaction fork commit (decision 5).~~ Done.
+   - `Cargo.toml` on `integrate-main` already pins
+     `iceberg-compaction-core` at `22cd178d14009468bc951a14d7acf63237af808a`.
+   - `Cargo.lock` was not updated and nothing was compiled. The lock resolves
+     in step 4.
 2. On `integrate-main`, run `git merge --no-ff --no-commit origin/wyrd/bifrost-variant/TASK-003`, which merges ours into main.
    - The three forbidden paths are not in the branch tree, so they stay out.
    - Resolve group by group, in this order: shared-spec, redux, server-sql, sdks, testing, infra-docs. Contracts go first because everything compiles against them.

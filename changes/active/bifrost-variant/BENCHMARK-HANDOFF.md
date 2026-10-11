@@ -7,9 +7,9 @@ the merge research in `merge-research/`.
 ## Plan
 
 1. **Finalize the merge plan.** `merge-research/RESOLUTION-MAP.md` holds the
-   human decisions recorded on 2026-10-11 (§2). One prerequisite is still open:
-   an `iceberg-compaction` fork commit with Arrow 60 and no REST catalog / Ring
-   (map §2.5).
+   human decisions recorded on 2026-10-11 (§2). The `iceberg-compaction` fork
+   prerequisite is done: `wyrd/main` at `22cd178` (Arrow 60, no REST catalog /
+   Ring), already pinned in `Cargo.toml` here (map §2.5).
 2. **Merge main with the current Variant work** on `integrate-main`. Follow map
    §4 for the procedure and §5 for the proof lanes.
 3. **Continue Bifrost benchmarking and optimization** on the merged branch.
@@ -55,16 +55,7 @@ work recorded further down.
 - **Runs 25/26, Parquet tier, 24 vs 12 MiB chunk.** See the task file. The
   24 MiB chunk stayed the default.
 
-**Read items still open in the task file:**
-
-- **Step 4:** codec measurement.
-- **Step 5:** the telemetry query benchmark (trace lookup, service window,
-  error rate, p99 per route, tokens per model, shredded `customer.id` lookup)
-  and the chunk sweep on both tiers.
-- **Step 6:** per-query overhead.
-- **Then:** the 100M-row heavy fixture.
-- **Variant key filters** were about 20–40x slower than promoted-column filters
-  in run 27/28 (a single cold check).
+See "Open optimization opportunities" below for what is still open.
 
 ## First: prove the merge kept performance
 
@@ -72,24 +63,19 @@ Before any new optimization, show that the merged branch is at least as fast
 as pre-merge `wyrd/bifrost-variant/TASK-003` at `cfe21dc90`. Run everything on
 the same host with nothing compiling, in this order:
 
-1. **Produce the pre-merge read baseline.** No read run exists at
-   `cfe21dc90`; see `benchmarks/pre-merge/README.md`.
-   - Run `mise run bench:bifrost:query-capacity` in the
-     `wyrd-bifrost-variant-task-003` worktree. One invocation runs the hot
-     (memtable) tier, then the Parquet tier under a fresh Postgres.
-   - Then run the same command with `-- --fixture telemetry`.
-   - Commit the reports to `benchmarks/pre-merge/`.
+1. **The pre-merge read baseline is recorded.** The standard and telemetry
+   fixtures, hot and Parquet tiers, were run on a clean `cfe21dc90` tree on
+   2026-10-11. See `benchmarks/pre-merge/`.
 2. **Run the same read sweeps on the merged branch** and compare them case by
    case. Use qps, p50/p95/p99, server CPU per query and peak memory, plus the
    per-query latency Pareto and the CPU Pareto by crate.
-3. **Writes, only after reads match:**
-   - `mise run bench:bifrost:write-capacity -- --fixture logs` (pre-merge:
-     `benchmarks/pre-merge/write-logs-run-37.md`)
-   - then `--fixture telemetry`
-   - then the native sweep (no fixture)
-
-   Produce a pre-merge baseline for each one first, if it isn't in
-   `benchmarks/pre-merge/`.
+3. **Writes, only after reads match.** Each one has a pre-merge baseline in
+   `benchmarks/pre-merge/`:
+   - `mise run bench:bifrost:write-capacity -- --fixture logs`
+     (`write-logs-run-37.md`)
+   - then `--fixture telemetry` (`write-telemetry.md`)
+   - then the native sweep, with no fixture (`write-native.md`)
+   - then `mise run bench:bifrost:client-queue` (`client-queue.txt`)
 
 Repeat a case before calling it a regression. On this disk, fsync time varies
 by up to about 2.5x between runs (run-36 vs run-37), and write rows/s varied
@@ -190,7 +176,83 @@ CPU Pareto at x64, run-37, by crate:
 | Fix 2: skip re-validating OTLP Variant bytes | **Dropped** | Validation already happens once, at Variant build (`EncodedVariant`). The check rejects NaN, oversize and over-deep values that OTLP can send (`non_finite_log_body_rejects_only_its_record`). |
 | Fix 5: single-pass OTLP decode | **Skipped** | The preflight pass reserves exact decode memory before allocating (`grpc/otlp.rs:668-678`). Removing it weakens memory admission for about 3.5% of CPU. |
 
-## Write open items, in order (after parity is proven)
+## Open optimization opportunities
+
+Start these only after parity is proven. Each one comes from a profile, not a
+guess. Before changing code, re-profile it on the merged branch and make one
+change per run.
+
+The read evidence comes from the pre-merge baseline at `cfe21dc90`
+(`benchmarks/pre-merge/`). Its profiles are in the TASK-003 worktree under
+`target/bifrost-query-capacity-premerge-cfe21dc90/`, and its logs hold the
+latency, CPU and off-CPU Paretos for every case.
+
+### Reads, in order
+
+1. **Variant key filters.**
+   - Evidence:
+     - On the spans fixture, `attributes ->> 'customer.id'` and
+       `attributes ->> 'region'` take 825 and 921 ms on hot, and 286 and
+       260 ms on Parquet.
+     - The promoted-column queries on the same table take 4–98 ms.
+     - Parquet shreds the core keys in 24 of 24 span files ("variant
+       shredding" row).
+   - Opportunity: find out whether the filter reads the shredded column or
+     decodes the whole Variant, and push the key filter down to the shredded
+     column. This is the largest per-query gap measured.
+   - This is the telemetry query benchmark: task step 5. Its case should run
+     close to the plain-column lookup.
+2. **ZSTD decompression on Parquet reads.**
+   - Evidence: `c:ZSTD` is 29% of CPU on selective x1, 56% on 1m-aggregate x8
+     (11.2 of 19.9 ms per query) and 24% on full-scan.
+   - Opportunity: task step 4, measuring codecs on the telemetry data (ZSTD-3
+     today vs ZSTD-1, LZ4_RAW, Snappy) for size and decode time. One option is
+     a faster codec for fresh Scribe files and ZSTD on Forge compaction, since
+     storage cost sits in old data.
+3. **Hot selective: fragment open and planning.**
+   - Evidence: of a 1.54 ms mean, `LiveScribeExec.fragment_open_time` is
+     0.55 ms (36%), `Oracle.physical_planning` 0.31 ms (20%) and
+     `Oracle.scribe_listing` 0.14 ms.
+   - Opportunity: the local memtable fragment still opens through
+     `ScribeFragmentExecutor`. Find out what that hop costs when the data is
+     in the same process.
+4. **Postgres pool wait.**
+   - Evidence: hot selective x1 makes 0.50 pool acquires per query with a
+     0.68 ms mean wait. Small-aggregate makes 0.84 acquires with 0.56 ms.
+   - The read cut itself is cached: `Oracle.cut_read` is 0.002 ms.
+   - Unknown: which path acquires the connection. Trace it with `WYRD_LOG`
+     first. If it's on the query's critical path, it's comparable to all of
+     planning.
+5. **Physical planning on every small query.**
+   - Evidence: 0.31–1.06 ms, 18–27% of latency for selective and
+     small-aggregate on both tiers.
+   - Opportunity: per-query planning cost, together with step 6.
+6. **Per-query CPU grows with concurrency.**
+   - Evidence: hot small-aggregate CPU per query is 2.86 ms at x1 and 7.14 ms
+     at x64. `core`, `alloc` and `c:mi` together are about 35% at x64.
+   - Opportunity: task step 6, allocator churn and per-query metrics
+     collection (gather plan metrics only when profiling is asked for).
+7. **Large hot scans.**
+   - Evidence: table-aggregate uses 57.7 ms CPU per query for 39.8 ms
+     latency, of which `datafusion_physical_plan` is 33%, `arrow_ord` 22% and
+     kernel 15%. Full-scan uses 34.0 ms CPU, with `datafusion_functions` at
+     37% and kernel 23%.
+   - Not diagnosed yet. Look at the symbol-level profile first.
+8. **Parquet full-scan.**
+   - Evidence: 687 ms CPU per query, made up of `c:ZSTD` 24%, kernel 24% and
+     `parquet` 12%.
+   - The kernel share is not diagnosed yet: check the off-CPU and symbol
+     profile for page faults or reads.
+9. **Parquet chunk size.**
+   - Evidence: 1m-aggregate x8 runs at 408 qps, p50 20.7 ms with the 24 MiB
+     chunk. In runs 25/26 a 12 MiB chunk gave 500 qps at p50 14.8 ms, but
+     doubled the CPU on table-aggregate and full-scan.
+   - Opportunity: the chunk sweep on the telemetry benchmark, both tiers (task
+     step 5).
+10. **Unmeasured:** the 100M-row heavy fixture (`-- --heavy`), and native IPC
+    Variant validation cost (no native profile yet).
+
+### Writes, in order
 
 1. **Confirm that fix 1's reuse hits.**
    - Today the Gate batch carries a `card_ref` column. Decode drops it,
@@ -207,17 +269,114 @@ CPU Pareto at x64, run-37, by crate:
    - The `Gate.write_request` profile is recorded (about 3,900 profiles), but
      its time reads 0.000 ms. The Gate/transport stage timing is not captured.
    - Measure that first, then attribute the remaining time.
+   - The same per-request ack latency caps span export. In the pre-merge read
+     baseline, 4 OTLP exporters reach about 60k spans/s at p50 42 ms, about
+     0.8–1.2 server cores, so the server is not CPU-bound there. Throughput
+     is roughly exporters × 512 spans / ack latency.
 3. **Group commit at x64.**
    - `shard_wait`, `group_sync` and `group_fence` take about 60 ms of the
      125.6 ms client mean.
    - Pick the next target from a profile, not by guessing. `group_sync`
      varies between runs (run-36 vs run-37), so compare several runs.
-4. **ZSTD is the largest CPU item** (18–24% across steps).
-   - It is level 1 already.
+4. **ZSTD is the largest write CPU item** (18–24% across steps).
+   - It is WAL ZSTD level 1 already.
    - Any change is a durability/space trade-off and needs evidence first.
-5. **Hot-only and Parquet-only runs** of the same sweep, plus the telemetry
-   (spans) and metrics fixtures.
-6. **Native validation cost:** native IPC pays a full `EncodedVariant`
+5. **Spans miss the per-core wire target.**
+   - Evidence: the pre-merge `write-telemetry.md` peaks at x64 at 425,901
+     rows/s, but only 16.5 MiB/s OTLP wire per core, against the 30 MiB/s
+     target.
+   - Spans are about 340 B of wire per row, against 1,253 B for logs. Per-row
+     cost is similar (about 51k rows/s per core for spans, 36k for logs), so a
+     bytes-per-core target penalizes small rows.
+   - At x64, server CPU is 10.0 ms per batch. `wyrd_server` is 24.8% of it,
+     mostly OTLP protobuf decode, and `parquet_variant` is 6.9%.
+   - Where server CPU goes, from the x64 spans profile
+     (`telemetry-writes/parquet/profiles/03-otlp spans-64/report.txt` in the
+     preserved pre-merge profiles):
+
+     Inclusive CPU per stage, from `perf report --no-inline --children` on
+     that `perf.data`. Self-time listings understate stages: the preflight is
+     0.7% self but 8.2% inclusive.
+
+     | Stage | Inclusive share | Biggest parts |
+     |---|---|---|
+     | OTLP decode (`TraceRequestDecoder::decode`) | 28.1% | `decode_trace_protobuf` 19.7%, `preflight_trace_protobuf` 8.2%; `WireFields::next` + `read_varint` 17.8% self across both |
+     | Projection (`project_resource_spans`) | 30.7% | `attributes_variant` 20.8%: Variant build (`append_object`) 11.7%, then `finish_variant` 9.7%, of which `EncodedVariant::validate` is 8.2% |
+     | Scribe ingress pool | 14.6% | `prepare_append` 10.2%: Arrow IPC encode 6.5% (WAL ZSTD 5.8%), `stamp_correlation_columns` 2.3%, `logical_data_identity` 1.7%; `decode_rows` 3.2% |
+     | Scribe persistence pool | 13.7% | Parquet `encode_batch` 13.4%: sort `take` 2.5%, Parquet ZSTD 3.1%, byte-array encode |
+     | Gate dispatch (`dispatch_canonical`) | 4.3% | `LogicalIdentity::of` 1.8% |
+
+   - The scanner cost is mostly repeated scanning of the same bytes, in
+     `crates/wyrd/wyrd-server/src/otlp_decode.rs`:
+     - `decode_span` makes about 10 full `WireFields` passes per span: 3
+       `repeated_message_count`, 5 `last_bytes_field`,
+       `decode_merged_status` (2+), then the main loop.
+     - `decode_key_value` makes about 7 passes per attribute: 2 in
+       `decode_merged_any_value`, 1 in `last_bytes_field`, 1 validation
+       loop, then 2 over the value body (`select_any_value_bodies` and the
+       fill).
+     - Every other `decode_*` function uses the same count-then-scan pattern.
+     - The counts exist so every `Vec` is sized exactly and the decode
+       reservation is exact (commit `9d8a864f6`, "Prove exact trace decode
+       capacity"). Any change must keep that.
+   - Levers, in order. Measure one per run against
+     `benchmarks/pre-merge/write-telemetry.md`, after the merge:
+     1. **Two passes per message instead of 7–10.**
+        - Pass 1 walks the message once. It collects all repeated counts, the
+          last offset of each singular field, and the wire-type checks.
+        - Pass 2 fills the struct.
+        - This keeps exact capacity, last-wins semantics and every malformed
+          check.
+        - Add a fast path for a singular `value` or `status` that occurs once,
+          so the AnyValue merge machinery runs only when a field repeats.
+        - Targets the 17.8%. If scanner cost scales with pass count, the
+          saving is about 10–13% of total CPU. That is an estimate, not a
+          measurement.
+     2. **Single-byte varint fast path in `WireFields::read_varint`.** Every
+        OTLP tag here is ≤ 16, so every key fits in one byte, and so do most
+        lengths. A `byte < 0x80` early return before the loop does the job;
+        prost uses the same trick. Targets part of the 6.9%.
+     3. **Decode straight into the projection's Arrow/Variant builders**,
+        skipping the intermediate `Span` / `KeyValue` / `String` structs.
+        - This removes the typed-struct build and drop (`from_utf8`, `String`
+          allocation, `Vec` pushes and drops) and the projection's walk over
+          those structs. Its share is not separated in the profile.
+        - It is larger than 1 and 2: `OtlpDecodePlan.decode_bytes` is defined
+          as the size of those structs, so the reservation accounting has to
+          be redesigned. Do 1 and 2 first.
+     - The preflight stays in every case. It is the memory-admission guard.
+       It costs 8.2% inclusive and runs on the same `WireFields` scanner, so
+       lever 2 also speeds it up.
+   - **Levers outside decode**, from the same profile:
+     4. **Stop fully re-validating Variants the server just built.**
+        - `finish_variant` (`tables/signal.rs`) passes the bytes it just built
+          from `VariantBuilder` through `EncodedVariant::from_bytes`. That runs
+          the full raw-bytes gate: the `scan_encoded` walk plus upstream
+          full validation. It costs 8.2% for input the server constructed
+          itself.
+        - The size limit is a length check. The depth limit can be tracked
+          while building, or proved from the OTLP preflight depth limit.
+        - Condition: the Variant size and depth limits must still hold exactly.
+     5. **Compute the logical identity once.** Gate's `LogicalIdentity::of`
+        (1.8%) and Scribe's `logical_data_identity` (1.7%) both SHA-256 the
+        same batch. This is write item 1, fix 1's reuse not hitting.
+     6. **WAL ZSTD (5.8%)** is write item 4. **Parquet encode (13.4%)** is
+        flush work on the persistence pool, so it is per-row CPU but off the
+        request path.
+   - **Can spans reach 30 MiB/s per core?**
+     - At ~340 B per row, that target means about 92k rows/s per core, against
+       about 51k today. That needs roughly 45% less CPU per row.
+     - Decode plus projection is 59% of CPU. Levers 1, 2, 4 and 5 add up to
+       roughly 20–25% (about 10–13% from 1, part of the scanner from 2, about
+       8% from 4, about 1.7% from 5). These are estimates, not measurements.
+     - So the per-byte target needs lever 3 and more on top, and it
+       is still open whether small signals are judged per row or per byte.
+       Spans already clear the 200k rows/s floor, at 426k.
+6. **Native write tail.** Native passes at 3.31M rows/s at x64, but p99 is
+   667 ms at x16 and 717 ms at x64. Not diagnosed yet.
+7. **Hot-only and Parquet-only write runs** of the same sweeps, plus a metrics
+   fixture.
+8. **Native validation cost:** native IPC pays a full `EncodedVariant`
    validation at the trust boundary. Don't change it unless a native profile
    shows that it matters.
 

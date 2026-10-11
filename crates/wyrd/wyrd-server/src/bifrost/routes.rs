@@ -1,8 +1,9 @@
 //! Axum adapters for the Bifrost catalog service functions.
 
 use axum::Json;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
-use wyrd_spec::error::WyrdProblem;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::vala::api::{
     BifrostTableDescription, BifrostTableEntry, RegisterTableRequest, RegisterTableResponse,
 };
@@ -27,9 +28,11 @@ pub fn router() -> OpenApiRouter<AppState> {
     request_body = RegisterTableRequest,
     responses(
         (status = 200, description = "Table created or matched", body = RegisterTableResponse),
-        (status = 400, description = "The declaration is not a caller-owned dataset, or its \
-          fields are not a valid Bifrost schema (WYRD_SPEC_400_VALIDATION, \
-          WYRD_VALA_400_SCHEMA_PARSE, WYRD_VALA_400_BIFROST_RESERVED_COLUMN)",
+        (status = 400, description = "The body does not decode as the request contract (for \
+          example a field names a type the wire does not define), the declaration is not a \
+          caller-owned dataset, its fields are not a valid Bifrost schema, or a field's type \
+          cannot be stored (WYRD_SPEC_400_VALIDATION, WYRD_VALA_400_SCHEMA_PARSE, \
+          WYRD_VALA_400_BIFROST_RESERVED_COLUMN, WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE)",
          body = WyrdProblem, content_type = "application/problem+json"),
         (status = 401, description = "The request carried no usable access token \
           (WYRD_AUTH_401_UNAUTHENTICATED, WYRD_AUTH_401_INVALID_TOKEN, \
@@ -56,13 +59,20 @@ pub fn router() -> OpenApiRouter<AppState> {
 ///
 /// # Errors
 ///
-/// Returns structured validation, authorization, fingerprint-conflict, or
-/// catalog-availability errors from the catalog service.
+/// Returns `WYRD_SPEC_400_VALIDATION` naming the decode failure when the body
+/// is not JSON or does not match `RegisterTableRequest`, such as a field type
+/// the wire does not define; otherwise the structured validation,
+/// authorization, fingerprint-conflict, or catalog-availability errors from
+/// the catalog service.
 pub(crate) async fn register(
     State(state): State<AppState>,
     caller: Caller,
-    Json(body): Json<RegisterTableRequest>,
+    body: Result<Json<RegisterTableRequest>, JsonRejection>,
 ) -> Result<Json<RegisterTableResponse>, WyrdErrorResponse> {
+    let Json(body) = body.map_err(|rejection| WyrdError::Validation {
+        message: "the body does not decode as a RegisterTableRequest".to_owned(),
+        details: serde_json::json!({ "field": "body", "reason": rejection.body_text() }),
+    })?;
     service::register_table(&state, caller, body)
         .await
         .map(Json)

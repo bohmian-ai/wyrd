@@ -66,18 +66,21 @@ Run independent discovery, conditional follow-up, and validation:
 
 1. **Independent discovery, in parallel:** always spawn two task implementation
    reviewers (`behavior-rev` and `invariant-rev`), a repository-standards
-   reviewer (`repo-rev`), a maintainer specialist (`maintainer-rev`), and a
-   system-resilience reviewer (`system-rev`). Also spawn one domain reviewer
+   reviewer (`repo-rev`), a maintainer specialist (`maintainer-rev`), a
+   system-resilience reviewer (`system-rev`), and a reuse reviewer
+   (`reuse-rev`). Also spawn one domain reviewer
    (`domain-rev`) for each materially changed sensitive domain, including
    security/RBAC, tenancy, concurrency, durability, persistent data, or another
    boundary whose correctness needs domain expertise.
 2. **Compare claims:** after discovery reports are complete, group findings by
    violated behavior or invariant rather than line number. Agreement is useful
    corroboration, not proof; unique findings still require validation. If
-   reports materially conflict, reveal an unreviewed reachable path, or repeat
-   remediation suggests a common source the reviewers did not trace, spawn one
-   fresh focused `followup-rev` to investigate only that uncertainty. Record
-   why it was or was not needed.
+   reports materially conflict or reveal an unreviewed reachable path, spawn
+   one fresh focused `followup-rev` to investigate only that uncertainty.
+   Record why it was or was not needed. On a repeat review (any earlier review
+   directory exists for this task), always spawn a fresh `followup-rev` in
+   root-cause mode, whatever the discovery reports contain; it may also carry
+   any conflict above.
 3. **Independent validation:** after any follow-up, always spawn one fresh
    structured Ponytail reviewer (`ponytail-rev`). It validates every proposed
    finding against source and produces the final finding ledger and
@@ -86,8 +89,11 @@ Run independent discovery, conditional follow-up, and validation:
 Discovery reviewers receive the immutable subject and inputs needed for their
 own scope, but not another reviewer's conclusions or an intended verdict. The
 `followup-rev`, when needed, receives the conflicting claims and source paths,
-without an intended verdict. The `ponytail-rev` receives the complete diff,
-applicable authorities, and every discovery and follow-up report. The
+without an intended verdict; in root-cause mode it also receives every earlier
+review directory's `verdict.md` and remediation task, and the remediation
+commits since the first reviewed candidate. The `ponytail-rev` receives the
+complete diff, applicable authorities, and every discovery and follow-up
+report. The
 orchestrator establishes the subject, routes inputs, compares claims, checks
 report completeness, and writes final artifacts from the validated ledger; it
 does not validate its own findings. If a required agent or report is missing,
@@ -112,9 +118,8 @@ acceptance criteria, negative flows, and regression boundaries. The
 `invariant-rev` follows values and state from producer to sink across shared
 owners, sibling consumers, lifecycle transitions, and failure paths. Both trace
 a failure at a consumer back to its producer before locating the defect. On a
-repeat review, use prior findings as hypotheses: determine whether apparently
-separate failures share the same source, including one introduced by an earlier
-remediation.
+repeat review, report each finding's relationship to prior findings you notice;
+the root-cause `followup-rev` owns that analysis.
 
 Apply the Ponytail ladder to every changed abstraction, dependency,
 configuration surface, compatibility path, generic layer, and speculative
@@ -268,6 +273,35 @@ Each finding needs a source-local ID, violated obligation or regression
 boundary, exact location, observable system consequence, and testable
 correction. A healthy-path test alone cannot prove a changed recovery path.
 
+## Independent reuse review (`reuse-rev`)
+
+Give this specialist the immutable subject, complete cumulative diff, base
+revision, repository root, and the task's pinned dependency and fork diffs. Do
+not provide other reviewers' conclusions or an intended verdict. It has one job:
+find every place the candidate added a mechanism that is semantically
+equivalent to, or parallel with, one that already exists, instead of reusing or
+extending the existing owner. Differently written code that does the same job
+counts; textual similarity is not required.
+
+For every added or materially changed type, function, module, conversion,
+encoder/decoder, validator, error mapping or carrier, rendering, schema/type
+mapping, wire field, test fixture or harness helper, and configuration, search
+the base tree (`git grep <term> <base>`, and CodeGraph callers, callees, and
+symbol search when `.codegraph/` exists) and the installed dependencies' public
+APIs for an existing owner that already does the job or should have been
+extended. Also find duplicates inside the candidate: the same branch pasted
+into several callers, two implementations of one job in one file, or one case
+given its own path beside the general one.
+
+Return `reuse-review.md`. For each confirmed duplicate, give a source-local ID,
+the new location, the existing owner (file:line or crate API), evidence that
+both do the same job, and the smallest consolidation that deletes the
+duplicate side. Then list each checked surface found not duplicated, one line
+each, with the owner searched. End with one overall `PASS`, `FAIL`, or
+`BLOCKED` result. A confirmed duplicate is a `VIOLATION` of
+[AGENTS.md](../../../AGENTS.md) §15 and is blocking in every review round.
+Uncovered added surfaces block this review.
+
 ## Independent sensitive domain review (`domain-rev`)
 
 Spawn a separate `domain-rev` for each sensitive domain materially changed by
@@ -296,13 +330,35 @@ discovery pass, not a vote on existing findings. A new or unique finding still
 goes to independent validation. Do not run extra passes merely to reach a
 predetermined count or obtain agreement.
 
+### Root-cause mode (repeat reviews)
+
+This pass owns the question of whether separate findings across rounds have
+one cause. For every finding in this round's discovery reports, and every
+prior-round finding and its remediation commits, identify findings that touch
+the same owner, value, or invariant, or code that an earlier remediation
+changed. For each such group, trace each symptom back through source to its
+producer and decide:
+
+- **shared root** — name the root (owner, mechanism, or decision) and show the
+  source path from it to each symptom, including symptoms an earlier round
+  already patched; or
+- **independent** — show the evidence that the causes differ.
+
+Proximity, timing, or a plausible story is not a shared root; without a traced
+path, record `independent` or `UNRESOLVED`. Return `root-cause.md` with one row
+per finding: related prior findings and remediation commits, the decision,
+source evidence, and for a shared root the correction site at the root and
+every symptom it closes. New findings at the root still go to independent
+validation.
+
 ## Structured Ponytail validation (`ponytail-rev`)
 
 Always spawn a fresh `ponytail-rev` after discovery and any follow-up are
 complete, even when their proposed finding union is empty. Give it the
 immutable subject, applicable authorities, complete diff, both task-review
-reports, `standards-review.md`, `maintainer-review.md`, `system-review.md`, every
-`domain-review-<domain>.md`, and any `followup-review.md`, but no intended verdict.
+reports, `standards-review.md`, `maintainer-review.md`, `system-review.md`,
+`reuse-review.md`, every `domain-review-<domain>.md`, and any
+`followup-review.md`, but no intended verdict.
 
 The `ponytail-rev` independently inspects the actual source, validates every
 proposed finding and correction, including claims from only one reviewer. It
@@ -340,8 +396,11 @@ finding the `ponytail-rev` must:
 4. ask whether the finding or remediation can be deleted, whether existing
    behavior already satisfies the task, and whether the proposed proof is the
    smallest credible check without a new dependency or test harness;
-5. compare prior findings and remediations for a shared source, consolidating
-   related failures into one correction when the same invariant owns them; and
+5. on a repeat review, validate every `root-cause.md` decision against source.
+   For a confirmed shared root, consolidate its symptoms into one correction at
+   the root. A correction or earlier remediation that patches a symptom of a
+   confirmed shared root is `INCORRECT`, and the correction removes the symptom
+   patches it makes redundant; and
 6. return `CONFIRMED`, `REVISED`, or `REJECTED` with source evidence and the
    smallest safe correction boundary. Explain why any retained consumer guard
    belongs there.
@@ -360,11 +419,15 @@ validated reviewer findings; never assign them a `FIND-*` ID retroactively.
 
 The orchestrator may include only independently confirmed or revised findings.
 A rejected finding is omitted, not softened into optional advice. If validation
-shows that the correction needs a new product, public API,
-architecture, security, compatibility, cross-service, concurrency, resource-
-ownership, or persistent-data decision, do not prescribe it as remediation;
-return `SPEC_REVISION_REQUIRED` when the approved task truly requires that
-decision, otherwise reject the finding as out of scope.
+shows that the correction needs a new product, public API, architecture,
+security, compatibility, cross-service, concurrency, resource-ownership, or
+persistent-data decision, return `SPEC_REVISION_REQUIRED` when the approved
+task truly requires that decision, otherwise reject the finding as out of
+scope. `SPEC_REVISION_REQUIRED` is an approval gate, not permission to omit the
+remedy: retain the finding and provide a decision-complete recommended spec
+revision together with the implementation correction and proof that follow if
+the user approves it. Do not defer discovery of the fix to `$wyrd-spec` or the
+implementation agent.
 
 Missing source, incomplete caller tracing, an unavailable independent
 `ponytail-rev`, or disagreement that cannot be resolved from approved authority
@@ -374,12 +437,13 @@ blocks the review. Preserve its final ledger and recommendations as
 ## Verdict and remediation task
 
 In the established review directory, preserve both task-review reports,
-`standards-review.md`, `maintainer-review.md`, `system-review.md`, every
-`domain-review-<domain>.md`,
-any `followup-review.md`, and `findings-validation.md`, then write `verdict.md`
-containing the immutable subject, reconciled acceptance matrix, independent
-review results, the follow-up decision, validated finding ledger, verification
-limits, prior-finding closure, and one verdict:
+`standards-review.md`, `maintainer-review.md`, `system-review.md`,
+`reuse-review.md`, every `domain-review-<domain>.md`,
+any `followup-review.md`, any `root-cause.md`, and `findings-validation.md`,
+then write `verdict.md` containing the immutable subject, reconciled acceptance
+matrix, independent review results, the follow-up decision, validated finding
+ledger, the validated root-cause groups on a repeat review, verification limits,
+prior-finding closure, and one verdict:
 
 - `PASS` — all required reports are complete, the independently validated ledger
   is empty, every obligation passes after reconciling proposed findings with
@@ -387,24 +451,32 @@ limits, prior-finding closure, and one verdict:
   change entered the diff. A rejected proposal does not force failure merely
   because its discovery reviewer reported `FAIL`;
 - `FIX_REQUIRED` — one or more bounded implementation findings remain;
-- `SPEC_REVISION_REQUIRED` — correction requires changing approved behavior or
-  an expensive-to-reverse decision; or
+- `SPEC_REVISION_REQUIRED` — one or more retained findings require explicit
+  approval of a recommended spec change before their implementation correction
+  may proceed; or
 - `BLOCKED` — the immutable subject, authority, diff, or required independent
   review cannot be obtained.
 
-For `FIX_REQUIRED`, also write one self-contained remediation task named
-`<task-id>-R<n>-<name>.md` in the same review directory. It must contain:
+For `FIX_REQUIRED` and `SPEC_REVISION_REQUIRED`, also write one self-contained
+remediation task named `<task-id>-R<n>-<name>.md` in the same review directory.
+Include every retained finding; do not drop findings that remain implementable
+under the current spec merely because another finding requires a revision. It
+must contain:
 
 1. the approved spec path, original task path, and candidate identities;
 2. an issue diagnosis for each material finding: the violated obligation,
    current behavior, exact evidence, observable consequence, and why the
-   candidate or its existing proof falls short;
+   candidate or its existing proof falls short; for a confirmed shared root,
+   one diagnosis at the root that lists every symptom it closes, including
+   symptoms patched in earlier rounds;
 3. the intended correction outcome;
-4. a decision-complete recommendation within the approved behavior: select the
-   minimal correction approach, name the existing owner or mechanism to reuse,
-   identify the source of the invalid state and affected consumers, resolve
-   alternatives that would change scope or proof, and explain why that approach
-   closes the diagnosed gap without relying on repeated downstream guards;
+4. a decision-complete recommendation: for findings already authorized by the
+   approved spec, select the minimal correction approach, name the existing
+   owner or mechanism to reuse, identify the source of the invalid state and
+   affected consumers, resolve alternatives that would change scope or proof,
+   and explain why that approach closes the diagnosed gap without relying on
+   repeated downstream guards; for spec-revision findings, provide the same
+   implementation detail contingent on the draft revision below;
 5. constraints, preserved behavior, and explicit non-goals;
 6. acceptance criteria mapped to every finding; and
 7. focused proof that directly exercises the gap plus only the narrowest
@@ -417,19 +489,46 @@ the rustdoc gate intact, but never create a style-only round. If approved spec t
 conflicts with the required correction, return `SPEC_REVISION_REQUIRED` and
 name the conflict instead of prescribing an unapproved behavior change.
 
+For each finding that requires a spec revision, the remediation task must also
+contain:
+
+1. the exact approved clauses that conflict with or fail to authorize the
+   correction;
+2. the recommended replacement, addition, or deletion as concrete draft spec
+   text, including the next revision number and a revision-history entry;
+3. the material decision and rationale the user must approve, with rejected
+   alternatives when they affect observable behavior or an expensive-to-reverse
+   boundary;
+4. the implementation correction that becomes authorized by that draft text,
+   including its owner, affected consumers, and preserved behavior; and
+5. sequencing that requires explicit human approval of the spec revision before
+   changing code, followed by the same focused and broader proof required for
+   any other remediation.
+
+Do not revise the spec merely to waive a failed obligation or make the current
+candidate pass. Removing or weakening an obligation is a valid recommendation
+only when higher authority and the user's stated intent establish that the
+obligation itself is wrong; state that evidence and still identify any code,
+tests, or generated artifacts that the approved revision would require.
+
 Do not write an outcome checklist or merely restate the acceptance matrix. The
 diagnosis and recommendation are the substance of the remediation task;
 acceptance criteria only prove that correction. An implementer must not need to
 rediscover the defect or choose the correction boundary. If that recommendation
 requires a new product, public API, architecture, security, compatibility,
-cross-service, concurrency-semantics, or persistent-data decision, return
-`SPEC_REVISION_REQUIRED` instead.
+cross-service, concurrency-semantics, or persistent-data decision, use
+`SPEC_REVISION_REQUIRED` and include the draft spec change and contingent
+implementation correction above; never substitute the verdict for the
+remediation packet.
 
 The remediation task packages validated findings for a fresh implementation
 agent; it is not another design plan. Do not specify helpers, private methods,
-local control flow, fixture structure, or optional improvements. Route it
-directly to `$wyrd-implement`. A later review reassesses the complete cumulative
-candidate against the original task.
+local control flow, fixture structure, or optional improvements. Route a
+`FIX_REQUIRED` packet directly to `$wyrd-implement`. Route a
+`SPEC_REVISION_REQUIRED` packet first to `$wyrd-spec` for the named approval;
+after approval, route that same packet to `$wyrd-implement` without making the
+implementer reconstruct the omitted fix. A later review reassesses the complete
+cumulative candidate against the original task and approved revision.
 
 Return only the verdict, verdict path, remediation task path when present, and
 finding IDs. `PASS` is the task's completion gate. Review does not implement,

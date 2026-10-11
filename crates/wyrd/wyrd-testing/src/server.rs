@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use wyrd_sql::OperatorPool;
-use wyrd_storage::StorageError;
 
+use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
@@ -42,7 +42,7 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::storage::{BifrostStorage, StorageInspection};
+use vala_bifrost_redux::storage::BifrostStorage;
 use wyrd_auth::connections::HumanConnections;
 use wyrd_auth::issuance::{TenantGrant, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
@@ -58,6 +58,7 @@ use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_crypt::{SealingKeyring, SecretKey};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_gateway::BuiltinEndpoints;
+use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_runtime::{Permission, PrincipalId, RbacCheck};
 use wyrd_semver::VersionBlock;
 use wyrd_server::boot::data_root::BifrostDataRoot;
@@ -80,8 +81,10 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_sql::queries::auth::service_account_by_card_ref;
 use wyrd_telemetry::TelemetryGuard;
+use wyrd_types::variant::variant_storage_type;
 
 use crate::bifrost::ForgeObjectStoreControl;
+use crate::bifrost::object_reads::ObjectReadProbe;
 
 use wyrd_spec::auth::{RoleSource, TokenAudience, TokenResponse};
 use wyrd_spec::card::verifier::{DriftBaselineState, DriftBaselineStatus};
@@ -126,6 +129,33 @@ const READ_DECISION: &str = "bifrost.query.read_decision";
 /// constant is public because a test that pins two Oracle replicas to one
 /// durable admission ceiling has to name the limit its shared cap derives from.
 pub const HARNESS_NODE_MEMORY_LIMIT_BYTES: usize = 3 * 1024 * 1024 * 1024;
+
+/// Renders one retained audit cell as text: a text column as its value and the
+/// Variant `detail` column as its JSON text, so assertions parse it like any
+/// other JSON. A null cell is `None`.
+///
+/// # Errors
+/// Returns [`WyrdTestServerError::Audit`] when the column is neither text nor
+/// Variant, or a Variant cell does not decode.
+fn audit_cell_text(column: &dyn Array, row: usize) -> Result<Option<String>, WyrdTestServerError> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(text) = column.as_any().downcast_ref::<StringArray>() {
+        return Ok(Some(text.value(row).to_owned()));
+    }
+    if column.data_type() != &variant_storage_type() {
+        return Err(WyrdTestServerError::Audit(
+            "retained audit projection is neither text nor Variant".to_owned(),
+        ));
+    }
+    let value = variant_cell_to_json(column, row).map_err(|violation| {
+        WyrdTestServerError::Audit(format!(
+            "retained audit detail does not decode: {violation:?}"
+        ))
+    })?;
+    Ok(Some(value.to_string()))
+}
 
 /// Separates a serve-task join failure from the server's own terminal outcome.
 ///
@@ -245,6 +275,8 @@ struct WyrdTestServerInner {
     forge_scheduler_trigger: ForgeSchedulerTrigger,
     /// Passive controls retained by the actual production-composed Forge object store.
     forge_object_store: Option<Arc<ForgeObjectStoreControl>>,
+    /// Ranged-read probe wrapping this server's Bifrost object store.
+    object_reads: Arc<ObjectReadProbe>,
     /// Process composition selected for this test server.
     forge_process_role: BifrostTarget,
     /// Stable identity assigned to this server process.
@@ -291,12 +323,6 @@ pub struct ServerShutdownInspection {
     pub listeners_stopped: bool,
     /// Supervisor join handles still retained after shutdown.
     pub supervised_tasks: u64,
-    /// Final storage-owner state, read from its owners, when this process had one.
-    ///
-    /// Captured after the bound production serve task joins and before the
-    /// harness drops, so it is the state production teardown actually left
-    /// rather than the state a test-invoked second shutdown produced.
-    pub storage: Option<StorageInspection>,
 }
 
 /// Exact query-owned resources inspected by test-tier cancellation journeys.
@@ -488,6 +514,13 @@ pub struct WyrdTestServerBuilder {
     /// capacity to be a stated number rather than whatever the injected memory
     /// envelope happens to divide into.
     oracle_query_slot_limit: Option<usize>,
+    /// Scanned bytes that earn one Oracle execution partition, replacing the
+    /// production default.
+    ///
+    /// Journey tables hold kilobytes, which the default sizes to one local
+    /// partition; a journey proving distributed execution states a smaller
+    /// value so its scans fan out.
+    oracle_partition_scan_bytes: Option<u64>,
     /// Oracle queue and deadline bounds replacing the production defaults.
     ///
     /// A journey that proves queue or total-deadline expiry states short
@@ -646,6 +679,7 @@ impl Default for WyrdTestServerBuilder {
             bifrost_data_path: None,
             system_resources: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             oracle_runtime: None,
             telemetry: None,
             bind_addrs: None,
@@ -1157,18 +1191,11 @@ impl WyrdTestServer {
         let scribe_inflight = self
             .bifrost_scribe()
             .map_or(0, |scribe| scribe.inflight_items_for_test() as u64);
-        let storage = self
-            .inner
-            .state
-            .bifrost
-            .bifrost_storage()
-            .map(|storage| storage.inspect());
         let inspection = ServerShutdownInspection {
             scribe,
             scribe_inflight,
             listeners_stopped,
             supervised_tasks: self.supervised_task_count_for_test() as u64,
-            storage,
         };
         if listeners_stopped {
             self.bifrost_settled |= matches!(self.mode, Mode::Bound { .. });
@@ -1812,6 +1839,60 @@ impl WyrdTestServer {
             .collect()
     }
 
+    /// Read the Parquet leaf column paths stored in one tenant table's hot objects.
+    ///
+    /// Lists the objects through [`Self::published_hot_files_for_test`], reads
+    /// each through the table's own FileIO, and returns every footer leaf path
+    /// (`events.list.element.attributes.typed_value…`). A journey uses it to
+    /// prove what layout Scribe actually stored, which a query result alone
+    /// cannot show because both readers unshred before rows leave the scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when listing the hot objects fails, the table does not
+    /// load, an object cannot be read, or its footer does not parse.
+    pub async fn stored_leaf_paths_for_test(
+        &self,
+        tenant: DataTenantId,
+        namespace: BifrostNamespace,
+        table_name: &str,
+    ) -> Result<BTreeSet<String>, WyrdTestServerError> {
+        let start = |error: &dyn std::fmt::Display| WyrdTestServerError::Start(error.to_string());
+        let binding = TenantTableBinding::resolve((tenant, TableRef::new(namespace, table_name)))
+            .map_err(|error| start(&error))?;
+        let table = self
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .map_err(|error| start(&error))?;
+        let mut paths = BTreeSet::new();
+        for file in self
+            .published_hot_files_for_test(tenant, namespace.as_str(), table_name)
+            .await?
+        {
+            let bytes = table
+                .file_io()
+                .new_input(&file.object_key)
+                .map_err(|error| start(&error))?
+                .read()
+                .await
+                .map_err(|error| start(&error))?;
+            let footer = parquet::file::metadata::ParquetMetaDataReader::new()
+                .parse_and_finish(&bytes)
+                .map_err(|error| start(&error))?;
+            paths.extend(
+                footer
+                    .file_metadata()
+                    .schema_descr()
+                    .columns()
+                    .iter()
+                    .map(|column| column.path().string()),
+            );
+        }
+        Ok(paths)
+    }
+
     /// Wait until no Scribe outbox write is still in flight.
     ///
     /// Every surface stages its decisions on the process Scribe outbox, whose
@@ -1870,9 +1951,10 @@ impl WyrdTestServer {
 
     /// Reads retained audit rows, every selected column projected as text.
     ///
-    /// `projection` is the `SELECT` list and must cast each column to text, so
-    /// one decoder serves every assertion shape. Rows come back in the tenant's
-    /// own decision-time order — the order the decisions were made — and the inspector's
+    /// `projection` is the `SELECT` list and must cast each scalar column to
+    /// text, so one decoder serves every assertion shape; the Variant `detail`
+    /// column is selected as is and rendered as its JSON text. Rows come back
+    /// in the tenant's own decision-time order — the order the decisions were made — and the inspector's
     /// own reads are excluded by principal exactly as they are for a count.
     ///
     /// # Errors
@@ -1885,7 +1967,6 @@ impl WyrdTestServer {
         projection: &str,
         predicate: &str,
     ) -> Result<Vec<Vec<Option<String>>>, WyrdTestServerError> {
-        use arrow::array::Array as _;
         use futures_util::StreamExt as _;
         use vala_bifrost_redux::oracle::QueryIpcDecoder;
         use wyrd_spec::vala::api::QueryStreamFrame;
@@ -1904,7 +1985,7 @@ impl WyrdTestServer {
                     sql: format!(
                         "SELECT {projection} FROM {AUDIT_LOG} WHERE ({predicate}) \
                          AND audit_principal_id <> '{AUDIT_INSPECTION_PRINCIPAL}' \
-                         ORDER BY wyrd_event_time"
+                         ORDER BY created_at"
                     ),
                     deadline_ms: Some(60_000),
                 },
@@ -1928,30 +2009,13 @@ impl WyrdTestServer {
                     let batch = decoder
                         .accept_batch(&batch.arrow_ipc_batch)
                         .map_err(|error| audit(&error))?;
-                    let columns: Vec<_> = batch
-                        .columns()
-                        .iter()
-                        .map(|column| {
-                            column
-                                .as_any()
-                                .downcast_ref::<arrow::array::StringArray>()
-                                .ok_or_else(|| {
-                                    WyrdTestServerError::Audit(
-                                        "retained audit projection is not text".to_owned(),
-                                    )
-                                })
-                        })
-                        .collect::<Result<_, _>>()?;
                     for index in 0..batch.num_rows() {
                         records.push(
-                            columns
+                            batch
+                                .columns()
                                 .iter()
-                                .map(|column| {
-                                    column
-                                        .is_valid(index)
-                                        .then(|| column.value(index).to_owned())
-                                })
-                                .collect(),
+                                .map(|column| audit_cell_text(column.as_ref(), index))
+                                .collect::<Result<_, _>>()?,
                         );
                     }
                 }
@@ -2464,6 +2528,12 @@ impl WyrdTestServer {
     #[must_use]
     pub fn forge_object_store_control_for_test(&self) -> Option<Arc<ForgeObjectStoreControl>> {
         self.inner.forge_object_store.as_ref().map(Arc::clone)
+    }
+
+    /// Return the probe observing ranged reads on this server's Bifrost store.
+    #[must_use]
+    pub fn object_reads_for_test(&self) -> &Arc<ObjectReadProbe> {
+        &self.inner.object_reads
     }
 
     /// Classifies one object through this node's production orphan predicate.
@@ -3668,32 +3738,33 @@ impl WyrdTestServer {
             .map_err(sql)
     }
 
-    /// Counts the active Oracle table reads one table currently holds.
+    /// Backdates every recorded snapshot supersession of one tenant by `age`.
     ///
-    /// Reads `vala.oracle_active_table_reads` under tenant RLS by the
-    /// registered table UID and ends the read transaction before returning, so
-    /// inspection holds no maintenance lock and never discards an abandoned
-    /// row.
+    /// Snapshot retention is measured in `PostgreSQL` time from Forge's first
+    /// observation of a replaced snapshot, which a journey cannot advance;
+    /// moving the recorded observation back is the equivalent. Runs on the
+    /// fixture superuser because the table is tenant-scoped under RLS.
     ///
     /// # Errors
-    /// Returns a harness SQL error when the table is unregistered or the read
-    /// transaction fails.
-    pub async fn oracle_active_table_reads_for_test(
+    /// Returns a harness SQL error when the superuser pool or the update fails.
+    pub async fn age_snapshot_supersessions_for_test(
         &self,
-        binding: &TenantTableBinding,
-    ) -> Result<i64, WyrdTestServerError> {
-        let mut conn = self.tenant_conn_for(binding.tenant).await?;
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.oracle_active_table_reads r \
-             JOIN vala.bifrost_tables t ON t.table_uid = r.table_uid \
-             WHERE t.fqn = $1",
+        tenant: DataTenantId,
+        age: Duration,
+    ) -> Result<(), WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let millis = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+        sqlx::query(
+            "UPDATE vala.forge_snapshot_supersessions \
+                SET observed_at = observed_at - $2 * interval '1 millisecond' \
+              WHERE data_tenant_id = $1",
         )
-        .bind(binding.table_ref.fqn())
-        .fetch_one(&mut **conn.transaction())
+        .bind(tenant.as_uuid())
+        .bind(millis)
+        .execute(&pool)
         .await
         .map_err(sql)?;
-        conn.commit().await.map_err(sql)?;
-        Ok(count)
+        Ok(())
     }
 
     /// Return the durable Scribe WAL root this fixture composed the server with.
@@ -4481,6 +4552,18 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Configure the scanned bytes that earn one Oracle execution partition.
+    ///
+    /// This is the same deployment knob production reads from
+    /// `WYRD_BIFROST_ORACLE_PARTITION_SCAN_BYTES`. A journey whose kilobyte
+    /// tables must still plan distributed sets it to one byte, so every scan
+    /// earns its full CPU-capped partition count.
+    #[must_use]
+    pub fn with_oracle_partition_scan_bytes_for_test(mut self, bytes: u64) -> Self {
+        self.oracle_partition_scan_bytes = Some(bytes);
+        self
+    }
+
     /// Configure this node's Oracle runtime bounds explicitly.
     ///
     /// These are the same values production reads from `bifrost.oracle`, such
@@ -4611,7 +4694,7 @@ impl WyrdTestServerBuilder {
                 };
                 (Some(Arc::new(root)), settings)
             };
-            let handle = fixture_storage_handle(settings)
+            let handle = StorageHandle::from_settings(settings)
                 .await
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (root, handle)
@@ -4770,6 +4853,7 @@ impl WyrdTestServerBuilder {
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: self.oracle_query_slot_limit,
+                    oracle_partition_scan_bytes: self.oracle_partition_scan_bytes,
                     scratch_root: Some(scratch_root),
                     volume_roots,
                 },
@@ -4781,16 +4865,29 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         // Same boot order as production: resources, then the one storage owner,
         // then the catalog that runs its Iceberg I/O through it.
-        let bifrost_storage = Arc::new(BifrostStorage::new(
-            Arc::clone(&storage),
+        let mut bifrost_storage = BifrostStorage::new(
+            storage.backend_config(),
             vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
                 self.bifrost_storage_io.to_storage_config(),
                 u64::try_from(bifrost_resources.plan().managed_memory_bytes).unwrap_or(u64::MAX),
                 bifrost_resources.oracle().is_some(),
             )
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-            bifrost_resources.oracle().map(|oracle| oracle.metadata()),
-        ));
+        )
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let mut object_reads = None;
+        bifrost_storage = bifrost_storage.with_objects_for_test(|objects| {
+            let probe = ObjectReadProbe::new(objects);
+            object_reads = Some(Arc::clone(&probe));
+            probe
+        });
+        let object_reads = object_reads.expect("the probe wraps the store it was given");
+        if let Some(oracle) = bifrost_resources.oracle() {
+            bifrost_storage = bifrost_storage
+                .with_metadata_cache(&oracle.metadata())
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        }
+        let bifrost_storage = Arc::new(bifrost_storage);
         let bifrost = test_catalog(&fixture, Arc::clone(&bifrost_storage)).await?;
         let target = self.forge_process_role;
         // Mirrors production: a Scribe-bearing node reclaims the identity stored
@@ -4829,7 +4926,7 @@ impl WyrdTestServerBuilder {
             || self
                 .bifrost_roles
                 .contains(&BifrostRuntimeRole::ForgeWorker))
-        .then(|| ForgeObjectStoreControl::new(Arc::new(storage.operator().clone())));
+        .then(|| ForgeObjectStoreControl::new(&bifrost_storage));
         let composed_forge_object_store = forge_object_store.as_ref().map(|control| {
             Arc::clone(control) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>
         });
@@ -4881,7 +4978,6 @@ impl WyrdTestServerBuilder {
             target,
             deployment_profile: DeploymentProfile::Development,
             postgres: postgres.as_ref().clone(),
-            storage: Arc::clone(&storage),
             bifrost_storage: Arc::clone(&bifrost_storage),
             catalog: Arc::clone(&bifrost),
             resources: bifrost_resources,
@@ -5018,6 +5114,7 @@ impl WyrdTestServerBuilder {
                 forge_clock: forge_clock_control,
                 forge_scheduler_trigger,
                 forge_object_store,
+                object_reads,
                 forge_process_role: self.forge_process_role,
                 node_id,
                 query_stream_fault,
@@ -5388,36 +5485,6 @@ fn claim_port(port: u16) -> Result<bool, WyrdTestServerError> {
     }
 }
 
-/// Opens a test fixture's storage handle, declaring the cursor listing a Local
-/// backend actually has.
-///
-/// The filesystem service resumes a listing from `start_after` correctly but
-/// does not advertise the capability, and Forge workers refuse to start on a
-/// staging backend that cannot resume a bounded orphan scan. A Local fixture
-/// stands in for a production object store, so it declares the support it
-/// actually has; every other backend is opened unchanged, and a caller wanting
-/// the incapable backend supplies its own plain storage handle instead.
-///
-/// # Errors
-///
-/// Returns the [`StorageError`] from building the operator or
-/// opening the handle.
-pub(crate) async fn fixture_storage_handle(
-    settings: StorageSettings,
-) -> Result<Arc<StorageHandle>, StorageError> {
-    if matches!(settings.backend, BackendConfig::Local { .. }) {
-        let operator = wyrd_storage::factory::build_operator(&settings.backend)?.layer(
-            opendal::layers::CapabilityOverrideLayer::new(|mut capability| {
-                capability.list_with_start_after = true;
-                capability
-            }),
-        );
-        StorageHandle::from_settings_with_operator(settings, operator).await
-    } else {
-        StorageHandle::from_settings(settings).await
-    }
-}
-
 /// Binds one loopback port, reports the concrete address, and releases it.
 ///
 /// # Errors
@@ -5743,20 +5810,22 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 /// simulated node still constructs its own Oracle-funded owner when it starts.
 ///
 /// # Panics
-/// Panics when the default storage policy does not resolve, which would mean
-/// the shipped defaults are themselves invalid.
+/// Panics when the default storage policy does not resolve or the backend's
+/// object store cannot be built, which would mean the fixture is unusable.
 #[must_use]
-pub fn test_storage_owner(storage: &Arc<StorageHandle>) -> Arc<BifrostStorage> {
-    Arc::new(BifrostStorage::new(
-        Arc::clone(storage),
-        vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
-            vala_bifrost_redux::storage::BifrostStorageConfig::default(),
-            u64::from(u32::MAX),
-            false,
+pub fn test_storage_owner(storage: &StorageHandle) -> Arc<BifrostStorage> {
+    Arc::new(
+        BifrostStorage::new(
+            storage.backend_config(),
+            vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
+                vala_bifrost_redux::storage::BifrostStorageConfig::default(),
+                u64::from(u32::MAX),
+                false,
+            )
+            .expect("the default storage policy is valid"),
         )
-        .expect("the default storage policy is valid"),
-        None,
-    ))
+        .expect("the fixture object store builds"),
+    )
 }
 
 /// Build a [`ServerPostgres`] from an already-started [`PgFixture`].
@@ -5810,6 +5879,7 @@ mod production_composition_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                oracle_partition_scan_bytes: None,
                 scratch_root: Some(scratch.path().to_owned()),
                 volume_roots: None,
             },

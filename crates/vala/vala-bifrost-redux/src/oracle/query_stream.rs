@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use tracing::Span;
 
-use super::planner::ActiveReadClaim;
+use super::profile::QueryProfile;
 use super::telemetry::AnalyticalAttemptOutcome;
 
 use super::*;
@@ -242,8 +242,8 @@ pub(super) struct QueryStreamInput {
     pub(super) gate_lifecycle: Option<Arc<QueryStreamLifecycle>>,
     /// Exactly-once owner-local registry settlement retained through terminal output.
     pub(super) running_query: Option<RunningQueryTerminalOwner>,
-    /// Active table reads released only after every descendant has joined.
-    pub(super) active_reads: Option<ActiveReadClaim>,
+    /// Query profile, emitted only after every descendant has joined.
+    pub(super) profile: Option<Arc<QueryProfile>>,
 }
 
 /// Exactly-once terminal owner for one inserted running-query entry.
@@ -296,8 +296,8 @@ impl Drop for RunningQueryTerminalOwner {
 enum QueryStreamEvent {
     /// Next physical batch result, or `None` when execution completed.
     Batch(Option<Result<RecordBatch, datafusion::error::DataFusionError>>),
-    /// Stable terminal failure selected before another batch is exposed.
-    Failed(QueryTerminalErrorCode),
+    /// Catalog failure selected before another batch is exposed.
+    Failed(BifrostError),
 }
 
 /// Inputs retained by the lazy frame stream until terminal cleanup.
@@ -330,8 +330,8 @@ struct FrameBuildInput {
     stream_telemetry_cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Exactly-once active-registry terminal owner.
     running_query: Option<RunningQueryTerminalOwner>,
-    /// Active table reads released only when this stream is finished.
-    active_reads: Option<ActiveReadClaim>,
+    /// Query profile, emitted only when this stream is finished.
+    profile: Option<Arc<QueryProfile>>,
 }
 
 /// Resolves the next event one frame loop iteration acts on.
@@ -353,7 +353,7 @@ async fn next_frame_event(
     deadline: std::time::Instant,
 ) -> QueryStreamEvent {
     if cancellation_requested(stream_cancellation, request_cancellation) {
-        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed);
+        return QueryStreamEvent::Failed(BifrostError::QueryExecutionFailed);
     }
     if let Some(value) = next.take() {
         return QueryStreamEvent::Batch(Some(value));
@@ -407,15 +407,14 @@ fn encode_frame(
 /// batch is taken from the plan. On exhaustion, failure, or cancellation it
 /// drops the plan's batch stream and then settles through
 /// [`settle_and_finish_stream`], which releases admission, finishes the
-/// running-query registry entry, and awaits the active-read claim's release
-/// before the terminal frame is yielded.
+/// running-query registry entry, and emits the query profile before the
+/// terminal frame is yielded.
 ///
 /// A consumer that drops the stream at any await skips that settlement. The
-/// admission guard and the active-read claim are therefore moved into one
+/// admission guard and the profile are therefore moved into one
 /// [`LeaderStreamOwners`] value before the generator is built, whose `Drop`
-/// revokes the query's Analytical graph before starting the claim's release,
-/// so Forge can never destroy objects a still-running follower or local driver
-/// may read.
+/// revokes the query's Analytical graph before emitting the profile, so the
+/// profile always includes every operator's final metrics.
 fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
     let FrameBuildInput {
         query_class,
@@ -432,13 +431,13 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
         request_cancellation,
         stream_telemetry_cancelled,
         mut running_query,
-        active_reads,
+        profile,
     } = input;
     let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
     // Built before the generator, never inside it: a stream dropped before its
     // first poll drops only its captures, in an unspecified order, so the two
     // owners must already be one captured value whose `Drop` fixes the order.
-    let owners = LeaderStreamOwners::new(admitted, active_reads);
+    let owners = LeaderStreamOwners::new(admitted, profile);
     let frames = async_stream::stream! {
         let mut owners = owners;
         // Re-bound after `owners` on purpose. When a consumer walks away the
@@ -470,7 +469,7 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
                         &mut row_count,
                     ) {
                         Err(()) => break failed_terminal_on_path(
-                            QueryTerminalErrorCode::QueryExecutionFailed,
+                            BifrostError::QueryExecutionFailed,
                             row_count,
                             query_class,
                         ),
@@ -490,17 +489,17 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
                     }
                 }
                 QueryStreamEvent::Batch(Some(Err(error))) => {
-                    let code = terminal_error_code(&error);
-                    tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
-                    break failed_terminal_on_path(code, row_count, query_class);
+                    let error = map_datafusion_error(&error);
+                    tracing::error!(error_code = error.code(), "Oracle query stream execution failed");
+                    break failed_terminal_on_path(error, row_count, query_class);
                 }
                 QueryStreamEvent::Batch(None) => break exhausted_terminal(
                     &degraded_sources,
                                 row_count,
                     query_class,
                 ),
-                QueryStreamEvent::Failed(code) => {
-                    break failed_terminal_on_path(code, row_count, query_class);
+                QueryStreamEvent::Failed(error) => {
+                    break failed_terminal_on_path(error, row_count, query_class);
                 }
             }
         };
@@ -519,7 +518,7 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
             running_query: &mut running_query,
             query_class,
             row_count,
-            active_reads: &mut owners.active_reads,
+            profile: &mut owners.profile,
         })
         .await;
         yield Ok(QueryStreamFrame::Terminal(terminal));
@@ -532,32 +531,32 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
 /// A consumer may drop the frame stream at any await, including mid-settlement.
 /// The admission guard carries the query's Analytical graph lifecycle, whose
 /// drop revokes every follower grant and aborts every local driver before it
-/// returns; the active-read claim's drop starts its release. Releasing the
-/// claim first would let Forge destroy objects a still-running follower or
-/// local driver may read, so this value's `Drop` fixes the order explicitly
-/// instead of leaving it to generator-state drop order.
+/// returns; the profile's last drop emits it. Emitting the profile first would
+/// miss metrics a still-running follower or local driver adds, so this value's
+/// `Drop` fixes the order explicitly instead of leaving it to generator-state
+/// drop order.
 struct LeaderStreamOwners {
     /// Admission guard, and through it the Analytical graph lifecycle.
     admitted: Option<AdmittedQueryGuard>,
-    /// Active table reads, released only after `admitted` is gone.
-    active_reads: Option<ActiveReadClaim>,
+    /// Query profile, dropped only after `admitted` is gone.
+    profile: Option<Arc<QueryProfile>>,
 }
 
 impl LeaderStreamOwners {
-    /// Takes ownership of the stream's admission guard and active-read claim.
-    const fn new(admitted: AdmittedQueryGuard, active_reads: Option<ActiveReadClaim>) -> Self {
+    /// Takes ownership of the stream's admission guard and query profile.
+    const fn new(admitted: AdmittedQueryGuard, profile: Option<Arc<QueryProfile>>) -> Self {
         Self {
             admitted: Some(admitted),
-            active_reads,
+            profile,
         }
     }
 }
 
 impl Drop for LeaderStreamOwners {
-    /// Revokes the Analytical graph first, then starts the claim's release.
+    /// Revokes the Analytical graph first, then drops the profile.
     fn drop(&mut self) {
         drop(self.admitted.take());
-        drop(self.active_reads.take());
+        drop(self.profile.take());
     }
 }
 
@@ -636,12 +635,12 @@ struct StreamSettlementInputs<'a> {
     query_class: QueryClass,
     /// Rows emitted before the terminal, reported on every outcome.
     row_count: u64,
-    /// Active table reads released only once nothing can read again.
+    /// Query profile, dropped only once nothing can add metrics again.
     ///
     /// Borrowed from the stream's [`LeaderStreamOwners`] rather than moved, so
-    /// a settlement dropped mid-await leaves the claim where that owner's
-    /// `Drop` releases it after the Analytical graph is revoked.
-    active_reads: &'a mut Option<ActiveReadClaim>,
+    /// a settlement dropped mid-await leaves the profile where that owner's
+    /// `Drop` drops it after the Analytical graph is revoked.
+    profile: &'a mut Option<Arc<QueryProfile>>,
 }
 
 /// Settles every owner the drained stream holds and assembles its terminal.
@@ -667,7 +666,7 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         running_query,
         query_class,
         row_count,
-        active_reads,
+        profile,
     } = inputs;
     let outcome = candidate.outcome;
     let failed_outcome = settle_failed_cancellation(
@@ -684,11 +683,7 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
     let candidate = if settlement.clean {
         candidate
     } else {
-        failed_terminal_on_path(
-            QueryTerminalErrorCode::QueryExecutionFailed,
-            row_count,
-            query_class,
-        )
+        failed_terminal_on_path(BifrostError::QueryExecutionFailed, row_count, query_class)
     };
     let candidate = close_ipc_stream(ipc, candidate, row_count, query_class);
     let terminal = release_and_finish_terminal(
@@ -703,12 +698,10 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
     if let Some(owner) = running_query {
         owner.finish(terminal.outcome);
     }
-    // Released only here. Every leader-local batch source was dropped by the
+    // Dropped only here. Every leader-local batch source was dropped by the
     // caller and the distributed and Analytical settlements have joined, so
-    // no descendant of this query can read its cut again.
-    if let Some(claim) = active_reads.take() {
-        claim.release().await;
-    }
+    // the profile's operator metrics are final.
+    drop(profile.take());
     terminal
 }
 
@@ -754,20 +747,20 @@ async fn next_query_stream_event(
     deadline: Instant,
 ) -> QueryStreamEvent {
     if cancellation.is_cancelled() || request_cancellation.is_cancelled() {
-        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed);
+        return QueryStreamEvent::Failed(BifrostError::QueryExecutionFailed);
     }
     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout);
+        return QueryStreamEvent::Failed(BifrostError::QueryTimeout);
     };
     tokio::select! {
         () = cancellation.cancelled() => {
-            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
+            QueryStreamEvent::Failed(BifrostError::QueryExecutionFailed)
         }
         () = request_cancellation.cancelled() => {
-            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
+            QueryStreamEvent::Failed(BifrostError::QueryExecutionFailed)
         }
         () = tokio::time::sleep(remaining) => {
-            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout)
+            QueryStreamEvent::Failed(BifrostError::QueryTimeout)
         }
         value = batches.next() => QueryStreamEvent::Batch(value),
     }
@@ -938,7 +931,7 @@ fn successful_terminal(
         .any(|source| *source != QuerySource::LiveTail);
     if published_lost {
         return failed_terminal_on_path(
-            QueryTerminalErrorCode::QueryVisibilityUnavailable,
+            BifrostError::QueryVisibilityUnavailable,
             row_count,
             query_class,
         );
@@ -1308,45 +1301,6 @@ impl QueryIpcDecoder {
     }
 }
 
-/// Maps a late `DataFusion` failure to the closed terminal-code catalog.
-///
-/// A typed resource refusal or query deadline anywhere in the chain is
-/// selected structurally before any message classification. The deadline is
-/// typed because a live source enforces the same query deadline as the leader
-/// on its own timer, and whichever fires first must report the same timeout.
-fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTerminalErrorCode {
-    if super::datafusion_resources_exhausted(error) {
-        return QueryTerminalErrorCode::QueryResourcesExhausted;
-    }
-    if datafusion_query_timeout(error) {
-        return QueryTerminalErrorCode::QueryTimeout;
-    }
-    let message = error.to_string().to_ascii_lowercase();
-    if super::is_tenant_refusal(error) {
-        QueryTerminalErrorCode::QueryTenantInvariant
-    } else if message.contains("reconciliation invariant") {
-        QueryTerminalErrorCode::QueryReconciliationInvariant
-    } else {
-        QueryTerminalErrorCode::QueryExecutionFailed
-    }
-}
-
-/// Reports whether a typed [`BifrostError::QueryTimeout`] sits anywhere in an
-/// execution error chain, including contextual wrappers added by plans.
-fn datafusion_query_timeout(error: &datafusion::error::DataFusionError) -> bool {
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(current) = source {
-        if matches!(
-            current.downcast_ref::<BifrostError>(),
-            Some(BifrostError::QueryTimeout)
-        ) {
-            return true;
-        }
-        source = current.source();
-    }
-    false
-}
-
 /// Selects the terminal outcome for a stream that observed a failed step.
 fn failed_stream_outcome(explicit_cancelled: &std::sync::atomic::AtomicBool) -> &'static str {
     if explicit_cancelled.load(std::sync::atomic::Ordering::Acquire) {
@@ -1396,11 +1350,7 @@ fn close_ipc_stream(
         },
         Err(error) => {
             tracing::error!(%error, "Oracle query stream could not close its Arrow IPC stream");
-            failed_terminal_on_path(
-                QueryTerminalErrorCode::QueryExecutionFailed,
-                row_count,
-                query_class,
-            )
+            failed_terminal_on_path(BifrostError::QueryExecutionFailed, row_count, query_class)
         }
     }
 }
@@ -1496,39 +1446,6 @@ impl OracleQueryStream {
         self
     }
 
-    /// Builds a test stream through the production telemetry and admission owners.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the IPC encoder cannot encode `schema` into the opening schema
-    /// frame.
-    #[cfg(test)]
-    pub(super) fn test_from_physical(
-        schema: &arrow::datatypes::SchemaRef,
-        batches: datafusion::physical_plan::SendableRecordBatchStream,
-        scan_stats: super::OracleQueryScanStats,
-    ) -> Self {
-        let (admitted, _shared, _request_cancellation) =
-            super::admission::admitted_guard_for_test();
-        let (ipc, schema_frame) = QueryIpcEncoder::new(schema).expect("test schema frame");
-        Self::new(QueryStreamInput {
-            query_class: QueryClass::Interactive,
-            schema_frame,
-            ipc,
-            batches,
-            first: None,
-            admitted,
-            deadline: Instant::now() + Duration::from_secs(1),
-            deadline_ms: 0,
-            degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            query_telemetry: OracleTelemetry::start_query(QueryClass::Interactive),
-            scan_stats,
-            gate_lifecycle: None,
-            running_query: None,
-            active_reads: None,
-        })
-    }
-
     /// Creates a lazy stream that owns local admission guards through terminal output.
     ///
     /// The returned future retains all cleanup state until the terminal frame
@@ -1550,7 +1467,7 @@ impl OracleQueryStream {
             scan_stats,
             gate_lifecycle,
             running_query,
-            active_reads,
+            profile,
         } = input;
         #[cfg(feature = "test-support")]
         let mut admitted = admitted;
@@ -1580,7 +1497,7 @@ impl OracleQueryStream {
             request_cancellation,
             stream_telemetry_cancelled,
             running_query,
-            active_reads,
+            profile,
         });
         let frames = polled_in_span(frames, span);
         let stream = Self::assemble(
@@ -1669,6 +1586,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::Schema;
+    use datafusion::error::DataFusionError;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
@@ -1679,8 +1597,8 @@ mod tests {
     use crate::oracle::exec::OracleQueryScanStats;
     use crate::oracle::failed_terminal_on_path;
     use crate::oracle::{
-        BifrostError, OracleTelemetry, QueryClass, QuerySchemaFrame, QuerySource, QueryStreamFrame,
-        QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+        BifrostError, OracleTelemetry, QueryCatalogError, QueryClass, QuerySchemaFrame,
+        QuerySource, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
     };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
@@ -1692,19 +1610,76 @@ mod tests {
     /// Panics when the typed chain is not selected before message text.
     #[test]
     fn late_resource_exhaustion_is_typed_terminal() {
-        use datafusion::error::DataFusionError;
         let wrapped = DataFusionError::Context(
             "tenant invariant".to_owned(),
             Box::new(DataFusionError::ResourcesExhausted("private".to_owned())),
         );
         assert_eq!(
-            super::terminal_error_code(&wrapped),
-            QueryTerminalErrorCode::QueryResourcesExhausted
+            crate::oracle::map_datafusion_error(&wrapped),
+            BifrostError::QueryResourcesExhausted
         );
         assert_eq!(
-            super::terminal_error_code(&DataFusionError::Internal("private".to_owned())),
-            QueryTerminalErrorCode::QueryExecutionFailed
+            crate::oracle::map_datafusion_error(&DataFusionError::Internal("private".to_owned())),
+            BifrostError::QueryExecutionFailed
         );
+    }
+
+    /// A late catalog failure keeps its exact code and details, whether its
+    /// envelope is in the local chain or crossed from a worker, and the failed
+    /// terminal carries that error's complete problem.
+    ///
+    /// The remote forms are the pinned distributed wire shapes: the worker's
+    /// `External` envelope, or the Parquet `External` a footer refusal raises,
+    /// is reduced to its display text and rebuilt as a generic external error
+    /// under the structurally preserved frames.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the late mapping or terminal loses the catalog identity.
+    #[test]
+    fn late_catalog_error_keeps_its_identity() {
+        for error in [
+            BifrostError::VariantInvalidJson {
+                field: "parse_json".to_owned(),
+                row: 1,
+                path: String::new(),
+            },
+            BifrostError::QueryTenantInvariant,
+        ] {
+            let envelope = QueryCatalogError::external(error.clone());
+            let DataFusionError::External(inner) = &envelope else {
+                panic!("the envelope is an external error");
+            };
+            let text = inner.to_string();
+            let local = DataFusionError::Context("late batch".to_owned(), Box::new(envelope));
+            let forwarded = DataFusionError::Context(
+                "remote stage".to_owned(),
+                Box::new(DataFusionError::Context(
+                    "late batch".to_owned(),
+                    Box::new(DataFusionError::External(text.clone().into())),
+                )),
+            );
+            let parquet = |inner: Box<dyn std::error::Error + Send + Sync>| {
+                DataFusionError::ParquetError(Box::new(
+                    datafusion::parquet::errors::ParquetError::External(inner),
+                ))
+            };
+            let local_footer = parquet(Box::new(QueryCatalogError(error.clone())));
+            let forwarded_footer =
+                DataFusionError::Context("remote stage".to_owned(), Box::new(parquet(text.into())));
+            for late in [local, forwarded, local_footer, forwarded_footer] {
+                let mapped = crate::oracle::map_datafusion_error(&late);
+                assert_eq!(mapped, error);
+                let terminal = failed_terminal_on_path(mapped, 3, QueryClass::Analytical);
+                assert_eq!(terminal.outcome, QueryTerminalOutcome::Failed);
+                assert_eq!(
+                    terminal.error,
+                    Some(Box::new(
+                        wyrd_spec::error::WyrdError::from(error.clone()).problem()
+                    ))
+                );
+            }
+        }
     }
 
     /// A typed query deadline raised by a live source, under its context
@@ -1715,7 +1690,6 @@ mod tests {
     /// Panics when the typed deadline is not selected.
     #[test]
     fn late_query_deadline_is_typed_terminal() {
-        use datafusion::error::DataFusionError;
         let wrapped = DataFusionError::Context(
             "Oracle query deadline elapsed during a live Scribe read".to_owned(),
             Box::new(DataFusionError::External(Box::new(
@@ -1723,8 +1697,8 @@ mod tests {
             ))),
         );
         assert_eq!(
-            super::terminal_error_code(&wrapped),
-            QueryTerminalErrorCode::QueryTimeout
+            crate::oracle::map_datafusion_error(&wrapped),
+            BifrostError::QueryTimeout
         );
     }
 
@@ -1812,8 +1786,8 @@ mod tests {
                 "{source:?} loss must fail"
             );
             assert_eq!(
-                failed.error.as_ref().map(|error| error.code),
-                Some(QueryTerminalErrorCode::QueryVisibilityUnavailable)
+                failed.error.as_ref().map(|error| error.code.as_str()),
+                Some("WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE")
             );
             failed
                 .validate()
@@ -1968,7 +1942,7 @@ mod tests {
             super::QueryIpcEncoder::new(schema).expect("failed stream opens");
         drop(dropped);
         let failed = failed_terminal_on_path(
-            QueryTerminalErrorCode::QueryExecutionFailed,
+            BifrostError::QueryExecutionFailed,
             0,
             QueryClass::Interactive,
         );
@@ -2151,7 +2125,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            active_reads: None,
+            profile: None,
         });
         let mut terminal_seen = false;
         while let Some(Ok(frame)) = stream.frames.next().await {
@@ -2195,7 +2169,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            active_reads: None,
+            profile: None,
         });
         assert!(matches!(
             stream.frames.next().await,
@@ -2238,7 +2212,7 @@ mod tests {
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
-            active_reads: None,
+            profile: None,
         });
         assert!(matches!(
             stream.frames.next().await,

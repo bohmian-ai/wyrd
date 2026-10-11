@@ -224,10 +224,10 @@ mod tests {
             format!("{root}/{partition}{attempt}-{ordinal}-{writer}.parquet")
         };
 
-        let first_path = path(first_writer, "00000", "wyrd_event_time_day=2026-08-29/");
+        let first_path = path(first_writer, "00000", "created_at_day=2026-08-29/");
         let first = ForgeOutputIdentity::validate(&first_path, &root, attempt)
             .expect("a partitioned recipe path is well-formed");
-        assert_eq!(first.partition_path, "wyrd_event_time_day=2026-08-29");
+        assert_eq!(first.partition_path, "created_at_day=2026-08-29");
         assert_eq!(first.writer_ordinal, 0);
         assert_eq!(first.writer_uuid, first_writer);
 
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(unpartitioned.partition_path, "");
         assert_eq!(unpartitioned.writer_ordinal, 1);
 
-        let second_path = path(second_writer, "00000", "wyrd_event_time_day=2026-08-29/");
+        let second_path = path(second_writer, "00000", "created_at_day=2026-08-29/");
         let second = ForgeOutputIdentity::validate(&second_path, &root, attempt)
             .expect("a concurrent writer restarts its own ordinal");
         assert_eq!(
@@ -329,7 +329,7 @@ mod tests {
 
         for (case, partition, ordinal, expected_ordinal) in [
             ("unpartitioned", "", "00000", 0_u64),
-            ("partitioned", "wyrd_event_time_day=2026-08-29/", "00007", 7),
+            ("partitioned", "created_at_day=2026-08-29/", "00007", 7),
             ("wide ordinal", "", "123456", 123_456),
         ] {
             let object = path(ordinal, partition);

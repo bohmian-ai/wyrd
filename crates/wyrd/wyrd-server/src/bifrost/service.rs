@@ -10,9 +10,9 @@ use vala_bifrost_redux::catalog::{BifrostCatalogError, CompactionRegistration, T
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire, RegisterOutcome,
-    RegisterTableRequest, RegisterTableResponse,
+    BifrostTableDescription, BifrostTableEntry, RegisterTableRequest, RegisterTableResponse,
 };
+use wyrd_types::spec_to_field;
 
 use crate::AppState;
 use crate::audit;
@@ -24,49 +24,13 @@ fn map_engine_error(error: BifrostCatalogError) -> WyrdError {
     error.into_public().into()
 }
 
-/// Rejects a re-registration whose declared layout differs from the one the
-/// table was created with.
-///
-/// A retry of the same registration must be idempotent, so the incoming
-/// declaration is resolved against the table's stored physical schema and
-/// compared with the stored canonical layout. Comparing canonical forms means
-/// an equivalent-but-differently-spelled declaration (an omitted declaration
-/// versus an explicit empty one) still retries cleanly, while a genuinely
-/// different physical layout conflicts.
-///
-/// `stored_schema` is the provider's own schema rather than anything rebuilt
-/// from the describe response: the managed Bloom floor is decided by which
-/// server-stamped columns the table actually carries, and describe reports
-/// only the managed column a writer may supply itself.
-///
-/// # Errors
-///
-/// Returns [`wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch`]
-/// (`WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH`) when the layouts differ, and a
-/// validation error when the incoming declaration is not valid against the
-/// stored schema.
-fn assert_registered_layout_matches(
-    fqn: &str,
-    stored_schema: &arrow::datatypes::Schema,
-    stored_layout: &PhysicalLayoutWire,
-    declared: Option<&PhysicalLayoutWire>,
-) -> Result<(), WyrdError> {
-    let canonical =
-        vala_bifrost_redux::catalog::layout::PhysicalLayout::resolve(fqn, stored_schema, declared)
-            .map_err(WyrdError::from)?;
-    if &canonical.to_wire() == stored_layout {
-        return Ok(());
-    }
-    Err(wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch {
-        table: fqn.to_owned(),
-    }
-    .into())
-}
-
 /// Register (idempotently create) a Bifrost table.
 ///
-/// Dataset registration requires `bifrost_table:write`. A matching-fingerprint re-register returns
-/// `AlreadyExists`; a conflicting schema is `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
+/// Dataset registration requires `bifrost_table:write`. The catalog decides
+/// every outcome under its registration lock: each declared field is stored as
+/// its Iceberg form, so a re-register whose fields are the same Iceberg columns
+/// returns `AlreadyExists`, and a different schema is
+/// `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
 /// A supplied `compaction_target_file_size_bytes` must match an existing
 /// table's explicit target (`WYRD_VALA_409_BIFROST_COMPACTION_TARGET_MISMATCH`),
 /// and a supplied `compaction_type` its explicit type
@@ -82,6 +46,9 @@ fn assert_registered_layout_matches(
 ///
 /// Returns a permission error when the caller lacks `bifrost_table:write`,
 /// a validation error for a non-dataset namespace,
+/// [`wyrd_spec::vala::BifrostError::UnsupportedType`] for a field type Bifrost
+/// cannot store (the same [`wyrd_types::schema::check_supported`] decision
+/// every SDK applies before sending),
 /// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
 /// carries no catalog, and the mapped catalog error otherwise.
 pub async fn register_table(
@@ -105,75 +72,30 @@ pub async fn register_table(
             details: serde_json::json!({ "table": fqn_for_audit }),
         });
     }
-    let user_fields: Vec<Field> = body.fields.iter().map(convert::field_to_arrow).collect();
-    let fingerprint = convert::fingerprint_hex(&user_fields);
-
-    let fqn = format!("{}.{}", ns.as_str(), body.name);
+    wyrd_types::schema::check_supported(&body.fields)?;
+    let user_fields: Vec<Field> = body
+        .fields
+        .iter()
+        .map(|spec| spec_to_field(spec, true))
+        .collect();
     let table = TableRef::new(ns, body.name.clone());
     let catalog = state
         .bifrost
         .catalog()
         .ok_or(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable)?;
-
-    match catalog.describe_table(&table, caller.data_tenant_id).await {
-        Ok(existing) => {
-            if existing.entry.fingerprint != fingerprint {
-                return Err(
-                    wyrd_spec::vala::BifrostError::FingerprintMismatch { table: fqn }.into(),
-                );
-            }
-            let stored_schema = catalog
-                .assignment_schema(&table, caller.data_tenant_id)
-                .await
-                .map_err(map_engine_error)?;
-            assert_registered_layout_matches(
-                &fqn,
-                &stored_schema,
-                &existing.physical_layout,
-                body.physical_layout.as_ref(),
-            )?;
-            if let Some(bytes) = body.compaction_target_file_size_bytes
-                && existing.compaction_target_file_size_bytes != Some(bytes)
-            {
-                return Err(
-                    wyrd_spec::vala::BifrostError::CompactionTargetMismatch { table: fqn }.into(),
-                );
-            }
-            if let Some(kind) = body.compaction_type
-                && existing.compaction_type != Some(kind)
-            {
-                return Err(
-                    wyrd_spec::vala::BifrostError::CompactionTypeMismatch { table: fqn }.into(),
-                );
-            }
-            Ok(RegisterTableResponse {
-                outcome: RegisterOutcome::AlreadyExists,
-                table_uid: existing.entry.table_uid,
-                fingerprint,
-            })
-        }
-        Err(BifrostCatalogError::TableNotFound(_)) => {
-            let table_uid = catalog
-                .register_dataset(
-                    caller.data_tenant_id,
-                    table,
-                    user_fields,
-                    body.physical_layout.clone(),
-                    CompactionRegistration {
-                        target_file_size_bytes: body.compaction_target_file_size_bytes,
-                        compaction_type: body.compaction_type.map(Into::into),
-                    },
-                )
-                .await
-                .map_err(map_engine_error)?;
-            Ok(RegisterTableResponse {
-                outcome: RegisterOutcome::Created,
-                table_uid: convert::to_hex(table_uid.as_bytes()),
-                fingerprint,
-            })
-        }
-        Err(other) => Err(map_engine_error(other)),
-    }
+    catalog
+        .register_dataset(
+            caller.data_tenant_id,
+            table,
+            user_fields,
+            body.physical_layout,
+            CompactionRegistration {
+                target_file_size_bytes: body.compaction_target_file_size_bytes,
+                compaction_type: body.compaction_type.map(Into::into),
+            },
+        )
+        .await
+        .map_err(map_engine_error)
 }
 
 /// List the tables visible to the caller's tenant (schema-free entries).
@@ -258,7 +180,10 @@ mod pg_tests {
 
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{CompactionTypeWire, DataTypeSpec, FieldSpec, TimeGranularityWire};
+    use wyrd_spec::vala::api::{
+        CompactionTypeWire, DataTypeSpec, FieldSpec, PhysicalLayoutWire, RegisterOutcome,
+        TimeGranularityWire,
+    };
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
     use crate::components::gateway::recording::{AuditDecision, RecordingScribe};
@@ -596,6 +521,7 @@ mod pg_tests {
             let mut req = register_req(&name, vec![field("id", DataTypeSpec::Int64)]);
             req.physical_layout = Some(PhysicalLayoutWire {
                 partition_granularity: TimeGranularityWire::Day,
+                time_column: None,
                 sort_keys: Vec::new(),
                 bloom_columns: vec!["absent_column".to_owned()],
             });

@@ -42,7 +42,7 @@ use super::expire::ExpiryTaskAuthority;
 use super::identity::task_table_binding;
 use super::leader::{ForgeCompactionDispatch, ForgeCompactionOutcome};
 use super::lease::{ForgeLease, forge_lease_key};
-use super::metrics::{ForgeCleanupRefusalStage, ForgeTaskResult, ForgeTelemetry};
+use super::metrics::{ForgeTaskResult, ForgeTelemetry};
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
@@ -6638,7 +6638,17 @@ impl ForgeCompactionPlanRunner {
             .shared
             .rewrite
             .rewrite_plan(plan, &self.shared.table, &self.shared.policy)
-            .await?;
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    worker = %self.owner,
+                    task_id = %self.task_id,
+                    plan_index = self.plan_index,
+                    operation_id = %self.operation_id,
+                    error = %error,
+                    "Forge compaction plan rewrite failed"
+                );
+            })?;
         let metadata = self.shared.table.metadata();
         let context = RewritePublication {
             claim: &self.claim,
@@ -7843,7 +7853,7 @@ impl ForgeWorker {
         let expected = catalog_path_to_object_key(
             table.metadata().location(),
             binding,
-            &self.forge.core.staging,
+            &self.forge.core.warehouse,
             &forge_data_location(table.metadata().location()),
         )?;
         if prefix != expected {
@@ -8019,8 +8029,8 @@ impl ForgeWorker {
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "expired cleanup cursor named an absent candidate".to_owned(),
                 })?;
-            // The exclusive table authority is held from reader exclusion
-            // through this candidate's delete outcome, including a resumed
+            // The exclusive table authority is held through this
+            // candidate's delete outcome, including a resumed
             // preparation, and surrendered before settlement, which takes the
             // same row on its own connection.
             let mut authority_conn = self
@@ -8030,15 +8040,9 @@ impl ForgeWorker {
                 .tenant_conn(attempt.tenant)
                 .await
                 .map_err(ForgeError::Sql)?;
-            // No authority means an Oracle read holds the table. That is the
-            // typed refusal: nothing was written, and dropping the
-            // uncommitted authority connection takes no lock with it.
-            let Some(exclusive) = super::table_authority::TableAuthority::new(&mut authority_conn)
+            let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
                 .exclusive(attempt.tenant, &attempt.binding.table_ref)
-                .await?
-            else {
-                return Err(Self::preparation_refused(index, prepared));
-            };
+                .await?;
             if !prepared {
                 require_running(stop)?;
                 lease.require_fence(&self.forge.core.operator_pool).await?;
@@ -8096,36 +8100,6 @@ impl ForgeWorker {
         })
     }
 
-    /// Maps an active read refusing one candidate's exclusive authority to its
-    /// outcome.
-    ///
-    /// The refusal precedes the candidate's preparation and delete and wrote
-    /// nothing, so the outcome depends only on what the durable row already
-    /// held. An unprepared index zero is the first preparation: the row is
-    /// still `running` with no evidence, so the claim is released through the
-    /// non-attempt-consuming [`ForgeError::Capacity`] path. A later index, or a
-    /// resumed candidate that is already `prepared`, means the row is already
-    /// `prepared`, which generic retry cannot settle. The exact frontier is
-    /// then retained as [`ForgeError::CleanupRetained`] for prepared-claim
-    /// replay.
-    ///
-    /// Each refusal is counted exactly once here, labelled by that outcome:
-    /// `prepare` for a released first preparation and `replay` for a frontier
-    /// retained for prepared-claim replay.
-    fn preparation_refused(index: u32, prepared: bool) -> ForgeError {
-        if index == 0 && !prepared {
-            ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Prepare);
-            return ForgeError::Capacity {
-                detail: "an Oracle query is still reading this table".to_owned(),
-            };
-        }
-        ForgeTelemetry::record_expired_cleanup_refusal(ForgeCleanupRefusalStage::Replay);
-        ForgeError::CleanupRetained {
-            index,
-            transition: "forge.expired_cleanup.preparation_refused",
-        }
-    }
-
     /// Proves one prepared candidate is still safe to delete right now.
     ///
     /// The preparation committed before this runs, so its evidence is durable;
@@ -8181,7 +8155,7 @@ impl ForgeWorker {
         let path = candidate.path.as_str();
         let metadata = match self.forge.core.object_store.stat(path).await {
             Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => None,
+            Err(object_store::Error::NotFound { .. }) => None,
             Err(error) => return Err(ForgeError::ObjectDelete(error)),
         };
         let evidence = metadata
@@ -8306,9 +8280,7 @@ impl ForgeWorker {
                 ForgeTelemetry::record_deleted_objects(ForgeTaskStrategy::ExpiredCleanup, 1);
                 Ok(ExpiredCleanupOutcome::Deleted)
             }
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
-                Ok(ExpiredCleanupOutcome::Missing)
-            }
+            Err(object_store::Error::NotFound { .. }) => Ok(ExpiredCleanupOutcome::Missing),
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -8491,7 +8463,7 @@ impl Forge {
         let object_path = catalog_path_to_object_key(
             table.metadata().location(),
             binding,
-            &self.core.staging,
+            &self.core.warehouse,
             &location,
         )?;
         let raw = self
@@ -8500,7 +8472,7 @@ impl Forge {
             .read(&object_path)
             .await
             .map_err(ForgeError::ObjectStore)?;
-        let digest = format!("sha256:{}", hex::encode(Sha256::digest(raw.to_bytes())));
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(&raw)));
         let evidence = ForgeTaskEvidence {
             version: 1,
             committed_snapshot_id: Some(snapshot_id),
@@ -8575,7 +8547,7 @@ impl ForgeWorker {
             let object_path = catalog_path_to_object_key(
                 table.metadata().location(),
                 binding,
-                &forge.core.staging,
+                &forge.core.warehouse,
                 &location,
             )?;
             let raw = forge
@@ -8613,7 +8585,7 @@ impl ForgeWorker {
                 committed_metadata_location: Some(location),
                 committed_metadata_digest: Some(format!(
                     "sha256:{}",
-                    hex::encode(Sha256::digest(raw.to_bytes()))
+                    hex::encode(Sha256::digest(&raw))
                 )),
                 cleanup_candidates: Vec::new(),
                 deleted_candidate_count: 0,
@@ -8663,7 +8635,7 @@ impl ForgeWorker {
         let object_path = catalog_path_to_object_key(
             table.metadata().location(),
             binding,
-            &self.forge.core.staging,
+            &self.forge.core.warehouse,
             location,
         )?;
         let raw = self
@@ -8673,7 +8645,7 @@ impl ForgeWorker {
             .read(&object_path)
             .await
             .map_err(ForgeError::ObjectStore)?;
-        let actual = format!("sha256:{}", hex::encode(Sha256::digest(raw.to_bytes())));
+        let actual = format!("sha256:{}", hex::encode(Sha256::digest(&raw)));
         if actual != expected {
             return Err(ForgeError::Reconciliation {
                 detail: "Prepared metadata digest does not match exact durable bytes".to_owned(),
@@ -9513,10 +9485,10 @@ mod tests {
         ForgeWorker::validate_payload(&claimed_task(
             ForgeTaskStrategy::SnapshotExpiry,
             serde_json::json!({
-                "kind": "maintenance",
-                "trigger_commit_count": 0,
-                "snapshot_expiry_due": true,
-                "reconciliation_due": false,
+            "kind": "maintenance",
+            "trigger_commit_count": 0,
+            "snapshot_expiry_due": true,
+            "reconciliation_due": false,
             }),
         ))
         .expect("snapshot expiration is an activated production route");

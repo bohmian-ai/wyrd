@@ -42,7 +42,7 @@ async fn scribe_promotion_integration_appends_existing_datafile_without_put() {
         "the fixture sealed real data objects"
     );
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let mut forge = SupervisedPromotion::start(
         &fixture,
         fixture.catalog.iceberg_catalog(),
@@ -69,11 +69,6 @@ async fn scribe_promotion_integration_appends_existing_datafile_without_put() {
             .filter(|(path, _)| data_object(path))
             .collect::<BTreeMap<_, _>>(),
         "promotion left every data object byte-identical"
-    );
-    assert_eq!(
-        object_store.output_writers(),
-        0,
-        "promotion opened no rewrite output"
     );
     assert_eq!(object_store.deletes(), 0, "promotion deleted no object");
     assert!(
@@ -111,7 +106,7 @@ async fn scribe_promotion_integration_appends_existing_datafile_without_put() {
 #[tokio::test]
 async fn scribe_promotion_integration_conflict_revalidates_before_retry() {
     let fixture = PromotionIntegrationFixture::start("promotion_conflict").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -170,7 +165,7 @@ async fn scribe_promotion_integration_conflict_revalidates_before_retry() {
 #[tokio::test]
 async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operation() {
     let fixture = PromotionIntegrationFixture::start("promotion_reset_retry").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -240,7 +235,7 @@ async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operat
 #[tokio::test]
 async fn scribe_promotion_integration_cancellation_drains_without_settlement() {
     let fixture = PromotionIntegrationFixture::start("promotion_drain").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -451,7 +446,7 @@ async fn assert_mutation_is_refused_before_catalog_io(
     assert_ne!(altered, original, "{name} must change the evidence");
     fixture.set_promotion_record(row_id, &altered).await;
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -470,11 +465,6 @@ async fn assert_mutation_is_refused_before_catalog_io(
         catalog.attempts(),
         0,
         "{name} must be refused before any catalog commit"
-    );
-    assert_eq!(
-        object_store.output_writers(),
-        0,
-        "{name} must not open a rewrite output"
     );
     assert_eq!(object_store.deletes(), 0, "{name} must delete no object");
     assert!(
@@ -508,22 +498,13 @@ async fn scribe_promotion_integration_rejects_corrupted_object_before_catalog_io
         .as_str()
         .expect("the record names its object")
         .to_owned();
-    let intact = fixture
-        .staging
-        .read(&object_key)
-        .await
-        .expect("the sealed object is readable")
-        .to_bytes();
+    let intact = fixture.read_object(&object_key).await;
     let mut corrupted = intact.to_vec();
     let last = corrupted.len() - 5;
     corrupted[last] ^= 0xFF;
-    fixture
-        .staging
-        .write(&object_key, corrupted)
-        .await
-        .expect("fixture object corruption");
+    fixture.write_object(&object_key, corrupted).await;
     {
-        let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+        let object_store = CountingObjectStore::new(&fixture.storage);
         let catalog = PromotionCatalogSeam::new(
             fixture.catalog.iceberg_catalog(),
             object_store.read_counter(),
@@ -543,11 +524,7 @@ async fn scribe_promotion_integration_rejects_corrupted_object_before_catalog_io
         );
         assert!(fixture.live_data_paths().await.is_empty());
     }
-    fixture
-        .staging
-        .write(&object_key, intact.to_vec())
-        .await
-        .expect("fixture object restoration");
+    fixture.write_object(&object_key, intact).await;
 }
 
 /// Forge operation family and phase vocabulary shared by the barrier proof.
@@ -764,10 +741,7 @@ mod promotion_barrier {
                 &mut conn,
             )
             .exclusive(identity.clone())
-            .await?
-            .ok_or_else(|| SqlError::Conflict {
-                detail: "an Oracle query is still reading this table".to_owned(),
-            })?;
+            .await?;
         let prepared = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
             .expect("valid Forge resource")
             .prepare_snapshot_expiration(

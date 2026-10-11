@@ -56,12 +56,8 @@ async fn each_composed_node_owns_exactly_one_storage_owner() {
                 "node {index} must publish one owner to every role"
             );
             assert!(
-                owner.metadata_cache_enabled(),
-                "an Oracle-serving node must resolve a metadata budget"
-            );
-            assert!(
                 owner.policy().metadata_cache_bytes() > 0,
-                "an enabled cache must have a nonzero budget"
+                "an Oracle-serving node must resolve a metadata budget"
             );
             Arc::clone(owner)
         })

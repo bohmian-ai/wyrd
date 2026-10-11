@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::DataTenantId;
 use crate::auth::{PrincipalId, PrincipalKindTag};
+use crate::error::WyrdProblem;
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
 pub use crate::vala::audit_detail::{
@@ -119,9 +120,6 @@ pub struct BifrostTableDescription {
     /// a null `card_uid`. A supplied UID is stored only once the server has
     /// confirmed the writer may correlate to that Card.
     pub correlation_fields: Vec<FieldSpec>,
-    /// Managed columns a writer may supply itself rather than let the server
-    /// stamp: non-null `wyrd_event_time: Timestamp(Microsecond, UTC)`.
-    pub managed_candidates: Vec<FieldSpec>,
     /// Lower-case 64-character hex of the complete canonical physical
     /// fingerprint, present only for a canonical `OTel` signal built-in.
     ///
@@ -268,7 +266,42 @@ pub enum DataTypeSpec {
     /// Nested struct of named fields.
     #[cfg_attr(feature = "server", schema(no_recursion))]
     Struct(Vec<FieldSpec>),
+    /// Unordered key/value entries, the Iceberg `map` type.
+    ///
+    /// Key and value are full [`FieldSpec`]s for the same reason as
+    /// [`Self::List`]'s element: each keeps its name, nullability, metadata,
+    /// and stable field id. An Iceberg map key is always required, so register
+    /// stores a key declared nullable as non-nullable.
+    #[cfg_attr(feature = "server", schema(no_recursion))]
+    Map {
+        /// Declaration of every entry's key.
+        key: Box<FieldSpec>,
+        /// Declaration of every entry's value.
+        value: Box<FieldSpec>,
+    },
+    /// Self-describing semi-structured value stored in the Parquet/Iceberg
+    /// Variant encoding.
+    ///
+    /// On the Arrow wire it is the canonical `arrow.parquet.variant` extension
+    /// type over a `metadata`/`value` binary struct. Each value keeps its own
+    /// type: integers stay integers, objects keep missing keys distinct from
+    /// null ones. Values are bounded by [`VARIANT_MAX_DEPTH`] and
+    /// [`VARIANT_MAX_ENCODED_BYTES`].
+    Variant,
 }
+
+/// Maximum Variant nesting depth, counting the root container as one.
+///
+/// A fixed contract constant, not configuration: a deeper value is refused
+/// with `WYRD_VALA_400_VARIANT_TOO_DEEP`.
+pub const VARIANT_MAX_DEPTH: u32 = 64;
+
+/// Maximum canonical encoded Variant bytes, metadata plus value.
+///
+/// A fixed contract constant, not configuration: a larger value is refused
+/// with `WYRD_VALA_413_VARIANT_TOO_LARGE` before queue reservation or durable
+/// write.
+pub const VARIANT_MAX_ENCODED_BYTES: u64 = 8_388_608;
 
 /// Arrow-free field declaration. Follows the `card::field::FieldSpec` precedent
 /// but carries a typed [`DataTypeSpec`] instead of a loose dtype string.
@@ -296,9 +329,18 @@ pub struct FieldSpec {
 /// description round-trips through Arrow without a second id convention.
 pub const PARQUET_FIELD_ID_KEY: &str = "PARQUET:field_id";
 
+/// The [`DataTypeSpec::Timestamp`] zone of every stored zoned timestamp.
+///
+/// A zoned timestamp is one UTC instant; its zone only labels how to display
+/// it. Iceberg stores it as `timestamptz` and reads it back with this label,
+/// so a table description, a built-in declaration, and a read all spell it
+/// this way. A writer may send any zone label: Bifrost converts it to this one
+/// on ingest without changing the instant.
+pub const UTC_TIME_ZONE: &str = "+00:00";
+
 /// Time-partition granularity on the wire.
 ///
-/// Bifrost v1 partitions every table on `wyrd_event_time` and admits exactly
+/// Bifrost partitions every table on its one time column and admits exactly
 /// these two Iceberg-native transforms; nothing else is representable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -353,18 +395,27 @@ pub struct SortKeyWire {
 /// at least one key and the Bloom list begins with the schema-present managed
 /// floor.
 ///
-/// The partition itself is system-owned. Every table is partitioned on
-/// `wyrd_event_time`, so the declaration carries only the granularity and no
-/// wire field names a partition column.
+/// Every table is partitioned on exactly one time column: a non-null
+/// microsecond or nanosecond timestamp column of the table's own content,
+/// named by `time_column`, or the managed `wyrd_ingested_at` when the
+/// declaration names none. The column is the source of the table's one
+/// Iceberg `hour` or `day` partition field.
 ///
 /// On the request path an omitted `sort_keys` and an explicit empty `sort_keys`
 /// resolve identically, because the server injects nothing ahead of a declared
-/// key and defaults an empty order to `wyrd_event_time` descending.
+/// key and defaults an empty order to the time column descending.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct PhysicalLayoutWire {
-    /// Required partition granularity on the managed `wyrd_event_time` column.
+    /// Required partition granularity on the time column.
     pub partition_granularity: TimeGranularityWire,
+    /// The table's time column: a non-null `TIMESTAMP_LTZ` or `TIMESTAMP_NTZ`
+    /// column at microsecond or nanosecond precision.
+    ///
+    /// Omitted on a request, the time column is `wyrd_ingested_at`. The
+    /// canonical form in a description and the control row always names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_column: Option<String>,
     /// Ordered sort keys; at most four may be declared.
     #[serde(default)]
     pub sort_keys: Vec<SortKeyWire>,
@@ -385,8 +436,8 @@ pub struct RegisterTableRequest {
     pub fields: Vec<FieldSpec>,
     /// Optional physical layout declaration.
     ///
-    /// Omitting the field entirely resolves to `hour(wyrd_event_time)`,
-    /// `wyrd_event_time` descending nulls-last, and the managed Bloom floor.
+    /// Omitting the field entirely resolves to `hour(wyrd_ingested_at)`,
+    /// `wyrd_ingested_at` descending nulls-last, and the managed Bloom floor.
     /// Supplying the object requires `partition_granularity`; within it, an
     /// explicit empty `sort_keys` resolves exactly as an omitted one does, and
     /// an explicit empty `bloom_columns` means "managed floor only".
@@ -439,8 +490,6 @@ pub struct RegisterTableResponse {
 pub const MAX_QUERY_TERMINAL_WARNINGS: usize = 16;
 /// Maximum number of closed source-completion entries.
 pub const MAX_QUERY_SOURCE_COMPLETIONS: usize = 3;
-/// Maximum byte length of scrubbed terminal error detail.
-pub const MAX_QUERY_ERROR_DETAIL_BYTES: usize = 1_024;
 
 /// Error returned when an Oracle query contract violates its closed protocol.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -458,12 +507,6 @@ pub enum QueryContractError {
         field: &'static str,
         /// Protocol maximum.
         maximum: usize,
-    },
-    /// A bounded scrubbed value is invalid.
-    #[error("{field} is not a valid scrubbed value")]
-    InvalidDetail {
-        /// Invalid scrubbed field.
-        field: &'static str,
     },
     /// Terminal fields form an invalid state.
     #[error("invalid query terminal: {reason}")]
@@ -849,92 +892,6 @@ pub struct SourceCompletion {
     pub outcome: SourceCompletionOutcome,
 }
 
-/// Closed stable codes allowed in late failed terminals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum QueryTerminalErrorCode {
-    /// The query deadline elapsed.
-    QueryTimeout,
-    /// A required visibility source was unavailable.
-    QueryVisibilityUnavailable,
-    /// A tenant isolation invariant failed.
-    QueryTenantInvariant,
-    /// Equal row identities contained unequal values.
-    QueryReconciliationInvariant,
-    /// Peer authentication, fencing, or replay validation failed.
-    QueryPeerSecurity,
-    /// The table catalog was unavailable.
-    CatalogUnreachable,
-    /// Object storage was unavailable.
-    StorageUnreachable,
-    /// Query execution failed after framing began.
-    QueryExecutionFailed,
-    /// The admitted query could not obtain the execution memory it needed.
-    QueryResourcesExhausted,
-}
-
-/// Scrubbed detail attached to a failed terminal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct QueryErrorDetail(
-    /// Normalized bounded detail text.
-    String,
-);
-
-impl QueryErrorDetail {
-    /// Constructs bounded, control-free terminal detail.
-    ///
-    /// # Errors
-    /// Returns [`QueryContractError`] for empty, overlong, control-bearing, or
-    /// secret-like input.
-    pub fn new(value: impl Into<String>) -> Result<Self, QueryContractError> {
-        let value = value.into();
-        let value = value.trim();
-        let lower = value.to_ascii_lowercase();
-        if value.is_empty()
-            || value.len() > MAX_QUERY_ERROR_DETAIL_BYTES
-            || value.chars().any(char::is_control)
-            || lower.contains("bearer ")
-            || lower.contains("token=")
-            || lower.contains("password=")
-            || lower.contains("secret=")
-            || lower.contains("-----begin ")
-        {
-            return Err(QueryContractError::InvalidDetail { field: "detail" });
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    /// Borrows the scrubbed detail.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl<'de> Deserialize<'de> for QueryErrorDetail {
-    /// Deserializes diagnostic text while reapplying redaction invariants.
-    ///
-    /// # Errors
-    /// Returns a deserializer error when the input is not text or contains
-    /// forbidden secret-bearing material.
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Stable late-stream error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct QueryTerminalError {
-    /// Closed stable error code.
-    pub code: QueryTerminalErrorCode,
-    /// Optional scrubbed diagnostic.
-    pub detail: Option<QueryErrorDetail>,
-}
-
 /// Terminal frame retaining immutable cut metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -954,8 +911,14 @@ pub struct QueryTerminalFrame {
     pub warnings: Vec<QueryWarning>,
     /// Exactly one entry for each source present in the cut.
     pub source_completion: Vec<SourceCompletion>,
-    /// Required only for failed terminals.
-    pub error: Option<QueryTerminalError>,
+    /// Catalog error that failed the query, as its RFC 9457 problem.
+    ///
+    /// Required for [`QueryTerminalOutcome::Failed`] and absent otherwise. It
+    /// is the same problem, code and details included, the query would have
+    /// returned had it failed before the first frame, so a caller reads one
+    /// error whatever the row on which the failure happened. A failure with
+    /// no catalog identity is `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
+    pub error: Option<Box<WyrdProblem>>,
     /// Arrow IPC end-of-stream delta closing the query's single IPC stream.
     ///
     /// The public query stream is one Arrow IPC stream split across Wyrd
@@ -1095,6 +1058,14 @@ mod query_terminal_tests {
         ]
     }
 
+    /// The generic execution failure a failed fixture terminal carries.
+    fn execution_failed() -> Box<WyrdProblem> {
+        Box::new(
+            crate::error::WyrdError::from(crate::vala::error::BifrostError::QueryExecutionFailed)
+                .problem(),
+        )
+    }
+
     /// Builds one terminal from its independently varied fields.
     fn terminal(
         outcome: QueryTerminalOutcome,
@@ -1108,10 +1079,7 @@ mod query_terminal_tests {
             row_count: 1,
             warnings,
             source_completion: sources(live),
-            error: failed.then_some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryExecutionFailed,
-                detail: None,
-            }),
+            error: failed.then(execution_failed),
             arrow_ipc_eos: if failed { Vec::new() } else { EOS.to_vec() },
         }
     }
@@ -1861,207 +1829,6 @@ pub struct PeerContext {
     pub claims_bytes: Vec<u8>,
 }
 
-/// One signed persisted object a leader assigned to a follower.
-///
-/// A path string alone forces a follower to re-derive every other fact about
-/// the object — which source it came from, how large it is, whether it can be
-/// pruned — by querying the catalog a second time. That query is both a cost
-/// and a correctness hazard: it observes a catalog that may have moved since
-/// the leader pinned its cut.
-///
-/// The typed descriptor removes the re-query. The leader already resolved every
-/// fact a follower needs at pin time, and the descriptor carries exactly those
-/// facts inside the assignment-authority digest, so a follower that validates
-/// the signature has validated the object's identity with it. The variant, not
-/// a suffix on `scan_id`, is the authority for which source an object came from.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(tag = "source", rename_all = "snake_case")]
-pub enum PersistedFileDescriptor {
-    /// A sealed object still unresolved in `vala.file_list`.
-    Hot(HotFileDescriptor),
-    /// A data file reachable from the pinned Iceberg snapshot's manifests.
-    Iceberg(IcebergFileDescriptor),
-}
-
-impl PersistedFileDescriptor {
-    /// Returns the catalog-pinned object path this descriptor names.
-    #[must_use]
-    pub fn path(&self) -> &str {
-        match self {
-            Self::Hot(hot) => &hot.path,
-            Self::Iceberg(iceberg) => &iceberg.path,
-        }
-    }
-
-    /// Returns the object's exact size in bytes.
-    #[must_use]
-    pub const fn size_bytes(&self) -> u64 {
-        match self {
-            Self::Hot(hot) => hot.size_bytes,
-            Self::Iceberg(iceberg) => iceberg.size_bytes,
-        }
-    }
-
-    /// Returns the object's exact record count.
-    #[must_use]
-    pub const fn row_count(&self) -> u64 {
-        match self {
-            Self::Hot(hot) => hot.row_count,
-            Self::Iceberg(iceberg) => iceberg.row_count,
-        }
-    }
-
-    /// Returns the declared inclusive event-time bounds, when both are present.
-    ///
-    /// A half-present or reversed pair yields `None`, which is the descriptor's
-    /// only representation of "retain this file": a follower never invents an
-    /// interval from a partial one.
-    #[must_use]
-    pub const fn event_time_micros(&self) -> Option<(i64, i64)> {
-        let (min, max) = match self {
-            Self::Hot(hot) => (hot.min_event_time_micros, hot.max_event_time_micros),
-            Self::Iceberg(iceberg) => {
-                (iceberg.min_event_time_micros, iceberg.max_event_time_micros)
-            }
-        };
-        match (min, max) {
-            (Some(min), Some(max)) if min <= max => Some((min, max)),
-            _ => None,
-        }
-    }
-
-    /// Returns whether this descriptor carries a well-formed immutable identity.
-    ///
-    /// The minimal identity differs by source because the authorities differ: a
-    /// hot object is identified by its `vala.file_list` row and the writer's
-    /// decoded SHA-256, neither of which may be the zero value, while a pinned
-    /// Iceberg object is identified by the snapshot its manifest belongs to. Both require a canonical nonempty path
-    /// and a positive size, and both require an event-time pair that is either
-    /// wholly absent or ordered.
-    ///
-    /// A zero-row file is valid: an empty object still participates in residual
-    /// execution. Whether the object exists, belongs to the tenant, or matches
-    /// the schema is decided by the binding and context checks that run before
-    /// this value is used, not here.
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        let (min, max) = match self {
-            Self::Hot(hot) => {
-                // An all-zero digest is what a defaulted checksum looks like,
-                // and every object that produced one would share a cache key
-                // with every other — returning one object's footer for
-                // another's rows. It is refused as an absent identity, not
-                // accepted as an unlikely one.
-                if hot.file_list_id.is_nil() || hot.sha256 == [0_u8; 32] {
-                    return false;
-                }
-                (hot.min_event_time_micros, hot.max_event_time_micros)
-            }
-            Self::Iceberg(iceberg) => {
-                if iceberg.snapshot_id <= 0 {
-                    return false;
-                }
-                (iceberg.min_event_time_micros, iceberg.max_event_time_micros)
-            }
-        };
-        let bounds_valid = match (min, max) {
-            (None, None) => true,
-            (Some(min), Some(max)) => min <= max,
-            _ => false,
-        };
-        !self.path().is_empty() && self.size_bytes() > 0 && bounds_valid
-    }
-}
-
-/// One sealed hot object assigned from `vala.file_list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct HotFileDescriptor {
-    /// Catalog-pinned object location.
-    pub path: String,
-    /// Exact object size in bytes, always positive.
-    pub size_bytes: u64,
-    /// Exact record count the writer sealed into this object.
-    pub row_count: u64,
-    /// Identity of the `vala.file_list` row that declared this object.
-    pub file_list_id: uuid::Uuid,
-    /// Writer-recorded object checksum, already decoded from its durable hex
-    /// form. It is carried decoded because it is cache identity, not a display
-    /// value: two distinct objects that shared a cache key would return one
-    /// object's footer for the other's rows.
-    #[serde(with = "sha256_hex")]
-    #[schemars(with = "String")]
-    pub sha256: [u8; 32],
-    /// Inclusive lower `wyrd_event_time` bound in epoch microseconds.
-    pub min_event_time_micros: Option<i64>,
-    /// Inclusive upper `wyrd_event_time` bound in epoch microseconds.
-    pub max_event_time_micros: Option<i64>,
-}
-
-/// One pinned Iceberg data file assigned from the snapshot's manifests.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct IcebergFileDescriptor {
-    /// Catalog-pinned object location.
-    pub path: String,
-    /// Exact object size in bytes from the pinned manifest, always positive.
-    pub size_bytes: u64,
-    /// Exact record count from the pinned manifest entry.
-    pub row_count: u64,
-    /// Pinned snapshot the manifest carrying this file belongs to, always
-    /// positive. It is the publication authority for the object: the same path
-    /// under a different snapshot is a different immutable file.
-    pub snapshot_id: i64,
-    /// Inclusive lower `wyrd_event_time` bound in epoch microseconds.
-    pub min_event_time_micros: Option<i64>,
-    /// Inclusive upper `wyrd_event_time` bound in epoch microseconds.
-    pub max_event_time_micros: Option<i64>,
-}
-
-/// Serializes a decoded object checksum as lowercase hex on the wire.
-///
-/// The durable `vala.file_list` column and every operator-facing surface use
-/// the 64-character hex form, so the wire keeps it; only in-memory identity
-/// comparisons use the decoded bytes.
-mod sha256_hex {
-    use serde::{Deserialize as _, Deserializer, Serializer};
-
-    /// Emits the 64-character lowercase hex form of a decoded checksum.
-    ///
-    /// # Errors
-    /// Returns the serializer's own error when the string cannot be emitted.
-    pub(super) fn serialize<S: Serializer>(
-        value: &[u8; 32],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&hex::encode(value))
-    }
-
-    /// Decodes exactly 32 bytes from the 64-character lowercase hex form.
-    ///
-    /// # Errors
-    /// Returns a deserializer error when the value is not valid hex or does not
-    /// decode to exactly 32 bytes; a shorter or longer checksum is a different
-    /// identity domain, never a truncation to tolerate.
-    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<[u8; 32], D::Error> {
-        let encoded = String::deserialize(deserializer)?;
-        let decoded = hex::decode(&encoded).map_err(serde::de::Error::custom)?;
-        <[u8; 32]>::try_from(decoded.as_slice())
-            .map_err(|_| serde::de::Error::custom("object checksum must decode to 32 bytes"))
-    }
-}
-
-/// Explicit persisted-file assignment for one physical-plan scan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct PersistedFileAssignment {
-    /// Signed typed descriptors assigned to this follower, in order.
-    pub files: Vec<PersistedFileDescriptor>,
-}
-
 /// Immutable Scribe memory-provider cut carried by the private follower wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -2100,8 +1867,6 @@ pub struct FollowerScanAssignment {
     pub scan_id: String,
     /// Authenticated tenant/table binding for this scan.
     pub binding: TenantTableBinding,
-    /// Required wrapper preserving explicit-empty persisted semantics.
-    pub persisted: PersistedFileAssignment,
     /// Scribe memory-provider cut, present only for a Scribe target.
     pub scribe_provider_cut: Option<ScribeProviderCut>,
     /// Schema fingerprint bound to the encoded placeholder.
@@ -2109,10 +1874,6 @@ pub struct FollowerScanAssignment {
     /// Required output/predicate/hidden-tenant projection closure, in the
     /// stable order the leaf union and remote placeholder must expose.
     pub required_columns: Vec<String>,
-    /// Closed leaf predicates pushed to this assignment's readers, in filter
-    /// order. Recognized predicates are always `Inexact`; DataFusion retains
-    /// its own residual filter above the table provider regardless.
-    pub predicates: Vec<crate::vala::assignment_authority::ScanPredicate>,
 }
 
 /// Context-bound worker request carrying one serialized physical subtree.
@@ -2342,10 +2103,12 @@ mod tests {
 
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            error: Some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryExecutionFailed,
-                detail: None,
-            }),
+            error: Some(Box::new(
+                crate::error::WyrdError::from(
+                    crate::vala::error::BifrostError::QueryExecutionFailed,
+                )
+                .problem(),
+            )),
             arrow_ipc_eos: Vec::new(),
             ..base.clone()
         };
@@ -2863,6 +2626,7 @@ mod bifrost_wire_tests {
     fn bifrost_wire_physical_layout_has_no_partition_column_field() {
         let layout = PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Hour,
+            time_column: None,
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         };
@@ -2958,20 +2722,12 @@ mod bifrost_wire_tests {
                     )]),
                 },
             ],
-            managed_candidates: vec![FieldSpec {
-                name: "wyrd_event_time".to_string(),
-                data_type: DataTypeSpec::Timestamp {
-                    unit: TimeUnit::Microsecond,
-                    tz: Some("UTC".to_string()),
-                },
-                nullable: false,
-                metadata: BTreeMap::from([(PARQUET_FIELD_ID_KEY.to_string(), "1004".to_string())]),
-            }],
             canonical_physical_fingerprint: None,
             physical_layout: PhysicalLayoutWire {
                 partition_granularity: TimeGranularityWire::Hour,
+                time_column: Some("wyrd_ingested_at".to_string()),
                 sort_keys: vec![SortKeyWire {
-                    column: "wyrd_event_time".to_string(),
+                    column: "wyrd_ingested_at".to_string(),
                     direction: SortDirectionWire::Desc,
                     null_order: NullOrderWire::Last,
                 }],
@@ -2993,8 +2749,9 @@ mod bifrost_wire_tests {
         });
         bifrost_wire_round_trip(&PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Day,
+            time_column: Some("created_at".to_string()),
             sort_keys: vec![SortKeyWire {
-                column: "wyrd_event_time".to_string(),
+                column: "created_at".to_string(),
                 direction: SortDirectionWire::Desc,
                 null_order: NullOrderWire::Last,
             }],

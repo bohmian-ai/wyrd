@@ -23,13 +23,10 @@ use parquet::file::metadata::{KeyValue, ParquetMetaData};
 use parquet::file::reader::FileReader;
 use vala_bifrost_redux::catalog::{
     TableRef, TableUid, TenantTableBinding, inject_metadata_not_found_for_test,
-    reset_active_cut_acquisitions_for_test,
+    reset_cut_reads_for_test,
 };
 use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::oracle::planner::{
-    LeaderOwnershipEvent, take_leader_ownership_order_for_test,
-};
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, Oracle, iceberg_projection_probe};
 use vala_bifrost_redux::parquet::footer::tenant_key_value;
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata;
@@ -48,12 +45,9 @@ use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuthMethod, NodeId, NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire,
-    TimeGranularityWire,
+    AuthMethod, NodeId, NullOrderWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
 };
-use wyrd_spec::vala::api::{
-    BifrostQueryRequest, QueryClass, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning,
-};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryClass, QueryTerminalOutcome, QueryWarning};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::canonical_signals::{Cell, Row, attributes, batch};
@@ -78,10 +72,11 @@ enum PruningExpectation {
     /// One node plans and scans locally: file-level or row-group-level
     /// exclusion both count, because the leaf's file set is the leader's.
     FilesOrRowGroups,
-    /// A follower rebuilds its own leaf and `with_assigned_files` pins its file
-    /// set, so row-group exclusion under the signed closure is the only signal
-    /// that can move. This is the assertion that regresses if
-    /// `OracleCatalogResolver::resolve` stops passing `assignment.predicates`.
+    /// A follower runs its task's share of the leader's scan. The predicate
+    /// `DataFusion` pushed into that scan travels inside it, so row-group
+    /// exclusion inside the follower's files is required positively. This is
+    /// the assertion that regresses if the pushed predicate stops reaching the
+    /// worker's Parquet scan.
     RowGroupsOnly,
 }
 
@@ -91,18 +86,17 @@ enum PruningExpectation {
 ///
 /// This is the hot-Parquet owner of the projection half. The cut is asserted
 /// to hold hot files and no compacted file immediately before the queries run,
-/// so the broad/narrow byte difference is attributable to `HotParquetExec`'s
+/// so the broad/narrow byte difference is attributable to DataFusion's Parquet scan's
 /// column mask and to nothing else. Predicate, retained rows, retained row
 /// groups, and physical authority are identical across the two queries; only
 /// the requested column set differs.
 ///
 /// The two legs prove different halves. The `one_mixed` leg plans and scans on
 /// one node, so either physical granularity may move and the assertion accepts
-/// whichever the fixture's layout produced. The `three_mixed` leg dispatches to
-/// a follower whose leaf file set is pinned by `with_assigned_files`, so file
-/// counts cannot move and row-group exclusion under the signed
-/// `assignment.predicates` closure is the only available signal — that leg
-/// requires it positively.
+/// whichever the fixture's layout produced. The `three_mixed` leg runs the
+/// scan's tasks on followers, carrying the pushed predicate inside the scan
+/// `datafusion-distributed` ships — that leg requires row-group exclusion
+/// there positively.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_selective_predicate_and_projection_prune_distributed_reads() {
@@ -122,6 +116,108 @@ async fn pg_bifrost_selective_predicate_and_projection_prune_distributed_reads()
     .expect("distributed pruning journey");
 }
 
+/// A Variant filter on a key a sealed hot object did not shred reads that key
+/// as null instead of failing to decode.
+///
+/// Every document holds only `a`, so the hot object shreds `a` and no row
+/// keeps a residual `value`; Arrow then reports any other key as missing.
+/// Promotion is parked before the write so the read goes through
+/// DataFusion's Parquet scan, which is the reader that evaluates the Variant leaf.
+///
+/// # Panics
+///
+/// Panics when the cluster cannot start, the cut is not hot-only, or either
+/// filter returns other than its exact rows.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_hot_variant_filter_on_an_unshredded_key_reads_null() {
+    prove_hot_variant_absent_key()
+        .await
+        .expect("hot Variant absent-key journey");
+}
+
+/// Drives one hot-only Variant object through a shredded-key and an
+/// absent-key filter on the public query route.
+///
+/// # Errors
+///
+/// Returns a client, catalog, or cluster-lifecycle error surfaced by any
+/// journey step, or a description of the wrong cut or rows.
+async fn prove_hot_variant_absent_key() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
+        BifrostClusterSpec::one_mixed(),
+        ForgeConfig::default(),
+        false,
+        true,
+    )
+    .await?;
+    let promotion = cluster
+        .commit_uncertainty_catalog()
+        .ok_or("the topology wraps its Forge catalog in the commit seam")?;
+    promotion.pause_before_commit();
+    let server = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing ingest node")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_hot_variant");
+    let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", DataType::Int64, false),
+        wyrd_types::variant::variant_field("doc", true),
+    ]));
+    register_table_with(
+        server,
+        tenant,
+        &table,
+        schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+    )
+    .await?;
+    let table_fqn = format!("vala.bifrost.{table}");
+    writer(server, "hot-variant-writer")
+        .await?
+        .write(
+            &table_fqn,
+            &schema,
+            [1_i64, 2].map(|id| {
+                serde_json::json!({"id": id, "doc": {"a": id}})
+                    .to_string()
+                    .into_bytes()
+            }),
+        )
+        .await?;
+    server.flush_bifrost().await?;
+    tokio::time::timeout(Duration::from_secs(30), promotion.wait_for_before_commit())
+        .await
+        .map_err(|_| "the promotion never reached the parked commit")?;
+    cluster.refresh_oracle_snapshots().await?;
+    let (compacted_files, hot_files) = file_tier_counts(&cluster, tenant, &table).await?;
+    if hot_files == 0 || compacted_files != 0 {
+        return Err(format!(
+            "the hot reader proof requires a hot-only cut: \
+             hot={hot_files} compacted={compacted_files}"
+        )
+        .into());
+    }
+
+    let reader = client(server, "hot-variant-reader").await?;
+    for (key, text, expected) in [("a", "2", vec![2_i64]), ("c", "x", Vec::new())] {
+        let ids = query_ids(
+            &reader,
+            format!("SELECT id FROM {table_fqn} WHERE doc->>'{key}' = '{text}' ORDER BY id"),
+        )
+        .await?;
+        if ids != expected {
+            return Err(format!("doc->>'{key}' = '{text}' returned {ids:?}").into());
+        }
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
 /// Drives one topology through a three-file selective-predicate fixture,
 /// proving strictly fewer scanned bytes than an unfiltered scan, the pruning
 /// signal `expectation` names, identical residual-filtered rows, and a
@@ -137,7 +233,7 @@ async fn prove_selective_predicate_pruning(
     expectation: PruningExpectation,
 ) -> Result<(), JourneyError> {
     // Every proof below reads sealed hot Parquet: files and row groups
-    // scanned, footer statistics, `HotParquetExec`'s projection mask and the
+    // scanned, footer statistics, DataFusion's Parquet scan's projection mask and the
     // footer tenant proof. Scribe's unsealed live tail has none of those, so
     // the fixture flushes. Forge promotes each flushed object to Iceberg as
     // soon as it is published (REQ-002), which would move the measurement
@@ -269,14 +365,11 @@ async fn prove_selective_predicate_pruning(
                 .into());
             }
         }
-        // The follower rebuilds its own leaf and `with_assigned_files`
-        // overwrites its file set with the assignment's, so any file-level
-        // pruning `provider.scan` performed is discarded and `files_scanned`
-        // cannot move. What survives the rebuild is the signed
-        // `assignment.predicates` closure reaching `with_filter`, which drives
-        // `select_row_groups_for_predicates` and both row-group counters. On a
-        // distributed leg the leader's plan holds only remote leaves, so the
-        // folded `FollowerScanEvidence` is the sole source of these numbers.
+        // The follower runs its task's share of the leader's scan, with the
+        // predicate `DataFusion` pushed into it, which drives the scan's
+        // row-group pruning and both row-group counters. On a distributed leg
+        // the leader's plan executes no scan itself, so the follower metrics
+        // `datafusion-distributed` returns are the sole source of these numbers.
         // Both halves are required, and `pruned` is required positively rather
         // than inferred: `sum_metric` reports an absent family as 0.0, so a
         // missing series must fail here, not pass.
@@ -312,7 +405,7 @@ async fn prove_selective_predicate_pruning(
     // in exactly one respect: it does not request `unused_payload`. Predicate,
     // cut, retained rows, and retained row groups are identical, so a byte
     // difference can only come from the physical reader declining to decode
-    // that column. On a hot-only cut that reader is `HotParquetExec`, and its
+    // that column. On a hot-only cut that reader is DataFusion's Parquet scan, and its
     // name-derived `ProjectionMask` is the only mechanism that can produce it.
     let narrow_checkpoint = cluster
         .telemetry()
@@ -386,7 +479,7 @@ async fn prove_selective_predicate_pruning(
         return Err(format!("foreign file reached a SQL operator under predicate pushdown: rows={refused_rows} outcome={refused_outcome:?} error={refused_error:?}").into());
     }
     if refused_outcome != QueryTerminalOutcome::Failed
-        || refused_error != Some(QueryTerminalErrorCode::QueryTenantInvariant)
+        || refused_error.as_deref() != Some(BifrostError::QueryTenantInvariant.code())
     {
         return Err(format!(
             "footer tenant proof did not fail closed: {refused_outcome:?} {refused_error:?}"
@@ -423,7 +516,7 @@ async fn prove_selective_predicate_pruning(
 /// is a property of the fixture's physical layout rather than of the invariant
 /// under test. A journey that asserted only one surface would therefore pin a
 /// fixture detail; this normalizes both into the same
-/// `(rows, outcome, error code)` triple so the assertion stays on the
+/// `(rows, outcome, catalog error code)` triple so the assertion stays on the
 /// invariant.
 ///
 /// # Errors
@@ -433,7 +526,7 @@ async fn prove_selective_predicate_pruning(
 async fn query_terminal_either_surface(
     client: &WyrdClient,
     sql: String,
-) -> Result<(u64, QueryTerminalOutcome, Option<QueryTerminalErrorCode>), JourneyError> {
+) -> Result<(u64, QueryTerminalOutcome, Option<String>), JourneyError> {
     let opened = wyrd_client::Bifrost::query_only(client)
         .query(&BifrostQueryRequest {
             params: Vec::new(),
@@ -444,9 +537,11 @@ async fn query_terminal_either_surface(
     let mut stream = match opened {
         Ok(stream) => stream,
         Err(BifrostClientError::Transport(WyrdError::Vala { error })) => {
-            let code = bifrost_terminal_code(&error)
-                .ok_or_else(|| format!("refusal is not a terminal query outcome: {error:?}"))?;
-            return Ok((0, QueryTerminalOutcome::Failed, Some(code)));
+            return Ok((
+                0,
+                QueryTerminalOutcome::Failed,
+                Some(error.code().to_owned()),
+            ));
         }
         Err(other) => return Err(other.into()),
     };
@@ -468,29 +563,8 @@ async fn query_terminal_either_surface(
     Ok((
         rows,
         terminal.outcome,
-        terminal.error.as_ref().map(|error| error.code),
+        terminal.error.as_ref().map(|error| error.code.clone()),
     ))
-}
-
-/// Maps the closed terminal Bifrost query errors back to their terminal code.
-///
-/// Returns `None` for a Bifrost error that is not a terminal query outcome
-/// (an admission rejection or invalid SQL, for example), so a caller cannot
-/// silently reinterpret an unrelated refusal as a terminal result.
-fn bifrost_terminal_code(error: &BifrostError) -> Option<QueryTerminalErrorCode> {
-    Some(match error {
-        BifrostError::QueryTimeout => QueryTerminalErrorCode::QueryTimeout,
-        BifrostError::QueryVisibilityUnavailable => {
-            QueryTerminalErrorCode::QueryVisibilityUnavailable
-        }
-        BifrostError::QueryTenantInvariant => QueryTerminalErrorCode::QueryTenantInvariant,
-        BifrostError::QueryReconciliationInvariant => {
-            QueryTerminalErrorCode::QueryReconciliationInvariant
-        }
-        BifrostError::QueryPeerSecurity => QueryTerminalErrorCode::QueryPeerSecurity,
-        BifrostError::QueryExecutionFailed => QueryTerminalErrorCode::QueryExecutionFailed,
-        _ => return None,
-    })
 }
 
 /// Number of rows written before compaction. Every one of them is sealed as
@@ -516,12 +590,10 @@ const HOT_BATCH_ID_BASE: i64 = 101;
 /// leaves at once — the compacted `:iceberg` leaf and the sealed `:hot` leaf —
 /// and prunes physically on both.
 ///
-/// The two leaves are otherwise untestable together. A table that has never
-/// compacted records an `:iceberg` assignment with an empty file set, which
-/// `OracleCatalogResolver::resolve` short-circuits before it ever calls
-/// `provider.scan`, so a fixture that only writes and flushes exercises the hot
-/// leaf and nothing else. This journey therefore compacts first and writes
-/// second:
+/// The two are otherwise untestable together. A table that has never
+/// compacted has no Iceberg data file, so a fixture that only writes and
+/// flushes exercises hot files and nothing else. This journey therefore
+/// compacts first and writes second:
 ///
 /// 1. write `COMPACTED_BATCH_ROWS` rows, each sealed as its own file;
 /// 2. drive one Forge pass to completion and require the inputs to be marked
@@ -538,8 +610,8 @@ const HOT_BATCH_ID_BASE: i64 = 101;
 /// Pruning is then required to move bytes scanned against an unfiltered
 /// baseline of the same cut, and the fixture is shaped so that only the
 /// compacted leaf can move it: every hot row matches the predicate, so the hot
-/// leaf reads the same bytes either way. Removing `assignment.predicates` from
-/// the follower's `provider.scan` call collapses the difference to zero, which
+/// leaf reads the same bytes either way. A pushed predicate that no longer
+/// reaches the follower's Parquet scan collapses the difference to zero, which
 /// is the regression this leg exists to catch.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
@@ -591,20 +663,9 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .bifrost_catalog()
         .ok_or("Scribe composition retains the shared catalog")?
         .iceberg_catalog();
-    let binding = TenantTableBinding::resolve((
-        tenant,
-        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Bifrost, &table),
-    ))?;
-    let loaded = catalog.load_table(&binding.table_ident()).await?;
-    let tx = iceberg::transaction::Transaction::new(&loaded);
-    let tx = iceberg::transaction::ApplyTransactionAction::apply(
-        tx.update_table_properties().set(
-            "wyrd.forge.enable-compaction".to_owned(),
-            "false".to_owned(),
-        ),
-        tx,
-    )?;
-    tx.commit_once(catalog.as_ref()).await?;
+    let binding =
+        TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, &table)))?;
+    set_table_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
     let rows = writer(ingest_server, "two-tier-writer").await?;
     let table_fqn = format!("vala.bifrost.{table}");
 
@@ -717,21 +778,15 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .delta_since(&selective_checkpoint)
         .map_err(|error| error.to_string())?;
     let selective_bytes = sum_metric(&selective_delta, "oracle_query_bytes_scanned_total");
-    // Bytes, not row groups, is the pruning signal for the compacted leaf, and
-    // the choice is forced rather than preferred.
-    // `oracle_query_row_groups_{scanned,pruned}_total` are fed only by
-    // `OracleScanMetricsHandle::record_row_groups`, which the hot Parquet
-    // reader calls and the Iceberg reader does not; the compacted leaf's
-    // counters come from `iceberg::arrow::ScanMetrics`, which exposes byte
-    // ranges and nothing else. Asserting on row groups here would therefore
-    // measure the hot leaf and report it as coverage of the compacted one.
+    // Bytes are the pruning signal for the compacted leaf: the row-group
+    // counters sum every leaf, so they cannot attribute pruning to it.
     //
     // Attribution still holds: every hot row matches the predicate, so the hot
     // leaf reads identical bytes filtered and unfiltered, and the whole of this
     // difference is the compacted leaf skipping row groups inside its published
-    // data file. Removing `assignment.predicates` from the follower's
-    // `provider.scan` call collapses it to zero, which is what makes this a
-    // real assertion rather than a restatement of the fixture.
+    // data file. A pushed predicate that no longer reaches the follower's
+    // Parquet scan collapses it to zero, which is what makes this a real
+    // assertion rather than a restatement of the fixture.
     //
     // Strict `Less` rather than a negated `<`: an incomparable (NaN) metric
     // must fail this proof, not silently satisfy it.
@@ -740,7 +795,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         Some(std::cmp::Ordering::Less)
     ) {
         return Err(format!(
-            "compacted leaf must scan strictly fewer bytes under the signed predicate: \
+            "compacted leaf must scan strictly fewer bytes under the pushed predicate: \
              selective={selective_bytes} unfiltered={unfiltered_bytes}"
         )
         .into());
@@ -770,7 +825,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
 /// column, and the narrow closure is a strict subset of the broad one. It does
 /// not claim that the narrow query issued fewer object-store bytes.
 ///
-/// The hot-only journey owns the byte proof for `HotParquetExec`. Neither leg
+/// The hot-only journey owns the byte proof for DataFusion's Parquet scan. Neither leg
 /// is inferred from an aggregate reduction over the mixed-tier cut this journey
 /// later builds.
 ///
@@ -982,46 +1037,34 @@ async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, Journey
     Ok(ids)
 }
 
-/// Appends one journey row carrying a caller-chosen managed event time.
+/// Appends one journey row through public IPC ingest on `client`'s node.
 ///
-/// The write door refuses to declare `wyrd_event_time`, but public IPC ingest
-/// accepts a supplied value and Scribe lifts it verbatim into the managed
-/// slot, which is how a live row is placed in a chosen time partition.
+/// Raw IPC ingest lands the row in the Scribe of the node `client` targets,
+/// which is how a case places a live row on a chosen owner. With
+/// `event_time_micros`, the row also carries [`EVENT_TIME`] and the table must
+/// be one [`register_timed_table`] registered, so the value decides the hour
+/// partition; without it the row partitions on its ingest instant.
 ///
 /// # Errors
 ///
 /// Returns an error when the client cannot connect or ingest refuses the row.
-async fn append_event_time_row(
+async fn append_live_row(
     client: &WyrdClient,
     table: &str,
     id: i64,
-    event_time_micros: i64,
+    event_time_micros: Option<i64>,
 ) -> Result<(), JourneyError> {
-    let mut fields = journey_schema()
-        .fields()
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    fields.push(Arc::new(arrow::datatypes::Field::new(
-        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-        arrow::datatypes::DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            Some("UTC".into()),
-        ),
-        false,
-    )));
-    let batch = RecordBatch::try_new(
-        Arc::new(arrow::datatypes::Schema::new(fields)),
+    let mut batch = RecordBatch::try_new(
+        journey_schema(),
         vec![
             Arc::new(arrow::array::Int64Array::from(vec![id])),
             Arc::new(arrow::array::StringArray::from(vec!["live"])),
             Arc::new(arrow::array::StringArray::from(vec![unused_payload(id)])),
-            Arc::new(
-                arrow::array::TimestampMicrosecondArray::from(vec![event_time_micros])
-                    .with_timezone("UTC"),
-            ),
         ],
     )?;
+    if let Some(micros) = event_time_micros {
+        batch = with_event_time(&batch, vec![micros])?;
+    }
     let mut ipc = Vec::new();
     let mut ipc_writer =
         arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())?;
@@ -1083,16 +1126,16 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
     let table = unique_table("oracle_live_routes");
     let table_fqn = format!("vala.bifrost.{table}");
     let first = cluster.server(0).ok_or("missing node 0")?;
-    register_table(first, tenant, &table).await?;
+    register_timed_table(first, tenant, &table).await?;
     let now = chrono::Utc::now();
-    // A week back is inside ingest's accepted window yet in a live partition
-    // the one-hour event-time floor below provably excludes.
+    // A week back is a live partition the one-hour event-time floor below
+    // provably excludes.
     let stale = (now - chrono::Duration::days(7)).timestamp_micros();
     let now = now.timestamp_micros();
     for (index, id, event_time) in [(0_usize, 1_i64, now), (1, 2, now), (2, 3, stale)] {
         let server = cluster.server(index).ok_or("missing writer node")?;
         let writer = client(server, &format!("live-writer-{index}")).await?;
-        append_event_time_row(&writer, &table_fqn, id, event_time).await?;
+        append_live_row(&writer, &table_fqn, id, Some(event_time)).await?;
     }
     cluster.refresh_oracle_snapshots().await?;
     let reader = client(first, "live-route-reader").await?;
@@ -1101,9 +1144,7 @@ async fn live_query_routes_only_relevant_scribes() -> Result<(), JourneyError> {
     let before = scribe_fragment_executions(&cluster)?;
     let pruned = query_ids(
         &reader,
-        format!(
-            "SELECT id FROM {table_fqn} WHERE wyrd_event_time >= TIMESTAMP '{floor}' ORDER BY id"
-        ),
+        format!("SELECT id FROM {table_fqn} WHERE {EVENT_TIME} >= TIMESTAMP '{floor}' ORDER BY id"),
     )
     .await?;
     let pruned_delta = execution_delta(&before, &scribe_fragment_executions(&cluster)?);
@@ -1181,14 +1222,14 @@ async fn grouped_counts(
 }
 
 /// A filtered aggregate over published files and live rows on two Scribes is
-/// one Analytical plan: the published scan runs on the one Oracle worker the
-/// table's cut is frozen to while each Scribe executes exactly one live
-/// fragment, and the result counts both.
+/// one Analytical plan: the published scan runs on the query's frozen Oracle
+/// workers while each Scribe executes exactly one live fragment, and the
+/// result counts both.
 ///
 /// The live leaf caps its stage at one task, so the aggregate above the union
-/// stays on the coordinator and only the published leaf stage is remote. A
-/// published table is bound to one destination, so exactly one worker leases a
-/// graph for it.
+/// stays on the coordinator and only the published leaf stage is remote.
+/// `datafusion-distributed` places that stage's tasks, so which and how many
+/// frozen workers lease a graph is upstream's choice; at least one must.
 ///
 /// Published rows alone, or live rows drained anywhere but the two Scribe
 /// fragments, cannot produce these counts and deltas together.
@@ -1196,8 +1237,8 @@ async fn grouped_counts(
 /// # Errors
 ///
 /// Returns an error when the peer cluster, ingest, publication, or query
-/// fails, when counts or per-node fragment deltas differ, or when other than
-/// exactly one published worker leased a graph for the query.
+/// fails, when counts or per-node fragment deltas differ, or when no frozen
+/// worker leased a graph for the query.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), JourneyError> {
@@ -1280,11 +1321,8 @@ async fn published_workers_and_live_scribes_share_one_plan() -> Result<(), Journ
             leased.push(index);
         }
     }
-    if leased.len() != 1 {
-        return Err(format!(
-            "the published scan must run on its one frozen worker, saw leases on {leased:?}"
-        )
-        .into());
+    if leased.is_empty() {
+        return Err("the published scan leased a graph on no frozen worker".into());
     }
     if cluster.peer_body_polls() <= polls_before {
         return Err("no published work crossed the private peer plane".into());
@@ -1455,9 +1493,8 @@ async fn live_stream_backpressure_and_query_owned_lifetime() -> Result<(), Journ
     let writer_node = cluster.server(0).ok_or("missing node 0")?;
     register_table(writer_node, tenant, &table).await?;
     let writer = client(writer_node, "live-lifetime-writer").await?;
-    let now = chrono::Utc::now().timestamp_micros();
     for id in 1..=3 {
-        append_event_time_row(&writer, &table_fqn, id, now).await?;
+        append_live_row(&writer, &table_fqn, id, None).await?;
     }
     cluster.refresh_oracle_snapshots().await?;
     let leader = cluster.server(1).ok_or("missing node 1")?;
@@ -1571,9 +1608,8 @@ async fn seed_published_and_live(
     }
     published_node.flush_bifrost().await?;
     let live = client(live_node, "seed-live-writer").await?;
-    let now = chrono::Utc::now().timestamp_micros();
     for id in 101..=103 {
-        append_event_time_row(&live, &table_fqn, id, now).await?;
+        append_live_row(&live, &table_fqn, id, None).await?;
     }
     cluster.refresh_oracle_snapshots().await?;
     Ok(table_fqn)
@@ -1978,13 +2014,7 @@ async fn remote_staged_footer_refusal_fails_closed() -> Result<(), JourneyError>
     let scribe = cluster.server(1).ok_or("missing node 1")?;
     register_table(leader, tenant, &table).await?;
     let writer = client(scribe, "staged-refusal-writer").await?;
-    append_event_time_row(
-        &writer,
-        &table_fqn,
-        1,
-        chrono::Utc::now().timestamp_micros(),
-    )
-    .await?;
+    append_live_row(&writer, &table_fqn, 1, None).await?;
     scribe.seal_bifrost_writable_for_test().await?;
     let runs = staged_runs(scribe, tenant, &table).await?;
     let foreign = cluster.add_tenant("oracle-staged-foreign").await?;
@@ -2006,7 +2036,7 @@ async fn remote_staged_footer_refusal_fails_closed() -> Result<(), JourneyError>
         .map_err(|error| error.to_string())?;
     if rows != 0
         || outcome != QueryTerminalOutcome::Failed
-        || error != Some(QueryTerminalErrorCode::QueryTenantInvariant)
+        || error.as_deref() != Some(BifrostError::QueryTenantInvariant.code())
     {
         return Err(format!(
             "staged foreign footer did not fail closed: rows={rows} {outcome:?} {error:?}"
@@ -2066,8 +2096,10 @@ async fn staged_runs(
 
 /// Rewrites one staged run in place so its footer names `foreign` as tenant.
 ///
-/// Rows, schema and every other footer key are copied unchanged, so the
-/// footer tenant proof is the only check the rewritten run can fail.
+/// Rows, schema and every other footer key are copied unchanged, and the
+/// writer recipe is the one for the journey table's `wyrd_ingested_at` time
+/// column, so the footer tenant proof is the only check the rewritten run can
+/// fail.
 ///
 /// # Errors
 ///
@@ -2085,11 +2117,14 @@ fn rewrite_footer_tenant(run: &Path, foreign: DataTenantId) -> Result<(), Journe
         .filter(|entry| entry.key != tenant.key && entry.key != ARROW_SCHEMA_META_KEY)
         .collect();
     metadata.push(tenant);
-    let rows = usize::try_from(builder.metadata().file_metadata().num_rows())?;
     let schema = builder.schema().clone();
     let batches = builder.build()?.collect::<Result<Vec<_>, _>>()?;
     let mut parquet = Vec::new();
-    let properties = bifrost_writer_properties_with_metadata(rows, metadata, &[]);
+    let properties = bifrost_writer_properties_with_metadata(
+        metadata,
+        wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT,
+        &[],
+    );
     let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
     for batch in &batches {
         writer.write(batch)?;
@@ -2440,7 +2475,13 @@ async fn hot_filtering_mechanisms_cover_all_table_kinds() -> Result<(), JourneyE
 /// Small enough that Forge's rewrite of the three 45,000-row slices closes
 /// several row groups, each still spanning more than one 20,000-row page, so
 /// one sorted output file exposes row-group and page pruning together.
-const REWRITE_ROW_GROUP_BYTES: u64 = 512 * 1024;
+///
+/// Rewritten rows carry the v3 `_row_id` beside the unique `key_id` and
+/// `score`, and each unique column counts its uncompressed dictionary until
+/// the dictionary page limit forces plain encoding near 32,000 rows. The
+/// target must close each group between 20,000 rows and that fallback; a
+/// larger one is never reached once the estimate turns compressed.
+const REWRITE_ROW_GROUP_BYTES: u64 = 768 * 1024;
 
 /// After an actual Forge promotion, and again after an actual Forge rewrite,
 /// the caller-registered custom dataset and the built-in spans, records, and
@@ -2507,7 +2548,24 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
     let fixture = {
         let scribe = cluster.server(0).ok_or("missing Scribe node")?;
         let fixture = FilteringFixture::write(scribe).await?;
-        fixture.declare_rewrite_row_groups(scribe).await?;
+        let catalog = scribe
+            .state()
+            .bifrost_catalog()
+            .ok_or("Scribe composition retains the shared catalog")?
+            .iceberg_catalog();
+        let binding = TenantTableBinding::resolve((
+            scribe.data_tenant_id(),
+            TableRef::new(BifrostNamespace::Datasets, &fixture.custom),
+        ))?;
+        // Scribe's sealed files ignore this property; Forge reads it when it
+        // plans the rewrite.
+        set_table_property(
+            &catalog,
+            &binding,
+            iceberg::spec::TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES,
+            &REWRITE_ROW_GROUP_BYTES.to_string(),
+        )
+        .await?;
         fixture
     };
     cluster.refresh_oracle_snapshots().await?;
@@ -2529,7 +2587,7 @@ async fn iceberg_filtering_mechanisms_cover_all_table_kinds() -> Result<(), Jour
         .prove_cut(&cluster, scribe, &reader, FilterCut::Promoted)
         .await?;
 
-    fixture.await_rewrite(&cluster, scribe).await?;
+    await_rewrite(&cluster, scribe, &fixture.tables()).await?;
     cluster.refresh_oracle_snapshots().await?;
     fixture
         .prove_cut(&cluster, scribe, &reader, FilterCut::Rewritten)
@@ -2553,26 +2611,26 @@ struct FilteringFixture {
 }
 
 /// One query of the filtering matrix and its exact expected row identities.
-struct FilterCase {
+pub(crate) struct FilterCase {
     /// Name reported with every failure and evidence line.
-    name: String,
+    pub(crate) name: String,
     /// The SQL, projecting the row identity as an `Int64` `id`, ordered by it.
-    sql: String,
+    pub(crate) sql: String,
     /// Ascending row identities the query must return.
-    expected: Vec<i64>,
+    pub(crate) expected: Vec<i64>,
 }
 
 /// Physical scan evidence one query's Oracle telemetry delta records.
 #[derive(Debug, Clone, Copy)]
-struct ScanEvidence {
+pub(crate) struct ScanEvidence {
     /// Hot files opened, or Iceberg data files the manifest pruning kept.
-    files: f64,
+    pub(crate) files: f64,
     /// Row groups excluded by statistics or Bloom filters.
-    row_groups_pruned: f64,
+    pub(crate) row_groups_pruned: f64,
     /// Row groups of those excluded by a Bloom filter alone.
-    bloom_pruned: f64,
+    pub(crate) bloom_pruned: f64,
     /// Rows the page index skipped inside retained row groups.
-    page_rows_pruned: f64,
+    pub(crate) page_rows_pruned: f64,
 }
 
 impl FilteringFixture {
@@ -2627,15 +2685,15 @@ impl FilteringFixture {
                 .await?;
             fixture
                 .writer
-                .write_batch("vala.traces.spans", &fixture.spans_batch(spans, file)?)
+                .write_batch("vala.traces.spans", &fixture.spans_batch(spans, file))
                 .await?;
             fixture
                 .writer
-                .write_batch("vala.logs.records", &fixture.records_batch(records, file)?)
+                .write_batch("vala.logs.records", &fixture.records_batch(records, file))
                 .await?;
             fixture
                 .writer
-                .write_batch("vala.metrics.points", &fixture.points_batch(points, file)?)
+                .write_batch("vala.metrics.points", &fixture.points_batch(points, file))
                 .await?;
             server.flush_bifrost().await?;
         }
@@ -2648,21 +2706,22 @@ impl FilteringFixture {
     /// # Errors
     ///
     /// Returns the registration or describe error, and an error when the
-    /// resolved partition, sort order, or Bloom columns differ from the
-    /// declaration.
+    /// resolved partition, time column, sort order, or Bloom columns differ
+    /// from the declaration.
     async fn register_custom(&self) -> Result<(), JourneyError> {
         let declared_sort = vec![SortKeyWire {
             column: "key_id".to_owned(),
             direction: SortDirectionWire::Asc,
             null_order: NullOrderWire::Last,
         }];
-        let config =
-            wyrd_client::bifrost::TableConfig::from_arrow(&self.custom_fqn(), custom_schema())?
-                .with_layout(PhysicalLayoutWire {
-                    partition_granularity: TimeGranularityWire::Hour,
-                    sort_keys: declared_sort.clone(),
-                    bloom_columns: vec![CUSTOM_BLOOM_COLUMN.to_owned()],
-                });
+        let config = wyrd_client::bifrost::TableConfig::from_arrow(
+            &self.custom_fqn(),
+            timed_schema(&custom_schema()),
+        )?
+        .with_layout(timed_layout_with(
+            declared_sort.clone(),
+            vec![CUSTOM_BLOOM_COLUMN.to_owned()],
+        ));
         wyrd_client::Bifrost::connect_with_table(self.writer.client(), config)
             .await?
             .register()
@@ -2672,6 +2731,7 @@ impl FilteringFixture {
             .await?
             .physical_layout;
         if resolved.partition_granularity != TimeGranularityWire::Hour
+            || resolved.time_column.as_deref() != Some(EVENT_TIME)
             || resolved.sort_keys != declared_sort
             || !resolved
                 .bloom_columns
@@ -2700,15 +2760,18 @@ impl FilteringFixture {
         self.hour + file * FILTER_SLICE_MICROS
     }
 
-    /// The half-open SQL event-time predicate selecting `file`'s slice.
+    /// The half-open SQL predicate selecting `file`'s slice on `time_column`.
+    ///
+    /// `time_column` is the table's declared time column, so the predicate is
+    /// the one partition and statistics pruning act on.
     ///
     /// # Errors
     ///
     /// Returns an error when a slice bound is not a representable timestamp.
-    fn slice_filter(&self, file: i64) -> Result<String, JourneyError> {
+    fn slice_filter(&self, time_column: &str, file: i64) -> Result<String, JourneyError> {
         let start = self.slice_start(file);
         Ok(format!(
-            "wyrd_event_time >= TIMESTAMP '{}' AND wyrd_event_time < TIMESTAMP '{}'",
+            "{time_column} >= TIMESTAMP '{}' AND {time_column} < TIMESTAMP '{}'",
             sql_timestamp(start)?,
             sql_timestamp(start + FILTER_SLICE_MICROS)?
         ))
@@ -2719,9 +2782,12 @@ impl FilteringFixture {
         self.slice_start(key / CUSTOM_ROWS_PER_FILE) + (key % CUSTOM_ROWS_PER_FILE) * 10_000
     }
 
-    /// The event time of signal row `row` of `file`, inside the file's slice.
-    fn signal_event_time(&self, file: i64, row: i64) -> i64 {
-        self.slice_start(file) + row * 1_000_000
+    /// The `OTLP` instant of signal row `row` of `file`, in Unix nanoseconds.
+    ///
+    /// It lies inside the file's slice and is the row's identity: it is the
+    /// signal table's time column, ascending with `file` and `row`.
+    fn signal_instant(&self, file: i64, row: i64) -> i64 {
+        (self.slice_start(file) + row * 1_000_000) * 1_000
     }
 
     /// One custom slice, written in descending key order so the sealed file's
@@ -2763,13 +2829,13 @@ impl FilteringFixture {
     /// ordinals inside a file's range are never written, which is where the
     /// absent Bloom probe is drawn from. Even rows are roots.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns the Arrow error when the event-time column does not attach.
-    fn spans_batch(&self, schema: &SchemaRef, file: i64) -> Result<RecordBatch, JourneyError> {
+    /// Panics when the described schema does not assemble the rows.
+    fn spans_batch(&self, schema: &SchemaRef, file: i64) -> RecordBatch {
         let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
             .map(|row| {
-                let id = signal_id(file, row);
+                let id = self.signal_instant(file, row);
                 let mut cells = Row::from([
                     (
                         "trace_id",
@@ -2786,7 +2852,7 @@ impl FilteringFixture {
                     ("resource_present", Cell::Bool(true)),
                     (
                         "resource_attributes",
-                        Cell::Bytes(attributes(&[("service.name", "filtering")])),
+                        Cell::Variant(attributes(&[("service.name", "filtering")])),
                     ),
                     ("scope_present", Cell::Bool(true)),
                     ("scope_name", Cell::Text("filtering".to_owned())),
@@ -2801,24 +2867,19 @@ impl FilteringFixture {
                 cells
             })
             .collect();
-        with_event_time(
-            &batch(schema, &rows),
-            (0..SIGNAL_ROWS_PER_FILE)
-                .map(|row| self.signal_event_time(file, row))
-                .collect(),
-        )
+        batch(schema, &rows)
     }
 
     /// One log slice: even rows are uncorrelated (null `trace_id`) and row 0
     /// carries no event name; severity rises with the row.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns the Arrow error when the event-time column does not attach.
-    fn records_batch(&self, schema: &SchemaRef, file: i64) -> Result<RecordBatch, JourneyError> {
+    /// Panics when the described schema does not assemble the rows.
+    fn records_batch(&self, schema: &SchemaRef, file: i64) -> RecordBatch {
         let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
             .map(|row| {
-                let id = signal_id(file, row);
+                let id = self.signal_instant(file, row);
                 let mut cells = Row::from([
                     ("time_unix_nano", Cell::Int64(id)),
                     ("observed_time_unix_nano", Cell::Int64(id)),
@@ -2841,24 +2902,19 @@ impl FilteringFixture {
                 cells
             })
             .collect();
-        with_event_time(
-            &batch(schema, &rows),
-            (0..SIGNAL_ROWS_PER_FILE)
-                .map(|row| self.signal_event_time(file, row))
-                .collect(),
-        )
+        batch(schema, &rows)
     }
 
     /// One point slice: even rows are integer sums and odd rows are double
     /// gauges, so `int_value` is null on exactly the odd rows.
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns the Arrow error when the event-time column does not attach.
-    fn points_batch(&self, schema: &SchemaRef, file: i64) -> Result<RecordBatch, JourneyError> {
+    /// Panics when the described schema does not assemble the rows.
+    fn points_batch(&self, schema: &SchemaRef, file: i64) -> RecordBatch {
         let rows: Vec<Row> = (0..SIGNAL_ROWS_PER_FILE)
             .map(|row| {
-                let id = signal_id(file, row);
+                let id = self.signal_instant(file, row);
                 let mut cells = Row::from([
                     ("metric_name", Cell::Text(metric_name(file, row))),
                     ("unit", Cell::Text("1".to_owned())),
@@ -2880,12 +2936,7 @@ impl FilteringFixture {
                 cells
             })
             .collect();
-        with_event_time(
-            &batch(schema, &rows),
-            (0..SIGNAL_ROWS_PER_FILE)
-                .map(|row| self.signal_event_time(file, row))
-                .collect(),
-        )
+        batch(schema, &rows)
     }
 
     /// The four tables the fixture writes, as `(namespace, table)`.
@@ -2896,41 +2947,6 @@ impl FilteringFixture {
             (BifrostNamespace::Logs, "records"),
             (BifrostNamespace::Metrics, "points"),
         ]
-    }
-
-    /// Declares [`REWRITE_ROW_GROUP_BYTES`] as the custom table's Forge
-    /// row-group target.
-    ///
-    /// A test-scoped Iceberg table property: Scribe's sealed files ignore it,
-    /// and Forge reads it when it plans the rewrite.
-    ///
-    /// # Errors
-    ///
-    /// Returns catalog, binding, or commit errors.
-    async fn declare_rewrite_row_groups(
-        &self,
-        server: &WyrdTestServer,
-    ) -> Result<(), JourneyError> {
-        let catalog = server
-            .state()
-            .bifrost_catalog()
-            .ok_or("Scribe composition retains the shared catalog")?
-            .iceberg_catalog();
-        let binding = TenantTableBinding::resolve((
-            server.data_tenant_id(),
-            vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Datasets, &self.custom),
-        ))?;
-        let loaded = catalog.load_table(&binding.table_ident()).await?;
-        let tx = iceberg::transaction::Transaction::new(&loaded);
-        let tx = iceberg::transaction::ApplyTransactionAction::apply(
-            tx.update_table_properties().set(
-                iceberg::spec::TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES.to_owned(),
-                REWRITE_ROW_GROUP_BYTES.to_string(),
-            ),
-            tx,
-        )?;
-        tx.commit_once(catalog.as_ref()).await?;
-        Ok(())
     }
 
     /// Waits, bounded, until the freshly started coordinator has promoted every
@@ -2955,13 +2971,13 @@ impl FilteringFixture {
             .server_by_node(coordinator)
             .ok_or("the delayed coordinator is running")?;
         tokio::time::timeout(
-            FORGE_PASS_WAIT,
+            COMPACTION_PASS_WAIT,
             server.wait_for_forge_scheduler_passes_for_test(1),
         )
         .await
         .map_err(|_| "the coordinator never completed its boot pass")?;
         let tenant = cluster.data_tenant_id();
-        let deadline = std::time::Instant::now() + FORGE_PHASE_BUDGET;
+        let deadline = std::time::Instant::now() + COMPACTION_BUDGET;
         loop {
             let mut hot_tables = Vec::new();
             for (_, table) in self.tables() {
@@ -2979,63 +2995,11 @@ impl FilteringFixture {
             let before = server.completed_forge_scheduler_passes_for_test();
             server.request_forge_scheduler_pass_for_test();
             tokio::time::timeout(
-                FORGE_PASS_WAIT,
+                COMPACTION_PASS_WAIT,
                 server.wait_for_forge_scheduler_passes_for_test(before + 1),
             )
             .await
             .map_err(|_| "a requested scheduler pass did not complete")?;
-        }
-    }
-
-    /// Advances every Forge clock past the compaction interval and waits,
-    /// bounded, until each table's current snapshot plans only Forge outputs.
-    ///
-    /// Each iteration releases retry backoff, requests a scheduler pass, and
-    /// waits for a worker completion; the exit condition is the planned data
-    /// files themselves, never a pass or completion count.
-    ///
-    /// # Errors
-    ///
-    /// Returns clock, catalog, scan-planning, or Postgres errors, or an error
-    /// naming the tables still planning Scribe objects when the budget
-    /// elapses.
-    async fn await_rewrite(
-        &self,
-        cluster: &WyrdTestCluster,
-        server: &WyrdTestServer,
-    ) -> Result<(), JourneyError> {
-        let observer = cluster
-            .forge_completion_observer()
-            .ok_or("cluster was started without a Forge completion observer")?;
-        for node in cluster.servers() {
-            node.forge_clock()
-                .advance(chrono::Duration::days(1))
-                .map_err(|error| format!("elapse the compaction interval: {error}"))?;
-        }
-        let tenant = cluster.data_tenant_id();
-        let deadline = std::time::Instant::now() + FORGE_PHASE_BUDGET;
-        loop {
-            let mut pending = Vec::new();
-            for (namespace, table) in self.tables() {
-                let paths = planned_paths(server, tenant, namespace, table).await?;
-                if paths.is_empty() || !paths.iter().all(|path| path.contains(FORGE_DATA_SEGMENT)) {
-                    pending.push(format!("{table}: {paths:?}"));
-                }
-            }
-            if pending.is_empty() {
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!("the rewrite did not publish: {pending:?}").into());
-            }
-            for (_, table) in self.tables() {
-                release_forge_retries(cluster, tenant, table).await?;
-            }
-            let target = observer.completed().saturating_add(1);
-            cluster.request_forge_scheduler_pass_for_test();
-            // A lapsed wait is not a verdict: the planned files checked at the
-            // top of the next iteration are.
-            let _ = tokio::time::timeout(FORGE_PASS_WAIT, observer.wait_for_at_least(target)).await;
         }
     }
 
@@ -3073,9 +3037,16 @@ impl FilteringFixture {
                 )
                 .into());
             }
-            let objects =
-                SealedObject::read_tier(cluster, server, tenant, namespace, table, cut.tier())
-                    .await?;
+            let objects = SealedObject::read_tier(
+                cluster,
+                server,
+                tenant,
+                namespace,
+                table,
+                filter_time_column(namespace),
+                cut.tier(),
+            )
+            .await?;
             let forge_outputs = objects
                 .iter()
                 .filter(|object| object.path.contains(FORGE_DATA_SEGMENT))
@@ -3331,7 +3302,7 @@ impl FilteringFixture {
                 name: "custom event-time slice".to_owned(),
                 sql: format!(
                     "SELECT key_id AS id FROM {custom} WHERE {} ORDER BY id",
-                    self.slice_filter(2)?
+                    self.slice_filter(EVENT_TIME, 2)?
                 ),
                 expected: custom_keys(2).collect(),
             },
@@ -3348,7 +3319,10 @@ impl FilteringFixture {
         for (name, filter, expected) in [
             (
                 "custom mixed key/time match",
-                format!("label = 'label-04' AND {}", self.slice_filter(1)?),
+                format!(
+                    "label = 'label-04' AND {}",
+                    self.slice_filter(EVENT_TIME, 1)?
+                ),
                 custom_where(&|key| {
                     key / CUSTOM_ROWS_PER_FILE == 1
                         && custom_label(key).as_deref() == Some("label-04")
@@ -3356,7 +3330,10 @@ impl FilteringFixture {
             ),
             (
                 "custom mixed key/time miss",
-                format!("key_id = {CUSTOM_PROBE_KEY} AND {}", self.slice_filter(2)?),
+                format!(
+                    "key_id = {CUSTOM_PROBE_KEY} AND {}",
+                    self.slice_filter(EVENT_TIME, 2)?
+                ),
                 Vec::new(),
             ),
             (
@@ -3476,12 +3453,13 @@ impl FilteringFixture {
             (0..FILTER_FILES)
                 .flat_map(|file| (0..SIGNAL_ROWS_PER_FILE).map(move |row| (file, row)))
                 .filter(|(file, row)| keep(*file, *row))
-                .map(|(file, row)| signal_id(file, row))
+                .map(|(file, row)| self.signal_instant(file, row))
                 .collect()
         };
         let trace = |file: i64, ordinal: i64| hex::encode(fixture_trace_id(file, ordinal));
 
-        for (table, id) in [
+        // Each signal row's identity is its time column's Unix nanoseconds.
+        for (table, time) in [
             ("vala.traces.spans", "start_time_unix_nano"),
             ("vala.logs.records", "time_unix_nano"),
             ("vala.metrics.points", "time_unix_nano"),
@@ -3491,7 +3469,7 @@ impl FilteringFixture {
                 reader,
                 FilterCase {
                     name: format!("{table} unfiltered"),
-                    sql: format!("SELECT {id} AS id FROM {table} ORDER BY id"),
+                    sql: format!("SELECT CAST({time} AS BIGINT) AS id FROM {table} ORDER BY id"),
                     expected: signals(&|_, _| true),
                 },
             )
@@ -3503,8 +3481,8 @@ impl FilteringFixture {
                 FilterCase {
                     name: format!("{table} event-time slice"),
                     sql: format!(
-                        "SELECT {id} AS id FROM {table} WHERE {} ORDER BY id",
-                        self.slice_filter(0)?
+                        "SELECT CAST({time} AS BIGINT) AS id FROM {table} WHERE {} ORDER BY id",
+                        self.slice_filter(time, 0)?
                     ),
                     expected: signals(&|file, _| file == 0),
                 },
@@ -3519,7 +3497,7 @@ impl FilteringFixture {
             FilterCase {
                 name: "spans absent trace id within bounds".to_owned(),
                 sql: format!(
-                    "SELECT start_time_unix_nano AS id FROM vala.traces.spans \
+                    "SELECT CAST(start_time_unix_nano AS BIGINT) AS id FROM vala.traces.spans \
                      WHERE trace_id = X'{}' ORDER BY id",
                     hex::encode(probes.span_probe)
                 ),
@@ -3544,7 +3522,9 @@ impl FilteringFixture {
         )?;
         expect_measure("spans absent trace", "bloom", absent.bloom_pruned, 1.0)?;
 
-        for (name, table, id, filter, expected) in [
+        let spans_time = |file| self.slice_filter("start_time_unix_nano", file);
+        let signal_time = |file| self.slice_filter("time_unix_nano", file);
+        for (name, table, time, filter, expected) in [
             (
                 "spans trace present",
                 "vala.traces.spans",
@@ -3556,22 +3536,14 @@ impl FilteringFixture {
                 "spans mixed trace/time match",
                 "vala.traces.spans",
                 "start_time_unix_nano",
-                format!(
-                    "trace_id = X'{}' AND {}",
-                    trace(2, 4),
-                    self.slice_filter(2)?
-                ),
+                format!("trace_id = X'{}' AND {}", trace(2, 4), spans_time(2)?),
                 signals(&|file, row| file == 2 && row == 2),
             ),
             (
                 "spans mixed trace/time miss",
                 "vala.traces.spans",
                 "start_time_unix_nano",
-                format!(
-                    "trace_id = X'{}' AND {}",
-                    trace(2, 4),
-                    self.slice_filter(0)?
-                ),
+                format!("trace_id = X'{}' AND {}", trace(2, 4), spans_time(0)?),
                 Vec::new(),
             ),
             (
@@ -3606,7 +3578,7 @@ impl FilteringFixture {
                 "records uncorrelated in slice",
                 "vala.logs.records",
                 "time_unix_nano",
-                format!("trace_id IS NULL AND {}", self.slice_filter(1)?),
+                format!("trace_id IS NULL AND {}", signal_time(1)?),
                 signals(&|file, row| file == 1 && row % 2 == 0),
             ),
             (
@@ -3634,7 +3606,7 @@ impl FilteringFixture {
                 "points mixed type/time",
                 "vala.metrics.points",
                 "time_unix_nano",
-                format!("metric_type = 'sum' AND {}", self.slice_filter(2)?),
+                format!("metric_type = 'sum' AND {}", signal_time(2)?),
                 signals(&|file, row| file == 2 && row % 2 == 0),
             ),
         ] {
@@ -3643,7 +3615,9 @@ impl FilteringFixture {
                 reader,
                 FilterCase {
                     name: name.to_owned(),
-                    sql: format!("SELECT {id} AS id FROM {table} WHERE {filter} ORDER BY id"),
+                    sql: format!(
+                        "SELECT CAST({time} AS BIGINT) AS id FROM {table} WHERE {filter} ORDER BY id"
+                    ),
                     expected,
                 },
             )
@@ -3668,7 +3642,6 @@ struct FilterProbes {
     custom_groups: usize,
 }
 
-/// Path segment every Forge rewrite output carries beneath its table root.
 const FORGE_DATA_SEGMENT: &str = "/data/forge/";
 
 /// The physical cut one filtering phase proves.
@@ -3710,44 +3683,6 @@ enum PhysicalTier {
     Iceberg,
 }
 
-/// Bound on one requested Forge scheduler pass or worker completion.
-const FORGE_PASS_WAIT: Duration = Duration::from_secs(30);
-
-/// Bound on one whole Forge phase of the filtering journey.
-const FORGE_PHASE_BUDGET: Duration = Duration::from_mins(3);
-
-/// The data-file paths one table's current Iceberg snapshot plans.
-///
-/// # Errors
-///
-/// Returns catalog, binding, or scan-planning errors.
-async fn planned_paths(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    namespace: BifrostNamespace,
-    table: &str,
-) -> Result<Vec<String>, JourneyError> {
-    let catalog = server
-        .state()
-        .bifrost_catalog()
-        .ok_or("Scribe composition retains the shared catalog")?
-        .iceberg_catalog();
-    let binding = TenantTableBinding::resolve((
-        tenant,
-        vala_bifrost_redux::catalog::TableRef::new(namespace, table),
-    ))?;
-    let loaded = catalog.load_table(&binding.table_ident()).await?;
-    if loaded.metadata().current_snapshot().is_none() {
-        return Ok(Vec::new());
-    }
-    let mut tasks = loaded.scan().select_all().build()?.plan_files().await?;
-    let mut paths = Vec::new();
-    while let Some(task) = futures_util::TryStreamExt::try_next(&mut tasks).await? {
-        paths.push(task.data_file_path);
-    }
-    Ok(paths)
-}
-
 /// One sealed object read back from storage, with its decoded rows and its
 /// footer's column and offset indexes.
 struct SealedObject {
@@ -3762,8 +3697,8 @@ struct SealedObject {
 }
 
 impl SealedObject {
-    /// Reads every object of one table in `tier`, ordered by its first event
-    /// time.
+    /// Reads every object of one table in `tier`, ordered by the earliest
+    /// value of the table's `time_column`.
     ///
     /// Hot objects are the table's unpromoted `vala.file_list` rows; Iceberg
     /// objects are the data files the table's current snapshot plans.
@@ -3777,6 +3712,7 @@ impl SealedObject {
         tenant: DataTenantId,
         namespace: BifrostNamespace,
         table: &str,
+        time_column: &str,
         tier: PhysicalTier,
     ) -> Result<Vec<Self>, JourneyError> {
         let catalog = server
@@ -3825,26 +3761,39 @@ impl SealedObject {
         }
         let mut keyed = objects
             .into_iter()
-            .map(|object| object.first_event_time().map(|first| (first, object)))
+            .map(|object| {
+                object
+                    .first_instant(time_column)
+                    .map(|first| (first, object))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         keyed.sort_by_key(|(first, _)| *first);
         Ok(keyed.into_iter().map(|(_, object)| object).collect())
     }
 
-    /// The earliest `wyrd_event_time` this object holds.
+    /// The earliest raw value of `time_column` this object holds, in the
+    /// column's own unit.
+    ///
+    /// The value only orders one table's objects, so the unit never has to be
+    /// compared across tables.
     ///
     /// # Errors
     ///
-    /// Returns an error when the column is missing, mistyped, or empty.
-    fn first_event_time(&self) -> Result<i64, JourneyError> {
+    /// Returns an error when the column is missing, not a timestamp, or empty.
+    fn first_instant(&self, time_column: &str) -> Result<i64, JourneyError> {
         let column = self
             .rows
-            .column_by_name(wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME)
-            .ok_or_else(|| format!("{}: no event-time column", self.path))?
+            .column_by_name(time_column)
+            .ok_or_else(|| format!("{}: no {time_column} column", self.path))?;
+        if !matches!(column.data_type(), DataType::Timestamp(_, _)) {
+            return Err(format!("{}: {time_column} is not a timestamp", self.path).into());
+        }
+        let raw = arrow::compute::cast(column, &DataType::Int64)?;
+        let raw = raw
             .as_any()
-            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-            .ok_or_else(|| format!("{}: event time is not microseconds", self.path))?;
-        arrow::compute::min(column).ok_or_else(|| format!("{}: no event time", self.path).into())
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| format!("{}: {time_column} did not cast to Int64", self.path))?;
+        arrow::compute::min(raw).ok_or_else(|| format!("{}: no {time_column}", self.path).into())
     }
 
     /// Requires the rows to be in `keys` order.
@@ -3984,13 +3933,11 @@ impl SealedObject {
     /// Returns an error when the object carries no offset index.
     fn page_count(&self, column: &str) -> Result<usize, JourneyError> {
         let index = self.column_index(column)?;
-        self.metadata
-            .offset_index()
-            .ok_or_else(|| format!("{}: no offset index", self.path))?
-            .iter()
-            .map(|columns| {
-                columns
-                    .get(index)
+        (0..self.metadata.num_row_groups())
+            .map(|group| {
+                self.metadata
+                    .page_index_for_row_group(group)
+                    .offset_index(index)
                     .map(|column| column.page_locations().len())
                     .ok_or_else(|| format!("{}: no offset index for {column}", self.path))
             })
@@ -4032,9 +3979,8 @@ impl SealedObject {
         let index = self.column_index("key_id")?;
         let pages = self
             .metadata
-            .offset_index()
-            .and_then(|groups| groups.get(group))
-            .and_then(|columns| columns.get(index))
+            .page_index_for_row_group(group)
+            .offset_index(index)
             .ok_or_else(|| format!("{}: no key offset index", self.path))?
             .page_locations()
             .len();
@@ -4079,7 +4025,7 @@ impl SealedObject {
 ///
 /// Returns telemetry or query errors, and an error when the returned ids are
 /// not exactly the expected ids.
-async fn run_case(
+pub(crate) async fn run_case(
     cluster: &WyrdTestCluster,
     reader: &WyrdClient,
     case: FilterCase,
@@ -4124,7 +4070,7 @@ async fn run_case(
 /// # Errors
 ///
 /// Returns an error naming the case, the measure, and both values.
-fn expect_measure(
+pub(crate) fn expect_measure(
     case: &str,
     measure: &str,
     actual: f64,
@@ -4136,8 +4082,21 @@ fn expect_measure(
     Ok(())
 }
 
+/// The time column a filtering-fixture table in `namespace` declares.
+///
+/// The custom dataset declares [`EVENT_TIME`]; each signal table declares its
+/// built-in `OTLP` instant.
+fn filter_time_column(namespace: BifrostNamespace) -> &'static str {
+    match namespace {
+        BifrostNamespace::Traces => "start_time_unix_nano",
+        BifrostNamespace::Logs | BifrostNamespace::Metrics => "time_unix_nano",
+        _ => EVENT_TIME,
+    }
+}
+
 /// The custom dataset's user schema: a sort key, a nullable Bloom key, and a
-/// value column with neither.
+/// value column with neither. Registration and batches append [`EVENT_TIME`]
+/// through [`timed_schema`].
 fn custom_schema() -> SchemaRef {
     Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("key_id", arrow::datatypes::DataType::Int64, false),
@@ -4156,11 +4115,6 @@ fn custom_keys(file: i64) -> Range<i64> {
 /// file's bounds without ever being written.
 fn custom_label(key: i64) -> Option<String> {
     (key % 10 != 0).then(|| format!("label-{:02}", 2 * (key % 8)))
-}
-
-/// The row identity of signal row `row` of `file`.
-fn signal_id(file: i64, row: i64) -> i64 {
-    file * 100 + row + 1
 }
 
 /// A fixture trace id whose last two bytes are `file` and `ordinal`.
@@ -4206,27 +4160,21 @@ fn sql_timestamp(micros: i64) -> Result<String, JourneyError> {
     )
 }
 
-/// Appends a caller-supplied `wyrd_event_time` to `batch`.
+/// Appends a caller-supplied [`EVENT_TIME`] column to `batch`.
+///
+/// The result has [`timed_schema`] of the batch's schema, which is what a
+/// table registered with [`timed_layout`] declares.
 ///
 /// # Errors
 ///
 /// Returns the Arrow error when the column count differs from the rows.
 fn with_event_time(batch: &RecordBatch, micros: Vec<i64>) -> Result<RecordBatch, JourneyError> {
-    let mut fields = batch.schema().fields().iter().cloned().collect::<Vec<_>>();
-    fields.push(Arc::new(arrow::datatypes::Field::new(
-        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-        arrow::datatypes::DataType::Timestamp(
-            arrow::datatypes::TimeUnit::Microsecond,
-            Some("UTC".into()),
-        ),
-        false,
-    )));
     let mut columns = batch.columns().to_vec();
     columns.push(Arc::new(
         arrow::array::TimestampMicrosecondArray::from(micros).with_timezone("UTC"),
     ));
     Ok(RecordBatch::try_new(
-        Arc::new(arrow::datatypes::Schema::new(fields)),
+        timed_schema(&batch.schema()),
         columns,
     )?)
 }
@@ -4281,12 +4229,9 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
         direction: SortDirectionWire::Asc,
         null_order: NullOrderWire::Last,
     }];
-    let config = wyrd_client::bifrost::TableConfig::from_arrow(&fqn, binary_key_schema())?
-        .with_layout(PhysicalLayoutWire {
-            partition_granularity: TimeGranularityWire::Hour,
-            sort_keys: sort_keys.clone(),
-            bloom_columns: Vec::new(),
-        });
+    let config =
+        wyrd_client::bifrost::TableConfig::from_arrow(&fqn, timed_schema(&binary_key_schema()))?
+            .with_layout(timed_layout_with(sort_keys.clone(), Vec::new()));
     wyrd_client::Bifrost::connect_with_table(rows.client(), config)
         .await?
         .register()
@@ -4323,6 +4268,7 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
         tenant,
         BifrostNamespace::Datasets,
         &table,
+        EVENT_TIME,
         PhysicalTier::Iceberg,
     )
     .await?;
@@ -4359,7 +4305,7 @@ async fn binary_sort_key_page_pruning() -> Result<(), JourneyError> {
         (
             "fixed-size key and time",
             format!(
-                "fixed_key = X'{probe_fixed}' AND wyrd_event_time >= TIMESTAMP '{}'",
+                "fixed_key = X'{probe_fixed}' AND {EVENT_TIME} >= TIMESTAMP '{}'",
                 sql_timestamp(event_time(BINARY_PROBE_ROW))?
             ),
         ),
@@ -4453,25 +4399,24 @@ async fn settle_query(
     Ok(())
 }
 
-/// Proves the active cut is one tenant-scoped statement with one bounded retry.
+/// Proves the cut is one tenant-scoped statement with one bounded retry.
 ///
-/// Cold and warm queries over one table and over a two-table join each acquire
-/// their whole cut in exactly one statement. One injected metadata `NotFound`
-/// after acquisition costs exactly one reacquisition and the query succeeds; a
-/// second consecutive `NotFound` is terminal and releases the query's active
-/// reads. A caller not granted the table is refused before any metadata read,
-/// so an armed fault stays unconsumed. Another tenant's lookup of the same name
+/// A cold query over one table or over a two-table join reads its whole cut
+/// in exactly one statement; the same query warm is served from the node's
+/// cut cache in none. One injected metadata `NotFound` after the cached read
+/// costs exactly one Postgres reread and the query succeeds; a second
+/// consecutive `NotFound` is terminal. A caller not granted the table is
+/// refused before any metadata read, so an armed fault stays unconsumed. Another tenant's lookup of the same name
 /// fails exactly as a never-registered name does, exposing no identity.
 ///
 /// # Errors
 /// Returns server, catalog, or harness errors.
 ///
 /// # Panics
-/// Panics when a statement count, outcome, retained read, or error differs.
+/// Panics when a statement count, outcome, or error differs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
--> Result<(), JourneyError> {
+async fn tenant_scoped_cut_is_one_statement_and_one_bounded_retry() -> Result<(), JourneyError> {
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
     let left = unique_table("cut_left");
@@ -4483,43 +4428,37 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
         "SELECT l.id FROM vala.bifrost.{left} l JOIN vala.bifrost.{right} r ON l.id = r.id"
     );
 
-    reset_active_cut_acquisitions_for_test();
-    for (case, sql) in [
-        ("cold one-table", &one),
-        ("warm one-table", &one),
-        ("cold join", &join),
-        ("warm join", &join),
+    reset_cut_reads_for_test();
+    for (case, sql, statements) in [
+        ("cold one-table", &one, 1),
+        ("warm one-table", &one, 0),
+        ("cold join", &join, 1),
+        ("warm join", &join, 0),
     ] {
         settle_query(&server, query_context(tenant)?, sql).await?;
         assert_eq!(
-            reset_active_cut_acquisitions_for_test(),
-            1,
-            "{case} acquires its whole cut in one statement"
+            reset_cut_reads_for_test(),
+            statements,
+            "{case} reads its whole cut in {statements} statements"
         );
     }
 
+    // Both cuts are now cached, so each count below is Postgres rereads only.
     inject_metadata_not_found_for_test(1);
     settle_query(&server, query_context(tenant)?, &join).await?;
     assert_eq!(
-        reset_active_cut_acquisitions_for_test(),
-        2,
-        "one missing metadata document costs exactly one reacquisition"
+        reset_cut_reads_for_test(),
+        1,
+        "one missing metadata document costs exactly one reread"
     );
 
     inject_metadata_not_found_for_test(2);
     let terminal = settle_query(&server, query_context(tenant)?, &one).await;
     assert!(terminal.is_err(), "a second NotFound is terminal");
     assert_eq!(
-        reset_active_cut_acquisitions_for_test(),
-        2,
+        reset_cut_reads_for_test(),
+        1,
         "the terminal NotFound is not retried again"
-    );
-    let binding =
-        TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, &left)))?;
-    assert_eq!(
-        server.oracle_active_table_reads_for_test(&binding).await?,
-        0,
-        "the failed query released its active reads"
     );
 
     // A grant for some other table identity does not cover this one; the
@@ -4556,8 +4495,8 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
     );
     settle_query(&server, query_context(tenant)?, &one).await?;
     assert_eq!(
-        reset_active_cut_acquisitions_for_test(),
-        3,
+        reset_cut_reads_for_test(),
+        1,
         "the refused query read no metadata, so the armed fault fell to the next query"
     );
 
@@ -4586,241 +4525,6 @@ async fn tenant_scoped_active_cut_is_one_statement_and_one_bounded_retry()
     );
     server.shutdown().await?;
     Ok(())
-}
-
-/// Leader pod of the held-cut journey's Analytical graph.
-const HELD_CUT_LEADER: usize = 0;
-
-/// Follower pod whose `ExecuteTask` the held-cut journey holds.
-const HELD_CUT_FOLLOWER: usize = 1;
-
-/// Scribe pod that ingests the held-cut journey's rows.
-const HELD_CUT_SCRIBE: usize = 3;
-
-/// Counts the active table reads one table holds on the shared database.
-///
-/// # Errors
-/// Returns a harness error when the pod is not running or the read fails.
-async fn active_reads(
-    cluster: &PeerCluster,
-    binding: &TenantTableBinding,
-) -> Result<i64, JourneyError> {
-    Ok(cluster
-        .server(HELD_CUT_LEADER)?
-        .oracle_active_table_reads_for_test(binding)
-        .await?)
-}
-
-/// Waits until one table holds no active read, since a dropped owner's release
-/// runs on a spawned task after the drop returns.
-///
-/// # Errors
-/// Returns an error naming `case` when a read remains after the bound, or a
-/// harness error when the count cannot be read.
-async fn await_no_active_reads(
-    cluster: &PeerCluster,
-    binding: &TenantTableBinding,
-    case: &str,
-) -> Result<(), JourneyError> {
-    let deadline = tokio::time::Instant::now() + LIVE_SETTLE_TIMEOUT;
-    loop {
-        let reads = active_reads(cluster, binding).await?;
-        if reads == 0 {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!("{case}: {reads} active reads remain").into());
-        }
-        tokio::time::sleep(SETTLEMENT_INTERVAL).await;
-    }
-}
-
-/// Proves the leader revoked each recorded Analytical graph before its claim.
-///
-/// Drains this process's leader ownership log and, for every query whose
-/// graph recorded a revocation, requires that revocation to precede the first
-/// release of the same query's active-read claim. Both transitions are
-/// appended synchronously where they happen, so a claim released while a
-/// follower grant or local driver is still owned is recorded first and fails
-/// here. `expected` is the number of Analytical graphs `case` must have
-/// produced, so a case that never reached a graph cannot pass vacuously.
-///
-/// # Errors
-/// Returns an error naming `case` when a graph count differs from `expected`,
-/// a claim release precedes its graph's revocation, or a revoked graph's
-/// claim never began releasing.
-fn assert_graphs_revoked_before_claims(case: &str, expected: usize) -> Result<(), JourneyError> {
-    let order = take_leader_ownership_order_for_test();
-    let position = |query: uuid::Uuid, event: LeaderOwnershipEvent| {
-        order
-            .iter()
-            .position(|recorded| *recorded == (query, event))
-    };
-    let graphs: BTreeSet<uuid::Uuid> = order
-        .iter()
-        .filter(|(_, event)| *event == LeaderOwnershipEvent::GraphRevoked)
-        .map(|(query, _)| *query)
-        .collect();
-    if graphs.len() != expected {
-        return Err(format!(
-            "{case}: {} Analytical graphs were revoked, not {expected}: {order:?}",
-            graphs.len()
-        )
-        .into());
-    }
-    for query in graphs {
-        let revoked = position(query, LeaderOwnershipEvent::GraphRevoked);
-        let released = position(query, LeaderOwnershipEvent::ClaimReleaseStarted)
-            .ok_or_else(|| format!("{case}: query {query} never released its claim: {order:?}"))?;
-        if revoked.is_none_or(|revoked| revoked > released) {
-            return Err(format!(
-                "{case}: query {query} released its claim before revoking its graph: {order:?}"
-            )
-            .into());
-        }
-    }
-    Ok(())
-}
-
-/// Proves one inseparable cut-and-claim owner holds active reads to the end.
-///
-/// An Analytical graph whose follower task is held keeps its single active
-/// read; releasing the follower lets the query finish, and the read is already
-/// gone when the caller receives the terminal frame. A caller that drops the
-/// query while that follower is still held releases its read once the drop
-/// reaches the owner. A caller that drops an already returned stream releases
-/// its read the same way. A query dropped at its post-pin boundary — after the
-/// claim committed but before any owner received it — releases its row too.
-/// In every case with a graph, the leader's ownership log shows that graph
-/// revoked every follower and local driver before its claim began releasing.
-///
-/// # Errors
-/// Returns cluster, ingest, or query errors.
-///
-/// # Panics
-/// Panics when an active read is released before its last descendant settles
-/// or survives a completed terminal; returns an error when a dropped owner or
-/// pin never releases its row.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn held_cut_owns_active_reads_until_all_descendants_settle() -> Result<(), JourneyError> {
-    let mut cluster = PeerCluster::start_with_slots(&[
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Oracle, Some(2)),
-        (BifrostTarget::Scribe, None),
-    ])
-    .await?;
-    let tenant = cluster.tenant();
-    let table = unique_table("held_cut");
-    cluster.register_table(HELD_CUT_SCRIBE, &table).await?;
-    // Two published objects give the grouped statement remote work.
-    cluster
-        .ingest_rows(HELD_CUT_SCRIBE, &table, 0, 12, 3)
-        .await?;
-    cluster
-        .ingest_rows(HELD_CUT_SCRIBE, &table, 0, 12, 3)
-        .await?;
-    cluster.refresh_snapshots().await?;
-    let binding = TenantTableBinding::resolve((
-        tenant,
-        vala_bifrost_redux::catalog::TableRef::new(BifrostNamespace::Bifrost, &table),
-    ))?;
-    let engine = cluster
-        .server(HELD_CUT_LEADER)?
-        .state()
-        .bifrost_query()
-        .map(|query| Arc::clone(query.engine()))
-        .ok_or("the leader pod composes no Oracle")?;
-    let request = BifrostQueryRequest {
-        sql: format!(
-            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
-             GROUP BY filter_key ORDER BY filter_key"
-        ),
-        deadline_ms: None,
-        params: Vec::new(),
-    };
-
-    drop(vala_bifrost_redux::oracle::planner::take_leader_ownership_order_for_test());
-    // Success: the follower is held, so the graph cannot produce its first
-    // batch; once it is let go, the terminal arrives only after the read was
-    // released. The query runs inside the join because its first batch waits
-    // on the held follower.
-    cluster.arm_execute_pause(HELD_CUT_FOLLOWER)?;
-    let drain = async {
-        let mut stream = engine
-            .query_sql(query_context(tenant)?, request.clone())
-            .await?;
-        let mut class = None;
-        while let Some(frame) = futures_util::StreamExt::next(&mut stream.frames).await {
-            if let wyrd_spec::vala::api::QueryStreamFrame::Terminal(terminal) = frame? {
-                assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
-                assert_eq!(
-                    active_reads(&cluster, &binding).await?,
-                    0,
-                    "the read is released before the terminal frame is emitted"
-                );
-                class = Some(terminal.query_class);
-            }
-        }
-        Ok::<_, JourneyError>(class)
-    };
-    let hold = async {
-        cluster.await_execute_paused(HELD_CUT_FOLLOWER).await?;
-        assert_eq!(
-            active_reads(&cluster, &binding).await?,
-            1,
-            "a graph with a held follower keeps its one active read"
-        );
-        cluster.release_execute_pause(HELD_CUT_FOLLOWER)?;
-        Ok::<(), JourneyError>(())
-    };
-    let (class, ()) = tokio::try_join!(drain, hold)?;
-    assert_eq!(class, Some(QueryClass::Analytical));
-    assert_graphs_revoked_before_claims("a settled query", 1)?;
-
-    // Caller drop: dropping the query while its follower still reads releases
-    // the row; nothing can consume a result from the dropped leader.
-    let leader_baseline = cluster.ownership_snapshot(HELD_CUT_LEADER)?;
-    cluster.arm_execute_pause(HELD_CUT_FOLLOWER)?;
-    tokio::select! {
-        result = engine.query_sql(query_context(tenant)?, request.clone()) => {
-            return Err(format!("the held graph returned early: {:?}", result.map(|_| ())).into());
-        }
-        paused = cluster.await_execute_paused(HELD_CUT_FOLLOWER) => paused?,
-    }
-    cluster.release_execute_pause(HELD_CUT_FOLLOWER)?;
-    await_baseline(&cluster, HELD_CUT_LEADER, leader_baseline).await?;
-    await_no_active_reads(&cluster, &binding, "a dropped caller").await?;
-    assert_graphs_revoked_before_claims("a dropped caller", 1)?;
-
-    // Stream drop: the caller received the leader stream and drops it unread,
-    // so the stream's own owner collapses the graph and then the claim.
-    let stream = engine
-        .query_sql(query_context(tenant)?, request.clone())
-        .await?;
-    drop(stream);
-    await_no_active_reads(&cluster, &binding, "a dropped stream").await?;
-    assert_graphs_revoked_before_claims("a dropped stream", 1)?;
-
-    // Drop at the post-pin boundary: the claim committed but no owner
-    // received it, and the dropped pin still releases it.
-    let context = query_context(tenant)?;
-    cluster.arm_preparation_pause(HELD_CUT_LEADER, &context.request_id)?;
-    tokio::select! {
-        result = engine.query_sql(context, request) => {
-            return Err(format!("the paused query returned: {:?}", result.map(|_| ())).into());
-        }
-        () = async {
-            while cluster.preparation_pause_deadline(HELD_CUT_LEADER).is_none() {
-                tokio::task::yield_now().await;
-            }
-        } => {}
-    }
-    cluster.release_preparation_pause(HELD_CUT_LEADER)?;
-    await_no_active_reads(&cluster, &binding, "a dropped pin").await?;
-    assert_graphs_revoked_before_claims("a dropped pin", 0)?;
-    cluster.shutdown().await
 }
 
 /// Rows the held-query journey writes into each of its two hot objects.
@@ -4863,27 +4567,6 @@ async fn held_query_live_files(
         }
     }
     Ok((Some(current.snapshot_id()), snapshots, files))
-}
-
-/// Commits one table property through the shared catalog, outside Forge.
-///
-/// # Errors
-/// Returns the catalog load, transaction, or commit error.
-async fn held_query_set_property(
-    catalog: &Arc<dyn Catalog>,
-    binding: &TenantTableBinding,
-    key: &str,
-    value: &str,
-) -> Result<(), JourneyError> {
-    let loaded = catalog.load_table(&binding.table_ident()).await?;
-    let tx = iceberg::transaction::Transaction::new(&loaded);
-    let tx = iceberg::transaction::ApplyTransactionAction::apply(
-        tx.update_table_properties()
-            .set(key.to_owned(), value.to_owned()),
-        tx,
-    )?;
-    tx.commit_once(catalog.as_ref()).await?;
-    Ok(())
 }
 
 /// Reads one `file_list` row's `(compacted, committed)` state, if it exists.
@@ -4974,28 +4657,30 @@ async fn held_query_ids(
 /// Proves a held query owns its exact hot objects through promotion and rewrite.
 ///
 /// The query pins a cut of two Scribe hot files, then is held at its post-pin
-/// boundary with its active table read committed. While held, those same
-/// objects are promoted unchanged and their `file_list` rows become terminal,
-/// a small-files rewrite publishes one distinct replacement object and
-/// snapshot, and a leader maintenance pass — expiration, expired cleanup, and
-/// orphan cleanup — destroys nothing. Released, the query returns
-/// every row exactly once and the original paths still exist. Once its read is
-/// gone and an ordinary append moves the head off the rewrite (whose lineage
-/// root names the replaced snapshot), the next maintenance passes expire the
-/// replaced snapshot and delete exactly the original objects and their
-/// terminal `file_list` rows, while the replacement survives. No Forge clock
-/// is advanced.
+/// boundary, recording nothing. While held, those same objects are promoted
+/// unchanged and their `file_list` rows become terminal, a small-files rewrite
+/// publishes one distinct replacement object and snapshot, and a leader
+/// maintenance pass — expiration, expired cleanup, and orphan cleanup —
+/// destroys nothing, because the replaced snapshot is inside the retention
+/// window. Released, the query returns every row exactly once and the original
+/// paths still exist. Once an ordinary append moves the head off the rewrite
+/// (whose lineage root names the replaced snapshot) and the window has passed,
+/// the next maintenance passes expire the replaced snapshot and delete exactly
+/// the original objects and their terminal `file_list` rows, while the
+/// replacement survives. No Forge clock is advanced; the window's passing is
+/// the recorded supersessions backdated in `PostgreSQL`.
 ///
 /// # Errors
 /// Returns cluster, ingest, catalog, query, or SQL errors.
 ///
 /// # Panics
-/// Panics when any destructive step runs while the read is held, the query
-/// returns other than each row once, or cleanup deletes anything but the
-/// original objects.
+/// Panics when any destructive step runs inside the window, the query returns
+/// other than each row once, or cleanup deletes anything but the original
+/// objects.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(), JourneyError> {
+async fn held_query_survives_cleanup_until_the_retention_window_passes() -> Result<(), JourneyError>
+{
     let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         BifrostClusterSpec::one_mixed(),
         ForgeConfig::default(),
@@ -5021,7 +4706,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         .iceberg_catalog();
     // One promotion commit makes the table due, so the rewrite needs no
     // elapsed interval and no clock advance.
-    held_query_set_property(
+    set_table_property(
         &catalog,
         &binding,
         "wyrd.forge.compaction.trigger-snapshot-count",
@@ -5078,7 +4763,6 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     let observer = cluster
         .forge_completion_observer()
         .ok_or("cluster was started without a Forge completion observer")?;
-    let storage = cluster.storage_operator();
 
     let query = held_query_ids(
         &engine,
@@ -5093,11 +4777,6 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         })
         .await
         .map_err(|_| "the query never reached its post-pin hold")?;
-        assert_eq!(
-            server.oracle_active_table_reads_for_test(&binding).await?,
-            1,
-            "the held query owns one active table read over the hot cut"
-        );
 
         // Promotion appends the same objects unchanged and settles their rows.
         promotion.release_paused_before_commit();
@@ -5149,22 +4828,22 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
             "the rewrite published a distinct Forge object: {replacement}"
         );
 
-        // Every destructive path refuses while the read is held.
+        // Every destructive path keeps the replaced snapshot inside the window.
         held_query_maintenance_pass(server).await?;
         let held = held_query_live_files(catalog.as_ref(), &binding).await?;
         assert!(
             held.1.contains(&promoted_snapshot),
-            "snapshot expiration keeps the replaced snapshot while the read is held"
+            "snapshot expiration keeps the replaced snapshot inside the window"
         );
         for original in &originals {
             assert!(
-                storage.exists(original).await?,
+                cluster.object_exists(original).await?,
                 "the held pass's expired and orphan cleanup leave {original}"
             );
             assert_eq!(
                 held_query_file_row(&cluster, tenant, &table, original).await?,
                 Some((true, true)),
-                "{original}'s terminal file_list row survives while the read is held"
+                "{original}'s terminal file_list row survives inside the window"
             );
         }
         pause.release();
@@ -5177,17 +4856,12 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         (1..=HELD_QUERY_OBJECTS * HELD_QUERY_ROWS).collect::<Vec<_>>(),
         "the held query returns every row exactly once"
     );
-    assert_eq!(
-        server.oracle_active_table_reads_for_test(&binding).await?,
-        0,
-        "the settled query released its active table read"
-    );
 
     // The rewrite head still names its base snapshot as lineage, which keeps
     // the originals reachable until an ordinary append moves the head. With
     // compaction off, a third object promotes without rewriting the
     // replacement, so the replacement stays live in the new head.
-    held_query_set_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
+    set_table_property(&catalog, &binding, "wyrd.forge.enable-compaction", "false").await?;
     rows.write(
         &format!("vala.bifrost.{table}"),
         &journey_schema(),
@@ -5210,10 +4884,15 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     .await
     .map_err(|_| "the later object never promoted beside the replacement")??;
 
-    // After the last reader, ordinary maintenance destroys only the originals.
+    // Past the window, ordinary maintenance destroys only the originals. Each
+    // pass first ages every supersession Forge has recorded so far.
+    let past_window = ForgeConfig::default().snapshot_retention + Duration::from_secs(60);
     let deleted = tokio::time::timeout(HELD_QUERY_TRANSITION_BOUND, async {
         for original in &originals {
-            while storage.exists(original).await? {
+            while cluster.object_exists(original).await? {
+                server
+                    .age_snapshot_supersessions_for_test(tenant, past_window)
+                    .await?;
                 held_query_maintenance_pass(server).await?;
             }
         }
@@ -5234,7 +4913,7 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
         .await?;
         let live = held_query_live_files(catalog.as_ref(), &binding).await?;
         return Err(format!(
-            "an original object was never deleted after release: originals={originals:?} \
+            "an original object was never deleted after the window: originals={originals:?} \
              live={live:?} tasks={tasks:?}"
         )
         .into());
@@ -5242,10 +4921,10 @@ async fn held_query_blocks_cleanup_then_releases_replaced_snapshot() -> Result<(
     let after = held_query_live_files(catalog.as_ref(), &binding).await?;
     assert!(
         !after.1.contains(&promoted_snapshot),
-        "the replaced snapshot expired after the last reader"
+        "the replaced snapshot expired after the window"
     );
     assert!(
-        storage.exists(&replacement).await?,
+        cluster.object_exists(&replacement).await?,
         "the replacement object survives cleanup"
     );
     for original in &originals {

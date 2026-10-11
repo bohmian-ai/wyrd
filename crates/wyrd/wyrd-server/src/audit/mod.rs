@@ -38,22 +38,49 @@ pub fn audit_event(
     permission: &str,
     outcome: AuditOutcome,
 ) -> AuditEvent {
+    attributed_event(
+        &caller.request_id,
+        &caller.principal,
+        &caller.delegation_chain,
+        operation,
+        resource,
+        permission,
+        outcome,
+    )
+}
+
+/// Build a data-plane [`AuditEvent`] attributed to one verified principal.
+///
+/// The one builder every authenticated boundary shares — HTTP through
+/// [`audit_event`] and Bifrost Gate through its write-decision sink — so a
+/// decision row carries the same principal, credential, and delegation
+/// attribution whichever surface reached it.
+#[must_use]
+pub fn attributed_event(
+    request_id: &RequestId,
+    principal: &Principal,
+    delegation_chain: &[DelegationStep],
+    operation: &str,
+    resource: &str,
+    permission: &str,
+    outcome: AuditOutcome,
+) -> AuditEvent {
     AuditEvent {
-        request_id: caller.request_id.clone(),
+        request_id: request_id.clone(),
         trace_id: None,
         operation: operation.to_owned(),
         resource: resource.to_owned(),
-        card_ref: caller.principal.card_ref().cloned(),
-        principal_id: caller.principal.id,
-        principal_kind: caller.principal.kind.tag(),
-        credential_id: caller.principal.credential_id,
+        card_ref: principal.card_ref().cloned(),
+        principal_id: principal.id,
+        principal_kind: principal.kind.tag(),
+        credential_id: principal.credential_id,
         permission: permission.to_owned(),
         outcome,
-        detail: delegation_detail(caller),
+        detail: delegation_detail(delegation_chain),
     }
 }
 
-/// Project the caller's verified delegation chain into a durable detail.
+/// Project a verified delegation chain into a durable detail.
 ///
 /// Operations reached through this builder carry no operation-specific detail
 /// of their own, so an attribution-only detail is the one place their audit row
@@ -64,12 +91,12 @@ pub fn audit_event(
 /// Callers that already build an operation-specific detail must fold the chain
 /// into that detail instead of calling this; overwriting a read decision with
 /// an attribution-only detail would lose the decision.
-fn delegation_detail(caller: &Caller) -> Option<AuditDetail> {
-    if caller.delegation_chain.is_empty() {
+fn delegation_detail(delegation_chain: &[DelegationStep]) -> Option<AuditDetail> {
+    if delegation_chain.is_empty() {
         return None;
     }
     Some(AuditDetail::DelegationAttribution {
-        delegation_chain: wyrd_runtime::audit_delegation_chain(&caller.delegation_chain),
+        delegation_chain: wyrd_runtime::audit_delegation_chain(delegation_chain),
     })
 }
 

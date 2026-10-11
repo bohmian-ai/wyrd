@@ -10,18 +10,37 @@
 //! object store, and the real resource governor — never a scheduler, never a
 //! worker, and never a fabricated plan.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use iceberg::spec::{DataContentType, DataFile};
+use arrow::array::{Array as _, AsArray as _, Int64Array, RecordBatch, TimestampMicrosecondArray};
+use arrow::compute::cast;
+use arrow::datatypes::{DataType, Field, Int64Type, Schema as ArrowSchema};
+use arrow::util::display::array_value_to_string;
+use futures_util::TryStreamExt as _;
+use iceberg::metadata_columns::{
+    RESERVED_COL_NAME_FILE, RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+    RESERVED_COL_NAME_ROW_ID,
+};
+use iceberg::spec::{DataContentType, DataFile, FormatVersion, ManifestContentType, Operation};
+use iceberg::table::Table;
+use parquet_variant_compute::{VariantArray, variant_to_json};
 use vala_bifrost_redux::catalog::layout::FORGE_WRITER_RECIPE;
-use vala_bifrost_redux::forge::{ForgeClock, ForgeError, ForgeObjectStore, ForgeUnsettledOutput};
+use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+use vala_bifrost_redux::forge::{
+    ForgeClock, ForgeError, ForgeObjectStore, ForgeTableKey, ForgeUnsettledOutput,
+};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::tables::builtin_tables;
+use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
+use wyrd_types::variant::variant_field;
 
 use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
 use super::support::{
-    CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion, remove_table_properties,
-    set_table_properties,
+    CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
+    fixture_day, remove_table_properties, set_table_properties,
 };
 
 /// Runs one whole attempt over the promoted snapshot with no plan budget.
@@ -31,7 +50,7 @@ use super::support::{
 /// Panics when the attempt fails; every caller here runs against a promoted
 /// small-file set that must select.
 async fn rewrite_whole_attempt(fixture: &PromotedRewriteFixture) -> AttemptRun {
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let forge = fixture.forge(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -157,7 +176,7 @@ async fn drain_at_output(
         ordinal,
         token: cancel.clone(),
     });
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let attempt_id = uuid::Uuid::now_v7();
     let forge = fixture.forge(
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
@@ -202,7 +221,7 @@ async fn drain_at_output(
 async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
     let fixture = PromotedRewriteFixture::start("rewrite_identity").await;
     let attempt_id = uuid::Uuid::now_v7();
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let forge = fixture.forge(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -306,7 +325,7 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
 async fn managed_rewrite_cancellation_drains_and_preserves_possible_outputs() {
     let fixture = PromotedRewriteFixture::start("rewrite_drain").await;
     let live_before = fixture.fixture.live_data_paths().await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let cancel = tokio_util::sync::CancellationToken::new();
     let (catalog, store) = fixture.breaking_catalog(RewriteOutputBreak::CancelAtOpen {
         ordinal: 2,
@@ -401,7 +420,7 @@ async fn managed_rewrite_cancellation_drains_and_preserves_possible_outputs() {
 async fn managed_rewrite_failure_preserves_attempt_global_possible_outputs() {
     let fixture = PromotedRewriteFixture::start("rewrite_failure").await;
     let live_before = fixture.fixture.live_data_paths().await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let (catalog, store) = fixture.breaking_catalog(RewriteOutputBreak::FailAtClose { ordinal: 2 });
     let forge = fixture.forge(
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
@@ -475,7 +494,7 @@ async fn managed_rewrite_produces_exact_handoff_without_catalog_commit() {
     let fixture = PromotedRewriteFixture::start("rewrite_handoff").await;
     let live_before = fixture.fixture.live_data_paths().await;
     let objects_before = fixture.object_digests().await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::new(AtomicUsize::new(0)),
@@ -571,7 +590,7 @@ async fn assert_equality_delete_applies_to_output_rows() {
     );
     fixture.publish_deletes(&target, None, Some(11)).await;
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let forge = fixture.forge(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -642,7 +661,7 @@ async fn assert_position_delete_applies_to_output_rows() {
 
     deletes.publish_deletes(&target, Some(0), None).await;
     let live_before = deletes.fixture.live_data_paths().await;
-    let store = CountingObjectStore::new(Arc::clone(&deletes.fixture.staging));
+    let store = CountingObjectStore::new(&deletes.fixture.storage);
     let forge = deletes.forge(
         deletes.fixture.catalog.iceberg_catalog(),
         Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
@@ -705,7 +724,7 @@ async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
         "the fixture table declares no legacy whole-file ceiling"
     );
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.fixture.storage);
     let forge = fixture.forge(
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -769,7 +788,7 @@ async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
 #[tokio::test]
 async fn compaction_publishes_replacements_without_deleting_inputs() {
     let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_nondestructive").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let mut supervisor = SupervisedPromotion::start(
         &promoted.fixture,
         promoted.fixture.catalog.iceberg_catalog(),
@@ -989,7 +1008,7 @@ async fn small_files_merges_staged_pairs_once_and_lone_files_wait() {
         .fixture
         .seal_partition_files(STAGED_DAY, STAGED_ROWS, 2, 0)
         .await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let mut supervisor = SupervisedPromotion::start(
         &promoted.fixture,
         promoted.fixture.catalog.iceberg_catalog(),
@@ -1080,5 +1099,956 @@ async fn small_files_merges_staged_pairs_once_and_lone_files_wait() {
         paths(&live_files_with_rows(&promoted, 2).await),
         lone,
         "single-file days still wait"
+    );
+}
+
+/// Upper bound on production steps any one lineage phase may take.
+const LINEAGE_STEPS: usize = 24;
+
+/// Distinct files every original row must have lived in: its promoted object
+/// and two successive rewrite outputs.
+const REWRITTEN_TWICE: usize = 3;
+
+/// One live row: its logical identity and the hidden v3 lineage the reader
+/// resolves for it.
+///
+/// Ordered by logical identity first. The fixtures may repeat a logical value
+/// once Forge has cleaned up the files that carried it, so a row is the whole
+/// tuple rather than the logical value alone.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LiveRow {
+    /// Logical identity of the row, rendered from its key column.
+    key: String,
+    /// `_row_id` the reader resolves for the row.
+    row_id: i64,
+    /// `_last_updated_sequence_number` the reader resolves for the row.
+    last_updated_sequence_number: i64,
+}
+
+/// One table whose lineage the scenario follows across every rewrite.
+struct LineageTable {
+    /// Bound tenant table the rows live in.
+    binding: TenantTableBinding,
+    /// Logical column that identifies each generated row.
+    key_column: &'static str,
+    /// Every row seen so far, as first observed, with every data file it has
+    /// lived in.
+    rows: BTreeMap<LiveRow, BTreeSet<String>>,
+    /// Rows promoted before the first rewrite, which must be rewritten twice.
+    original: BTreeSet<LiveRow>,
+}
+
+impl LineageTable {
+    /// Starts following one table that has not been observed yet.
+    fn new(binding: TenantTableBinding, key_column: &'static str) -> Self {
+        Self {
+            binding,
+            key_column,
+            rows: BTreeMap::new(),
+            original: BTreeSet::new(),
+        }
+    }
+
+    /// Loads the table's current metadata through the real catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table cannot be loaded.
+    async fn load(&self, fixture: &PromotionIntegrationFixture) -> Table {
+        fixture
+            .catalog
+            .iceberg_catalog()
+            .load_table(&self.binding.table_ident())
+            .await
+            .expect("lineage table loads")
+    }
+
+    /// Scans every live row with its hidden lineage and current file.
+    ///
+    /// The scan asks the fork reader for both reserved columns and `_file`
+    /// beside the key column, which is the resolution any reader of the table
+    /// gets: a physical value when a rewrite wrote one, otherwise the value
+    /// inherited from the file's `first_row_id` and data sequence number.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scan fails or a lineage value is null.
+    async fn scan(&self, fixture: &PromotionIntegrationFixture) -> Vec<(LiveRow, String)> {
+        let table = self.load(fixture).await;
+        let mut rows = Vec::new();
+        if table.metadata().current_snapshot().is_none() {
+            return rows;
+        }
+        let batches: Vec<RecordBatch> = table
+            .scan()
+            .select([
+                self.key_column,
+                RESERVED_COL_NAME_ROW_ID,
+                RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+                RESERVED_COL_NAME_FILE,
+            ])
+            .build()
+            .expect("lineage scan builds")
+            .to_arrow()
+            .await
+            .expect("lineage scan starts")
+            .try_collect()
+            .await
+            .expect("lineage scan reads");
+        for batch in &batches {
+            let lineage_column = |name: &str, to: &DataType| {
+                let column = batch
+                    .column_by_name(name)
+                    .unwrap_or_else(|| panic!("the scan returns {name}"));
+                let values = cast(column, to).expect("lineage values cast");
+                assert_eq!(values.null_count(), 0, "every live row carries {name}");
+                values
+            };
+            let row_ids = lineage_column(RESERVED_COL_NAME_ROW_ID, &DataType::Int64);
+            let sequences = lineage_column(
+                RESERVED_COL_NAME_LAST_UPDATED_SEQUENCE_NUMBER,
+                &DataType::Int64,
+            );
+            let files = lineage_column(RESERVED_COL_NAME_FILE, &DataType::Utf8);
+            let row_ids = row_ids.as_primitive::<Int64Type>();
+            let sequences = sequences.as_primitive::<Int64Type>();
+            let files = files.as_string::<i32>();
+            let keys = batch
+                .column_by_name(self.key_column)
+                .expect("the scan returns the key column");
+            for row in 0..batch.num_rows() {
+                let live = LiveRow {
+                    key: array_value_to_string(keys, row).expect("key renders"),
+                    row_id: row_ids.value(row),
+                    last_updated_sequence_number: sequences.value(row),
+                };
+                rows.push((live, files.value(row).to_owned()));
+            }
+        }
+        rows
+    }
+
+    /// Proves every row seen before is still live with the lineage it was
+    /// first seen with, then records new rows and each row's current file.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a known row is no longer live with the same logical value,
+    /// `_row_id`, and `_last_updated_sequence_number`.
+    async fn observe(&mut self, fixture: &PromotionIntegrationFixture) {
+        let current = self.scan(fixture).await;
+        let name = &self.binding.table_ref.name;
+        let live: BTreeSet<&LiveRow> = current.iter().map(|(row, _)| row).collect();
+        for row in self.rows.keys() {
+            assert!(
+                live.contains(row),
+                "{name} row {row:?} keeps its _row_id and _last_updated_sequence_number"
+            );
+        }
+        for (row, file) in current {
+            self.rows.entry(row).or_default().insert(file);
+        }
+    }
+
+    /// Marks every row seen so far as one that must be rewritten twice.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a row already lived in more than its promoted object, which
+    /// would mean a rewrite ran before the baseline was taken.
+    fn freeze_original(&mut self) {
+        for (row, homes) in &self.rows {
+            assert_eq!(homes.len(), 1, "{row:?} is recorded before any rewrite");
+        }
+        self.original = self.rows.keys().cloned().collect();
+    }
+
+    /// Reports whether every original row has lived in two rewrite outputs.
+    fn rewritten_twice(&self) -> bool {
+        !self.original.is_empty()
+            && self.original.iter().all(|row| {
+                self.rows
+                    .get(row)
+                    .is_some_and(|homes| homes.len() >= REWRITTEN_TWICE)
+            })
+    }
+
+    /// Reports whether the held leader term currently owes this table a rewrite.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table identity is invalid.
+    fn owes_compaction(
+        &self,
+        fixture: &PromotionIntegrationFixture,
+        supervisor: &SupervisedPromotion,
+    ) -> bool {
+        let key = ForgeTableKey {
+            tenant: fixture.tenant,
+            table: ForgeTaskTableIdentity::new(
+                "wyrd-redux",
+                self.binding.table_ref.namespace.as_str(),
+                &self.binding.table_ref.name,
+            )
+            .expect("lineage table identity"),
+        };
+        supervisor
+            .forge()
+            .held_leader_term()
+            .is_some_and(|term| term.schedule().owes_compaction(&key))
+    }
+}
+
+/// Requests one production pass and settles the attempts it makes runnable.
+///
+/// Two tables share the worker, so one pass can make more than one attempt
+/// runnable; this requires success and progress rather than exactly one.
+///
+/// # Panics
+///
+/// Panics when the pass or the attempts miss their bound or any attempt fails.
+async fn advance(supervisor: &mut SupervisedPromotion) {
+    supervisor.restart_worker();
+    let pass = supervisor.request_pass();
+    supervisor.settle_some_success().await;
+    supervisor.await_pass(pass).await;
+}
+
+/// Runs one production step and re-observes every table.
+///
+/// # Panics
+///
+/// Panics when the step fails or any observation fails.
+async fn advance_and_observe(
+    supervisor: &mut SupervisedPromotion,
+    fixture: &PromotionIntegrationFixture,
+    tables: &mut [LineageTable],
+) {
+    advance(supervisor).await;
+    for table in tables.iter_mut() {
+        table.observe(fixture).await;
+    }
+}
+
+/// Counts the data manifests of a table's current snapshot.
+///
+/// # Panics
+///
+/// Panics when the table has no head or its manifest list cannot be read.
+async fn head_data_manifests(table: &Table) -> usize {
+    let head = table.metadata().current_snapshot().expect("a head");
+    table
+        .manifest_list_reader(head)
+        .load()
+        .await
+        .expect("manifest list loads")
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.content == ManifestContentType::Data)
+        .count()
+}
+
+/// Provisions every built-in and asserts each is created as format v3.
+///
+/// # Panics
+///
+/// Panics when a built-in cannot be provisioned or loaded, or is not v3.
+async fn assert_builtins_are_v3(fixture: &PromotionIntegrationFixture) {
+    for definition in builtin_tables() {
+        fixture
+            .catalog
+            .ensure_builtin(fixture.tenant, definition)
+            .await
+            .expect("every built-in provisions");
+        let namespace = BifrostNamespace::from_domain_namespace(definition.namespace)
+            .expect("built-in namespace");
+        let binding = TenantTableBinding::resolve((
+            fixture.tenant,
+            TableRef::new(namespace, definition.name),
+        ))
+        .expect("built-in binding");
+        let table = fixture
+            .catalog
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .expect("built-in loads");
+        assert_eq!(
+            table.metadata().format_version(),
+            FormatVersion::V3,
+            "vala.{}.{} is v3",
+            definition.namespace,
+            definition.name
+        );
+    }
+}
+
+/// Fragments the user table's head and lets one leader pass collect it.
+///
+/// Compaction is disabled and drained first so the fragmenting promotion is
+/// the head; the maintenance pass must then rewrite the v3 manifests, expire
+/// replaced snapshots, and leave every observed lineage intact. Returns the
+/// user row count before the fragmenting promotion.
+///
+/// # Panics
+///
+/// Panics when the head is not fragmented, the pass does not rewrite and
+/// expire, or any lineage observation fails.
+async fn collect_v3_garbage(
+    fixture: &PromotionIntegrationFixture,
+    supervisor: &mut SupervisedPromotion,
+    tables: &mut [LineageTable],
+) -> usize {
+    set_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
+    for _ in 0..LINEAGE_STEPS {
+        if !tables[0].owes_compaction(fixture, supervisor) {
+            break;
+        }
+        advance_and_observe(supervisor, fixture, tables).await;
+    }
+    let rows_before = tables[0].rows.len();
+    fixture.seal_more(1).await;
+    advance_and_observe(supervisor, fixture, tables).await;
+    assert_eq!(
+        tables[0].rows.len(),
+        rows_before + 2,
+        "the fragmenting rows are promoted"
+    );
+    let before = tables[0].load(fixture).await;
+    let before_manifests = head_data_manifests(&before).await;
+    let before_snapshots = before.metadata().snapshots().count();
+    assert!(
+        before_manifests >= 2,
+        "the head is fragmented: {before_manifests}"
+    );
+    supervisor.maintain_only().await;
+    let after = tables[0].load(fixture).await;
+    assert_eq!(
+        after
+            .metadata()
+            .current_snapshot()
+            .expect("a head")
+            .summary()
+            .operation,
+        Operation::Replace,
+        "the leader pass rewrote the v3 manifests"
+    );
+    assert!(
+        head_data_manifests(&after).await < before_manifests,
+        "the leader pass merged the v3 manifests"
+    );
+    assert!(
+        after.metadata().snapshots().count() < before_snapshots,
+        "the leader pass expired replaced snapshots"
+    );
+    tables[0].observe(fixture).await;
+    rows_before
+}
+
+/// Hidden v3 row lineage survives repeated Forge rewrites and v3 GC.
+///
+/// Every built-in and the user table are created as format v3. A user table
+/// and a built-in table are written through the real Scribe and promoted;
+/// the production scheduler and worker then rewrite them until every
+/// originally promoted row has lived in two successive rewrite outputs, with
+/// more rows promoted between rounds because only Forge's own commits make a
+/// table due. After every step each known row, found by its logical value,
+/// must still carry the `_row_id` and
+/// `_last_updated_sequence_number` it was first seen with. Finally a leader
+/// maintenance pass rewrites the user table's fragmented manifests and expires
+/// its replaced snapshots, existing lineage survives it, and rows promoted
+/// after it are read with lineage too.
+///
+/// # Panics
+///
+/// Panics when a table is not v3, when any row's lineage changes, or when GC
+/// does not rewrite and expire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn v3_row_lineage_survives_repeated_rewrite() {
+    let promoted = PromotedRewriteFixture::start_unpromoted("v3_lineage").await;
+    let fixture = &promoted.fixture;
+    assert_builtins_are_v3(fixture).await;
+    let mut builtin_files = 2;
+    let builtin = fixture
+        .seal_builtin_table(
+            BifrostNamespace::Verification,
+            "results",
+            0,
+            builtin_files,
+            3,
+        )
+        .await;
+    set_table_properties(
+        &fixture.catalog,
+        &fixture.binding,
+        &[
+            ("wyrd.forge.enable-manifest-rewrite", "true"),
+            ("commit.manifest.min-count-to-merge", "2"),
+        ],
+    )
+    .await;
+    let mut tables = [
+        LineageTable::new(fixture.binding.clone(), "value"),
+        LineageTable::new(builtin, "result_id"),
+    ];
+    assert_eq!(
+        tables[0].load(fixture).await.metadata().format_version(),
+        FormatVersion::V3,
+        "the user table is v3"
+    );
+
+    let object_store = CountingObjectStore::new(&fixture.storage);
+    let mut supervisor = SupervisedPromotion::start_serial(
+        fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.join_worker().await;
+
+    // Promotion publishes the sealed rows; their lineage is the baseline.
+    advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    assert_eq!(tables[0].rows.len(), 4, "the user rows are promoted");
+    assert_eq!(tables[1].rows.len(), 6, "the built-in rows are promoted");
+    for table in &mut tables {
+        table.freeze_original();
+    }
+
+    // Rewrite until every original row has moved through two outputs.
+    for _ in 0..LINEAGE_STEPS {
+        if tables.iter().all(LineageTable::rewritten_twice) {
+            break;
+        }
+        if !tables
+            .iter()
+            .any(|table| table.owes_compaction(fixture, &supervisor))
+        {
+            fixture.seal_more(1).await;
+            fixture
+                .seal_builtin_table(
+                    BifrostNamespace::Verification,
+                    "results",
+                    builtin_files,
+                    1,
+                    3,
+                )
+                .await;
+            builtin_files += 1;
+        }
+        advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    }
+    for table in &tables {
+        assert!(
+            table.rewritten_twice(),
+            "every original row of {} was rewritten twice",
+            table.binding.table_ref.name
+        );
+    }
+
+    let rows_before = collect_v3_garbage(fixture, &mut supervisor, &mut tables).await;
+
+    // Rows promoted after the manifest rewrite join the lineage baseline.
+    fixture.seal_more(1).await;
+    advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    assert_eq!(
+        tables[0].rows.len(),
+        rows_before + 4,
+        "the fresh rows are promoted"
+    );
+    supervisor.shutdown().await;
+}
+
+/// One logical row of the Variant scenario: its key and its JSON document.
+type VariantRow = (i64, serde_json::Value);
+
+/// The span-event column of the Variant scenario: one event per row whose
+/// `attributes` Variant holds the row's document again, so every assertion
+/// on `v` also covers a Variant inside a List of Structs.
+fn events_field() -> Field {
+    Field::new(
+        "events",
+        DataType::List(Arc::new(Field::new(
+            "element",
+            DataType::Struct(vec![variant_field("attributes", true)].into()),
+            true,
+        ))),
+        true,
+    )
+}
+
+/// Builds one ingress batch of `docs` whose event times land `day` days before
+/// the fixture day, so each batch is its own closed partition and Forge plan.
+///
+/// # Panics
+///
+/// Panics when a document cannot be encoded or the batch cannot be assembled.
+fn variant_batch(day: i64, docs: &[VariantRow]) -> RecordBatch {
+    let noon = (fixture_day() - chrono::Duration::days(day))
+        .and_hms_opt(12, 0, 0)
+        .expect("fixture timestamp")
+        .and_utc()
+        .timestamp_micros();
+    let mut variants = VariantColumnBuilder::with_capacity(docs.len());
+    for (_, doc) in docs {
+        variants.append(&EncodedVariant::from_json(doc).expect("fixture Variant encodes"));
+    }
+    let variants = variants.finish();
+    let DataType::List(element) = events_field().data_type().clone() else {
+        unreachable!("events is a List");
+    };
+    let DataType::Struct(children) = element.data_type().clone() else {
+        unreachable!("an event is a Struct");
+    };
+    let events = arrow::array::ListArray::new(
+        element,
+        arrow::buffer::OffsetBuffer::from_lengths(vec![1; docs.len()]),
+        Arc::new(arrow::array::StructArray::new(
+            children,
+            vec![Arc::clone(&variants)],
+            None,
+        )),
+        None,
+    );
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            variant_field("v", true),
+            events_field(),
+            super::support::fixture_time_field(),
+        ])),
+        vec![
+            Arc::new(Int64Array::from_iter_values(
+                docs.iter().map(|(key, _)| *key),
+            )),
+            variants,
+            Arc::new(events),
+            Arc::new(
+                TimestampMicrosecondArray::from_iter_values(
+                    (0..i64::try_from(docs.len()).expect("bounded fixture rows"))
+                        .map(|row| noon + row),
+                )
+                .with_timezone("UTC"),
+            ),
+        ],
+    )
+    .expect("fixture Variant batch")
+}
+
+/// Reads every row of `batches` as its key and its logical JSON document.
+///
+/// Both Variants are unshredded first, through the fork's one walk, so a
+/// shredded object and an unshredded scan of the same rows read back
+/// identically; each row's event `attributes` must hold the same document
+/// as its `v`.
+///
+/// # Panics
+///
+/// Panics when a batch lacks a column, a value cannot be rendered, or a
+/// row's event differs from its `v`.
+fn logical_rows(batches: &[RecordBatch]) -> BTreeSet<(i64, String)> {
+    let mut rows = BTreeSet::new();
+    for batch in batches {
+        let keys = batch
+            .column_by_name("value")
+            .expect("the key column")
+            .as_primitive::<Int64Type>();
+        let unshredded = |name: &str| {
+            let schema = batch.schema();
+            let (_, field) = schema.fields().find(name).expect("the Variant column");
+            iceberg::arrow::unshred_variants(field, batch.column_by_name(name).expect(name))
+                .expect("unshred")
+                .1
+        };
+        let json = variant_to_json(&unshredded("v")).expect("Variant JSON");
+        let events = unshredded("events");
+        let events = events.as_list::<i32>();
+        for row in 0..batch.num_rows() {
+            let attributes = Arc::clone(
+                events
+                    .value(row)
+                    .as_struct()
+                    .column_by_name("attributes")
+                    .expect("event attributes"),
+            );
+            let event = variant_to_json(&attributes).expect("Variant JSON");
+            assert_eq!(
+                event.value(0),
+                json.value(row),
+                "event {row} holds its row's document"
+            );
+            let doc: serde_json::Value =
+                serde_json::from_str(json.value(row)).expect("Variant JSON parses");
+            rows.insert((keys.value(row), doc.to_string()));
+        }
+    }
+    rows
+}
+
+/// Renders the scenario's input rows the way [`logical_rows`] reads them.
+fn expected_rows(docs: &[VariantRow]) -> BTreeSet<(i64, String)> {
+    docs.iter()
+        .map(|(key, doc)| (*key, doc.to_string()))
+        .collect()
+}
+
+/// Returns the shredded field names of column `v` in one stored object,
+/// asserting the event `attributes` shred the same fields.
+///
+/// An unshredded object returns no names.
+///
+/// # Panics
+///
+/// Panics when the object has no batch or no Variant column.
+fn shredded_fields(batches: &[RecordBatch]) -> Vec<String> {
+    let names = |column: &arrow::array::ArrayRef| match VariantArray::try_new(column)
+        .expect("Variant storage")
+        .typed_value_column()
+        .map(arrow::array::Array::data_type)
+    {
+        Some(DataType::Struct(fields)) => fields
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let fields = names(batches[0].column_by_name("v").expect("the Variant column"));
+    let events = batches[0]
+        .column_by_name("events")
+        .expect("the events column")
+        .as_list::<i32>();
+    let attributes = events
+        .values()
+        .as_struct()
+        .column_by_name("attributes")
+        .expect("event attributes");
+    assert_eq!(
+        names(attributes),
+        fields,
+        "event attributes shred the same fields as v"
+    );
+    fields
+}
+
+/// Returns the top-level keys of every document an object holds, sorted.
+fn document_keys(rows: &BTreeSet<(i64, String)>) -> Vec<String> {
+    let keys: BTreeSet<String> = rows
+        .iter()
+        .flat_map(|(_, doc)| {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(doc)
+                .expect("an object document")
+                .into_iter()
+                .map(|(key, _)| key)
+        })
+        .collect();
+    keys.into_iter().collect()
+}
+
+/// Asserts every object shreds exactly its own documents' fields and keeps its rows.
+///
+/// Each object's shredded fields must equal the keys of the documents it
+/// holds: a table-wide union would add keys another object's documents carry.
+/// The union of every object's logical rows must equal `expected`.
+///
+/// # Panics
+///
+/// Panics when an object's layout or the combined rows differ.
+async fn assert_per_file_layouts(
+    promoted: &PromotedRewriteFixture,
+    paths: &[String],
+    expected: &BTreeSet<(i64, String)>,
+    read: &str,
+) {
+    let mut rows = BTreeSet::new();
+    for path in paths {
+        let batches = promoted.object_batches(path).await;
+        let object_rows = logical_rows(&batches);
+        assert_eq!(
+            shredded_fields(&batches),
+            document_keys(&object_rows),
+            "{read} object {path} shreds exactly its own documents' fields"
+        );
+        rows.extend(object_rows);
+    }
+    assert_eq!(&rows, expected, "{read} objects keep every logical row");
+}
+
+/// Reads every live row of the table through the Iceberg reader.
+///
+/// # Panics
+///
+/// Panics when the scan fails.
+async fn published_rows(promoted: &PromotedRewriteFixture) -> BTreeSet<(i64, String)> {
+    let batches: Vec<RecordBatch> = promoted
+        .load_table()
+        .await
+        .scan()
+        .select(["value", "v", "events"])
+        .build()
+        .expect("published scan builds")
+        .to_arrow()
+        .await
+        .expect("published scan starts")
+        .try_collect()
+        .await
+        .expect("published scan reads");
+    logical_rows(&batches)
+}
+
+/// Returns the `typed_value` type of shredded field `field` of column `v`.
+///
+/// # Panics
+///
+/// Panics when `field` is not shredded in the first batch.
+fn shredded_type(batches: &[RecordBatch], field: &str) -> DataType {
+    let column = batches[0].column_by_name("v").expect("the Variant column");
+    let Some(DataType::Struct(fields)) = VariantArray::try_new(column)
+        .expect("Variant storage")
+        .typed_value_column()
+        .map(arrow::array::Array::data_type)
+        .cloned()
+    else {
+        panic!("column v is not shredded");
+    };
+    let (_, child) = fields.find(field).expect("shredded field");
+    let DataType::Struct(slots) = child.data_type() else {
+        panic!("shredded field {field} is not a value/typed_value pair");
+    };
+    slots
+        .find("typed_value")
+        .expect("typed_value slot")
+        .1
+        .data_type()
+        .clone()
+}
+
+/// A rewrite's outputs take the layout combined from its sources' footers.
+///
+/// Two hot objects share one closed day. `A` holds `{"t": int, "a": int}` in
+/// 10 rows. `B` holds `t` as a string in 3 rows, one of which also has `z`,
+/// so `B` alone shreds `t` as a string and `z`. Combined, `a` covers 10 of
+/// 13 rows and is kept; `t` keeps the integer type that covers more rows;
+/// `z` covers 1 of 13 rows, under the 10% threshold, and is dropped even
+/// though a source shredded it. Every output reads back the logical rows and
+/// records one Forge residual-share sample.
+///
+/// # Panics
+///
+/// Panics when an output's layout differs from the combined layout or a
+/// logical row is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn rewrite_outputs_share_the_combined_source_layout() {
+    let telemetry = super::support::ForgeTelemetryCheckpoint::install();
+    let mut docs: Vec<VariantRow> = (1..=10)
+        .map(|key| (key, serde_json::json!({"a": key, "t": key})))
+        .collect();
+    docs.push((11, serde_json::json!({"t": "x", "z": 1})));
+    docs.push((12, serde_json::json!({"t": "y"})));
+    docs.push((13, serde_json::json!({"t": "w"})));
+    let fixture = PromotionIntegrationFixture::start_with(
+        "variant_combined",
+        vec![
+            Field::new("value", DataType::Int64, false),
+            variant_field("v", true),
+            events_field(),
+        ],
+        &[variant_batch(0, &docs[..10]), variant_batch(0, &docs[10..])],
+    )
+    .await;
+    let promoted = PromotedRewriteFixture { fixture };
+    let fixture = &promoted.fixture;
+    let hot: Vec<String> = fixture
+        .file_rows()
+        .await
+        .into_iter()
+        .map(|row| row.file_path)
+        .collect();
+    assert_per_file_layouts(&promoted, &hot, &expected_rows(&docs), "hot").await;
+
+    let object_store = CountingObjectStore::new(&fixture.storage);
+    let mut supervisor = SupervisedPromotion::start_serial(
+        fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.join_worker().await;
+    let mut tables = [LineageTable::new(fixture.binding.clone(), "value")];
+    advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    assert_eq!(
+        tables[0].rows.len(),
+        docs.len(),
+        "the Variant rows are promoted"
+    );
+    supervisor.shutdown().await;
+
+    let run = rewrite_whole_attempt(&promoted).await;
+    let outputs = run.output_paths();
+    assert!(!outputs.is_empty(), "the shared day is rewritten");
+    let mut rows = BTreeSet::new();
+    for path in &outputs {
+        let batches = promoted.object_batches(path).await;
+        assert_eq!(
+            shredded_fields(&batches),
+            ["a", "t"],
+            "output {path} keeps the fields covering 10% of the rewrite's rows"
+        );
+        assert!(
+            shredded_type(&batches, "t").is_integer(),
+            "output {path} keeps the type covering more rows"
+        );
+        rows.extend(logical_rows(&batches));
+    }
+    assert_eq!(
+        rows,
+        expected_rows(&docs),
+        "rewrite outputs keep every logical row"
+    );
+    let forge_samples: u64 = telemetry
+        .snapshot()
+        .histograms
+        .iter()
+        .filter(|(series, _)| {
+            series.starts_with("bifrost_variant_residual_share{")
+                && series.contains("writer=\"forge\"")
+        })
+        .map(|(_, histogram)| histogram.count)
+        .sum();
+    assert_eq!(
+        forge_samples,
+        u64::try_from(outputs.len()).expect("bounded outputs"),
+        "each output records its residual share"
+    );
+}
+
+/// Standard Variant layouts round-trip through Scribe, promotion, and Forge
+/// with each file's layout drawn from its own day's documents.
+///
+/// Two closed days hold documents of different shapes (`a` integers, `b`
+/// strings). Each sealed object takes its claim's sampled layout and each
+/// rewrite plan combines only its own day's source footers, so no file
+/// shreds another day's fields. Logical rows are compared on the hot objects, the
+/// published table, one non-committing rewrite's outputs, and after every
+/// original row has been rewritten twice by the production scheduler. Each
+/// handoff's outputs must describe the objects written (row count, size) and
+/// name the evidence's base snapshot, and no object may shred another day's
+/// fields. Rolled outputs may close in any order, so outputs are compared as
+/// a set.
+///
+/// # Panics
+///
+/// Panics when any read differs from the input rows, a layout is a union, or
+/// a handoff does not describe its outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn standard_variant_layouts_round_trip_per_file() {
+    let mut docs: Vec<VariantRow> = vec![
+        (1, serde_json::json!({"a": 1})),
+        (2, serde_json::json!({"a": 2})),
+        (3, serde_json::json!({"b": "x"})),
+        (4, serde_json::json!({"b": "y"})),
+    ];
+    let fixture = PromotionIntegrationFixture::start_with(
+        "variant_layouts",
+        vec![
+            Field::new("value", DataType::Int64, false),
+            variant_field("v", true),
+            events_field(),
+        ],
+        &[variant_batch(0, &docs[..2]), variant_batch(1, &docs[2..])],
+    )
+    .await;
+    let promoted = PromotedRewriteFixture { fixture };
+    let fixture = &promoted.fixture;
+
+    let hot: Vec<String> = fixture
+        .file_rows()
+        .await
+        .into_iter()
+        .map(|row| row.file_path)
+        .collect();
+    assert_per_file_layouts(&promoted, &hot, &expected_rows(&docs), "hot").await;
+
+    let object_store = CountingObjectStore::new(&fixture.storage);
+    let mut supervisor = SupervisedPromotion::start_serial(
+        fixture,
+        fixture.catalog.iceberg_catalog(),
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.join_worker().await;
+    let mut tables = [LineageTable::new(fixture.binding.clone(), "value")];
+    advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    assert_eq!(tables[0].rows.len(), 4, "the Variant rows are promoted");
+    tables[0].freeze_original();
+    assert_eq!(
+        published_rows(&promoted).await,
+        expected_rows(&docs),
+        "the published read returns the logical rows"
+    );
+
+    let run = rewrite_whole_attempt(&promoted).await;
+    assert_eq!(run.handoffs.len(), 2, "one plan per closed day");
+    for handoff in &run.handoffs {
+        assert_eq!(
+            handoff.base_snapshot_id,
+            run.evidence().base_snapshot_id,
+            "each handoff names the snapshot the evidence was derived from"
+        );
+        for output in &handoff.output_data_files {
+            let batches = promoted.object_batches(output.file_path()).await;
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(
+                output.record_count(),
+                u64::try_from(rows).expect("bounded fixture rows"),
+                "the output DataFile counts the rows its object holds"
+            );
+        }
+    }
+    assert_per_file_layouts(
+        &promoted,
+        &run.output_paths(),
+        &expected_rows(&docs),
+        "rewrite",
+    )
+    .await;
+
+    let mut day = 2;
+    for _ in 0..LINEAGE_STEPS {
+        if tables[0].rewritten_twice() {
+            break;
+        }
+        if !tables[0].owes_compaction(fixture, &supervisor) {
+            let first = docs.len();
+            let key = i64::try_from(first).expect("bounded fixture rows") + 1;
+            docs.push((key, serde_json::json!({ format!("d{day}"): key })));
+            fixture.seal(&[variant_batch(day, &docs[first..])]).await;
+            day += 1;
+        }
+        advance_and_observe(&mut supervisor, fixture, &mut tables).await;
+    }
+    assert!(
+        tables[0].rewritten_twice(),
+        "every original Variant row was rewritten twice"
+    );
+    supervisor.shutdown().await;
+
+    let live: Vec<String> = promoted
+        .live_data_files()
+        .await
+        .iter()
+        .map(|file| file.file_path().to_owned())
+        .collect();
+    assert_per_file_layouts(&promoted, &live, &expected_rows(&docs), "twice-compacted").await;
+    assert_eq!(
+        published_rows(&promoted).await,
+        expected_rows(&docs),
+        "the twice-compacted read returns the logical rows"
     );
 }

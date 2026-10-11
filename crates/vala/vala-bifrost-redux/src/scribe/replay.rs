@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
@@ -182,16 +183,91 @@ pub fn replay_wal_directory_stream(
     emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
 ) -> Result<(), ScribeError> {
     let mut emit = emit;
-    replay_wal_directory_stream_accounted(wal_dir, None, None, None, None, |chunk| {
+    replay_wal_directory_stream_accounted(wal_dir, None, None, None, None, None, |chunk| {
         emit(chunk).map(|()| ReplayChunkSettlement {
             identity_memory: None,
         })
     })
 }
 
+/// The acknowledgement fences WAL recovery consults before it ends a shard
+/// chain at a bad record.
+///
+/// Recovery runs on the WAL IO lane, a blocking thread outside the async
+/// runtime, so the lookup blocks on the control-plane runtime for its one
+/// read. It runs only when a chain ends in a bad record.
+#[derive(Clone)]
+pub(crate) struct ReplayFences {
+    /// Control-plane pool holding the batch fences.
+    postgres: Arc<vala_sql::ValaPostgres>,
+    /// Runtime the blocking lane drives the read on.
+    runtime: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for ReplayFences {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReplayFences")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReplayFences {
+    /// Creates the lookup over the control-plane pool and its runtime.
+    #[must_use]
+    pub(crate) const fn new(
+        postgres: Arc<vala_sql::ValaPostgres>,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self { postgres, runtime }
+    }
+
+    /// The newest acknowledgement fence of one WAL shard stream, or `None`
+    /// when that stream acknowledged nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when `PostgreSQL` cannot answer, or a stored
+    /// segment sequence or LSN is negative.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called from inside the async runtime, which
+    /// [`tokio::runtime::Handle::block_on`] forbids; the WAL IO lane is not.
+    pub(crate) fn newest(
+        &self,
+        stream: StreamIdentity,
+        shard: u8,
+    ) -> Result<Option<crate::scribe::wal::NewestFence>, ScribeError> {
+        let fence = self.runtime.block_on(async {
+            let mut conn = self.postgres.conn().await?;
+            vala_sql::queries::scribe_batch_commits::newest_wal_fence(
+                &mut conn,
+                stream.node_id.as_uuid(),
+                stream.writer_epoch.as_i64(),
+                i16::from(shard),
+            )
+            .await
+        })?;
+        fence
+            .map(|(segment_sequence, lsn)| {
+                let invalid = |_| ScribeError::Internal {
+                    detail: "Scribe batch fence holds a negative WAL position".to_owned(),
+                };
+                Ok(crate::scribe::wal::NewestFence {
+                    segment_sequence: u64::try_from(segment_sequence).map_err(invalid)?,
+                    lsn: WalLsn::new(u64::try_from(lsn).map_err(invalid)?),
+                })
+            })
+            .transpose()
+    }
+}
+
 /// Replay the WAL directory with a bounded decode reservation on each emitted
 /// batch. The production WAL lane supplies the governor and a shutdown flag;
-/// unit tests may omit them for isolated parsing or deduplication. The callback
+/// unit tests may omit them for isolated parsing or deduplication. `fences`
+/// lets a shard chain end at a bad record in its unacknowledged tail; without
+/// it every bad record fails closed. The callback
 /// returns whether its chunk reached durable retirement settlement, which lets
 /// the reader release a completed segment pin without exposing later records.
 /// Cancellation is observed between records and only after a started callback
@@ -207,6 +283,7 @@ pub(crate) fn replay_wal_directory_stream_accounted(
     governor: Option<&ScribeResources>,
     wal: Option<&crate::scribe::wal::WalWriter>,
     cancelled: Option<&AtomicBool>,
+    fences: Option<crate::scribe::wal::FenceLookup<'_>>,
     mut emit: impl FnMut(ReplayChunk) -> Result<ReplayChunkSettlement, ScribeError>,
 ) -> Result<(), ScribeError> {
     let wal_dir = wal_dir.as_ref();
@@ -219,71 +296,78 @@ pub(crate) fn replay_wal_directory_stream_accounted(
     // independently with the correct shard_id threaded to ReplayedSealKey.
     let mut accumulators: HashMap<(StreamIdentity, u8), ReplayAccumulator<'_>> = HashMap::new();
 
-    reader.for_each_stream_record_accounted(governor, wal, |stream, shard_id, accounted| {
-        let (segment_path, record, payload_memory) = accounted.into_parts();
-        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-            return Err(ScribeError::Internal {
-                detail: "WAL replay cancelled".to_owned(),
-            });
-        }
-        if recovery_stream.is_some_and(|current| {
-            stream.node_id != current.node_id || stream.writer_epoch >= current.writer_epoch
-        }) {
-            return Ok(false);
-        }
-        let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
-        let key = (stream, shard_id);
-        if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(key) {
-            entry.insert(ReplayAccumulator::new(
-                stream,
-                shard_id,
-                sealed_lsn_map,
-                governor,
-            )?);
-        }
-        let segment_changed = accumulators
-            .get(&key)
-            .and_then(|accumulator| accumulator.current_segment_path.as_ref())
-            .is_some_and(|current| current != &segment_path);
-        if segment_changed {
-            let accumulator = accumulators
+    reader.for_each_stream_record_accounted(
+        governor,
+        wal,
+        fences,
+        |stream, shard_id, accounted| {
+            let (segment_path, record, payload_memory) = accounted.into_parts();
+            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+                return Err(ScribeError::Internal {
+                    detail: "WAL replay cancelled".to_owned(),
+                });
+            }
+            if recovery_stream.is_some_and(|current| {
+                stream.node_id != current.node_id || stream.writer_epoch >= current.writer_epoch
+            }) {
+                return Ok(false);
+            }
+            let sealed_lsn_map = sealed_lsn_map(&stream_directory(wal_dir, stream))?;
+            let key = (stream, shard_id);
+            if let std::collections::hash_map::Entry::Vacant(entry) = accumulators.entry(key) {
+                entry.insert(ReplayAccumulator::new(
+                    stream,
+                    shard_id,
+                    sealed_lsn_map,
+                    governor,
+                )?);
+            }
+            let segment_changed = accumulators
+                .get(&key)
+                .and_then(|accumulator| accumulator.current_segment_path.as_ref())
+                .is_some_and(|current| current != &segment_path);
+            if segment_changed {
+                let accumulator =
+                    accumulators
+                        .get_mut(&key)
+                        .ok_or_else(|| ScribeError::Internal {
+                            detail: "replay accumulator disappeared at segment boundary".to_owned(),
+                        })?;
+                // WAL v6 may roll between a SLICE and its terminal COMMIT. Keep
+                // that incomplete batch and its segment refs together, then emit
+                // at the first later boundary where no batch crosses the cut.
+                if accumulator.pending_batches.is_empty()
+                    && let Some(chunk) = accumulator.take_chunk()?
+                {
+                    let settlement = emit(chunk)?;
+                    accumulator.identity_memory = settlement.identity_memory;
+                }
+            }
+            let completed_unit = accumulators
                 .get_mut(&key)
                 .ok_or_else(|| ScribeError::Internal {
-                    detail: "replay accumulator disappeared at segment boundary".to_owned(),
-                })?;
-            // WAL v6 may roll between a SLICE and its terminal COMMIT. Keep
-            // that incomplete batch and its segment refs together, then emit
-            // at the first later boundary where no batch crosses the cut.
-            if accumulator.pending_batches.is_empty()
-                && let Some(chunk) = accumulator.take_chunk()?
-            {
-                let settlement = emit(chunk)?;
-                accumulator.identity_memory = settlement.identity_memory;
+                    detail: "replay accumulator disappeared before append".to_owned(),
+                })?
+                .append(segment_path, &record, payload_memory)?;
+            if completed_unit {
+                let accumulator =
+                    accumulators
+                        .get_mut(&key)
+                        .ok_or_else(|| ScribeError::Internal {
+                            detail: "replay accumulator disappeared before unit handoff".to_owned(),
+                        })?;
+                if let Some(chunk) = accumulator.take_chunk()? {
+                    let settlement = emit(chunk)?;
+                    accumulator.identity_memory = settlement.identity_memory;
+                }
             }
-        }
-        let completed_unit = accumulators
-            .get_mut(&key)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "replay accumulator disappeared before append".to_owned(),
-            })?
-            .append(segment_path, &record, payload_memory)?;
-        if completed_unit {
-            let accumulator = accumulators
-                .get_mut(&key)
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "replay accumulator disappeared before unit handoff".to_owned(),
-                })?;
-            if let Some(chunk) = accumulator.take_chunk()? {
-                let settlement = emit(chunk)?;
-                accumulator.identity_memory = settlement.identity_memory;
-            }
-        }
-        // A completely cursor-suppressed segment has no cohort member and can
-        // retire at EOF. Any pending/visible state remains pinned for handoff.
-        Ok(accumulators
-            .get(&key)
-            .is_some_and(ReplayAccumulator::segment_retirement_safe))
-    })?;
+            // A completely cursor-suppressed segment has no cohort member and can
+            // retire at EOF. Any pending/visible state remains pinned for handoff.
+            Ok(accumulators
+                .get(&key)
+                .is_some_and(ReplayAccumulator::segment_retirement_safe))
+        },
+    )?;
 
     let accumulator_keys = accumulators.keys().copied().collect::<Vec<_>>();
     for key in accumulator_keys {
@@ -1187,7 +1271,7 @@ mod tests {
     #[test]
     fn replay_decode_failure_drops_payload_before_identity_lease() {
         let resources =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let baseline = resources.snapshot().expect("baseline snapshot");
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
         let mut accumulator = ReplayAccumulator::new(stream, 0, HashMap::new(), Some(&resources))
@@ -1395,6 +1479,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |mut chunk| {
                 recovered.extend(chunk.states.into_values().map(|state| state.stream));
                 Ok(ReplayChunkSettlement {
@@ -1509,12 +1594,13 @@ mod tests {
         wal.sync_data_for_test(&seal_key).expect("sync");
 
         let budget =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let mut chunks = Vec::new();
         replay_wal_directory_stream_accounted(
             temp_dir.path(),
             None,
             Some(&budget),
+            None,
             None,
             None,
             |mut chunk| {
@@ -1577,6 +1663,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             |mut chunk| {
                 let identity_memory = chunk.identity_memory.take();
                 restored = restored.saturating_add(
@@ -1604,9 +1691,8 @@ mod tests {
         let seal_key = replay_key(tenant);
         wal.append_and_commit_for_replay_test(&seal_key, [7; 16], &[9; 1024])
             .expect("append");
-        let budget = crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig {
+        let budget = crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig {
             memory_limit_bytes: 1,
-            ..crate::scribe::AdmissionConfig::default()
         });
         let occupied = budget
             .try_reserve_maintenance(
@@ -1621,6 +1707,7 @@ mod tests {
             temp_dir.path(),
             Some(current),
             Some(&budget),
+            None,
             None,
             None,
             |mut chunk| {
@@ -1659,6 +1746,7 @@ mod tests {
             None,
             None,
             Some(&cancelled),
+            None,
             |mut chunk| {
                 settled = settled.saturating_add(chunk.states.len());
                 cancelled.store(true, Ordering::Release);
@@ -1948,11 +2036,7 @@ mod tests {
             )
             .expect("writer"),
         );
-        let operator = std::sync::Arc::new(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .expect("memory operator")
-                .finish(),
-        );
+        let operator = std::sync::Arc::new(object_store::memory::InMemory::new());
         crate::scribe::ScribeImpl::new_for_embedded_with_deps(
             operator,
             wal,
@@ -2325,7 +2409,7 @@ mod tests {
         let complete_batches = write_writer_ordered_group(&wal, &seal_key, shard_id, tenant);
 
         let resources =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let baseline = resources.snapshot().expect("baseline");
         let near_full = resources
             .try_reserve_maintenance(
@@ -2338,6 +2422,7 @@ mod tests {
             temp_dir.path(),
             None,
             Some(&resources),
+            None,
             None,
             None,
             |mut chunk| {

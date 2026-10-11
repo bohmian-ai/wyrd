@@ -8,7 +8,6 @@ use crate::contracts::{
     projected_source_schema_fingerprint,
 };
 use crate::namespaces::BifrostNamespace;
-use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::memory::{MEMORY_CATEGORY_COUNT, MemoryCategory};
 use crate::scribe::replay::replay_wal_directory;
 use crate::scribe::seal_key::SealKey;
@@ -18,7 +17,6 @@ use arrow::array::{Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::Datelike as _;
-use opendal::services::Memory;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
@@ -35,14 +33,11 @@ fn key(tenant: DataTenantId, table: &str) -> SealKey {
     )
 }
 
-/// The one admitted event-time instant every closeout fixture shares.
+/// The one event-time instant every closeout fixture shares.
 ///
-/// Derived from the production admission window rather than pinned, so the
-/// batch this module builds stays inside `[receipt - past, receipt + future]`
-/// at any wall-clock time. A pinned literal here ages out of the window and
-/// turns every appending test in this file into a permanent failure.
-fn fixture_event_time_micros() -> i64 {
-    EventTimeWindow::default().admitted_event_time_micros(1)
+/// Every instant is admitted, so the fixture pins one.
+const fn fixture_event_time_micros() -> i64 {
+    1_784_016_000_000_000
 }
 
 /// The exact daily partition covering [`fixture_event_time_micros`].
@@ -74,8 +69,11 @@ fn batch_with_value(value: i64) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new(
-                "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "event_time",
+                DataType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some(iceberg::arrow::UTC_TIME_ZONE.into()),
+                ),
                 false,
             ),
             Field::new("value", DataType::Int64, false),
@@ -83,7 +81,7 @@ fn batch_with_value(value: i64) -> RecordBatch {
         vec![
             Arc::new(
                 TimestampMicrosecondArray::from(vec![fixture_event_time_micros()])
-                    .with_timezone("UTC"),
+                    .with_timezone(iceberg::arrow::UTC_TIME_ZONE),
             ),
             Arc::new(Int64Array::from(vec![value])),
         ],
@@ -112,11 +110,7 @@ fn scribe(wal_root: &TempDir, node: NodeId) -> (Arc<WalWriter>, crate::scribe::S
         WalWriter::new(wal_root.path(), *node.as_bytes(), 1, WalConfig::default())
             .expect("WAL writer"),
     );
-    let operator = Arc::new(
-        opendal::Operator::new(Memory::default())
-            .expect("memory object store")
-            .finish(),
-    );
+    let operator = Arc::new(object_store::memory::InMemory::new());
     let scribe = crate::scribe::ScribeImpl::new_for_embedded_with_deps(
         operator,
         Arc::clone(&wal),
@@ -672,7 +666,7 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
 /// WAL volume refusal is proven by `wal::tests::wal_capacity_refusal_is_not_sticky`.
 fn scribe_root_memory_limit_refuses_past_its_ceiling() {
     let resources =
-        crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
     let limit = resources.limit_bytes();
     let scribe = resources
         .try_reserve_maintenance(MemoryCategory::Raw, limit)

@@ -5,8 +5,9 @@
 //! permission, so it is lineage only and appends no audit event.
 //!
 //! The fence also records when Wyrd ingested the batch. [`ingest_instant`]
-//! reads that instant once per batch at admission; Scribe stamps it on every
-//! row as `wyrd_ingested_at` and [`record`] stores the same value here.
+//! reads the `PostgreSQL` clock that Scribe's admission clock is anchored on;
+//! Scribe stamps each batch's admission instant on every row as
+//! `wyrd_ingested_at` and [`record`] stores the same value here.
 // raw-query grep allowlist: every statement is fixed and tenant-bound; `vala.scribe_batch_commits` post-dates the sqlx offline cache, so run `mise run sqlx:prepare` to promote them to macros.
 
 use chrono::{DateTime, Utc};
@@ -241,7 +242,7 @@ pub async fn resolve(
     }
 }
 
-/// Reads the one ingestion instant Scribe admits a batch under.
+/// Reads the `PostgreSQL` instant Scribe anchors its admission clock on.
 ///
 /// PostgreSQL is the clock of record for `wyrd_ingested_at`: the value is
 /// `statement_timestamp()` from the tenant transaction, so every replica
@@ -335,6 +336,33 @@ pub async fn record(
         "Scribe batch identity contradicts its durable fence"
     );
     Err(invariant("scribe batch commit identity mismatch"))
+}
+
+/// Returns the WAL segment sequence and COMMIT LSN of the newest fence of
+/// one WAL shard stream, across every tenant, or `None` when it has none.
+///
+/// WAL recovery calls this before it ends a shard's chain at a bad record: a
+/// fence in that segment beyond the last good record means an acknowledged
+/// batch lies in the discarded region. The `vala.scribe_wal_newest_fence`
+/// security-definer function answers it from the top of one index, so the
+/// tenant-bound application role reads one WAL position and no tenant's rows.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot execute the read.
+pub async fn newest_wal_fence(
+    conn: &mut sqlx::PgConnection,
+    node_id: uuid::Uuid,
+    writer_epoch: i64,
+    shard_id: i16,
+) -> Result<Option<(i64, i64)>, SqlError> {
+    sqlx::query_as("SELECT * FROM vala.scribe_wal_newest_fence($1, $2, $3)")
+        .bind(node_id)
+        .bind(writer_epoch)
+        .bind(shard_id)
+        .fetch_optional(conn)
+        .await
+        .map_err(SqlError::from)
 }
 
 /// Loads one tenant-visible durable batch fence without interpreting identity.

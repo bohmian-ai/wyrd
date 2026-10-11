@@ -9,7 +9,7 @@ use arrow::datatypes::Field;
 use crate::tables::fields::{float64, ts_us_utc, utf8};
 use crate::tables::{CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_desc};
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
+use wyrd_spec::vala::managed_columns::WYRD_INGESTED_AT;
 
 /// `vala.drift.result_features` — one row per scored feature of one Drift run.
 ///
@@ -51,6 +51,10 @@ impl DomainTable for ResultFeaturesTable {
 
     /// Daily partitions sorted newest first, Bloom-pruned on `result_id` for the parent-result join.
     fn physical_layout() -> PhysicalLayoutWire {
-        daily_layout(vec![sort_desc(WYRD_EVENT_TIME)], &["result_id"])
+        daily_layout(
+            WYRD_INGESTED_AT,
+            vec![sort_desc(WYRD_INGESTED_AT)],
+            &["result_id"],
+        )
     }
 }

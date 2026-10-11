@@ -13,41 +13,55 @@ use arrow::datatypes::Field;
 use crate::tables::fields::{
     CanonicalField, CanonicalField as F, CanonicalType as T, canonical_arrow_fields,
 };
+use crate::tables::signal;
 use crate::tables::{
-    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
+    CanonicalBatchValidator, CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc,
+    sort_desc,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// Element declaration of an explicit-bucket count collection.
-pub static BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false);
+pub static BUCKET_COUNT_ELEMENT: F = F::payload(iceberg::spec::LIST_FIELD_NAME, T::Int64, false);
 
 /// Element declaration of an explicit-bound collection.
-pub static EXPLICIT_BOUND_ELEMENT: F = F::payload("item", T::Float64, false);
+pub static EXPLICIT_BOUND_ELEMENT: F =
+    F::payload(iceberg::spec::LIST_FIELD_NAME, T::Float64, false);
 
 /// Element declaration of the positive exponential bucket counts.
-pub static POSITIVE_BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false);
+pub static POSITIVE_BUCKET_COUNT_ELEMENT: F =
+    F::payload(iceberg::spec::LIST_FIELD_NAME, T::Int64, false);
 
 /// Ordered fields of the positive exponential bucket collection.
+///
+/// Both children are nullable because the collection itself is: a required
+/// Parquet leaf under a null Struct reads back padded values, which a field
+/// query such as `positive_buckets['offset']` would expose. The table
+/// validator still refuses a partly present collection.
 pub static POSITIVE_BUCKET_FIELDS: [F; 2] = [
-    F::payload("offset", T::Int32, false),
+    F::payload("offset", T::Int32, true),
     F::payload(
         "bucket_counts",
         T::List(&POSITIVE_BUCKET_COUNT_ELEMENT),
-        false,
+        true,
     ),
 ];
 
 /// Element declaration of the negative exponential bucket counts.
-pub static NEGATIVE_BUCKET_COUNT_ELEMENT: F = F::payload("item", T::Int64, false);
+pub static NEGATIVE_BUCKET_COUNT_ELEMENT: F =
+    F::payload(iceberg::spec::LIST_FIELD_NAME, T::Int64, false);
 
 /// Ordered fields of the negative exponential bucket collection.
+///
+/// Both children are nullable because the collection itself is: a required
+/// Parquet leaf under a null Struct reads back padded values, which a field
+/// query such as `negative_buckets['offset']` would expose. The table
+/// validator still refuses a partly present collection.
 pub static NEGATIVE_BUCKET_FIELDS: [F; 2] = [
-    F::payload("offset", T::Int32, false),
+    F::payload("offset", T::Int32, true),
     F::payload(
         "bucket_counts",
         T::List(&NEGATIVE_BUCKET_COUNT_ELEMENT),
-        false,
+        true,
     ),
 ];
 
@@ -58,43 +72,50 @@ pub static QUANTILE_VALUE_FIELDS: [F; 2] = [
 ];
 
 /// Element declaration of the ordered summary quantile collection.
-pub static QUANTILE_VALUE_ELEMENT: F =
-    F::payload("quantile_value", T::Struct(&QUANTILE_VALUE_FIELDS), false);
+pub static QUANTILE_VALUE_ELEMENT: F = F::payload(
+    iceberg::spec::LIST_FIELD_NAME,
+    T::Struct(&QUANTILE_VALUE_FIELDS),
+    false,
+);
 
 /// Ordered fields of one exemplar.
 ///
 /// An exemplar carries filtered caller attributes and the correlation ids of
 /// the originating span, so the whole subtree is access-gated payload.
 pub static EXEMPLAR_FIELDS: [F; 6] = [
-    F::sensitive("time_unix_nano", T::Int64, false),
+    F::sensitive("time_unix_nano", signal::OTLP_INSTANT, false),
     F::sensitive("int_value", T::Int64, true),
     F::sensitive("double_value", T::Float64, true),
-    F::sensitive("filtered_attributes", T::Binary, false),
+    F::sensitive("filtered_attributes", T::Variant, false),
     F::sensitive("trace_id", T::FixedSizeBinary(16), true),
     F::sensitive("span_id", T::FixedSizeBinary(8), true),
 ];
 
 /// Element declaration of the ordered exemplar collection.
-pub static EXEMPLAR_ELEMENT: F = F::sensitive("exemplar", T::Struct(&EXEMPLAR_FIELDS), false);
-
-/// Element declaration of the ordered resource entity-reference collection.
-pub static METRIC_ENTITY_REF_ELEMENT: F = F::sensitive("entity_ref", T::Binary, false);
+pub static EXEMPLAR_ELEMENT: F = F::sensitive(
+    iceberg::spec::LIST_FIELD_NAME,
+    T::Struct(&EXEMPLAR_FIELDS),
+    false,
+);
 
 /// The canonical `vala.metrics.points` ledger.
 ///
 /// Every kind-specific column is nullable because a point of another kind does not
 /// own it; the projector, not nullability, is what forbids a point from
-/// carrying a shape its declared kind cannot own.
+/// carrying a shape its declared kind cannot own. The trailing promoted
+/// resource columns copy well-known semantic-convention values out of
+/// `resource_attributes` so they can be filtered without decoding; each is
+/// null when its source is absent or is not a string.
 pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::meta("metric_name", T::Utf8, false),
     F::meta("description", T::Utf8, false),
     F::meta("unit", T::Utf8, false),
-    F::sensitive("metadata", T::Binary, false),
+    F::sensitive("metadata", T::Variant, false),
     F::meta("metric_type", T::Utf8, false),
-    F::meta("time_unix_nano", T::Int64, false),
-    F::meta("start_time_unix_nano", T::Int64, false),
+    F::meta("time_unix_nano", signal::OTLP_INSTANT, false),
+    F::meta("start_time_unix_nano", signal::OTLP_INSTANT, false),
     F::meta("flags", T::Int64, false),
-    F::sensitive("attributes", T::Binary, false),
+    F::sensitive("attributes", T::Variant, false),
     F::meta("int_value", T::Int64, true),
     F::meta("double_value", T::Float64, true),
     F::meta("aggregation_temporality", T::Int32, true),
@@ -115,20 +136,23 @@ pub static METRIC_FIELDS: &[CanonicalField] = &[
     F::payload("quantile_values", T::List(&QUANTILE_VALUE_ELEMENT), true),
     F::sensitive("exemplars", T::List(&EXEMPLAR_ELEMENT), false),
     F::meta("resource_present", T::Bool, false),
-    F::sensitive("resource_attributes", T::Binary, false),
+    F::sensitive("resource_attributes", T::Variant, false),
     F::meta("resource_dropped_attributes_count", T::Int64, false),
     F::meta("resource_schema_url", T::Utf8, false),
     F::sensitive(
         "resource_entity_refs",
-        T::List(&METRIC_ENTITY_REF_ELEMENT),
+        T::List(&signal::ENTITY_REF_ELEMENT),
         false,
     ),
     F::meta("scope_present", T::Bool, false),
     F::meta("scope_name", T::Utf8, false),
     F::meta("scope_version", T::Utf8, false),
-    F::sensitive("scope_attributes", T::Binary, false),
+    F::sensitive("scope_attributes", T::Variant, false),
     F::meta("scope_dropped_attributes_count", T::Int64, false),
     F::meta("scope_schema_url", T::Utf8, false),
+    F::meta("service_name", T::Utf8, true),
+    F::meta("service_version", T::Utf8, true),
+    F::meta("deployment_environment", T::Utf8, true),
 ];
 
 /// The canonical durable table for the `OTLP` metric signal.
@@ -148,8 +172,8 @@ impl DomainTable for PointsTable {
         "scope_attributes",
     ];
 
-    const CANONICAL_VALIDATOR: Option<crate::tables::CanonicalBatchValidator> =
-        Some(crate::tables::metrics::projection::validate_metric_points);
+    const CANONICAL_VALIDATOR: CanonicalBatchValidator =
+        crate::tables::metrics::projection::validate_metric_points;
 
     fn canonical_fields() -> Option<&'static [CanonicalField]> {
         Some(METRIC_FIELDS)
@@ -161,7 +185,8 @@ impl DomainTable for PointsTable {
 
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(
-            vec![sort_desc(WYRD_EVENT_TIME), sort_asc("metric_name")],
+            "time_unix_nano",
+            vec![sort_desc("time_unix_nano"), sort_asc("metric_name")],
             &["metric_name", "metric_type"],
         )
     }

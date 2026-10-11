@@ -1609,10 +1609,7 @@ mod pg_tests {
                     &mut conn,
                 )
                 .exclusive(identity)
-                .await?
-                .ok_or_else(|| SqlError::Conflict {
-                    detail: "an Oracle query is still reading this table".to_owned(),
-                })?;
+                .await?;
             let prepared = ops
                 .prepare_snapshot_expiration(operator, tenant, &exclusive, request)
                 .await;

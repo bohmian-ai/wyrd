@@ -4,7 +4,7 @@ use wyrd_spec::vala::api::BifrostQueryRequest;
 
 use super::support::PeerJourneyError;
 use crate::peer_cluster::PeerCluster;
-use crate::support::{metric_value, public_client, wait_for_spans};
+use crate::support::{metric_value, public_client, sum_metric, wait_for_spans};
 use wyrd_telemetry::CapturedSpan;
 use wyrd_testing::bifrost::BifrostTelemetryCheckpoint;
 use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
@@ -33,10 +33,11 @@ async fn graph_lease_owns_exact_resources_for_complete_graph() {
 
 /// Drives the lease scenarios against one live multi-process topology.
 ///
-/// The topology is three Oracles and one Scribe because a graph only becomes
-/// distributed when a leaf stage has more than one task, and the leader is not
-/// a participant in its own worker set: two remote followers and two published
-/// files are the smallest shape that puts a real stage on a real peer.
+/// The topology is three Oracles and one Scribe because a scan of one published
+/// file is one partition with no repartition and so no stage boundary, and the
+/// leader is not a participant in its own worker set: two remote followers and
+/// two published files are the smallest shape that puts a real stage on a real
+/// peer.
 ///
 /// # Errors
 ///
@@ -517,15 +518,10 @@ async fn coordinate_baseline(
         // Complete ownership, not a chosen subset: a graph, attempt, cleanup
         // failure, admitted or queued query, peer reservation, slot unit,
         // query memory or scratch owner, spill entry, or live gauge that this
-        // execution failed to return diverges here.
-        let ownership = cluster.ownership_snapshot(index)?;
-        if ownership != ownership_before[index] {
-            return Err(format!(
-                "Oracle {index} left ownership at {ownership:?}, not its {:?} baseline",
-                ownership_before[index]
-            )
-            .into());
-        }
+        // execution failed to return diverges here. A follower's held grant
+        // closes only once the leader's admit stream resets, after the graph
+        // lease, so the snapshot is awaited rather than read once.
+        crate::support::await_baseline(cluster, index, ownership_before[index]).await?;
     }
 
     Ok(evidence.result_digest)
@@ -799,14 +795,7 @@ async fn execute_style(
         if live != 0 {
             return Err(format!("{name} left {live} graph leases on Oracle {index}").into());
         }
-        let ownership = cluster.ownership_snapshot(index)?;
-        if ownership != ownership_before[index] {
-            return Err(format!(
-                "{name} left Oracle {index} at {ownership:?}, not its {:?} baseline",
-                ownership_before[index]
-            )
-            .into());
-        }
+        crate::support::await_baseline(cluster, index, ownership_before[index]).await?;
     }
     Ok(())
 }
@@ -820,7 +809,9 @@ async fn execute_style(
 /// input/output messages the payload gate protects. Nothing here reaches into a
 /// pod: the span arrives through the Scribe's public OTLP route with a
 /// provisioned credential, and it is read back through the leader's public
-/// query listener over the same stage graph the styles used.
+/// query listener over the same stage graph the styles used. A Variant key
+/// under the span's event list reads back as that leaf alone, scanning strictly
+/// fewer bytes than the whole `events` list.
 ///
 /// A second data tenant then runs the identical statement against the identical
 /// listener. It must see none of it, which is tenant isolation stated as a
@@ -829,7 +820,8 @@ async fn execute_style(
 /// # Errors
 ///
 /// Returns the first claim that broke: the OTLP export, the publication, the
-/// readback, or the foreign tenant reaching another tenant's span.
+/// readback, the nested-leaf scan, or the foreign tenant reaching another
+/// tenant's span.
 async fn prove_canonical_genai_span(cluster: &mut PeerCluster) -> Result<(), PeerJourneyError> {
     use wyrd_testing::bifrost::canonical_signals as fixture;
 
@@ -934,6 +926,43 @@ async fn prove_canonical_genai_span(cluster: &mut PeerCluster) -> Result<(), Pee
         if !rendered.contains(&hex::encode(messages)) {
             return Err("the structured GenAI messages did not survive the round trip".into());
         }
+    }
+
+    // A Variant key under a list element is read as that leaf alone over the
+    // distributed graph: the nested read returns the event's attribute while
+    // scanning strictly fewer bytes than reading the whole `events` list.
+    let filter = format!("WHERE scope_name = '{scope}' AND parent_span_id IS NULL");
+    let (leaf, leaf_bytes) = scanned_bytes(
+        cluster,
+        &leader,
+        &format!(
+            "SELECT events[1]['attributes'] ->> 'gen_ai.finish_reason' AS reason \
+             FROM vala.traces.spans {filter}"
+        ),
+    )
+    .await?;
+    let reason = leaf.first().and_then(|row| row.get("reason"));
+    if reason.map(String::as_str) != Some("stop") {
+        return Err(format!("the nested event attribute read back as {reason:?}").into());
+    }
+    let (_, whole_bytes) = scanned_bytes(
+        cluster,
+        &leader,
+        &format!("SELECT events FROM vala.traces.spans {filter}"),
+    )
+    .await?;
+    // Strict `Less`, so an incomparable (NaN) metric fails rather than passes.
+    if leaf_bytes <= 0.0
+        || !matches!(
+            leaf_bytes.partial_cmp(&whole_bytes),
+            Some(std::cmp::Ordering::Less)
+        )
+    {
+        return Err(format!(
+            "the nested-leaf read must scan strictly fewer bytes than the whole \
+             events list: leaf={leaf_bytes} whole={whole_bytes}"
+        )
+        .into());
     }
 
     // Isolation: another tenant on the same listener reaches none of it.
@@ -1104,6 +1133,32 @@ async fn public_query(
         .terminal()
         .ok_or("the canonical readback produced no terminal frame")?;
     Ok(rows)
+}
+
+/// Runs `sql` through [`public_query`] and returns its rows with the physical
+/// bytes Oracle reported scanning for it.
+///
+/// The topology shares one telemetry recorder and this journey runs one query
+/// at a time, so the scanned-bytes delta around the query is that query's.
+///
+/// # Errors
+///
+/// Returns the telemetry capture failure or the [`public_query`] failure.
+async fn scanned_bytes(
+    cluster: &PeerCluster,
+    client: &WyrdClient,
+    sql: &str,
+) -> Result<(Vec<std::collections::BTreeMap<String, String>>, f64), PeerJourneyError> {
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|error| PeerJourneyError::from(error.to_string()))?;
+    let rows = public_query(client, sql).await?;
+    let delta = cluster
+        .telemetry()
+        .delta_since(&checkpoint)
+        .map_err(|error| PeerJourneyError::from(error.to_string()))?;
+    Ok((rows, sum_metric(&delta, "oracle_query_bytes_scanned_total")))
 }
 
 /// Oracle pods of the remote live-read journey.
@@ -1322,10 +1377,10 @@ async fn assert_remote_query_telemetry(
     assert!(
         metric_value(
             &delta,
-            "oracle_query_phase_seconds",
-            BifrostMetricKind::HistogramCount,
-            &[("phase", "peer_open")]
-        ) >= 1.0,
+            "oracle_query_profile_nanoseconds_total",
+            BifrostMetricKind::Counter,
+            &[("event", "LiveScribeExec.fragment_open_time")]
+        ) > 0.0,
         "{oracle_outcome}: the remote live read opened a peer fragment"
     );
     if oracle_outcome == "client_drop" {

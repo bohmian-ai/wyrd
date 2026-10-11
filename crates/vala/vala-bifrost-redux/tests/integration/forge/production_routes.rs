@@ -5,7 +5,7 @@
 //! manifest rewrite, snapshot expiry, and cleanup on its maintenance timer.
 
 use chrono::Duration as ChronoDuration;
-use iceberg::spec::{FormatVersion, Operation};
+use iceberg::spec::Operation;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -52,7 +52,7 @@ async fn fragmented_table(name: &str, properties: &[(&str, &str)]) -> ExpirableT
     let mut all = vec![("wyrd.forge.enable-compaction", "false")];
     all.extend_from_slice(properties);
     set_table_properties(&fixture.catalog, &fixture.binding, &all).await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
     let mut supervised = SupervisedPromotion::start(
@@ -157,42 +157,6 @@ async fn leader_timer_skips_manifest_rewrite_when_disabled() {
         after.snapshots.len() < before.snapshots.len(),
         "default expiry still retired aged ancestors: {before:?} -> {after:?}"
     );
-}
-
-/// A format-v3 table is skipped by manifest rewrite, as `RisingWave` does.
-///
-/// # Panics
-///
-/// Panics when the table cannot be loaded or upgraded to format v3, or when
-/// the pass committed a rewrite or changed the manifest count.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn leader_timer_skips_manifest_rewrite_on_format_v3() {
-    let table = fragmented_table(
-        "timer_v3",
-        &[
-            ("wyrd.forge.enable-manifest-rewrite", "true"),
-            ("commit.manifest.min-count-to-merge", "2"),
-            ("wyrd.forge.enable-snapshot-expiration", "false"),
-        ],
-    )
-    .await;
-    let catalog = table.fixture.catalog.iceberg_catalog();
-    let loaded = catalog
-        .load_table(&table.fixture.binding.table_ident())
-        .await
-        .expect("fixture table loads");
-    let tx = Transaction::new(&loaded);
-    tx.upgrade_table_version()
-        .set_format_version(FormatVersion::V3)
-        .apply(tx)
-        .expect("upgrade applies")
-        .commit(catalog.as_ref())
-        .await
-        .expect("the table upgrades to v3");
-    let (before, after) = maintain_once(&table).await;
-    assert_eq!(after.snapshot_id, before.snapshot_id, "no rewrite commit");
-    assert_eq!(after.data_manifests, before.data_manifests);
 }
 
 /// Builds the validated logical identity of the fixture's one table.
@@ -620,7 +584,7 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
     // One entry per page and one page per pass, so the route must checkpoint a
     // durable cursor and resume it across the worker restarts below.
     promoted.fixture.config.orphan_gc_max_list_pages = 1;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     object_store.page_listing_by(1);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
@@ -940,7 +904,7 @@ async fn assert_only_the_rowless_generation_is_gone(
 async fn worker_malformed_known_payload_observes_one_refusal() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("malformed_episode").await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let forge = fixture.build_forge_for_test(
         fixture.catalog.iceberg_catalog(),
         store,
@@ -1021,7 +985,7 @@ async fn worker_prepared_recovery_observes_one_ownership_episode() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("prepared_episode").await;
     let observer = ForgeWorkerCompletionObserver::default();
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let forge = fixture.build_forge_for_test(
         fixture.catalog.iceberg_catalog(),
         store,
@@ -1112,7 +1076,7 @@ async fn worker_prepared_recovery_observes_one_ownership_episode() {
 async fn interrupted_startup_waits_for_its_prepared_lease() {
     let fixture = PromotionIntegrationFixture::start("interrupted_startup").await;
     let observer = ForgeWorkerCompletionObserver::default();
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let forge = fixture.build_forge_for_test(
         fixture.catalog.iceberg_catalog(),
         store,
@@ -1477,7 +1441,7 @@ async fn worker_prepared_fatal_closes_before_release_and_observation() {
     let observer = ForgeWorkerCompletionObserver::default();
     let forge = fixture.build_forge_for_test(
         fixture.catalog.iceberg_catalog(),
-        CountingObjectStore::new(Arc::clone(&fixture.staging)),
+        CountingObjectStore::new(&fixture.storage),
         ForgeClock::system(),
         observer.clone(),
         ForgeSchedulerTrigger::default(),
@@ -1613,7 +1577,7 @@ async fn current_snapshot_id(fixture: &PromotionIntegrationFixture) -> i64 {
 async fn a_promotion_planned_in_the_settlement_window_is_superseded() {
     let _telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("settle_window").await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let forge = fixture.build_forge_for_test(
         fixture.catalog.iceberg_catalog(),
         store,
@@ -1716,7 +1680,7 @@ async fn promotion_notification_only_after_iceberg_commit() {
         .await
         .expect("Forge table settings commit");
 
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let seam = PromotionCatalogSeam::new(catalog, store.read_counter());
     seam.park_next_commit();
     let supervised = SupervisedPromotion::start(
@@ -1848,13 +1812,12 @@ async fn worker_selects_current_iceberg_files() {
     let mut promotion = SupervisedPromotion::start(
         &promoted.fixture,
         promoted.fixture.catalog.iceberg_catalog(),
-        CountingObjectStore::new(Arc::clone(&promoted.fixture.staging))
-            as Arc<dyn ForgeObjectStore>,
+        CountingObjectStore::new(&promoted.fixture.storage) as Arc<dyn ForgeObjectStore>,
         ForgeClock::system(),
     );
     promotion.run_one_success().await;
     promotion.shutdown().await;
-    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let store = CountingObjectStore::new(&promoted.fixture.storage);
     let forge = promoted.forge(
         promoted.fixture.catalog.iceberg_catalog(),
         Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
@@ -1998,7 +1961,7 @@ async fn worker_reports_no_plan_dispatch_as_success() {
         &[("wyrd.forge.compaction.type", "files-with-delete")],
     )
     .await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let mut supervisor = SupervisedPromotion::start_serial(
         &fixture,
         fixture.catalog.iceberg_catalog(),
@@ -2034,7 +1997,6 @@ async fn worker_reports_no_plan_dispatch_as_success() {
         snapshots,
         "a dispatch that planned nothing publishes nothing"
     );
-    assert_eq!(store.output_writers(), 0, "planning nothing writes nothing");
     supervisor.shutdown().await;
 }
 
@@ -2055,7 +2017,7 @@ async fn worker_reports_no_plan_dispatch_as_success() {
 async fn dispatch_shutdown_before_episode_closes_and_reports_not_started() {
     let _telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("dispatch_shutdown").await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let mut supervisor = SupervisedPromotion::start_serial(
         &fixture,
         fixture.catalog.iceberg_catalog(),
@@ -2168,7 +2130,7 @@ fn track(
 async fn report_preserves_later_commits_and_ignores_stale() {
     let _telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("report_accounting").await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let (clock, control) = manual_clock();
     let supervisor = SupervisedPromotion::start_serial(
         &fixture,
@@ -2368,7 +2330,7 @@ fn decision_keys(fixture: &PromotionIntegrationFixture) -> Vec<ForgeTableKey> {
 async fn leader_decision_has_no_catalog_io() {
     let _telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("leader_decision").await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let supervisor = SupervisedPromotion::start_serial(
         &fixture,
@@ -2504,7 +2466,7 @@ async fn property_less_table_is_compacted_after_the_default_interval() {
         cleared.metadata().properties()
     );
 
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
     let mut supervised = SupervisedPromotion::start(
@@ -2562,7 +2524,7 @@ fn coordinator(fixture: &PromotionIntegrationFixture) -> (Arc<Forge>, ForgeSched
     let trigger = ForgeSchedulerTrigger::with_owner_for_test(Uuid::now_v7());
     let forge = fixture.build_forge_for_test(
         fixture.catalog.iceberg_catalog(),
-        CountingObjectStore::new(Arc::clone(&fixture.staging)),
+        CountingObjectStore::new(&fixture.storage),
         ForgeClock::system(),
         ForgeWorkerCompletionObserver::new(),
         trigger.clone(),

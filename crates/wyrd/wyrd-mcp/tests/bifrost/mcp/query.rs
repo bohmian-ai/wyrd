@@ -14,7 +14,6 @@ mod investigation;
 mod pg_tests {
     use super::investigation::EvidenceInvestigation;
     use super::{McpJourneyError, client, discover, problem, structured, transport};
-    use std::fmt::Write as _;
 
     use std::time::Duration;
 
@@ -23,10 +22,15 @@ mod pg_tests {
     use rmcp::service::PeerRequestOptions;
     use rmcp::service::ServiceError;
     use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_runtime::Permission;
     use wyrd_spec::auth::TokenAudience;
     use wyrd_spec::request_id::RequestId;
     use wyrd_testing::WyrdTestServer;
+    use wyrd_testing::bifrost::canonical_signals as fixture;
     use wyrd_testing::bifrost::seed_query_fixture;
+    use wyrd_testing::bifrost::shared_process_telemetry_for_test;
+    use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
+    use wyrd_testing::gateway_capture::GatewayCapture;
     use wyrd_testing::server::BifrostQueryResourceSnapshot;
 
     /// An agent correlates telemetry, Cards, judgments, and custom rows through existing SQL.
@@ -491,13 +495,14 @@ mod pg_tests {
 
         // One bounded read-only trace query returns one complete result. The
         // canonical span ledger stores the OTLP status as its numeric
-        // `status_code` and the start instant as `start_time_unix_nano`, so the
-        // window is expressed in nanoseconds rather than as a timestamp.
+        // `status_code` and the start instant as the nanosecond timestamp
+        // `start_time_unix_nano`, the table's time column, so the window binds
+        // nanosecond instants.
         let minute_nanos = 60_000_000_000_i64;
         let lower = start - minute_nanos;
         let upper = start + minute_nanos;
         let sql = format!(
-            "SELECT name, status_code FROM {table} WHERE status_code = 2 AND start_time_unix_nano >= {lower} AND start_time_unix_nano < {upper}"
+            "SELECT name, status_code FROM {table} WHERE status_code = 2 AND start_time_unix_nano >= to_timestamp_nanos({lower}) AND start_time_unix_nano < to_timestamp_nanos({upper})"
         );
         let result = client
             .call_tool(query(serde_json::json!({"sql": sql, "max_rows": 10})))
@@ -606,8 +611,6 @@ mod pg_tests {
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_reads_canonical_trace_genai_logs_and_metrics_through_sql()
     -> Result<(), McpJourneyError> {
-        use wyrd_testing::bifrost::canonical_signals as fixture;
-
         let server = WyrdTestServer::start_bound().await?;
         let seeded = fixture::seed_canonical_signals(&server, "mcp-canonical-signals").await?;
         let scope = seeded.scope.as_str();
@@ -724,26 +727,269 @@ mod pg_tests {
                 .call_tool(query(serde_json::json!({"sql": payload_sql})))
                 .await?,
         )?;
-        // The tool renders a binary column as hex, so the expected structured
-        // messages are compared in the same encoding the agent receives.
-        let payload = messages["rows"][0][0]
-            .as_str()
-            .ok_or("the attribute payload is a JSON string")?;
-        let hex_of = |text: &str| {
-            text.bytes().fold(String::new(), |mut hex, byte| {
-                let _ = write!(hex, "{byte:02x}");
-                hex
-            })
-        };
-        assert!(
-            payload.contains(&hex_of(fixture::INPUT_MESSAGES))
-                && payload.contains(&hex_of(fixture::OUTPUT_MESSAGES)),
-            "an authorized agent reads the structured GenAI messages: {payload}"
+        // The tool renders a Variant cell as its JSON value.
+        assert_eq!(
+            messages["rows"][0][0],
+            serde_json::json!({
+                "gen_ai.input.messages": fixture::INPUT_MESSAGES,
+                "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
+            }),
+            "an authorized agent reads the structured GenAI messages"
         );
         reader.cancel().await?;
 
         client.cancel().await?;
         server.shutdown().await?;
+        Ok(())
+    }
+
+    /// An agent reads built-in Variant and Struct payloads as JSON values.
+    ///
+    /// The canonical span fixture stores Variant attribute collections and
+    /// Struct events. Through `bifrost.query` an agent reads `->>` text, `->`
+    /// and whole Variant cells as JSON values, a Struct child by exact field
+    /// access, a Variant nested in a Struct, and parsed integers beyond 2^53
+    /// and at `u64::MAX` exactly; invalid JSON in `parse_json` is a query
+    /// execution failure and `try_parse_json` is null.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, transport, tool-call, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a value renders differently or the invalid-JSON query is
+    /// not refused with `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn builtin_variant_and_struct_payloads_are_queryable() -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        let seeded = fixture::seed_canonical_signals(&server, "mcp-variant-payloads").await?;
+        let parent = format!(
+            "FROM vala.traces.spans WHERE scope_name = '{}' AND parent_span_id IS NULL",
+            seeded.scope
+        );
+        let client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(seeded.token.clone().into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+
+        let payloads = structured(
+            client
+                .call_tool(query(serde_json::json!({
+                    "sql": format!(
+                        "SELECT attributes ->> 'gen_ai.input.messages' AS input_messages, \
+                         attributes -> 'absent' AS absent, attributes, \
+                         events[1]['name'] AS event_name, \
+                         events[1]['attributes'] ->> 'gen_ai.finish_reason' AS finish_reason, \
+                         parse_json('{{\"n\": 9007199254740993, \"u\": 18446744073709551615}}') AS parsed, \
+                         try_parse_json('{{bad') AS lenient {parent}"
+                    ),
+                    "max_rows": 10,
+                })))
+                .await?,
+        )?;
+        assert_eq!(
+            payloads["rows"],
+            serde_json::json!([[
+                fixture::INPUT_MESSAGES,
+                null,
+                {
+                    "gen_ai.input.messages": fixture::INPUT_MESSAGES,
+                    "gen_ai.output.messages": fixture::OUTPUT_MESSAGES,
+                },
+                fixture::EVENT_NAME,
+                "stop",
+                {"n": 9_007_199_254_740_993_i64, "u": u64::MAX},
+                null,
+            ]]),
+            "Variant cells render as their JSON values and Struct access stays exact"
+        );
+
+        let invalid = client
+            .call_tool(query(serde_json::json!({
+                "sql": format!("SELECT parse_json('{{bad') AS v {parent}"),
+            })))
+            .await?;
+        assert_eq!(
+            problem(invalid)?["code"],
+            serde_json::json!("WYRD_VALA_500_QUERY_EXECUTION_FAILED"),
+            "invalid JSON in parse_json is a query execution failure"
+        );
+
+        client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Sums the Oracle scan counters one telemetry window recorded.
+    ///
+    /// Returns the files and bytes the Oracle readers scanned, which stay zero
+    /// for a query refused before any provider reads storage.
+    fn oracle_scans(delta: &BifrostTelemetryDelta) -> (f64, f64) {
+        let sum = |family: &str| -> f64 {
+            delta
+                .metrics
+                .iter()
+                .filter(|sample| sample.family == family)
+                .map(|sample| sample.value)
+                .sum()
+        };
+        (
+            sum("oracle_query_files_scanned_total"),
+            sum("oracle_query_bytes_scanned_total"),
+        )
+    }
+
+    /// An agent without gateway payload authority cannot read any leaf of a
+    /// sensitive Variant column, and the refusal happens before any read.
+    ///
+    /// A real gateway call is captured into `vala.gateway.calls`. An agent
+    /// holding payload-read authority reads `request_payload ->> 'model'`, and
+    /// an agent holding only query read reads `call_id`; both scan storage.
+    /// The query-only agent is then refused every shape that reaches a
+    /// payload leaf: a `->>` projection, a `->` chain, a predicate-only use,
+    /// and `to_json` of the response payload. Each refusal is
+    /// `WYRD_VALA_403_QUERY_FORBIDDEN` with no rows, and its telemetry window
+    /// records no scanned file or byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns server, capture, MCP transport, telemetry, or shutdown failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a permitted read fails or scans nothing, or a payload read
+    /// without authority is not refused before any scan.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn sensitive_variant_leaf_is_denied_before_io() -> Result<(), McpJourneyError> {
+        let (_telemetry_guard, telemetry) = shared_process_telemetry_for_test()?;
+        let gateway = GatewayCapture::start().await?;
+        gateway.capture_call().await?;
+        // Capture is delivered to Scribe asynchronously; seal only once both
+        // calls (the answered one and the refused one) have arrived, so the
+        // permitted reads below come from storage rather than the live tail.
+        // Each test is its own process, so the absolute count is this test's.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while telemetry
+            .snapshot()?
+            .iter()
+            .filter(|sample| {
+                sample.family == "wyrd_gateway_capture_total"
+                    && sample.labels.get("outcome").map(String::as_str) == Some("delivered")
+            })
+            .map(|sample| sample.value)
+            .sum::<f64>()
+            < 2.0
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "both gateway calls are captured within 30 s"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        gateway.server.flush_bifrost().await?;
+        let server = &gateway.server;
+        let payload_reader = agent_with_permissions(
+            server,
+            "payload_reader",
+            &[
+                Permission::bifrost_query_read(),
+                Permission::gateway_payload_read(),
+            ],
+        )
+        .await?;
+        let metadata_reader = agent_with_permissions(
+            server,
+            "metadata_reader",
+            &[Permission::bifrost_query_read()],
+        )
+        .await?;
+
+        for (case, agent, sql) in [
+            (
+                "payload leaf with authority",
+                &payload_reader,
+                "SELECT request_payload ->> 'model' AS model FROM vala.gateway.calls \
+                 WHERE request_payload ->> 'model' IS NOT NULL",
+            ),
+            (
+                "metadata without payload authority",
+                &metadata_reader,
+                "SELECT call_id FROM vala.gateway.calls",
+            ),
+        ] {
+            let window = telemetry.checkpoint()?;
+            let result = structured(
+                agent
+                    .call_tool(query(serde_json::json!({"sql": sql})))
+                    .await?,
+            )?;
+            let (files, bytes) = oracle_scans(&telemetry.delta_since(&window)?);
+            assert!(
+                result["rows"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty()),
+                "{case} returns the captured call: {result}"
+            );
+            assert!(
+                files > 0.0 && bytes > 0.0,
+                "{case} reads storage: {files} files, {bytes} bytes"
+            );
+        }
+
+        for (case, sql) in [
+            (
+                "->> projection",
+                "SELECT request_payload ->> 'model' AS model FROM vala.gateway.calls",
+            ),
+            (
+                "-> chain",
+                "SELECT to_json(request_payload -> 'messages' -> 0) AS first FROM vala.gateway.calls",
+            ),
+            (
+                "predicate only",
+                "SELECT call_id FROM vala.gateway.calls \
+                 WHERE request_payload ->> 'model' = 'openai/gpt-4o'",
+            ),
+            (
+                "to_json of the response",
+                "SELECT to_json(response_payload) AS body FROM vala.gateway.calls",
+            ),
+        ] {
+            let window = telemetry.checkpoint()?;
+            let refusal = problem(
+                metadata_reader
+                    .call_tool(query(serde_json::json!({"sql": sql})))
+                    .await?,
+            )?;
+            let (files, bytes) = oracle_scans(&telemetry.delta_since(&window)?);
+            assert_eq!(
+                refusal["code"],
+                serde_json::json!("WYRD_VALA_403_QUERY_FORBIDDEN"),
+                "{case}: {refusal}"
+            );
+            assert!(
+                refusal.get("rows").is_none(),
+                "{case} returns no rows: {refusal}"
+            );
+            assert_eq!(
+                (files, bytes),
+                (0.0, 0.0),
+                "{case} is refused before any read"
+            );
+        }
+
+        payload_reader.cancel().await?;
+        metadata_reader.cancel().await?;
+        gateway.server.shutdown().await?;
         Ok(())
     }
 

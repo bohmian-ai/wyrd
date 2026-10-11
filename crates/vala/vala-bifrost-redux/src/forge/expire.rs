@@ -223,17 +223,16 @@ impl Forge {
     /// table's exclusive maintenance authority is the one SQL lock deliberately
     /// held across that IO: it is taken before preparation and surrendered
     /// only once the commit's outcome is known and the claims are settled or
-    /// reset, which is what makes the reader check and the destructive commit
-    /// inseparable. The Forge lease TTL bounds that hold. Claims that outlive
-    /// the authority therefore always name an expiration whose acceptance is
-    /// unknown, and Oracle refuses new cuts of the table until reconciliation
-    /// establishes the stable pointer.
+    /// reset, so no other destructive maintenance interleaves with it. The
+    /// Forge lease TTL bounds that hold. Claims that outlive the authority
+    /// therefore always name an expiration whose acceptance is unknown, which
+    /// reconciliation resolves. Oracle cuts never wait on it: retention keeps
+    /// every expired snapshot older than the maximum query deadline.
     ///
     /// # Errors
     /// Returns [`ForgeError::Shutdown`] when `stop` is cancelled at a stage
     /// boundary, [`ForgeError::FenceLost`] when the table lease fence is gone,
-    /// an SQL conflict when an Oracle query still holds the table's read
-    /// authority, policy and metadata errors from snapshot selection, the
+    /// policy and metadata errors from snapshot selection, the
     /// catalog, SQL, or object-store error of any reconciliation, preparation,
     /// commit, or settlement step, and [`ForgeError::Reconciliation`] when a
     /// submitted commit outlives the lease bound. Drift, a definite
@@ -292,11 +291,10 @@ impl Forge {
         let claim_table = self.expiry_claim_table(key, &table).await?;
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
-        // The exclusive table authority is held from reader exclusion through
-        // the Iceberg commit's known outcome and the claims' resolution, so no
-        // Oracle cut can pin the pre-expiry pointer between the reader check
-        // and the commit, and none ever observes the claims of an expiration
-        // whose outcome is known. The lease TTL bounds the hold.
+        // The exclusive table authority is held through the Iceberg commit's
+        // known outcome and the claims' resolution, so no other destructive
+        // maintenance interleaves with this expiry. The lease TTL bounds the
+        // hold.
         let mut authority_conn = self
             .core
             .vala
@@ -305,8 +303,7 @@ impl Forge {
             .map_err(ForgeError::Sql)?;
         let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
             .exclusive(key.tenant, &key.table_ref)
-            .await?
-            .ok_or_else(super::table_authority::active_read_refusal)?;
+            .await?;
         let expiry = PreparedExpiry {
             key,
             binding,
@@ -329,8 +326,7 @@ impl Forge {
                 resolution?
             }
             // The commit may already have reached the catalog: the claims stay
-            // Prepared, which keeps new cuts off this table until
-            // reconciliation establishes the stable pointer.
+            // Prepared as uncertain-outcome evidence for reconciliation.
             Err(_) if progress.submitted.load(Ordering::Acquire) => {
                 authority_conn.commit().await.map_err(ForgeError::Sql)?;
                 return Err(ForgeError::Reconciliation {
@@ -373,8 +369,8 @@ impl Forge {
 
     /// Prepares, commits, and resolves one expiry under the table's authority.
     ///
-    /// `exclusive` is held throughout, so the claims are resolved before any
-    /// Oracle cut can observe them: a committed expiry settles, and drift, a
+    /// `exclusive` is held throughout, so the claims are resolved before the
+    /// authority is surrendered: a committed expiry settles, and drift, a
     /// definite optimistic-commit rejection, or any failure before the commit
     /// was submitted resets. The one corroborating read must still match
     /// exactly what preparation recorded; anything else is definite pre-call
@@ -469,8 +465,8 @@ impl Forge {
     /// Releases the claims of an expiry that failed before its commit was
     /// submitted, and returns that failure.
     ///
-    /// Nothing reached the catalog, so the claims would only keep new cuts off
-    /// the table. A reset that itself fails is logged and leaves the claims to
+    /// Nothing reached the catalog, so the claims name no uncertain effect. A
+    /// reset that itself fails is logged and leaves the claims to
     /// reconciliation.
     async fn release_unsubmitted(
         &self,
@@ -518,7 +514,7 @@ enum ExpiryResolution {
 impl Forge {
     /// Gathers every non-catalog authority that protects a snapshot.
     ///
-    /// The three roots are read together, under the fence this pass already
+    /// The roots are read together, under the fence this pass already
     /// holds, because a decision made from two of them is not a smaller
     /// decision — it is an unsafe one. Watermarks are returned unvalidated;
     /// corroborating them against Iceberg belongs to the policy, which is the
@@ -568,6 +564,24 @@ impl Forge {
         let claimed_snapshot_ids = super::table_authority::TableAuthority::new(&mut conn)
             .claimed_snapshot_ids(key.tenant, &key.table_ref)
             .await?;
+        // Oracle readers record nothing; a snapshot replaced within the
+        // retention window may still be read and is kept. The observation
+        // commits with the other roots.
+        let current = table.metadata().current_snapshot_id();
+        let replaced = table
+            .metadata()
+            .snapshots()
+            .map(|snapshot| snapshot.snapshot_id())
+            .filter(|id| Some(*id) != current)
+            .collect::<Vec<_>>();
+        let retained_snapshot_ids = super::table_authority::TableAuthority::new(&mut conn)
+            .retained_supersessions(
+                key.tenant,
+                &key.table_ref,
+                &replaced,
+                self.core.config.snapshot_retention,
+            )
+            .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         if attempts_overflowed {
             return Err(ForgeError::SnapshotExpiry {
@@ -578,6 +592,7 @@ impl Forge {
             attempt_watermarks,
             lineage_snapshot_id: head_lineage_snapshot_id(table),
             claimed_snapshot_ids,
+            retained_snapshot_ids,
             destructive_maintenance,
         })
     }
@@ -889,11 +904,8 @@ fn expiry_selection<'detail>(
 impl Forge {
     /// Submits the canonical expiry transaction while preserving uncertain acceptance.
     ///
-    /// `exclusive` is the table's live exclusive maintenance authority. The
-    /// borrow keeps every Oracle cut acquisition on this table waiting until
-    /// the caller surrenders it after this commit's outcome is known, so a
-    /// reader either committed before the authority was taken — and no
-    /// authority exists — or observes the post-expiry pointer. `submitted` is
+    /// `exclusive` is the table's live exclusive maintenance authority, held
+    /// by the caller until this commit's outcome is known. `submitted` is
     /// set immediately before the commit is handed to the catalog, so a caller
     /// that cuts this future off knows whether acceptance may be unknown.
     ///
@@ -1261,15 +1273,9 @@ impl Forge {
                     .await?
             }
             ForgeExpirationSettlement::Committed => {
-                let Some(evidence) = self
+                let evidence = self
                     .retry_committed_expiry(lease, expiry, table, stop)
                     .await?
-                else {
-                    outcome.pending = 1;
-                    outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
-                    return Ok(outcome);
-                };
-                evidence
             }
         };
         Self::record_expired_snapshots(&detail);
@@ -1284,10 +1290,7 @@ impl Forge {
     /// the same exclusive maintenance authority through its known outcome and
     /// settles before surrendering it; the lease TTL bounds the hold. A retry
     /// still running at the bound may have reached the catalog, so its claims
-    /// stay Prepared and keep new cuts off the table for the next pass.
-    ///
-    /// Returns `None`, with nothing destroyed, while any reader holds the
-    /// table; the operation then stays Prepared for a later pass.
+    /// stay Prepared for the next reconciliation pass.
     ///
     /// # Errors
     ///
@@ -1300,7 +1303,7 @@ impl Forge {
         expiry: PreparedExpiry<'_>,
         table: Table,
         stop: &CancellationToken,
-    ) -> Result<Option<ForgeTaskEvidence>, ForgeError> {
+    ) -> Result<ForgeTaskEvidence, ForgeError> {
         let key = expiry.key;
         let mut authority_conn = self
             .core
@@ -1308,13 +1311,9 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let Some(exclusive) = super::table_authority::TableAuthority::new(&mut authority_conn)
+        let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
             .exclusive(key.tenant, &key.table_ref)
-            .await?
-        else {
-            authority_conn.commit().await.map_err(ForgeError::Sql)?;
-            return Ok(None);
-        };
+            .await?;
         let submitted = AtomicBool::new(false);
         let bounded = tokio::time::timeout(
             self.core.config.lease_ttl,
@@ -1336,7 +1335,7 @@ impl Forge {
         drop(exclusive);
         authority_conn.commit().await.map_err(ForgeError::Sql)?;
         match bounded {
-            Ok(evidence) => evidence.map(Some),
+            Ok(evidence) => evidence,
             Err(_) => Err(ForgeError::Reconciliation {
                 detail: "retried Iceberg snapshot expiry outlived the Forge lease bound".to_owned(),
             }),
@@ -1532,7 +1531,7 @@ impl Forge {
             committed.metadata().location(),
             expired_files,
             binding,
-            &self.core.staging,
+            &self.core.warehouse,
             &identity,
         )?;
         evidence.validate(false).map_err(ForgeError::Sql)?;
@@ -1694,7 +1693,7 @@ fn expiry_cleanup_candidates(
     table_location: &str,
     expired: &ExpiredFileSet,
     binding: &TenantTableBinding,
-    staging: &opendal::Operator,
+    warehouse: &str,
     identity: &ForgeTaskTableIdentity,
 ) -> Result<Vec<ForgeCleanupCandidate>, ForgeError> {
     let categories = [
@@ -1710,7 +1709,7 @@ fn expiry_cleanup_candidates(
         .flat_map(|(category, paths)| paths.iter().map(move |path| (category, path)))
         .map(|(category, path)| {
             let key =
-                super::path::catalog_path_to_object_key(table_location, binding, staging, path)?;
+                super::path::catalog_path_to_object_key(table_location, binding, warehouse, path)?;
             Ok(ForgeCleanupCandidate {
                 category,
                 table: identity.clone(),

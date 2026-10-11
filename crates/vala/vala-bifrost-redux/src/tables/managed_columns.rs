@@ -10,9 +10,7 @@ use arrow::datatypes::{Field, TimeUnit};
 
 use crate::tables::CorrelationPolicy;
 use crate::tables::fields::{CanonicalField, CanonicalType, canonical_arrow_fields};
-use wyrd_spec::vala::{
-    CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
-};
+use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
 /// Which tables a managed column is appended to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +21,7 @@ pub enum ManagedScope {
     /// The request that carried the rows, fresh on every attempt and appended
     /// alongside the correlation columns.
     Request,
-    /// Time axis appended to every table, whatever its correlation policy.
+    /// Ingestion time appended to every table, whatever its correlation policy.
     Time,
 }
 
@@ -50,7 +48,10 @@ impl ManagedColumn {
         Self {
             field: CanonicalField::meta(
                 name,
-                CanonicalType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
+                CanonicalType::Timestamp(
+                    TimeUnit::Microsecond,
+                    Some(iceberg::arrow::UTC_TIME_ZONE),
+                ),
                 false,
             ),
             scope: ManagedScope::Time,
@@ -72,13 +73,11 @@ impl ManagedColumn {
 
 /// Every server-managed column, in physical order.
 ///
-/// Correlation columns come first, then the two time columns:
+/// Correlation columns come first, then the ingestion time:
 ///
 /// - `run_id`, `card_uid`: optional correlation to a run and a Card version;
 /// - `principal_id`: the authenticated writer;
 /// - `wyrd_request_id`: the request that wrote the row, the join key to audit;
-/// - `wyrd_event_time`: when the observed thing happened — the caller's value
-///   when supplied, otherwise equal to `wyrd_ingested_at`;
 /// - `wyrd_ingested_at`: when Wyrd accepted the row, read once per batch from
 ///   `PostgreSQL` and never caller-supplied.
 ///
@@ -90,14 +89,13 @@ pub static MANAGED_COLUMNS: &[ManagedColumn] = &[
     ManagedColumn::identity(CARD_UID, true, ManagedScope::Correlation),
     ManagedColumn::identity(PRINCIPAL_ID, false, ManagedScope::Correlation),
     ManagedColumn::identity(WYRD_REQUEST_ID, false, ManagedScope::Request),
-    ManagedColumn::time(WYRD_EVENT_TIME),
     ManagedColumn::time(WYRD_INGESTED_AT),
 ];
 
 impl CorrelationPolicy {
     /// Report whether a table under this policy appends `column`.
     ///
-    /// Time columns are always appended. Correlation and request columns are
+    /// The ingestion time is always appended. Correlation and request columns are
     /// appended by `Observation` tables; `None` tables carry their own identity
     /// columns and append neither.
     #[must_use]
@@ -125,6 +123,20 @@ pub fn is_managed_column(name: &str) -> bool {
     MANAGED_COLUMNS
         .iter()
         .any(|column| column.field.name == name)
+}
+
+/// The name prefix every server-owned column carries, managed or not.
+pub const RESERVED_PREFIX: &str = "wyrd_";
+
+/// Report whether a writer may not supply or declare a column named `name`.
+///
+/// Reserved is every managed column plus every [`RESERVED_PREFIX`] name, so
+/// a retired or future server column stays refused rather than silently
+/// becoming user content. Registration and native ingest both
+/// refuse through this one rule.
+#[must_use]
+pub fn is_reserved_column(name: &str) -> bool {
+    name.starts_with(RESERVED_PREFIX) || is_managed_column(name)
 }
 
 /// Report whether `name` is a managed correlation column.
@@ -196,7 +208,6 @@ mod tests {
                 CARD_UID,
                 PRINCIPAL_ID,
                 WYRD_REQUEST_ID,
-                WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,
             ]
         );
@@ -204,19 +215,15 @@ mod tests {
         assert!(!fields[3].is_nullable());
     }
 
-    /// Tables without a correlation policy append only the two time columns.
+    /// Tables without a correlation policy append only the ingestion time.
     ///
     /// # Panics
     ///
-    /// Panics when anything other than the event and ingest time columns is
-    /// appended.
+    /// Panics when anything other than the ingestion time column is appended.
     #[test]
-    fn none_policy_appends_only_the_time_columns() {
+    fn none_policy_appends_only_the_ingestion_time() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::None);
-        assert_eq!(
-            field_names(&fields),
-            vec![WYRD_EVENT_TIME, WYRD_INGESTED_AT]
-        );
+        assert_eq!(field_names(&fields), vec![WYRD_INGESTED_AT]);
     }
 
     /// Caller-declared fields remain ahead of every server-managed field.
@@ -231,12 +238,14 @@ mod tests {
         assert_eq!(fields[0].name(), "my_col");
     }
 
-    /// The managed-name check covers exactly the declaration.
+    /// The managed-name check covers exactly the declaration, and the
+    /// reserved-name check adds every `wyrd_*` name to it.
     ///
     /// # Panics
     ///
-    /// Panics when a declared column is not reported as managed, or when the
-    /// retired batch column or a user name is.
+    /// Panics when a declared column is not reported as managed, when the
+    /// retired batch column or a user name is, or when a `wyrd_*` name is not
+    /// reported as reserved.
     #[test]
     fn is_managed_column_covers_exactly_the_declaration() {
         for column in MANAGED_COLUMNS {
@@ -248,6 +257,9 @@ mod tests {
         }
         assert!(!is_managed_column("wyrd_batch_id"));
         assert!(!is_managed_column("value"));
+        assert!(is_reserved_column("wyrd_batch_id"));
+        assert!(is_reserved_column(PRINCIPAL_ID));
+        assert!(!is_reserved_column("value"));
         assert!(is_correlation_column(RUN_ID));
         assert!(is_correlation_column(PRINCIPAL_ID));
         assert!(!is_correlation_column(WYRD_REQUEST_ID));

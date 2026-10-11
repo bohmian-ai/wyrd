@@ -532,11 +532,12 @@ pub enum RunInput {
     /// A Drift comparison window.
     DriftWindow(DriftWindow),
     /// One committed Eval observation, located by its record ID and the exact
-    /// server-managed `wyrd_event_time` that selects its UTC-day partition.
+    /// `created_at`, the table's time column, that selects its UTC-day
+    /// partition.
     EvalRecord {
         /// Logical input record ID.
         record_id: String,
-        /// Committed observation's server event time.
+        /// Committed observation's `created_at`.
         event_time: DateTime<Utc>,
     },
 }

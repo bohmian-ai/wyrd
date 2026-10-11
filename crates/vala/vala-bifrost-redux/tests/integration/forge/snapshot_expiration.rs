@@ -364,7 +364,7 @@ pub(super) async fn head_watermark(fixture: &PromotionIntegrationFixture) -> (i6
 /// Panics when the fixture cannot promote twice or the table has no head.
 pub(super) async fn expirable_table(name: &str) -> ExpirableTable {
     let fixture = PromotionIntegrationFixture::start(name).await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let store = CountingObjectStore::new(&fixture.storage);
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
     let mut supervised = SupervisedPromotion::start(
@@ -822,10 +822,8 @@ pub(super) async fn seed_never_published_object(fixture: &PromotionIntegrationFi
         Uuid::now_v7()
     );
     fixture
-        .staging
-        .write(&path, b"never published".to_vec())
-        .await
-        .expect("the orphan object seeds");
+        .write_object(&path, b"never published".to_vec())
+        .await;
     path
 }
 
@@ -833,13 +831,9 @@ pub(super) async fn seed_never_published_object(fixture: &PromotionIntegrationFi
 ///
 /// # Panics
 ///
-/// Panics when the staging operator fails for a reason other than absence.
+/// Panics when the object store fails for a reason other than absence.
 pub(super) async fn object_exists(fixture: &PromotionIntegrationFixture, path: &str) -> bool {
-    match fixture.staging.stat(path).await {
-        Ok(_) => true,
-        Err(error) if error.kind() == opendal::ErrorKind::NotFound => false,
-        Err(error) => panic!("staging stat failed: {error}"),
-    }
+    fixture.object_exists(path).await
 }
 
 /// Asserts an expiration left one never-published object to the orphan owner.
@@ -1038,8 +1032,17 @@ pub(super) async fn maintain_once(table: &ExpirableTable) -> (HeadShape, HeadSha
 /// Panics when a fixture dependency fails or the first promotion commits no
 /// snapshot.
 pub(super) async fn leader_only_table(name: &str) -> ExpirableTable {
-    let fixture = PromotionIntegrationFixture::start(name).await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    leader_only(PromotionIntegrationFixture::start(name).await).await
+}
+
+/// Starts [`leader_only_table`] over an already-configured fixture.
+///
+/// # Panics
+///
+/// Panics when a fixture dependency fails or the first promotion commits no
+/// snapshot.
+pub(super) async fn leader_only(fixture: PromotionIntegrationFixture) -> ExpirableTable {
+    let store = CountingObjectStore::new(&fixture.storage);
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
     let mut supervised = SupervisedPromotion::start(
@@ -1215,7 +1218,7 @@ pub(super) async fn latest_cleanup_task(fixture: &PromotionIntegrationFixture) -
 /// # Panics
 ///
 /// Panics when the read-only count fails.
-async fn expiry_attempts(fixture: &PromotionIntegrationFixture) -> i64 {
+pub(super) async fn expiry_attempts(fixture: &PromotionIntegrationFixture) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM vala.forge_tasks \
          WHERE data_tenant_id = $1 AND strategy = 'snapshot_expiry'",

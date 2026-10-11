@@ -989,7 +989,6 @@ mod tests {
             VerificationResultId::new_v7(),
             now,
             now,
-            now,
         )
         .build(&VerifierReport::Drift(None))
         .expect("an unscored Drift result builds");
@@ -1294,7 +1293,6 @@ mod tests {
                 .as_ref()
                 .expect("the fixture Verifier carries its UID"),
             VerificationResultId::new_v7(),
-            now,
             now,
             now,
         )

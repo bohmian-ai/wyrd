@@ -282,29 +282,31 @@ async fn forge_hot_object_promotes_unchanged_and_remains_exact() {
 ///
 /// # Panics
 ///
-/// Panics when the staging operator cannot be listed or read.
+/// Panics when the Bifrost store cannot be listed or read.
 async fn object_digests(fixture: &ForgeFixture) -> BTreeMap<String, String> {
     let prefix = format!("{}/", fixture.binding.object_prefix);
-    let entries = fixture
-        .staging
-        .list_with(&prefix)
-        .recursive(true)
+    use futures_util::TryStreamExt as _;
+    use object_store::ObjectStoreExt as _;
+    use sha2::Digest as _;
+    let objects = fixture.storage.objects();
+    let entries: Vec<_> = objects
+        .list(Some(&object_store::path::Path::from(prefix)))
+        .try_collect()
         .await
         .expect("promotion object listing");
     let mut digests = BTreeMap::new();
     for entry in entries {
-        if entry.metadata().is_dir() {
-            continue;
-        }
-        let bytes = fixture
-            .staging
-            .read(entry.path())
+        let bytes = objects
+            .get(&entry.location)
             .await
-            .expect("promotion object read");
-        digests.insert(entry.path().to_owned(), {
-            use sha2::Digest as _;
-            hex::encode(sha2::Sha256::digest(bytes.to_bytes()))
-        });
+            .expect("promotion object read")
+            .bytes()
+            .await
+            .expect("promotion object body");
+        digests.insert(
+            entry.location.to_string(),
+            hex::encode(sha2::Sha256::digest(&bytes)),
+        );
     }
     digests
 }
@@ -326,7 +328,7 @@ async fn scribe_promotion_revalidates_footer_and_appends_without_data_put() {
         "the fixture sealed real data objects"
     );
 
-    let object_store = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
+    let object_store = ForgeObjectStoreControl::new(&fixture.storage);
     let mut forge = SupervisedForge::start_with_seams(
         &fixture,
         fixture.config.clone(),
@@ -396,7 +398,7 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
     ///
     /// # Panics
     ///
-    /// Panics when the cut cannot be acquired, materialized, or released, when
+    /// Panics when the cut cannot be read or materialized, when
     /// a path is visible from both hot and promoted sources, or when the cut
     /// does not cover the sealed set exactly.
     async fn assert_exact_cut(
@@ -406,31 +408,16 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
         sealed: &BTreeSet<String>,
         label: &str,
     ) {
-        let query_id = uuid::Uuid::now_v7();
-        let acquired = catalog
-            .acquire_active_cut(
-                tenant,
-                vala_sql::queries::oracle_reader_authority::ActiveReadOwner {
-                    query_id,
-                    node_id: uuid::Uuid::now_v7(),
-                    fencing_token: 1,
-                },
-                std::time::Instant::now() + std::time::Duration::from_hours(1),
-                std::slice::from_ref(table),
-            )
+        let cut = catalog
+            .read_cut(tenant, std::slice::from_ref(table))
             .await
-            .expect("the registered table acquires its active cut")
-            .expect("an hour remains before the deadline")
+            .expect("the registered table reads its cut")
             .pop()
-            .expect("one acquired table");
+            .expect("one table cut");
         let pinned = catalog
-            .materialize_acquired_cut(tenant, table, acquired)
+            .materialize_cut(tenant, table, cut)
             .await
             .unwrap_or_else(|error| panic!("{label} cut: {error}"));
-        catalog
-            .release_active_reads(tenant, query_id)
-            .await
-            .expect("the inspection cut releases its active read");
         let hot = pinned
             .hot_files
             .iter()

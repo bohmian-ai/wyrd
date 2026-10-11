@@ -1,7 +1,8 @@
 //! `vala.gateway.calls` — one terminal analytical row per captured gateway call.
 //!
-//! The user fields are the exact `GatewayCallPayloadV1` record, field for
-//! field and in declaration order; the Observation policy appends the canonical
+//! The user fields are the `GatewayCallPayloadV1` record in declaration order,
+//! except that its two canonical payload JSON texts are stored as the Variant
+//! columns `request_payload` and `response_payload`; the Observation policy appends the canonical
 //! managed envelope. Only the gateway capture principal may write the table,
 //! which Gate enforces, and the two payload columns require the additional
 //! payload-read permission, which Oracle enforces.
@@ -10,32 +11,27 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
+use wyrd_types::variant::variant_field;
+
 use crate::tables::fields::{boolean, int32, int64, ts_us_utc, utf8};
 use crate::tables::{
     CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
-/// Canonical redacted request JSON column, readable only with payload authority.
-pub const REQUEST_PAYLOAD_JSON: &str = "request_payload_json";
+/// Redacted request payload Variant column, readable only with payload authority.
+pub const REQUEST_PAYLOAD: &str = "request_payload";
 
-/// Canonical redacted response JSON column, readable only with payload authority.
-pub const RESPONSE_PAYLOAD_JSON: &str = "response_payload_json";
+/// Redacted response payload Variant column, readable only with payload authority.
+pub const RESPONSE_PAYLOAD: &str = "response_payload";
+
+/// Optional resolved `ModelRef` Struct column; present exactly when routing resolved a model.
+pub const RESOLVED_MODEL: &str = "resolved_model";
 
 /// Built-in definition of `vala.gateway.calls`.
 pub struct CallsTable;
 
 impl CallsTable {
-    /// Arrow type of one `ModelRef`: its provider and provider-native model.
-    #[must_use]
-    pub fn model_ref_type() -> DataType {
-        DataType::Struct(Fields::from(vec![
-            utf8("provider", false),
-            utf8("model", false),
-        ]))
-    }
-
     /// Arrow type of one normalized usage list.
     ///
     /// Each element is one `GatewayUsageAmount`; the quantity keeps its exact
@@ -43,7 +39,7 @@ impl CallsTable {
     #[must_use]
     pub fn usage_type() -> DataType {
         DataType::List(Arc::new(Field::new(
-            "item",
+            iceberg::spec::LIST_FIELD_NAME,
             DataType::Struct(Fields::from(vec![
                 utf8("dimension", false),
                 utf8("unit", false),
@@ -56,7 +52,11 @@ impl CallsTable {
     /// Arrow type of the sorted pricing-version set.
     #[must_use]
     pub fn pricing_versions_type() -> DataType {
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)))
+        DataType::List(Arc::new(Field::new(
+            iceberg::spec::LIST_FIELD_NAME,
+            DataType::Utf8,
+            false,
+        )))
     }
 
     /// Arrow type of the captured binary payload object references.
@@ -68,7 +68,7 @@ impl CallsTable {
     #[must_use]
     pub fn payload_object_refs_type() -> DataType {
         DataType::List(Arc::new(Field::new(
-            "item",
+            iceberg::spec::LIST_FIELD_NAME,
             DataType::Struct(Fields::from(vec![
                 utf8("digest", false),
                 utf8("content_type", false),
@@ -84,8 +84,10 @@ impl DomainTable for CallsTable {
     const NAME: &'static str = "calls";
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
-    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] =
-        &[REQUEST_PAYLOAD_JSON, RESPONSE_PAYLOAD_JSON];
+    /// Both Variant payload columns require payload-read authority.
+    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[REQUEST_PAYLOAD, RESPONSE_PAYLOAD];
+    /// A resolved model carries both its provider and model, or neither.
+    const WHOLE_STRUCTS: &'static [&'static str] = &[RESOLVED_MODEL];
 
     /// The `GatewayCallPayloadV1` fields in contract order.
     ///
@@ -99,8 +101,26 @@ impl DomainTable for CallsTable {
             utf8("caller_principal_id", false),
             utf8("operation", false),
             utf8("ingress_dialect", false),
-            Field::new("requested_model", Self::model_ref_type(), false),
-            Field::new("resolved_model", Self::model_ref_type(), true),
+            // A `ModelRef`: its provider and provider-native model.
+            Field::new(
+                "requested_model",
+                DataType::Struct(Fields::from(vec![
+                    utf8("provider", false),
+                    utf8("model", false),
+                ])),
+                false,
+            ),
+            // Optional, so both children are nullable: a required Parquet leaf
+            // under a null Struct reads back padded values that a field query
+            // would expose. The table validator still refuses a partial model.
+            Field::new(
+                RESOLVED_MODEL,
+                DataType::Struct(Fields::from(vec![
+                    utf8("provider", true),
+                    utf8("model", true),
+                ])),
+                true,
+            ),
             utf8("resolved_deployment", true),
             boolean("streaming", false),
             ts_us_utc("started_at", false),
@@ -113,8 +133,8 @@ impl DomainTable for CallsTable {
             utf8("currency", true),
             Field::new("pricing_versions", Self::pricing_versions_type(), false),
             int64("capture_policy_version", false),
-            utf8(REQUEST_PAYLOAD_JSON, true),
-            utf8(RESPONSE_PAYLOAD_JSON, true),
+            variant_field(REQUEST_PAYLOAD, true),
+            variant_field(RESPONSE_PAYLOAD, true),
             Field::new(
                 "payload_object_refs",
                 Self::payload_object_refs_type(),
@@ -123,10 +143,11 @@ impl DomainTable for CallsTable {
         ]
     }
 
-    /// Partitions hourly on event time and clusters by call identity.
+    /// Partitions hourly on `started_at` and clusters by call identity.
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(
-            vec![sort_desc(WYRD_EVENT_TIME), sort_asc("call_id")],
+            "started_at",
+            vec![sort_desc("started_at"), sort_asc("call_id")],
             &["call_id", "caller_principal_id"],
         )
     }
@@ -136,13 +157,12 @@ impl DomainTable for CallsTable {
 mod tests {
     use arrow::datatypes::DataType;
 
-    use super::CallsTable;
+    use super::{CallsTable, RESOLVED_MODEL};
     use crate::tables::{DomainTable, builtin_table};
-    use wyrd_spec::vala::{
-        CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID,
-    };
+    use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
-    /// Pins the exact contract columns, their nullability, and the envelope.
+    /// Pins the exact contract columns, their nullability, the two model
+    /// Structs' child nullability, and the envelope.
     ///
     /// # Panics
     ///
@@ -179,25 +199,42 @@ mod tests {
                 ("currency", true),
                 ("pricing_versions", false),
                 ("capture_policy_version", false),
-                ("request_payload_json", true),
-                ("response_payload_json", true),
+                ("request_payload", true),
+                ("response_payload", true),
                 ("payload_object_refs", false),
                 (RUN_ID, true),
                 (CARD_UID, true),
                 (PRINCIPAL_ID, false),
                 (WYRD_REQUEST_ID, false),
-                (WYRD_EVENT_TIME, false),
                 (WYRD_INGESTED_AT, false),
             ]
         );
         assert_eq!(
             definition.sensitive_payload_columns,
-            ["request_payload_json", "response_payload_json"]
+            ["request_payload", "response_payload"]
         );
         assert!(matches!(
             schema.field_with_name("usage").expect("usage").data_type(),
             DataType::List(_)
         ));
+        // A required model has required children; only the optional resolved
+        // model's children are nullable.
+        for (model, nullable) in [("requested_model", false), (RESOLVED_MODEL, true)] {
+            let DataType::Struct(children) =
+                schema.field_with_name(model).expect(model).data_type()
+            else {
+                panic!("{model} is a Struct");
+            };
+            let layout = children
+                .iter()
+                .map(|child| (child.name().as_str(), child.is_nullable()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                layout,
+                [("provider", nullable), ("model", nullable)],
+                "{model}"
+            );
+        }
         assert!(CallsTable::canonical_fields().is_none());
     }
 }

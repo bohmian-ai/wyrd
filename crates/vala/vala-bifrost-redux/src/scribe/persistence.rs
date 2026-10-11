@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use arrow::datatypes::SchemaRef;
 use num_traits::ToPrimitive;
-use opendal::Operator;
+use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 #[cfg(any(test, feature = "test-support"))]
@@ -97,12 +97,16 @@ fn record_persist_stage(stage: &'static str, started: std::time::Instant) {
         .record(started.elapsed().as_secs_f64());
 }
 
-/// Counts one generation's Parquet-encoded bytes after a durable encode.
+/// Counts one staged member's raw and Parquet-encoded bytes after a durable encode.
 ///
-/// Increments `bifrost_scribe_persistence_encoded_bytes_total` by `file_size`.
-fn record_encoded_bytes(file_size: usize) {
+/// Increments `bifrost_scribe_persistence_raw_bytes_total` by the frozen
+/// bucket's uncompressed Arrow bytes and
+/// `bifrost_scribe_persistence_encoded_bytes_total` by the staged runs' encoded
+/// bytes, so `rate(raw) / rate(encoded)` is the staging compression ratio.
+fn record_staged_bytes(staged: &crate::scribe::member_stager::StagedRuns) {
+    metrics::counter!("bifrost_scribe_persistence_raw_bytes_total").increment(staged.raw_bytes());
     metrics::counter!("bifrost_scribe_persistence_encoded_bytes_total")
-        .increment(u64::try_from(file_size).unwrap_or(u64::MAX));
+        .increment(staged.staged_bytes());
 }
 
 /// Test-tier one-shot failures for the concrete persistence seams.
@@ -569,6 +573,8 @@ impl ImmutableGeneration {
             seal_key: self.seal_key.clone(),
             schema: self.schema.clone(),
             batches: self.rows.clone(),
+            // Staging writes the rows; it never prunes them.
+            statistics: Vec::new(),
             metas: self.append_metas.clone(),
             opened_at: self.opened_at,
             closed_at: self.closed_at,
@@ -683,12 +689,12 @@ impl ScribePersistenceConfig {
 /// Shared dependencies every persistence worker needs to publish a claim.
 ///
 /// Built once when the persistence runtime starts and handed to each worker,
-/// so workers share one object-store operator, WAL writer, CPU and WAL-IO
+/// so workers share one object store, WAL writer, CPU and WAL-IO
 /// lanes, fenced actor stream, memory budget, and hot-source registry rather
 /// than constructing their own.
 pub(crate) struct PersistenceRuntimeContext {
-    /// Object-store operator shared by persistence workers.
-    pub(crate) operator: Arc<Operator>,
+    /// Bifrost object store shared by persistence workers.
+    pub(crate) operator: Arc<dyn ObjectStore>,
     /// WAL writer used for manifest location and recovery identity.
     pub(crate) wal: Arc<WalWriter>,
     /// Bounded CPU lane used to encode immutable generations.
@@ -726,7 +732,7 @@ pub struct PersistenceRuntime {
     /// WAL-root stage owner used for pre-readiness publication recovery.
     recovery_wal: Option<Arc<WalWriter>>,
     /// Durable object store used for pre-readiness upload convergence.
-    recovery_operator: Option<Operator>,
+    recovery_operator: Option<Arc<dyn ObjectStore>>,
     /// Root owner charged before allocating recovery transfer buffers.
     recovery_memory: Option<ScribeResources>,
     /// The shared worker retained so drain can publish residue after the queue empties.
@@ -839,7 +845,7 @@ impl PersistenceRuntime {
         let stage = Arc::new(crate::scribe::hot_stage::ScribeHotStage::new(stage_root));
         let publisher = crate::scribe::claim_publication::ClaimPublisher::new(
             Arc::clone(&stage),
-            ScribeStageMover::new(context.wal.base_dir(), (*context.operator).clone()),
+            ScribeStageMover::new(context.wal.base_dir(), Arc::clone(&context.operator)),
             ScribePublicationReconciler::new(
                 operator_pool,
                 context.actor_stream,
@@ -899,7 +905,7 @@ impl PersistenceRuntime {
             )
         });
         let recovery_wal = Arc::clone(&context.wal);
-        let recovery_operator = (*context.operator).clone();
+        let recovery_operator = Arc::clone(&context.operator);
         let recovery_memory = context.memory.clone();
         let failures = Arc::new(Mutex::new(Vec::new()));
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
@@ -1298,7 +1304,7 @@ impl PersistenceRuntime {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "Scribe staged recovery has no root memory owner".to_owned(),
             })?;
-        ScribeStageMover::new(wal.base_dir(), operator.clone())
+        ScribeStageMover::new(wal.base_dir(), Arc::clone(operator))
             .recover_publications(reconciler, memory)
             .await
     }
@@ -1428,7 +1434,7 @@ pub struct ScribeStageMover {
 impl ScribeStageMover {
     /// Builds the mover over the WAL-root stage namespace and durable object store.
     #[must_use]
-    pub fn new(wal_root: &Path, operator: Operator) -> Self {
+    pub fn new(wal_root: &Path, operator: Arc<dyn ObjectStore>) -> Self {
         Self {
             staging: ScribeStaging::new(wal_root),
             uploader: BifrostParquetUploader::new(operator),
@@ -1618,11 +1624,22 @@ impl ScribeStageMover {
 
     /// Replays one validated durable publication in upload/catalog/cleanup order.
     ///
+    /// `vala.file_list` is read first, because a published key is never
+    /// uploaded again:
+    ///
+    /// - a committed set only has its objects read back, then the publication
+    ///   replays and cleans up;
+    /// - an absent set uploads each object, which writes only a missing or
+    ///   contradicting key, then publishes and cleans up;
+    /// - a partial or contradicting set fails closed with no upload and no
+    ///   cleanup, leaving the manifest for an operator.
+    ///
     /// # Errors
     ///
-    /// Returns an internal error when object identity or verified upload fails,
-    /// when fenced SQL publication is not known committed, or when exact
-    /// post-commit cleanup cannot complete.
+    /// Returns an internal error when the publication state cannot be read or
+    /// conflicts, object identity or verification fails, fenced SQL
+    /// publication is not known committed, or exact post-commit cleanup
+    /// cannot complete.
     ///
     /// # Cancellation
     ///
@@ -1641,6 +1658,12 @@ impl ScribeStageMover {
             publication = %publication.logical_identity,
             "reconciling staged publication under the active replacement fence"
         );
+        let state = reconciler.publication_state(&publication.rows).await?;
+        if state == file_list_writer::ArtifactSetPublication::Conflict {
+            return Err(ScribeError::Internal {
+                detail: "recovered Scribe publication contradicts the file list".to_owned(),
+            });
+        }
         for claim in &publication.claims {
             let identity =
                 ParquetObjectIdentity::new(claim.object_key.clone()).map_err(|error| {
@@ -1648,19 +1671,25 @@ impl ScribeStageMover {
                         detail: format!("invalid recovered Scribe object identity: {error}"),
                     }
                 })?;
-            self.uploader
-                .upload_file_verified(
-                    &identity,
-                    &claim.staged_path,
-                    claim.sha256,
-                    claim.length,
-                    chunk,
-                    BifrostUploadRole::Scribe,
-                )
-                .await
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!("recovered staged upload failed: {error}"),
-                })?;
+            let verified = if state == file_list_writer::ArtifactSetPublication::Committed {
+                self.uploader
+                    .verify_published(&identity, claim.sha256, claim.length, chunk)
+                    .await
+            } else {
+                self.uploader
+                    .upload_file_verified(
+                        &identity,
+                        &claim.staged_path,
+                        claim.sha256,
+                        claim.length,
+                        chunk,
+                        BifrostUploadRole::Scribe,
+                    )
+                    .await
+            };
+            verified.map_err(|error| ScribeError::Internal {
+                detail: format!("recovered staged upload failed: {error}"),
+            })?;
         }
         match reconciler.publish(&publication.rows).await {
             ScribePublicationOutcome::Committed(_) => {
@@ -1804,6 +1833,21 @@ impl ScribePublicationReconciler {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn fail_claim_retirement(&self, table_name: &str) -> bool {
         self.faults.take_claim_retirement(table_name)
+    }
+
+    /// Reads what `vala.file_list` already records for one full set,
+    /// without writing or fencing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when the set is malformed or the read fails.
+    pub(crate) async fn publication_state(
+        &self,
+        rows: &[file_list_writer::FileListArtifactInsert],
+    ) -> Result<file_list_writer::ArtifactSetPublication, ScribeError> {
+        file_list_writer::artifact_set_publication(&self.operator_pool, rows)
+            .await
+            .map_err(ScribeError::from)
     }
 
     /// Attempts or reconciles one exact full-set publication.
@@ -2181,7 +2225,7 @@ impl PersistenceWorker {
             }
         };
         record_persist_stage("stage_member", staged_started);
-        record_encoded_bytes(usize::try_from(staged.staged_bytes()).unwrap_or(usize::MAX));
+        record_staged_bytes(&staged);
         let member = staged.member();
         staging.register_member(staged, chrono::Utc::now()).await?;
         Ok(member)
@@ -2964,6 +3008,7 @@ mod tests {
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: None,
+                    oracle_partition_scan_bytes: None,
                     scratch_root: Some(scratch_root.to_owned()),
                     volume_roots: Some(crate::resources::BifrostVolumeRoots {
                         wal: wal_root.to_owned(),
@@ -3055,11 +3100,7 @@ mod tests {
                 .with_operator_pool(database.operator_pool().clone())
                 .with_output_scratch(output_scratch),
                 PersistenceRuntimeContext {
-                    operator: Arc::new(
-                        Operator::new(opendal::services::Memory::default())
-                            .expect("memory operator")
-                            .finish(),
-                    ),
+                    operator: Arc::new(object_store::memory::InMemory::new()),
                     wal: Arc::clone(&wal),
                     persistence_cpu: ScribePersistenceCpuPool::new(1),
                     wal_io: ScribeWalIoPool::new(1),
@@ -3149,7 +3190,7 @@ mod tests {
         fn fixture_schema() -> Arc<arrow::datatypes::Schema> {
             Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(
-                    wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+                    "event_time",
                     arrow::datatypes::DataType::Timestamp(
                         arrow::datatypes::TimeUnit::Microsecond,
                         None,
@@ -3164,14 +3205,14 @@ mod tests {
         ///
         /// The fixture drives the persistence worker directly rather than through
         /// the catalog, so it owns the one registration the worker requires. The
-        /// layout is the canonical omission default, matching a table registered
-        /// without a declaration.
+        /// layout partitions daily on the fixture's `event_time`, matching the
+        /// day partition the generation seals into.
         async fn register_control_row(&self, table: &crate::catalog::TableRef) {
             let fqn = table.fqn();
             let layout = crate::catalog::layout::PhysicalLayout::resolve(
                 &fqn,
                 &Self::fixture_schema(),
-                None,
+                Some(&crate::tables::daily_layout("event_time", Vec::new(), &[])),
             )
             .expect("the fixture schema resolves");
             let mut conn = self
@@ -3323,12 +3364,13 @@ mod tests {
         );
     }
 
-    /// Per-generation encoded bytes are counted after a durable persist.
+    /// Per-member raw and encoded bytes are counted after a durable persist.
     ///
     /// Drives one complete `persist_once` through the real persistence runtime
     /// using the [`IdlePersistenceFixture`] and asserts that
-    /// `bifrost_scribe_persistence_encoded_bytes_total` is incremented by a
-    /// positive amount (the Parquet-encoded size).
+    /// `bifrost_scribe_persistence_raw_bytes_total` and
+    /// `bifrost_scribe_persistence_encoded_bytes_total` are each incremented by
+    /// a positive amount (the Arrow and Parquet-encoded sizes).
     #[tokio::test(flavor = "current_thread")]
     #[cfg(feature = "test-support")]
     async fn persist_once_counts_encoded_bytes() {
@@ -3345,6 +3387,15 @@ mod tests {
         assert!(
             encoded_bytes.is_some_and(|bytes| bytes > 0),
             "encoded bytes must be counted after persist_once"
+        );
+        let raw_bytes = recorder
+            .snapshot()
+            .counters
+            .get("bifrost_scribe_persistence_raw_bytes_total")
+            .copied();
+        assert!(
+            raw_bytes.is_some_and(|bytes| bytes > 0),
+            "raw bytes must be counted after persist_once"
         );
     }
 

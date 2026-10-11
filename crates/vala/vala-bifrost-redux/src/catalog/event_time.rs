@@ -1,6 +1,7 @@
-//! Normalized immutable `wyrd_event_time` statistics for one persisted file.
+//! Normalized immutable time-column statistics for one persisted file.
 //!
-//! Both persisted sources declare an event-time interval for every object they
+//! Every table has one time column (its layout's `time_column`). Both persisted
+//! sources declare that column's interval for every object they
 //! produce: a pinned Iceberg manifest entry carries it as typed `DataFile`
 //! lower/upper bounds, and an unresolved `vala.file_list` row carries it as two
 //! durable timestamp columns. Oracle uses that interval to exclude a provably
@@ -13,7 +14,12 @@
 //! would drop rows, which is a correctness failure, whereas pruning that
 //! declines costs one file read.
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
+use iceberg::spec::{DataFile, Datum, PrimitiveLiteral, PrimitiveType};
+
+use crate::catalog::TimePrecision;
 
 /// Closed reason one file's declared event-time bounds cannot prune.
 ///
@@ -83,6 +89,47 @@ impl EventTimeStatistics {
             },
             (Some(_), Some(_)) => Self::Unusable(EventTimeBoundsDefect::Contradictory),
             _ => Self::Unusable(EventTimeBoundsDefect::Missing),
+        }
+    }
+
+    /// Decodes one manifest entry's time-column interval by field identity.
+    ///
+    /// The bounds may be any Iceberg timestamp type a time column can have; a
+    /// nanosecond bound is narrowed through [`TimePrecision`] so the interval
+    /// still contains every stored instant. A bound that is absent is
+    /// [`EventTimeBoundsDefect::Missing`]; one that is present but not a
+    /// timestamp long literal, or not representable as a UTC microsecond
+    /// instant, is [`EventTimeBoundsDefect::Invalid`]. Both classes retain the
+    /// file.
+    #[must_use]
+    pub fn from_manifest_bounds(data_file: &DataFile, field_id: i32) -> Self {
+        let decode = |bounds: &HashMap<i32, Datum>, upper: bool| {
+            let datum = bounds
+                .get(&field_id)
+                .ok_or(EventTimeBoundsDefect::Missing)?;
+            let precision = match datum.data_type() {
+                PrimitiveType::Timestamp | PrimitiveType::Timestamptz => TimePrecision::Micros,
+                PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs => TimePrecision::Nanos,
+                _ => return Err(EventTimeBoundsDefect::Invalid),
+            };
+            let PrimitiveLiteral::Long(value) = datum.literal() else {
+                return Err(EventTimeBoundsDefect::Invalid);
+            };
+            let micros = if upper {
+                precision.ceil_micros(*value)
+            } else {
+                precision.floor_micros(*value)
+            };
+            DateTime::from_timestamp_micros(micros)
+                .map(|_| micros)
+                .ok_or(EventTimeBoundsDefect::Invalid)
+        };
+        match (
+            decode(data_file.lower_bounds(), false),
+            decode(data_file.upper_bounds(), true),
+        ) {
+            (Ok(min_micros), Ok(max_micros)) => Self::normalize(Some(min_micros), Some(max_micros)),
+            (Err(defect), _) | (_, Err(defect)) => Self::Unusable(defect),
         }
     }
 

@@ -208,11 +208,6 @@ struct AnalyticalGraphState {
     running_query: Option<super::query_stream::RunningQueryTerminalOwner>,
     /// The query-owned runtime every follower of this graph installs.
     runtime: OracleExecution,
-    /// Every outbound exchange stream this graph opened, owned by the graph.
-    ///
-    /// Shared by the leader session that opens them and the lease that settles
-    /// the graph, so one graph has exactly one place its exchanges live.
-    exchanges: Arc<super::analytical_transport::AnalyticalGraphExchanges>,
     /// Cancellation child covering every descendant of this graph.
     ///
     /// Owned by the graph rather than by each attempt because a graph's
@@ -489,7 +484,6 @@ impl AnalyticalSupervisor {
                 retained_admission: None,
                 running_query: None,
                 runtime,
-                exchanges: Arc::default(),
                 cancel: self.root_cancel.child_token(),
                 metric_fold: None,
             }),
@@ -507,25 +501,6 @@ impl AnalyticalSupervisor {
         })
     }
 
-    /// Returns one registered graph's own exchange registry.
-    ///
-    /// `None` when the graph is not registered here, which is the correct
-    /// answer: an unregistered graph opens no exchange.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
-    pub fn graph_exchanges(
-        &self,
-        graph: AnalyticalGraphKey,
-    ) -> Result<Option<Arc<super::analytical_transport::AnalyticalGraphExchanges>>, BifrostError>
-    {
-        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        Ok(graphs
-            .get(&graph)
-            .map(|entry| Arc::clone(&entry.state().exchanges)))
-    }
-
     /// Returns one registered graph's own cancellation child.
     ///
     /// `None` when the graph is not registered here, which is the correct
@@ -540,6 +515,51 @@ impl AnalyticalSupervisor {
     ) -> Result<Option<CancellationToken>, BifrostError> {
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
         Ok(graphs.get(&graph).map(|entry| entry.state().cancel.clone()))
+    }
+
+    /// Reports whether one registered graph's envelope has no nested child left.
+    ///
+    /// An unregistered graph is idle by definition: there is no envelope left to
+    /// outlive. Callers use this to wait out a teardown they cannot observe
+    /// directly before releasing the graph, so a poison still means a leak.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub fn graph_children_idle(&self, graph: AnalyticalGraphKey) -> Result<bool, BifrostError> {
+        Ok(self.graph_children_debt(graph)? == 0)
+    }
+
+    /// Reports what one registered graph's envelope still owes its children.
+    ///
+    /// Returns the query-pool memory bytes a nested child still holds. An
+    /// unregistered graph owes nothing. This is what makes a drain timeout name
+    /// what stayed rather than only its existence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub fn graph_children_debt(&self, graph: AnalyticalGraphKey) -> Result<usize, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        Ok(graphs
+            .get(&graph)
+            .map_or(0, |entry| entry.state().resources.nested_memory_bytes()))
+    }
+
+    /// Names the nested children one registered graph's envelope still holds.
+    ///
+    /// Paired with [`Self::graph_children_debt`] in a drain timeout, so the
+    /// warning says what stayed and not only how much. An unregistered graph
+    /// holds nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub fn graph_children(&self, graph: AnalyticalGraphKey) -> Result<Vec<String>, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        Ok(graphs.get(&graph).map_or_else(Vec::new, |entry| {
+            entry.state().resources.nested_memory_consumers()
+        }))
     }
 
     /// Returns the number of registered graphs, for terminal-cleanup evidence.
@@ -841,6 +861,10 @@ impl AnalyticalSupervisor {
 
     /// Releases one graph's runtime and admitted envelope.
     ///
+    /// The graph's removal and the return of its envelope and permit are one
+    /// step under the graph lock, so `live_graphs` reaching zero implies every
+    /// released envelope is already back with the resource root.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when an attempt of the graph is
@@ -858,17 +882,41 @@ impl AnalyticalSupervisor {
                 });
             }
         }
-        let removed = {
+        // The envelope's own nested children outlive the attempts that made
+        // them: upstream drops a follower's stage plan after the coordinator
+        // channel ends, so a cache entry, exchange buffer, or spill write can
+        // still hold this envelope for a moment. Returning it now would report
+        // a live reservation back to the process governor and poison it.
+        if !self.graph_children_idle(graph)? {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical graph still owns a live envelope child".to_owned(),
+            });
+        }
+        // The graph leaves the map, its runtime leaves the registry, and its
+        // envelope and permit drop, all under the graph lock, so no observer of
+        // `live_graphs` sees the graph gone while its envelope is still
+        // charged. The registry lock is a leaf, so nesting it here is safe.
+        let (running_query, attempt) = {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-            graphs.remove(&graph)
+            let Some(mut removed) = graphs.remove(&graph) else {
+                return Err(BifrostError::QueryExecutionFailed);
+            };
+            let state = removed.state_mut();
+            // Handed back rather than dropped here: dropping the owner would
+            // retire the entry as failed, and only the caller knows this
+            // graph's terminal.
+            let running_query = state.running_query.take();
+            // An attempt ownership left on the permit would re-enter this
+            // supervisor when dropped, so it is dropped after the lock.
+            let attempt = state
+                .retained_admission
+                .as_mut()
+                .and_then(super::admission::AdmittedQueryGuard::take_analytical);
+            self.registry.invalidate(graph)?;
+            drop(removed);
+            (running_query, attempt)
         };
-        let Some(mut removed) = removed else {
-            return Err(BifrostError::QueryExecutionFailed);
-        };
-        // Handed back rather than dropped here: dropping the owner would retire
-        // the entry as failed, and only the caller knows this graph's terminal.
-        let running_query = removed.state_mut().running_query.take();
-        self.registry.invalidate(graph)?;
+        drop(attempt);
         tracing::debug!(
             public_query_id = %graph.public_query_id,
             datafusion_query_id = %graph.datafusion_query_id,
@@ -1434,6 +1482,7 @@ mod tests {
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             scratch_root: None,
             volume_roots: None,
         };
@@ -1562,10 +1611,7 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let failing_resources = failing_oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits the rewrite-failure query");
         let failing_runtime = failing_resources.execution().clone();
         let mut failing = lifecycle_over_fold(
@@ -1652,10 +1698,7 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let expired_resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits the held query");
         let expired_runtime = expired_resources.execution().clone();
         let never = Arc::clone(&held);
@@ -1699,10 +1742,7 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let settled_resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits the released query");
         let settled_runtime = settled_resources.execution().clone();
         let mut settled = lifecycle_over_fold(
@@ -1765,16 +1805,10 @@ mod tests {
     async fn analytical_stage_identity_separates_public_and_datafusion_queries() {
         let oracle = oracle_role();
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let resources_b = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits a second analytical query");
         let runtime_a = resources.execution().clone();
         let runtime_b = resources_b.execution().clone();
@@ -1914,10 +1948,7 @@ mod tests {
         let metrics_guard = metrics::set_default_local_recorder(&recorder);
         let oracle = oracle_role();
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let pool = Arc::clone(resources.execution().memory_pool());
         let runtime = resources.execution().clone();

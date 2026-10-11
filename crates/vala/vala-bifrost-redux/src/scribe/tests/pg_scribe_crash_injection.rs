@@ -266,3 +266,168 @@ fn replay_restores_multi_shard_seal_key_to_recorded_lanes() {
          got {total_records}"
     );
 }
+
+/// Writes one acknowledged batch, then `tail` as the bytes a crashed group
+/// fsync left behind it.
+///
+/// Returns the segment path, its length before the tail, and the batch's
+/// COMMIT LSN, the newest fence the batch's acknowledgement committed.
+///
+/// # Panics
+///
+/// Panics when the WAL fixture cannot be written or read back.
+fn acknowledged_prefix_then(
+    temp_dir: &TempDir,
+    key: &SealKey,
+    tail: &[u8],
+) -> (std::path::PathBuf, u64, WalLsn) {
+    let node = NodeId::new(Uuid::now_v7());
+    let writer = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
+        .expect("WAL writer");
+    writer
+        .append_and_commit_for_replay_test(key, [1_u8; 16], &data_bytes(1))
+        .expect("acknowledged append");
+    let reader = crate::scribe::wal::WalReader::open_directory_unfiltered(temp_dir.path())
+        .expect("WAL reader");
+    let commit = reader
+        .read_all_records()
+        .expect("acknowledged records")
+        .last()
+        .expect("the batch's COMMIT")
+        .lsn;
+    let path = temp_dir
+        .path()
+        .join(node.as_uuid().simple().to_string())
+        .join("1")
+        .join(format!(
+            "shard-{:02}",
+            shard_for(
+                key.tenant,
+                &key.table,
+                Uuid::from_bytes([1_u8; 16]),
+                crate::scribe::routing::TEST_SHARD_COUNT,
+            )
+        ))
+        .join("0.wal");
+    let valid_len = std::fs::metadata(&path).expect("WAL metadata").len();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open WAL tail");
+    file.write_all(tail).expect("crashed group bytes");
+    file.sync_all().expect("sync crashed group bytes");
+    (path, valid_len, commit)
+}
+
+/// Replays `temp_dir` with `fences` as the acknowledgement authority and
+/// returns the reconstructed seal-key states.
+///
+/// # Errors
+///
+/// Returns the replay's refusal.
+fn replay_with_fences(
+    temp_dir: &TempDir,
+    fences: Option<crate::scribe::wal::FenceLookup<'_>>,
+) -> Result<usize, crate::contracts::ScribeError> {
+    let mut states = 0;
+    crate::scribe::replay::replay_wal_directory_stream_accounted(
+        temp_dir.path(),
+        None,
+        None,
+        None,
+        None,
+        fences,
+        |chunk| {
+            states += chunk.states.len();
+            Ok(crate::scribe::replay::ReplayChunkSettlement {
+                identity_memory: None,
+            })
+        },
+    )?;
+    Ok(states)
+}
+
+/// The newest fence of every stream: the acknowledged COMMIT at `lsn` in
+/// segment zero.
+const fn fence_at(lsn: WalLsn) -> crate::scribe::wal::NewestFence {
+    crate::scribe::wal::NewestFence {
+        segment_sequence: 0,
+        lsn,
+    }
+}
+
+#[test]
+/// Unwritten blocks of a crashed group read as zeros; the chain ends at
+/// them because the newest fence precedes them, and the acknowledged batch
+/// replays.
+fn zeroed_block_after_the_newest_fence_ends_the_chain() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let key = key();
+    let (path, valid_len, commit) = acknowledged_prefix_then(&temp_dir, &key, &[0_u8; 512]);
+
+    let fences = |_: StreamIdentity, _: u8| Ok(Some(fence_at(commit)));
+    let replayed = replay_with_fences(&temp_dir, Some(&fences)).expect("replay ends at the tail");
+
+    assert_eq!(replayed, 1, "the acknowledged batch replays");
+    assert_eq!(
+        std::fs::metadata(path).expect("WAL metadata").len(),
+        valid_len,
+        "the unacknowledged tail is truncated"
+    );
+}
+
+#[test]
+/// A complete record whose CRC fails ends the chain when its stream
+/// acknowledged nothing beyond it.
+fn corrupt_record_in_an_unacknowledged_stream_ends_the_chain() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let key = key();
+    let mut corrupt = WalRecord::new(WalLsn::new(9), 2, [2_u8; 16], vec![1, 2, 3]).encode();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xff;
+    let (path, valid_len, _) = acknowledged_prefix_then(&temp_dir, &key, &corrupt);
+
+    let fences = |_: StreamIdentity, _: u8| Ok(None);
+    let replayed = replay_with_fences(&temp_dir, Some(&fences)).expect("replay ends at the tail");
+
+    assert_eq!(replayed, 1);
+    assert_eq!(
+        std::fs::metadata(path).expect("WAL metadata").len(),
+        valid_len
+    );
+}
+
+#[test]
+/// A bad record before an acknowledged COMMIT is corruption of acknowledged
+/// data: replay refuses and leaves the segment untouched.
+fn bad_record_before_an_acknowledged_commit_fails_closed() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let key = key();
+    let (path, valid_len, commit) = acknowledged_prefix_then(&temp_dir, &key, &[0_u8; 512]);
+
+    let fences = |_: StreamIdentity, _: u8| Ok(Some(fence_at(WalLsn::new(commit.as_u64() + 1))));
+    let error = replay_with_fences(&temp_dir, Some(&fences)).expect_err("acknowledged data lost");
+
+    assert!(error.to_string().contains("acknowledged COMMIT"), "{error}");
+    assert_eq!(
+        std::fs::metadata(path).expect("WAL metadata").len(),
+        valid_len + 512,
+        "a refused replay mutates nothing"
+    );
+}
+
+#[test]
+/// Without a fence authority no bad record can be proven unacknowledged, so
+/// replay refuses it.
+fn bad_record_without_a_fence_authority_fails_closed() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let key = key();
+    let (path, valid_len, _) = acknowledged_prefix_then(&temp_dir, &key, &[0_u8; 512]);
+
+    replay_with_fences(&temp_dir, None).expect_err("an unproven tail fails closed");
+
+    assert_eq!(
+        std::fs::metadata(path).expect("WAL metadata").len(),
+        valid_len + 512
+    );
+}

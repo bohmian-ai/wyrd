@@ -6,33 +6,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
-use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::execution::TaskContext;
 use datafusion::execution::session_state::SessionState;
+use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
-use iceberg::io::FileIO;
-use iceberg_datafusion::physical_plan::IcebergTableScan;
+use wyrd_tonic::prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, OracleRoleFence,
-    PersistedFileDescriptor, ReservationId, TenantTableBinding,
+    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, OracleRoleFence, ReservationId,
+    TenantTableBinding,
 };
 use wyrd_tonic::prost::Message;
 
 use super::codec::{OraclePhysicalExtensionCodec, physical_plan_fingerprint};
 use crate::catalog::layout::TimePartition;
-use crate::catalog::{BifrostCatalog, TableRef, TenantTableBinding as CatalogTableBinding};
+use crate::catalog::{BifrostCatalog, TableRef};
 use crate::contracts::ScribeError;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, LiveTailBatches};
-use crate::storage::BifrostStorage;
 
 /// Hard private plan-size default enforced before protobuf decoding.
 pub const DEFAULT_MAX_PHYSICAL_PLAN_BYTES: usize = 8 * 1024 * 1024;
@@ -58,8 +55,7 @@ pub enum PhysicalPlanFollowerError {
 ///
 /// The class is decided where the cause is known and carried unchanged to the
 /// role's dispatch mapping, which is the only place it becomes a wire
-/// outcome. A published follower treats every class as eligible source loss;
-/// a Scribe follower degrades only `SourceLoss` and fails `Fault`.
+/// outcome. A Scribe follower degrades only `SourceLoss` and fails `Fault`.
 #[derive(Debug, Error)]
 pub enum FollowerResolutionError {
     /// Schema, projection, predicate, binding, integrity, or local execution
@@ -115,48 +111,18 @@ impl std::fmt::Debug for ResolvedFollowerSource {
 /// # Errors
 ///
 /// Returns a redacted message when a signed name is absent from the
-/// authenticated schema or names it ambiguously. Neither is repaired: silently
-/// deduplicating or reordering a signed assignment would read something other
-/// than what the leader signed.
+/// authenticated schema or names it ambiguously. None is repaired: silently deduplicating or
+/// reordering a signed assignment would read something other than what the
+/// leader signed.
 pub(super) fn signed_closure_schema(
     full_schema: &arrow::datatypes::Schema,
-    required_columns: &[String],
+    assignment: &FollowerScanAssignment,
 ) -> Result<SchemaRef, String> {
-    super::exec::select_schema_by_name(full_schema, required_columns)
+    super::exec::select_schema_by_name(full_schema, &assignment.required_columns)
         .map(|(schema, _)| schema)
         .map_err(|_| {
             "assignment closure does not resolve against the authenticated schema".to_owned()
         })
-}
-
-/// Resolver that refuses every assignment, for fixtures that never scan.
-///
-/// Analytical decode needs a resolver to exist before a plan arrives, but a
-/// transport or session fixture proves ordering rather than data. Refusing is
-/// the honest behavior: a fixture that unexpectedly reaches source resolution
-/// fails loudly instead of silently reading nothing.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Default)]
-pub struct UnresolvableSource;
-
-#[cfg(any(test, feature = "test-support"))]
-#[async_trait]
-impl FollowerSourceResolver for UnresolvableSource {
-    /// Always refuses, naming the fixture rather than a catalog failure.
-    ///
-    /// # Errors
-    ///
-    /// Always returns [`FollowerResolutionError::Fault`].
-    async fn resolve(
-        &self,
-        _target_role: ClusterRole,
-        _assignment: &FollowerScanAssignment,
-        _session: &SessionState,
-    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
-        Err(FollowerResolutionError::Fault(
-            "fixture resolver refuses every assignment".to_owned(),
-        ))
-    }
 }
 
 /// Async boundary that constructs one authenticated role-local scan provider.
@@ -209,15 +175,12 @@ where
 fn request_session(
     execution: &crate::resources::OracleExecution,
 ) -> (SessionState, Arc<TaskContext>) {
-    let state = execution.session_state(datafusion::prelude::SessionConfig::new());
-    let task = Arc::new(TaskContext::from(&state));
-    (state, task)
+    execution.session(datafusion::prelude::SessionConfig::new())
 }
 
 /// Refuses a follower fragment that was assigned nothing to scan.
 ///
-/// Each dispatched persisted file and each assigned Scribe cut is one
-/// openable scan target; a fragment with none should never have been
+/// Each assigned Scribe cut is one openable scan target; a fragment with none should never have been
 /// dispatched.
 ///
 /// # Errors
@@ -228,10 +191,10 @@ fn request_session(
 fn require_scannable_work(
     assignments: &[FollowerScanAssignment],
 ) -> Result<(), PhysicalPlanFollowerError> {
-    let scannable = assignments.iter().any(|assignment| {
-        !assignment.persisted.files.is_empty() || assignment.scribe_provider_cut.is_some()
-    });
-    if !scannable {
+    if !assignments
+        .iter()
+        .any(|assignment| assignment.scribe_provider_cut.is_some())
+    {
         return Err(PhysicalPlanFollowerError::Preflight(
             "dispatched fragment carries no scannable work".to_owned(),
         ));
@@ -261,117 +224,6 @@ pub struct AuthenticatedFollowerContext<'a> {
     pub local_fence: OracleRoleFence,
 }
 
-/// Authenticated Oracle resolver backed by the tenant catalog and Iceberg provider.
-pub struct OracleCatalogResolver {
-    /// Tenant-qualified catalog owner.
-    catalog: Arc<BifrostCatalog>,
-}
-
-impl std::fmt::Debug for OracleCatalogResolver {
-    /// Redacts catalog internals while exposing the non-secret resolver shape.
-    ///
-    /// # Errors
-    /// Returns the formatter error if the destination cannot accept the redacted value.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("OracleCatalogResolver")
-            .field("catalog", &"authenticated")
-            .finish()
-    }
-}
-
-impl OracleCatalogResolver {
-    /// Creates an Oracle resolver from already-authenticated process capabilities.
-    #[must_use]
-    pub fn new(catalog: Arc<BifrostCatalog>) -> Self {
-        Self { catalog }
-    }
-
-    /// Builds the follower-governed hot leaf for a validated hot assignment.
-    ///
-    /// Every object identity, size, and assignment fence has been validated by
-    /// the caller, so the shared hot leaf is constructed in follower
-    /// governance: its reservations are charged to the request-local pool
-    /// backed by the retained worker lease. It is built at the closure schema,
-    /// so its Parquet column mask decodes only the signed columns, and split
-    /// across the session's target partitions by byte range.
-    ///
-    /// # Errors
-    /// Returns a scrubbed message when an assigned descriptor is not a hot
-    /// object bound to this assignment.
-    fn hot_leaf(
-        &self,
-        assignment: &FollowerScanAssignment,
-        assigned_locations: &[(PersistedFileDescriptor, String, String)],
-        required_schema: SchemaRef,
-        full_schema: SchemaRef,
-        session: &SessionState,
-    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
-        let files = assigned_locations
-            .iter()
-            .map(|(descriptor, _, location)| {
-                signed_hot_source(descriptor, location, &assignment.binding)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ResolvedFollowerSource {
-            plan: Arc::new(
-                super::exec::HotParquetExec::new(
-                    files,
-                    self.catalog.file_io(),
-                    Arc::clone(self.catalog.storage()),
-                    required_schema,
-                    super::exec::HotParquetPlan::Follower {
-                        memory_pool: session.runtime_env().memory_pool.clone(),
-                    },
-                    Arc::new(super::exec::OracleScanMetricsHandle::default()),
-                    assignment.predicates.clone(),
-                )
-                .with_partitions(session.config().target_partitions()),
-            ),
-            full_schema,
-        })
-    }
-
-    /// Resolves every assigned descriptor to its table-relative and absolute
-    /// object location.
-    ///
-    /// Kept separate from `resolve` because it is the one part of that workflow
-    /// that only needs the catalog binding: it turns signed paths into
-    /// locations this node can open, and refuses any path that does not live
-    /// under the authenticated table's own prefix.
-    ///
-    /// # Errors
-    /// Returns a scrubbed message when the binding does not resolve, when a
-    /// signed path is not under the table's prefix, or when the catalog cannot
-    /// place an object.
-    fn assigned_locations(
-        &self,
-        assignment: &FollowerScanAssignment,
-        table: TableRef,
-    ) -> Result<Vec<(PersistedFileDescriptor, String, String)>, String> {
-        let catalog_binding =
-            CatalogTableBinding::resolve((assignment.binding.tenant_id, table))
-                .map_err(|_| "authenticated Oracle assignment binding failed".to_owned())?;
-        assignment
-            .persisted
-            .files
-            .iter()
-            .map(|descriptor| {
-                let path = descriptor.path();
-                let table_relative = path
-                    .strip_prefix(&catalog_binding.object_prefix)
-                    .and_then(|suffix| suffix.strip_prefix('/'))
-                    .ok_or_else(|| "authenticated Oracle assignment binding failed".to_owned())?
-                    .to_owned();
-                self.catalog
-                    .object_location(&catalog_binding, path)
-                    .map(|location| (descriptor.clone(), table_relative, location))
-                    .map_err(|_| "authenticated Oracle assignment location failed".to_owned())
-            })
-            .collect()
-    }
-}
-
 /// Builds the leaf for an assignment that names no files at all.
 ///
 /// A signed closure can legitimately select nothing once the leader has pruned
@@ -395,211 +247,6 @@ fn empty_assignment_leaf(
         .map_err(|_| {
             FollowerResolutionError::Fault("authenticated empty provider failed".to_owned())
         })
-}
-
-#[async_trait]
-impl FollowerSourceResolver for OracleCatalogResolver {
-    /// Builds one tenant-qualified leaf for an Oracle assignment and rejects
-    /// Scribe assignments.
-    ///
-    /// Which leaf depends on the validated variant of the assignment's own
-    /// descriptors, never on its scan id. A hot assignment
-    /// reads sealed Scribe output directly through [`super::exec::HotParquetExec`],
-    /// which takes `assignment.predicates` as its own filter; an Iceberg
-    /// assignment reads compacted output through the catalog provider's scan,
-    /// which takes the same predicates as logical filters. Both leaves therefore
-    /// prune from the closure the leader signed, but only one of them is built
-    /// per call — the hot branch returns before the provider scan, so a hot
-    /// assignment never plans a catalog scan it would discard.
-    ///
-    /// Both leaves are also built at the signed closure schema rather than the
-    /// full catalog schema, so the physical read is narrowed here rather than
-    /// being narrowed by a projection above a leaf that already paid for the
-    /// wide columns.
-    ///
-    /// Cancellation during catalog or scan IO drops all locally acquired state
-    /// and exposes no provider; retry restarts the complete resolution.
-    ///
-    /// # Errors
-    /// Returns a redacted resolution error for a role mismatch, invalid table binding,
-    /// catalog lookup failure, a closure that does not resolve against the
-    /// authenticated schema, hot-file metadata failure, or physical scan
-    /// construction failure.
-    async fn resolve(
-        &self,
-        target_role: ClusterRole,
-        assignment: &FollowerScanAssignment,
-        session: &SessionState,
-    ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
-        if target_role != ClusterRole::Oracle || assignment.scribe_provider_cut.is_some() {
-            return Err(FollowerResolutionError::Fault(
-                "Oracle resolver received a non-Oracle assignment".to_owned(),
-            ));
-        }
-        let table = assignment_table(&assignment.binding)?;
-        // Classified before any catalog or object I/O. The scan id is a
-        // leader-chosen label on the wire; the descriptor variant is what
-        // preflight validated and what the assignment-authority digest covers,
-        // so it is the only thing this dispatch may read. A list mixing sources
-        // or snapshots has no single correct reader and is refused here as well
-        // as in preflight, because this resolver is reachable from any
-        // authenticated fragment.
-        let source = super::AssignedPersistedSource::classify(&assignment.persisted.files)
-            .map_err(|_| "authenticated Oracle assignment names mixed sources".to_owned())?;
-        // An Iceberg assignment binds to the snapshot it names rather than to
-        // whichever one is current here, so a snapshot that has since been
-        // replaced fails to resolve instead of serving files and a schema the
-        // leader never planned, digested, or signed.
-        let provider = match source {
-            super::AssignedPersistedSource::Iceberg { snapshot_id } => {
-                self.catalog
-                    .pinned_provider(&table, assignment.binding.tenant_id, snapshot_id)
-                    .await
-            }
-            super::AssignedPersistedSource::Hot | super::AssignedPersistedSource::Empty => {
-                self.catalog
-                    .provider(&table, assignment.binding.tenant_id)
-                    .await
-            }
-        }
-        .map_err(|_| "authenticated Oracle catalog provider failed".to_owned())?;
-        // Validates the full physical schema fingerprint against the
-        // authenticated table's actual schema immediately after catalog
-        // resolution and before any per-file object I/O (the hot-file branch
-        // below issues metadata HEAD requests). `decode` repeats this check
-        // once more after every scan id in the request resolves, but that
-        // later check alone would let a mismatched hot assignment reach
-        // storage first.
-        let full_schema = provider.schema();
-        let actual = super::assignment_schema_fingerprint(full_schema.as_ref());
-        if actual != assignment.schema_fingerprint {
-            return Err(FollowerResolutionError::Fault(
-                "resolved provider schema fingerprint differs from assignment".to_owned(),
-            ));
-        }
-        // Derived before any object I/O so an assignment naming a column this
-        // table does not have is refused rather than partially read.
-        let required_schema =
-            signed_closure_schema(full_schema.as_ref(), &assignment.required_columns)?;
-        if assignment.persisted.files.is_empty() {
-            return empty_assignment_leaf(&required_schema, full_schema);
-        }
-        let assigned_locations = self.assigned_locations(assignment, table)?;
-        if source == super::AssignedPersistedSource::Hot {
-            return self.hot_leaf(
-                assignment,
-                &assigned_locations,
-                required_schema,
-                full_schema,
-                session,
-            );
-        }
-        // Compacted assignments keep the catalog's own scan. Rebuild the leaf
-        // from the closure the leader signed: the follower resolves its own
-        // provider, so `assignment.predicates` is the only description of what
-        // this cut may skip, and handing it back as logical filters is what
-        // lets the Iceberg source prune files and row groups. The signed names
-        // are translated to this provider's own indices and pushed as the scan
-        // projection, so unrequested columns are never read; the provider is
-        // free to return them in its own order, which the name-based
-        // normalization below corrects without touching the signed closure.
-        let pushdown =
-            super::exec::scan_predicate_logical_exprs(&assignment.predicates, &full_schema);
-        let (_, indices) =
-            super::exec::select_schema_by_name(full_schema.as_ref(), &assignment.required_columns)
-                .map_err(|_| {
-                    "assignment closure does not resolve against the authenticated schema"
-                        .to_owned()
-                })?;
-        let plan = provider
-            .scan(session, Some(&indices), &pushdown, None)
-            .await
-            .map_err(|_| "authenticated Oracle physical scan failed".to_owned())?;
-        // The descriptor is retained on each assigned location for identity-bearing
-        // reads; plan restriction itself only needs the canonical path, the
-        // table-relative alias, and the resolved object location.
-        let restriction = assigned_locations
-            .iter()
-            .map(|(descriptor, table_relative, location)| {
-                (
-                    descriptor.path().to_owned(),
-                    table_relative.clone(),
-                    location.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let plan = restrict_plan_to_assigned_files(
-            plan,
-            &restriction,
-            session.config().target_partitions(),
-        )?;
-        // Footers load through the node's one governed cache, charged to the
-        // request-local pool the retained worker lease backs, like hot ranges.
-        let plan = super::exec::route_published_footers(
-            plan,
-            &super::exec::PublishedFooters::new(
-                Arc::clone(self.catalog.storage()),
-                assignment.binding.tenant_id,
-                assignment.binding.table.clone(),
-                super::exec::HotParquetPlan::Follower {
-                    memory_pool: session.runtime_env().memory_pool.clone(),
-                },
-            ),
-        )
-        .map_err(|_| "authenticated Oracle footer routing failed".to_owned())?;
-        let plan = super::exec::project_plan_by_name(plan, &assignment.required_columns)
-            .map_err(|_| "authenticated Oracle closure normalization failed".to_owned())?;
-        Ok(ResolvedFollowerSource { plan, full_schema })
-    }
-}
-
-/// Builds one hot leaf source from the signed descriptor and its resolved
-/// location, without touching the object.
-///
-/// The descriptor's `size_bytes` is the leader's own durable statement of the
-/// object's exact length, taken from the `vala.file_list` row it signed and
-/// covered by the assignment-authority digest this follower already verified.
-/// Re-reading the length from storage would replace that verified fact with an
-/// unauthenticated one — an object whose length disagreed would be read at
-/// whatever length storage reported rather than refused — and would spend one
-/// round trip per assigned file before the scan begins.
-///
-/// The event-time interval is deliberately dropped: the leader already applied
-/// the query interval to this list and signed the result, so every assigned
-/// file is retained by construction and a second local decision here could only
-/// disagree with a signed one.
-///
-/// # Errors
-/// Returns a redacted resolution error when the signed length does not fit this
-/// platform's `usize`, which is a malformed assignment rather than a large file.
-fn signed_hot_source(
-    descriptor: &PersistedFileDescriptor,
-    location: &str,
-    binding: &wyrd_spec::vala::api::TenantTableBinding,
-) -> Result<super::exec::HotFileSource, String> {
-    let PersistedFileDescriptor::Hot(hot) = descriptor else {
-        return Err("authenticated Oracle hot provider failed".to_owned());
-    };
-    let size_bytes = usize::try_from(descriptor.size_bytes())
-        .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?;
-    Ok(super::exec::HotFileSource {
-        // Keyed on the leader's signed `vala.file_list` identity and decoded
-        // checksum, the same identity the leader itself keys on, so a follower
-        // reading the same durable object shares the node's one decode.
-        metadata_key: crate::storage::ObjectMetadataKey::new(
-            binding.tenant_id,
-            binding.table.clone(),
-            hot.path.clone(),
-            hot.file_list_id,
-            hot.sha256,
-            hot.size_bytes,
-        ),
-        location: location.to_owned(),
-        size_bytes,
-        event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
-            crate::catalog::event_time::EventTimeBoundsDefect::Missing,
-        ),
-    })
 }
 
 /// Authenticated Scribe resolver backed by the unchanged pod-local live-tail service.
@@ -661,23 +308,36 @@ fn live_open_error(error: &ScribeError) -> FollowerResolutionError {
 ///
 /// It turns the opened live read into one `DataFusion` leaf: the memtable cut
 /// as an in-memory source and the unserved staged runs through Oracle's own
-/// hot-Parquet scan, both split across the session's target partitions and
-/// filtered by the signed predicates.
+/// hot-Parquet scan, the memtable split across the session's target
+/// partitions and the staged runs by `DataFusion`'s Parquet scan, both filtered by
+/// the signed closure.
 pub struct ScribeTailResolver<T = FetchLiveTailService> {
     /// Existing Scribe snapshot service; this owner calls it once per assignment.
     tail: Arc<T>,
     /// Closed source for the authenticated role-local table schema.
     schema_source: ScribeSchemaSource,
-    /// The node's storage owner, whose metadata cache holds staged-run footers.
-    storage: Arc<BifrostStorage>,
-    /// Non-blocking local-filesystem reader for this pod's staged runs.
-    staged_io: FileIO,
+    /// The pod's Oracle partition sizing, the one the leader sized the query
+    /// with; memtable batches are dealt by it.
+    partitioning: crate::scan_sizing::OraclePartitioning,
 }
 
 /// Closed Scribe schema source separating production catalog IO from unit fixtures.
 enum ScribeSchemaSource {
-    /// Shared tenant-qualified production catalog.
-    Catalog(Arc<BifrostCatalog>),
+    /// Shared tenant-qualified production catalog, and the last schema it
+    /// returned for each tenant's table.
+    ///
+    /// A cached schema is used only while its fingerprint equals the one the
+    /// signed assignment carries, so a schema change reloads from the
+    /// catalog. Without it every hot query paid a registration read and an
+    /// Iceberg metadata load just to rebuild an unchanged schema.
+    // ponytail: one entry per tenant table ever queried, never evicted; bound
+    // it if registrations churn.
+    Catalog {
+        /// Shared tenant-qualified production catalog.
+        catalog: Arc<BifrostCatalog>,
+        /// Last catalog schema of each tenant's table.
+        schemas: std::sync::RwLock<HashMap<(DataTenantId, TableRef), SchemaRef>>,
+    },
     /// Focused unit-test schema with no external catalog.
     #[cfg(test)]
     Fixed(arrow::datatypes::SchemaRef),
@@ -690,26 +350,22 @@ impl<T> std::fmt::Debug for ScribeTailResolver<T> {
     }
 }
 
-/// Builds the `FileIO` that opens staged runs by their absolute local path.
-///
-/// Backed by `OpenDAL`'s filesystem service, whose reads are async, so a staged
-/// scan never blocks a runtime worker the way a `std::fs` reader would.
-fn staged_run_io() -> FileIO {
-    iceberg::io::FileIOBuilder::new(Arc::new(
-        iceberg_storage_opendal::OpenDalStorageFactory::fs(),
-    ))
-    .build()
-}
-
 impl ScribeTailResolver<FetchLiveTailService> {
-    /// Creates a Scribe resolver from the local tail capability and shared catalog.
+    /// Creates a Scribe resolver from the local tail capability, shared
+    /// catalog, and the pod's Oracle partition sizing.
     #[must_use]
-    pub fn new(tail: Arc<FetchLiveTailService>, catalog: Arc<BifrostCatalog>) -> Self {
+    pub fn new(
+        tail: Arc<FetchLiveTailService>,
+        catalog: Arc<BifrostCatalog>,
+        partitioning: crate::scan_sizing::OraclePartitioning,
+    ) -> Self {
         Self {
             tail,
-            storage: Arc::clone(catalog.storage()),
-            schema_source: ScribeSchemaSource::Catalog(catalog),
-            staged_io: staged_run_io(),
+            schema_source: ScribeSchemaSource::Catalog {
+                catalog,
+                schemas: std::sync::RwLock::default(),
+            },
+            partitioning,
         }
     }
 }
@@ -717,18 +373,14 @@ impl ScribeTailResolver<FetchLiveTailService> {
 #[cfg(test)]
 impl<T> ScribeTailResolver<T> {
     /// Creates one catalog-free resolver for focused role-local provider tests.
-    ///
-    /// `storage` supplies the metadata cache staged-run footers load through.
-    pub(crate) fn with_schema(
-        tail: Arc<T>,
-        schema: SchemaRef,
-        storage: Arc<BifrostStorage>,
-    ) -> Self {
+    pub(crate) fn with_schema(tail: Arc<T>, schema: SchemaRef) -> Self {
         Self {
             tail,
             schema_source: ScribeSchemaSource::Fixed(schema),
-            storage,
-            staged_io: staged_run_io(),
+            partitioning: crate::scan_sizing::OraclePartitioning::new(
+                4,
+                crate::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
+            ),
         }
     }
 }
@@ -737,46 +389,54 @@ impl<T> ScribeTailResolver<T> {
     /// Builds the Scribe follower's leaf over one opened live read.
     ///
     /// Memtable rows are projected to the signed closure and dealt round-robin
-    /// across exactly the session's target partitions of one in-memory source,
-    /// leaving unused partitions empty, so a sparse cut keeps the session
-    /// shape. The unserved staged runs are read by
-    /// [`super::exec::HotParquetExec`] at the same partition count, so they
-    /// get the row-group and page pruning, node metadata cache, and grant
-    /// charging every Oracle hot read gets; the scan holds the staged lease
-    /// until its last stream drops. A signed predicate
-    /// conjunction becomes one `FilterExec` above both. A read with neither
+    /// across the partitions their bytes earn, at most the session's target
+    /// partitions (see [`crate::scan_sizing::OraclePartitioning::scan_partitions`]), of one
+    /// in-memory source. Each batch keeps the exact bounds Scribe recorded at
+    /// append, so the query's pushed predicate drops batches it cannot match,
+    /// and the kept batches are dealt again over the partitions their own
+    /// bytes earn. The unserved staged runs are read by
+    /// `DataFusion`'s Parquet scan, so they get the row-group and page pruning
+    /// every Oracle hot read gets, with no footer caching because a staged run
+    /// is rewritable; the scan's files hold the staged lease until the plan
+    /// drops. A read with neither
     /// rows nor runs is an in-memory source of empty partitions at the
     /// closure schema.
     ///
     /// # Errors
     /// Returns [`FollowerResolutionError::Fault`] when a memtable batch does
     /// not project to the closure, a staged run's size cannot be read or its
-    /// path is not UTF-8, a signed predicate does not compile against the
-    /// closure, or a plan node cannot be built.
+    /// path is not UTF-8, or a plan node cannot be built.
     async fn live_leaf(
         &self,
         read: LiveTailBatches,
         required_schema: &SchemaRef,
         assignment: &FollowerScanAssignment,
-        writer_epoch: u64,
         session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, FollowerResolutionError> {
         let fault = |detail: &str| FollowerResolutionError::Fault(detail.to_owned());
-        let partitions = session.config().target_partitions().max(1);
         let (rows, runs, lease) = read.into_parts();
         let mut leaves: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(2);
         if !rows.is_empty() || runs.is_empty() {
-            let mut groups = vec![Vec::new(); partitions];
-            for (index, batch) in rows.iter().enumerate() {
-                groups[index % partitions].push(
-                    super::exec::project_batch(batch, Arc::clone(required_schema))
-                        .map_err(|_| fault("Scribe memtable rows do not match the closure"))?,
-                );
-            }
-            leaves.push(
-                MemorySourceConfig::try_new_exec(&groups, Arc::clone(required_schema), None)
-                    .map_err(|_| fault("Scribe memtable source construction failed"))?,
-            );
+            let projected = rows
+                .iter()
+                .map(|batch| {
+                    Ok((
+                        super::exec::project_batch(&batch.rows, Arc::clone(required_schema))
+                            .map_err(|_| fault("Scribe memtable rows do not match the closure"))?,
+                        Arc::clone(&batch.statistics),
+                    ))
+                })
+                .collect::<Result<Vec<_>, FollowerResolutionError>>()?;
+            // Dealt over the partitions the projected bytes earn; pushdown
+            // re-deals whatever the query's predicate keeps.
+            let source = super::memtable_source::MemtableSource::try_new(
+                projected,
+                self.partitioning,
+                session.config().target_partitions(),
+                Arc::clone(required_schema),
+            )
+            .map_err(|_| fault("Scribe memtable source construction failed"))?;
+            leaves.push(Arc::new(DataSourceExec::new(Arc::new(source))));
         }
         if !runs.is_empty() {
             let mut files = Vec::with_capacity(runs.len());
@@ -790,53 +450,37 @@ impl<T> ScribeTailResolver<T> {
                     .into_string()
                     .map_err(|_| fault("Scribe staged run path is not UTF-8"))?;
                 files.push(super::exec::HotFileSource {
-                    metadata_key: crate::storage::ObjectMetadataKey::staged(
-                        assignment.binding.tenant_id,
-                        assignment.binding.table.clone(),
-                        location.clone(),
-                        writer_epoch,
-                        size,
-                    ),
                     size_bytes: usize::try_from(size)
                         .map_err(|_| fault("Scribe staged run size does not fit"))?,
+                    row_count: None,
                     location,
                     event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
                         crate::catalog::event_time::EventTimeBoundsDefect::Missing,
                     ),
                 });
             }
-            let scan = super::exec::HotParquetExec::new(
-                files,
-                self.staged_io.clone(),
-                Arc::clone(&self.storage),
-                Arc::clone(required_schema),
-                super::exec::HotParquetPlan::Follower {
-                    memory_pool: Arc::clone(&session.runtime_env().memory_pool),
-                },
-                Arc::new(super::exec::OracleScanMetricsHandle::default()),
-                assignment.predicates.clone(),
-            )
-            .with_partitions(partitions);
-            let scan = match lease {
-                Some(lease) => scan.with_staged_lease(lease),
-                None => scan,
-            };
-            leaves.push(Arc::new(scan));
+            // A staged run's footer is never cached, so its row groups are
+            // unknown; one partition per run is the split a decoded follower
+            // plan has always had.
+            let runs = files.len();
+            leaves.push(
+                super::exec::hot_parquet_scan(
+                    files,
+                    super::exec::HotObjects::Staged(lease),
+                    assignment.binding.tenant_id,
+                    required_schema,
+                    None,
+                    session.config().options(),
+                    Some(runs),
+                )
+                .map_err(|_| fault("Scribe staged scan construction failed"))?,
+            );
         }
-        let leaf = match leaves.len() {
-            1 => leaves.remove(0),
+        match leaves.len() {
+            1 => Ok(leaves.remove(0)),
             _ => datafusion::physical_plan::union::UnionExec::try_new(leaves)
-                .map_err(|_| fault("Scribe live source union failed"))?,
-        };
-        let Some(predicate) =
-            super::exec::scan_predicate_conjunction(&assignment.predicates, required_schema)
-                .map_err(|_| fault("Scribe signed predicate does not match the closure"))?
-        else {
-            return Ok(leaf);
-        };
-        datafusion::physical_plan::filter::FilterExec::try_new(predicate, leaf)
-            .map(|filter| Arc::new(filter) as Arc<dyn ExecutionPlan>)
-            .map_err(|_| fault("Scribe signed filter construction failed"))
+                .map_err(|_| fault("Scribe live source union failed")),
+        }
     }
 }
 
@@ -903,6 +547,10 @@ where
     /// live-tail page so a distributed query, whose leader never drains a local
     /// fence, still reports the live-tail page families an operator reads.
     ///
+    /// The table schema comes from the resolver's cache when its fingerprint
+    /// equals the assignment's, and from the catalog otherwise, which then
+    /// refreshes the cache.
+    ///
     /// Cancellation before the single snapshot returns exposes no batches or
     /// provider. Cancellation during provider construction drops the complete
     /// local cohort. A retry begins again from the authenticated assignment.
@@ -918,7 +566,7 @@ where
         assignment: &FollowerScanAssignment,
         session: &SessionState,
     ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
-        if target_role != ClusterRole::Scribe || !assignment.persisted.files.is_empty() {
+        if target_role != ClusterRole::Scribe {
             return Err(FollowerResolutionError::Fault(
                 "Scribe resolver received a non-Scribe assignment".to_owned(),
             ));
@@ -939,13 +587,32 @@ where
         ))
         .map_err(|_| "Scribe tenant/table binding is invalid".to_owned())?;
         let full_schema = match &self.schema_source {
-            ScribeSchemaSource::Catalog(catalog) => catalog
-                .assignment_schema(
-                    &assignment_table(&assignment.binding)?,
+            ScribeSchemaSource::Catalog { catalog, schemas } => {
+                let key = (
                     assignment.binding.tenant_id,
-                )
-                .await
-                .map_err(|_| "authenticated Scribe schema resolution failed".to_owned())?,
+                    assignment_table(&assignment.binding)?,
+                );
+                let cached = schemas
+                    .read()
+                    .ok()
+                    .and_then(|schemas| schemas.get(&key).cloned())
+                    .filter(|schema| {
+                        super::assignment_schema_fingerprint(schema.as_ref())
+                            == assignment.schema_fingerprint
+                    });
+                if let Some(schema) = cached {
+                    schema
+                } else {
+                    let schema = catalog
+                        .assignment_schema(&key.1, key.0)
+                        .await
+                        .map_err(|_| "authenticated Scribe schema resolution failed".to_owned())?;
+                    if let Ok(mut schemas) = schemas.write() {
+                        schemas.insert(key, Arc::clone(&schema));
+                    }
+                    schema
+                }
+            }
             #[cfg(test)]
             ScribeSchemaSource::Fixed(schema) => Arc::clone(schema),
         };
@@ -958,8 +625,7 @@ where
                 "resolved provider schema fingerprint differs from assignment".to_owned(),
             ));
         }
-        let required_schema =
-            signed_closure_schema(full_schema.as_ref(), &assignment.required_columns)?;
+        let required_schema = signed_closure_schema(full_schema.as_ref(), assignment)?;
         let table_name = format!(
             "{}.{}",
             assignment.binding.namespace, assignment.binding.table
@@ -990,13 +656,7 @@ where
             })
             .await?;
         let plan = self
-            .live_leaf(
-                read,
-                &required_schema,
-                assignment,
-                cut.writer_epoch,
-                session,
-            )
+            .live_leaf(read, &required_schema, assignment, session)
             .await?;
         Ok(ResolvedFollowerSource { plan, full_schema })
     }
@@ -1016,138 +676,6 @@ fn assignment_table(binding: &TenantTableBinding) -> Result<TableRef, String> {
         &binding.table,
     ))
     .ok_or_else(|| "assignment table binding is not canonical".to_owned())
-}
-
-/// Restricts every file-backed leaf to the exact authenticated assignment.
-///
-/// The Iceberg provider remains responsible for schema, pruning, and tenant
-/// filtering. This final projection removes every unassigned manifest file and
-/// rejects assignments that do not correspond to a planned file. Each Iceberg
-/// leaf reads across `partitions`, the follower session's target partitions.
-///
-/// # Errors
-/// Returns an error when the provider is not file-backed, an assigned location
-/// is absent, or a non-file leaf prevents proving exact file-set equality.
-fn restrict_plan_to_assigned_files(
-    plan: Arc<dyn ExecutionPlan>,
-    assigned_files: &[(String, String, String)],
-    partitions: usize,
-) -> Result<Arc<dyn ExecutionPlan>, String> {
-    let assigned = assigned_files
-        .iter()
-        .map(|(_, _, location)| location.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let relative_assignments = assigned_files
-        .iter()
-        .flat_map(|(canonical, table_relative, location)| {
-            [
-                (canonical.clone(), location.clone()),
-                (table_relative.clone(), location.clone()),
-            ]
-        })
-        .collect::<std::collections::BTreeMap<_, _>>();
-    if assigned.len() != assigned_files.len() || assigned.iter().any(|file| file.trim().is_empty())
-    {
-        return Err("authenticated Oracle assignment contains duplicate or empty files".to_owned());
-    }
-    let mut observed = std::collections::BTreeSet::new();
-    let mut file_leaves = 0usize;
-    let transformed = plan
-        .transform_up(|node| {
-            if let Some(exec) = node.downcast_ref::<super::exec::OracleIcebergScanExec>() {
-                file_leaves = file_leaves.saturating_add(1);
-                observed.extend(assigned.iter().cloned());
-                return Ok(Transformed::yes(Arc::new(
-                    exec.clone()
-                        .with_assigned_files(assigned.clone(), relative_assignments.clone())
-                        .with_partitions(partitions),
-                )));
-            }
-            if node.is::<IcebergTableScan>() {
-                let restricted = super::exec::OracleIcebergScanExec::from_plan(node.as_ref())
-                    .map_err(|_| {
-                        datafusion::common::DataFusionError::Plan(
-                            "authenticated Oracle Iceberg source failed".to_owned(),
-                        )
-                    })?
-                    .with_assigned_files(assigned.clone(), relative_assignments.clone())
-                    .with_partitions(partitions);
-                file_leaves = file_leaves.saturating_add(1);
-                observed.extend(assigned.iter().cloned());
-                return Ok(Transformed::yes(Arc::new(restricted)));
-            }
-            let Some(exec) = node.downcast_ref::<DataSourceExec>() else {
-                return Ok(Transformed::no(node));
-            };
-            let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() else {
-                return Err(datafusion::common::DataFusionError::Plan(
-                    "Oracle assignment encountered a non-file data source".to_owned(),
-                ));
-            };
-            file_leaves = file_leaves.saturating_add(1);
-            let groups = config
-                .file_groups
-                .iter()
-                .filter_map(|group| {
-                    let files = group
-                        .iter()
-                        .filter(|file| {
-                            let object_path = file.object_meta.location.to_string();
-                            let location = relative_assignments
-                                .get(&object_path)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    physical_file_location(
-                                        config.object_store_url.as_str(),
-                                        &object_path,
-                                    )
-                                });
-                            if assigned.contains(&location) {
-                                observed.insert(location);
-                                true
-                            } else {
-                                false
-                            }
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    (!files.is_empty()).then(|| FileGroup::new(files))
-                })
-                .collect();
-            let restricted = FileScanConfigBuilder::from(config.clone())
-                .with_file_groups(groups)
-                .build();
-            Ok(Transformed::yes(Arc::new(
-                exec.clone().with_data_source(Arc::new(restricted)),
-            )))
-        })
-        .map_err(|_| "authenticated Oracle file projection failed".to_owned())?
-        .data;
-    if file_leaves == 0 || observed != assigned {
-        // Counts only: which files a tenant owns is not safe to name in an
-        // error that crosses the dispatch boundary, but the shape of the
-        // mismatch is what a maintainer needs to tell "no file leaf in this
-        // plan" apart from "the leaf lost files the leader signed for".
-        return Err(format!(
-            "authenticated Oracle assignment differs from planned files: \
-             file_leaves={file_leaves} observed={} assigned={}",
-            observed.len(),
-            assigned.len()
-        ));
-    }
-    Ok(transformed)
-}
-
-/// Joins `DataFusion`'s authenticated object-store authority and relative object key.
-fn physical_file_location(store: &str, path: &str) -> String {
-    if store == "file://" {
-        return format!("file:///{}", path.trim_start_matches('/'));
-    }
-    if store.ends_with('/') || path.starts_with('/') {
-        format!("{store}{path}")
-    } else {
-        format!("{store}/{path}")
-    }
 }
 
 /// Concrete owner of preflight, provider resolution, and `DataFusion` decode.
@@ -1253,9 +781,8 @@ where
                     ),
                 ));
             }
-            let expected =
-                signed_closure_schema(resolved.full_schema.as_ref(), &assignment.required_columns)
-                    .map_err(|detail| PhysicalPlanFollowerError::Resolution(detail.into()))?;
+            let expected = signed_closure_schema(resolved.full_schema.as_ref(), &assignment)
+                .map_err(|detail| PhysicalPlanFollowerError::Resolution(detail.into()))?;
             if resolved.plan.schema() != expected {
                 return Err(PhysicalPlanFollowerError::Resolution(
                     FollowerResolutionError::Fault(
@@ -1305,10 +832,16 @@ where
             .decode(request, authenticated, &session, &context)
             .await?;
         self.effects.execution.fetch_add(1, Ordering::SeqCst);
-        // Snapshot the scan metric sets before execution consumes the plan.
-        // The leader's own plan has only remote leaves, so this follower-side
-        // capture is the only place a distributed query can observe physical
-        // read volume at all.
+        // A live fragment ships its predicate as a `FilterExec` above the
+        // placeholder; `DataFusion`'s own pushdown moves it into the
+        // substituted staged scan, where it prunes row groups and pages.
+        let plan = FilterPushdown::new()
+            .optimize(plan, session.config().options())
+            .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
+        // Snapshot the scan metric sets after pushdown and before execution
+        // consumes the plan. They return to the leader in this live
+        // fragment's footer; published scans report through
+        // `record_distributed_scan_metrics` instead.
         let scan_stats = super::exec::OracleQueryScanStats::from_plan(plan.as_ref());
         let stream = execute_stream(plan, context)
             .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
@@ -1342,21 +875,12 @@ where
         self.effects.preflight.load(Ordering::SeqCst)
     }
 
-    /// Performs the complete IO-free validation phase.
-    ///
-    /// # Errors
-    /// Returns a preflight error for any malformed request, contradictory
-    /// authenticated binding, unsupported plan node, or inconsistent scan set.
     /// Validates one authenticated assignment beyond its identity and binding.
     ///
     /// Runs the checks that are about the assignment's *content* rather than
-    /// its identity: the persisted file list must be unique, ordered, and name
-    /// exactly one persisted source, the
-    /// signed projection closure must be non-empty, every
-    /// closed predicate must reference a column inside that closure, the role
-    /// must match the presence or absence of a Scribe provider cut, and a cut
-    /// must be internally valid, pinned to `target_fence`, and copy the
-    /// top-level closure byte-for-byte.
+    /// its identity: the signed projection closure must be non-empty, the
+    /// target must be a Scribe, and its provider cut must be present,
+    /// internally valid, and pinned to `target_fence`.
     ///
     /// # Errors
     ///
@@ -1368,60 +892,23 @@ where
         target_role: ClusterRole,
         target_fence: wyrd_spec::vala::api::FencingToken,
     ) -> Result<(), PhysicalPlanFollowerError> {
-        if !Self::valid_persisted_files(&assignment.persisted.files) {
-            return Err(PhysicalPlanFollowerError::Preflight(
-                "persisted assignment is not unique and ordered".to_owned(),
-            ));
-        }
-        // Refused here, before any provider resolution or object I/O, because
-        // hot and Iceberg descriptors are resolved by different readers under
-        // different authority: a mixed list has no single correct leaf, and
-        // whichever the resolver picked would silently drop the other source's
-        // rows from an otherwise valid, signed result.
-        super::AssignedPersistedSource::classify(&assignment.persisted.files)
-            .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
         // The leader never signs an empty closure: a scan that reads no
-        // column still reads `wyrd_event_time` for its row counts.
+        // column still reads the time column for its row counts.
         if assignment.required_columns.is_empty() {
             return Err(PhysicalPlanFollowerError::Preflight(
                 "assignment projection closure is empty".to_owned(),
             ));
         }
-        // Every closed predicate's column must already be part of the
-        // signed projection closure (`required_columns` is defined as
-        // `scan_output_names + predicate_names`), so a
-        // predicate referencing a column outside that closure indicates a
-        // malformed assignment rather than a merely unusual one.
-        if assignment.predicates.iter().any(|predicate| {
-            !assignment
-                .required_columns
-                .iter()
-                .any(|column| column == predicate.column())
-        }) {
+        let Some(cut) = assignment
+            .scribe_provider_cut
+            .as_ref()
+            .filter(|_| target_role == ClusterRole::Scribe)
+        else {
             return Err(PhysicalPlanFollowerError::Preflight(
-                "assignment predicate references a column outside the projection closure"
-                    .to_owned(),
+                "assignment is not a Scribe hot-provider cut".to_owned(),
             ));
-        }
-        match target_role {
-            ClusterRole::Oracle if assignment.scribe_provider_cut.is_some() => {
-                return Err(PhysicalPlanFollowerError::Preflight(
-                    "Oracle assignment contains a Scribe provider cut".to_owned(),
-                ));
-            }
-            ClusterRole::Scribe
-                if assignment.scribe_provider_cut.is_none()
-                    || !assignment.persisted.files.is_empty() =>
-            {
-                return Err(PhysicalPlanFollowerError::Preflight(
-                    "Scribe assignment lacks an explicit hot-provider cut".to_owned(),
-                ));
-            }
-            ClusterRole::Oracle | ClusterRole::Scribe => {}
-        }
-        if let Some(cut) = &assignment.scribe_provider_cut
-            && (cut.writer_epoch != target_fence || !cut.is_valid())
-        {
+        };
+        if cut.writer_epoch != target_fence || !cut.is_valid() {
             return Err(PhysicalPlanFollowerError::Preflight(
                 "invalid Scribe provider cut".to_owned(),
             ));
@@ -1429,6 +916,16 @@ where
         Ok(())
     }
 
+    /// Performs the complete IO-free validation phase.
+    ///
+    /// Checks the request's wire shape and role fences against the
+    /// authenticated context, decodes the plan to collect its extension
+    /// placeholders, and validates every assignment's identity, binding, and
+    /// content before any provider resolution or object I/O.
+    ///
+    /// # Errors
+    /// Returns a preflight error for any malformed request, contradictory
+    /// authenticated binding, unsupported plan node, or inconsistent scan set.
     fn preflight(
         &self,
         request: &ExecuteFragmentRequest,
@@ -1489,14 +986,6 @@ where
             ));
         }
         Ok(PreflightRequest { assignments })
-    }
-
-    /// Requires canonical non-empty object locations with no duplicates.
-    fn valid_persisted_files(files: &[PersistedFileDescriptor]) -> bool {
-        files
-            .iter()
-            .all(|file| file.is_valid() && !file.path().trim().is_empty())
-            && files.windows(2).all(|pair| pair[0].path() < pair[1].path())
     }
 
     /// Walks every child of follower-permitted native operators and leaf extensions.
@@ -1652,151 +1141,14 @@ pub(crate) mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use datafusion::datasource::listing::PartitionedFile;
-    use datafusion::datasource::physical_plan::ParquetSource;
     use datafusion::execution::context::SessionContext;
-    use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::execution::session_state::SessionStateBuilder;
     use datafusion::physical_plan::{ExecutionPlanProperties, collect};
     use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
-    use wyrd_spec::vala::api::{PeerContext, PersistedFileAssignment, ScribeProviderCut};
-    use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+    use wyrd_spec::vala::api::{PeerContext, ScribeProviderCut};
 
     use super::*;
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
-
-    /// Builds a file-backed physical source with the exact supplied catalog paths.
-    fn file_plan(schema: SchemaRef, files: &[&str]) -> Arc<dyn ExecutionPlan> {
-        let source = Arc::new(ParquetSource::new(schema));
-        let groups = vec![FileGroup::new(
-            files
-                .iter()
-                .map(|file| PartitionedFile::new((*file).to_owned(), 1))
-                .collect(),
-        )];
-        let config = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), source)
-            .with_file_groups(groups)
-            .build();
-        DataSourceExec::from_data_source(config)
-    }
-
-    /// Returns every file location still reachable from a restricted source.
-    ///
-    /// # Panics
-    /// Panics if the supplied plan is not the file-backed source constructed by
-    /// [`file_plan`] or if that source does not contain a [`FileScanConfig`].
-    fn plan_files(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
-        let exec = plan.downcast_ref::<DataSourceExec>().expect("file source");
-        let config = exec
-            .data_source()
-            .downcast_ref::<FileScanConfig>()
-            .expect("file scan config");
-        config
-            .file_groups
-            .iter()
-            .flat_map(datafusion::datasource::physical_plan::FileGroup::iter)
-            .map(|file| file.object_meta.location.to_string())
-            .collect()
-    }
-
-    /// Exact Oracle projection excludes unassigned catalog files and fails closed.
-    ///
-    /// # Panics
-    /// Panics if the valid fixture cannot be projected or its file-backed plan
-    /// violates the test construction invariant.
-    #[test]
-    fn oracle_projection_is_exactly_the_authenticated_assignment() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            true,
-        )]));
-        let catalog = file_plan(
-            Arc::clone(&schema),
-            &["assigned.parquet", "unassigned.parquet"],
-        );
-        let assigned = physical_file_location(
-            ObjectStoreUrl::local_filesystem().as_str(),
-            "assigned.parquet",
-        );
-        let restricted = restrict_plan_to_assigned_files(
-            catalog,
-            &[(
-                ("assigned.parquet").to_owned(),
-                "assigned.parquet".to_owned(),
-                assigned.clone(),
-            )],
-            1,
-        )
-        .expect("exact assigned file remains executable");
-        assert_eq!(plan_files(&restricted), vec!["assigned.parquet"]);
-
-        assert!(
-            restrict_plan_to_assigned_files(
-                file_plan(Arc::clone(&schema), &["assigned.parquet"]),
-                &[(
-                    "missing.parquet".to_owned(),
-                    "missing.parquet".to_owned(),
-                    physical_file_location(
-                        ObjectStoreUrl::local_filesystem().as_str(),
-                        "missing.parquet",
-                    ),
-                )],
-                1
-            )
-            .is_err()
-        );
-        assert!(
-            restrict_plan_to_assigned_files(
-                file_plan(Arc::clone(&schema), &["assigned.parquet"]),
-                &[
-                    (
-                        "assigned.parquet".to_owned(),
-                        "assigned.parquet".to_owned(),
-                        assigned.clone(),
-                    ),
-                    (
-                        "extra.parquet".to_owned(),
-                        "extra.parquet".to_owned(),
-                        physical_file_location(
-                            ObjectStoreUrl::local_filesystem().as_str(),
-                            "extra.parquet",
-                        ),
-                    ),
-                ],
-                1
-            )
-            .is_err()
-        );
-        assert!(
-            restrict_plan_to_assigned_files(
-                file_plan(schema, &["assigned.parquet"]),
-                &[
-                    (
-                        "assigned.parquet".to_owned(),
-                        "assigned.parquet".to_owned(),
-                        assigned.clone(),
-                    ),
-                    (
-                        "assigned.parquet".to_owned(),
-                        "assigned.parquet".to_owned(),
-                        assigned,
-                    ),
-                ],
-                1
-            )
-            .is_err()
-        );
-    }
-
-    /// Builds the node storage owner a Scribe resolver fixture loads
-    /// staged-run footers through.
-    ///
-    /// # Panics
-    /// Panics when the fixture storage root is unusable.
-    fn test_storage() -> Arc<BifrostStorage> {
-        crate::storage::BifrostStorage::for_test(&std::env::temp_dir(), true)
-    }
 
     /// Builds one otherwise-valid Scribe provider cut for focused tests.
     fn cut() -> ScribeProviderCut {
@@ -1872,8 +1224,7 @@ pub(crate) mod tests {
             _session: &SessionState,
         ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let required_schema =
-                signed_closure_schema(self.schema.as_ref(), &assignment.required_columns)?;
+            let required_schema = signed_closure_schema(self.schema.as_ref(), assignment)?;
             Ok(ResolvedFollowerSource {
                 plan: Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
                     required_schema,
@@ -1883,11 +1234,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// Creates one valid Oracle-role request and its exact authenticated facts.
+    /// Creates one valid Scribe-role request and its exact authenticated facts.
     ///
     /// # Errors
     /// Returns a plan error if the extension leaf cannot be serialized.
-    fn oracle_request() -> datafusion::common::Result<(ExecuteFragmentRequest, TenantTableBinding)>
+    fn scribe_request() -> datafusion::common::Result<(ExecuteFragmentRequest, TenantTableBinding)>
     {
         let tenant_id = DataTenantId::new_v7();
         let binding = TenantTableBinding {
@@ -1918,8 +1269,8 @@ pub(crate) mod tests {
         };
         let target_fence = OracleRoleFence {
             node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
-            role: ClusterRole::Oracle,
-            fencing_token: 12,
+            role: ClusterRole::Scribe,
+            fencing_token: cut().writer_epoch,
         };
         Ok((
             ExecuteFragmentRequest {
@@ -1933,15 +1284,9 @@ pub(crate) mod tests {
                 assignments: vec![FollowerScanAssignment {
                     scan_id: "scan".to_owned(),
                     binding: binding.clone(),
-                    persisted: PersistedFileAssignment {
-                        files: vec![crate::oracle::test_persisted_descriptor(
-                            "s3://bucket/file.parquet",
-                        )],
-                    },
-                    scribe_provider_cut: None,
+                    scribe_provider_cut: Some(cut()),
                     schema_fingerprint: fingerprint,
                     required_columns: vec!["value".to_owned()],
-                    predicates: Vec::new(),
                 }],
                 plan_fingerprint: physical_plan_fingerprint(&bytes),
             },
@@ -1984,12 +1329,12 @@ pub(crate) mod tests {
             batches: Vec::new(),
         });
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Utf8,
             true,
         )]));
         let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
-        let resolver = ScribeTailResolver::with_schema(tail, schema, test_storage());
+        let resolver = ScribeTailResolver::with_schema(tail, schema);
         let binding = TenantTableBinding {
             tenant_id,
             namespace: "vala.logs".to_owned(),
@@ -1998,13 +1343,14 @@ pub(crate) mod tests {
         let assignment = |scan_id| FollowerScanAssignment {
             scan_id,
             binding: binding.clone(),
-            persisted: PersistedFileAssignment { files: Vec::new() },
             scribe_provider_cut: Some(cut()),
             schema_fingerprint: fingerprint.clone(),
-            required_columns: vec!["wyrd_event_time".to_owned()],
-            predicates: Vec::new(),
+            required_columns: vec!["event_time".to_owned()],
         };
-        let session = SessionContext::new().state();
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
         resolver
             .resolve(
                 ClusterRole::Scribe,
@@ -2056,7 +1402,7 @@ pub(crate) mod tests {
             WriterEpoch::new(2),
         );
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Utf8,
             true,
         )]));
@@ -2067,7 +1413,6 @@ pub(crate) mod tests {
                 batches: Vec::new(),
             }),
             Arc::clone(&schema),
-            test_storage(),
         );
         let binding = TenantTableBinding {
             tenant_id: DataTenantId::new_v7(),
@@ -2077,13 +1422,14 @@ pub(crate) mod tests {
         let assignment = FollowerScanAssignment {
             scan_id: local_scribe_scan_id(&binding, stream),
             binding: binding.clone(),
-            persisted: PersistedFileAssignment { files: Vec::new() },
             scribe_provider_cut: Some(cut()),
             schema_fingerprint: super::super::assignment_schema_fingerprint(schema.as_ref()),
-            required_columns: vec!["wyrd_event_time".to_owned()],
-            predicates: Vec::new(),
+            required_columns: vec!["event_time".to_owned()],
         };
-        let session = SessionContext::new().state();
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
 
         let mut other_epoch = assignment.clone();
         if let Some(cut) = other_epoch.scribe_provider_cut.as_mut() {
@@ -2127,7 +1473,7 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Oracle and Scribe assignments remain a closed role-local matrix.
+    /// A Scribe assignment resolves through its role-local provider exactly once.
     ///
     /// # Panics
     /// Panics if the canonical request cannot be built or the validated plan
@@ -2139,8 +1485,7 @@ pub(crate) mod tests {
 
     /// Exercises one complete role-local provider resolution and execution.
     async fn prove_role_local_providers_are_isolated_and_consumed_once() {
-        oracle_projection_is_exactly_the_authenticated_assignment();
-        let (request, binding) = oracle_request().expect("valid Oracle request");
+        let (request, binding) = scribe_request().expect("valid Scribe request");
         let calls = Arc::new(AtomicUsize::new(0));
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
@@ -2164,114 +1509,6 @@ pub(crate) mod tests {
         assert_eq!(stream.split().0.schema().fields().len(), 1);
     }
 
-    /// Follower sessions are shaped only by the admitted grant and assigned work.
-    ///
-    /// This is the follower half of the resource-parity contract: the session's
-    /// A hot leaf source takes its exact length from the signed descriptor, not
-    /// from a fresh read of the object.
-    ///
-    /// The leader signed `size_bytes` from the `vala.file_list` row and the
-    /// assignment-authority digest covers it. Re-reading the length from
-    /// storage would replace that verified fact with an unauthenticated one and
-    /// spend a round trip per assigned file before the scan begins, so the
-    /// fixture's descriptor length deliberately differs from anything a real
-    /// object would report — nothing here exists in storage at all.
-    ///
-    /// # Panics
-    /// Panics when the built source does not carry the signed length.
-    #[test]
-    fn hot_leaf_sources_take_their_length_from_the_signed_descriptor() {
-        let descriptor = PersistedFileDescriptor::Hot(wyrd_spec::vala::api::HotFileDescriptor {
-            path: "tenant/spans/a.parquet".to_owned(),
-            size_bytes: 987_654,
-            row_count: 3,
-            file_list_id: uuid::Uuid::now_v7(),
-            sha256: [4_u8; 32],
-            min_event_time_micros: Some(1),
-            max_event_time_micros: Some(2),
-        });
-        let binding = wyrd_spec::vala::api::TenantTableBinding {
-            tenant_id: wyrd_spec::DataTenantId::new_v7(),
-            namespace: "vala.traces".to_owned(),
-            table: "spans".to_owned(),
-        };
-        let source = signed_hot_source(&descriptor, "memory:///tenant/spans/a.parquet", &binding)
-            .expect("signed descriptor builds a hot source");
-        assert_eq!(source.size_bytes, 987_654);
-        assert_eq!(source.location, "memory:///tenant/spans/a.parquet");
-        assert!(
-            source.event_time.interval().is_none(),
-            "a follower carries no local pruning decision: the leader already made and signed it"
-        );
-    }
-
-    /// Preflight refuses a signed assignment whose file list names both hot and
-    /// Iceberg descriptors, before any provider resolution or object I/O.
-    ///
-    /// The two sources are resolved by different readers under different
-    /// authority — a `vala.file_list` row and decoded checksum for hot, the
-    /// pinned snapshot for Iceberg — so a mixed list has no single correct
-    /// leaf. Silently resolving one variant would return a signed, digest-clean
-    /// result that is missing the other source's rows, which is why this is a
-    /// refusal rather than a partition.
-    ///
-    /// # Panics
-    /// Panics when a mixed list is accepted or a uniform one is refused.
-    #[test]
-    fn preflight_refuses_an_assignment_naming_two_persisted_sources() {
-        let mut assignment = FollowerScanAssignment {
-            scan_id: "mixed-source-scan".to_owned(),
-            binding: TenantTableBinding {
-                tenant_id: DataTenantId::new_v7(),
-                namespace: "vala.bifrost".to_owned(),
-                table: "events".to_owned(),
-            },
-            persisted: PersistedFileAssignment {
-                files: vec![crate::oracle::test_persisted_descriptor("a.parquet")],
-            },
-            scribe_provider_cut: None,
-            schema_fingerprint: "mixed".to_owned(),
-            required_columns: vec!["wyrd_event_time".to_owned()],
-            predicates: Vec::new(),
-        };
-        let fence: wyrd_spec::vala::api::FencingToken = 1;
-        assert!(
-            PhysicalPlanFollower::<CountingResolver>::validate_assignment(
-                &assignment,
-                ClusterRole::Oracle,
-                fence,
-            )
-            .is_ok(),
-            "a uniform Iceberg assignment is accepted"
-        );
-
-        assignment
-            .persisted
-            .files
-            .push(PersistedFileDescriptor::Hot(
-                wyrd_spec::vala::api::HotFileDescriptor {
-                    path: "b.parquet".to_owned(),
-                    size_bytes: 4_096,
-                    row_count: 1,
-                    file_list_id: uuid::Uuid::now_v7(),
-                    sha256: [9_u8; 32],
-                    min_event_time_micros: None,
-                    max_event_time_micros: None,
-                },
-            ));
-        let refusal = PhysicalPlanFollower::<CountingResolver>::validate_assignment(
-            &assignment,
-            ClusterRole::Oracle,
-            fence,
-        )
-        .expect_err("a mixed persisted source is refused");
-        assert!(
-            matches!(&refusal, PhysicalPlanFollowerError::Preflight(detail)
-                if detail.contains("more than one persisted source")),
-            "{refusal:?}"
-        );
-    }
-
     /// Proves a follower refuses empty fragments and that its partition count
     /// and sort-merge reservation come from one
     /// [`OracleSessionShape`](crate::resources::OracleSessionShape) built from
@@ -2279,35 +1516,21 @@ pub(crate) mod tests {
     /// supplied.
     #[test]
     fn admitted_session_shape_contract() {
-        let assignment = |files: usize, cut: bool| FollowerScanAssignment {
+        let assignment = |cut: bool| FollowerScanAssignment {
             scan_id: "shape-contract-scan".to_owned(),
             binding: TenantTableBinding {
                 tenant_id: DataTenantId::new_v7(),
                 namespace: "vala.bifrost".to_owned(),
                 table: "events".to_owned(),
             },
-            persisted: PersistedFileAssignment {
-                files: (0..files)
-                    .map(|index| {
-                        crate::oracle::test_persisted_descriptor(&format!("file-{index}.parquet"))
-                    })
-                    .collect(),
-            },
             scribe_provider_cut: cut.then(self::cut),
             schema_fingerprint: "shape".to_owned(),
-            required_columns: vec!["wyrd_event_time".to_owned()],
-            predicates: Vec::new(),
+            required_columns: vec!["event_time".to_owned()],
         };
 
-        for scannable in [
-            vec![assignment(3, false)],
-            vec![assignment(0, true)],
-            vec![assignment(2, false), assignment(0, true)],
-        ] {
-            require_scannable_work(&scannable).expect("scannable fragment");
-        }
+        require_scannable_work(&[assignment(true)]).expect("scannable fragment");
         assert!(
-            require_scannable_work(&[assignment(0, false)]).is_err(),
+            require_scannable_work(&[assignment(false)]).is_err(),
             "a fragment with no scannable work is a contract failure"
         );
         assert!(
@@ -2339,7 +1562,11 @@ pub(crate) mod tests {
         assert!(parquet_options.enable_page_index);
     }
 
-    /// Proves every Oracle follower request rebuilds its governed `DataFusion` context.
+    /// Proves every Oracle follower request gets its own task context, and
+    /// that each one executes on its admitted execution's governed runtime.
+    ///
+    /// The planning state is a clone of the process template and so shares
+    /// its session id; only the task context carries the grant's runtime.
     ///
     /// # Panics
     /// Panics if either independent request fails provider resolution, native
@@ -2347,10 +1574,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn oracle_resolver_builds_fresh_request_local_context() {
         let execution = bounded_execution(1024, 1);
-        let (first_state, first_context) = request_session(&execution);
-        let (second_state, second_context) = request_session(&execution);
-        assert_ne!(first_state.session_id(), second_state.session_id());
+        let (_, first_context) = request_session(&execution);
+        let (_, second_context) = request_session(&execution);
         assert!(!Arc::ptr_eq(&first_context, &second_context));
+        for context in [&first_context, &second_context] {
+            assert!(Arc::ptr_eq(&context.runtime_env(), execution.runtime()));
+        }
         prove_role_local_providers_are_isolated_and_consumed_once().await;
         prove_role_local_providers_are_isolated_and_consumed_once().await;
         assert_complete_preflight_matrix().await;
@@ -2359,10 +1588,11 @@ pub(crate) mod tests {
     /// Builds every request mutation a follower decode must refuse.
     ///
     /// The cases cover each independent authority the decode checks: a physical
-    /// plan whose join loses a child, a reservation the leader never issued, an
+    /// plan whose join loses a child, a plan fingerprinted by a peer built from
+    /// another `DataFusion` revision, a reservation the leader never issued, an
     /// assignment whose namespace, table, or tenant does not match the
     /// authenticated binding, a fence naming the wrong role or a stale token, an
-    /// empty Scribe provider cut, an unknown scan id, a wrong schema
+    /// missing Scribe provider cut, an unknown scan id, a wrong schema
     /// fingerprint, a duplicated assignment, and undecodable plan bytes. Each
     /// case mutates exactly one field so a refusal cannot be attributed to a
     /// second defect.
@@ -2388,6 +1618,12 @@ pub(crate) mod tests {
         case.plan_fingerprint = physical_plan_fingerprint(&case.physical_plan_bytes);
         malformed.push(case);
         let mut case = request.clone();
+        case.plan_fingerprint = super::super::codec::physical_plan_fingerprint_at(
+            "another-revision",
+            &case.physical_plan_bytes,
+        );
+        malformed.push(case);
+        let mut case = request.clone();
         case.reservation_id = ReservationId::new(uuid::Uuid::now_v7());
         malformed.push(case);
         let mut case = request.clone();
@@ -2400,13 +1636,13 @@ pub(crate) mod tests {
         case.assignments[0].binding.tenant_id = DataTenantId::new_v7();
         malformed.push(case);
         let mut case = request.clone();
-        case.target_fence.role = ClusterRole::Scribe;
+        case.target_fence.role = ClusterRole::Oracle;
         malformed.push(case);
         let mut case = request.clone();
         case.target_fence.fencing_token += 1;
         malformed.push(case);
         let mut case = request.clone();
-        case.assignments[0].scribe_provider_cut = Some(cut());
+        case.assignments[0].scribe_provider_cut = None;
         malformed.push(case);
         let mut case = request.clone();
         case.assignments[0].scan_id = "unknown".to_owned();
@@ -2494,7 +1730,7 @@ pub(crate) mod tests {
     async fn scribe_provider_is_active_plus_all_unretired_immutable() {
         let tenant_id = DataTenantId::new_v7();
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Utf8,
             true,
         )]));
@@ -2505,9 +1741,11 @@ pub(crate) mod tests {
             WriterEpoch::new(2),
         );
         let service = Arc::new(FetchLiveTailService::new(stream, memtable));
-        let resolver =
-            ScribeTailResolver::with_schema(service, Arc::clone(&schema), test_storage());
-        let session = SessionContext::new().state();
+        let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
         let binding = TenantTableBinding {
             tenant_id,
             namespace: "vala.logs".to_owned(),
@@ -2519,7 +1757,6 @@ pub(crate) mod tests {
                 &FollowerScanAssignment {
                     scan_id: local_scribe_scan_id(&binding, stream),
                     binding,
-                    persisted: PersistedFileAssignment { files: Vec::new() },
                     scribe_provider_cut: Some(cut()),
                     schema_fingerprint: super::super::assignment_schema_fingerprint(
                         schema.as_ref(),
@@ -2527,8 +1764,7 @@ pub(crate) mod tests {
                     // The resolver now projects the assignment's own closure,
                     // so this fixture names the single column its memtable
                     // schema actually carries.
-                    required_columns: vec!["wyrd_event_time".to_owned()],
-                    predicates: Vec::new(),
+                    required_columns: vec!["event_time".to_owned()],
                 },
                 &session,
             )
@@ -2619,7 +1855,7 @@ pub(crate) mod tests {
         (key, memtable)
     }
 
-    /// Builds one Scribe assignment carrying the signed closure and predicate.
+    /// Builds one Scribe assignment carrying the signed closure.
     fn closure_assignment(
         scan_id: String,
         binding: TenantTableBinding,
@@ -2631,16 +1867,9 @@ pub(crate) mod tests {
         FollowerScanAssignment {
             scan_id,
             binding,
-            persisted: PersistedFileAssignment { files: Vec::new() },
             scribe_provider_cut: Some(cut()),
             schema_fingerprint,
             required_columns,
-            predicates: vec![wyrd_spec::vala::assignment_authority::ScanPredicate::Eq(
-                "status_code".to_owned(),
-                wyrd_spec::vala::assignment_authority::ScanLiteral::Utf8(
-                    "STATUS_CODE_ERROR".to_owned(),
-                ),
-            )],
         }
     }
 
@@ -2695,8 +1924,7 @@ pub(crate) mod tests {
             WriterEpoch::new(2),
         );
         let service = Arc::new(FetchLiveTailService::new(stream, memtable));
-        let resolver =
-            ScribeTailResolver::with_schema(service, Arc::clone(&schema), test_storage());
+        let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
         (tenant_id, schema, stream, resolver)
     }
 
@@ -2708,8 +1936,7 @@ pub(crate) mod tests {
     /// distinct properties are pinned together because they are one contract:
     ///
     /// 1. the fetch request copies `assignment.required_columns` byte-for-byte,
-    ///    so the memtable projects at the source, and the leaf filters by
-    ///    `assignment.predicates` rather than shipping every row;
+    ///    so the memtable projects at the source;
     /// 2. the resolved leaf — and the non-owning empty branch, which produces
     ///    no rows at all — declares that same closure schema, so the serialized
     ///    plan's `Column` indices are closure indices on every branch.
@@ -2727,11 +1954,14 @@ pub(crate) mod tests {
     /// Panics if resolution, execution, or the recorded request violates the
     /// closure contract this owner pins.
     #[tokio::test]
-    async fn scribe_provider_projects_and_filters_a_nonzero_ordinal() {
+    async fn scribe_provider_projects_a_nonzero_ordinal() {
         use arrow::array::Int64Array;
 
         let (tenant_id, schema, stream, resolver) = closure_fixture_resolver();
-        let session = SessionContext::new().state();
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
         let binding = closure_fixture_binding(tenant_id);
         let closure = signed_closure();
         let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
@@ -2773,8 +2003,8 @@ pub(crate) mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             durations,
-            vec![41_i64],
-            "only the ERROR row survives, with its duration preserved"
+            vec![41_i64, 97],
+            "every row reads its duration from closure ordinal 0"
         );
 
         // The non-owning branch produces no rows but must still declare the
@@ -2810,7 +2040,6 @@ pub(crate) mod tests {
                 batches: Vec::new(),
             }),
             Arc::clone(&schema),
-            test_storage(),
         );
         let assignment = closure_assignment(
             local_scribe_scan_id(&binding, stream),
@@ -2850,7 +2079,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn scribe_provider_refuses_a_mismatched_full_schema_fingerprint() {
         let (tenant_id, schema, stream, _resolver) = closure_fixture_resolver();
-        let session = SessionContext::new().state();
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
+        )
+        .state();
         let binding = closure_fixture_binding(tenant_id);
         let closure = signed_closure();
 
@@ -2862,7 +2094,6 @@ pub(crate) mod tests {
                 batches: Vec::new(),
             }),
             Arc::clone(&schema),
-            test_storage(),
         );
         assert!(
             counting
@@ -2901,7 +2132,6 @@ pub(crate) mod tests {
     async fn resolve_staged_fixture(
         fixture: &StagedGenerationFixture,
         service: Arc<FetchLiveTailService>,
-        predicates: Vec<ScanPredicate>,
         session: &SessionState,
     ) -> Arc<dyn ExecutionPlan> {
         fixture
@@ -2919,12 +2149,10 @@ pub(crate) mod tests {
             namespace: "vala.bifrost".to_owned(),
             table: "events".to_owned(),
         };
-        let resolver =
-            ScribeTailResolver::with_schema(service, Arc::clone(&schema), test_storage());
+        let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
         let assignment = FollowerScanAssignment {
             scan_id: local_scribe_scan_id(&binding, stream),
             binding,
-            persisted: PersistedFileAssignment { files: Vec::new() },
             scribe_provider_cut: Some(ScribeProviderCut {
                 writer_epoch: u64::try_from(stream.writer_epoch.as_i64())
                     .expect("positive fixture epoch"),
@@ -2933,7 +2161,6 @@ pub(crate) mod tests {
             }),
             schema_fingerprint: super::super::assignment_schema_fingerprint(schema.as_ref()),
             required_columns: vec!["value".to_owned()],
-            predicates,
         };
         resolver
             .resolve(ClusterRole::Scribe, &assignment, session)
@@ -2942,29 +2169,46 @@ pub(crate) mod tests {
             .plan
     }
 
-    /// A selective predicate skips the staged row groups that cannot match.
+    /// A selective filter skips the staged row groups that cannot match.
     ///
-    /// The staged run holds `[1, 2, 3]` one row per row group. Reading it for
-    /// `value = 2` through the resolved Scribe leaf must return only `2` and
-    /// record two pruned row groups in the same scan evidence a follower
-    /// footer reports, proving staged runs go through Oracle's hot-Parquet
-    /// pruning rather than being decoded whole and filtered afterwards.
+    /// The staged run holds `[1, 2, 3]` one row per row group. A `value = 2`
+    /// `FilterExec` over the resolved Scribe leaf, pushed into its scan by
+    /// `DataFusion`'s own `FilterPushdown`, must return only `2` and record two
+    /// pruned row groups in the scan evidence a follower footer reports: staged
+    /// runs prune natively rather than being decoded whole and filtered after.
     ///
     /// # Panics
     /// Panics when resolution or execution fails, the wrong rows survive, or
     /// the scan evidence records no scanned bytes or no pruned row group.
     #[tokio::test]
     async fn scribe_staged_scan_prunes_non_matching_row_groups() {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
+
         let fixture = crate::scribe::tail_rpc::tests::staged_generation_fixture_with_runs(1);
         let service = Arc::clone(&fixture.service);
-        let session = SessionContext::new().state();
-        let plan = resolve_staged_fixture(
-            &fixture,
-            service,
-            vec![ScanPredicate::Eq("value".to_owned(), ScanLiteral::I64(2))],
-            &session,
+        let session = SessionContext::new_with_config(
+            crate::resources::OracleSessionShape::for_test().session_config(),
         )
-        .await;
+        .state();
+        let leaf = resolve_staged_fixture(&fixture, service, &session).await;
+        let predicate = datafusion::physical_expr::expressions::binary(
+            Arc::new(datafusion::physical_expr::expressions::Column::new(
+                "value", 0,
+            )),
+            datafusion::logical_expr::Operator::Eq,
+            datafusion::physical_expr::expressions::lit(2_i64),
+            &leaf.schema(),
+        )
+        .expect("value = 2");
+        let plan = datafusion::physical_optimizer::filter_pushdown::FilterPushdown::new()
+            .optimize(
+                Arc::new(
+                    datafusion::physical_plan::filter::FilterExec::try_new(predicate, leaf)
+                        .expect("filter plans"),
+                ),
+                session.config_options(),
+            )
+            .expect("filter pushdown");
         let evidence = FollowerScanEvidence(super::super::exec::OracleQueryScanStats::from_plan(
             plan.as_ref(),
         ));
@@ -3012,10 +2256,10 @@ pub(crate) mod tests {
         // One partition, so the stream is the leaf's own rather than a
         // coalescing stream whose spawned partition tasks end asynchronously.
         let session = SessionContext::new_with_config(
-            datafusion::prelude::SessionConfig::new().with_target_partitions(1),
+            crate::resources::OracleSessionShape::new(1).session_config(),
         )
         .state();
-        let plan = resolve_staged_fixture(&fixture, service, Vec::new(), &session).await;
+        let plan = resolve_staged_fixture(&fixture, service, &session).await;
         let leases = || {
             fixture
                 .registry
@@ -3038,8 +2282,8 @@ pub(crate) mod tests {
 
     /// Returns the partition count each live source under `plan` advertises.
     ///
-    /// Walks past a signed `FilterExec` and a mixed `UnionExec` to the
-    /// memory and staged leaves, in the order the resolver built them.
+    /// Walks past a mixed `UnionExec` to the memory and staged leaves, in the
+    /// order the resolver built them.
     fn live_source_partitions(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
         if plan.children().is_empty() {
             return vec![plan.output_partitioning().partition_count()];
@@ -3068,25 +2312,26 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// Every live source keeps the session's partition count, however sparse.
+    /// Each live source reads at its own partition count and every row once.
     ///
-    /// At four target partitions, an empty snapshot, a one-batch memtable cut
-    /// (fewer batches than partitions) and a mixed memtable-plus-staged cut
-    /// must each give every source four partitions, with unused groups left
-    /// empty. Draining every partition returns each row exactly once, after
-    /// the signed predicate where one applies.
+    /// At four target partitions, an empty snapshot and a one-batch memtable
+    /// cut each earn one memtable partition, as their bytes fall under one
+    /// scan chunk, and a small staged run reads as one partition by
+    /// `DataFusion`'s scan rules. Draining every partition returns
+    /// each row exactly once; the query predicate is the fragment's own
+    /// `FilterExec`, not the resolver's.
     ///
     /// # Panics
     /// Panics when resolution or execution fails, a source advertises a
     /// different partition count, or the drained rows are not exactly once.
     #[tokio::test]
-    async fn scribe_live_sources_keep_the_session_partition_count() {
+    async fn scribe_live_sources_read_every_row_once_at_their_partition_count() {
         let session = SessionContext::new_with_config(
-            datafusion::prelude::SessionConfig::new().with_target_partitions(4),
+            crate::resources::OracleSessionShape::new(4).session_config(),
         )
         .state();
 
-        // One memtable batch under the signed predicate.
+        // One memtable batch.
         let (tenant_id, schema, stream, resolver) = closure_fixture_resolver();
         let binding = closure_fixture_binding(tenant_id);
         let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
@@ -3102,14 +2347,16 @@ pub(crate) mod tests {
             .await
             .expect("the one-batch cut resolves")
             .plan;
-        assert_eq!(live_source_partitions(&plan), vec![4]);
+        assert_eq!(live_source_partitions(&plan), vec![1]);
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await
             .expect("the one-batch cut executes");
+        let mut values = first_int64_values(&rows);
+        values.sort_unstable();
         assert_eq!(
-            first_int64_values(&rows),
-            vec![41],
-            "the ERROR row survives exactly once"
+            values,
+            vec![41, 97],
+            "every memtable row is read exactly once"
         );
 
         // An empty snapshot.
@@ -3120,14 +2367,13 @@ pub(crate) mod tests {
                 batches: Vec::new(),
             }),
             Arc::clone(&schema),
-            test_storage(),
         );
         let plan = empty
             .resolve(ClusterRole::Scribe, &assignment, &session)
             .await
             .expect("the empty cut resolves")
             .plan;
-        assert_eq!(live_source_partitions(&plan), vec![4]);
+        assert_eq!(live_source_partitions(&plan), vec![1]);
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await
             .expect("the empty cut executes");
@@ -3166,8 +2412,8 @@ pub(crate) mod tests {
             )
             .expect("the newer batch inserts");
         let service = Arc::clone(&fixture.service);
-        let plan = resolve_staged_fixture(&fixture, service, Vec::new(), &session).await;
-        assert_eq!(live_source_partitions(&plan), vec![4, 4]);
+        let plan = resolve_staged_fixture(&fixture, service, &session).await;
+        assert_eq!(live_source_partitions(&plan), vec![1, 1]);
         let rows = collect(plan, Arc::new(TaskContext::default()))
             .await
             .expect("the mixed cut executes");
@@ -3181,7 +2427,7 @@ pub(crate) mod tests {
     /// # Panics
     /// Panics if the canonical physical-plan fixtures cannot be encoded or decoded.
     pub(crate) async fn assert_complete_preflight_matrix() {
-        let (request, binding) = oracle_request().expect("valid Oracle request");
+        let (request, binding) = scribe_request().expect("valid Scribe request");
         let calls = Arc::new(AtomicUsize::new(0));
         let follower = PhysicalPlanFollower::new(CountingResolver {
             calls: Arc::clone(&calls),

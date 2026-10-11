@@ -1,153 +1,22 @@
-//! Closed scan-predicate/literal vocabulary and the v2
-//! assignment-authority digest.
+//! The assignment-authority digest binding a live Scribe fragment's
+//! assignments to the leader's peer context.
 //!
-//! This module is the Arrow-free, IO-free contract for the predicate and
-//! index pushdown closure: the exact leaf predicate/literal enums the
-//! `OracleTableProvider` classifier recognizes as `Inexact`-supported, and
-//! the deterministic byte encoding hashed into the
-//! `assignment-authority` digest that binds a follower's projection,
-//! predicates, files, and Scribe cut to the leader's peer context before any
-//! object I/O. The context is unsigned; the digest proves the context and the
-//! dispatched assignments agree, and origin comes from the mTLS cluster
-//! identity. Every byte-level rule here is normative, so its encoding must be
-//! reproduced exactly by any producer or verifier.
+//! This module is the Arrow-free, IO-free deterministic byte encoding hashed
+//! into the `assignment-authority` digest that binds a Scribe follower's
+//! projection and provider cut to the leader's peer context before any read.
+//! The context is unsigned; the digest proves the context and the dispatched
+//! assignments agree, and origin comes from the mTLS cluster identity. Every
+//! byte-level rule here is normative, so its encoding must be reproduced
+//! exactly by any producer or verifier.
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-/// Closed scalar literal vocabulary for a supported comparison predicate.
-///
-/// Only these seven variants may appear as the literal operand of a supported
-/// leaf predicate. `F64Bits` carries the IEEE-754 bit pattern (via
-/// [`f64::to_bits`]) rather than a raw `f64` so equality, hashing, and the
-/// digest encoding stay exact instead of floating-point-approximate. `Bytes`
-/// carries a binary or fixed-size binary literal (for example a trace id)
-/// losslessly, so binary identifiers never round-trip through UTF-8.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub enum ScanLiteral {
-    /// Boolean literal.
-    Bool(bool),
-    /// Signed 64-bit integer literal.
-    I64(i64),
-    /// Unsigned 64-bit integer literal.
-    U64(u64),
-    /// IEEE-754 double-precision literal, carried as its raw bit pattern.
-    F64Bits(u64),
-    /// UTF-8 string literal.
-    Utf8(String),
-    /// Microsecond-precision UTC timestamp literal.
-    TimestampMicros(i64),
-    /// Binary literal compared byte-for-byte against binary and fixed-size
-    /// binary columns.
-    Bytes(Vec<u8>),
-}
-
-impl ScanLiteral {
-    /// Returns the digest literal-type tag defined by the assignment-authority
-    /// encoding (`Bool` 0, `I64` 1, `U64` 2, `F64Bits` 3, `Utf8` 4,
-    /// `TimestampMicros` 5, `Bytes` 6).
-    #[must_use]
-    pub fn digest_tag(&self) -> u8 {
-        match self {
-            ScanLiteral::Bool(_) => 0,
-            ScanLiteral::I64(_) => 1,
-            ScanLiteral::U64(_) => 2,
-            ScanLiteral::F64Bits(_) => 3,
-            ScanLiteral::Utf8(_) => 4,
-            ScanLiteral::TimestampMicros(_) => 5,
-            ScanLiteral::Bytes(_) => 6,
-        }
-    }
-}
-
-/// Closed leaf predicate vocabulary reachable through predicate pushdown.
-///
-/// This is the complete supported-expression subset: typed comparisons over
-/// exactly one unqualified column and one [`ScanLiteral`], plus null-checks.
-/// Any DataFusion filter outside this shape (`OR`, `NOT`, casts, functions,
-/// arithmetic, column-to-column comparison, qualified/unknown columns,
-/// non-finite floats, mixed-type comparisons) is classified `Unsupported` by
-/// the caller and never reaches this type. A literal appearing on the left of
-/// a comparison is normalized by the caller (operator reversed) before
-/// constructing this enum, so every comparison variant here always carries
-/// `(column, literal)` in that order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub enum ScanPredicate {
-    /// `column = literal`.
-    Eq(String, ScanLiteral),
-    /// `column != literal`.
-    NotEq(String, ScanLiteral),
-    /// `column < literal`.
-    Lt(String, ScanLiteral),
-    /// `column <= literal`.
-    LtEq(String, ScanLiteral),
-    /// `column > literal`.
-    Gt(String, ScanLiteral),
-    /// `column >= literal`.
-    GtEq(String, ScanLiteral),
-    /// `column IS NULL`.
-    IsNull(String),
-    /// `column IS NOT NULL`.
-    IsNotNull(String),
-}
-
-impl ScanPredicate {
-    /// Returns the digest operator tag defined by the assignment-authority
-    /// encoding (`Eq` 0, `NotEq` 1, `Lt` 2, `LtEq` 3, `Gt` 4, `GtEq` 5,
-    /// `IsNull` 6, `IsNotNull` 7).
-    #[must_use]
-    pub fn digest_op_tag(&self) -> u8 {
-        match self {
-            ScanPredicate::Eq(..) => 0,
-            ScanPredicate::NotEq(..) => 1,
-            ScanPredicate::Lt(..) => 2,
-            ScanPredicate::LtEq(..) => 3,
-            ScanPredicate::Gt(..) => 4,
-            ScanPredicate::GtEq(..) => 5,
-            ScanPredicate::IsNull(..) => 6,
-            ScanPredicate::IsNotNull(..) => 7,
-        }
-    }
-
-    /// Borrows the predicate's column name, regardless of variant.
-    #[must_use]
-    pub fn column(&self) -> &str {
-        match self {
-            ScanPredicate::Eq(column, _)
-            | ScanPredicate::NotEq(column, _)
-            | ScanPredicate::Lt(column, _)
-            | ScanPredicate::LtEq(column, _)
-            | ScanPredicate::Gt(column, _)
-            | ScanPredicate::GtEq(column, _)
-            | ScanPredicate::IsNull(column)
-            | ScanPredicate::IsNotNull(column) => column,
-        }
-    }
-
-    /// Borrows the predicate's literal operand, or `None` for a null-check.
-    #[must_use]
-    pub fn literal(&self) -> Option<&ScanLiteral> {
-        match self {
-            ScanPredicate::Eq(_, literal)
-            | ScanPredicate::NotEq(_, literal)
-            | ScanPredicate::Lt(_, literal)
-            | ScanPredicate::LtEq(_, literal)
-            | ScanPredicate::Gt(_, literal)
-            | ScanPredicate::GtEq(_, literal) => Some(literal),
-            ScanPredicate::IsNull(_) | ScanPredicate::IsNotNull(_) => None,
-        }
-    }
-}
 
 /// Input to the assignment-authority digest for exactly one
 /// `FollowerScanAssignment`, in canonical (validated, unsorted) order.
 ///
-/// Every list field is hashed in the order given: files, columns, and
-/// predicates are never sorted by the digest function. The caller is
-/// responsible for supplying the already-validated semantic order it wants
-/// signed.
+/// Every list field is hashed in the order given: columns are never sorted
+/// by the digest function. The caller is responsible for supplying the
+/// already-validated semantic order it wants signed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssignmentDigestInput<'a> {
     /// Stable scan identifier encoded in the physical extension node.
@@ -160,17 +29,10 @@ pub struct AssignmentDigestInput<'a> {
     pub table: &'a str,
     /// Canonical lowercase 64-hex physical schema fingerprint.
     pub schema_fingerprint_hex: &'a str,
-    /// Signed typed persisted-file descriptors assigned to this follower, in
-    /// order. The descriptor's variant, size, row count, source identity, and
-    /// declared event-time bounds are all inside the digest, so a follower that
-    /// validates the signature has validated the object identity it will read.
-    pub files: &'a [crate::vala::api::PersistedFileDescriptor],
     /// Optional Scribe memory-provider cut for this assignment.
     pub scribe_cut: Option<&'a crate::vala::api::ScribeProviderCut>,
     /// Required output/predicate/hidden-tenant projection closure, in order.
     pub required_columns: &'a [String],
-    /// Closed leaf predicates, in filter order.
-    pub predicates: &'a [ScanPredicate],
 }
 
 /// Digest encoding failure for one assignment-authority input.
@@ -187,32 +49,13 @@ pub enum AssignmentDigestError {
     },
 }
 
-/// Domain separator for the v7 assignment-authority digest.
+/// Domain separator for the v9 assignment-authority digest.
 ///
-/// v7 drops the follower reader cut: followers no longer establish snapshot
-/// protection, because the leader's committed active table read covers every
-/// descendant fragment it plans. The assignment is v6 without the cut, and the
-/// domain differs so a v6 signature can never validate against v7 bytes.
-///
-/// v6 drops the Scribe cut's batch-count and retained-byte limits: the cut is
-/// the writer epoch and the two partitions. Every other rule is unchanged from
-/// v5, and the domain differs so a v5 signature can never validate against v6
-/// bytes.
-///
-/// v5 appended the required
-/// follower reader cut to every assignment, so a signed
-/// fragment names the exact protected snapshot the follower may read. The
-/// domain differs from v4 so a v4 signature — which carried no cut — can never
-/// validate against v5 bytes.
-///
-/// v4 replaced v3's length-prefixed persisted path strings with typed
-/// [`crate::vala::api::PersistedFileDescriptor`] encodings: a source tag, the
-/// path, the object size, the record count, the hot source's `vala.file_list`
-/// identity and decoded checksum or the Iceberg source's pinned snapshot, and
-/// the declared event-time bounds. Every other count, length, option,
-/// predicate, projection, cut, and numeric rule is unchanged from v3, and the
-/// domain differs so a v3 signature can never validate against v4 bytes.
-const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v7\0";
+/// v9 drops the persisted-file descriptors and the scan predicates: persisted
+/// reads are planned and distributed by `DataFusion`, so an assignment names
+/// only a Scribe provider cut and its projection. The domain differs so v8
+/// bytes never validate as v9.
+const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v9\0";
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
@@ -267,96 +110,6 @@ fn push_option<T>(
         Some(inner) => {
             buffer.push(1);
             write(buffer, inner)?;
-        }
-    }
-    Ok(())
-}
-
-/// Appends one scan literal as its digest tag followed by its typed
-/// payload.
-///
-/// Fixed-width values are big-endian, booleans one byte, and UTF-8 and byte
-/// literals length-prefixed, so two literals of different types or values
-/// never encode identically.
-///
-/// # Errors
-///
-/// Returns [`AssignmentDigestError::LengthOverflow`] when a UTF-8 or byte
-/// literal exceeds the `u32` length domain.
-fn push_literal(buffer: &mut Vec<u8>, literal: &ScanLiteral) -> Result<(), AssignmentDigestError> {
-    buffer.push(literal.digest_tag());
-    match literal {
-        ScanLiteral::Bool(value) => buffer.push(u8::from(*value)),
-        ScanLiteral::I64(value) | ScanLiteral::TimestampMicros(value) => {
-            buffer.extend_from_slice(&value.to_be_bytes());
-        }
-        ScanLiteral::U64(value) => buffer.extend_from_slice(&value.to_be_bytes()),
-        ScanLiteral::F64Bits(bits) => buffer.extend_from_slice(&bits.to_be_bytes()),
-        ScanLiteral::Utf8(value) => push_string(buffer, value)?,
-        ScanLiteral::Bytes(value) => push_bytes(buffer, value, "bytes length")?,
-    }
-    Ok(())
-}
-
-fn push_predicate(
-    buffer: &mut Vec<u8>,
-    predicate: &ScanPredicate,
-) -> Result<(), AssignmentDigestError> {
-    buffer.push(predicate.digest_op_tag());
-    push_string(buffer, predicate.column())?;
-    push_option(buffer, predicate.literal(), push_literal)
-}
-
-/// Appends one optional big-endian `i64` as `option_tag:u8 || value:i64`.
-///
-/// The tag is what keeps an absent bound distinct from a zero one: without it,
-/// a file that declares no interval and a file that declares the epoch instant
-/// would sign identically.
-fn push_optional_i64(buffer: &mut Vec<u8>, value: Option<i64>) {
-    match value {
-        None => buffer.push(0),
-        Some(value) => {
-            buffer.push(1);
-            buffer.extend_from_slice(&value.to_be_bytes());
-        }
-    }
-}
-
-/// Appends one typed persisted-file descriptor.
-///
-/// The leading source tag is what makes the two variants unambiguous to the
-/// digest: `1` for hot, `2` for Iceberg. Tag `0` is deliberately unused so an
-/// all-zero or truncated buffer cannot decode as a valid descriptor. Every
-/// field except the path is fixed width, and the path keeps its `u32` length
-/// prefix, so no two distinct descriptors can encode to the same bytes.
-///
-/// # Errors
-/// Returns [`AssignmentDigestError::LengthOverflow`] when the path exceeds the
-/// `u32` length domain.
-fn push_file_descriptor(
-    buffer: &mut Vec<u8>,
-    descriptor: &crate::vala::api::PersistedFileDescriptor,
-) -> Result<(), AssignmentDigestError> {
-    use crate::vala::api::PersistedFileDescriptor;
-    match descriptor {
-        PersistedFileDescriptor::Hot(hot) => {
-            buffer.push(1);
-            push_string(buffer, &hot.path)?;
-            buffer.extend_from_slice(&hot.size_bytes.to_be_bytes());
-            buffer.extend_from_slice(&hot.row_count.to_be_bytes());
-            buffer.extend_from_slice(hot.file_list_id.as_bytes());
-            buffer.extend_from_slice(&hot.sha256);
-            push_optional_i64(buffer, hot.min_event_time_micros);
-            push_optional_i64(buffer, hot.max_event_time_micros);
-        }
-        PersistedFileDescriptor::Iceberg(iceberg) => {
-            buffer.push(2);
-            push_string(buffer, &iceberg.path)?;
-            buffer.extend_from_slice(&iceberg.size_bytes.to_be_bytes());
-            buffer.extend_from_slice(&iceberg.row_count.to_be_bytes());
-            buffer.extend_from_slice(&iceberg.snapshot_id.to_be_bytes());
-            push_optional_i64(buffer, iceberg.min_event_time_micros);
-            push_optional_i64(buffer, iceberg.max_event_time_micros);
         }
     }
     Ok(())
@@ -438,10 +191,6 @@ fn push_assignment(
     push_string(buffer, assignment.table)?;
     let fingerprint = decode_schema_fingerprint(assignment.schema_fingerprint_hex)?;
     buffer.extend_from_slice(&fingerprint);
-    push_count(buffer, assignment.files.len(), "files")?;
-    for file in assignment.files {
-        push_file_descriptor(buffer, file)?;
-    }
     push_option(buffer, assignment.scribe_cut, push_scribe_cut)?;
     push_count(
         buffer,
@@ -450,10 +199,6 @@ fn push_assignment(
     )?;
     for column in assignment.required_columns {
         push_string(buffer, column)?;
-    }
-    push_count(buffer, assignment.predicates.len(), "predicates")?;
-    for predicate in assignment.predicates {
-        push_predicate(buffer, predicate)?;
     }
     Ok(())
 }
@@ -513,41 +258,8 @@ mod tests {
 
     use crate::vala::api::{ScribeProviderCut, TimeGranularityWire, TimePartitionWire};
 
-    /// Builds the normative v3 Scribe cut: writer epoch 7, the two hourly
-    /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`, 16 maximum
-    /// batches, and 1 MiB maximum retained bytes. The projection closure lives
-    /// on the enclosing assignment, never on the cut.
-    /// The normative v4 hot descriptor: the same object path v3 signed as a
-    /// bare string, now carrying its size, record count, `vala.file_list`
-    /// identity, decoded checksum, and declared event-time interval.
-    fn normative_hot_descriptor() -> crate::vala::api::PersistedFileDescriptor {
-        crate::vala::api::PersistedFileDescriptor::Hot(crate::vala::api::HotFileDescriptor {
-            path: "s3://bucket/logs/a.parquet".to_string(),
-            size_bytes: 4_194_304,
-            row_count: 128,
-            file_list_id: uuid::Uuid::parse_str("0f0e0d0c-0b0a-0908-0706-050403020100")
-                .expect("fixture file-list identity parses"),
-            sha256: [0x11; 32],
-            min_event_time_micros: Some(1_787_493_600_000_000),
-            max_event_time_micros: Some(1_787_497_200_000_000),
-        })
-    }
-
-    /// The normative v4 Iceberg descriptor, used to prove the source variant is
-    /// itself authoritative rather than inferred from the path.
-    fn normative_iceberg_descriptor() -> crate::vala::api::PersistedFileDescriptor {
-        crate::vala::api::PersistedFileDescriptor::Iceberg(
-            crate::vala::api::IcebergFileDescriptor {
-                path: "s3://bucket/logs/a.parquet".to_string(),
-                size_bytes: 4_194_304,
-                row_count: 128,
-                snapshot_id: 8_675_309,
-                min_event_time_micros: Some(1_787_493_600_000_000),
-                max_event_time_micros: Some(1_787_497_200_000_000),
-            },
-        )
-    }
-
+    /// Builds the normative Scribe cut: writer epoch 7 over the two hourly
+    /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`.
     fn normative_scribe_cut() -> ScribeProviderCut {
         ScribeProviderCut {
             writer_epoch: 7,
@@ -564,225 +276,101 @@ mod tests {
             .expect("fixture start is canonical")
     }
 
-    /// Normative v7 vector: one assignment for tenant
-    /// `00112233-4455-6677-8899-aabbccddeeff`, table `logs.records`, fingerprint
-    /// `00..1f`, one typed hot descriptor, three required columns carried once
-    /// on the assignment, a single `Eq(service_name, "api")` predicate, and the
-    /// normative Scribe cut must encode to exactly 348 bytes and hash to the
-    /// fixed digest below. Asserting both the byte length and the hash prevents
-    /// a compensating pair of layout mistakes from passing.
-    ///
-    /// v7 is exactly 112 bytes shorter than v6's 460: the reader cut's 16 table
-    /// uuid + 8 snapshot + 8 snapshot timestamp + 8 retained head + 4 ancestry
-    /// count + 24 for its three entries + 4 digest version + 32 digest + 8
-    /// epoch fence are gone.
+    /// Returns the normative fingerprint, tenant, and projection closure.
     ///
     /// # Panics
     ///
-    /// Panics when a fixture identifier fails to parse, encoding fails, or the
-    /// encoded vector differs from the normative 348-byte length or fixed
-    /// digest.
-    #[test]
-    fn normative_vector_encodes_to_fixed_length_and_digest() {
-        let fingerprint = hex::encode((0u8..32).collect::<Vec<_>>());
-        let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
-        let files = vec![normative_hot_descriptor()];
+    /// Panics if the fixed fixture tenant UUID fails to parse, which cannot
+    /// happen.
+    fn base_vector() -> (String, uuid::Uuid, Vec<String>) {
+        let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
+        let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff")
+            .expect("fixture tenant parses");
         let required_columns = vec![
             "service_name".to_string(),
-            "wyrd_event_time".to_string(),
+            "wyrd_ingested_at".to_string(),
             "data_tenant_id".to_string(),
         ];
-        let predicates = vec![ScanPredicate::Eq(
-            "service_name".to_string(),
-            ScanLiteral::Utf8("api".to_string()),
-        )];
+        (fingerprint, tenant_uuid, required_columns)
+    }
+
+    /// Digests one assignment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the assignment cannot be encoded for the digest.
+    fn digest_of(assignment: &AssignmentDigestInput<'_>) -> String {
+        assignment_authority_digest(std::slice::from_ref(assignment)).expect("fixture encodes")
+    }
+
+    /// Every field of an assignment — identity, table, fingerprint, cut
+    /// presence and content, and projection order — moves the digest, so a
+    /// peer cannot replay a signed context against a different read.
+    #[test]
+    fn every_assignment_field_changes_the_digest() {
+        let (fingerprint, tenant_uuid, required_columns) = base_vector();
         let cut = normative_scribe_cut();
-        let assignment = AssignmentDigestInput {
+        let baseline = AssignmentDigestInput {
             scan_id: "scan-1",
             tenant_uuid,
             namespace: "logs",
             table: "records",
             schema_fingerprint_hex: &fingerprint,
-            files: &files,
             scribe_cut: Some(&cut),
             required_columns: &required_columns,
-            predicates: &predicates,
         };
-
-        let bytes = encode_assignment_authority_bytes(std::slice::from_ref(&assignment)).unwrap();
-        assert_eq!(
-            bytes.len(),
-            348,
-            "normative vector must encode to exactly 348 bytes"
-        );
-
-        let digest = assignment_authority_digest(std::slice::from_ref(&assignment)).unwrap();
-        assert_eq!(
-            digest,
-            "82ba611135f393fff2757dc27b7b87b81b092aca16cf35c9ca8cb0565d597be4"
-        );
-    }
-
-    /// Every descriptor field and the descriptor order are independently
-    /// authoritative.
-    ///
-    /// A follower trusts the descriptor instead of re-querying the catalog, so
-    /// any fact a leader could have signed differently — the source variant, the
-    /// path, the size, the record count, the `vala.file_list` identity, the
-    /// decoded checksum, the pinned snapshot, either event-time bound, or the
-    /// position in the list — must move the digest. If one did not, a peer could
-    /// substitute a different object, or the same object under different claimed
-    /// statistics, and still present a valid signature.
-    ///
-    /// The two variants deliberately share a path here: the source tag alone
-    /// must separate them, because a path is not publication authority.
-    #[test]
-    fn assignment_authority_v4_binds_every_descriptor_field_and_order() {
-        use crate::vala::api::PersistedFileDescriptor;
-
-        let (fingerprint, tenant_uuid, files, required_columns, predicates) = base_vector();
-        let cut = normative_scribe_cut();
-        let digest_with = |files: &[PersistedFileDescriptor]| {
+        let mut other_fingerprint = fingerprint.clone();
+        other_fingerprint.replace_range(0..2, "ff");
+        let mut other_epoch = cut.clone();
+        other_epoch.writer_epoch = 2;
+        let mut other_start = cut.clone();
+        other_start.start_partition = hour_partition(1_787_490_000_000_000);
+        let reordered = vec![
+            "wyrd_ingested_at".to_string(),
+            "service_name".to_string(),
+            "data_tenant_id".to_string(),
+        ];
+        let digests = [
+            digest_of(&baseline),
             digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files,
-                scribe_cut: Some(&cut),
-                required_columns: &required_columns,
-                predicates: &predicates,
-            })
-        };
-        let baseline = digest_with(&files);
-
-        // The source tag separates two descriptors that name the same path.
-        assert_ne!(
-            baseline,
-            digest_with(std::slice::from_ref(&normative_iceberg_descriptor())),
-            "the source variant is authoritative, not inferred from the path"
-        );
-
-        let hot_mutation = |mutate: fn(&mut crate::vala::api::HotFileDescriptor)| {
-            let mut descriptor = normative_hot_descriptor();
-            if let PersistedFileDescriptor::Hot(hot) = &mut descriptor {
-                mutate(hot);
-            }
-            vec![descriptor]
-        };
-        for (field, mutated) in [
-            (
-                "path",
-                hot_mutation(|hot| hot.path = "s3://bucket/logs/b.parquet".to_string()),
-            ),
-            ("size_bytes", hot_mutation(|hot| hot.size_bytes += 1)),
-            ("row_count", hot_mutation(|hot| hot.row_count += 1)),
-            (
-                "file_list_id",
-                hot_mutation(|hot| hot.file_list_id = uuid::Uuid::from_u128(9)),
-            ),
-            ("sha256", hot_mutation(|hot| hot.sha256[31] ^= 0x01)),
-            (
-                "min_event_time_micros value",
-                hot_mutation(|hot| hot.min_event_time_micros = Some(1_787_493_600_000_001)),
-            ),
-            (
-                "min_event_time_micros presence",
-                hot_mutation(|hot| {
-                    hot.min_event_time_micros = None;
-                    hot.max_event_time_micros = None;
-                }),
-            ),
-            (
-                "max_event_time_micros value",
-                hot_mutation(|hot| hot.max_event_time_micros = Some(1_787_497_200_000_001)),
-            ),
-        ] {
-            assert_ne!(baseline, digest_with(&mutated), "{field} must be bound");
-        }
-
-        let iceberg_mutation = |mutate: fn(&mut crate::vala::api::IcebergFileDescriptor)| {
-            let mut descriptor = normative_iceberg_descriptor();
-            if let PersistedFileDescriptor::Iceberg(iceberg) = &mut descriptor {
-                mutate(iceberg);
-            }
-            vec![descriptor]
-        };
-        let iceberg_baseline = digest_with(std::slice::from_ref(&normative_iceberg_descriptor()));
-        for (field, mutated) in [
-            ("size_bytes", iceberg_mutation(|file| file.size_bytes += 1)),
-            ("row_count", iceberg_mutation(|file| file.row_count += 1)),
-            (
-                "snapshot_id",
-                iceberg_mutation(|file| file.snapshot_id += 1),
-            ),
-            (
-                "max_event_time_micros",
-                iceberg_mutation(|file| file.max_event_time_micros = Some(1_787_497_200_000_001)),
-            ),
-        ] {
-            assert_ne!(
-                iceberg_baseline,
-                digest_with(&mutated),
-                "iceberg {field} must be bound"
-            );
-        }
-
-        // Order is authoritative: the same two descriptors in the other order
-        // must not produce the same digest.
-        let forward = vec![normative_hot_descriptor(), normative_iceberg_descriptor()];
-        let reversed = vec![normative_iceberg_descriptor(), normative_hot_descriptor()];
-        assert_ne!(
-            digest_with(&forward),
-            digest_with(&reversed),
-            "descriptor order must be bound"
-        );
-
-        // The v4 domain must separate the same logical assignment from v3.
-        assert_ne!(
-            baseline, "949a3d1c1e779d23e57fbd1569fab6cdbcd65dd30eac5a0dfa1ab5facd7b4394",
-            "a v3 signature must never validate against v4 bytes"
-        );
-    }
-
-    /// Each partition bound is independently authoritative: changing either
-    /// endpoint's granularity or start instant must move the digest, so a
-    /// signed cut cannot be replayed against a different partition range.
-    #[test]
-    fn every_partition_bound_component_changes_the_digest() {
-        let (fingerprint, tenant_uuid, files, required_columns, predicates) = base_vector();
-        let baseline_cut = normative_scribe_cut();
-        let digest_with = |cut: &ScribeProviderCut| {
+                scan_id: "scan-2",
+                ..baseline.clone()
+            }),
             digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files: &files,
-                scribe_cut: Some(cut),
-                required_columns: &required_columns,
-                predicates: &predicates,
-            })
-        };
-        let baseline = digest_with(&baseline_cut);
-
-        let mut moved_start = baseline_cut.clone();
-        moved_start.start_partition = hour_partition(1_787_490_000_000_000);
-        assert_ne!(baseline, digest_with(&moved_start));
-
-        let mut moved_end = baseline_cut.clone();
-        moved_end.end_partition = hour_partition(1_787_500_800_000_000);
-        assert_ne!(baseline, digest_with(&moved_end));
-
-        let day_start = chrono::DateTime::from_timestamp_micros(1_787_443_200_000_000)
-            .expect("fixture start is representable");
-        let mut regranulated = baseline_cut.clone();
-        regranulated.start_partition = TimePartitionWire::new(TimeGranularityWire::Day, day_start)
-            .expect("fixture day start is canonical");
-        regranulated.end_partition = regranulated.start_partition;
-        assert_ne!(baseline, digest_with(&regranulated));
+                tenant_uuid: uuid::Uuid::from_u128(1),
+                ..baseline.clone()
+            }),
+            digest_of(&AssignmentDigestInput {
+                namespace: "logz",
+                ..baseline.clone()
+            }),
+            digest_of(&AssignmentDigestInput {
+                table: "recordz",
+                ..baseline.clone()
+            }),
+            digest_of(&AssignmentDigestInput {
+                schema_fingerprint_hex: &other_fingerprint,
+                ..baseline.clone()
+            }),
+            digest_of(&AssignmentDigestInput {
+                scribe_cut: None,
+                ..baseline.clone()
+            }),
+            digest_of(&AssignmentDigestInput {
+                scribe_cut: Some(&other_epoch),
+                ..baseline.clone()
+            }),
+            digest_of(&AssignmentDigestInput {
+                scribe_cut: Some(&other_start),
+                ..baseline.clone()
+            }),
+            digest_of(&AssignmentDigestInput {
+                required_columns: &reordered,
+                ..baseline.clone()
+            }),
+        ];
+        let distinct: std::collections::BTreeSet<_> = digests.iter().collect();
+        assert_eq!(distinct.len(), digests.len(), "every field is bound");
     }
 
     /// A partition start that is not the exact boundary of its granularity is
@@ -798,332 +386,18 @@ mod tests {
         assert!(TimePartitionWire::new(TimeGranularityWire::Day, mid_day).is_err());
     }
 
-    fn base_vector() -> (
-        String,
-        uuid::Uuid,
-        Vec<crate::vala::api::PersistedFileDescriptor>,
-        Vec<String>,
-        Vec<ScanPredicate>,
-    ) {
-        let fingerprint = hex::encode((0u8..32).collect::<Vec<_>>());
-        let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
-        let files = vec![normative_hot_descriptor()];
-        let required_columns = vec![
-            "service_name".to_string(),
-            "wyrd_event_time".to_string(),
-            "data_tenant_id".to_string(),
-        ];
-        (fingerprint, tenant_uuid, files, required_columns, vec![])
-    }
-
-    fn digest_of(assignment: &AssignmentDigestInput<'_>) -> String {
-        assignment_authority_digest(std::slice::from_ref(assignment)).unwrap()
-    }
-
-    fn baseline_digest(predicates: &[ScanPredicate]) -> String {
-        let (fingerprint, tenant_uuid, files, required_columns, _) = base_vector();
-        digest_of(&AssignmentDigestInput {
-            scan_id: "scan-1",
-            tenant_uuid,
-            namespace: "logs",
-            table: "records",
-            schema_fingerprint_hex: &fingerprint,
-            files: &files,
-            scribe_cut: None,
-            required_columns: &required_columns,
-            predicates,
-        })
-    }
-
-    /// Every mutation class the packet requires must change the digest:
-    /// scan id, tenant, namespace, table, fingerprint bytes, file path bytes,
-    /// list reordering, float bits, and predicate operator/column/literal.
-    ///
-    /// # Panics
-    ///
-    /// Panics when encoding fails or any required field-class mutation leaves
-    /// the digest unchanged.
-    #[test]
-    fn every_field_class_mutation_changes_the_digest() {
-        let predicates = vec![ScanPredicate::Eq(
-            "service_name".to_string(),
-            ScanLiteral::Utf8("api".to_string()),
-        )];
-        let baseline = baseline_digest(&predicates);
-        let (fingerprint, tenant_uuid, files, required_columns, _) = base_vector();
-
-        // scan_id
-        assert_ne!(
-            baseline,
-            digest_of(&AssignmentDigestInput {
-                scan_id: "scan-2",
-                tenant_uuid,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files: &files,
-                scribe_cut: None,
-                required_columns: &required_columns,
-                predicates: &predicates,
-            })
-        );
-
-        // tenant uuid
-        let other_tenant = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeef0").unwrap();
-        assert_ne!(
-            baseline,
-            digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid: other_tenant,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files: &files,
-                scribe_cut: None,
-                required_columns: &required_columns,
-                predicates: &predicates,
-            })
-        );
-
-        // namespace
-        assert_ne!(
-            baseline,
-            digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logz",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files: &files,
-                scribe_cut: None,
-                required_columns: &required_columns,
-                predicates: &predicates,
-            })
-        );
-
-        // table
-        assert_ne!(
-            baseline,
-            digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logs",
-                table: "recordz",
-                schema_fingerprint_hex: &fingerprint,
-                files: &files,
-                scribe_cut: None,
-                required_columns: &required_columns,
-                predicates: &predicates,
-            })
-        );
-
-        // fingerprint bytes
-        let mut mutated_fingerprint = fingerprint.clone();
-        mutated_fingerprint.replace_range(0..2, "ff");
-        assert_ne!(
-            baseline,
-            digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &mutated_fingerprint,
-                files: &files,
-                scribe_cut: None,
-                required_columns: &required_columns,
-                predicates: &predicates,
-            })
-        );
-
-        // file path bytes
-        let mutated_files = vec![{
-            let mut descriptor = normative_hot_descriptor();
-            if let crate::vala::api::PersistedFileDescriptor::Hot(hot) = &mut descriptor {
-                hot.path = "s3://bucket/logs/b.parquet".to_string();
-            }
-            descriptor
-        }];
-        assert_ne!(
-            baseline,
-            digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files: &mutated_files,
-                scribe_cut: None,
-                required_columns: &required_columns,
-                predicates: &predicates,
-            })
-        );
-
-        // required_columns reordered
-        let reordered_columns = vec![
-            "wyrd_event_time".to_string(),
-            "service_name".to_string(),
-            "data_tenant_id".to_string(),
-        ];
-        assert_ne!(
-            baseline,
-            digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files: &files,
-                scribe_cut: None,
-                required_columns: &reordered_columns,
-                predicates: &predicates,
-            })
-        );
-
-        // predicate operator
-        let noteq_predicate = vec![ScanPredicate::NotEq(
-            "service_name".to_string(),
-            ScanLiteral::Utf8("api".to_string()),
-        )];
-        assert_ne!(baseline, baseline_digest(&noteq_predicate));
-
-        // predicate column
-        let other_column_predicate = vec![ScanPredicate::Eq(
-            "other_column".to_string(),
-            ScanLiteral::Utf8("api".to_string()),
-        )];
-        assert_ne!(baseline, baseline_digest(&other_column_predicate));
-
-        // predicate literal
-        let other_literal_predicate = vec![ScanPredicate::Eq(
-            "service_name".to_string(),
-            ScanLiteral::Utf8("apk".to_string()),
-        )];
-        assert_ne!(baseline, baseline_digest(&other_literal_predicate));
-
-        // float bits
-        let float_baseline = baseline_digest(&[ScanPredicate::Gt(
-            "duration_ms".to_string(),
-            ScanLiteral::F64Bits(1.0_f64.to_bits()),
-        )]);
-        let float_mutated = baseline_digest(&[ScanPredicate::Gt(
-            "duration_ms".to_string(),
-            ScanLiteral::F64Bits(1.000_000_1_f64.to_bits()),
-        )]);
-        assert_ne!(float_baseline, float_mutated);
-
-        // binary literal: distinct from its UTF-8 spelling and from other bytes
-        let bytes_baseline = baseline_digest(&[ScanPredicate::Eq(
-            "service_name".to_string(),
-            ScanLiteral::Bytes(b"api".to_vec()),
-        )]);
-        assert_ne!(baseline, bytes_baseline);
-        let bytes_mutated = baseline_digest(&[ScanPredicate::Eq(
-            "service_name".to_string(),
-            ScanLiteral::Bytes(vec![0xff, 0x00, 0x01]),
-        )]);
-        assert_ne!(bytes_baseline, bytes_mutated);
-    }
-
-    #[test]
-    fn scribe_cut_presence_and_content_changes_the_digest() {
-        let (fingerprint, tenant_uuid, files, required_columns, predicates) = base_vector();
-        let no_cut = digest_of(&AssignmentDigestInput {
-            scan_id: "scan-1",
-            tenant_uuid,
-            namespace: "logs",
-            table: "records",
-            schema_fingerprint_hex: &fingerprint,
-            files: &files,
-            scribe_cut: None,
-            required_columns: &required_columns,
-            predicates: &predicates,
-        });
-        let cut = normative_scribe_cut();
-        let with_cut = digest_of(&AssignmentDigestInput {
-            scan_id: "scan-1",
-            tenant_uuid,
-            namespace: "logs",
-            table: "records",
-            schema_fingerprint_hex: &fingerprint,
-            files: &files,
-            scribe_cut: Some(&cut),
-            required_columns: &required_columns,
-            predicates: &predicates,
-        });
-        assert_ne!(no_cut, with_cut);
-
-        let mut mutated_cut = cut.clone();
-        mutated_cut.writer_epoch = 2;
-        let with_mutated_cut = digest_of(&AssignmentDigestInput {
-            scan_id: "scan-1",
-            tenant_uuid,
-            namespace: "logs",
-            table: "records",
-            schema_fingerprint_hex: &fingerprint,
-            files: &files,
-            scribe_cut: Some(&mutated_cut),
-            required_columns: &required_columns,
-            predicates: &predicates,
-        });
-        assert_ne!(with_cut, with_mutated_cut);
-
-        // The projection closure is carried once, on the assignment. With a cut
-        // present it must still be signed there, so a peer cannot widen a
-        // Scribe follower's projection while replaying the same cut.
-        let reordered_columns = vec![
-            "wyrd_event_time".to_string(),
-            "service_name".to_string(),
-            "data_tenant_id".to_string(),
-        ];
-        assert_ne!(
-            with_cut,
-            digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files: &files,
-                scribe_cut: Some(&cut),
-                required_columns: &reordered_columns,
-                predicates: &predicates,
-            })
-        );
-
-        // Predicates stay signed alongside a cut for the same reason.
-        let widened_predicates = vec![ScanPredicate::NotEq(
-            "service_name".to_string(),
-            ScanLiteral::Utf8("api".to_string()),
-        )];
-        assert_ne!(
-            with_cut,
-            digest_of(&AssignmentDigestInput {
-                scan_id: "scan-1",
-                tenant_uuid,
-                namespace: "logs",
-                table: "records",
-                schema_fingerprint_hex: &fingerprint,
-                files: &files,
-                scribe_cut: Some(&cut),
-                required_columns: &required_columns,
-                predicates: &widened_predicates,
-            })
-        );
-    }
-
+    /// A fingerprint that is not 64 lowercase hex characters is refused.
     #[test]
     fn rejects_non_canonical_schema_fingerprint() {
-        let (_, tenant_uuid, files, required_columns, predicates) = base_vector();
+        let (_, tenant_uuid, required_columns) = base_vector();
         let assignment = AssignmentDigestInput {
             scan_id: "scan-1",
             tenant_uuid,
             namespace: "logs",
             table: "records",
             schema_fingerprint_hex: "not-hex",
-            files: &files,
             scribe_cut: None,
             required_columns: &required_columns,
-            predicates: &predicates,
         };
         assert!(matches!(
             assignment_authority_digest(std::slice::from_ref(&assignment)),

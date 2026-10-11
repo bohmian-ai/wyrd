@@ -10,6 +10,7 @@
 pub const BIFROST_CATALOG_NAME: &str = "wyrd-redux";
 
 mod bifrost_catalog;
+mod cut_cache;
 mod error;
 pub mod event_time;
 mod iceberg_sql;
@@ -27,15 +28,16 @@ pub use bifrost_catalog::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{
-    inject_metadata_not_found_for_test, reset_active_cut_acquisitions_for_test,
-    reset_sealed_pin_count_for_test, sealed_pin_count_for_test,
+    inject_metadata_not_found_for_test, reset_cut_reads_for_test, reset_sealed_pin_count_for_test,
+    sealed_pin_count_for_test,
 };
 pub use error::BifrostCatalogError;
 pub use layout::{
-    LayoutSortKey, NullOrder, PhysicalLayout, SortDirection, TimeGranularity, TimePartition,
-    TimePartitionError, TimePartitionSpec,
+    LayoutSortKey, NullOrder, PhysicalLayout, SortDirection, TimeAxis, TimeColumnValues,
+    TimeGranularity, TimePartition, TimePartitionError, TimePrecision,
 };
 pub(crate) use logical_table_identity::{LogicalTableIdentity, PhysicalTableProjection};
+pub use storage::warehouse_uri;
 pub use table_ref::TableRef;
 pub(crate) use tenant_table::PhysicalBindingFacts;
 pub use tenant_table::{TenantTableBinding, TenantTableBindingError, TenantTableKey};

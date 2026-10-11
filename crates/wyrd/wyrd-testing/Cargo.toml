@@ -67,7 +67,7 @@ iceberg = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
 http-body-util = "0.1"
-opendal = { workspace = true }
+object_store = { workspace = true }
 parquet = { workspace = true }
 rand = { workspace = true }
 # The capacity benchmark serves its judge mock over trusted TLS.
@@ -105,6 +105,7 @@ wyrd-auth-verify = { workspace = true }
 wyrd-crypt = { workspace = true }
 wyrd-client = { workspace = true, features = ["internal", "test-support"] }
 wyrd-queue = { workspace = true }
+wyrd-types = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
@@ -119,13 +120,21 @@ wyrd-tls = { workspace = true }
 
 wiremock = { workspace = true }
 
+# The release-server launcher reads host and process usage on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 workspace-hack.workspace = true
 # The peer-context journey encodes a Scribe fragment exactly as a leader does.
 datafusion-proto = { workspace = true }
+# The leaf-predicate peer journey plans its filter as a leader's session does.
+datafusion = { workspace = true }
 # The analytical-layout journey maps an Eval report through the production
 # result payload builder, whose Eval input is this crate's report type.
 vala-eval = { workspace = true }
+# The Variant recovery journey builds Variant ingest batches from JSON.
+parquet-variant-compute = { workspace = true }
 metrics = { workspace = true }
 # Local provider upstream of the native gateway ingress journey.
 wiremock = { workspace = true }

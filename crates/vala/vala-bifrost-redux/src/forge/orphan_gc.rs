@@ -6,8 +6,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use iceberg::spec::{DataContentType, ManifestContentType, TableMetadata};
-use opendal::raw::Timestamp;
-use opendal::{EntryMode, ErrorKind};
+use object_store::ObjectMeta;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -123,14 +122,14 @@ pub(crate) struct MaintenanceProtection {
     /// The table lease's single captured maintenance time.
     pub(crate) now: DateTime<Utc>,
     /// Inclusive last-modified cutoff derived once from `now`.
-    object_age_cutoff: Timestamp,
+    object_age_cutoff: DateTime<Utc>,
 }
 
 /// Object-store evidence evaluated by the shared eligibility predicate.
 #[derive(Clone, Copy)]
 pub(crate) enum ObjectEvidence<'metadata> {
     /// The object exists with freshly loaded metadata.
-    Present(&'metadata opendal::Metadata),
+    Present(&'metadata ObjectMeta),
     /// The object was absent at the evidence load.
     Missing,
 }
@@ -142,10 +141,8 @@ pub(crate) enum GcEligibility {
     Eligible,
     /// A retained/open reference or destructive gate protects the object.
     Protected,
-    /// The object's age is absent or newer than the inclusive cutoff.
+    /// The object is newer than the inclusive cutoff.
     TooYoung,
-    /// The path resolves to a non-file object.
-    NotFile,
     /// The path is outside the binding or is not a known Iceberg object type.
     InvalidPath,
     /// The object does not currently exist.
@@ -158,7 +155,7 @@ impl MaintenanceProtection {
         live_set: ProtectedLiveSet,
         blocked: bool,
         now: DateTime<Utc>,
-        object_age_cutoff: Timestamp,
+        object_age_cutoff: DateTime<Utc>,
     ) -> Self {
         Self {
             live_set,
@@ -243,13 +240,8 @@ impl MaintenanceProtection {
         let ObjectEvidence::Present(metadata) = evidence else {
             return GcEligibility::Missing;
         };
-        if metadata.mode() != EntryMode::FILE {
-            return GcEligibility::NotFile;
-        }
         if scope == MaintenanceScope::AttemptGeneration
-            && metadata
-                .last_modified()
-                .is_none_or(|modified| modified > self.object_age_cutoff)
+            && metadata.last_modified > self.object_age_cutoff
         {
             return GcEligibility::TooYoung;
         }
@@ -746,7 +738,7 @@ impl Forge {
             .await?;
         let evidence = match self.core.object_store.stat(path).await {
             Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == opendal::ErrorKind::NotFound => None,
+            Err(object_store::Error::NotFound { .. }) => None,
             Err(error) => return Err(ForgeError::ObjectDelete(error)),
         };
         Ok(format!(
@@ -1039,9 +1031,10 @@ impl Forge {
         .compose();
         let object_age_cutoff = match table_context.age_cutoff_ms {
             Some(cutoff_ms) => {
-                Timestamp::from_millisecond(cutoff_ms).map_err(|_| ForgeError::InvalidConfig {
-                    detail: "orphan cleanup cutoff cannot be represented by object storage"
-                        .to_owned(),
+                DateTime::<Utc>::from_timestamp_millis(cutoff_ms).ok_or_else(|| {
+                    ForgeError::InvalidConfig {
+                        detail: "orphan cleanup cutoff is not a representable UTC time".to_owned(),
+                    }
                 })?
             }
             None => self.gc_object_age_cutoff(table_context.now)?,
@@ -1072,7 +1065,7 @@ impl Forge {
         let key = request.table.key;
         let binding = request.table.binding;
         let normalize = |path: &str| {
-            catalog_path_to_object_key(table_location, binding, &self.core.staging, path)
+            catalog_path_to_object_key(table_location, binding, &self.core.warehouse, path)
         };
         let mut conn = self
             .core
@@ -1162,12 +1155,6 @@ impl Forge {
                 .open_outputs
                 .push(normalize(prepared.candidate.path.as_str())?);
         }
-        // An active Oracle table read may still open any object its cut
-        // named, so it blocks the pass. This is a lock-free hint: every
-        // deletion separately requires the table's exclusive authority.
-        roots.blocked |= super::table_authority::TableAuthority::new(&mut conn)
-            .has_active_reads(key.tenant, &key.table_ref)
-            .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         Ok(roots)
     }
@@ -1202,7 +1189,7 @@ impl Forge {
                     paths.insert(catalog_path_to_object_key(
                         table_location,
                         binding,
-                        &self.core.staging,
+                        &self.core.warehouse,
                         path.as_str(),
                     )?);
                 }
@@ -1285,22 +1272,16 @@ impl Forge {
     /// # Errors
     ///
     /// Returns [`ForgeError::InvalidConfig`] when the TTL or timestamp overflows.
-    fn gc_object_age_cutoff(&self, now: DateTime<Utc>) -> Result<Timestamp, ForgeError> {
-        let cutoff_chrono = now
-            .checked_sub_signed(
-                chrono::Duration::from_std(self.core.config.orphan_gc_ttl).map_err(|_| {
-                    ForgeError::InvalidConfig {
-                        detail: "orphan GC TTL cannot be represented by chrono".to_owned(),
-                    }
-                })?,
-            )
-            .ok_or_else(|| ForgeError::InvalidConfig {
-                detail: "orphan GC age cutoff overflows UTC".to_owned(),
-            })?;
-        Timestamp::from_millisecond(cutoff_chrono.timestamp_millis()).map_err(|_| {
-            ForgeError::InvalidConfig {
-                detail: "orphan GC cutoff cannot be represented by object storage".to_owned(),
-            }
+    fn gc_object_age_cutoff(&self, now: DateTime<Utc>) -> Result<DateTime<Utc>, ForgeError> {
+        now.checked_sub_signed(
+            chrono::Duration::from_std(self.core.config.orphan_gc_ttl).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "orphan GC TTL cannot be represented by chrono".to_owned(),
+                }
+            })?,
+        )
+        .ok_or_else(|| ForgeError::InvalidConfig {
+            detail: "orphan GC age cutoff overflows UTC".to_owned(),
         })
     }
 }
@@ -1342,9 +1323,7 @@ impl Forge {
         let mut pages = self
             .core
             .object_store
-            .list_pages(&prefix, table.start_after)
-            .await
-            .map_err(ForgeError::ObjectList)?;
+            .list_pages(&prefix, table.start_after);
         let batch_cap = self.core.config.max_gc_candidates_per_batch;
         let mut candidates = Vec::new();
         let mut frontier: Option<String> = None;
@@ -1362,7 +1341,7 @@ impl Forge {
             scanned_pages = scanned_pages.saturating_add(1);
             // Key order is what makes the frontier meaningful, and a backend is
             // only required to page — not to order within a page.
-            entries.sort_unstable_by(|left, right| left.path().cmp(right.path()));
+            entries.sort_unstable_by(|left, right| left.location.cmp(&right.location));
             for entry in entries {
                 if candidates.len() >= batch_cap {
                     // Stopping *before* this entry is what keeps the frontier
@@ -1371,12 +1350,9 @@ impl Forge {
                     partial = true;
                     break 'scan;
                 }
-                let path = entry.path().to_owned();
-                if protection.gc_eligibility(
-                    binding,
-                    &path,
-                    ObjectEvidence::Present(entry.metadata()),
-                ) == GcEligibility::Eligible
+                let path = entry.location.to_string();
+                if protection.gc_eligibility(binding, &path, ObjectEvidence::Present(&entry))
+                    == GcEligibility::Eligible
                 {
                     candidates.push(path.clone());
                 }
@@ -1441,7 +1417,7 @@ impl Forge {
                 })?;
             let metadata = match self.core.object_store.stat(&normalized).await {
                 Ok(metadata) => Some(metadata),
-                Err(error) if error.kind() == ErrorKind::NotFound => None,
+                Err(object_store::Error::NotFound { .. }) => None,
                 Err(error) => return Err(ForgeError::ObjectDelete(error)),
             };
             let eligibility = protection.gc_eligibility(
@@ -1470,7 +1446,7 @@ impl Forge {
                     ForgeTelemetry::record_deleted_objects(ForgeTaskStrategy::OrphanCleanup, 1);
                     tally.deleted.push(path.as_str().to_owned());
                 }
-                Err(error) if error.kind() == ErrorKind::NotFound => {
+                Err(object_store::Error::NotFound { .. }) => {
                     tally.deleted.push(path.as_str().to_owned());
                 }
                 Err(error) => return Err(ForgeError::ObjectDelete(error)),
@@ -1543,46 +1519,35 @@ impl Forge {
             })
             .await?;
         // The exclusive table authority is taken after the protection load
-        // and held through every delete's outcome. While a reader holds the table
-        // no authority exists and the whole batch is retained, exactly as a
-        // blocked protection retains it.
+        // and held through every delete's outcome.
         let mut authority_conn = self
             .core
             .vala
             .tenant_conn(table.key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let tally = match super::table_authority::TableAuthority::new(&mut authority_conn)
+        let exclusive = super::table_authority::TableAuthority::new(&mut authority_conn)
             .exclusive(table.key.tenant, &table.key.table_ref)
-            .await?
-        {
-            // The lease TTL bounds the authority hold: an Oracle cut waits on
-            // this row, and the store has no request timeout of its own. A
-            // batch cut off at the bound leaves its operation open, and the
-            // idempotent replay re-proves every candidate.
-            Some(exclusive) => tokio::time::timeout(
-                self.core.config.lease_ttl,
-                self.apply_gc_deletions(
-                    lease,
-                    table,
-                    &exclusive,
-                    &protection,
-                    candidate_paths,
-                    request.deadline,
-                ),
-            )
-            .await
-            .unwrap_or(Err(ForgeError::Timeout {
-                operation: "orphan-GC deletion under table authority",
-            })),
-            None => Ok(GcDeletionTally {
-                skipped: candidate_paths
-                    .iter()
-                    .map(|path| path.as_str().to_owned())
-                    .collect(),
-                ..GcDeletionTally::default()
-            }),
-        };
+            .await?;
+        // The lease TTL bounds the authority hold: the store has no request
+        // timeout of its own. A batch cut off at the bound leaves its
+        // operation open, and the idempotent replay re-proves every candidate.
+        let tally = tokio::time::timeout(
+            self.core.config.lease_ttl,
+            self.apply_gc_deletions(
+                lease,
+                table,
+                &exclusive,
+                &protection,
+                candidate_paths,
+                request.deadline,
+            ),
+        )
+        .await
+        .unwrap_or(Err(ForgeError::Timeout {
+            operation: "orphan-GC deletion under table authority",
+        }));
+        drop(exclusive);
         authority_conn.commit().await.map_err(ForgeError::Sql)?;
         let GcDeletionTally {
             deleted,
@@ -1829,7 +1794,7 @@ impl Forge {
         path: &str,
     ) -> Result<(), ForgeError> {
         let normalized =
-            catalog_path_to_object_key(table_location, binding, &self.core.staging, path)?;
+            catalog_path_to_object_key(table_location, binding, &self.core.warehouse, path)?;
         live.insert(normalized);
         Ok(())
     }
@@ -1845,7 +1810,7 @@ impl Forge {
         metadata: &TableMetadata,
         binding: &TenantTableBinding,
     ) -> Result<(), ForgeError> {
-        validate_table_location(binding, metadata.location(), &self.core.staging)
+        validate_table_location(binding, metadata.location(), &self.core.warehouse)
     }
 
     /// Load the exact terminal Reset generation set used by production GC.
@@ -1915,6 +1880,17 @@ impl Forge {
 mod tests {
     use super::*;
     use crate::forge::protection_roots::OrphanProtectionRoots;
+
+    /// Builds the listing metadata of one object last modified at `modified`.
+    fn object_meta(modified: DateTime<Utc>) -> ObjectMeta {
+        ObjectMeta {
+            location: object_store::path::Path::from("fixture.parquet"),
+            last_modified: modified,
+            size: 1,
+            e_tag: None,
+            version: None,
+        }
+    }
 
     /// A task-driven batch keeps one identity across retry and takeover, stays
     /// distinct from another task selecting the same paths, and leaves the
@@ -2018,9 +1994,11 @@ mod tests {
         use crate::catalog::TableRef;
         use crate::namespaces::BifrostNamespace;
 
-        let old = Timestamp::from_millisecond(0).expect("timestamp");
-        let young = Timestamp::from_millisecond(47 * 60 * 60 * 1_000).expect("timestamp");
-        let cutoff = Timestamp::from_millisecond(24 * 60 * 60 * 1_000).expect("timestamp");
+        let old = DateTime::<Utc>::from_timestamp_millis(0).expect("timestamp");
+        let young =
+            DateTime::<Utc>::from_timestamp_millis(47 * 60 * 60 * 1_000).expect("timestamp");
+        let cutoff =
+            DateTime::<Utc>::from_timestamp_millis(24 * 60 * 60 * 1_000).expect("timestamp");
         let binding = TenantTableBinding::resolve((
             DataTenantId::new_v7(),
             TableRef::new(BifrostNamespace::Traces, "spans"),
@@ -2045,9 +2023,8 @@ mod tests {
             now: DateTime::<Utc>::from_timestamp_millis(48 * 60 * 60 * 1_000).expect("time"),
             object_age_cutoff: cutoff,
         };
-        let old_metadata = opendal::Metadata::new(EntryMode::FILE).with_last_modified(old);
-        let young_metadata = opendal::Metadata::new(EntryMode::FILE).with_last_modified(young);
-        let directory = opendal::Metadata::new(EntryMode::DIR);
+        let old_metadata = object_meta(old);
+        let young_metadata = object_meta(young);
 
         assert_eq!(
             protection.gc_eligibility(&binding, &old_path, ObjectEvidence::Present(&old_metadata)),
@@ -2094,10 +2071,6 @@ mod tests {
             GcEligibility::TooYoung
         );
         assert_eq!(
-            protection.gc_eligibility(&binding, &old_path, ObjectEvidence::Present(&directory)),
-            GcEligibility::NotFile
-        );
-        assert_eq!(
             protection.gc_eligibility(
                 &binding,
                 "other/data/file.parquet",
@@ -2119,7 +2092,7 @@ mod tests {
     /// proof the durable set cannot supply on its own — the tenant/table
     /// binding, the destructive-maintenance gate, fresh unreachability from
     /// every retained head, the object age floor, and the object's own
-    /// existence and kind — and requires the deletion to be refused.
+    /// existence — and requires the deletion to be refused.
     ///
     /// # Panics
     ///
@@ -2130,9 +2103,11 @@ mod tests {
         use crate::catalog::TableRef;
         use crate::namespaces::BifrostNamespace;
 
-        let old = Timestamp::from_millisecond(0).expect("timestamp");
-        let young = Timestamp::from_millisecond(47 * 60 * 60 * 1_000).expect("timestamp");
-        let cutoff = Timestamp::from_millisecond(24 * 60 * 60 * 1_000).expect("timestamp");
+        let old = DateTime::<Utc>::from_timestamp_millis(0).expect("timestamp");
+        let young =
+            DateTime::<Utc>::from_timestamp_millis(47 * 60 * 60 * 1_000).expect("timestamp");
+        let cutoff =
+            DateTime::<Utc>::from_timestamp_millis(24 * 60 * 60 * 1_000).expect("timestamp");
         let binding = TenantTableBinding::resolve((
             DataTenantId::new_v7(),
             TableRef::new(BifrostNamespace::Traces, "spans"),
@@ -2150,9 +2125,8 @@ mod tests {
             now,
             object_age_cutoff: cutoff,
         };
-        let old_metadata = opendal::Metadata::new(EntryMode::FILE).with_last_modified(old);
-        let young_metadata = opendal::Metadata::new(EntryMode::FILE).with_last_modified(young);
-        let directory = opendal::Metadata::new(EntryMode::DIR);
+        let old_metadata = object_meta(old);
+        let young_metadata = object_meta(young);
 
         assert_eq!(
             protection.expired_cleanup_eligibility(
@@ -2203,14 +2177,6 @@ mod tests {
             ),
             GcEligibility::InvalidPath,
             "a candidate outside the tenant table binding is never deletable"
-        );
-        assert_eq!(
-            protection.expired_cleanup_eligibility(
-                &binding,
-                &expired_manifest,
-                ObjectEvidence::Present(&directory)
-            ),
-            GcEligibility::NotFile
         );
         assert_eq!(
             protection.expired_cleanup_eligibility(
@@ -2303,14 +2269,18 @@ mod tests {
             composed.live_set,
             composed.blocked,
             DateTime::<Utc>::from_timestamp_millis(48 * 60 * 60 * 1_000).expect("time"),
-            Timestamp::from_millisecond(24 * 60 * 60 * 1_000).expect("timestamp"),
+            DateTime::<Utc>::from_timestamp_millis(24 * 60 * 60 * 1_000).expect("timestamp"),
         )
     }
 
     /// Object metadata older than the matrix cutoff.
-    fn orphan_matrix_aged() -> opendal::Metadata {
-        opendal::Metadata::new(EntryMode::FILE)
-            .with_last_modified(Timestamp::from_millisecond(0).expect("timestamp"))
+    ///
+    /// # Panics
+    ///
+    /// Panics if the Unix epoch is not a representable timestamp, which
+    /// cannot happen.
+    fn orphan_matrix_aged() -> ObjectMeta {
+        object_meta(DateTime::<Utc>::from_timestamp_millis(0).expect("timestamp"))
     }
 
     /// Observable consequence of removing exactly one protection root.
@@ -2457,8 +2427,8 @@ mod tests {
             GcEligibility::InvalidPath,
             "another tenant's binding never addresses this table's objects"
         );
-        let young = opendal::Metadata::new(EntryMode::FILE).with_last_modified(
-            Timestamp::from_millisecond(47 * 60 * 60 * 1_000).expect("timestamp"),
+        let young = object_meta(
+            DateTime::<Utc>::from_timestamp_millis(47 * 60 * 60 * 1_000).expect("timestamp"),
         );
         assert_eq!(
             protection.gc_eligibility(
@@ -2467,15 +2437,6 @@ mod tests {
                 ObjectEvidence::Present(&young)
             ),
             GcEligibility::TooYoung
-        );
-        assert_eq!(
-            protection.gc_eligibility(
-                &paths.binding,
-                &paths.orphan,
-                ObjectEvidence::Present(&opendal::Metadata::new(EntryMode::FILE))
-            ),
-            GcEligibility::TooYoung,
-            "an object with no last-modified evidence has not proven its age"
         );
         assert_eq!(
             protection.gc_eligibility(&paths.binding, &paths.orphan, ObjectEvidence::Missing),

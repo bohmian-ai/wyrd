@@ -731,9 +731,9 @@ impl VerifierRunner {
 
 /// Build `report`'s result payload once into the write that completes `run`.
 ///
-/// Mints one result ID and one producer event time shared by every row — a
-/// result fact this process observes, not a coordination instant — attributed
-/// to the tenant SYSTEM principal and the exact `verifier`. The write is
+/// Mints one result ID and the execution `ended_at`, the results table's time
+/// column — a result fact this process observes, not a coordination instant —
+/// attributed to the tenant SYSTEM principal and the exact `verifier`. The write is
 /// returned rather than staged: only a settlement that still holds the lease
 /// may stage it, so a holder that lost its lease writes no result.
 ///
@@ -750,7 +750,7 @@ fn result(
         Err(transition) => return (transition, None),
     };
     let result_id = VerificationResultId::new_v7();
-    let event_time = Utc::now();
+    let ended_at = Utc::now();
     let invalid = || {
         Transition::Terminate(
             TerminalStatus::Errored,
@@ -761,9 +761,8 @@ fn result(
         ResultRun::claimed(run, report.run_id()),
         &run.verifier_uid,
         result_id,
-        event_time,
         started_at,
-        event_time,
+        ended_at,
     )
     .build(report)
     {

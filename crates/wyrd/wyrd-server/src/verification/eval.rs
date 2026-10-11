@@ -33,9 +33,9 @@ use vala_eval::{
     EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,
 };
 use wyrd_runtime::principal::PrincipalId;
+use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
-
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
@@ -57,8 +57,6 @@ use wyrd_sql::queries::cards::{get_card_by_ref, get_card_by_uid};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 use wyrd_storage::tenant_path;
 use wyrd_storage::{StorageError, StorageHandle};
-use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValueList, any_value};
-use wyrd_tonic::prost::Message as _;
 
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError, writer_caller};
 use super::engines::{EngineOutcome, VerifierReport};
@@ -612,9 +610,10 @@ impl BifrostReader {
     }
 
     /// Read one committed observation of `subject` by its record ID, pruned
-    /// to the UTC day of its frozen server `event_time`, with the managed
-    /// application `run_id` that wrote it (`None` when the row names none)
-    /// and its managed writer `principal_id`.
+    /// to the UTC day of its `created_at`, the table's time column, which the
+    /// run froze as `event_time`, with the managed application `run_id` that
+    /// wrote it (`None` when the row names none) and its managed writer
+    /// `principal_id`.
     ///
     /// # Errors
     /// Returns [`ReadError::Admission`] when Bifrost refuses the read at
@@ -631,8 +630,8 @@ impl BifrostReader {
             "SELECT record_id, session_id, context, trace_id, span_id, created_at, media, run_id, principal_id \
                  FROM vala.eval.observations \
                  WHERE card_uid = '{}' AND record_id = '{}' \
-                   AND wyrd_event_time >= TIMESTAMP '{start}' \
-                   AND wyrd_event_time < TIMESTAMP '{end}' \
+                   AND created_at >= TIMESTAMP '{start}' \
+                   AND created_at < TIMESTAMP '{end}' \
                  LIMIT 1",
             quoted(subject),
             quoted(record_id),
@@ -666,29 +665,32 @@ impl BifrostReader {
             .map(|at| at.is_valid(0).then(|| at.value(0)))?
             .and_then(DateTime::<Utc>::from_timestamp_micros)
             .ok_or("created_at is missing")?;
-        let json_text = |name| -> Result<Value, String> {
-            text(batch, name, 0)?
-                .map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
-                .transpose()
-                .map(Option::unwrap_or_default)
+        let variant = |name: &str| -> Result<Value, String> {
+            let column = batch
+                .column_by_name(name)
+                .ok_or_else(|| format!("{name} is missing"))?;
+            variant_cell_to_json(column.as_ref(), 0).map_err(|_| format!("{name} does not decode"))
         };
         let run_id = text(batch, "run_id", 0)?.map(RunId::from_string);
         let record = serde_json::from_value(json!({
             "record_id": text(batch, "record_id", 0)?,
             "session_id": text(batch, "session_id", 0)?,
-            "context": json_text("context")?,
+            "context": variant("context")?,
             "trace_id": trace_id.map(|id| id.to_hex()),
             "span_id": span_id.map(|id| id.to_hex()),
             "created_at": created_at,
-            "media": json_text("media")?,
+            "media": variant("media")?,
         }))
         .map_err(|error| format!("record {record_id} does not decode: {error}"))?;
         Ok((record, run_id, text(batch, "principal_id", 0)?))
     }
 
-    /// Read the visible spans of `trace_id` received from the start of the
-    /// day before the record's day to the end of the day containing
+    /// Read the visible spans of `trace_id` that started from the start of
+    /// the day before the record's day to the end of the day containing
     /// `event_time + window`, in start-time then span-ID order.
+    ///
+    /// The range is on `start_time_unix_nano`, the span table's time column,
+    /// so it prunes to the partitions and files the range covers.
     ///
     /// The one total order makes positional selectors such as `$.spans[0]`
     /// reproducible across retries and restarts. At most
@@ -719,8 +721,8 @@ impl BifrostReader {
                         links, dropped_links_count, scope_name, service_name \
                  FROM vala.traces.spans \
                  WHERE trace_id = X'{}' \
-                   AND wyrd_event_time >= TIMESTAMP '{start}' \
-                   AND wyrd_event_time < TIMESTAMP '{end}' \
+                   AND start_time_unix_nano >= TIMESTAMP '{start}' \
+                   AND start_time_unix_nano < TIMESTAMP '{end}' \
                  ORDER BY start_time_unix_nano, span_id \
                  LIMIT {}",
             trace_id.to_hex(),
@@ -887,17 +889,30 @@ fn nested<T>(
         .collect()
 }
 
-/// The canonical attribute payload in column `name` at `row` as JSON; a null
-/// payload is empty.
+/// The Variant attribute object in column `name` at `row` as JSON; a null
+/// value is empty.
+///
+/// Bytes values render as base64 text and integers keep their exact value.
 ///
 /// # Errors
-/// Returns the column or protobuf decode failure.
+/// Returns a description when the column is absent, is not Variant storage,
+/// the value does not decode, or the value is not an object.
 fn attribute_column(
     batch: &RecordBatch,
     name: &str,
     row: usize,
 ) -> Result<Map<String, Value>, String> {
-    bytes(batch, name, row)?.map_or_else(|| Ok(Map::new()), |raw| attributes(&raw))
+    let column = batch
+        .column_by_name(name)
+        .ok_or_else(|| format!("column {name} is missing"))?;
+    let ordinal = u64::try_from(row).unwrap_or(u64::MAX);
+    match variant_cell_to_json(column.as_ref(), row)
+        .map_err(|violation| violation.into_error(name, ordinal).to_string())?
+    {
+        Value::Null => Ok(Map::new()),
+        Value::Object(attributes) => Ok(attributes),
+        _ => Err(format!("column {name} does not hold an attribute object")),
+    }
 }
 
 /// Non-negative 32-bit count in 64-bit column `name` at `row`; null is zero.
@@ -907,46 +922,6 @@ fn attribute_column(
 fn count(batch: &RecordBatch, name: &str, row: usize) -> Result<u32, String> {
     u32::try_from(int64(batch, name, row)?.unwrap_or_default())
         .map_err(|_| format!("column {name} is not a 32-bit count"))
-}
-
-/// Decode a canonical `KeyValueList` attribute payload into JSON.
-///
-/// # Errors
-/// Returns the protobuf decode failure.
-fn attributes(raw: &[u8]) -> Result<Map<String, Value>, String> {
-    Ok(KeyValueList::decode(raw)
-        .map_err(|error| error.to_string())?
-        .values
-        .into_iter()
-        .map(|entry| (entry.key, any_json(entry.value)))
-        .collect())
-}
-
-/// One OTLP `AnyValue` as JSON; bytes become base64 text.
-fn any_json(value: Option<AnyValue>) -> Value {
-    match value.and_then(|value| value.value) {
-        None => Value::Null,
-        Some(any_value::Value::StringValue(text)) => Value::String(text),
-        Some(any_value::Value::BoolValue(flag)) => Value::Bool(flag),
-        Some(any_value::Value::IntValue(number)) => Value::from(number),
-        Some(any_value::Value::DoubleValue(number)) => Value::from(number),
-        Some(any_value::Value::BytesValue(raw)) => {
-            Value::String(base64::engine::general_purpose::STANDARD.encode(raw))
-        }
-        Some(any_value::Value::ArrayValue(array)) => Value::Array(
-            array
-                .values
-                .into_iter()
-                .map(|item| any_json(Some(item)))
-                .collect(),
-        ),
-        Some(any_value::Value::KvlistValue(list)) => Value::Object(
-            list.values
-                .into_iter()
-                .map(|entry| (entry.key, any_json(entry.value)))
-                .collect(),
-        ),
-    }
 }
 
 /// The UTC day containing `at`, as `[start, end)` SQL timestamp literals.

@@ -2,7 +2,7 @@
 //!
 //! [`DriftEngine`] loads the run's exact fitted baseline, asks Oracle for
 //! fixed server-owned aggregates over the run's subject and frozen
-//! `wyrd_event_time` window, and feeds only those aggregates to the existing
+//! `created_at` window, and feeds only those aggregates to the existing
 //! `vala-drift` scorers. [`ObservationWindow`] renders the fixed SQL: the
 //! canonical `vala.drift.observations` table, the exact subject/series/window
 //! filter, and one method-specific aggregate. The subject UID, feature name,
@@ -105,11 +105,12 @@ fn retry(code: &str, message: impl Into<String>) -> EngineOutcome {
     })
 }
 
-/// One run's subject and frozen ingest-time window over the observation table.
+/// One run's subject and frozen `created_at` window over the observation table.
 ///
 /// A pure value: it renders the fixed SQL and never executes it. Every
 /// statement filters the exact subject `card_uid`, one feature `series`, and
-/// `wyrd_event_time` in `[start, end)` before its method-specific aggregate.
+/// `created_at`, the table's time column, in `[start, end)` before its
+/// method-specific aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationWindow {
     /// Observed subject Card UID as the managed `card_uid` column stores it.
@@ -137,7 +138,7 @@ impl ObservationWindow {
     }
 
     /// Render `value` as a microsecond UTC timestamp string literal, which
-    /// Oracle coerces to the `wyrd_event_time` column type.
+    /// Oracle coerces to the `created_at` column type.
     fn instant(value: DateTime<Utc>) -> String {
         Self::text(&value.to_rfc3339_opts(SecondsFormat::Micros, true))
     }
@@ -152,7 +153,7 @@ impl ObservationWindow {
     fn rows_in(&self, filter: &str) -> String {
         format!(
             "FROM {OBSERVATIONS} WHERE card_uid = {} AND {filter} \
-             AND wyrd_event_time >= {} AND wyrd_event_time < {}",
+             AND created_at >= {} AND created_at < {}",
             Self::text(&self.subject),
             Self::instant(self.start),
             Self::instant(self.end),
@@ -997,16 +998,8 @@ mod tests {
     use super::*;
 
     /// One observation row: subject, series, numeric and string values,
-    /// event and creation seconds past the window start, and record id.
-    type Row<'a> = (
-        &'a str,
-        &'a str,
-        Option<f64>,
-        Option<&'a str>,
-        i64,
-        i64,
-        &'a str,
-    );
+    /// `created_at` seconds past the window start, and record id.
+    type Row<'a> = (&'a str, &'a str, Option<f64>, Option<&'a str>, i64, &'a str);
 
     /// Build a batch of named `Int64` and `Float64` columns.
     ///
@@ -1080,20 +1073,14 @@ mod tests {
                     "series" => Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
                     "num_value" => Arc::new(rows.iter().map(|r| r.2).collect::<Float64Array>()),
                     "str_value" => Arc::new(rows.iter().map(|r| r.3).collect::<StringArray>()),
-                    "wyrd_event_time" => Arc::new(
+                    "created_at" => Arc::new(
                         TimestampMicrosecondArray::from_iter_values(
                             rows.iter().map(|r| micros(r.4)),
                         )
-                        .with_timezone("UTC"),
-                    ),
-                    "created_at" => Arc::new(
-                        TimestampMicrosecondArray::from_iter_values(
-                            rows.iter().map(|r| micros(r.5)),
-                        )
-                        .with_timezone("UTC"),
+                        .with_timezone(wyrd_spec::vala::api::UTC_TIME_ZONE),
                     ),
                     "record_id" => {
-                        Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.6)))
+                        Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.5)))
                     }
                     _ => arrow::array::new_null_array(field.data_type(), rows.len()),
                 }
@@ -1141,14 +1128,14 @@ mod tests {
         let uid = subject().to_string();
         let other = "0190aaaa-0000-7000-8000-000000000009";
         let rows: Vec<Row<'_>> = vec![
-            (&uid, "age", Some(10.0), None, 0, 0, "a"),
-            (&uid, "age", Some(10.5), None, 1, 1, "b"),
-            (&uid, "age", Some(20.0), None, 2, 2, "c"),
-            (&uid, "age", Some(99.0), None, 3, 3, "d"),
-            (&uid, "age", Some(1.0), None, 3600, 4, "end is exclusive"),
-            (&uid, "age", Some(1.0), None, -1, 5, "before start"),
-            (&uid, "height", Some(1.0), None, 4, 6, "other series"),
-            (other, "age", Some(1.0), None, 4, 7, "other subject"),
+            (&uid, "age", Some(10.0), None, 0, "a"),
+            (&uid, "age", Some(10.5), None, 1, "b"),
+            (&uid, "age", Some(20.0), None, 2, "c"),
+            (&uid, "age", Some(99.0), None, 3, "d"),
+            (&uid, "age", Some(1.0), None, 3600, "end is exclusive"),
+            (&uid, "age", Some(1.0), None, -1, "before start"),
+            (&uid, "height", Some(1.0), None, 6, "other series"),
+            (other, "age", Some(1.0), None, 7, "other subject"),
         ];
         let sql = window()
             .psi_numeric("age", &[f64::NEG_INFINITY, 10.0, 20.0, f64::INFINITY])
@@ -1165,7 +1152,7 @@ mod tests {
             Some(f64::INFINITY),
             Some(f64::NEG_INFINITY),
         ] {
-            let invalid: Vec<Row<'_>> = vec![(&uid, "age", bad, None, 0, 0, "a")];
+            let invalid: Vec<Row<'_>> = vec![(&uid, "age", bad, None, 0, "a")];
             let mut counts = vec![0; 3];
             let scorable = run(&sql, &invalid)
                 .await
@@ -1188,11 +1175,11 @@ mod tests {
     async fn psi_categorical_sql_escapes_labels_and_counts_unknowns_as_other() {
         let uid = subject().to_string();
         let rows: Vec<Row<'_>> = vec![
-            (&uid, "it's", None, Some("o'neil"), 0, 0, "a"),
-            (&uid, "it's", None, Some("red"), 1, 1, "b"),
-            (&uid, "it's", None, Some("red"), 2, 2, "c"),
-            (&uid, "it's", None, Some("mauve"), 3, 3, "d"),
-            (&uid, "it's", None, Some("teal"), 4, 4, "e"),
+            (&uid, "it's", None, Some("o'neil"), 0, "a"),
+            (&uid, "it's", None, Some("red"), 1, "b"),
+            (&uid, "it's", None, Some("red"), 2, "c"),
+            (&uid, "it's", None, Some("mauve"), 3, "d"),
+            (&uid, "it's", None, Some("teal"), 4, "e"),
         ];
         let sql = window().psi_categorical("it's", &["red", "o'neil", "blue"], 3);
         let mut counts = vec![0; 4];
@@ -1201,7 +1188,7 @@ mod tests {
         }
         assert_eq!(counts, vec![2, 1, 0, 2]);
 
-        let null: Vec<Row<'_>> = vec![(&uid, "it's", None, None, 0, 0, "a")];
+        let null: Vec<Row<'_>> = vec![(&uid, "it's", None, None, 0, "a")];
         let mut counts = vec![0; 4];
         let scorable = run(&sql, &null)
             .await
@@ -1219,11 +1206,11 @@ mod tests {
     async fn spc_sql_orders_subgroups_by_creation_then_record() {
         let uid = subject().to_string();
         let rows: Vec<Row<'_>> = vec![
-            (&uid, "age", Some(4.0), None, 0, 2, "a"),
-            (&uid, "age", Some(1.0), None, 1, 0, "b"),
-            (&uid, "age", Some(3.0), None, 2, 1, "b"),
-            (&uid, "age", Some(2.0), None, 3, 1, "a"),
-            (&uid, "age", None, None, 4, 3, "a"),
+            (&uid, "age", Some(4.0), None, 2, "a"),
+            (&uid, "age", Some(1.0), None, 0, "b"),
+            (&uid, "age", Some(3.0), None, 1, "b"),
+            (&uid, "age", Some(2.0), None, 1, "a"),
+            (&uid, "age", None, None, 3, "a"),
         ];
         let sql = window().spc("age", 2).expect("spc SQL");
         let batches = run(&sql, &rows).await;
@@ -1336,10 +1323,10 @@ mod tests {
             .incomplete(&["x"], &["c"])
             .expect("completeness SQL");
         let complete = vec![
-            (uid, "x", Some(1.0), Some("1"), 0, 0, "r1"),
-            (uid, "c", None, Some("a"), 0, 0, "r1"),
-            (uid, "unrelated", None, None, 0, 0, "r2"),
-            (uid, "x", None, None, 7200, 0, "outside the window"),
+            (uid, "x", Some(1.0), Some("1"), 0, "r1"),
+            (uid, "c", None, Some("a"), 0, "r1"),
+            (uid, "unrelated", None, None, 0, "r2"),
+            (uid, "x", None, None, 7200, "outside the window"),
         ];
         assert_eq!(incomplete(&sql, &complete).await, 0);
         assert_eq!(
@@ -1347,7 +1334,7 @@ mod tests {
             0,
             "an empty window selects nothing"
         );
-        let omitted = vec![(uid, "x", Some(1.0), Some("1"), 0, 0, "r1")];
+        let omitted = vec![(uid, "x", Some(1.0), Some("1"), 0, "r1")];
         assert_eq!(incomplete(&sql, &omitted).await, 1);
         for bad in [
             None,
@@ -1356,20 +1343,20 @@ mod tests {
             Some(f64::NEG_INFINITY),
         ] {
             let rows = vec![
-                (uid, "x", bad, None, 0, 0, "r1"),
-                (uid, "c", None, Some("a"), 0, 0, "r1"),
+                (uid, "x", bad, None, 0, "r1"),
+                (uid, "c", None, Some("a"), 0, "r1"),
             ];
             assert_eq!(incomplete(&sql, &rows).await, 1, "{bad:?}");
         }
         let null_category = vec![
-            (uid, "x", Some(1.0), Some("1"), 0, 0, "r1"),
-            (uid, "c", None, None, 0, 0, "r1"),
+            (uid, "x", Some(1.0), Some("1"), 0, "r1"),
+            (uid, "c", None, None, 0, "r1"),
         ];
         assert_eq!(incomplete(&sql, &null_category).await, 1);
         let repeated = vec![
-            (uid, "x", Some(1.0), Some("1"), 0, 0, "r1"),
-            (uid, "x", Some(2.0), Some("2"), 0, 0, "r1"),
-            (uid, "c", None, Some("a"), 0, 0, "r1"),
+            (uid, "x", Some(1.0), Some("1"), 0, "r1"),
+            (uid, "x", Some(2.0), Some("2"), 0, "r1"),
+            (uid, "c", None, Some("a"), 0, "r1"),
         ];
         assert_eq!(
             incomplete(&sql, &repeated).await,
@@ -1385,8 +1372,8 @@ mod tests {
     async fn custom_sql_is_one_row_and_requires_a_complete_window() {
         let uid = subject().to_string();
         let rows: Vec<Row<'_>> = vec![
-            (&uid, "latency", Some(2.0), None, 0, 0, "a"),
-            (&uid, "latency", Some(3.0), None, 1, 1, "b"),
+            (&uid, "latency", Some(2.0), None, 0, "a"),
+            (&uid, "latency", Some(3.0), None, 1, "b"),
         ];
         let sql = window().custom("latency");
         let mut row = None;
@@ -1452,8 +1439,8 @@ mod tests {
             .zip(0_i64..)
             .flat_map(|(record, second)| {
                 [
-                    (uid, "x", Some(value), None, second, second, *record),
-                    (uid, "y", Some(value), None, second, second, *record),
+                    (uid, "x", Some(value), None, second, *record),
+                    (uid, "y", Some(value), None, second, *record),
                 ]
             })
             .collect()
@@ -1478,10 +1465,10 @@ mod tests {
             .collect::<Vec<_>>();
         let records = names.iter().map(String::as_str).collect::<Vec<_>>();
         let complete = observations(&uid, &records, 5.0);
-        let seam = [(uid.as_str(), "x", Some(5.0), None, 9, 9, "late")];
+        let seam = [(uid.as_str(), "x", Some(5.0), None, 9, "late")];
         let null_only = [
-            (uid.as_str(), "x", None, None, 9, 9, "late"),
-            (uid.as_str(), "y", None, None, 9, 9, "late"),
+            (uid.as_str(), "x", None, None, 9, "late"),
+            (uid.as_str(), "y", None, None, 9, "late"),
         ];
 
         let psi_profile = PsiProfile {
@@ -1558,7 +1545,7 @@ mod tests {
 
         let mut rows = observations(&uid, &records[..99], 5.0);
         assert_eq!(decide(&sql, &rows, fold()).await, None, "99 records");
-        rows.push((&uid, "x", Some(5.0), None, 0, 0, "r0"));
+        rows.push((&uid, "x", Some(5.0), None, 0, "r0"));
         assert_eq!(decide(&sql, &rows, fold()).await, None, "a repeated row");
 
         let sufficient = observations(&uid, &records, 5.0);
@@ -1583,7 +1570,7 @@ mod tests {
         )
         .expect("SPC fits");
         let mut rows = observations(&uid, &["r0", "r1", "r2"], 50.0);
-        rows.push((&uid, "x", Some(50.0), None, 3, 3, "r2"));
+        rows.push((&uid, "x", Some(50.0), None, 3, "r2"));
         let sql = window().spc_statement(&spc).expect("SPC SQL");
 
         assert_eq!(decide(&sql, &rows, DistributionFold::spc(&spc)).await, None);

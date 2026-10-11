@@ -19,7 +19,7 @@
 //! bind the same Agent prove each Eval record runs only its writer's bindings.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use arrow::array::{Array, StringArray};
@@ -629,7 +629,8 @@ async fn record_id(
             server,
             tenant,
             format!(
-                "SELECT record_id FROM vala.eval.observations WHERE context LIKE '%\"{marker}\"%'"
+                "SELECT record_id FROM vala.eval.observations \
+                 WHERE (context ->> 'marker') = '{marker}'"
             ),
         )
         .await?,
@@ -648,9 +649,9 @@ async fn record_id(
 /// cross-tenant URI each settle `errored` with `eval_execution_failed`, no
 /// result, no dispatch, and no provider request.
 ///
-/// The matrix records are received one day ahead of the SDK's clock, yet each
-/// run freezes and reads its record by the client emit time the SDK stamped
-/// as `wyrd_event_time`, never by the receipt day.
+/// The matrix records are received one day after the SDK authors their
+/// `created_at`, so each run must read its record by the frozen `created_at`
+/// day.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
@@ -695,8 +696,8 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         .await;
 
     // The matrix records are received one day ahead of the SDK's own clock,
-    // so a receipt-stamped `wyrd_event_time` would land on the next UTC day;
-    // the SDK's emit-time stamp must win.
+    // so each row's `created_at`, the time column a run freezes, and its
+    // `wyrd_ingested_at` receipt fall on different UTC days.
     let scribe = server.bifrost_scribe().ok_or("the server owns no Scribe")?;
     scribe.shift_receipt_clock_for_test(DAY);
     let state = start_state(&bundle, &client).await;
@@ -726,7 +727,6 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         .await?;
     let oversized = media(&format!("file:///{oversized_object}"));
 
-    let emitted_from = chrono::Utc::now();
     emit(
         &agent,
         &json!({ "answer": "yes", "marker": "pass" }),
@@ -767,7 +767,6 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         Some(&oversized),
         None,
     );
-    let emitted_to = chrono::Utc::now();
     state.shutdown().await?;
     scribe.shift_receipt_clock_for_test(Duration::ZERO);
     server.flush_bifrost().await?;
@@ -861,13 +860,13 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         );
     }
 
-    // The frozen record identity and the committed event time of the row.
+    // The frozen record identity and the committed `created_at` of the row.
     let times = texts(
         &query(
             &server,
             tenant,
             format!(
-                "SELECT CAST(wyrd_event_time AS BIGINT) FROM vala.eval.observations \
+                "SELECT CAST(created_at AS BIGINT) FROM vala.eval.observations \
                  WHERE record_id = '{pass}'"
             ),
         )
@@ -880,24 +879,17 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         )
         .into());
     }
-    // The run froze the SDK's emit-time stamp, not the receipt a day ahead.
-    if !(emitted_from..=emitted_to).contains(&gated_pass.event_time) {
-        return Err(format!(
-            "the run froze {} outside the emit window [{emitted_from}, {emitted_to}]",
-            gated_pass.event_time
-        )
-        .into());
-    }
-    // The exact row reads back by the frozen managed day.
+    // The exact row reads back by the frozen `created_at` day, and its
+    // `wyrd_ingested_at` receipt lies on another UTC day.
     let day = gated_pass.event_time.date_naive();
-    let read = texts(
+    let received = texts(
         &query(
             &server,
             tenant,
             format!(
-                "SELECT record_id FROM vala.eval.observations \
+                "SELECT CAST(wyrd_ingested_at AS BIGINT) FROM vala.eval.observations \
                  WHERE record_id = '{pass}' \
-                   AND wyrd_event_time >= '{}' AND wyrd_event_time < '{}'",
+                   AND created_at >= '{}' AND created_at < '{}'",
                 day.and_hms_opt(0, 0, 0)
                     .ok_or("midnight")?
                     .and_utc()
@@ -912,8 +904,17 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
         )
         .await?,
     )?;
-    if read != [Some(pass.clone())] {
-        return Err(format!("the frozen day read {read:?} for {pass}").into());
+    let [Some(received)] = received.as_slice() else {
+        return Err(format!("the frozen day read {received:?} for {pass}").into());
+    };
+    let received = chrono::DateTime::from_timestamp_micros(received.parse()?)
+        .ok_or("the wyrd_ingested_at is out of range")?;
+    if received.date_naive() == day {
+        return Err(format!(
+            "wyrd_ingested_at {received} shares the created_at day of {}",
+            gated_pass.event_time
+        )
+        .into());
     }
 
     // Redacted capture stores no `actual`.
@@ -923,7 +924,7 @@ async fn continuous_eval_runs_the_terminal_matrix() -> Result<(), ServerJourneyE
             &server,
             tenant,
             format!(
-                "SELECT actual FROM vala.eval.result_items WHERE result_id = '{}'",
+                "SELECT to_json(actual) FROM vala.eval.result_items WHERE result_id = '{}'",
                 ungated.state.result_id.ok_or("no result")?
             ),
         )
@@ -1019,42 +1020,47 @@ const OBSERVATIONS: &str = "vala.eval.observations";
 /// `observations_ready` Eval bindings whose subject is the `agent` Card.
 const AGENT_BINDINGS: usize = 4;
 
-/// One Eval observation frame for `subject`: the SDK's exact projection plus
-/// correlation, its `wyrd_event_time` stamped once at `at` as the SDK stamps an
-/// emit, so every replay of the frame carries the same event time.
+/// One unstamped Eval observation frame for `subject`: the SDK's exact
+/// projection plus correlation, created now.
+///
+/// The frame's bytes, including its `created_at`, are fixed once built, so a
+/// replay carries the same time column while Scribe stamps each attempt's
+/// own `wyrd_ingested_at` receipt.
 ///
 /// # Panics
 /// Panics when the row does not match the fixed table projection.
-fn answered_observation(
-    subject: &wyrd_spec::reference::CardRef,
-    record: &str,
-    at: chrono::DateTime<chrono::Utc>,
-) -> Vec<u8> {
+fn unstamped_observation(subject: &wyrd_spec::reference::CardRef, record: &str) -> Vec<u8> {
+    observation_frame(
+        subject,
+        &json!({
+            "record_id": record,
+            "context": { "answer": "yes" },
+            "created_at": chrono::Utc::now().to_rfc3339(),
+        }),
+    )
+}
+
+/// One Eval observation IPC frame of `row` for `subject` through the SDK's
+/// exact projection plus correlation.
+///
+/// # Panics
+/// Panics when the row does not match the fixed table projection.
+fn observation_frame(subject: &wyrd_spec::reference::CardRef, row: &Value) -> Vec<u8> {
     use vala_bifrost_redux::tables::DomainTable as _;
     let schema = Arc::new(arrow::datatypes::Schema::new(
         vala_bifrost_redux::tables::EvalObservationsTable::arrow_fields(),
     ));
-    let mut builder = wyrd_queue::BatchBuilder::new(schema);
-    builder
-        .append_json_row(
-            &json!({
-                "record_id": record,
-                "context": json!({ "answer": "yes" }).to_string(),
-                "created_at": at.to_rfc3339(),
-            })
-            .to_string(),
-            subject.uid.as_ref(),
-            None,
-            Some(at.timestamp_micros()),
-        )
-        .expect("the observation row matches the fixed projection");
-    builder.finish_ipc().expect("the observation frame encodes")
+    wyrd_queue::RowPreflight::new(&schema)
+        .prepare(&[row.to_string()], subject.uid.as_ref(), None)
+        .expect("the observation row matches the fixed projection")
+        .to_ipc()
+        .expect("the observation frame encodes")
 }
 
-/// A sealed replay of an observation on a later receipt day is acknowledged
-/// but never activates runs: only the attempt that committed the batch
-/// enqueues, so every run freezes the stored row's client-stamped
-/// `wyrd_event_time` and the row reads back from its original day.
+/// A sealed replay of an unstamped observation on a later receipt day is
+/// acknowledged but never activates runs: only the attempt that committed the
+/// batch enqueues, so every run freezes the stored row's `created_at` and the
+/// row is stored once, with its first receipt's `wyrd_ingested_at`.
 ///
 /// Run inserts are held behind a table lock while the original, two concurrent
 /// replays one day later, and a distinct sentinel frame are acknowledged.
@@ -1105,9 +1111,17 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
         .execute(&mut *lock)
         .await?;
 
-    let emitted = chrono::Utc::now();
-    let frame = answered_observation(&subject, &record, emitted);
+    let frame = unstamped_observation(&subject, &record);
+    // Scribe stamps receipts from PostgreSQL time, so the window is read from
+    // that same clock rather than the host's.
+    let postgres_now = "SELECT clock_timestamp()";
+    let before: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(postgres_now)
+        .fetch_one(&superuser)
+        .await?;
     ingest.insert(OBSERVATIONS, batch, frame.clone()).await?;
+    let after: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(postgres_now)
+        .fetch_one(&superuser)
+        .await?;
     scribe.shift_receipt_clock_for_test(Duration::from_hours(24));
     let (first, second) = tokio::join!(
         ingest.insert(OBSERVATIONS, batch, frame.clone()),
@@ -1120,7 +1134,7 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
         .insert(
             OBSERVATIONS,
             uuid::Uuid::now_v7(),
-            answered_observation(&subject, &sentinel, chrono::Utc::now()),
+            unstamped_observation(&subject, &sentinel),
         )
         .await?;
     // Gate stages run requests before each acknowledgement returns, and the
@@ -1143,25 +1157,11 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
     enqueued(&seed, 2 * AGENT_BINDINGS).await?;
     let runs = seed.observation_runs().await?;
     server.flush_bifrost().await?;
-    let stored = texts(
-        &query(
-            &server,
-            tenant,
-            format!(
-                "SELECT CAST(wyrd_event_time AS BIGINT) FROM vala.eval.observations \
-                 WHERE record_id = '{record}'"
-            ),
-        )
-        .await?,
-    )?;
-    let [Some(stored)] = stored.as_slice() else {
-        return Err(format!("the replayed batch is not stored once: {stored:?}").into());
-    };
-    let stored = chrono::DateTime::from_timestamp_micros(stored.parse()?)
-        .ok_or("the stored event time is out of range")?;
-    if stored.timestamp_micros() != emitted.timestamp_micros() {
-        return Err(format!("the row holds {stored}, not its emit time {emitted}").into());
+    let received = stored_instant(&server, tenant, &record, "wyrd_ingested_at").await?;
+    if received < before || received > after {
+        return Err(format!("the row holds {received}, not its first receipt").into());
     }
+    let stored = stored_instant(&server, tenant, &record, "created_at").await?;
     let frozen: Vec<&ObservationRun> = runs.iter().filter(|run| run.record_id == record).collect();
     let sentinel_runs = runs.iter().filter(|run| run.record_id == sentinel).count();
     if runs.len() != 2 * AGENT_BINDINGS
@@ -1171,14 +1171,14 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
     {
         return Err(format!("expected one run per binding frozen at {stored}: {runs:?}").into());
     }
-    let day = stored.date_naive();
+    let day = received.date_naive();
     let original_day = texts(
         &query(
             &server,
             tenant,
             format!(
                 "SELECT record_id FROM vala.eval.observations WHERE record_id = '{record}' \
-                 AND wyrd_event_time >= '{}' AND wyrd_event_time < '{}'",
+                 AND wyrd_ingested_at >= '{}' AND wyrd_ingested_at < '{}'",
                 day.and_hms_opt(0, 0, 0)
                     .ok_or("midnight")?
                     .and_utc()
@@ -1198,6 +1198,35 @@ async fn sealed_replay_on_a_later_day_activates_once() -> Result<(), ServerJourn
     }
     server.shutdown().await?;
     Ok(())
+}
+
+/// The one stored observation `record`'s microsecond timestamp `column`.
+///
+/// # Errors
+/// Returns the query error, or an error when the record is not stored exactly
+/// once or the value is out of range.
+async fn stored_instant(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    record: &str,
+    column: &str,
+) -> Result<chrono::DateTime<chrono::Utc>, ServerJourneyError> {
+    let values = texts(
+        &query(
+            server,
+            tenant,
+            format!(
+                "SELECT CAST({column} AS BIGINT) FROM {OBSERVATIONS} \
+                 WHERE record_id = '{record}'"
+            ),
+        )
+        .await?,
+    )?;
+    let [Some(value)] = values.as_slice() else {
+        return Err(format!("record {record} is not stored once: {column} {values:?}").into());
+    };
+    Ok(chrono::DateTime::from_timestamp_micros(value.parse()?)
+        .ok_or_else(|| format!("the stored {column} is out of range"))?)
 }
 
 /// Poll until the refusing trigger has counted `count` enqueue attempts.
@@ -1287,7 +1316,7 @@ async fn integrated_enqueue_outage_preserves_ack_and_recovers() -> Result<(), Se
 
     let record = uuid::Uuid::now_v7().to_string();
     let batch = uuid::Uuid::now_v7();
-    let frame = answered_observation(&subject, &record, chrono::Utc::now());
+    let frame = unstamped_observation(&subject, &record);
     ingest.insert(OBSERVATIONS, batch, frame.clone()).await?;
     enqueue_attempts(&superuser, 1).await?;
     ingest.insert(OBSERVATIONS, batch, frame).await?;
@@ -1296,7 +1325,7 @@ async fn integrated_enqueue_outage_preserves_ack_and_recovers() -> Result<(), Se
         .insert(
             OBSERVATIONS,
             uuid::Uuid::now_v7(),
-            answered_observation(&subject, &sentinel, chrono::Utc::now()),
+            unstamped_observation(&subject, &sentinel),
         )
         .await?;
     // The outbox keeps retrying the refused requests.
@@ -1377,8 +1406,21 @@ const LINKED_SPAN: &str = "2b3c4d5e6f708192";
 const CEILING_TRACE: &str = "9f2c333b42475257c7d7e7f707172737";
 /// Trace holding one span more than the server's span ceiling.
 const OVERFLOW_TRACE: &str = "a03d444c53586368d8e8f80818283848";
-/// Fixed span start instant of the evidence trace, in UNIX nanoseconds.
-const EVIDENCE_START: u64 = 1_700_000_000_000_000_000;
+/// Span start instant of the evidence traces, in UNIX nanoseconds: the
+/// moment this test binary first exports a span.
+///
+/// Spans partition and are read on `start_time_unix_nano`, and a record reads
+/// spans from the day before its `created_at` through its trace window, so the
+/// spans start now to sit inside the window of a record created now.
+///
+/// # Panics
+/// Panics when the current instant does not fit Unix nanoseconds.
+static EVIDENCE_START: LazyLock<u64> = LazyLock::new(|| {
+    chrono::Utc::now()
+        .timestamp_nanos_opt()
+        .and_then(|nanos| u64::try_from(nanos).ok())
+        .expect("the current instant fits Unix nanoseconds")
+});
 
 /// Write the trace Service graph beside [`write_graph`]'s Cards: the traced
 /// Agent is verified by `eval-trace-evidence`, whose trace tasks select span
@@ -1543,26 +1585,26 @@ impl TraceJourney {
         runs
     }
 
-    /// Every canonical result item of `result` as `task_id=actual`, sorted.
+    /// Every canonical result item of `result` as `task_id=actual`, sorted, with
+    /// `actual` rendered by the Oracle's `to_json`.
     ///
     /// # Errors
     /// Returns the query error.
     async fn items(&self, result: Option<uuid::Uuid>) -> Result<Vec<String>, ServerJourneyError> {
         let result = result.ok_or("the run has no result")?;
-        let mut items: Vec<String> = texts(
-            &query(
-                &self.server,
-                self.tenant,
-                format!(
-                    "SELECT task_id || '=' || actual FROM vala.eval.result_items \
-                     WHERE result_id = '{result}'"
-                ),
-            )
-            .await?,
-        )?
-        .into_iter()
-        .map(Option::unwrap_or_default)
-        .collect();
+        let batches = query(
+            &self.server,
+            self.tenant,
+            format!(
+                "SELECT concat(task_id, '=', to_json(actual)) FROM vala.eval.result_items \
+                 WHERE result_id = '{result}'"
+            ),
+        )
+        .await?;
+        let mut items: Vec<String> = texts(&batches)?
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect();
         items.sort();
         Ok(items)
     }
@@ -1583,9 +1625,11 @@ fn span_at(trace: &str, name: &str, ordinal: u64, offset_ms: i64) -> Span {
     }
 }
 
-/// One Eval observation frame for `subject` under `trace` whose caller-owned
-/// `wyrd_event_time` is `at`, so Scribe commits it on that day instead of the
-/// receipt day.
+/// One Eval observation frame for `subject` under `trace` created `at`.
+///
+/// `created_at` is the observation table's time column, so the row lands in
+/// the partition of `at` and a run over it freezes `at`, whatever its receipt
+/// day. Its `context.marker` is `record`.
 ///
 /// # Panics
 /// Panics when the row does not match the fixed table projection.
@@ -1595,26 +1639,15 @@ fn stamped_observation(
     trace: &str,
     at: chrono::DateTime<chrono::Utc>,
 ) -> Vec<u8> {
-    use vala_bifrost_redux::tables::DomainTable as _;
-    let schema = Arc::new(arrow::datatypes::Schema::new(
-        vala_bifrost_redux::tables::EvalObservationsTable::arrow_fields(),
-    ));
-    let mut builder = wyrd_queue::BatchBuilder::new(schema);
-    builder
-        .append_json_row(
-            &json!({
-                "record_id": record,
-                "context": json!({ "marker": record }).to_string(),
-                "trace_id": trace,
-                "created_at": at.to_rfc3339(),
-            })
-            .to_string(),
-            subject.uid.as_ref(),
-            None,
-            Some(at.timestamp_micros()),
-        )
-        .expect("the observation row matches the fixed projection");
-    builder.finish_ipc().expect("the observation frame encodes")
+    observation_frame(
+        subject,
+        &json!({
+            "record_id": record,
+            "context": { "marker": record },
+            "trace_id": trace,
+            "created_at": at.to_rfc3339(),
+        }),
+    )
 }
 
 /// The principal ID of every retained Oracle read decision `tenant` made as
@@ -1646,10 +1679,10 @@ async fn system_reads(
 /// and dropped counts, in one total start-time order, bounded on both sides
 /// to the record's trace window.
 ///
-/// Both spans land on today's receipt day, exported in reverse start order.
-/// A record received today reads them; a record committed five days ago
-/// (spans after its window) and one stamped three days ahead (spans before
-/// its window) read none and time out awaiting their trace. A second
+/// Both spans start now, exported in reverse start order. A record created
+/// today reads them; a record created five days ago (spans after its window)
+/// and one created three days ahead (spans before its window) read none and
+/// time out awaiting their trace. A second
 /// in-window record over the same trace, scored by a restarted runtime,
 /// produces identical canonical items. Every input read before and after the
 /// restart is audited as the tenant's one stored System principal.
@@ -1663,7 +1696,7 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
     let journey = TraceJourney::start().await?;
     let mut first = span_at(EVIDENCE_TRACE, "first-span", 1, 0);
     first.events = vec![wyrd_tonic::otlp::trace::v1::span::Event {
-        time_unix_nano: EVIDENCE_START + 500,
+        time_unix_nano: *EVIDENCE_START + 500,
         name: "retrieval".to_owned(),
         attributes: vec![text_attribute("doc", "d1")],
         dropped_attributes_count: 1,
@@ -1693,41 +1726,24 @@ async fn continuous_eval_reads_ordered_bounded_trace_evidence() -> Result<(), Se
     let state = start_state(&journey.bundle, &journey.client).await;
     let subject = state.run().for_card("traced")?.subject().clone();
     state.shutdown().await?;
-    let past = uuid::Uuid::now_v7().to_string();
+    // Records created five days ago and three days ahead carry the evidence
+    // trace, but their trace windows exclude spans that start now.
     let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&journey.client).await?;
-    ingest
-        .insert(
-            OBSERVATIONS,
-            uuid::Uuid::now_v7(),
-            stamped_observation(
-                &subject,
-                &past,
-                EVIDENCE_TRACE,
-                chrono::Utc::now() - chrono::Duration::days(5),
-            ),
-        )
-        .await?;
-    let scribe = journey
-        .server
-        .bifrost_scribe()
-        .ok_or("the server owns no Scribe")?;
-    // The SDK stamps its own clock, so the future record is a raw frame stamped
-    // three days ahead; the shifted receipt keeps it inside Scribe's window.
+    let past = uuid::Uuid::now_v7().to_string();
     let future = uuid::Uuid::now_v7().to_string();
-    scribe.shift_receipt_clock_for_test(3 * DAY);
-    ingest
-        .insert(
-            OBSERVATIONS,
-            uuid::Uuid::now_v7(),
-            stamped_observation(
-                &subject,
-                &future,
-                EVIDENCE_TRACE,
-                chrono::Utc::now() + chrono::Duration::days(3),
-            ),
-        )
-        .await?;
-    scribe.shift_receipt_clock_for_test(Duration::ZERO);
+    for (record, at) in [
+        (&past, chrono::Utc::now() - chrono::Duration::days(5)),
+        (&future, chrono::Utc::now() + chrono::Duration::days(3)),
+    ] {
+        ingest
+            .insert(
+                OBSERVATIONS,
+                uuid::Uuid::now_v7(),
+                stamped_observation(&subject, record, EVIDENCE_TRACE, at),
+            )
+            .await?;
+    }
+    journey.server.flush_bifrost().await?;
 
     let runs = journey.run_to(3).await?;
     let evidence = record_id(&journey.server, journey.tenant, "evidence-1").await?;

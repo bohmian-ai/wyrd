@@ -1,4 +1,12 @@
-import { Table, tableFromIPC, tableToIPC, type RecordBatch, type Schema } from "apache-arrow";
+import {
+  DataType,
+  Table,
+  tableFromIPC,
+  tableToIPC,
+  type Field,
+  type RecordBatch,
+  type Schema,
+} from "apache-arrow";
 import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
@@ -22,9 +30,14 @@ const {
   connectWyrdClient,
   loadWorkflowFromPath,
   openWyrdState,
+  storedTimestampText,
   tableConfigFromArrowIpc,
   tableConfigFromJsonSchema,
   telemetryProviderExists,
+  timestampFormat,
+  timestampKinds,
+  timestampText,
+  variantToValue,
   workflowFromYaml,
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
@@ -49,8 +62,9 @@ export type QueryParam = null | boolean | number | string;
 
 /**
  * One column's logical type: a scalar variant name, or a single-key object for
- * a parameterized form. `List` and `Struct` carry full field declarations,
- * which is what makes the contract recursive.
+ * a parameterized form. `List`, `Struct`, and `Map` carry full field
+ * declarations, which is what makes the contract recursive. `Map` carries its
+ * non-nullable `key` and its `value` declarations.
  */
 export type DataTypeSpec =
   | string
@@ -60,7 +74,8 @@ export type DataTypeSpec =
   | { readonly Time64: Readonly<Record<string, string>> }
   | { readonly Decimal128: Readonly<Record<string, number>> }
   | { readonly List: FieldDescription }
-  | { readonly Struct: readonly FieldDescription[] };
+  | { readonly Struct: readonly FieldDescription[] }
+  | { readonly Map: { readonly key: FieldDescription; readonly value: FieldDescription } };
 
 /**
  * One column declaration in a table description, exactly as stored.
@@ -93,9 +108,15 @@ export interface SortKey {
   readonly null_order: string;
 }
 
-/** A table's server-resolved partitioning, sort order, and Bloom columns. */
+/**
+ * A table's server-resolved partitioning, sort order, and Bloom columns.
+ *
+ * `partition_granularity` applies to `time_column`, which is `wyrd_ingested_at`
+ * unless the table declared its own.
+ */
 export interface PhysicalLayout {
   readonly partition_granularity: string;
+  readonly time_column: string;
   readonly sort_keys: readonly SortKey[];
   readonly bloom_columns: readonly string[];
 }
@@ -103,8 +124,8 @@ export interface PhysicalLayout {
 /**
  * The server's projection of one registered table's stored physical schema.
  *
- * A writer declares `user_fields`, supplies `correlation_fields`, and may
- * supply `managed_candidates`. `canonical_physical_fingerprint` is present only
+ * A writer declares `user_fields` and supplies `correlation_fields`.
+ * `canonical_physical_fingerprint` is present only
  * for a canonical signal table; `compaction_target_file_size_bytes` only when
  * the table declared an explicit Forge compaction file target, and
  * `compaction_type` only when it declared an explicit compaction type.
@@ -113,7 +134,6 @@ export interface TableDescription {
   readonly entry: TableEntry;
   readonly user_fields: readonly FieldDescription[];
   readonly correlation_fields: readonly FieldDescription[];
-  readonly managed_candidates: readonly FieldDescription[];
   readonly canonical_physical_fingerprint?: string;
   readonly physical_layout: PhysicalLayout;
   readonly compaction_target_file_size_bytes?: number;
@@ -409,6 +429,15 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
   }
 
   /**
+   * @internal Each top-level timestamp column's Bifrost timestamp type,
+   * decided in Rust from the retained schema; empty until the stream completes.
+   */
+  get timestampKinds(): Readonly<Record<string, string>> {
+    const ipc = this.#native.schemaIpc;
+    return ipc === null || ipc === undefined ? {} : timestampKinds(ipc);
+  }
+
+  /**
    * Iterate this stream with `for await`.
    *
    * @returns This stream.
@@ -500,9 +529,13 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
  *
  * Sort keys reuse {@link SortKey} — the same shape the describe route returns —
  * so a layout read back from the server can be declared again unchanged.
+ * `timeColumn` names the non-null timestamp column that partitions the table
+ * and leads its default sort order; omitted, it is `wyrd_ingested_at`. Any
+ * instant is accepted.
  */
 export interface TableLayout {
   partitionGranularity?: "hour" | "day";
+  timeColumn?: string;
   sortKeys?: readonly SortKey[];
   bloomColumns?: readonly string[];
 }
@@ -522,7 +555,11 @@ export interface ResolvedTable {
 /** A JSON Schema document, or a schema that emits one, as JSON text. */
 function jsonSchemaText(schema: Readonly<Record<string, unknown>> | JsonSchemaSource): string {
   const source = schema as JsonSchemaSource;
-  return JSON.stringify(typeof source.toJSONSchema === "function" ? source.toJSONSchema() : schema);
+  return JSON.stringify(
+    typeof source.toJSONSchema === "function"
+      ? source.toJSONSchema({ override: zodTimestampFormat })
+      : schema,
+  );
 }
 
 function layoutJson(layout?: TableLayout): string | undefined {
@@ -531,6 +568,7 @@ function layoutJson(layout?: TableLayout): string | undefined {
   }
   return JSON.stringify({
     partition_granularity: layout.partitionGranularity ?? "hour",
+    time_column: layout.timeColumn,
     sort_keys: layout.sortKeys ?? [],
     bloom_columns: layout.bloomColumns ?? [],
   });
@@ -554,7 +592,34 @@ export interface TableConfigOptions {
  * on Zod, or on any other schema library.
  */
 export interface JsonSchemaSource {
-  toJSONSchema(): Readonly<Record<string, unknown>>;
+  toJSONSchema(params?: {
+    override?(context: {
+      zodSchema: unknown;
+      jsonSchema: Record<string, unknown>;
+    }): void;
+  }): Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Mark a Zod local date-time with the `TIMESTAMP_NTZ` format.
+ *
+ * Zod's `toJSONSchema` hook, read structurally so Zod stays out of this SDK's
+ * dependencies. `z.iso.datetime()` already declares `date-time`, which is
+ * `TIMESTAMP_LTZ`; a local-only one declares no format, so without this it
+ * would register as text. Other schema libraries never call the hook.
+ */
+function zodTimestampFormat(context: {
+  zodSchema: unknown;
+  jsonSchema: Record<string, unknown>;
+}): void {
+  const def = (
+    context.zodSchema as {
+      _zod?: { def?: { format?: string; local?: boolean; offset?: boolean } };
+    }
+  )._zod?.def;
+  if (def?.format === "datetime" && def.local === true && def.offset !== true) {
+    context.jsonSchema.format = TimestampNTZ.format;
+  }
 }
 
 /**
@@ -592,6 +657,12 @@ export class TableConfig {
    * dependency of this SDK and any peer offering the same method works
    * unchanged.
    *
+   * Time fields declare Wyrd timestamp columns: `TimestampNTZ.schema(z)`,
+   * `TimestampLTZ.schema(z)`, and `TimestampTZ.schema(z)` declare their own
+   * type, `z.iso.datetime()` declares `TIMESTAMP_LTZ`, and
+   * `z.iso.datetime({ local: true })` declares `TIMESTAMP_NTZ`. Zod refuses to
+   * describe `z.date()` in JSON Schema, so it is refused here too.
+   *
    * `options.layout` requests the table's physical layout.
    * `options.compactionTargetFileSizeBytes` pins the table's Forge compaction
    * file target; omitted, the table follows the server's deployment default.
@@ -608,7 +679,8 @@ export class TableConfig {
    * @param options - Optional layout and Forge compaction declarations.
    * @returns The declared, still unregistered, table config.
    * @throws {@link WyrdError} when the resulting document does not map to an
-   * Arrow schema, declares a column the write path already owns, the
+   * Arrow schema (`WYRD_VALA_400_SCHEMA_PARSE`, including a model that allows
+   * extra keys), declares a column the write path already owns, the
    * compaction target is not a non-negative integer, or the compaction type
    * is not a known spelling (`WYRD_SPEC_400_VALIDATION`).
    */
@@ -727,6 +799,162 @@ export class TableConfig {
  */
 export interface RowSchema<T> {
   parse(value: unknown): T;
+}
+
+/** Brands a timestamp text with the Bifrost timestamp type it was checked as. */
+declare const timestampBrand: unique symbol;
+
+/** `TIMESTAMP_NTZ` text: an RFC 3339 wall-clock reading with no offset. */
+export type TimestampNTZ = string & { readonly [timestampBrand]: "TIMESTAMP_NTZ" };
+/** `TIMESTAMP_LTZ` text: one RFC 3339 instant, rendered in UTC. */
+export type TimestampLTZ = string & { readonly [timestampBrand]: "TIMESTAMP_LTZ" };
+/** `TIMESTAMP_TZ` text: one RFC 3339 instant in the writer's offset. */
+export type TimestampTZ = string & { readonly [timestampBrand]: "TIMESTAMP_TZ" };
+
+/**
+ * A Zod-style namespace, named structurally so this SDK never depends on Zod.
+ *
+ * Zod's `meta` and `refine` both return the string schema they are called on,
+ * so a field built from it has the type `meta` returns.
+ */
+export interface StringSchemaFactory {
+  string(): { meta(meta: Record<string, unknown>): unknown };
+}
+
+/** The string schema type a {@link StringSchemaFactory} builds. */
+export type StringSchemaOf<Z extends StringSchemaFactory> = ReturnType<
+  ReturnType<Z["string"]>["meta"]
+>;
+
+/**
+ * One Wyrd timestamp type: its name, its JSON Schema format, and the checks
+ * that make a text a value of it.
+ */
+export interface WyrdTimestampType<T extends string> {
+  /** `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ`. */
+  readonly name: string;
+  /** The JSON Schema `format` that declares a column of this type. */
+  readonly format: string;
+  /**
+   * Check `text` and return its canonical text.
+   *
+   * The text is parsed by the same Rust parser an insert uses, so a value this
+   * accepts is one Bifrost accepts.
+   *
+   * @throws TypeError when the text is not this type: an offset for
+   * `TIMESTAMP_NTZ`, no offset for the others, or not RFC 3339.
+   */
+  parse(text: string): T;
+  /**
+   * A string schema for a field of this type, built with the caller's Zod.
+   *
+   * It carries this type's format, so a table declared from it registers this
+   * column type, and it accepts only text {@link WyrdTimestampType.parse}
+   * accepts.
+   */
+  schema<Z extends StringSchemaFactory>(z: Z): StringSchemaOf<Z>;
+}
+
+/**
+ * Build one Wyrd timestamp type from its name.
+ *
+ * The format, the check, and the canonical text all come from the Rust owner,
+ * so the three types restate nothing.
+ */
+function wyrdTimestamp<T extends string>(name: string): WyrdTimestampType<T> {
+  const format = timestampFormat(name) as string;
+  const accepts = (text: string): boolean => timestampText(name, text) != null;
+  return {
+    name,
+    format,
+    parse(text: string): T {
+      const canonical = timestampText(name, text);
+      if (canonical == null) {
+        throw new TypeError(`${name} does not accept ${JSON.stringify(text)}`);
+      }
+      return canonical as T;
+    },
+    schema<Z extends StringSchemaFactory>(z: Z): StringSchemaOf<Z> {
+      const field = z.string().meta({ format }) as {
+        refine(check: (value: string) => boolean, message: string): StringSchemaOf<Z>;
+      };
+      return field.refine(accepts, `not a ${name}`);
+    },
+  };
+}
+
+/** `TIMESTAMP_NTZ`: a wall-clock reading with no instant. */
+export const TimestampNTZ = wyrdTimestamp<TimestampNTZ>("TIMESTAMP_NTZ");
+/** `TIMESTAMP_LTZ`: one instant. */
+export const TimestampLTZ = wyrdTimestamp<TimestampLTZ>("TIMESTAMP_LTZ");
+/** `TIMESTAMP_TZ`: one instant plus the writer's wall-clock reading. */
+export const TimestampTZ = wyrdTimestamp<TimestampTZ>("TIMESTAMP_TZ");
+
+/**
+ * One stored timestamp cell as its Wyrd timestamp type's text.
+ *
+ * Apache Arrow hands a microsecond timestamp over as fractional milliseconds,
+ * which round back to the exact microseconds; a `TIMESTAMP_TZ` cell is its
+ * `{utc, local}` struct. Rust renders the text.
+ */
+function timestampValue(kind: string, value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  const micros = (millis: unknown): number => Math.round((millis as number) * 1000);
+  const stored = value as { utc: unknown; local: unknown };
+  const text =
+    typeof value === "number"
+      ? storedTimestampText(kind, micros(value))
+      : storedTimestampText(kind, micros(stored.utc), micros(stored.local));
+  if (text == null) {
+    throw new TypeError(`stored ${kind} value is out of range`);
+  }
+  return text;
+}
+
+/** The Arrow extension name every Variant column carries. */
+const VARIANT_EXTENSION = "arrow.parquet.variant";
+
+/**
+ * Project one row value onto its native JavaScript value.
+ *
+ * A Variant cell decodes through the shared Rust owner (objects become plain
+ * objects, arrays arrays, and an integer outside the safe range a `bigint`),
+ * a Struct becomes a plain object, a List an array, and a Map an object keyed
+ * by its entry keys, recursively. Every scalar stays as Apache Arrow produced
+ * it, so 64-bit integers are `bigint`.
+ */
+function nativeValue(field: Field, value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (field.metadata.get("ARROW:extension:name") === VARIANT_EXTENSION) {
+    const cell = value as { metadata: Uint8Array; value: Uint8Array };
+    return variantToValue(cell.metadata, cell.value);
+  }
+  const children = field.type.children as Field[] | null;
+  if (DataType.isStruct(field.type)) {
+    const struct = value as Record<string, unknown>;
+    return Object.fromEntries(
+      (children ?? []).map((child) => [child.name, nativeValue(child, struct[child.name])]),
+    );
+  }
+  if (DataType.isList(field.type)) {
+    return Array.from(value as Iterable<unknown>, (item) =>
+      nativeValue(children?.[0] as Field, item),
+    );
+  }
+  if (DataType.isMap(field.type)) {
+    const entry = children?.[0]?.type.children as Field[];
+    return Object.fromEntries(
+      Array.from(value as Iterable<[unknown, unknown]>, ([key, item]) => [
+        String(key),
+        nativeValue(entry[1] as Field, item),
+      ]),
+    );
+  }
+  return value;
 }
 
 /**
@@ -916,8 +1144,9 @@ export class Bifrost {
    * destination instead of using the active binding, carries correlation as
    * ordinary columns, and is durable when it resolves, so no flush follows it.
    * Build the batch against {@link TableConfig.schema} from
-   * `describeTableConfig` - a canonical table compares an incoming block
-   * against its declared fields exactly, metadata included.
+   * `describeTableConfig`. Columns match the table's declared columns by name,
+   * in any order; the server judges every column's type and refuses a stale
+   * declaration.
    *
    * @param table - The destination's `namespace.name`.
    * @param batch - One Arrow batch matching the table's declared fields.
@@ -968,7 +1197,12 @@ export class Bifrost {
    * A purely local projection over the completed result: the query, its
    * authorization, its limits, and its terminal are the same ones raw
    * {@link Bifrost.sql} runs. The schema never reaches the server and says
-   * nothing about the table's stored layout.
+   * nothing about the table's stored layout. Every cell reaches `rows` as its
+   * native value: a Struct is a plain object, a List an array, a Map an
+   * object, a Variant its decoded JSON value, and a 64-bit integer a
+   * `bigint`. A top-level timestamp column's cell is its Wyrd timestamp
+   * type's text: `TIMESTAMP_NTZ` with no offset, `TIMESTAMP_LTZ` in UTC, and
+   * `TIMESTAMP_TZ` in the writer's offset.
    *
    * @param query - One SELECT statement.
    * @param params - Values bound to `$1..$n`, in order.
@@ -998,10 +1232,21 @@ export class Bifrost {
     if (rows === undefined) {
       return result;
     }
+    const kinds = stream.timestampKinds;
     return result
       .toArrow()
       .toArray()
-      .map((row: { toJSON(): Record<string, unknown> }) => rows.parse(row.toJSON()));
+      .map((row: { toJSON(): Record<string, unknown> }) => {
+        const values = row.toJSON();
+        for (const field of schema.fields) {
+          const kind = kinds[field.name];
+          values[field.name] =
+            kind === undefined
+              ? nativeValue(field, values[field.name])
+              : timestampValue(kind, values[field.name]);
+        }
+        return rows.parse(values);
+      });
   }
 
   /**

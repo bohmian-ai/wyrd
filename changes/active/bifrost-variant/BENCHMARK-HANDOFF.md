@@ -290,9 +290,64 @@ latency, CPU and off-CPU Paretos for every case.
      bytes-per-core target penalizes small rows.
    - At x64, server CPU is 10.0 ms per batch. `wyrd_server` is 24.8% of it,
      mostly OTLP protobuf decode, and `parquet_variant` is 6.9%.
-   - Decide whether the target should be judged per row or per byte for small
-     signals. Otherwise the protobuf decode and projection cost per span is the
-     lever.
+   - Where decode CPU goes, from the x64 spans profile
+     (`telemetry-writes/parquet/profiles/03-otlp spans-64/report.txt` in the
+     preserved pre-merge profiles):
+
+     | Bucket | Share |
+     |---|---|
+     | Wire scanner: `WireFields::next` 10.86% + `read_varint` 6.90% | 17.8% |
+     | Typed-struct build: `from_utf8`, `fixed_string`, `String::clone`, `push_mut`, `decode_*` | ~5.8% |
+     | Projection re-walk: `project_resource_spans`, `unique_keys`, IndexMap and hashing | ~4.3% |
+     | Preflight | 0.7% |
+
+   - The scanner cost is mostly repeated scanning of the same bytes, in
+     `crates/wyrd/wyrd-server/src/otlp_decode.rs`:
+     - `decode_span` makes about 10 full `WireFields` passes per span: 3
+       `repeated_message_count`, 5 `last_bytes_field`,
+       `decode_merged_status` (2+), then the main loop.
+     - `decode_key_value` makes about 7 passes per attribute: 2 in
+       `decode_merged_any_value`, 1 in `last_bytes_field`, 1 validation
+       loop, then 2 over the value body (`select_any_value_bodies` and the
+       fill).
+     - Every other `decode_*` function uses the same count-then-scan pattern.
+     - The counts exist so every `Vec` is sized exactly and the decode
+       reservation is exact (commit `9d8a864f6`, "Prove exact trace decode
+       capacity"). Any change must keep that.
+   - Levers, in order. Measure one per run against
+     `benchmarks/pre-merge/write-telemetry.md`, after the merge:
+     1. **Two passes per message instead of 7–10.**
+        - Pass 1 walks the message once. It collects all repeated counts, the
+          last offset of each singular field, and the wire-type checks.
+        - Pass 2 fills the struct.
+        - This keeps exact capacity, last-wins semantics and every malformed
+          check.
+        - Add a fast path for a singular `value` or `status` that occurs once,
+          so the AnyValue merge machinery runs only when a field repeats.
+        - Targets the 17.8%. If scanner cost scales with pass count, the
+          saving is about 10–13% of total CPU. That is an estimate, not a
+          measurement.
+     2. **Single-byte varint fast path in `WireFields::read_varint`.** Every
+        OTLP tag here is ≤ 16, so every key fits in one byte, and so do most
+        lengths. A `byte < 0x80` early return before the loop does the job;
+        prost uses the same trick. Targets part of the 6.9%.
+     3. **Decode straight into the projection's Arrow/Variant builders**,
+        skipping the intermediate `Span` / `KeyValue` / `String` structs.
+        - This removes most of the ~10% in the build and re-walk buckets.
+        - It is larger than 1 and 2: `OtlpDecodePlan.decode_bytes` is defined
+          as the size of those structs, so the reservation accounting has to
+          be redesigned. Do 1 and 2 first.
+     - The preflight stays in every case. It is the memory-admission guard and
+       costs 0.7%.
+   - **Decode alone will not reach 30 MiB/s per core.**
+     - At ~340 B per row, that target means about 92k rows/s per core, against
+       about 51k today. That needs roughly 45% less CPU per row.
+     - All of decode, including the projection re-walk, is about 28%.
+     - So it is still open whether small signals are judged per row or per
+       byte. Spans already clear the 200k rows/s floor, at 426k.
+     - Other large items in the same profile: `sha2` (3.7%), Variant
+       validation (`EncodedVariant::validate` plus `Variant::try_new_*`,
+       ~2.8%), and ZSTD.
 6. **Native write tail.** Native passes at 3.31M rows/s at x64, but p99 is
    667 ms at x16 and 717 ms at x64. Not diagnosed yet.
 7. **Hot-only and Parquet-only write runs** of the same sweeps, plus a metrics

@@ -443,3 +443,143 @@ An unexplained substantive S divergence outside approved M exceptions is a mater
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+Candidate: merge `b356c948f` (M `8a8813a7` + S `cfe21dc9`) plus commits
+`b38f9be37`, `597533616`, `cac9c4969`, `4f9a5c1d1`, `80b29eb2a`, `eaa129c4a`,
+`5e7b177b0`, `1678da1ac` on `wyrd/bifrost-variant/integrate-main`. Status:
+**IMPLEMENTED**, pending `$wyrd-task-review`.
+
+### Acceptance
+
+| Criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| TASK-001-C01 cohesive engine | S catalog/oracle/scribe/forge/storage owners imported; S-deleted owners stay deleted (`analytical_scan.rs`, `pruning.rs`, `fixed_ipc.rs`, `storage/cache.rs`, `storage/telemetry.rs`, `wyrd-queue/src/schema.rs`); M consumers adapted in `597533616`/`cac9c4969` (results via `ScribeOutbox::stage`, audit via staged `AuditEvent`, eval observations via admin write) | `cargo check --workspace --all-features --all-targets` clean; `mise run lints` (incl. release `wyrd-server` bin) | PASS |
+| TASK-001-C02 S02/S03/S04/S20/S22 | S retention/deadline (S02), cut cache (S03), group commit/fences (S04), v3 rewrite (S20); REQ-022: cut read inside `TenantConn` (`oracle_reader_authority.rs`, `bifrost_catalog.rs::read_cut`), WAL fence via `OperatorPool` (`scribe_batch_commits::newest_wal_fence`, `ReplayFences`); REQ-024: `olap_minimal.sql` restored to M bytes, three S forward migrations without GRANT/REVOKE, `operator_access` policy, plpgsql SECURITY DEFINER `scribe_wal_newest_fence` | P02, P03, P04, P06, P22, P27, P28 below | PASS |
+| TASK-001-C03 ten tables / time axes | `builtin_tables() -> [_; 10]`; no `vala.dev.agent_traces`/`CodeAxis` in crates, sdks, docs, architecture (grep empty); consumers moved to `created_at`/`ended_at`/`started_at`/`wyrd_ingested_at` (`4f9a5c1d1`: capacity load, `observe_ingest`, security posture, schema.svx) | P01; `observe_ingest::observations_store_the_client_emit_time` adapted | PASS |
+| TASK-001-C04 graph | `iceberg-compaction-core` rev `22cd178d14009468bc951a14d7acf63237af808a`; lock/Hakari regenerated; `ring` only via M's `jsonwebtoken` (present in M lock) | `mise run check:workspace-hack` ("no operations to perform"), `mise run check:deps` | PASS |
+| TASK-001-C05 dispositions | [dispositions.tsv](../dispositions.tsv): every one of 527 B→S records with class, disposition, owner task, note | Generated from `git diff --name-status -M B S`, `git merge-tree M S` and HEAD blobs | PASS |
+| TASK-001-EVIDENCE | This section | Commands below | PASS |
+
+### Dispositions ledger
+
+[dispositions.tsv](../dispositions.tsv) is the canonical per-path ledger
+(later tasks update rows they touch). Counts at this candidate:
+
+- 527 B→S records (531 paths incl. rename sources). Overlap with B→M: 228
+  paths = 138 conflicting + 85 auto-merged + 5 byte-identical.
+  `git merge-tree --name-only M S` reports 148 conflicted paths; 10 sit at
+  main-side rename destinations outside the B→S path set. The plan's figure of
+  76 auto-merged overlaps came from an earlier count. This ledger counts every
+  overlapping path that is neither conflicted nor identical (85) and gives each
+  one a row.
+- Dispositions: preserved 277, adapted 184, retired 51, main-retained 8,
+  source deletion kept 7.
+- "Retired" includes rehomed tests (wyrd-client `tests/bifrost/*`,
+  vala-sql `tests/pg_*`, wyrd-server `tests/pg_*`) whose bodies now live in the
+  consolidated integration binaries (S3).
+- Assigned, not implemented here: audit (TASK-003: `audit_staging.rs`,
+  `gate_audit.rs`, `audit/mod.rs`), results publisher and drift SDK journeys
+  (TASK-004), Python/TS/Rust SDK source assertions in stories main deleted or
+  rewrote, incl. `test_bifrost_e2e.py` Variant attributes and TS `otel-export`
+  (TASK-005), `bifrost_query_capacity` logs/telemetry and other capacity
+  workloads (TASK-006).
+
+### Historical L01–L64 and S1–S4 reconciliation
+
+Checked against the integrated tree. Every entry follows evidence.md's recorded
+status. Items with a concrete current check:
+
+- L02/L62: compaction pin is now the task-supplied `22cd178d` (supersedes
+  6965606); ring absent from the compaction/iceberg cone.
+- L03/L23/S3: vala-sql has one `tests/integration` binary (12 modules); source
+  `pg_oracle_membership` content rehomed there.
+- L07/S2: `scripts/checks/object-store-pin.sh` and `scripts/test-families.sh`
+  absent and unreferenced.
+- L08/S4: `wyrd-tonic/proto` holds only `wyrd.v1.proto`; capacity binaries are
+  `capacity` and `bifrost_forge_capacity`.
+- L10/L16: no `CodeAxis`/`agent_traces` anywhere.
+- L12/L57/L51/L01: no audit publisher, staging or hash chain; `audit/` is
+  `mod.rs` only.
+- L20/L38/L56/S1: workspace Clippy passes under the pinned stable toolchain
+  (1.98) with no added `allow`/`expect`; the source `type_complexity` allow and
+  one unfulfilled `expect` were removed (`5e7b177b0`).
+- L22/L60: M's reader-authority and `UnresolvedExpiry` cut refusal are retired
+  by the approved REQ-002 (S retention window; spec: "Do not port main's
+  barriers/refusals for new cuts"). The prepared-expiry lease authority
+  safeguard is proven by P06 `retryable_catalog_failure_retains_prepared_authority`;
+  Forge barrier work is TASK-002.
+- L26: no `planning_demands` consumer; only historical migrations reference it.
+- L34: `params: Vec::new()` carried on rehomed `BifrostQueryRequest` literals.
+- L43: no Python `wyrd.verification` module or TS `Verification` client.
+- L46: TS `index.d.ts`/`.d.cts` regenerated via `ts:build` (`80b29eb2a`);
+  `codegen:check` clean.
+- L58/REQ-022: main role model kept. The P22 payload-refusal case uses a seeded
+  role, because every main builtin role holds `gateway_payload_read`
+  (`1678da1ac`).
+
+### Scenario proof (RED/GREEN)
+
+S behavior was imported intact, so the selected recipes give verification-only
+proof. RED observed during this task:
+
+- **REQ-022 (static RED):** `mise run check:tenant-isolation` failed on
+  `OracleTableCuts::read` (bare connection) and `newest_wal_fence` (bare
+  connection, no marker). GREEN after `eaa129c4a`.
+- **P22 RED:** `published::variant_sql_registry_covers_every_session` failed
+  with "the sensitive Variant read settled (Interactive, [])".
+  - Diagnosis:
+    - Symptom: panic at `published.rs:850`.
+    - Evidence: no "Oracle refused a query reaching gateway payload columns"
+      line in the trace.
+    - Cause: `builtin_roles.rs:44` grants `gateway_payload_read` to
+      `workload` (`DEFAULT_CARD_ROLE`), so `authorize_payload_columns`
+      (`oracle/mod.rs:3479`) returns `Ok`.
+    - Fix site: the test caller, not the server.
+  - An independent read-only diagnostician confirmed the cause and fix site and
+    found no other affected callers.
+  - First fix run: a role name with hyphens was refused with
+    `WYRD_PERMISSION_500_ROLE_CORRUPT` (names must match `^[a-z0-9_]{1,64}$`);
+    renamed.
+  - GREEN, rerun with `--no-capture`: the trace shows the payload refusal.
+
+| Recipe | Exact selectors | Result |
+|---|---|---|
+| P01 | `catalog::layout::tests::{time_column_drives_partition_and_sort, invalid_time_column_is_refused_naming_the_field}`, `scribe::execution_lanes::tests::{same_iceberg_type_spellings_cast_to_the_registered_type, a_naive_timestamp_is_refused_for_a_zoned_column}`, `scribe::parquet_writer::tests::row_group_bounds_read_the_time_column` | 5/5 PASS |
+| P02 | `catalog::cut_cache::tests::cut_cache_serves_only_fresh_listened_cuts` | PASS |
+| P03 | `oracle::tests::request_deadline_projects_unusable_budgets_to_the_default`; wyrd-server `config::tests::max_query_deadline_sits_between_default_deadline_and_retention` | 2/2 PASS |
+| P04 | `scribe::shards::tests::{group_commit_syncs_once, same_batch_resent_before_commit_lands_in_a_later_group_and_commits_once, group_commit_crash_between_sync_and_fence_replays}`, `scribe::pg_scribe_crash_injection::{zeroed_block_after_the_newest_fence_ends_the_chain, bad_record_before_an_acknowledged_commit_fails_closed, bad_record_without_a_fence_authority_fails_closed}` | 6/6 PASS |
+| P06 | 3 lib (`forge::leadership` ×2, `forge::worker`) + 7 journey (`production_routes` ×2, `snapshot_expiration::retryable_catalog_failure_retains_prepared_authority`, `reader_expiry_ordering` ×2, `managed_rewrite` ×2) + vala-sql `pg_forge_tasks::pg_tests::previous_owner_reclaims_its_unexpired_attempt` | 11/11 PASS |
+| P22 | `published::{variant_sql_registry_covers_every_session, struct_and_variant_share_physical_pushdown}`, `distributed::pg_hot_variant_filter_on_an_unshredded_key_reads_null`, `recovery::variant_staging_restores_and_publishes_once`, `scribe::parquet_writer::tests::recovery_runs_are_unshredded_and_the_claim_sample_shreds` | 5/5 PASS (first selector RED → GREEN) |
+| P27 | `tests::forge_and_oracle_migrations_have_unique_forward_owners`, `pg_migration::pg_tests::shipped_audit_staging_migration_is_immutable` | 2/2 PASS |
+| P28 | vala-sql `vala_migrations_apply_and_are_idempotent`; wyrd-sql 3-selector set; vala-sql `pg_schema_usage` 2-selector set; wyrd-sql upgrade/principal 3-selector set | 9/9 PASS |
+
+Run exactly as written in "Exact Selected Recipes" with
+`WYRD_LOG` and `RUST_LOG` set to `info,vala_bifrost_redux=debug` and `RUST_BACKTRACE=1`. Additional
+regression run for the changed cut owner:
+`scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p vala-sql --test integration -E 'test(/^pg_oracle_membership::/)'`
+6/6 PASS. Its statement-local binding and rebind-refusal sub-assertions were
+removed because `TenantConn` now carries the tenant in its type.
+
+### Static lanes
+
+`mise run fmt:check`, `mise run lints`, `mise run check:deps`,
+`mise run check:tenant-isolation`, `mise run check:workspace-hack`,
+`mise run codegen:check`, `git diff --check`: all PASS on the final candidate.
+TS lanes (`ts:lints`, `ts:format:check`, `ts:typecheck`, `ts:napi:check`) passed
+with `80b29eb2a`.
+
+### Limits and non-goals
+
+- Unported source assertion: `newest_wal_fence_spans_tenants_on_one_stream`
+  (deleted with main's `pg_audit_staging.rs`). It covered the SQL fence lookup
+  across tenants. The adapted SECURITY DEFINER function is applied by P28; P04
+  covers replay semantics with injected fences. The cross-tenant SQL lookup
+  itself has no executable proof in this task's selected recipes.
+- Not done here (owned by TASK-002 through TASK-006): Forge cut barriers and
+  Oracle memory, audit, observations/results, public journeys, workload ports.
+  None were implemented in this task.
+- No deployment, push, merge to main, data migration, compatibility shim,
+  suppression attribute, hand-edited generated artifact, or restored retired
+  script/descriptor/publisher.

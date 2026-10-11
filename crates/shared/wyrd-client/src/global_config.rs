@@ -229,15 +229,34 @@ mod tests {
         )
         .expect("config fixture");
         let key = SecretString::from("first-key".to_owned());
-        GlobalConfig::save_local(&environment, "http://127.0.0.1:8080", "http://127.0.0.1:50051", Some(&key))
-            .expect("first save");
+        GlobalConfig::save_local(
+            &environment,
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:50051",
+            Some(&key),
+        )
+        .expect("first save");
         let credentials_path = dir.path().join("credentials.toml");
         let mut retained = fs::read_to_string(&credentials_path).expect("credentials saved");
         retained.push_str("# retained cache\naccess_token = 'cached-token'\naccess_expires_at = '2099-01-01T00:00:00Z'\n");
         fs::write(&credentials_path, retained).expect("cache fixture");
         let credentials = fs::read(&credentials_path).expect("cached credentials");
-        GlobalConfig::save_local(&environment, "http://127.0.0.1:8080", "http://127.0.0.1:50051", Some(&key)).expect("retry");
-        assert!(GlobalConfig::save_local(&environment, "http://127.0.0.1:9090", "http://127.0.0.1:50052", None).is_err());
+        GlobalConfig::save_local(
+            &environment,
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:50051",
+            Some(&key),
+        )
+        .expect("retry");
+        assert!(
+            GlobalConfig::save_local(
+                &environment,
+                "http://127.0.0.1:9090",
+                "http://127.0.0.1:50052",
+                None
+            )
+            .is_err()
+        );
         assert_eq!(
             fs::read(dir.path().join("credentials.toml")).expect("credentials retained"),
             credentials

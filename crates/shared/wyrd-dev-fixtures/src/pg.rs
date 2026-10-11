@@ -351,10 +351,7 @@ impl UnmigratedDatabase {
     pub async fn create() -> Result<Self, FixtureError> {
         let test_db = TestDatabase::create_empty().await?;
         let migrator = test_db.owner_pool().await?;
-        Ok(Self {
-            migrator,
-            test_db,
-        })
+        Ok(Self { migrator, test_db })
     }
 
     /// The platform-login operator pool, which owns DDL on this database.

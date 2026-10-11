@@ -202,7 +202,9 @@ impl DevServer {
         let Self {
             child, endpoint, ..
         } = self;
-        let child = child.as_mut().expect("the server is retained after readiness");
+        let child = child
+            .as_mut()
+            .expect("the server is retained after readiness");
         if !configured || !args.hosts.is_empty() {
             tokio::select! {
                 offered = mcp::offer_local(&args.hosts, endpoint) => offered?,
@@ -334,15 +336,12 @@ impl DevServer {
     /// # Errors
     /// Returns redacted recovery guidance if waiting fails or the server exits.
     async fn exited(child: &mut Child) -> Result<ExitCode, WyrdCliError> {
-        child
-            .wait()
-            .await
-            .map_err(|_| {
-                dev_error(
-                    "server exit",
-                    "rerun; saved client configuration and committed server state remain",
-                )
-            })?;
+        child.wait().await.map_err(|_| {
+            dev_error(
+                "server exit",
+                "rerun; saved client configuration and committed server state remain",
+            )
+        })?;
         Err(dev_error(
             "server exit",
             "the foreground server exited; rerun with the same tenant and configuration directory",

@@ -297,7 +297,10 @@ async fn server_dev_first_run_is_client_ready() {
     fs::create_dir_all(&server_file).expect("server file directory");
     fs::write(
         server_file.join("server.toml"),
-        format!("[grpc]\nbind = \"0.0.0.0:{}\"\n", local.grpc.rsplit_once(':').expect("port").1),
+        format!(
+            "[grpc]\nbind = \"0.0.0.0:{}\"\n",
+            local.grpc.rsplit_once(':').expect("port").1
+        ),
     )
     .expect("non-loopback server file");
     local.start(&[]).await;

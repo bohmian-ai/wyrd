@@ -69,14 +69,13 @@ the same host with nothing compiling, in this order:
 2. **Run the same read sweeps on the merged branch** and compare them case by
    case. Use qps, p50/p95/p99, server CPU per query and peak memory, plus the
    per-query latency Pareto and the CPU Pareto by crate.
-3. **Writes, only after reads match:**
-   - `mise run bench:bifrost:write-capacity -- --fixture logs` (pre-merge:
-     `benchmarks/pre-merge/write-logs-run-37.md`)
-   - then `--fixture telemetry`
-   - then the native sweep (no fixture)
-
-   Produce a pre-merge baseline for each one first, if it isn't in
-   `benchmarks/pre-merge/`.
+3. **Writes, only after reads match.** Each one has a pre-merge baseline in
+   `benchmarks/pre-merge/`:
+   - `mise run bench:bifrost:write-capacity -- --fixture logs`
+     (`write-logs-run-37.md`)
+   - then `--fixture telemetry` (`write-telemetry.md`)
+   - then the native sweep, with no fixture (`write-native.md`)
+   - then `mise run bench:bifrost:client-queue` (`client-queue.txt`)
 
 Repeat a case before calling it a regression. On this disk, fsync time varies
 by up to about 2.5x between runs (run-36 vs run-37), and write rows/s varied
@@ -282,9 +281,23 @@ latency, CPU and off-CPU Paretos for every case.
 4. **ZSTD is the largest write CPU item** (18–24% across steps).
    - It is WAL ZSTD level 1 already.
    - Any change is a durability/space trade-off and needs evidence first.
-5. **Hot-only and Parquet-only runs** of the same sweep, plus the telemetry
-   (spans) and metrics fixtures.
-6. **Native validation cost:** native IPC pays a full `EncodedVariant`
+5. **Spans miss the per-core wire target.**
+   - Evidence: the pre-merge `write-telemetry.md` peaks at x64 at 425,901
+     rows/s, but only 16.5 MiB/s OTLP wire per core, against the 30 MiB/s
+     target.
+   - Spans are about 340 B of wire per row, against 1,253 B for logs. Per-row
+     cost is similar (about 51k rows/s per core for spans, 36k for logs), so a
+     bytes-per-core target penalizes small rows.
+   - At x64, server CPU is 10.0 ms per batch. `wyrd_server` is 24.8% of it,
+     mostly OTLP protobuf decode, and `parquet_variant` is 6.9%.
+   - Decide whether the target should be judged per row or per byte for small
+     signals. Otherwise the protobuf decode and projection cost per span is the
+     lever.
+6. **Native write tail.** Native passes at 3.31M rows/s at x64, but p99 is
+   667 ms at x16 and 717 ms at x64. Not diagnosed yet.
+7. **Hot-only and Parquet-only write runs** of the same sweeps, plus a metrics
+   fixture.
+8. **Native validation cost:** native IPC pays a full `EncodedVariant`
    validation at the trust boundary. Don't change it unless a native profile
    shows that it matters.
 

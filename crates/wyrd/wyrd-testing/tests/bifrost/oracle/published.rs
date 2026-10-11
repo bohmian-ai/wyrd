@@ -16,7 +16,7 @@ use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::ForgeConfig;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::WyrdClient;
-use wyrd_runtime::builtin_roles::DEFAULT_CARD_ROLE;
+use wyrd_runtime::Permission;
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdProblem;
@@ -977,14 +977,25 @@ async fn prove_variant_sql_sessions() -> Result<(), JourneyError> {
     prove_worker_tenant_refusal(&cluster, &client, &suffix).await?;
 
     // A caller without gateway payload authority is refused at the logical
-    // plan, before any peer or provider work.
+    // plan, before any peer or provider work. Every builtin role reads
+    // payloads, so the caller holds a seeded role with only table and query
+    // reads.
+    coordinator
+        .seed_role(
+            "variant_sql_no_payload",
+            &[
+                Permission::bifrost_table_read(),
+                Permission::bifrost_query_read(),
+            ],
+        )
+        .await?;
     let unprivileged = client_from_bootstrap(
         coordinator,
         coordinator
             .bootstrap_service_in_tenant(
                 cluster.tenant(),
                 "variant-sql-unprivileged",
-                &[DEFAULT_CARD_ROLE],
+                &["variant_sql_no_payload"],
             )
             .await?,
     )?;

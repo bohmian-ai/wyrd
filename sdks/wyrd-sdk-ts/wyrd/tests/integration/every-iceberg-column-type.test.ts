@@ -30,12 +30,14 @@ import {
   type DataType,
   type Table,
 } from "apache-arrow";
-import { beforeAll, describe, expect, it } from "vitest";
+import { expect, vi } from "vitest";
 import { z } from "zod";
 
 import { Bifrost, TableConfig } from "@wyrd/sdk";
 
-import { columnValues, useTestServer } from "../support/test-server.js";
+import { columnValues, serverTest } from "../support/server.js";
+
+vi.setConfig({ testTimeout: 60_000 });
 
 const FIXTURES = new URL("../../../../../fixtures/bifrost/", import.meta.url);
 const EVERY_TYPE = tableFromIPC(readFileSync(new URL("every_iceberg_type.arrow", FIXTURES)));
@@ -58,99 +60,100 @@ const mapOf = (value: DataType) =>
     ),
   );
 
-describe("every iceberg column type", () => {
-  const server = useTestServer();
-  let all: Bifrost;
-  let allTypes: Table;
-  let narrowTypes: Table;
+/** Both tables, registered, written, and published once, and what each reads back. */
+interface Written {
+  readonly all: Bifrost;
+  readonly allTypes: Table;
+  readonly narrowTypes: Table;
+}
 
-  beforeAll(async () => {
-    all = await Bifrost.connect({
-      table: TableConfig.fromArrow("vala.datasets.all_types", EVERY_TYPE.schema),
-    });
-    await all.register();
-    await all.writeBatch("vala.datasets.all_types", EVERY_TYPE.batches[0]!);
-    const narrow = await Bifrost.connect({
-      table: TableConfig.fromArrow("vala.datasets.narrow_types", NARROW.schema),
-    });
-    await narrow.register();
-    await narrow.writeBatch("vala.datasets.narrow_types", NARROW.batches[0]!);
-    server().flushBifrost();
-    allTypes = (await all.sql("SELECT * FROM vala.datasets.all_types ORDER BY id")).toArrow();
-    narrowTypes = (
-      await narrow.sql("SELECT * FROM vala.datasets.narrow_types ORDER BY int8")
-    ).toArrow();
-  }, 60_000);
-
-  it.each(EVERY_TYPE.schema.names)(
-    "every iceberg type round trips with nested nulls: %s",
-    (column) => {
-      const written = EVERY_TYPE.getChild(column);
-
-      expect(String(allTypes.getChild(column)?.type)).toBe(String(written?.type));
-      expect(columnValues(allTypes.getChild(column))).toEqual(columnValues(written));
+/**
+ * Every test starts after {@link Written}, so the narrower-declaration story
+ * finds `narrow_types` registered without reading the fixture.
+ */
+const test = serverTest().extend<{ written: Written }>({
+  written: [
+    async ({ server }, use) => {
+      const all = await Bifrost.connect({
+        table: TableConfig.fromArrow("vala.datasets.all_types", EVERY_TYPE.schema),
+      });
+      await all.register();
+      await all.writeBatch("vala.datasets.all_types", EVERY_TYPE.batches[0]);
+      const narrow = await Bifrost.connect({
+        table: TableConfig.fromArrow("vala.datasets.narrow_types", NARROW.schema),
+      });
+      await narrow.register();
+      await narrow.writeBatch("vala.datasets.narrow_types", NARROW.batches[0]);
+      server.flushBifrost();
+      const allTypes = (await all.sql("SELECT * FROM vala.datasets.all_types ORDER BY id")).toArrow();
+      const narrowTypes = (await narrow.sql("SELECT * FROM vala.datasets.narrow_types ORDER BY int8")).toArrow();
+      await use({ all, allTypes, narrowTypes });
     },
+    { scope: "file", auto: true },
+  ],
+});
+
+test.for(EVERY_TYPE.schema.names)(
+  "every iceberg type round trips with nested nulls: %s",
+  (column, { written: { allTypes } }) => {
+    const written = EVERY_TYPE.getChild(column);
+
+    expect(String(allTypes.getChild(column)?.type)).toBe(String(written?.type));
+    expect(columnValues(allTypes.getChild(column))).toEqual(columnValues(written));
+  },
+);
+
+test("a map column reads back as a plain object", async ({ written: { all } }) => {
+  const rows = await all.sql(
+    "SELECT counts FROM vala.datasets.all_types ORDER BY id",
+    [],
+    z.object({ counts: z.record(z.string(), z.bigint().nullable()).nullable() }),
   );
 
-  it("a map column reads back as a plain object", async () => {
-    const rows = await all.sql(
-      "SELECT counts FROM vala.datasets.all_types ORDER BY id",
-      z.object({ counts: z.record(z.string(), z.bigint().nullable()).nullable() }),
-    );
+  expect(rows).toEqual([{ counts: { a: 1n, b: 2n } }, { counts: null }, { counts: { k: null } }, { counts: {} }]);
+});
 
-    expect(rows).toEqual([
-      { counts: { a: 1n, b: 2n } },
-      { counts: null },
-      { counts: { k: null } },
-      { counts: {} },
-    ]);
+test("a 64-bit integer reads back as a bigint", async ({ written: { all } }) => {
+  const rows = await all.sql(
+    "SELECT int64 FROM vala.datasets.all_types ORDER BY id",
+    [],
+    z.object({ int64: z.bigint().nullable() }),
+  );
+
+  expect(rows).toEqual([{ int64: 7n }, { int64: null }, { int64: 0n }, { int64: 9223372036854775807n }]);
+});
+
+test.for(NARROW.schema.names)(
+  "a narrower type reads back the same values: %s",
+  (column, { written: { narrowTypes } }) => {
+    expect(columnValues(narrowTypes.getChild(column))).toEqual(columnValues(NARROW.getChild(column)));
+  },
+);
+
+test("a narrower declaration is the table it describes", async () => {
+  const described = await Bifrost.connect({
+    table: await TableConfig.describe("vala.datasets.narrow_types"),
   });
 
-  it("a 64-bit integer reads back as a bigint", async () => {
-    const rows = await all.sql(
-      "SELECT int64 FROM vala.datasets.all_types ORDER BY id",
-      z.object({ int64: z.bigint().nullable() }),
-    );
+  await expect(described.register()).resolves.toBe("already_exists");
+});
 
-    expect(rows).toEqual([
-      { int64: 7n },
-      { int64: null },
-      { int64: 0n },
-      { int64: 9223372036854775807n },
-    ]);
-  });
-
-  it.each(NARROW.schema.names)("a narrower type reads back the same values: %s", (column) => {
-    expect(columnValues(narrowTypes.getChild(column))).toEqual(
-      columnValues(NARROW.getChild(column)),
-    );
-  });
-
-  it("a narrower declaration is the table it describes", async () => {
-    const described = await Bifrost.connect({
-      table: await TableConfig.describe("vala.datasets.narrow_types"),
-    });
-
-    await expect(described.register()).resolves.toBe("already_exists");
-  });
-
-  it.each([
-    new DenseUnion([0], [new Field("i", new Int32(), true)]),
-    new Duration(TimeUnit.SECOND),
-    new Interval(IntervalUnit.MONTH_DAY_NANO),
-    new Float16(),
-    mapOf(new Float16()),
-    new Uint64(),
-    new DateMillisecond(),
-    new TimeSecond(),
-    new TimeMillisecond(),
-    new TimeNanosecond(),
-    new TimestampSecond(),
-    new TimestampMillisecond(),
-    mapOf(new Uint64()),
-  ])("a type Bifrost cannot store is refused when declared: %s", (type) => {
-    expect(() => TableConfig.fromArrow("vala.datasets.no_wire_form", oneColumn(type))).toThrow(
-      expect.objectContaining({ code: UNSUPPORTED_TYPE }),
-    );
-  });
+test.each([
+  new DenseUnion([0], [new Field("i", new Int32(), true)]),
+  new Duration(TimeUnit.SECOND),
+  new Interval(IntervalUnit.MONTH_DAY_NANO),
+  new Float16(),
+  mapOf(new Float16()),
+  new Uint64(),
+  new DateMillisecond(),
+  new TimeSecond(),
+  new TimeMillisecond(),
+  new TimeNanosecond(),
+  new TimestampSecond(),
+  new TimestampMillisecond(),
+  mapOf(new Uint64()),
+])("a type Bifrost cannot store is refused when declared: %s", (type) => {
+  expect(() => TableConfig.fromArrow("vala.datasets.no_wire_form", oneColumn(type))).toThrow(
+    expect.objectContaining({ code: UNSUPPORTED_TYPE }),
+  );
 });

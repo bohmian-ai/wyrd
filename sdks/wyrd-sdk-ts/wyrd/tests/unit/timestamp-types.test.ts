@@ -12,9 +12,7 @@ describe("Wyrd timestamp types", () => {
   it("accept only their own text and return it canonically", () => {
     expect(TimestampNTZ.parse("2026-10-06T09:00:00")).toBe("2026-10-06T09:00:00");
     expect(TimestampLTZ.parse("2026-10-06T12:00:00-05:00")).toBe("2026-10-06T17:00:00Z");
-    expect(TimestampTZ.parse("2026-10-06T12:00:00.000001-05:00")).toBe(
-      "2026-10-06T12:00:00.000001-05:00",
-    );
+    expect(TimestampTZ.parse("2026-10-06T12:00:00.000001-05:00")).toBe("2026-10-06T12:00:00.000001-05:00");
     expect(() => TimestampNTZ.parse("2026-10-06T12:00:00-05:00")).toThrow(
       'TIMESTAMP_NTZ does not accept "2026-10-06T12:00:00-05:00"',
     );

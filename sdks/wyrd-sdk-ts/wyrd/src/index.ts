@@ -1,12 +1,4 @@
-import {
-  DataType,
-  Table,
-  tableFromIPC,
-  tableToIPC,
-  type Field,
-  type RecordBatch,
-  type Schema,
-} from "apache-arrow";
+import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch, type Schema } from "apache-arrow";
 import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
@@ -556,9 +548,7 @@ export interface ResolvedTable {
 function jsonSchemaText(schema: Readonly<Record<string, unknown>> | JsonSchemaSource): string {
   const source = schema as JsonSchemaSource;
   return JSON.stringify(
-    typeof source.toJSONSchema === "function"
-      ? source.toJSONSchema({ override: zodTimestampFormat })
-      : schema,
+    typeof source.toJSONSchema === "function" ? source.toJSONSchema({ override: zodTimestampFormat }) : schema,
   );
 }
 
@@ -593,10 +583,7 @@ export interface TableConfigOptions {
  */
 export interface JsonSchemaSource {
   toJSONSchema(params?: {
-    override?(context: {
-      zodSchema: unknown;
-      jsonSchema: Record<string, unknown>;
-    }): void;
+    override?(context: { zodSchema: unknown; jsonSchema: Record<string, unknown> }): void;
   }): Readonly<Record<string, unknown>>;
 }
 
@@ -608,10 +595,7 @@ export interface JsonSchemaSource {
  * `TIMESTAMP_LTZ`; a local-only one declares no format, so without this it
  * would register as text. Other schema libraries never call the hook.
  */
-function zodTimestampFormat(context: {
-  zodSchema: unknown;
-  jsonSchema: Record<string, unknown>;
-}): void {
+function zodTimestampFormat(context: { zodSchema: unknown; jsonSchema: Record<string, unknown> }): void {
   const def = (
     context.zodSchema as {
       _zod?: { def?: { format?: string; local?: boolean; offset?: boolean } };
@@ -822,9 +806,7 @@ export interface StringSchemaFactory {
 }
 
 /** The string schema type a {@link StringSchemaFactory} builds. */
-export type StringSchemaOf<Z extends StringSchemaFactory> = ReturnType<
-  ReturnType<Z["string"]>["meta"]
->;
+export type StringSchemaOf<Z extends StringSchemaFactory> = ReturnType<ReturnType<Z["string"]>["meta"]>;
 
 /**
  * One Wyrd timestamp type: its name, its JSON Schema format, and the checks
@@ -936,14 +918,10 @@ function nativeValue(field: Field, value: unknown): unknown {
   const children = field.type.children as Field[] | null;
   if (DataType.isStruct(field.type)) {
     const struct = value as Record<string, unknown>;
-    return Object.fromEntries(
-      (children ?? []).map((child) => [child.name, nativeValue(child, struct[child.name])]),
-    );
+    return Object.fromEntries((children ?? []).map((child) => [child.name, nativeValue(child, struct[child.name])]));
   }
   if (DataType.isList(field.type)) {
-    return Array.from(value as Iterable<unknown>, (item) =>
-      nativeValue(children?.[0] as Field, item),
-    );
+    return Array.from(value as Iterable<unknown>, (item) => nativeValue(children?.[0] as Field, item));
   }
   if (DataType.isMap(field.type)) {
     const entry = children?.[0]?.type.children as Field[];
@@ -1241,9 +1219,7 @@ export class Bifrost {
         for (const field of schema.fields) {
           const kind = kinds[field.name];
           values[field.name] =
-            kind === undefined
-              ? nativeValue(field, values[field.name])
-              : timestampValue(kind, values[field.name]);
+            kind === undefined ? nativeValue(field, values[field.name]) : timestampValue(kind, values[field.name]);
         }
         return rows.parse(values);
       });

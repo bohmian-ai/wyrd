@@ -4,11 +4,13 @@
 // `prediction['feature_importance']['importance']`. An open record registers
 // as a Variant column, queried with `->` and `->>`.
 import { z } from "zod";
-import { beforeAll, describe, expect, it } from "vitest";
+import { expect, vi } from "vitest";
 
 import { Bifrost, TableConfig } from "@wyrd/sdk";
 
-import { useTestServer } from "../support/test-server.js";
+import { serverTest } from "../support/server.js";
+
+vi.setConfig({ testTimeout: 60_000 });
 
 const FeatureImportance = z.object({
   name: z.string(),
@@ -66,70 +68,75 @@ const REQUEST_ROWS = REQUESTS.map((request) => ({
 const Importance = z.object({ request_id: z.string(), importance: z.number() });
 const Region = z.object({ request_id: z.string(), region: z.string() });
 
-describe("register a table from a model", () => {
-  const server = useTestServer();
-  let apiRequests: Bifrost;
+/** The `api_requests` table, registered from {@link ApiRequest} and holding {@link REQUESTS}. */
+const test = serverTest().extend<{ apiRequests: Bifrost }>({
+  apiRequests: [
+    async ({ server }, use) => {
+      const apiRequests = await Bifrost.connect({
+        table: TableConfig.fromJsonSchema("vala.datasets.api_requests", ApiRequest),
+      });
+      await apiRequests.register();
+      for (const request of REQUESTS) {
+        apiRequests.insert(request);
+      }
+      await apiRequests.flush();
+      server.flushBifrost();
+      await use(apiRequests);
+    },
+    { scope: "file" },
+  ],
+});
 
-  beforeAll(async () => {
-    apiRequests = await Bifrost.connect({
-      table: TableConfig.fromJsonSchema("vala.datasets.api_requests", ApiRequest),
-    });
-    await apiRequests.register();
-    for (const request of REQUESTS) {
-      apiRequests.insert(request);
-    }
-    await apiRequests.flush();
-    server().flushBifrost();
-  }, 60_000);
+test("api requests read back as the same models", async ({ apiRequests }) => {
+  const rows = await apiRequests.sql(
+    "SELECT request_id, outcome, prediction, attributes " + "FROM vala.datasets.api_requests ORDER BY request_id",
+    [],
+    ApiRequestRow,
+  );
 
-  it("api requests read back as the same models", async () => {
-    const rows = await apiRequests.sql(
-      "SELECT request_id, outcome, prediction, attributes " +
-        "FROM vala.datasets.api_requests ORDER BY request_id",
-      ApiRequestRow,
-    );
+  expect(rows).toEqual(REQUEST_ROWS);
+});
 
-    expect(rows).toEqual(REQUEST_ROWS);
-  });
+test("a nested model field is selected by its path", async ({ apiRequests }) => {
+  const rows = await apiRequests.sql(
+    "SELECT request_id, prediction['feature_importance']['importance'] AS importance " +
+      "FROM vala.datasets.api_requests ORDER BY request_id",
+    [],
+    Importance,
+  );
 
-  it("a nested model field is selected by its path", async () => {
-    const rows = await apiRequests.sql(
-      "SELECT request_id, prediction['feature_importance']['importance'] AS importance " +
-        "FROM vala.datasets.api_requests ORDER BY request_id",
-      Importance,
-    );
+  expect(rows).toEqual([
+    { request_id: "req-1", importance: 0.72 },
+    { request_id: "req-2", importance: 0.31 },
+  ]);
+});
 
-    expect(rows).toEqual([
-      { request_id: "req-1", importance: 0.72 },
-      { request_id: "req-2", importance: 0.31 },
-    ]);
-  });
+test("a nested model field filters rows", async ({ apiRequests }) => {
+  const rows = await apiRequests.sql(
+    "SELECT request_id, prediction['feature_importance']['importance'] AS importance " +
+      "FROM vala.datasets.api_requests " +
+      "WHERE prediction['feature_importance']['importance'] > 0.5",
+    [],
+    Importance,
+  );
 
-  it("a nested model field filters rows", async () => {
-    const rows = await apiRequests.sql(
-      "SELECT request_id, prediction['feature_importance']['importance'] AS importance " +
-        "FROM vala.datasets.api_requests " +
-        "WHERE prediction['feature_importance']['importance'] > 0.5",
-      Importance,
-    );
+  expect(rows).toEqual([{ request_id: "req-1", importance: 0.72 }]);
+});
 
-    expect(rows).toEqual([{ request_id: "req-1", importance: 0.72 }]);
-  });
+test("an open dict field is queried by key", async ({ apiRequests }) => {
+  const rows = await apiRequests.sql(
+    "SELECT request_id, attributes -> 'client' ->> 'region' AS region " +
+      "FROM vala.datasets.api_requests ORDER BY request_id",
+    [],
+    Region,
+  );
 
-  it("an open dict field is queried by key", async () => {
-    const rows = await apiRequests.sql(
-      "SELECT request_id, attributes -> 'client' ->> 'region' AS region " +
-        "FROM vala.datasets.api_requests ORDER BY request_id",
-      Region,
-    );
+  expect(rows).toEqual([
+    { request_id: "req-1", region: "us-east" },
+    { request_id: "req-2", region: "eu-west" },
+  ]);
+});
 
-    expect(rows).toEqual([
-      { request_id: "req-1", region: "us-east" },
-      { request_id: "req-2", region: "eu-west" },
-    ]);
-  });
-
-  it("registering the same model again finds the existing table", async () => {
-    await expect(apiRequests.register()).resolves.toBe("already_exists");
-  });
+test("registering the same model again finds the existing table", async ({ apiRequests }) => {
+  await expect(apiRequests.register()).resolves.toBe("already_exists");
 });

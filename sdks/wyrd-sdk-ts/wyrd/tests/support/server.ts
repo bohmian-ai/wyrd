@@ -13,6 +13,20 @@ export function fixture(path: string): string {
   return resolve(import.meta.dirname, "../../../../../fixtures", path);
 }
 
+/**
+ * One Arrow column's values as plain JSON, so a column read back from the
+ * server compares with the column written whatever its chunking or integer
+ * width. Every number becomes its exact decimal string, so a 32-bit `number`
+ * written equals the 64-bit `bigint` it is stored and read back as.
+ */
+export function columnValues(column: { toJSON(): unknown } | null): unknown {
+  return JSON.parse(
+    JSON.stringify(column, (_key, value: unknown) =>
+      typeof value === "bigint" || typeof value === "number" ? String(value) : value,
+    ),
+  );
+}
+
 /** A Card reference the registry resolved, so it always carries the Card's `uid`. */
 export type RegisteredRef = CardRef & { readonly uid: string };
 

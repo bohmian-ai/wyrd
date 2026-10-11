@@ -8,10 +8,14 @@
  */
 import type { Field } from "apache-arrow";
 import { z } from "zod";
-import { startTestServer } from "@wyrd/testing";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import type { NativeWyrdTestServer } from "@wyrd/testing";
+import { expect, vi } from "vitest";
 
 import { Bifrost, TableConfig, WyrdError } from "@wyrd/sdk";
+
+import { serverTest } from "../support/server.js";
+
+vi.setConfig({ testTimeout: 60_000 });
 
 const Point = z.object({ x: z.int(), label: z.string().optional() });
 
@@ -26,32 +30,32 @@ const Event = z.object({
 /** Rows exactly as the query returns them. */
 const asReturned = { parse: (row: unknown) => row as Record<string, unknown> };
 
-let server: ReturnType<typeof startTestServer>;
-let bifrost: Bifrost;
-let table: string;
-
-beforeEach(async () => {
-  server = startTestServer();
-  table = `vala.datasets.events_${crypto.randomUUID().replaceAll("-", "")}`;
-  bifrost = await Bifrost.connect({
-    table: TableConfig.fromJsonSchema(table, Event),
-    serverUrl: server.baseUrl,
-    credential: server.apiKey,
-    grpcUrl: server.grpcUrl,
-  });
-  await bifrost.register();
-});
-
-afterEach(() => {
-  server.shutdown();
+/**
+ * Each test's own `events` table, uniquely named so tests stay independent on
+ * the file's shared server, and a writer registered on it.
+ */
+const test = serverTest().extend<{ table: string; bifrost: Bifrost }>({
+  table: async ({}, use) => {
+    await use(`vala.datasets.events_${crypto.randomUUID().replaceAll("-", "")}`);
+  },
+  bifrost: async ({ table }, use) => {
+    const bifrost = await Bifrost.connect({ table: TableConfig.fromJsonSchema(table, Event) });
+    await bifrost.register();
+    await use(bifrost);
+    await bifrost.shutdown();
+  },
 });
 
 function isVariant(field: Field | undefined): boolean {
   return field?.metadata.get("ARROW:extension:name") === "arrow.parquet.variant";
 }
 
-/** Insert rows, flush, and publish them. */
-async function insert(...events: z.infer<typeof Event>[]): Promise<void> {
+/** Insert rows through `bifrost`, flush, and publish them on `server`. */
+async function insert(
+  server: NativeWyrdTestServer,
+  bifrost: Bifrost,
+  ...events: z.infer<typeof Event>[]
+): Promise<void> {
   for (const event of events) {
     bifrost.insert(event);
   }
@@ -59,9 +63,9 @@ async function insert(...events: z.infer<typeof Event>[]): Promise<void> {
   server.flushBifrost();
 }
 
-it("maps model fields to Variant, Struct, and List columns", () => {
-  const schema = bifrost.table!.arrowSchema;
-  const field = (name: string) => schema.fields.find((f) => f.name === name);
+test("maps model fields to Variant, Struct, and List columns", ({ bifrost }) => {
+  const schema = bifrost.table?.arrowSchema;
+  const field = (name: string) => schema?.fields.find((f) => f.name === name);
 
   expect(isVariant(field("payload"))).toBe(true);
   expect(isVariant(field("mixed"))).toBe(true);
@@ -70,13 +74,15 @@ it("maps model fields to Variant, Struct, and List columns", () => {
   expect(field("tags")?.type.children[0]?.nullable).toBe(false); // string[] items are never null
 });
 
-it("returns inserted rows as native values", async () => {
+test("returns inserted rows as native values", async ({ server, bifrost, table }) => {
   await insert(
+    server,
+    bifrost,
     { id: 1, payload: { scores: [1, { z: null }] }, mixed: 5, point: { x: 1, label: "a" }, tags: ["a", "b"] },
     { id: 2, payload: '{"stays": "a string"}', mixed: "five", tags: [] },
   );
 
-  const rows = await bifrost.sql(`SELECT id, payload, mixed, point, tags FROM ${table} ORDER BY id`, asReturned);
+  const rows = await bifrost.sql(`SELECT id, payload, mixed, point, tags FROM ${table} ORDER BY id`, [], asReturned);
 
   expect(rows).toEqual([
     { id: 1n, payload: { scores: [1, { z: null }] }, mixed: 5, point: { x: 1n, label: "a" }, tags: ["a", "b"] },
@@ -84,38 +90,35 @@ it("returns inserted rows as native values", async () => {
   ]);
 });
 
-it("copies query results into another table", async () => {
+test("copies query results into another table", async ({ server, bifrost, table }) => {
   const archive = `vala.datasets.archive_${crypto.randomUUID().replaceAll("-", "")}`;
   const archiver = await Bifrost.connect({
     table: TableConfig.fromJsonSchema(archive, Event),
-    serverUrl: server.baseUrl,
-    credential: server.apiKey,
-    grpcUrl: server.grpcUrl,
   });
   await archiver.register();
-  await insert({ id: 1, payload: { source: "row" }, mixed: 8, point: { x: 1 }, tags: ["a"] });
+  await insert(server, bifrost, { id: 1, payload: { source: "row" }, mixed: 8, point: { x: 1 }, tags: ["a"] });
 
   // Not the declared (alphabetical) order: the server matches columns by name.
   const copied = await bifrost.sql(`SELECT id, payload, mixed, point, tags FROM ${table}`);
-  await bifrost.writeBatch(archive, copied.batches[0]!);
+  await bifrost.writeBatch(archive, copied.batches[0]);
   server.flushBifrost();
 
-  const rows = await bifrost.sql(`SELECT id, payload, mixed, point, tags FROM ${archive}`, asReturned);
+  const rows = await bifrost.sql(`SELECT id, payload, mixed, point, tags FROM ${archive}`, [], asReturned);
   expect(rows).toEqual([{ id: 1n, payload: { source: "row" }, mixed: 8, point: { x: 1n, label: null }, tags: ["a"] }]);
 });
 
-it("keeps Struct fields typed and Variant paths Variant", async () => {
-  await insert({ id: 1, payload: { scores: [1, 2] }, point: { x: 7 } });
+test("keeps Struct fields typed and Variant paths Variant", async ({ server, bifrost, table }) => {
+  await insert(server, bifrost, { id: 1, payload: { scores: [1, 2] }, point: { x: 7 } });
 
   const result = await bifrost.sql(`SELECT point['x'] AS x, payload -> 'scores' AS scores FROM ${table}`);
   const [x, scores] = result.schema.fields;
 
   expect(String(x?.type)).toBe("Int64");
   expect(isVariant(scores)).toBe(true);
-  expect(Array.from(result.batches[0]!.getChild("x")!.toArray())).toEqual([7n]);
+  expect(Array.from(result.batches[0].getChild("x")?.toArray() ?? [])).toEqual([7n]);
 });
 
-it("refuses an undeclared field and writes nothing", async () => {
+test("refuses an undeclared field and writes nothing", async ({ server, bifrost, table }) => {
   expect(() => bifrost.insert({ id: 1, undeclared: true })).toThrow(
     expect.objectContaining({ code: "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD" }),
   );
@@ -125,7 +128,7 @@ it("refuses an undeclared field and writes nothing", async () => {
   expect((await bifrost.sql(`SELECT id FROM ${table}`)).numRows).toBe(0);
 });
 
-it("refuses a model allowing extra keys", () => {
+test("refuses a model allowing extra keys", () => {
   const Loose = z.looseObject({ id: z.int() }); // extra keys could be silently lost
 
   let error: unknown;
@@ -140,8 +143,7 @@ it("refuses a model allowing extra keys", () => {
   expect((error as WyrdError).message).toContain("declare a Variant field for open data");
   expect((error as WyrdError).details).toMatchObject({
     data: {
-      detail:
-        "an object allows undeclared keys beside its declared properties; declare a Variant field for open data",
+      detail: "an object allows undeclared keys beside its declared properties; declare a Variant field for open data",
     },
   });
   expect((error as WyrdError).remediation).toBe(

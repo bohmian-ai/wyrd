@@ -7,11 +7,11 @@
 // a time column is refused naming the field.
 import { Field, Int64, RecordBatch, Schema, Struct, TimestampMicrosecond, makeData } from "apache-arrow";
 import { z } from "zod";
-import { describe, expect, it } from "vitest";
+import { expect } from "vitest";
 
 import { Bifrost, TableConfig } from "@wyrd/sdk";
 
-import { useTestServer } from "../support/test-server.js";
+import { serverTest } from "../support/server.js";
 
 const NAMESPACE = "vala.datasets";
 const READINGS = "ts_time_column_readings";
@@ -38,8 +38,8 @@ function readings(): RecordBatch {
       length: hours.length,
       nullCount: 0,
       children: [
-        makeData({ type: eventTime!.type, data: BigInt64Array.from(hours, (hour) => FIRST_HOUR + hour * HOUR + 1n) }),
-        makeData({ type: value!.type, data: BigInt64Array.from(hours) }),
+        makeData({ type: eventTime.type, data: BigInt64Array.from(hours, (hour) => FIRST_HOUR + hour * HOUR + 1n) }),
+        makeData({ type: value.type, data: BigInt64Array.from(hours) }),
       ],
     }),
   );
@@ -48,40 +48,41 @@ function readings(): RecordBatch {
 /** A writer for `name` on hourly partitions of `timeColumn`. */
 function table(name: string, timeColumn?: string): Promise<Bifrost> {
   return Bifrost.connect({
-    table: TableConfig.fromArrow(`${NAMESPACE}.${name}`, SCHEMA, { partitionGranularity: "hour", timeColumn }),
+    table: TableConfig.fromArrow(`${NAMESPACE}.${name}`, SCHEMA, {
+      layout: { partitionGranularity: "hour", timeColumn },
+    }),
   });
 }
 
-describe("table time column", () => {
-  const server = useTestServer();
+const test = serverTest();
 
-  it("a user table's time column prunes a time range", async () => {
-    const readingsTable = await table(READINGS, "event_time");
-    await readingsTable.register();
-    await readingsTable.writeBatch(`${NAMESPACE}.${READINGS}`, readings());
-    await readingsTable.flush();
-    server().flushBifrost();
-    const defaults = await table(DEFAULTS);
-    await defaults.register();
+test("a user table's time column prunes a time range", async ({ server }) => {
+  const readingsTable = await table(READINGS, "event_time");
+  await readingsTable.register();
+  await readingsTable.writeBatch(`${NAMESPACE}.${READINGS}`, readings());
+  await readingsTable.flush();
+  server.flushBifrost();
+  const defaults = await table(DEFAULTS);
+  await defaults.register();
 
-    const inRange = await readingsTable.sql(
-      `SELECT CAST(value AS INT) AS value FROM ${NAMESPACE}.${READINGS} ` +
-        "WHERE event_time >= TIMESTAMP '2026-10-06T01:00:00Z' " +
-        "AND event_time < TIMESTAMP '2026-10-06T03:00:00Z' ORDER BY value",
-      Value,
-    );
+  const inRange = await readingsTable.sql(
+    `SELECT CAST(value AS INT) AS value FROM ${NAMESPACE}.${READINGS} ` +
+      "WHERE event_time >= TIMESTAMP '2026-10-06T01:00:00Z' " +
+      "AND event_time < TIMESTAMP '2026-10-06T03:00:00Z' ORDER BY value",
+    [],
+    Value,
+  );
 
-    expect(inRange).toEqual([{ value: 1 }, { value: 2 }]);
-    expect((await readingsTable.describeTable(NAMESPACE, READINGS)).physical_layout.time_column).toBe("event_time");
-    expect((await defaults.describeTable(NAMESPACE, DEFAULTS)).physical_layout.time_column).toBe("wyrd_ingested_at");
-  }, 60_000);
+  expect(inRange).toEqual([{ value: 1 }, { value: 2 }]);
+  expect((await readingsTable.describeTable(NAMESPACE, READINGS)).physical_layout.time_column).toBe("event_time");
+  expect((await defaults.describeTable(NAMESPACE, DEFAULTS)).physical_layout.time_column).toBe("wyrd_ingested_at");
+}, 60_000);
 
-  it("an invalid time column is refused naming the field", async () => {
-    const refused = await table(REFUSED, "value");
+test("an invalid time column is refused naming the field", async () => {
+  const refused = await table(REFUSED, "value");
 
-    await expect(refused.register()).rejects.toMatchObject({
-      code: "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
-      message: expect.stringContaining("TimeColumn"),
-    });
+  await expect(refused.register()).rejects.toMatchObject({
+    code: "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
+    message: expect.stringContaining("TimeColumn"),
   });
 });

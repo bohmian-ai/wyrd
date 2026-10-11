@@ -1,28 +1,28 @@
 # Pre-merge benchmark reports
 
-These are the latest reports from the `wyrd-bifrost-variant-task-003`
-worktree, copied from `target/bifrost-query-capacity/`. Git ignores that
-directory and every run overwrites it.
+Pre-merge parity baseline for `wyrd/bifrost-variant/TASK-003` at `cfe21dc90`.
+Host: AMD Ryzen 9 9950X, 32 CPUs, 91 GiB, Linux. Compare only against runs on
+the same host.
 
-All reports come from the same host: AMD Ryzen 9 9950X, 32 CPUs, 91 GiB,
-Linux. **Only the logs write sweep was run at `cfe21dc90`, the pre-merge
-head.** The read reports predate the time-column change, the one-fsync group
-commit and fixes 1/3/4. They are historical reference, not the parity
-baseline.
-
-| File | Run | Date | Code |
+| File | Command | Date | Code |
 |---|---|---|---|
-| `read-standard-hot.md` | run 24 | 10-10 15:51 | `1190c539a` plus per-column bytes recorded at append (committed as `05f2ba96b`) |
-| `read-standard-parquet.md` | run 26 | 10-10 16:09 | same, but run with the 12 MiB chunk **experiment**. The default stayed 24 MiB (run 25), so its 1m-aggregate, broad-window, table-aggregate and full-scan rows do not reflect the default. |
-| `read-telemetry-hot.md` | after run 28 | 10-10 22:27 | between `05f2ba96b` and `179bfdc11`, exact state unrecorded |
-| `read-telemetry-parquet.md` | after run 28 | 10-11 07:18 | `179bfdc11` plus uncommitted work that later landed in `cfe21dc90`, exact state unrecorded |
-| `write-logs-run-37.md` | run-37 | 10-11 09:28 | `cfe21dc90` |
+| `read-standard-hot.md` | `mise run bench:bifrost:query-capacity` (hot tier) | 2026-10-11 10:37 | `cfe21dc90`, clean tree |
+| `read-standard-parquet.md` | same invocation (Parquet tier) | 2026-10-11 10:45 | `cfe21dc90`, clean tree |
+| `read-telemetry-hot.md` | `mise run bench:bifrost:query-capacity -- --fixture telemetry` (hot tier) | 2026-10-11 10:48 | `cfe21dc90`, clean tree |
+| `read-telemetry-parquet.md` | same invocation (Parquet tier) | 2026-10-11 10:52 | `cfe21dc90`, clean tree |
+| `write-logs-run-37.md` | `mise run bench:bifrost:write-capacity -- --fixture logs` | 2026-10-11 09:28 | `cfe21dc90` |
 
-The per-run history and its analysis are in
-`tasks/TASK-003-revision-query-latency.md` on `wyrd/bifrost-variant/TASK-003`
-(runs 10–28).
-
-**The parity baseline still has to be produced.** Run
-`mise run bench:bifrost:query-capacity` (hot, then Parquet) at `cfe21dc90` in
-the TASK-003 worktree, then the write sweeps. Add those reports here before
-comparing the merged branch.
+Notes:
+- **Every read row passes.** The telemetry invocation exits 1 only on its
+  `export spans` row: 4 OTLP exporters at about 60k spans/s, against the 200k
+  floor. That is a known write-side result (runs 27/28), and the write-capacity
+  sweep at x64 is where OTLP write throughput is judged.
+- **Write sweeps without a baseline yet:** telemetry and native. Produce
+  baselines for them at `cfe21dc90` before comparing writes.
+- **Older read runs** (runs 10–28, including the run 24 hot and run 25/26
+  Parquet numbers) are in `tasks/TASK-003-revision-query-latency.md` on
+  `wyrd/bifrost-variant/TASK-003`.
+- **Profiles** for these runs (perf, off-CPU, latency Paretos, server logs,
+  samples) are preserved in the `wyrd-bifrost-variant-task-003` worktree at
+  `target/bifrost-query-capacity-premerge-cfe21dc90/{standard,telemetry}/{hot,parquet}/`.
+  Git ignores that folder, and later bench runs do not overwrite it.

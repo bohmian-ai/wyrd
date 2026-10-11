@@ -2,7 +2,7 @@
 id: SPEC-bifrost-variant-main-integration
 revision: 2
 status: approved
-task_count: 1
+task_count: 6
 ---
 
 # Integrate the Bifrost variant with current main
@@ -13,7 +13,10 @@ Revision 2 records explicit human approval of every reconciled obligation in
 this conversation: batches 1–4, 5–8, 9–12, 13–16, 17–20, 21–24 and 25–27 were
 each approved (“agree” / “agree on all 4”). These approvals include the unified
 resolutions and the user's explicit benchmark/test consolidation instruction.
-The approved scope is one spec and one integration task on the existing branch.
+The approved scope is one spec and one integrated delivery on the existing branch.
+The user explicitly requested decomposition of original TASK-001 into six tasks
+on 2026-10-11; this organization amendment preserves revision 2's full behavioral
+authority, decisions, implementation constraints, and proof obligations.
 No deployment, retained-data deletion, push, external fork publication, or merge
 into main is authorized by this packet. The packet is the implementation
 authority; reconciliation.md is supporting decision history, not a rival task.
@@ -23,10 +26,12 @@ Wyrd product, security, verification, client, and tooling behavior. Users must
 be able to emit, verify, retain, and query attributable evidence through the
 real first-class clients and agent surfaces without losing main's fixes.
 
-There is exactly one implementation outcome and one task. The breadth is
-intentional: an engine that compiles but loses its surrounding consumers is
-not independently deliverable. Implementation order within that task is not
-permission to omit a later consumer or split delivery into partial outcomes.
+There is exactly one integrated delivery outcome, implemented through six
+sequential scoped tasks. The consumer-complete breadth remains mandatory: an
+engine that compiles but loses its surrounding consumers is not deliverable.
+Task boundaries are reviewed internal checkpoints, never permission to omit a
+consumer or release a partial outcome. Every task closes its affected consumers,
+tests and artifacts; final integrated acceptance accounts for all contributions.
 
 ## Immutable inputs and integration authority
 
@@ -386,8 +391,11 @@ the integrated candidate with its consumer closure, success/failure/edge proof,
 and no violated invariant. These are independent acceptance obligations, not
 permission to mark a group passed after only its happy path.
 
-TASK-001's traceability table maps each AC to the inspected owner, ordered
-behavioral scenario or explicit non-TDD proof, and exact focused recipes. The
+The six-task traceability map in decomposition.md assigns every AC to its
+inspected owners, task-local ordered behavioral scenarios or explicit non-TDD
+proof, and exact focused recipes. Original TASK-001 is retained verbatim under
+source/ as the lossless historical record; its former one-task scheduling is
+superseded, while all substantive obligations remain required. The
 implementation evidence must record one row per AC with actual source/diff,
 test/check result, and any bounded command correction. All 527 source changed
 records, all 148 conflicted paths, and all 76 automatically merged overlapping
@@ -493,4 +501,7 @@ or proposed scope/contract change routes through a new spec revision.
 - [Testing workflows](../../../architecture/references/languages/testing-workflows.md)
 - [Canonical integration evidence](evidence.md)
 - [Reconciliation decision history](reconciliation.md), superseded as execution authority by this approved revision.
-- [One integration task](tasks/TASK-001-integrate-bifrost-variant-with-main.md)
+- [Six-task decomposition and complete traceability](decomposition.md)
+- [Shared implementation contract](implementation-contract.md)
+- [Complete proof recipes](proof-recipes.md)
+- [Original integration task, verbatim historical source](source/TASK-001-integrate-bifrost-variant-with-main.md)

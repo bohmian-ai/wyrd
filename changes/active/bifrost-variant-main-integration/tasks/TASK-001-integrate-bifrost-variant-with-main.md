@@ -599,3 +599,9 @@ with `80b29eb2a`.
 - No deployment, push, merge to main, data migration, compatibility shim,
   suppression attribute, hand-edited generated artifact, or restored retired
   script/descriptor/publisher.
+
+### Acceptance
+
+2026-10-11: The user (Thorrester) accepted TASK-001 at `516479cd5` and
+explicitly waived the independent `$wyrd-task-review` checkpoint. TASK-002 may
+start. Final change review still owns integrated acceptance.

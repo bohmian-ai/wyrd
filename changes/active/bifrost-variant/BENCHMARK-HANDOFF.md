@@ -13,8 +13,37 @@ the merge research in `merge-research/`.
 2. **Merge main with the current Variant work** on `integrate-main`. Follow map
    §4 for the procedure and §5 for the proof lanes.
 3. **Continue Bifrost benchmarking and optimization** on the merged branch.
-   The state and next steps are described below.
+   Start by proving the merge kept performance (next section): query capacity
+   first, then writes. The state and next steps are described below.
 4. **Benchmark wyrd-gateway.** See the section at the end.
+
+## First: prove the merge kept performance
+
+Resumed benchmarking starts by showing that the merged branch is at least as
+fast as the pre-merge branch, `wyrd/bifrost-variant/TASK-003` at `cfe21dc90`.
+Run everything in this order, on the same host, with nothing compiling:
+
+1. **Query capacity, hot and Parquet:** `mise run bench:bifrost:query-capacity`.
+   One invocation runs the hot (memtable) tier, then the Parquet tier under a
+   fresh Postgres.
+2. **Writes:** run these only after the query results match.
+   - `mise run bench:bifrost:write-capacity -- --fixture logs`
+   - then `-- --fixture telemetry`
+   - then the native sweep (no fixture)
+
+Compare each report step by step against the pre-merge report for the same
+fixture. Use rate, p50/p95/p99, server CPU and peak memory, plus the per-query
+latency Pareto and the CPU Pareto by crate.
+
+This disk's fsync time varies by up to about 2.5x between runs (run-36 vs
+run-37), so repeat a step before calling it a regression.
+
+If the merged branch is worse, diagnose it against the pre-merge worktree
+`wyrd-bifrost-variant-task-003`. That worktree is kept at `cfe21dc90` as the
+reference and is not deleted until parity is proven. Diff the stage timings
+and the profiles under `target/bifrost-query-capacity/<mode>/<tier>/profiles/`
+in each worktree. Trace the regressing stage with `WYRD_LOG` before changing
+any code.
 
 ## Target and harness
 
@@ -101,7 +130,7 @@ CPU Pareto at x64, run-37, by crate:
 | Fix 2: skip re-validating OTLP Variant bytes | **Dropped** | Validation already happens once, at Variant build (`EncodedVariant`). The check rejects NaN, oversize and over-deep values that OTLP can send (`non_finite_log_body_rejects_only_its_record`). |
 | Fix 5: single-pass OTLP decode | **Skipped** | The preflight pass reserves exact decode memory before allocating (`grpc/otlp.rs:668-678`). Removing it weakens memory admission for about 3.5% of CPU. |
 
-## Open items, in order (after the merge)
+## Open items, in order (after parity is proven)
 
 1. **Confirm that fix 1's reuse hits.**
    - Today the Gate batch carries a `card_ref` column. Decode drops it,

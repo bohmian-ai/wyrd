@@ -57,13 +57,7 @@ impl LocalDev {
         let database = UnmigratedDatabase::create()
             .await
             .expect("empty managed database");
-        let options = database.migrator_pool().connect_options();
-        let name = options.get_database().expect("fixture database name");
-        let mut dsn = url::Url::parse(
-            &std::env::var("WYRD_PLATFORM_DATABASE_URL").expect("managed platform URL"),
-        )
-        .expect("local database URL");
-        dsn.set_path(&format!("/{name}"));
+        let dsn = database.url().expect("fixture database URL");
         let home = tempfile::Builder::new()
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()
@@ -85,7 +79,7 @@ impl LocalDev {
             stderr: None,
             home,
             _database: database,
-            dsn: SecretString::from(dsn.to_string()),
+            dsn,
             bind: free_bind(),
             grpc: free_bind(),
             peer: free_bind(),

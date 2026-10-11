@@ -23,3 +23,6 @@ pub use server::{
     server_postgres_from_fixture,
 };
 pub use time::ClockHandle;
+/// Isolated empty database for a test that runs a deployment's own migration,
+/// projected to the Python SDK's testing module.
+pub use wyrd_dev_fixtures::pg::UnmigratedDatabase;

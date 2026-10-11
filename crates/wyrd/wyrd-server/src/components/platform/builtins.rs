@@ -28,7 +28,7 @@ pub enum BuiltinTablesError {
         tenant: DataTenantId,
         /// Catalog failure for the first built-in that could not be ensured.
         #[source]
-        source: BifrostCatalogError,
+        source: Box<BifrostCatalogError>,
     },
 }
 
@@ -79,7 +79,10 @@ impl BuiltinTables {
             self.catalog
                 .ensure_builtin(tenant, definition)
                 .await
-                .map_err(|source| BuiltinTablesError::Catalog { tenant, source })?;
+                .map_err(|source| BuiltinTablesError::Catalog {
+                    tenant,
+                    source: Box::new(source),
+                })?;
         }
         Ok(())
     }

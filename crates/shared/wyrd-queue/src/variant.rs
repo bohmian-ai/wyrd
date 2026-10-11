@@ -1609,7 +1609,7 @@ mod tests {
         for levels in [1_000, 10_000] {
             for text in [
                 nested_text("1", levels),
-                format!(r#"{}1{}"#, r#"{"a":"#.repeat(levels), "}".repeat(levels)),
+                format!("{}1{}", r#"{"a":"#.repeat(levels), "}".repeat(levels)),
             ] {
                 WALK_READ_BYTES.with(|read| read.set(0));
                 assert!(matches!(

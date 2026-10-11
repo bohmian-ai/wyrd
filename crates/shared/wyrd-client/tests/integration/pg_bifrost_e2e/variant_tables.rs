@@ -360,7 +360,7 @@ mod pg_tests {
                         name: "count".to_owned(),
                         data_type: DataTypeSpec::UInt64,
                         nullable: true,
-                        metadata: Default::default(),
+                        metadata: std::collections::BTreeMap::default(),
                     }],
                     physical_layout: None,
                     compaction_target_file_size_bytes: None,

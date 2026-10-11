@@ -283,7 +283,7 @@ mod tests {
     /// Panics if the fixed fixture tenant UUID fails to parse, which cannot
     /// happen.
     fn base_vector() -> (String, uuid::Uuid, Vec<String>) {
-        let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
+        let fingerprint = hex::encode((0u8..32).collect::<Vec<u8>>());
         let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff")
             .expect("fixture tenant parses");
         let required_columns = vec![

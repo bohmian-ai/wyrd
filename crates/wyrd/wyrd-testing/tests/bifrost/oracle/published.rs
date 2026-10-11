@@ -67,10 +67,6 @@ async fn published_cache_pruning_and_shutdown_are_production_governed() {
 ///
 /// Panics when a phase's observation does not hold: tenant-isolated reads,
 /// pruning and storage-request counters, or settled shutdown reports.
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
-)]
 async fn prove_published_governance() -> Result<(), JourneyError> {
     // Forge promotes each Scribe flush to Iceberg as soon as it is published
     // (REQ-002), but phases 1-3 and 5 observe hot objects. The pod's Forge

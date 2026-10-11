@@ -274,9 +274,11 @@ impl<'a> ResultPayloadBuilder<'a> {
             verdict,
             window,
             record_id,
-            drift,
-            eval_summary(workflow.as_ref()),
-            assertion,
+            [
+                (DRIFT_REPORT, drift),
+                (EVAL_SUMMARY, eval_summary(workflow.as_ref())),
+                (ASSERTION_RESULT, assertion),
+            ],
         )?;
         batches.push(self.finish::<ResultsTable>(summary)?);
         Ok(ResultPayload {
@@ -288,9 +290,9 @@ impl<'a> ResultPayloadBuilder<'a> {
 
     /// Author the named columns of the one `vala.verification.results` row.
     ///
-    /// `drift_report` and `eval_summary` are the already-built one-row Struct
-    /// columns of the two implementation summaries, and `assertion_result` the
-    /// one-row Variant column of a task's assertion.
+    /// `reports` are the already-built one-row report columns: the Drift and
+    /// Eval summary Structs and a task's assertion Variant, appended after the
+    /// common columns.
     ///
     /// # Errors
     /// Returns a JSON error when the frozen Trigger cannot be encoded.
@@ -300,13 +302,11 @@ impl<'a> ResultPayloadBuilder<'a> {
         verdict: VerificationVerdict,
         window: Option<&DriftWindow>,
         record_id: Option<&str>,
-        drift_report: ArrayRef,
-        eval_summary: ArrayRef,
-        assertion_result: ArrayRef,
+        reports: [NamedColumn; 3],
     ) -> Result<Vec<NamedColumn>, ResultPayloadError> {
         let trigger = self.run.trigger.map(canonical_json).transpose()?;
         let verdict: &'static str = verdict.into();
-        Ok(vec![
+        let mut columns = vec![
             ("result_id", text([Some(self.result_id.to_string())])),
             ("implementation", text([Some(implementation)])),
             ("execution_status", text([Some("completed")])),
@@ -327,10 +327,9 @@ impl<'a> ResultPayloadBuilder<'a> {
             ("window_end", timestamps([window.map(|window| window.end)])),
             ("started_at", timestamps([Some(self.started_at)])),
             ("ended_at", timestamps([Some(self.ended_at)])),
-            (DRIFT_REPORT, drift_report),
-            (EVAL_SUMMARY, eval_summary),
-            (ASSERTION_RESULT, assertion_result),
-        ])
+        ];
+        columns.extend(reports);
+        Ok(columns)
     }
 
     /// Author the named `vala.drift.result_features` columns, one row per
@@ -953,9 +952,17 @@ mod tests {
                 VerificationVerdict::Inconclusive,
                 Some(window),
                 None,
-                drift_report(None).expect("null report builds"),
-                eval_summary(None),
-                assertion_result(None).expect("null assertion result builds"),
+                [
+                    (
+                        DRIFT_REPORT,
+                        drift_report(None).expect("null report builds"),
+                    ),
+                    (EVAL_SUMMARY, eval_summary(None)),
+                    (
+                        ASSERTION_RESULT,
+                        assertion_result(None).expect("null assertion result builds"),
+                    ),
+                ],
             )
             .expect("summary columns author")
     }
@@ -1201,14 +1208,12 @@ mod tests {
             "a sampled-out Eval still sets eval_summary"
         );
         let summary = RecordBatch::from(summary.clone());
-        assert_eq!(
-            summary
-                .column_by_name("pass_rate")
-                .expect("pass rate")
-                .as_primitive::<Float64Type>()
-                .value(0),
-            0.0
-        );
+        let pass_rate = summary
+            .column_by_name("pass_rate")
+            .expect("pass rate")
+            .as_primitive::<Float64Type>()
+            .value(0);
+        assert!(pass_rate.abs() < f64::EPSILON, "pass rate {pass_rate}");
         assert_eq!(
             summary
                 .column_by_name("duration_ms")

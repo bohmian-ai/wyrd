@@ -12,10 +12,9 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::array::{
-    ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, ListArray, MapArray,
-    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeStringArray, ListArray, MapArray, RecordBatch, StringArray,
+    StructArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
@@ -490,16 +489,17 @@ fn build_list(element: &FieldRef, path: &str, cells: &[Cell<'_>]) -> Result<Arra
     for cell in cells {
         let values: Vec<&RawValue> = match cell.raw {
             None => Vec::new(),
-            Some(raw) => match serde_json::from_str(raw.get()) {
-                Ok(values) => values,
-                Err(_) => {
+            Some(raw) => {
+                if let Ok(values) = serde_json::from_str(raw.get()) {
+                    values
+                } else {
                     failure = Some(Failure::schema(
                         cell.row,
                         format!("row {} field `{path}`: value is not a JSON array", cell.row),
                     ));
                     break;
                 }
-            },
+            }
         };
         lengths.push(values.len());
         items.extend(
@@ -638,6 +638,11 @@ fn collect<T>(
 /// Returns a schema-parse refusal for a value that does not convert to the
 /// column type (including malformed or wrong-width hex) or for a type the
 /// row path does not convert.
+///
+/// # Panics
+///
+/// Panics if Arrow refuses the Float64-to-Float32 narrowing, which it
+/// supports for every value.
 fn build_scalar(data_type: &DataType, path: &str, cells: &[Cell<'_>]) -> Result<ArrayRef, Failure> {
     let array: ArrayRef = match data_type {
         DataType::Boolean => Arc::new(BooleanArray::from(collect(path, cells, Value::as_bool)?)),
@@ -661,9 +666,12 @@ fn build_scalar(data_type: &DataType, path: &str, cells: &[Cell<'_>]) -> Result<
             v.as_u64().and_then(|n| u32::try_from(n).ok())
         })?)),
         DataType::UInt64 => Arc::new(UInt64Array::from(collect(path, cells, Value::as_u64)?)),
-        DataType::Float32 => Arc::new(Float32Array::from(collect(path, cells, |v| {
-            v.as_f64().map(|n| n as f32)
-        })?)),
+        // A Float32 column declares f32 precision, so JSON numbers narrow to it.
+        DataType::Float32 => arrow::compute::cast(
+            &Float64Array::from(collect(path, cells, Value::as_f64)?),
+            &DataType::Float32,
+        )
+        .expect("a Float64 array always narrows to Float32"),
         DataType::Float64 => Arc::new(Float64Array::from(collect(path, cells, Value::as_f64)?)),
         DataType::Utf8 => Arc::new(StringArray::from(collect(path, cells, |v| {
             v.as_str().map(str::to_owned)

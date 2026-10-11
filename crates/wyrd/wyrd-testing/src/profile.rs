@@ -21,6 +21,7 @@
 //! `kernel.perf_event_paranoid` at 1 or below; above that the off-CPU half
 //! reports itself as missing while the CPU half is unaffected.
 
+use std::fmt::Write as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -257,11 +258,13 @@ impl Capture {
         let mut folded = String::new();
         for (stack, seconds) in &stacks {
             let root_first: Vec<&str> = stack.split(';').rev().collect();
-            folded.push_str(&format!(
-                "{} {}\n",
+            // Writing to a String cannot fail.
+            let _ = writeln!(
+                folded,
+                "{} {}",
                 root_first.join(";"),
                 (seconds * 1e6).round()
-            ));
+            );
         }
         std::fs::write(directory.join("offcpu.folded"), folded)?;
         let mut ranked: Vec<(String, f64)> = stacks.into_iter().collect();

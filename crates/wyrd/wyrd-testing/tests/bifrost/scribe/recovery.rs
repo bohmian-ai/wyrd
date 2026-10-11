@@ -200,8 +200,7 @@ async fn variant_staging_restores_and_publishes_once() {
     );
     drop(scribe);
 
-    let server = server
-        .restart_bound(builder())
+    let server = Box::pin(server.restart_bound(builder()))
         .await
         .expect("the pod restarts on its retained data root");
     let client = tenant_client(&server, tenant).await;

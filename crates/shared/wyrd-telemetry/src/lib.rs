@@ -197,21 +197,22 @@ struct CaptureExporter {
 
 #[cfg(feature = "test-support")]
 impl opentelemetry_sdk::trace::SpanExporter for CaptureExporter {
-    /// Append one completed SDK export batch without network IO.
-    async fn export(
+    /// Append one completed SDK export batch without network IO; the append
+    /// completes before the returned future is polled.
+    fn export(
         &self,
         batch: Vec<opentelemetry_sdk::trace::SpanData>,
-    ) -> opentelemetry_sdk::error::OTelSdkResult {
-        let spans = Arc::clone(&self.spans);
-        spans
+    ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+        let appended = self
+            .spans
             .lock()
+            .map(|mut spans| spans.extend(batch))
             .map_err(|_| {
                 opentelemetry_sdk::error::OTelSdkError::InternalFailure(
                     "trace capture lock poisoned".to_owned(),
                 )
-            })?
-            .extend(batch);
-        Ok(())
+            });
+        std::future::ready(appended)
     }
 }
 

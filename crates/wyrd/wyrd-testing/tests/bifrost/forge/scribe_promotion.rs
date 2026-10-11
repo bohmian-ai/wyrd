@@ -284,10 +284,10 @@ async fn forge_hot_object_promotes_unchanged_and_remains_exact() {
 ///
 /// Panics when the Bifrost store cannot be listed or read.
 async fn object_digests(fixture: &ForgeFixture) -> BTreeMap<String, String> {
-    let prefix = format!("{}/", fixture.binding.object_prefix);
     use futures_util::TryStreamExt as _;
     use object_store::ObjectStoreExt as _;
     use sha2::Digest as _;
+    let prefix = format!("{}/", fixture.binding.object_prefix);
     let objects = fixture.storage.objects();
     let entries: Vec<_> = objects
         .list(Some(&object_store::path::Path::from(prefix)))

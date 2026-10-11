@@ -32,8 +32,6 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION vala.notify_bifrost_cut() FROM PUBLIC;
-
 CREATE TRIGGER file_list_notify_bifrost_cut
     AFTER INSERT OR UPDATE OR DELETE ON vala.file_list
     FOR EACH ROW EXECUTE FUNCTION vala.notify_bifrost_cut();

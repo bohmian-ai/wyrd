@@ -102,7 +102,7 @@ User-defined datasets for high-volume custom observability writes. Each tenant g
 | `wyrd_request_id` | `Utf8` | Admitting request identity |
 | `wyrd_ingested_at` | `Timestamp(µs, +00:00)` | When Wyrd accepted the batch: one PostgreSQL timestamp per batch, read at admission; never caller-supplied |
 
-Tables registered with `CorrelationPolicy::None` (for example `vala.system.audit_log`) carry only `wyrd_ingested_at`; `CorrelationPolicy::CodeAxis` tables declare their own `run_id`.
+Tables registered with `CorrelationPolicy::None` (for example `vala.system.audit_log`) carry only `wyrd_ingested_at`.
 
 ## vala.traces.spans
 

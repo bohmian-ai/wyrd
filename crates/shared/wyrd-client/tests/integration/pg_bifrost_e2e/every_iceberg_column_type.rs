@@ -19,7 +19,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::RegisterOutcome;
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::pg_tests::admin_client;
+use super::pg_tests::service_client;
 
 /// The table every Iceberg type is registered and written to.
 const ALL_TYPES: &str = "vala.datasets.all_types";
@@ -71,7 +71,7 @@ async fn round_trip(
         .expect("the batch writes");
     srv.flush_bifrost().await.expect("the rows publish");
     let read = table
-        .sql(&format!("SELECT * FROM {fqn} ORDER BY {order_by}"))
+        .sql(&format!("SELECT * FROM {fqn} ORDER BY {order_by}"), &[])
         .await
         .expect("the rows read back");
     concat_batches(read.schema(), read.batches()).expect("one read batch")
@@ -109,7 +109,7 @@ fn map_of(value: DataType) -> Field {
 #[ignore = "requires the controlled Postgres journey harness"]
 async fn every_iceberg_type_round_trips_with_nested_nulls() {
     let srv = WyrdTestServer::start_bound().await.expect("server starts");
-    let client = admin_client(&srv, "every-iceberg-column-type").await;
+    let client = service_client(&srv, "every-iceberg-column-type", &["admin"]).await;
     let written = fixture("every_iceberg_type.arrow");
 
     let read = round_trip(&srv, &client, ALL_TYPES, &written, "id").await;
@@ -146,7 +146,7 @@ async fn every_iceberg_type_round_trips_with_nested_nulls() {
 #[ignore = "requires the controlled Postgres journey harness"]
 async fn a_narrower_type_reads_back_the_same_values() {
     let srv = WyrdTestServer::start_bound().await.expect("server starts");
-    let client = admin_client(&srv, "every-iceberg-column-type").await;
+    let client = service_client(&srv, "every-iceberg-column-type", &["admin"]).await;
     let written = fixture("narrow_types.arrow");
 
     let read = round_trip(&srv, &client, NARROW_TYPES, &written, "int8").await;
@@ -177,7 +177,7 @@ async fn a_narrower_type_reads_back_the_same_values() {
 #[ignore = "requires the controlled Postgres journey harness"]
 async fn a_narrower_declaration_is_the_table_it_describes() {
     let srv = WyrdTestServer::start_bound().await.expect("server starts");
-    let client = admin_client(&srv, "every-iceberg-column-type").await;
+    let client = service_client(&srv, "every-iceberg-column-type", &["admin"]).await;
     round_trip(
         &srv,
         &client,

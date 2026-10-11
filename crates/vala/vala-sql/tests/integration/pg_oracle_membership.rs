@@ -606,24 +606,6 @@ mod pg_tests {
         }
     }
 
-    /// Projects the privileges one role holds on one relation, sorted.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the `information_schema` privilege read fails.
-    async fn grants(pool: &PgPool, table: &str, grantee: &str) -> Vec<String> {
-        sqlx::query_scalar(
-            "SELECT privilege_type FROM information_schema.role_table_grants \
-              WHERE table_schema = 'vala' AND table_name = $1 AND grantee = $2 \
-              ORDER BY privilege_type",
-        )
-        .bind(table)
-        .bind(grantee)
-        .fetch_all(pool)
-        .await
-        .expect("grants read")
-    }
-
     /// Proves a cut is one read-only, tenant-scoped statement: deduplicated,
     /// ordered, all-or-nothing, and never blocked by Forge's exclusive
     /// maintenance authority.
@@ -833,10 +815,6 @@ mod pg_tests {
     #[tokio::test]
     async fn retained_supersessions_hold_replaced_snapshots_for_the_window() {
         let reads = CutReads::start().await;
-        assert_eq!(
-            grants(&reads.superuser, "forge_snapshot_supersessions", "wyrd_app").await,
-            ["DELETE", "INSERT", "SELECT"]
-        );
         let tenant_a = reads.tenant().await;
         let tenant_b = reads.tenant().await;
         reads

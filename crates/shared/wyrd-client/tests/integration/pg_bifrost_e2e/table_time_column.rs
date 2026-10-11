@@ -15,7 +15,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire, UTC_TIME_ZONE};
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::pg_tests::admin_client;
+use super::pg_tests::service_client;
 
 /// The table partitioned on its declared `event_time` column.
 const READINGS: &str = "vala.datasets.time_column_readings";
@@ -84,7 +84,7 @@ fn readings() -> RecordBatch {
 /// Panics when the writer cannot connect.
 async fn connect(srv: &WyrdTestServer, fqn: &str, layout: PhysicalLayoutWire) -> Bifrost {
     let service = fqn.rsplit('.').next().unwrap_or(fqn).replace('_', "-");
-    let client = admin_client(srv, &service).await;
+    let client = service_client(srv, &service, &["admin"]).await;
     Bifrost::connect_with_table(
         &client,
         TableConfig::from_arrow(fqn, readings_schema())
@@ -120,24 +120,36 @@ async fn user_table_time_column_prunes_a_time_range() {
     srv.flush_bifrost().await.expect("the readings publish");
 
     let in_range: Vec<serde_json::Value> = readings_table
-        .sql_as(&format!(
-            "SELECT value FROM {READINGS} \
+        .sql_as(
+            &format!(
+                "SELECT value FROM {READINGS} \
              WHERE {EVENT_TIME} >= to_timestamp_micros({lower}) \
              AND {EVENT_TIME} < to_timestamp_micros({upper}) ORDER BY value",
-            lower = FIRST_HOUR_MICROS + HOUR_MICROS,
-            upper = FIRST_HOUR_MICROS + 3 * HOUR_MICROS,
-        ))
+                lower = FIRST_HOUR_MICROS + HOUR_MICROS,
+                upper = FIRST_HOUR_MICROS + 3 * HOUR_MICROS,
+            ),
+            &[],
+        )
         .await
         .expect("the range reads back");
-    let described = readings_table.describe(READINGS).await.expect("describes");
+    let (namespace, name) = READINGS
+        .rsplit_once('.')
+        .expect("the fqn names a namespace");
+    let described = readings_table
+        .describe_table(namespace, name)
+        .await
+        .expect("describes");
 
     let defaults = connect(&srv, DEFAULT_READINGS, hourly_on(None)).await;
     defaults
         .register()
         .await
         .expect("the default table registers");
+    let (namespace, name) = DEFAULT_READINGS
+        .rsplit_once('.')
+        .expect("the fqn names a namespace");
     let default_described = defaults
-        .describe(DEFAULT_READINGS)
+        .describe_table(namespace, name)
         .await
         .expect("describes");
 

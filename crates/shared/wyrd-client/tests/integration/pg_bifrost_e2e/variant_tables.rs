@@ -147,7 +147,7 @@ mod pg_tests {
         /// Panics when the query fails.
         async fn read(&self, table: &str) -> Vec<Event> {
             self.bifrost
-                .sql_as(&select_events(table))
+                .sql_as(&select_events(table), &[])
                 .await
                 .expect("rows read")
         }
@@ -248,7 +248,7 @@ mod pg_tests {
 
         let copied = events
             .bifrost
-            .sql(&select_events(&events.table))
+            .sql(&select_events(&events.table), &[])
             .await
             .expect("query runs");
         assert!(is_variant(
@@ -283,10 +283,13 @@ mod pg_tests {
 
         let result = events
             .bifrost
-            .sql(&format!(
-                "SELECT point['x'] AS x, payload -> 'scores' AS scores FROM {}",
-                events.table
-            ))
+            .sql(
+                &format!(
+                    "SELECT point['x'] AS x, payload -> 'scores' AS scores FROM {}",
+                    events.table
+                ),
+                &[],
+            )
             .await
             .expect("query runs");
 
@@ -507,9 +510,13 @@ mod pg_tests {
         )
         .await
         .expect("direct writer connects");
+        let (namespace, name) = events
+            .table
+            .rsplit_once('.')
+            .expect("the fqn names a namespace");
         let described = events
             .bifrost
-            .describe(&events.table)
+            .describe_table(namespace, name)
             .await
             .expect("table describes");
         let valid = RowPreflight::from_description(&described)

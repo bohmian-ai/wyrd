@@ -21,7 +21,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{DataTypeSpec, TimeUnit as WireTimeUnit, UTC_TIME_ZONE};
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::pg_tests::admin_client;
+use super::pg_tests::service_client;
 
 /// The table orders declared with Wyrd types are written to.
 const WYRD_ORDERS: &str = "vala.datasets.wyrd_orders";
@@ -82,7 +82,7 @@ async fn orders<T: schemars::JsonSchema, R: Serialize>(
     table: &str,
     rows: &[R],
 ) -> Bifrost {
-    let client = admin_client(srv, "three-timestamp-types").await;
+    let client = service_client(srv, "three-timestamp-types", &["admin"]).await;
     let orders = Bifrost::connect_with_table(
         &client,
         TableConfig::from_model::<T>(table).expect("the model declares a table"),
@@ -127,7 +127,10 @@ async fn wyrd_timestamps_read_back_as_wyrd_values() {
     let orders = wyrd_orders(&srv).await;
 
     let read: Vec<WyrdOrder> = orders
-        .sql_as(&format!("SELECT * FROM {WYRD_ORDERS} ORDER BY order_id"))
+        .sql_as(
+            &format!("SELECT * FROM {WYRD_ORDERS} ORDER BY order_id"),
+            &[],
+        )
         .await
         .expect("the orders read back");
 
@@ -168,7 +171,7 @@ async fn the_customers_local_hour_is_queryable() {
             "SELECT order_id, CAST(date_part('hour', submitted_at['local']) AS INT) AS local_hour, \
              CAST(date_part('hour', submitted_at['utc']) AS INT) AS utc_hour \
              FROM {WYRD_ORDERS} ORDER BY order_id"
-        ))
+        ), &[])
         .await
         .expect("the hours read back");
 
@@ -204,9 +207,18 @@ async fn chrono_timestamps_go_through_wyrd_types() {
     });
     let orders = orders::<ChronoOrder, _>(&srv, CHRONO_ORDERS, &rows).await;
 
-    let described = orders.describe(CHRONO_ORDERS).await.expect("describes");
+    let (namespace, name) = CHRONO_ORDERS
+        .rsplit_once('.')
+        .expect("the fqn names a namespace");
+    let described = orders
+        .describe_table(namespace, name)
+        .await
+        .expect("describes");
     let read: Vec<ChronoOrder> = orders
-        .sql_as(&format!("SELECT * FROM {CHRONO_ORDERS} ORDER BY order_id"))
+        .sql_as(
+            &format!("SELECT * FROM {CHRONO_ORDERS} ORDER BY order_id"),
+            &[],
+        )
         .await
         .expect("the orders read back");
     let refused = |row: serde_json::Value| {
@@ -292,7 +304,7 @@ fn arrow_order(zone: Option<&str>) -> RecordBatch {
 #[ignore = "requires the controlled Postgres journey harness"]
 async fn an_arrow_instant_in_any_zone_is_one_instant_and_a_naive_one_is_refused() {
     let srv = WyrdTestServer::start_bound().await.expect("server starts");
-    let client = admin_client(&srv, "three-timestamp-types").await;
+    let client = service_client(&srv, "three-timestamp-types", &["admin"]).await;
     let orders = Bifrost::connect_with_table(
         &client,
         TableConfig::from_arrow(ARROW_ORDERS, arrow_order(Some("America/New_York")).schema())
@@ -310,7 +322,7 @@ async fn an_arrow_instant_in_any_zone_is_one_instant_and_a_naive_one_is_refused(
     srv.flush_bifrost().await.expect("the rows publish");
 
     let read = orders
-        .sql(&format!("SELECT received_at FROM {ARROW_ORDERS}"))
+        .sql(&format!("SELECT received_at FROM {ARROW_ORDERS}"), &[])
         .await
         .expect("the orders read back");
     let read = concat_batches(read.schema(), read.batches()).expect("one read batch");

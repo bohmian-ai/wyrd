@@ -138,9 +138,6 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION vala.oracle_read_table_cut(uuid, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION vala.oracle_read_table_cut(uuid, jsonb) TO wyrd_app;
-
 -- ---------------------------------------------------------------------------
 -- Snapshot supersession observations
 -- ---------------------------------------------------------------------------
@@ -166,7 +163,5 @@ ALTER TABLE vala.forge_snapshot_supersessions FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.forge_snapshot_supersessions
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-REVOKE ALL ON vala.forge_snapshot_supersessions FROM PUBLIC;
--- Forge gathers expiry protection roots on a tenant connection.
-GRANT SELECT, INSERT, DELETE ON vala.forge_snapshot_supersessions TO wyrd_app;
+CREATE POLICY operator_access ON vala.forge_snapshot_supersessions TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

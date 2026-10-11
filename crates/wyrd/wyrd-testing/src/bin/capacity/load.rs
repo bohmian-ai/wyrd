@@ -486,15 +486,15 @@ fn query(shape: Work, sequence: u64, now: chrono::DateTime<chrono::Utc>) -> Stri
     if shape == Work::Lookup {
         format!(
             "SELECT record_id, num_value FROM vala.drift.observations \
-             WHERE series = 'f{}' AND wyrd_event_time >= TIMESTAMP '{since}' \
-             ORDER BY wyrd_event_time DESC LIMIT 10",
+             WHERE series = 'f{}' AND created_at >= TIMESTAMP '{since}' \
+             ORDER BY created_at DESC LIMIT 10",
             sequence % INGEST_FEATURES as u64
         )
     } else {
         format!(
             "SELECT series, COUNT(*) AS n, AVG(num_value) AS mean \
              FROM vala.drift.observations \
-             WHERE wyrd_event_time >= TIMESTAMP '{since}' GROUP BY series"
+             WHERE created_at >= TIMESTAMP '{since}' GROUP BY series"
         )
     }
 }

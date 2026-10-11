@@ -11,7 +11,7 @@ use wyrd_client::bifrost::{Bifrost, Correlation, TableConfig};
 use wyrd_spec::vala::api::RegisterOutcome;
 use wyrd_testing::server::WyrdTestServer;
 
-use crate::pg_tests::admin_client;
+use super::pg_tests::service_client;
 
 /// The table the API requests are registered and written to.
 const API_REQUESTS: &str = "vala.datasets.api_requests";
@@ -105,7 +105,7 @@ fn requests() -> Vec<ApiRequest> {
 ///
 /// Panics when registration, the insert, the flush, or publication fails.
 async fn api_requests(srv: &WyrdTestServer) -> Bifrost {
-    let client = admin_client(srv, "register-a-table-from-a-model").await;
+    let client = service_client(srv, "register-a-table-from-a-model", &["admin"]).await;
     let api_requests = Bifrost::connect_with_table(
         &client,
         TableConfig::from_model::<ApiRequest>(API_REQUESTS).expect("the model declares a table"),
@@ -136,10 +136,13 @@ async fn api_requests_read_back_as_the_same_models() {
     let api_requests = api_requests(&srv).await;
 
     let rows: Vec<ApiRequest> = api_requests
-        .sql_as(&format!(
-            "SELECT request_id, outcome, prediction, attributes \
+        .sql_as(
+            &format!(
+                "SELECT request_id, outcome, prediction, attributes \
              FROM {API_REQUESTS} ORDER BY request_id"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("the rows read back");
 
@@ -159,10 +162,13 @@ async fn a_nested_model_field_is_selected_by_its_path() {
     let api_requests = api_requests(&srv).await;
 
     let rows: Vec<Importance> = api_requests
-        .sql_as(&format!(
-            "SELECT request_id, prediction['feature_importance']['importance'] AS importance \
+        .sql_as(
+            &format!(
+                "SELECT request_id, prediction['feature_importance']['importance'] AS importance \
              FROM {API_REQUESTS} ORDER BY request_id"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("the path selects");
 
@@ -194,11 +200,14 @@ async fn a_nested_model_field_filters_rows() {
     let api_requests = api_requests(&srv).await;
 
     let rows: Vec<Importance> = api_requests
-        .sql_as(&format!(
-            "SELECT request_id, prediction['feature_importance']['importance'] AS importance \
+        .sql_as(
+            &format!(
+                "SELECT request_id, prediction['feature_importance']['importance'] AS importance \
              FROM {API_REQUESTS} \
              WHERE prediction['feature_importance']['importance'] > 0.5"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("the path filters");
 
@@ -224,10 +233,13 @@ async fn an_open_dict_field_is_queried_by_key() {
     let api_requests = api_requests(&srv).await;
 
     let rows: Vec<Region> = api_requests
-        .sql_as(&format!(
-            "SELECT request_id, attributes -> 'client' ->> 'region' AS region \
+        .sql_as(
+            &format!(
+                "SELECT request_id, attributes -> 'client' ->> 'region' AS region \
              FROM {API_REQUESTS} ORDER BY request_id"
-        ))
+            ),
+            &[],
+        )
         .await
         .expect("the key selects");
 

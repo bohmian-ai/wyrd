@@ -29,13 +29,13 @@ wyrd server dev --tenant acme
 
 The command migrates the database, starts the ordinary server, waits for readiness, and provisions `acme` through the server. On macOS it supplies the same host-memory input as the repository's development launcher when you have not set `WYRD_BIFROST_MEMORY_LIMIT_BYTES`.
 
-The default HTTP endpoint is `http://127.0.0.1:8080`. To use a different local port, set `WYRD_SERVER_BIND` to a loopback address before starting. The default gRPC port remains `50051`.
+The default HTTP endpoint is `http://127.0.0.1:8080`. To use a different local port, set `WYRD_SERVER_BIND` to a loopback address before starting. The public gRPC listener defaults to `127.0.0.1:50051`; set `WYRD_GRPC_BIND` to another loopback address to move it. Non-loopback addresses are refused before setup, and these selections override a server config file.
 
-On first use, the tenant key is saved in `credentials.toml`, with owner-only permissions. The endpoint is saved in `config.toml`. Both files use the existing Wyrd config directory (`WYRD_CONFIG_HOME`, otherwise `XDG_CONFIG_HOME/wyrd` or `~/.config/wyrd`). Unrelated settings and comments remain intact; another tenant's default key is never overwritten. Use a separate `WYRD_CONFIG_HOME` for another local deployment.
+On first use, the tenant key is saved in `credentials.toml`, with owner-only permissions. The HTTP and gRPC endpoints are saved in `config.toml`, replacing any earlier endpoints there. Both files use the existing Wyrd config directory (`WYRD_CONFIG_HOME`, otherwise `XDG_CONFIG_HOME/wyrd` or `~/.config/wyrd`). Unrelated settings and comments remain intact; another tenant's default key is never overwritten. Use a separate `WYRD_CONFIG_HOME` for another local deployment.
 
 If the platform root is newly initialized, its one-time administrative credential is disclosed only to the invoking terminal. Store it securely. When no terminal is available, the command prints recovery guidance without printing the root credential to stdout or stderr. Tenant credentials are never printed.
 
-Interactive runs offer detected MCP hosts. Select the hosts you want, or decline and keep using the CLI and SDKs. Scripts connect no hosts unless selected explicitly:
+The first interactive setup offers detected MCP hosts. Select the hosts you want, or decline and keep using the CLI and SDKs. Later starts find the saved configuration and skip the question, even after a decline; use `wyrd mcp install` to connect hosts later. Scripts connect no hosts unless selected explicitly, on any start:
 
 ```bash
 wyrd server dev --tenant acme --host codex
@@ -57,7 +57,7 @@ Press Ctrl-C in the server terminal. The CLI forwards termination and waits for 
 wyrd server dev --tenant acme
 ```
 
-Migrations are safe to rerun. An active tenant keeps its existing key, and the installed release is retained. PostgreSQL, `.wyrd/`, and the config directory must all survive if you want to keep the deployment. Without a configured persistent signing key, a restart invalidates previously issued access tokens; clients can exchange the saved API key again.
+A restart asks no questions. Migrations are safe to rerun. An active tenant keeps its existing key, and the installed release is retained. PostgreSQL, `.wyrd/`, and the config directory must all survive if you want to keep the deployment. Without a configured persistent signing key, a restart invalidates previously issued access tokens; clients can exchange the saved API key again.
 
 ## Recover a failed setup
 

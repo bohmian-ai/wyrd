@@ -28,13 +28,17 @@ wyrd server install
 `dev` composes migration, foreground serving, readiness, server-owned setup,
 protected local configuration, and optional MCP installation. It requires an
 external PostgreSQL URL in `WYRD_DATABASE_URL` and a required `--tenant` slug.
-Repeat `--host` to select detected hosts. Without it, interactive runs offer a
-selection and scripts select none. Ctrl-C settles the serving child.
+Repeat `--host` to select detected hosts. Without it, the first interactive
+setup offers a selection; later starts with saved configuration, and scripts,
+select none. `wyrd mcp install` connects hosts later. Ctrl-C settles the
+serving child, and a serving-child exit ends the command, even while the offer
+is unanswered.
 
 An existing compatible release is reused. `install` explicitly downloads and
 verifies the newest stable compatible release; `dev` installs only when no
-server is installed. HTTP defaults to `127.0.0.1:8080`; `WYRD_SERVER_BIND` may
-select another loopback address with a nonzero port. The saved endpoint and
+server is installed. HTTP defaults to `127.0.0.1:8080` and public gRPC to
+`127.0.0.1:50051`; `WYRD_SERVER_BIND` and `WYRD_GRPC_BIND` may select other
+loopback addresses with nonzero ports. The saved HTTP and gRPC endpoints and
 one-time tenant key use the existing Wyrd config files. Reruns preserve an
 active tenant's key. Stage failures carry `WYRD_CLI_503_SERVER_DEV` with safe
 recovery guidance; committed server state remains.

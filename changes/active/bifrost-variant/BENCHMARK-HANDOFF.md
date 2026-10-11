@@ -1,0 +1,147 @@
+# Bifrost benchmarking handoff (2026-10-11)
+
+Source branch: `wyrd/bifrost-variant/TASK-003` at `cfe21dc90`.
+Integration branch: `wyrd/bifrost-variant/integrate-main`, which is main plus
+the merge research in `merge-research/`.
+
+## Plan
+
+1. **Finalize the merge plan.** `merge-research/RESOLUTION-MAP.md` holds the
+   human decisions recorded on 2026-10-11 (§2). One prerequisite is still open:
+   an `iceberg-compaction` fork commit with Arrow 60 and no REST catalog / Ring
+   (map §2.5).
+2. **Merge main with the current Variant work** on `integrate-main`. Follow map
+   §4 for the procedure and §5 for the proof lanes.
+3. **Continue Bifrost benchmarking and optimization** on the merged branch.
+   The state and next steps are described below.
+4. **Benchmark wyrd-gateway.** See the section at the end.
+
+## Target and harness
+
+- **Target:** at least 30 MiB/s of OTLP wire per server core, and at least
+  200k rows/s at the fastest step. The bench judges both.
+- **Write sweep:**
+  `mise run bench:bifrost:write-capacity -- --fixture logs`.
+  - Fixture: 2M Kubernetes log records of about 1 KiB each, sent over OTLP
+    gRPC into `vala.logs.records`.
+  - Steps: x1, x4, x16 and x64 writers.
+  - Server: one release `wyrd-server` with production Scribe settings (one
+    shard, Parquet rotation and publication on).
+  - Each step reports rows/s, OTLP wire MiB/s per server core, the mean time
+    per batch for each Scribe stage, fsyncs per batch, and a CPU Pareto by
+    crate from perf.
+  - Output: `target/bifrost-query-capacity/logs-writes/parquet/profiles/`.
+  - Other fixtures: `--fixture telemetry` (spans) and the default native
+    sweep.
+- **Read sweep:** `mise run bench:bifrost:query-capacity`. It runs hot
+  (memtable) and Parquet tiers. `--fixture telemetry` exports spans instead.
+- **Client queue:** `mise run bench:bifrost:client-queue` covers WyrdState
+  Drift emission (AC-041).
+- These three benches are kept after the merge (decision D3). Main's
+  `bench:capacity` sits beside them.
+- **Rules:**
+  - Benches go through production paths only.
+  - Don't compile while a bench runs.
+  - Never generate synthetic host load.
+  - Compare only runs from the same host. Runs so far are on an AMD Ryzen 9
+    9950X with 32 CPUs and 91 GiB.
+
+## Results, OTLP logs write sweep at x64
+
+| Run | Change | rows/s | OTLP MiB/s per core | Server CPU per batch | Client mean | Verdict |
+|---|---|---|---|---|---|---|
+| run-34 | before one-fsync | — | — | — | — | slice sync 18.4 ms plus commit sync 8.0 ms per request |
+| run-35 | one fsync per group commit | 257,848 | 37.4 | 16.33 ms | 126.6 ms | PASS |
+| run-36 | + fixes 1, 3, 4 | 193,135 | 42.2 | 14.47 ms | — | FAIL: `group_sync` was 49 ms; the disk was slow on that run (fsyncs per batch unchanged) |
+| run-37 | same code as run-36 | **260,475** | **42.6** | **14.35 ms** | 125.6 ms | **PASS** |
+
+Run-37 at every step (code at `cfe21dc90`):
+
+| Writers | rows/s | OTLP MiB/s per core | p50/p95/p99 ms | Server CPU per batch | Server cores |
+|---|---|---|---|---|---|
+| x1 | 11,668 | 40.6 | 44.0 / 45.5 / 47.0 | 14.93 ms | 0.34 |
+| x4 | 41,673 | 45.5 | 50.0 / 59.9 / 66.9 | 13.40 ms | 1.09 |
+| x16 | 137,713 | 46.9 | 59.9 / 91.4 / 167.0 | 13.04 ms | 3.51 |
+| x64 | 260,475 | 42.6 | 112.8 / 246.6 / 303.4 | 14.35 ms | 7.30 |
+
+Scribe stage means per batch at x64, run-37:
+
+| Stage | Mean |
+|---|---|
+| `shard_wait` | 26.2 ms |
+| `group_sync` | 19.6 ms |
+| `group_fence` | 14.1 ms |
+| `group_write` | 6.3 ms |
+| `preprocess` | 2.7 ms |
+| `group_insert` | 1.2 ms |
+
+There were 0.06 fsyncs per batch.
+
+CPU Pareto at x64, run-37, by crate:
+
+| Crate | Share of server CPU |
+|---|---|
+| ZSTD (WAL compression) | 18.4% |
+| wyrd_server (mostly OTLP protobuf decode) | 12.9% |
+| sha2 | 9.9% |
+| kernel | 8.6% |
+| parquet_variant | 4.2% |
+
+## Optimizations so far
+
+| Item | Status | Evidence |
+|---|---|---|
+| One fsync per Scribe group commit, with replay stopping at a bad record in the unacked tail | In `cfe21dc90` | run-35; `newest_wal_fence_spans_tenants_on_one_stream` |
+| ZSTD level 1 for WAL payloads | In `88f6e0657` | — |
+| Scan sizing through one `ScanSizer`, and memtable column bytes recorded at append | In `1190c539a` and `05f2ba96b` | — |
+| Partitioning on each table's time column (TASK-005, REQ-036) | In `cfe21dc90` | — |
+| Fix 1: hash the logical identity once, reusing the Gate's digest in Scribe | In `cfe21dc90`, **but ineffective for OTLP** | See open item 1 |
+| Fix 3: presized Variant and UTF-8 builders | In `cfe21dc90` | About −11% CPU per batch, run-35 → run-37 |
+| Fix 4: cache conform plans per (tenant, table) | In `cfe21dc90` | `remembered_conform_plan_matches_a_fresh_plan_and_is_reused` |
+| Fix 2: skip re-validating OTLP Variant bytes | **Dropped** | Validation already happens once, at Variant build (`EncodedVariant`). The check rejects NaN, oversize and over-deep values that OTLP can send (`non_finite_log_body_rejects_only_its_record`). |
+| Fix 5: single-pass OTLP decode | **Skipped** | The preflight pass reserves exact decode memory before allocating (`grpc/otlp.rs:668-678`). Removing it weakens memory admission for about 3.5% of CPU. |
+
+## Open items, in order (after the merge)
+
+1. **Confirm that fix 1's reuse hits.**
+   - Today the Gate batch carries a `card_ref` column. Decode drops it,
+     because it resolves to `card_uid`.
+   - So `LogicalIdentity::for_rows` always misses, and both hash passes run.
+     A diagnostic confirmed it: kl=30 vs ol=29, and sha2 cost is unchanged at
+     about 1.4 ms per batch.
+   - Main removed `card_ref`, so after the merge the reuse should hit.
+   - Prove it with a profile: sha2 should fall by about half, roughly 4% of
+     x64 CPU.
+2. **Find the missing latency at x1.**
+   - At x1 the client mean is 43.9 ms, but the Scribe stages add up to about
+     9 ms.
+   - The `Gate.write_request` profile is recorded (about 3,900 profiles), but
+     its time reads 0.000 ms. The Gate/transport stage timing is not captured.
+   - Measure that first, then attribute the remaining time.
+3. **Group commit at x64.**
+   - `shard_wait`, `group_sync` and `group_fence` take about 60 ms of the
+     125.6 ms client mean.
+   - Pick the next target from a profile, not by guessing. `group_sync`
+     varies between runs (run-36 vs run-37), so compare several runs.
+4. **ZSTD is the largest CPU item** (18–24% across steps).
+   - It is level 1 already.
+   - Any change is a durability/space trade-off and needs evidence first.
+5. **Hot-only and Parquet-only runs** of the same sweep, plus the telemetry
+   (spans) and metrics fixtures.
+6. **Native validation cost:** native IPC pays a full `EncodedVariant`
+   validation at the trust boundary. Don't change it unless a native profile
+   shows that it matters.
+
+## Benchmarking wyrd-gateway (step 4)
+
+- **Existing work:** branch `change/gateway-benchmarks`, worktree
+  `wyrd-gateway-benchmarks`.
+  - Its packet is `changes/active/gateway-benchmarks/` (spec, tasks, review).
+  - The last commit, `916155620` (2026-09-25), records the TASK-002-R1
+    remediation evidence and a boot blocker.
+  - The branch is 2+ weeks old and predates main's bench consolidation.
+- **Main's `bench:capacity`** (REQ-171) is the one mixed server capacity
+  bench. Decide whether the gateway bench extends it or stays separate, the
+  way the Bifrost benches do.
+- First, read that packet and its boot blocker against the merged tree. Don't
+  start from scratch.

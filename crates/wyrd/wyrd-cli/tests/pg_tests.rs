@@ -9,13 +9,15 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret as _, SecretString};
+use serde_json::json;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
+use wyrd_client::bifrost::{Correlation, TableConfig};
 use wyrd_client::cards::{CardSelector, Cards};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::environment::Environment;
-use wyrd_client::{GlobalConfig, WyrdClient};
+use wyrd_client::{Bifrost, GlobalConfig, WyrdClient};
 use wyrd_dev_fixtures::pg::UnmigratedDatabase;
 use wyrd_spec::envelope::CardKind;
 
@@ -272,15 +274,81 @@ fn free_bind() -> String {
         .to_string()
 }
 
-/// First use migrates an empty database, saves a private key and endpoint,
-/// and supports fresh CLI writes and client reads outside the checkout.
+/// First use migrates an empty database, saves a private key and both
+/// endpoints, and supports fresh CLI writes and client reads outside the
+/// checkout. A stale saved gRPC destination is replaced by the selected
+/// custom loopback listener, which also governs a non-loopback server-file
+/// setting, and a fresh saved client writes Bifrost rows over it.
 ///
 /// # Panics
-/// Panics when bootstrap, the public write/read, or process cleanup fails.
+/// Panics when bootstrap, the public write/read, or process cleanup fails,
+/// or when the stale destination receives a connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn server_dev_first_run_is_client_ready() {
     let mut local = LocalDev::new().await;
+    let stale = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("stale gRPC destination");
+    let config = local.home.path().join("wyrd/config.toml");
+    fs::write(
+        &config,
+        format!(
+            "# retain unrelated settings\n[client]\ngrpc_url = \"http://{}\"\n",
+            stale.local_addr().expect("stale address")
+        ),
+    )
+    .expect("stale client config");
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).expect("protected config");
+    let server_file = local.home.path().join(".config/wyrd");
+    fs::create_dir_all(&server_file).expect("server file directory");
+    fs::write(
+        server_file.join("server.toml"),
+        format!("[grpc]\nbind = \"0.0.0.0:{}\"\n", local.grpc.rsplit_once(':').expect("port").1),
+    )
+    .expect("non-loopback server file");
     local.start(&[]).await;
+    let saved = GlobalConfig::load_in(&local.environment())
+        .expect("saved config")
+        .client;
+    assert_eq!(saved.grpc_url, Some(format!("http://{}", local.grpc)));
+    assert!(
+        fs::read_to_string(&config)
+            .expect("saved config text")
+            .contains("# retain unrelated settings")
+    );
+    let table = TableConfig::from_json_schema(
+        "vala.datasets.local_rows",
+        &json!({
+            "type": "object",
+            "properties": { "id": { "type": "integer" } },
+            "required": ["id"],
+        }),
+    )
+    .expect("table declares");
+    let writer = Bifrost::connect_with_table(&local.client(), table)
+        .await
+        .expect("saved gRPC destination connects");
+    writer.register().await.expect("table registers");
+    writer
+        .insert(
+            serde_json::to_vec(&json!({ "id": 1 })).expect("row serializes"),
+            Correlation::default(),
+        )
+        .expect("row inserts");
+    writer.shutdown().await.expect("gRPC write is acknowledged");
+    let rows: Vec<serde_json::Value> = Bifrost::connect(&local.client())
+        .await
+        .expect("fresh reader")
+        .sql_as("SELECT id FROM vala.datasets.local_rows", &[])
+        .await
+        .expect("fresh saved client reads");
+    assert_eq!(rows, [json!({ "id": 1 })]);
+    assert!(
+        tokio::time::timeout(Duration::ZERO, stale.accept())
+            .await
+            .is_err(),
+        "no bearer or data reaches the stale gRPC destination"
+    );
     let listed = local
         .command()
         .arg("list")
@@ -332,7 +400,9 @@ async fn server_dev_first_run_is_client_ready() {
 }
 
 /// Reruns retain the active release and key; a failed one-time save does not
-/// turn a retry into another issuance. Missing input is refused before setup.
+/// turn a retry into another issuance. Missing input and a non-loopback
+/// public gRPC bind are refused before setup, and an explicit host selected
+/// on a later start is still connected.
 ///
 /// # Panics
 /// Panics when a retry changes persisted identity or exposes credentials.
@@ -390,6 +460,18 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
         .expect("missing input");
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("WYRD_DATABASE_URL"));
+    let exposed = local
+        .command()
+        .env("WYRD_GRPC_BIND", "0.0.0.0:50051")
+        .args(["server", "dev", "--tenant", "local"])
+        .output()
+        .await
+        .expect("non-loopback gRPC input");
+    assert!(!exposed.status.success());
+    let errors = String::from_utf8_lossy(&exposed.stderr);
+    assert!(errors.contains("WYRD_GRPC_BIND"), "{errors}");
+    assert!(!errors.contains("wyrd_sk_") && !errors.contains("wyrd_global_"));
+    assert!(!local.home.path().join("wyrd/credentials.toml").exists());
     let mut restricted =
         url::Url::parse(&std::env::var("WYRD_DATABASE_URL").expect("managed tenant URL"))
             .expect("tenant URL");
@@ -434,8 +516,15 @@ async fn server_dev_repeat_and_partial_failure_preserve_state() {
     fs::write(&config, format!("# retained local settings\n{original}"))
         .expect("unrelated comment");
     let installed = fs::read_link(local.home.path().join("wyrd/server/current")).expect("release");
-    local.start(&[]).await;
+    let codex = local.home.path().join(".codex");
+    fs::create_dir_all(&codex).expect("later detected host");
+    local.start(&["codex"]).await;
     local.stop("-TERM").await;
+    assert!(
+        fs::read_to_string(codex.join("config.toml"))
+            .expect("explicit host on a later start")
+            .contains(&format!("http://{}", local.bind))
+    );
     assert_eq!(fs::read_to_string(&credentials).expect("retained key"), key);
     assert!(
         fs::read_to_string(&config)

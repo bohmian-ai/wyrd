@@ -1546,12 +1546,36 @@ cargo hakari verify
 """
 
 [tasks."codegen:regen"]
-description = "Regenerate JSON schemas / MCP tool list / pyi stubs / typed Card envelopes from source"
+description = "Regenerate JSON schemas / MCP tool list / pyi stubs / typed Card envelopes / UI HTTP contract types from source"
 run = """
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
 python3 scripts/gen_card_types.py
 (cd sdks/wyrd-sdk-python && uv run ruff format python/wyrd/_card_types.py)
 mise run codegen:stubs
+mise run codegen:http
+"""
+
+[tasks."codegen:http"]
+hide = true
+description = """Regenerate the UI's HTTP contract types from the OpenAPI document a freshly composed local server
+serves. The server needs its Postgres, so this owns one lifecycle; the exported document is ephemeral."""
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run codegen:http:inner'"
+
+[tasks."codegen:http:inner"]
+hide = true
+description = "Regenerate the UI's HTTP contract types with the Postgres lifecycle already provisioned"
+run = """
+set -eu
+ui=crates/wyrd/wyrd-server/wyrd-ui
+generated="$ui/src/lib/server/generated"
+document=$(mktemp)
+trap 'rm -f "$document"' EXIT
+# The harness logs to stdout; the document goes to its own file.
+cargo run --locked -q -p wyrd-server --example served_openapi -- "$document" > /dev/null
+pnpm --dir "$ui" install --frozen-lockfile
+# Cleared first so a file the generator no longer writes is reported as drift.
+rm -rf "$generated" && mkdir -p "$generated"
+pnpm --dir "$ui" exec openapi-typescript "$document" -o "$PWD/$generated/wyrd-http.ts"
 """
 
 [tasks."codegen:stubs"]
@@ -1564,11 +1588,13 @@ uv run ruff check --fix --select I python/wyrd
 """
 
 [tasks."codegen:check"]
-description = "Fail if generated schemas, pyi stubs, TypeScript error codes, typed Card envelopes, or UI theme tokens drift from source"
+description = """Fail if generated schemas, pyi stubs, TypeScript error codes, typed Card envelopes, UI HTTP contract types,
+or UI theme tokens drift from source, or if the UI no longer type-checks against the regenerated contract types"""
 run = """
 snapshot_codegen() {
   {
     find crates/wyrd-spec/schemas -type f -name '*.json'
+    find crates/wyrd/wyrd-server/wyrd-ui/src/lib/server/generated -type f 2>/dev/null || true
     printf '%s\n' sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts sdks/wyrd-sdk-ts/wyrd/src/card-types.ts \
       sdks/wyrd-sdk-python/python/wyrd/_card_types.py
     find sdks/wyrd-sdk-python/python/wyrd -type f -name '*.pyi' \
@@ -1585,14 +1611,15 @@ mise run codegen:regen
 snapshot_codegen > "$AFTER"
 diff -u "$BEFORE" "$AFTER" \
   || { echo 'codegen drift detected - run mise run codegen:regen and commit'; exit 1; }
-(cd crates/wyrd/wyrd-server/wyrd-ui && node --test brand/gen-theme.test.mjs && node brand/gen-theme.mjs --check)
+(cd crates/wyrd/wyrd-server/wyrd-ui && node --test brand/gen-theme.test.mjs && node brand/gen-theme.mjs --check \
+  && pnpm run check)
 """
 
 # --- napi TypeScript pipeline -----------------------------------------------------
 # The OpenAPI contract is served at runtime from `GET /openapi.json`, composed from the
 # same `utoipa-axum` registrations that mount the routes, and is proved by the served
 # `pg_openapi_contract` suite in `test:principals:integration`, so nothing here emits or
-# checks it.
+# checks it. Its only generated projection is the UI's, owned by `codegen:http`.
 # Every `ts:*` task needs the napi bindings + package roots (slice 13a). Two separate
 # pnpm packages under `sdks/wyrd-sdk-ts/` glued by `sdks/wyrd-sdk-ts/pnpm-workspace.yaml`:
 # public `@wyrd/sdk` (`sdks/wyrd-sdk-ts/wyrd`, built from `sdks/wyrd-sdk-ts/native`) and

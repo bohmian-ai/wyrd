@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::net::TcpListener;
-use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _, symlink};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -65,7 +65,11 @@ impl LocalDev {
         let version = env!("CARGO_PKG_VERSION");
         let root = home.path().join("wyrd/server");
         let installed = root.join("versions").join(version);
-        fs::create_dir_all(&installed).expect("installation directory");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&installed)
+            .expect("installation directory");
         let binary = assert_cmd::cargo::cargo_bin("wyrd").with_file_name("wyrd-server");
         assert!(
             binary.is_file(),

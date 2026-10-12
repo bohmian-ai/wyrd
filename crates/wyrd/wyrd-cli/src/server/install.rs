@@ -195,7 +195,8 @@ impl ServerInstaller {
     /// Selects the highest stable, non-draft `v<semver>` release, refuses it
     /// unless it shares this CLI's compatible version line, then downloads,
     /// verifies, extracts, and activates it. An already-extracted version is
-    /// activated without downloading again.
+    /// activated without downloading again. Directories it creates on the
+    /// way to `versions/` are private to the user.
     ///
     /// # Errors
     /// - [`WyrdCliError::ServerReleaseUnavailable`]: listing or download
@@ -220,7 +221,14 @@ impl ServerInstaller {
         let dir = self.version_dir(&version);
         if !dir.join("wyrd-server").is_file() {
             let versions = self.root.join("versions");
-            std::fs::create_dir_all(&versions).map_err(io)?;
+            // The root lies in the Wyrd config directory, which the saved
+            // login refuses when others can write it, so whatever this
+            // creates is private to the user regardless of the umask.
+            let mut private = std::fs::DirBuilder::new();
+            private.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut private, 0o700);
+            private.create(&versions).map_err(io)?;
             let staging = tempfile::Builder::new()
                 .prefix(".staging-")
                 .tempdir_in(&self.root)

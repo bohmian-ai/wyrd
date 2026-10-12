@@ -330,6 +330,7 @@ def local_deployment() -> Iterator[tuple[Path, dict[str, str]]]:
         home = Path(working)
         config = home / "wyrd"
         release = config / "server/versions" / version
+        config.mkdir(mode=0o700)
         release.mkdir(parents=True)
         shutil.copy2(root / "target/debug/wyrd-server", release / "wyrd-server")
         (config / "server/current").symlink_to(Path("versions") / version)

@@ -1161,22 +1161,21 @@ mod pg_tests {
             .expect("a query-only caller reads the structured GenAI messages");
         let batches = messages.batches();
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        let stored = arrow::compute::cast(
-            batches[0]
-                .column_by_name("attributes")
-                .expect("column `attributes`"),
-            &DataType::Binary,
-        )
-        .expect("the canonical attribute payload reads back as bytes");
-        let payload = stored
-            .as_any()
-            .downcast_ref::<arrow::array::BinaryArray>()
-            .expect("the cast payload is Binary")
-            .value(0)
-            .to_vec();
-        let payload = String::from_utf8_lossy(&payload);
-        assert!(payload.contains(fixture::INPUT_MESSAGES));
-        assert!(payload.contains(fixture::OUTPUT_MESSAGES));
+        let stored = batches[0]
+            .column_by_name("attributes")
+            .expect("column `attributes`");
+        let payload = wyrd_queue::variant::variant_cell_to_json(stored.as_ref(), 0)
+            .expect("the Variant attribute payload decodes");
+        assert_eq!(
+            payload["gen_ai.input.messages"],
+            fixture::INPUT_MESSAGES,
+            "the structured GenAI input messages survive the round trip verbatim"
+        );
+        assert_eq!(
+            payload["gen_ai.output.messages"],
+            fixture::OUTPUT_MESSAGES,
+            "the structured GenAI output messages survive the round trip verbatim"
+        );
 
         signals.server.shutdown().await.expect("server shutdown");
     }

@@ -2218,6 +2218,73 @@ impl WyrdTestCluster {
             .map_err(|error| ClusterError::Shutdown(error.to_string()))
     }
 
+    /// Drain one node and boot another only once that drain is under way.
+    ///
+    /// `drained` begins its graceful shutdown first. `restarted` boots only
+    /// after every membership role of `drained` is observed unready and its
+    /// shutdown is still running, so anything the drain must deliver to the
+    /// restarted node is discovered by a membership refresh during the drain
+    /// rather than before it. The drain is then awaited to completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/stopped `drained` or running
+    /// `restarted` node, when readiness withdrawal is not observed within 30
+    /// seconds, when the drain ended before the boot began, or for a failed
+    /// boot, membership read, join, or shutdown.
+    pub async fn stop_node_restarting_another_during_drain(
+        &mut self,
+        drained: NodeId,
+        restarted: NodeId,
+    ) -> Result<(), ClusterError> {
+        let server = self
+            .servers
+            .get_mut(&drained)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", drained.as_uuid())))?
+            .take()
+            .ok_or_else(|| {
+                ClusterError::Resource(format!("node {} is already stopped", drained.as_uuid()))
+            })?;
+        let drain = tokio::spawn(server.shutdown_and_inspect());
+        let pool = self.fixture.operator_pool().pool().clone();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut poll = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                poll.tick().await;
+                let withdrawn: Option<bool> = sqlx::query_scalar(
+                    "SELECT bool_and(NOT ready) FROM vala.cluster_nodes WHERE node_id=$1",
+                )
+                .bind(drained.as_uuid())
+                .fetch_one(&pool)
+                .await
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
+                if withdrawn == Some(true) {
+                    return Ok::<_, ClusterError>(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            ClusterError::Resource(format!(
+                "node {} never withdrew readiness while draining",
+                drained.as_uuid()
+            ))
+        })??;
+        if drain.is_finished() {
+            return Err(ClusterError::Resource(format!(
+                "node {} finished draining before node {} booted",
+                drained.as_uuid(),
+                restarted.as_uuid()
+            )));
+        }
+        self.restart_node(restarted).await?;
+        drain
+            .await
+            .map_err(|error| ClusterError::Shutdown(error.to_string()))?
+            .map(|_| ())
+            .map_err(|error| ClusterError::Shutdown(error.to_string()))
+    }
+
     /// Await one node's real terminal supervisor result and retain its restart slot.
     ///
     /// # Errors

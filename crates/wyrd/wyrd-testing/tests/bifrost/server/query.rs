@@ -751,9 +751,11 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
 /// The Scribe-only pod of a role-separated cluster is held unbooted, so an
 /// Oracle's read decision is staged on its process Scribe outbox while the
 /// membership names no Scribe and every delivery attempt finds an empty
-/// roster. The Scribe then boots and the Oracle pod is drained gracefully.
-/// Membership must keep refreshing, so the outbox finds the late Scribe and
-/// the decision lands in retained history, read back through the other Oracle.
+/// roster. The Oracle pod then begins a graceful drain, and the Scribe boots
+/// only after that drain has withdrawn the Oracle's readiness. Membership
+/// must keep refreshing through the drain, so the outbox discovers the late
+/// Scribe and the decision lands in retained history, read back through the
+/// other Oracle.
 ///
 /// # Errors
 /// Returns cluster setup, catalog, query, shutdown, or retained-history errors,
@@ -804,8 +806,9 @@ async fn oracle_only_pod_retains_audit_staged_before_its_drain() -> Result<(), S
     while let Some(frame) = stream.frames.next().await {
         frame?;
     }
-    cluster.restart_node(scribe).await?;
-    cluster.stop_node(drained).await?;
+    cluster
+        .stop_node_restarting_another_during_drain(drained, scribe)
+        .await?;
 
     cluster
         .server_by_node(reader)

@@ -10378,6 +10378,7 @@ dependencies = [
  "parquet",
  "parquet-variant",
  "parquet-variant-compute",
+ "pin-project",
  "prost",
  "rand 0.8.7",
  "rayon",

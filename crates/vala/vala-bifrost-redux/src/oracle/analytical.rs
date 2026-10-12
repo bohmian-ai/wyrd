@@ -53,7 +53,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use url::Url;
 use uuid::Uuid;
 use wyrd_spec::vala::BifrostError;
@@ -1882,7 +1882,9 @@ impl AnalyticalStageIngress {
     ///
     /// The returned lease is meant to be carried by the call's own request
     /// body, so the follower's ownership ends exactly when the coordinator's
-    /// connection does. Nested calls for the same graph share one release.
+    /// connection does. Nested calls for the same graph share one release. The
+    /// lease also carries the graph's cancellation, so settling the graph ends
+    /// that body and, with it, everything upstream keeps for the call.
     ///
     /// # Errors
     ///
@@ -1894,7 +1896,8 @@ impl AnalyticalStageIngress {
     ) -> Result<AnalyticalConnectionLease, BifrostError> {
         let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
         let Some(AnalyticalGraphEntry::Active {
-            open_connections, ..
+            lease,
+            open_connections,
         }) = graphs.get_mut(&graph)
         else {
             return Err(BifrostError::QueryExecutionFailed);
@@ -1903,6 +1906,7 @@ impl AnalyticalStageIngress {
         Ok(AnalyticalConnectionLease {
             ingress: Arc::clone(self),
             graph,
+            cancel: lease.cancel.clone(),
         })
     }
 
@@ -2758,14 +2762,28 @@ impl Drop for AnalyticalGraphLifecycle {
 
 /// Follower ownership of one graph, held for one open coordinator call.
 ///
-/// Dropping it is the release signal. The release itself is asynchronous — an
-/// attempt settles through the supervisor — so the drop spawns it onto the
-/// current runtime rather than blocking whatever dropped the connection.
+/// Dropping it is the release signal: the drop hands the graph to the
+/// ingress's settlement driver once its last connection closes. The lease also
+/// carries the graph's cancellation the other way, so a graph that settles
+/// first ends the coordinator call that holds it.
 pub struct AnalyticalConnectionLease {
     /// Follower ingress that owns the graph this lease keeps alive.
     ingress: Arc<AnalyticalStageIngress>,
     /// Graph this lease is one open connection for.
     graph: AnalyticalGraphKey,
+    /// The graph's own cancellation, cancelled on every settlement path.
+    cancel: CancellationToken,
+}
+
+impl AnalyticalConnectionLease {
+    /// Resolves once the graph this call holds has settled.
+    ///
+    /// Settlement cancels the graph unconditionally, so this is the one signal
+    /// the coordinator call's request body ends on. Upstream drops the stage's
+    /// cached task data, and every reservation in it, only when that body ends.
+    pub(crate) fn graph_settled(&self) -> WaitForCancellationFutureOwned {
+        self.cancel.clone().cancelled_owned()
+    }
 }
 
 impl fmt::Debug for AnalyticalConnectionLease {
@@ -4535,6 +4553,84 @@ mod tests {
                 .oracle_analytical_queries,
             0,
             "the transferred envelope returns to the process root exactly once"
+        );
+    }
+
+    /// A coordinator request body that never resolves on its own.
+    ///
+    /// Stands in for a coordinator that keeps its channel open after the graph
+    /// it addressed has settled, so only the graph itself can end the body.
+    struct OpenCoordinatorBody;
+
+    impl http_body::Body for OpenCoordinatorBody {
+        /// Matches the coordinator channel's chunk type.
+        type Data = bytes::Bytes;
+        /// The open body never fails.
+        type Error = std::convert::Infallible;
+
+        /// Stays pending forever, as an idle coordinator channel does.
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A settled graph ends the coordinator body that still holds it.
+    ///
+    /// Upstream keeps a stage's task data, and every reservation inside it,
+    /// until the coordinator channel's request body ends. A graph that settles
+    /// while its coordinator keeps the channel open must therefore end that
+    /// body itself, or those reservations outlive the graph with no owner.
+    ///
+    /// Required mutation RED: drop the settlement check from
+    /// [`ReplayBody::poll_frame`] and the body stays pending after settlement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the body ends before settlement or stays open after it.
+    #[tokio::test]
+    async fn settled_graph_ends_its_open_coordinator_body() {
+        use http_body::Body as _;
+
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let plan = fixture.leader_message(StageOperationV1::SetPlan);
+        fixture
+            .send(&plan, now)
+            .await
+            .expect("the reserving leader activates the graph");
+        let lease = fixture
+            .ingress
+            .retain_connection(fixture.graph)
+            .expect("a live graph retains a coordinator connection");
+        let mut body = std::pin::pin!(
+            super::super::analytical_transport::ReplayBody::new(
+                std::collections::VecDeque::new(),
+                OpenCoordinatorBody,
+            )
+            .with_lease(lease)
+        );
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(body.as_mut().poll_frame(cx)))
+                .await
+                .is_pending(),
+            "a live graph leaves its coordinator body open"
+        );
+
+        fixture
+            .ingress
+            .shutdown()
+            .await
+            .expect("the follower settles its graph without a poisoned lock");
+        assert!(
+            matches!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(body.as_mut().poll_frame(cx)))
+                    .await,
+                std::task::Poll::Ready(None)
+            ),
+            "the settled graph ends the body its coordinator still holds open"
         );
     }
 

@@ -3485,7 +3485,10 @@ mod tests {
                 .expect("staging backlog")
         };
         assert_eq!(
-            (backlog(&audit.name).live_members, backlog(&table.name).live_members),
+            (
+                backlog(&audit.name).live_members,
+                backlog(&table.name).live_members
+            ),
             (0, 1),
             "the table-scoped backlog keeps the claimed member while audit rows publish"
         );

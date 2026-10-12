@@ -347,7 +347,7 @@ async fn high_level_upload_dispatches_single_put_and_localfs() {
     assert_eq!(requests[2].target, "/v1/cards/upload/local");
 }
 
-/// S3 multipart plans mint part URLs, upload parts, and complete through the server.
+/// multipart plans mint part URLs, upload parts, and complete through the server.
 #[tokio::test]
 async fn high_level_upload_dispatches_s3_and_completes_server_upload() {
     let server = TestServer::start_with(|uri| {
@@ -369,7 +369,7 @@ async fn high_level_upload_dispatches_s3_and_completes_server_upload() {
     let storage = WyrdStorageClient::new(&client(server.uri()));
     let upload_id = UploadId::new();
 
-    let plan = UploadPlan::S3Multipart {
+    let plan = UploadPlan::Multipart {
         part_count: 1,
         part_size_bytes: 4,
         part_url_ttl_secs: 60,
@@ -378,7 +378,7 @@ async fn high_level_upload_dispatches_s3_and_completes_server_upload() {
     storage
         .upload_artifact(&upload_id, &plan, b"data".to_vec(), "key")
         .await
-        .expect("S3 multipart upload succeeds through façade");
+        .expect("multipart upload succeeds through façade");
     let requests = server.requests().await;
     assert_eq!(requests[0].method, "POST");
     assert!(requests[0].target.starts_with("/v1/cards/upload/"));
@@ -389,31 +389,11 @@ async fn high_level_upload_dispatches_s3_and_completes_server_upload() {
     assert!(requests[2].target.ends_with("/complete"));
 }
 
-/// GCS resumable and Azure block-blob plans dispatch to their protocol drivers.
+/// Azure block-blob plans dispatch to their protocol driver.
 #[tokio::test]
-async fn high_level_upload_dispatches_gcs_and_azure_protocols() {
-    let server = TestServer::start(vec![
-        response(200),
-        stored_response(),
-        response(201),
-        response(201),
-        stored_response(),
-    ])
-    .await;
+async fn high_level_upload_dispatches_azure_protocol() {
+    let server = TestServer::start(vec![response(201), response(201), stored_response()]).await;
     let storage = WyrdStorageClient::new(&client(server.uri()));
-    let gcs_upload_id = UploadId::new();
-    storage
-        .upload_artifact(
-            &gcs_upload_id,
-            &UploadPlan::GcsResumable {
-                session_uri: format!("{}/gcs", server.uri()),
-                chunk_size_bytes: 3,
-            },
-            b"gcs".to_vec(),
-            "key",
-        )
-        .await
-        .expect("GCS upload succeeds through façade");
     let upload_id = UploadId::new();
     storage
         .upload_artifact(
@@ -430,19 +410,14 @@ async fn high_level_upload_dispatches_gcs_and_azure_protocols() {
         .expect("Azure upload succeeds through façade");
     let requests = server.requests().await;
     assert_eq!(requests[0].method, "PUT");
-    assert_eq!(requests[0].target, "/gcs");
-    assert_eq!(requests[0].body, b"gcs");
-    assert_eq!(requests[1].method, "POST");
-    assert!(requests[1].target.ends_with("/complete"));
-    assert_eq!(requests[2].method, "PUT");
     assert!(
-        requests[2]
+        requests[0]
             .target
             .starts_with("/azure?sig=redacted&comp=block&blockid=")
     );
-    assert_eq!(requests[2].body, b"azu");
-    assert_eq!(requests[3].body, b"re");
-    assert_eq!(requests[4].method, "POST");
+    assert_eq!(requests[0].body, b"azu");
+    assert_eq!(requests[1].body, b"re");
+    assert_eq!(requests[2].method, "POST");
 }
 
 /// Verifies streamed download bytes, digest checks, and monotonic progress reports.
@@ -508,15 +483,11 @@ async fn façade_rejects_invalid_provider_plans_before_transfer() {
     let server = TestServer::start(Vec::new()).await;
     let storage = WyrdStorageClient::new(&client(server.uri()));
     for plan in [
-        UploadPlan::S3Multipart {
+        UploadPlan::Multipart {
             part_count: 0,
             part_size_bytes: 1,
             part_url_ttl_secs: 60,
             required_headers: Vec::new(),
-        },
-        UploadPlan::GcsResumable {
-            session_uri: format!("{}/gcs", server.uri()),
-            chunk_size_bytes: 0,
         },
         UploadPlan::AzureBlockBlob {
             sas_url: format!("{}/azure", server.uri()),

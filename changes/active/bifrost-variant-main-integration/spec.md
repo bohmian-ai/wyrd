@@ -528,12 +528,17 @@ control from `MultipartStore`. OpenDAL, `aws-sdk-s3`, `aws-config`,
 **Wire contract.** `GcsResumableV1`, `UploadPlan::GcsResumable` and
 `UploadCompleteRequest::GcsResumable` are deleted. GCS uploads above the
 multipart threshold use the GCS XML multipart API, the S3 multipart protocol
-GCS implements: `S3MultipartV1` — server-created upload id, per-part presigned
-`PUT ?partNumber&uploadId`, server completion with the client's part ETags,
-server abort. GCS XML multipart limits (5 MiB–5 GiB parts, 10,000 parts, 5 TiB)
+GCS implements. Because the protocol now serves both backends it is renamed
+backend-neutral (user ruling 2026-10-12): `S3MultipartV1` → `MultipartV1`
+(`multipart_v1` on the wire and in SQL), `UploadPlan::S3Multipart` →
+`UploadPlan::Multipart`, `S3MultipartComplete` → `MultipartComplete`,
+`S3CompletedPart` → `CompletedPart` — server-created upload id, per-part
+presigned `PUT ?partNumber&uploadId`, server completion with the client's part
+ETags, server abort. GCS XML multipart limits (5 MiB–5 GiB parts, 10,000 parts, 5 TiB)
 equal the existing plan limits. GCS therefore gains server abort and sweeper
 cleanup. Nothing has shipped, so `wyrd-sql` migration
-`20260601000002_storage.sql` is edited in place to drop `gcs_resumable_v1`.
+`20260601000002_storage.sql` is edited in place to drop `gcs_resumable_v1`
+and rename `s3_multipart_v1`.
 
 **Preserved.** Single PUT and GET presigning on every backend; S3 per-part
 presigning, completion and abort; Azure block-blob SAS (account key or user

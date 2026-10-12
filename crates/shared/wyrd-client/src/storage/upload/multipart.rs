@@ -1,4 +1,4 @@
-//! S3 multipart upload.
+//! Multipart upload over the S3 multipart protocol (AWS S3 and GCS XML).
 //!
 //! Each part PUT is bounded-retryable: transport failures and 5xx statuses
 //! retry up to three attempts with exponential backoff, and a 403 response
@@ -13,7 +13,7 @@ use std::time::Duration;
 use crate::WyrdClient;
 use bytes::Bytes;
 use wyrd_spec::storage::{
-    HeaderPair, S3CompletedPart, S3MultipartComplete, UploadCompleteRequest, UploadPlan,
+    CompletedPart, HeaderPair, MultipartComplete, UploadCompleteRequest, UploadPlan,
 };
 
 use super::{UploadHooks, UploadOutcome, checked_size, report};
@@ -24,7 +24,7 @@ use crate::storage::upload::reader::SourceReader;
 /// failure, 5xx, or 403 is returned to the caller.
 const MAX_PART_ATTEMPTS: u32 = 3;
 
-/// Executes S3 multipart upload with retry and progress tracking.
+/// Executes a multipart upload with retry and progress tracking.
 ///
 /// Each part is retried up to 3 times on transport failure or 5xx. A 403
 /// (expired presigned URL) triggers a fresh URL mint via
@@ -50,7 +50,7 @@ pub(crate) async fn upload(
     total: Option<u64>,
     hooks: &mut UploadHooks<'_>,
 ) -> Result<UploadOutcome, StorageClientError> {
-    let UploadPlan::S3Multipart {
+    let UploadPlan::Multipart {
         part_count,
         part_size_bytes,
         required_headers,
@@ -58,13 +58,13 @@ pub(crate) async fn upload(
     } = plan
     else {
         return Err(StorageClientError::PlanMismatch {
-            expected: "S3Multipart",
+            expected: "Multipart",
             actual: super::plan_variant(plan),
         });
     };
-    let part_size = checked_size(*part_size_bytes, "S3 part size")?;
+    let part_size = checked_size(*part_size_bytes, "multipart part size")?;
     let capacity = usize::try_from(*part_count)
-        .map_err(|_| StorageClientError::PlanInvalid("S3 part count exceeds usize"))?;
+        .map_err(|_| StorageClientError::PlanInvalid("multipart part count exceeds usize"))?;
     let mut parts = Vec::with_capacity(capacity);
     let mut uploaded = 0u64;
     for part_number in 1..=*part_count {
@@ -81,7 +81,7 @@ pub(crate) async fn upload(
                 .await?;
         uploaded += bytes.len() as u64;
         report(hooks.progress.as_ref(), uploaded, total);
-        parts.push(S3CompletedPart { part_number, e_tag });
+        parts.push(CompletedPart { part_number, e_tag });
     }
     if reader.has_more().await? {
         return Err(StorageClientError::SizeMismatch {
@@ -98,7 +98,7 @@ pub(crate) async fn upload(
         });
     }
     Ok(UploadOutcome::NeedsServerComplete(
-        UploadCompleteRequest::S3Multipart(S3MultipartComplete { parts }),
+        UploadCompleteRequest::Multipart(MultipartComplete { parts }),
     ))
 }
 

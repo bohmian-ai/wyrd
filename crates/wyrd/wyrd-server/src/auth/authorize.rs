@@ -275,7 +275,7 @@ mod pg_tests {
     use wyrd_auth::connections::HumanConnections;
     use wyrd_auth_oidc::ScreenedHttp;
     use wyrd_dev_fixtures::pg::{PgFixture, seed_active_human_connection};
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use crate::components::auth::ServerAuth;
     use crate::state::AppState;
@@ -331,7 +331,7 @@ mod pg_tests {
                 fixture.wyrd_postgres().clone(),
                 fixture.vala_postgres().clone(),
             )),
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            Arc::new(StorageHandle::new(signer)),
             crate::test_support::test_catalog().await,
         );
         let audit = Arc::clone(&state.scribe_outbox);

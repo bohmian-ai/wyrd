@@ -2738,15 +2738,11 @@ mod tests {
     fn card_upload_entry_preserves_cloud_storage_plans() {
         let upload_id = UploadId::from_uuid(Uuid::now_v7());
         let plans = [
-            UploadPlan::S3Multipart {
+            UploadPlan::Multipart {
                 part_count: 2,
                 part_size_bytes: 8,
                 part_url_ttl_secs: 60,
                 required_headers: Vec::new(),
-            },
-            UploadPlan::GcsResumable {
-                session_uri: "https://storage.googleapis.com/session".to_owned(),
-                chunk_size_bytes: 8,
             },
             UploadPlan::AzureBlockBlob {
                 sas_url: "https://blob.core.windows.net/object?sas".to_owned(),

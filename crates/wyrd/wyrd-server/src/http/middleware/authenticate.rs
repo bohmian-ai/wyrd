@@ -254,7 +254,7 @@ mod pg_tests {
 
     async fn test_state() -> AppState {
         use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-        use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+        use wyrd_storage::{LocalSigner, StorageHandle};
 
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let root = tempfile::tempdir().expect("temp dir");
@@ -273,7 +273,7 @@ mod pg_tests {
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         crate::test_support::test_app_state(
             postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            Arc::new(StorageHandle::new(signer)),
             crate::test_support::test_catalog().await,
         )
         .with_auth(crate::components::auth::ServerAuth {

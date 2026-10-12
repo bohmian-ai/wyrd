@@ -2574,7 +2574,7 @@ mod tests {
     use super::{AppState, LimitsConfig};
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
 
@@ -2759,7 +2759,7 @@ mod tests {
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         crate::test_support::test_app_state(
             postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            Arc::new(StorageHandle::new(signer)),
             crate::test_support::test_catalog().await,
         )
     }

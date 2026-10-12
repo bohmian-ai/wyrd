@@ -11,6 +11,8 @@ use object_store::ObjectStore;
 use object_store::limit::LimitStore;
 use object_store::local::LocalFileSystem;
 use wyrd_storage::BackendConfig;
+#[cfg(feature = "cloud")]
+use wyrd_storage::CloudStore;
 
 use crate::resources::{BifrostResourceError, MetadataReservation, OracleMetadataResources};
 
@@ -24,8 +26,9 @@ pub use crate::storage::policy::{BifrostStorageConfig, BifrostStoragePolicy};
 /// uploads, Oracle's `DataFusion` scans, Forge rewrites and cleanup, and the
 /// Iceberg catalog's `FileIO`. The store is `object_store`'s own client for the
 /// configured backend behind one node-wide [`LimitStore`]; timeouts and
-/// retries are the cloud clients' own. `wyrd-storage` keeps its separate
-/// client for card and artifact storage.
+/// retries are the cloud clients' own. The client is built by
+/// `wyrd_storage::CloudStore` constructors, the same ones its card and
+/// artifact storage uses.
 #[derive(Debug)]
 pub struct BifrostStorage {
     /// The backend store every Bifrost operation runs against, rooted at the
@@ -50,15 +53,16 @@ impl BifrostStorage {
     ///
     /// A local root is created when absent and served by
     /// [`LocalFileSystem`], which has no timeout or retry. A cloud backend
-    /// uses `object_store`'s client for it, configured from the environment
-    /// for credentials, with the policy's request timeout and retry bounds and
-    /// `wyrd-storage`'s idle-connection lifetime for that backend. An endpoint
-    /// selects an S3-compatible service or an emulator.
+    /// uses `wyrd-storage`'s `object_store` client for it, configured from
+    /// the environment for credentials, with the policy's request timeout and
+    /// retry bounds and `wyrd-storage`'s idle-connection lifetime for that
+    /// backend. An endpoint selects an S3-compatible service, or a GCS or
+    /// Azure emulator in builds with `wyrd-storage`'s `emulator` feature.
     ///
     /// # Errors
     /// Returns [`BifrostStorageError::InvalidConfiguration`] when the local
     /// root cannot be created, a cloud backend is selected in a build without
-    /// the `cloud` feature, or `object_store` rejects the backend settings.
+    /// the `cloud` feature, or `wyrd-storage` rejects the backend settings.
     pub fn new(
         backend: &BackendConfig,
         policy: BifrostStoragePolicy,
@@ -85,8 +89,10 @@ impl BifrostStorage {
             detail: format!("the Bifrost object store cannot be built: {error}"),
         };
         #[cfg(feature = "cloud")]
-        let built = |store: object_store::Result<Arc<dyn ObjectStore>>| {
-            store.map_err(|error| invalid(&error))
+        let built = |store: Result<CloudStore, wyrd_storage::StorageError>| {
+            store
+                .map(|store| store.objects())
+                .map_err(|error| invalid(&error))
         };
         match backend {
             BackendConfig::Local { root } => {
@@ -96,11 +102,20 @@ impl BifrostStorage {
                 ))
             }
             #[cfg(feature = "cloud")]
-            BackendConfig::S3(config) => built(cloud::s3(config, backend, policy)),
+            BackendConfig::S3(config) => {
+                let (options, retry) = cloud_transport(backend, policy);
+                built(CloudStore::s3(config, options, retry))
+            }
             #[cfg(feature = "cloud")]
-            BackendConfig::Gcs(config) => built(cloud::gcs(config, backend, policy)),
+            BackendConfig::Gcs(config) => {
+                let (options, retry) = cloud_transport(backend, policy);
+                built(CloudStore::gcs(config, options, retry))
+            }
             #[cfg(feature = "cloud")]
-            BackendConfig::Azure(config) => built(cloud::azure(config, backend, policy)),
+            BackendConfig::Azure(config) => {
+                let (options, retry) = cloud_transport(backend, policy);
+                built(CloudStore::azure(config, options, retry))
+            }
             #[cfg(not(feature = "cloud"))]
             BackendConfig::S3(_) | BackendConfig::Gcs(_) | BackendConfig::Azure(_) => {
                 let _ = policy;
@@ -222,113 +237,23 @@ impl BifrostStorage {
     }
 }
 
-/// `object_store`'s cloud clients, built from `wyrd-storage`'s backend settings.
+/// Returns the HTTP options and retry bounds every Bifrost cloud client uses.
+///
+/// The request timeout and retry bounds are the policy's; the idle-pool
+/// lifetime and plain-HTTP allowance are `wyrd-storage`'s for this backend.
 #[cfg(feature = "cloud")]
-mod cloud {
-    use std::sync::Arc;
-
-    use object_store::aws::AmazonS3Builder;
-    use object_store::azure::MicrosoftAzureBuilder;
-    use object_store::gcp::GoogleCloudStorageBuilder;
-    use object_store::{ClientOptions, ObjectStore, RetryConfig};
-    use wyrd_storage::BackendConfig;
-    use wyrd_storage::settings::{AzureConfig, GcsConfig, S3Config};
-
-    use super::BifrostStoragePolicy;
-
-    /// Returns the HTTP options and retry bounds every cloud client shares.
-    ///
-    /// The request timeout and retry bounds are the policy's; the idle-pool
-    /// lifetime is `wyrd-storage`'s for this backend, and plain HTTP is allowed
-    /// only for an `http://` endpoint (an emulator or local service).
-    fn client(
-        backend: &BackendConfig,
-        endpoint: Option<&str>,
-        policy: BifrostStoragePolicy,
-    ) -> (ClientOptions, RetryConfig) {
-        let options = ClientOptions::new()
-            .with_timeout(policy.request_timeout())
-            .with_pool_idle_timeout(wyrd_storage::factory::pool_idle_timeout(backend))
-            .with_allow_http(endpoint.is_some_and(|endpoint| endpoint.starts_with("http://")));
-        let retry = RetryConfig {
-            max_retries: usize::try_from(policy.max_retries()).unwrap_or(usize::MAX),
-            retry_timeout: policy.max_retry_elapsed(),
-            ..RetryConfig::default()
-        };
-        (options, retry)
-    }
-
-    /// Builds the S3 client: virtual-hosted on AWS, path-style at an endpoint.
-    ///
-    /// # Errors
-    /// Returns the `object_store` error for unusable settings or credentials.
-    pub(super) fn s3(
-        config: &S3Config,
-        backend: &BackendConfig,
-        policy: BifrostStoragePolicy,
-    ) -> object_store::Result<Arc<dyn ObjectStore>> {
-        let (options, retry) = client(backend, config.endpoint_url.as_deref(), policy);
-        let mut builder = AmazonS3Builder::from_env()
-            .with_bucket_name(&config.bucket)
-            .with_client_options(options)
-            .with_retry(retry);
-        if let Some(region) = &config.region {
-            builder = builder.with_region(region);
-        }
-        builder = match &config.endpoint_url {
-            Some(endpoint) => builder.with_endpoint(endpoint),
-            None => builder.with_virtual_hosted_style_request(true),
-        };
-        Ok(Arc::new(builder.build()?))
-    }
-
-    /// Builds the GCS client with `wyrd-storage`'s service-account cascade;
-    /// an endpoint without a key is an anonymous emulator.
-    ///
-    /// # Errors
-    /// Returns the `object_store` error for unusable settings or credentials.
-    pub(super) fn gcs(
-        config: &GcsConfig,
-        backend: &BackendConfig,
-        policy: BifrostStoragePolicy,
-    ) -> object_store::Result<Arc<dyn ObjectStore>> {
-        let (options, retry) = client(backend, config.endpoint_url.as_deref(), policy);
-        let mut builder = GoogleCloudStorageBuilder::from_env()
-            .with_bucket_name(&config.bucket)
-            .with_client_options(options)
-            .with_retry(retry);
-        let key = wyrd_storage::factory::gcs::service_account_json();
-        if let Some(key) = &key {
-            builder = builder.with_service_account_key(key);
-        }
-        if let Some(endpoint) = &config.endpoint_url {
-            builder = builder
-                .with_base_url(endpoint)
-                .with_skip_signature(key.is_none());
-        }
-        Ok(Arc::new(builder.build()?))
-    }
-
-    /// Builds the Azure Blob client; an endpoint names the account URL.
-    ///
-    /// # Errors
-    /// Returns the `object_store` error for unusable settings or credentials.
-    pub(super) fn azure(
-        config: &AzureConfig,
-        backend: &BackendConfig,
-        policy: BifrostStoragePolicy,
-    ) -> object_store::Result<Arc<dyn ObjectStore>> {
-        let (options, retry) = client(backend, config.endpoint_url.as_deref(), policy);
-        let mut builder = MicrosoftAzureBuilder::from_env()
-            .with_account(&config.account)
-            .with_container_name(&config.container)
-            .with_client_options(options)
-            .with_retry(retry);
-        if let Some(endpoint) = &config.endpoint_url {
-            builder = builder.with_endpoint(endpoint.clone());
-        }
-        Ok(Arc::new(builder.build()?))
-    }
+fn cloud_transport(
+    backend: &BackendConfig,
+    policy: BifrostStoragePolicy,
+) -> (object_store::ClientOptions, object_store::RetryConfig) {
+    let options =
+        wyrd_storage::factory::client_options(backend).with_timeout(policy.request_timeout());
+    let retry = object_store::RetryConfig {
+        max_retries: usize::try_from(policy.max_retries()).unwrap_or(usize::MAX),
+        retry_timeout: policy.max_retry_elapsed(),
+        ..object_store::RetryConfig::default()
+    };
+    (options, retry)
 }
 
 #[cfg(test)]

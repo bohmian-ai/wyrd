@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::WyrdClient;
 use wyrd_spec::storage::{
-    DownloadPlan, GcsResumableComplete, PartUrlResponse, SinglePutComplete, UploadCompleteRequest,
+    DownloadPlan, PartUrlResponse, SinglePutComplete, UploadCompleteRequest,
     UploadCompleteResponse, UploadId, UploadPlan,
 };
 
@@ -119,7 +119,7 @@ impl WyrdStorageClient {
         idempotency_key: &str,
         progress: Option<UploadProgressSink>,
     ) -> Result<(), StorageClientError> {
-        let part_url_minter = upload::s3_part_url_minter(self, upload_id, plan);
+        let part_url_minter = upload::part_url_minter(self, upload_id, plan);
         let progress_callback = progress.map(|sink| {
             let upload_id = upload_id.clone();
             Arc::new(move |uploaded_bytes, total_bytes| {
@@ -147,10 +147,7 @@ impl WyrdStorageClient {
                 UploadPlan::LocalFs { .. } | UploadPlan::SinglePut { .. } => {
                     Some(UploadCompleteRequest::SinglePut(SinglePutComplete {}))
                 }
-                UploadPlan::GcsResumable { .. } => {
-                    Some(UploadCompleteRequest::GcsResumable(GcsResumableComplete {}))
-                }
-                UploadPlan::S3Multipart { .. } | UploadPlan::AzureBlockBlob { .. } => None,
+                UploadPlan::Multipart { .. } | UploadPlan::AzureBlockBlob { .. } => None,
             })
             .ok_or(StorageClientError::PlanMismatch {
                 expected: "server-completable upload outcome",
@@ -189,7 +186,7 @@ impl WyrdStorageClient {
         upload::dispatch(&self.client, plan, source, hooks).await
     }
 
-    /// Mint one S3 multipart part URL through the authenticated Wyrd server.
+    /// Mint one multipart part URL through the authenticated Wyrd server.
     ///
     /// The returned URL is provider-presigned and must be used without Wyrd
     /// credentials. The storage service remains responsible for tenant checks
@@ -197,7 +194,7 @@ impl WyrdStorageClient {
     ///
     /// # Errors
     /// Returns a structured server error when the upload is missing, expired,
-    /// or is not an S3 multipart upload.
+    /// or is not an multipart upload.
     async fn part_url(
         &self,
         upload_id: &UploadId,
@@ -215,7 +212,7 @@ impl WyrdStorageClient {
 
     /// Complete a server-owned upload after the backend accepted its bytes.
     ///
-    /// S3 multipart and Azure block uploads require this call to commit their
+    /// multipart and Azure block uploads require this call to commit their
     /// backend state. The server then verifies the stored object and advances
     /// the durable upload row.
     ///

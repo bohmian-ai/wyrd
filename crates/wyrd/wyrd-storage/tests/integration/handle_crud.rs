@@ -18,7 +18,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::StorageBackendKind;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::settings;
-use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle, ValidatedPath, tenant_path};
+use wyrd_storage::{LocalSigner, StorageHandle, ValidatedPath, tenant_path};
 
 /// Write/read/list/delete round-trip plus a missing-key `NotFound`, all through
 /// the public [`StorageHandle`] data-plane API.
@@ -147,9 +147,8 @@ async fn configured_handle(kind: StorageBackendKind) -> Arc<StorageHandle> {
 #[tokio::test]
 async fn local_handle_crud() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let signer =
-        BackendSigner::Local(LocalSigner::new(dir.path().to_path_buf()).expect("local signer"));
-    let handle = StorageHandle::new(signer);
+    let handle =
+        StorageHandle::new(LocalSigner::new(dir.path().to_path_buf()).expect("local signer"));
     run_handle_crud(&handle).await;
 }
 

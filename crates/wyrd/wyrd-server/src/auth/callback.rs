@@ -83,7 +83,7 @@ mod pg_tests {
         user_id_by_identity,
     };
     use wyrd_sql::row_types::auth::HumanConnectionBinding;
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use super::exchange_authorization_code;
     use crate::auth::oauth::OAuthError;
@@ -1334,7 +1334,7 @@ mod pg_tests {
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         crate::test_support::test_app_state(
             postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            Arc::new(StorageHandle::new(signer)),
             crate::test_support::test_catalog().await,
         )
     }

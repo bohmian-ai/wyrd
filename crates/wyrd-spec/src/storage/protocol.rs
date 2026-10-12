@@ -15,10 +15,8 @@ use std::str::FromStr;
 pub enum WireProtocol {
     /// Cloud single PUT to a presigned URL.
     SinglePutV1,
-    /// AWS S3 multipart upload.
-    S3MultipartV1,
-    /// Google Cloud Storage resumable upload.
-    GcsResumableV1,
+    /// Multipart upload over the multipart protocol, served by AWS S3 and the GCS XML API.
+    MultipartV1,
     /// Azure block blob upload.
     AzureBlockBlobV1,
     /// Local filesystem upload through a server-owned temporary object.
@@ -29,8 +27,7 @@ impl fmt::Display for WireProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::SinglePutV1 => "single_put_v1",
-            Self::S3MultipartV1 => "s3_multipart_v1",
-            Self::GcsResumableV1 => "gcs_resumable_v1",
+            Self::MultipartV1 => "multipart_v1",
             Self::AzureBlockBlobV1 => "azure_block_blob_v1",
             Self::LocalFsV1 => "local_fs_v1",
         })
@@ -43,8 +40,7 @@ impl FromStr for WireProtocol {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "single_put_v1" => Ok(Self::SinglePutV1),
-            "s3_multipart_v1" => Ok(Self::S3MultipartV1),
-            "gcs_resumable_v1" => Ok(Self::GcsResumableV1),
+            "multipart_v1" => Ok(Self::MultipartV1),
             "azure_block_blob_v1" => Ok(Self::AzureBlockBlobV1),
             "local_fs_v1" => Ok(Self::LocalFsV1),
             other => Err(WireProtocolParseError(other.to_owned())),

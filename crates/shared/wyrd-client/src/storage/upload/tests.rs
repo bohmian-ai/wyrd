@@ -12,7 +12,7 @@ use crate::transport::credential::ResolvedCredential;
 use super::{ProgressCallback, UploadHooks, UploadOutcome, report, validate_plan};
 use crate::storage::WyrdStorageClient;
 use crate::storage::error::StorageClientError;
-use wyrd_spec::storage::{S3MultipartComplete, UploadCompleteRequest};
+use wyrd_spec::storage::{MultipartComplete, UploadCompleteRequest};
 
 /// Build an [`AuthMiddleware`] with a static bearer credential and default config.
 ///
@@ -36,24 +36,16 @@ fn client() -> WyrdClient {
 /// `UploadOutcome::into_server_complete` surfaces the completion body without protocol matching.
 #[test]
 fn server_completion_is_exposed_without_protocol_matching_at_the_call_site() {
-    let outcome = UploadOutcome::NeedsServerComplete(UploadCompleteRequest::S3Multipart(
-        S3MultipartComplete { parts: Vec::new() },
-    ));
+    let outcome =
+        UploadOutcome::NeedsServerComplete(UploadCompleteRequest::Multipart(MultipartComplete {
+            parts: Vec::new(),
+        }));
     assert!(outcome.into_server_complete().is_some());
 }
 
 /// Zero-sized chunk, block, and part dimensions are rejected by [`validate_plan`].
 #[test]
 fn malformed_dimensions_fail_before_dispatch() {
-    let plan = wyrd_spec::storage::UploadPlan::GcsResumable {
-        session_uri: "https://backend.invalid/session".to_owned(),
-        chunk_size_bytes: 0,
-    };
-    assert!(matches!(
-        validate_plan(&plan),
-        Err(StorageClientError::PlanInvalid(_))
-    ));
-
     let plan = wyrd_spec::storage::UploadPlan::AzureBlockBlob {
         sas_url: "https://backend.invalid/blob".to_owned(),
         block_size_bytes: 0,
@@ -64,7 +56,7 @@ fn malformed_dimensions_fail_before_dispatch() {
         Err(StorageClientError::PlanInvalid(_))
     ));
 
-    let plan = wyrd_spec::storage::UploadPlan::S3Multipart {
+    let plan = wyrd_spec::storage::UploadPlan::Multipart {
         part_count: 0,
         part_size_bytes: 1,
         part_url_ttl_secs: 60,
@@ -100,9 +92,10 @@ fn progress_preserves_known_and_unknown_totals() {
 /// Over-range chunk sizes fail plan validation before the facade issues any request.
 #[tokio::test]
 async fn over_range_dimensions_fail_before_request_dispatch() {
-    let plan = wyrd_spec::storage::UploadPlan::GcsResumable {
-        session_uri: "https://backend.invalid/session".to_owned(),
-        chunk_size_bytes: u64::MAX,
+    let plan = wyrd_spec::storage::UploadPlan::AzureBlockBlob {
+        sas_url: "https://backend.invalid/blob".to_owned(),
+        block_size_bytes: u64::MAX,
+        block_count_planned: 1,
     };
     let wyrd = client();
     let error = WyrdStorageClient::new(&wyrd)

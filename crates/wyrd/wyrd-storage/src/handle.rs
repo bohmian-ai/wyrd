@@ -1,10 +1,14 @@
 //! Storage handle shared by server-tier crates.
 
 use crate::error::StorageError;
+use crate::local::LocalSigner;
 use crate::settings::{BackendConfig, StorageSettings};
 use crate::signer::BackendSigner;
+use crate::telemetry::{ActiveOperation, StorageOperation};
 use crate::tenant_path::ValidatedPath;
-use opendal::{EntryMode, ErrorKind, Operator};
+use futures_util::TryStreamExt as _;
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt as _};
 use std::sync::Arc;
 use std::time::Duration;
 use wyrd_spec::storage::StorageBackendKind;
@@ -20,7 +24,7 @@ pub enum StorageHealthError {
     },
     /// The storage backend returned an unexpected error.
     #[error("storage health probe failed")]
-    Backend(#[source] opendal::Error),
+    Backend(#[source] object_store::Error),
     /// Local storage root is inaccessible.
     #[error("local storage root is inaccessible")]
     LocalRoot(#[source] std::io::Error),
@@ -28,16 +32,27 @@ pub enum StorageHealthError {
 
 /// Shared storage handle.
 ///
-/// The handle carries the active backend signer and the opendal `Operator`
-/// used for backend health probing.
+/// The handle carries the active backend signer and the `object_store` data
+/// plane bound to the same backend. A cloud handle's data plane is the
+/// signer's own store, so presigning, multipart control, and direct reads and
+/// writes share one client.
 #[derive(Clone)]
 pub struct StorageHandle {
+    /// Signer for client presigning, multipart control, and verification.
     signer: BackendSigner,
-    operator: Operator,
+    /// Data plane for server-side reads, writes, listing, and deletes.
+    objects: Arc<dyn ObjectStore>,
+    /// Backend label recorded on every storage metric.
+    metrics_backend: &'static str,
+    /// Backend settings the handle was built from.
     backend_config: BackendConfig,
+    /// Whether upload completion verifies server-side encryption.
     require_encryption: bool,
+    /// Lifetime of presigned URLs.
     presign_ttl: Duration,
+    /// Default multipart part size.
     default_part_size_bytes: u64,
+    /// Size at or above which cloud uploads use multipart.
     multipart_threshold_bytes: u64,
 }
 
@@ -45,7 +60,7 @@ impl std::fmt::Debug for StorageHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageHandle")
             .field("backend", &self.signer.kind())
-            .field("operator", &"<opendal::Operator>")
+            .field("objects", &self.objects)
             .field("require_encryption", &self.require_encryption)
             .field("presign_ttl", &self.presign_ttl)
             .field("default_part_size_bytes", &self.default_part_size_bytes)
@@ -55,44 +70,41 @@ impl std::fmt::Debug for StorageHandle {
 }
 
 impl StorageHandle {
-    /// Build a storage handle from an already-constructed signer.
+    /// Build a local storage handle from an already-constructed signer.
     ///
-    /// Intended for tests and local-mode harnesses. The resulting
-    /// [`BackendConfig`] is synthesized from the signer alone, so
-    /// optional fields (`region`, `endpoint_url`) are
-    /// defaulted, `require_encryption` is `false`,
-    /// `presign_ttl` is the crate default, and `default_part_size_bytes`
-    /// is the crate default. Production paths must use [`Self::from_settings`].
+    /// Intended for tests and local-mode harnesses: `require_encryption` is
+    /// `false` and every tuning value is the crate default. Production paths
+    /// must use [`Self::from_settings`].
     ///
     /// # Panics
     ///
-    /// Panics if opendal operator or HTTP client construction fails for the
-    /// synthesized config. Operator construction is lazy under opendal 0.57 (no
-    /// network calls or credential loading at build time), and the HTTP client
-    /// fails only when no Rustls crypto provider can be installed. Production
-    /// paths must use [`Self::from_settings`].
+    /// Panics if the signer's root, which [`LocalSigner::new`] proved exists,
+    /// can no longer be opened as a filesystem store.
     #[must_use]
-    pub fn new(signer: BackendSigner) -> Self {
-        let backend_config = match &signer {
-            BackendSigner::Local(local) => BackendConfig::Local {
-                root: local.root().to_path_buf(),
-            },
-            #[cfg(feature = "cloud")]
-            BackendSigner::Cloud(cloud) => cloud.backend_config(),
+    pub fn new(signer: LocalSigner) -> Self {
+        let backend_config = BackendConfig::Local {
+            root: signer.root().to_path_buf(),
         };
-        let operator = crate::factory::build_operator(&backend_config)
-            .expect("operator construction is infallible for the test/local-harness constructor");
-        Self::assemble(signer, operator, backend_config)
+        let signer = BackendSigner::Local(signer);
+        let objects = signer
+            .objects()
+            .expect("invariant: a LocalSigner root exists and opens as a filesystem store");
+        Self::assemble(signer, objects, backend_config)
     }
 
-    /// Assemble a handle from its substrate parts with default tuning.
-    fn assemble(signer: BackendSigner, operator: Operator, backend_config: BackendConfig) -> Self {
-        let operator = operator.layer(crate::telemetry::StorageTelemetryLayer::new(
-            backend_config.kind(),
-        ));
+    /// Assemble a handle from its substrate parts with default tuning and
+    /// register its idle operation gauges.
+    fn assemble(
+        signer: BackendSigner,
+        objects: Arc<dyn ObjectStore>,
+        backend_config: BackendConfig,
+    ) -> Self {
+        let metrics_backend = crate::telemetry::backend_label(backend_config.kind());
+        crate::telemetry::register(metrics_backend);
         Self {
             signer,
-            operator,
+            objects,
+            metrics_backend,
             backend_config,
             require_encryption: false,
             presign_ttl: Duration::from_secs(u64::from(crate::settings::DEFAULT_PRESIGN_TTL_SECS)),
@@ -103,44 +115,50 @@ impl StorageHandle {
 
     /// Build a storage handle from boot settings.
     ///
+    /// Builds the backend signer, runs the boot preflight, and binds the data
+    /// plane to the signer's store.
+    ///
     /// # Errors
-    /// Returns a storage error when signer or operator construction fails.
+    /// Returns a storage error when signer or store construction fails.
     pub async fn from_settings(settings: StorageSettings) -> Result<Arc<Self>, StorageError> {
-        let operator = crate::factory::build_operator(&settings.backend)?;
-        Self::from_settings_with_operator(settings, operator).await
+        let signer = crate::factory::build_signer(&settings.backend).await?;
+        let objects = signer.objects()?;
+        Ok(Self::finish(settings, signer, objects).await)
     }
 
-    /// Build a storage handle from boot settings over a supplied operator.
+    /// Build a storage handle from boot settings over a supplied data plane.
     ///
-    /// [`Self::from_settings`] constructs the operator from the backend
-    /// configuration and delegates here. A caller supplies its own operator
-    /// only to model a backend capability the locally available service does
-    /// not implement — a test harness layers cursor-resumable listing onto the
-    /// filesystem service so it behaves like the object stores production
-    /// deploys against. The signer, preflight probe, telemetry layer, and every
-    /// tuning value are exactly the ones [`Self::from_settings`] applies.
+    /// The signer, preflight, telemetry, and every tuning value are exactly
+    /// the ones [`Self::from_settings`] applies; only server-side reads,
+    /// writes, listing, and deletes go to `objects`. A test supplies a store
+    /// that wraps the backend's to model behavior the local service does not
+    /// exhibit, such as metadata that under-reports an object's size.
     ///
     /// # Errors
     /// Returns a storage error when signer construction fails.
-    pub async fn from_settings_with_operator(
+    pub async fn from_settings_with_store(
         settings: StorageSettings,
-        operator: Operator,
+        objects: Arc<dyn ObjectStore>,
     ) -> Result<Arc<Self>, StorageError> {
         let signer = crate::factory::build_signer(&settings.backend).await?;
-        crate::preflight::run(&signer).await;
+        Ok(Self::finish(settings, signer, objects).await)
+    }
 
-        let operator = operator.layer(crate::telemetry::StorageTelemetryLayer::new(
-            settings.backend.kind(),
-        ));
-        Ok(Arc::new(Self {
-            signer,
-            operator,
-            backend_config: settings.backend,
+    /// Run the boot preflight and apply the settings' tuning.
+    async fn finish(
+        settings: StorageSettings,
+        signer: BackendSigner,
+        objects: Arc<dyn ObjectStore>,
+    ) -> Arc<Self> {
+        crate::preflight::run(&signer).await;
+        let handle = Self::assemble(signer, objects, settings.backend);
+        Arc::new(Self {
             require_encryption: settings.require_encryption,
             presign_ttl: settings.presign_ttl,
             default_part_size_bytes: settings.part_size_bytes,
             multipart_threshold_bytes: settings.multipart_threshold_bytes,
-        }))
+            ..handle
+        })
     }
 
     /// Return the configured backend kind.
@@ -159,15 +177,6 @@ impl StorageHandle {
     #[must_use]
     pub fn signer(&self) -> &BackendSigner {
         &self.signer
-    }
-
-    /// Borrow the active `OpenDAL` operator.
-    ///
-    /// Data-plane workers that share this storage handle must use this
-    /// operator so artifact and analytical paths retain one backend binding.
-    #[must_use]
-    pub fn operator(&self) -> &Operator {
-        &self.operator
     }
 
     /// Whether upload completion must verify server-side encryption markers.
@@ -202,29 +211,33 @@ impl StorageHandle {
 
     /// Probe the storage backend for liveness.
     ///
-    /// For the local backend, attempts a `stat` of the configured storage root
-    /// directory. For cloud backends (S3, GCS, Azure), issues a `stat` against
-    /// `_wyrd/health.sentinel`; `NotFound` is treated as healthy (bucket
-    /// accessible, sentinel absent is expected).
+    /// For the local backend, reads the metadata of the configured storage
+    /// root. For cloud backends (S3, GCS, Azure), issues a `HEAD` of
+    /// `_wyrd/health.sentinel`; not-found is healthy (the bucket answered and
+    /// the sentinel is expected to be absent).
     ///
     /// # Errors
     ///
-    /// Returns [`StorageHealthError`] when the probe times out or the backend
-    /// returns an error that indicates inaccessibility.
+    /// Returns [`StorageHealthError`] when the backend returns an error that
+    /// indicates inaccessibility.
     #[tracing::instrument(skip(self))]
     pub async fn health_probe(&self) -> Result<(), StorageHealthError> {
         if let BackendConfig::Local { root } = &self.backend_config {
-            tokio::fs::metadata(root)
+            return tokio::fs::metadata(root)
                 .await
                 .map(|_| ())
-                .map_err(StorageHealthError::LocalRoot)
-        } else {
-            match self.operator.stat("_wyrd/health.sentinel").await {
-                Ok(_) => Ok(()),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(StorageHealthError::Backend(e)),
-            }
+                .map_err(StorageHealthError::LocalRoot);
         }
+        let active = self.start(StorageOperation::Head);
+        let result = match self
+            .objects
+            .head(&Path::from("_wyrd/health.sentinel"))
+            .await
+        {
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(StorageHealthError::Backend(error)),
+        };
+        active.finish(result, 0)
     }
 
     /// Read an object's bytes directly from the backend.
@@ -237,24 +250,24 @@ impl StorageHandle {
     /// [`StorageError::Backend`] for any other backend failure.
     #[tracing::instrument(skip(self), fields(backend = ?self.backend()))]
     pub async fn get_object(&self, path: &ValidatedPath) -> Result<Vec<u8>, StorageError> {
-        let buf = self
-            .operator
-            .read(&path.full)
+        let active = self.start(StorageOperation::Get);
+        let result = async { self.objects.get(&path.location()).await?.bytes().await }
             .await
-            .map_err(|e| self.map_operator_error(&e, "get_object", &path.full))?;
-        Ok(buf.to_vec())
+            .map(Vec::from)
+            .map_err(|error| self.store_error(&error, "get_object", path));
+        let bytes = result.as_ref().map_or(0, |body| body.len() as u64);
+        active.finish(result, bytes)
     }
 
     /// Read an object's body, holding at most `limit + 1` bytes of it.
     ///
-    /// The body streams from the backend chunk by chunk through the raw
-    /// accessor and the read stops as soon as `limit + 1` bytes are held. No
-    /// stored metadata sizes the read, so a caller whose earlier
-    /// [`Self::object_len`] check saw a stale or replaced object still learns
-    /// the truth: the returned buffer is longer than `limit` exactly when the
-    /// body is. Callers reject that overflow; this method only bounds the
-    /// allocation. Dropping the reader early abandons the rest of the body.
-    /// The object key is not recorded on the tracing span.
+    /// The body streams from the backend chunk by chunk and the read stops as
+    /// soon as `limit + 1` bytes are held. No stored metadata sizes the read,
+    /// so a caller whose earlier [`Self::object_len`] check saw a stale or
+    /// replaced object still learns the truth: the returned buffer is longer
+    /// than `limit` exactly when the body is. Callers reject that overflow;
+    /// this method only bounds the allocation. Stopping early drops the rest
+    /// of the body stream. The object key is not recorded on the tracing span.
     ///
     /// # Errors
     /// Returns [`StorageError::ObjectNotFound`] when the object is absent, or
@@ -266,31 +279,25 @@ impl StorageHandle {
         path: &ValidatedPath,
         limit: u64,
     ) -> Result<Vec<u8>, StorageError> {
-        use opendal::raw::oio::Read as _;
-        use opendal::raw::{Access as _, OpRead, normalize_path};
-
         let held = usize::try_from(limit)
             .unwrap_or(usize::MAX)
             .saturating_add(1);
-        let failed = |error: opendal::Error| {
-            self.map_operator_error(&error, "get_object_bounded", &path.full)
-        };
-        let (_, mut reader) = self
-            .operator
-            .inner()
-            .read(&normalize_path(&path.full), OpRead::new())
-            .await
-            .map_err(failed)?;
-        let mut body = Vec::new();
-        while body.len() < held {
-            let chunk = reader.read().await.map_err(failed)?.to_bytes();
-            if chunk.is_empty() {
-                break;
+        let active = self.start(StorageOperation::Get);
+        let result = async {
+            let mut stream = self.objects.get(&path.location()).await?.into_stream();
+            let mut body = Vec::new();
+            while body.len() < held
+                && let Some(chunk) = stream.try_next().await?
+            {
+                let take = chunk.len().min(held - body.len());
+                body.extend_from_slice(&chunk[..take]);
             }
-            let take = chunk.len().min(held - body.len());
-            body.extend_from_slice(&chunk[..take]);
+            Ok(body)
         }
-        Ok(body)
+        .await
+        .map_err(|error| self.store_error(&error, "get_object_bounded", path));
+        let bytes = result.as_ref().map_or(0, |body| body.len() as u64);
+        active.finish(result, bytes)
     }
 
     /// Size in bytes of an object, read from its metadata without its body.
@@ -302,14 +309,21 @@ impl StorageHandle {
     /// [`StorageError::Backend`] for any other backend failure.
     #[tracing::instrument(skip(self), fields(backend = ?self.backend()))]
     pub async fn object_len(&self, path: &ValidatedPath) -> Result<u64, StorageError> {
-        self.operator
-            .stat(&path.full)
+        let active = self.start(StorageOperation::Head);
+        let result = self
+            .objects
+            .head(&path.location())
             .await
-            .map(|metadata| metadata.content_length())
-            .map_err(|e| self.map_operator_error(&e, "object_len", &path.full))
+            .map(|meta| meta.size)
+            .map_err(|error| self.store_error(&error, "object_len", path));
+        active.finish(result, 0)
     }
 
     /// Write an object's bytes directly to the backend.
+    ///
+    /// The local backend stages and renames the file through
+    /// [`LocalSigner::write_atomically`]; cloud backends issue one `PUT`,
+    /// which never retries.
     ///
     /// # Errors
     /// Returns [`StorageError::Backend`] when the backend write fails.
@@ -319,75 +333,76 @@ impl StorageHandle {
         path: &ValidatedPath,
         bytes: Vec<u8>,
     ) -> Result<(), StorageError> {
-        #[cfg(not(feature = "cloud"))]
-        {
-            let BackendSigner::Local(local) = &self.signer;
-            return local
-                .write_atomically(std::path::Path::new(&path.full), &bytes)
-                .await;
-        }
-        #[cfg(feature = "cloud")]
-        if let BackendSigner::Local(local) = &self.signer {
-            return local
-                .write_atomically(std::path::Path::new(&path.full), &bytes)
-                .await;
-        }
-        #[cfg(feature = "cloud")]
-        self.operator
-            .write(&path.full, bytes)
-            .await
-            .map_err(|e| self.map_operator_error(&e, "put_object", &path.full))?;
-        #[cfg(feature = "cloud")]
-        Ok(())
+        let len = bytes.len() as u64;
+        let active = self.start(StorageOperation::Put);
+        let result = match &self.signer {
+            BackendSigner::Local(local) => {
+                local
+                    .write_atomically(std::path::Path::new(&path.full), &bytes)
+                    .await
+            }
+            #[cfg(feature = "cloud")]
+            BackendSigner::Cloud(_) => self
+                .objects
+                .put(&path.location(), object_store::PutPayload::from(bytes))
+                .await
+                .map(|_| ())
+                .map_err(|error| self.store_error(&error, "put_object", path)),
+        };
+        active.finish(result, len)
     }
 
     /// List object keys beneath a tenant-validated path.
     ///
-    /// Returns the full backend keys of every file under `path` (recursive).
+    /// Returns the full backend keys of every object strictly under `path`
+    /// (recursive).
     ///
     /// # Errors
     /// Returns [`StorageError::Backend`] when the backend list fails.
     #[tracing::instrument(skip(self), fields(backend = ?self.backend()))]
     pub async fn list_objects(&self, path: &ValidatedPath) -> Result<Vec<String>, StorageError> {
-        // Trailing slash scopes listing to objects strictly under this prefix;
-        // opendal list_with without it also matches the prefix key itself.
-        let prefix = format!("{}/", path.full);
-        let entries = self
-            .operator
-            .list_with(&prefix)
-            .recursive(true)
+        let active = self.start(StorageOperation::List);
+        let result = self
+            .objects
+            .list(Some(&path.location()))
+            .map_ok(|meta| meta.location.to_string())
+            .try_collect()
             .await
-            .map_err(|e| self.map_operator_error(&e, "list_objects", &path.full))?;
-        Ok(entries
-            .into_iter()
-            .filter(|entry| entry.metadata().mode() == EntryMode::FILE)
-            .map(|entry| entry.path().to_owned())
-            .collect())
+            .map_err(|error| self.store_error(&error, "list_objects", path));
+        active.finish(result, 0)
     }
 
     /// Delete an object directly from the backend.
+    ///
+    /// Deleting an absent object succeeds, so a repeated delete is idempotent.
     ///
     /// # Errors
     /// Returns [`StorageError::Backend`] when the backend delete fails.
     #[tracing::instrument(skip(self), fields(backend = ?self.backend()))]
     pub async fn delete_object(&self, path: &ValidatedPath) -> Result<(), StorageError> {
-        self.operator
-            .delete(&path.full)
-            .await
-            .map_err(|e| self.map_operator_error(&e, "delete_object", &path.full))?;
-        Ok(())
+        let active = self.start(StorageOperation::Delete);
+        let result = match self.objects.delete(&path.location()).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(self.store_error(&error, "delete_object", path)),
+        };
+        active.finish(result, 0)
     }
 
-    /// Map an opendal data-plane error onto the storage error catalog.
-    fn map_operator_error(
+    /// Start one metered data-plane operation.
+    fn start(&self, operation: StorageOperation) -> ActiveOperation {
+        ActiveOperation::start(self.metrics_backend, operation)
+    }
+
+    /// Map an `object_store` data-plane error onto the storage error catalog.
+    fn store_error(
         &self,
-        error: &opendal::Error,
+        error: &object_store::Error,
         op: &'static str,
-        storage_path: &str,
+        path: &ValidatedPath,
     ) -> StorageError {
-        if error.kind() == ErrorKind::NotFound {
+        if matches!(error, object_store::Error::NotFound { .. }) {
             StorageError::ObjectNotFound {
-                storage_path: storage_path.to_owned(),
+                storage_path: path.full.clone(),
             }
         } else {
             StorageError::Backend {
@@ -405,10 +420,9 @@ mod tests {
     use crate::local::LocalSigner;
     use tempfile::TempDir;
 
+    /// Build a local handle over `root`.
     fn local_handle(root: &std::path::Path) -> StorageHandle {
-        let signer =
-            BackendSigner::Local(LocalSigner::new(root.to_path_buf()).expect("local signer"));
-        StorageHandle::new(signer)
+        StorageHandle::new(LocalSigner::new(root.to_path_buf()).expect("local signer"))
     }
 
     #[tokio::test]
@@ -480,6 +494,59 @@ mod tests {
             matches!(absent, Err(StorageError::ObjectNotFound { .. })),
             "expected ObjectNotFound, got {absent:?}"
         );
+    }
+    /// Every data-plane call records one success with its bytes, and no
+    /// operation stays active afterwards.
+    #[tokio::test(flavor = "current_thread")]
+    async fn data_plane_calls_emit_exact_operation_metrics() {
+        let recorder = crate::telemetry::tests::TestRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = TempDir::new().expect("tempdir");
+        let handle = local_handle(dir.path());
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let card = uuid::Uuid::now_v7().to_string();
+        let path = crate::tenant_path::validate(
+            &crate::tenant_path::build(tenant, &card, "dir/object"),
+            tenant,
+        )
+        .expect("object path is valid");
+        let prefix =
+            crate::tenant_path::validate(&crate::tenant_path::build(tenant, &card, "dir"), tenant)
+                .expect("prefix path is valid");
+
+        handle.put_object(&path, vec![1_u8; 3]).await.expect("put");
+        assert_eq!(handle.get_object(&path).await.expect("get").len(), 3);
+        assert_eq!(handle.object_len(&path).await.expect("head"), 3);
+        assert_eq!(
+            handle.list_objects(&prefix).await.expect("list"),
+            vec![path.full.clone()]
+        );
+        handle.delete_object(&path).await.expect("delete");
+
+        for (direction, operation) in [("write", "put"), ("read", "get")] {
+            assert_eq!(
+                recorder.counter(&format!(
+                    "wyrd_storage_bytes_total{{backend=local,direction={direction},operation={operation}}}"
+                )),
+                3
+            );
+        }
+        for operation in ["put", "get", "head", "list", "delete"] {
+            assert_eq!(
+                recorder.counter(&format!(
+                    "wyrd_storage_operations_total{{backend=local,operation={operation},outcome=success}}"
+                )),
+                1
+            );
+            assert!(
+                recorder
+                    .gauge(&format!(
+                        "wyrd_storage_operations_active{{backend=local,operation={operation}}}"
+                    ))
+                    .abs()
+                    <= f64::EPSILON
+            );
+        }
     }
 }
 

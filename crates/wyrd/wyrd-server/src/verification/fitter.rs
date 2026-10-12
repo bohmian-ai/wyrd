@@ -320,13 +320,15 @@ impl BaselineFitter {
             gate.pass(cancel).await?;
         }
         let (spec, path) = self.resolve(tenant, claimed).await?;
-        let bytes = self
-            .storage
-            .operator()
-            .read(&path)
-            .await
-            .map_err(|error| fit_error(BASELINE_ARTIFACT_INVALID, error.to_string()))?
-            .to_bytes();
+        let invalid = |message: String| fit_error(BASELINE_ARTIFACT_INVALID, message);
+        let path =
+            tenant_path::validate(&path, tenant).map_err(|error| invalid(error.to_string()))?;
+        let bytes = bytes::Bytes::from(
+            self.storage
+                .get_object(&path)
+                .await
+                .map_err(|error| invalid(error.to_string()))?,
+        );
         let cancel = cancel.clone();
         tokio::task::spawn_blocking(move || {
             let batch = decode_bounded(bytes, MAX_DECODED_BYTES, &cancel)?;

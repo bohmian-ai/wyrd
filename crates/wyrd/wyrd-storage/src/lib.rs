@@ -8,21 +8,15 @@
 #![deny(rustdoc::broken_intra_doc_links)]
 
 #[cfg(feature = "cloud")]
-pub mod azure;
-#[cfg(feature = "cloud")]
 pub mod cloud;
 pub mod encryption;
 pub mod env_parse;
 pub mod error;
 pub mod factory;
-#[cfg(feature = "cloud")]
-pub mod gcs;
 pub mod handle;
 pub mod local;
 pub mod plan;
 pub mod preflight;
-#[cfg(feature = "cloud")]
-pub mod s3;
 pub mod service;
 pub mod settings;
 pub mod sha;
@@ -33,9 +27,7 @@ pub mod tenant_path;
 mod telemetry;
 
 #[cfg(feature = "cloud")]
-pub use azure::{AzureSasMode, AzureSigner};
-#[cfg(feature = "cloud")]
-pub use cloud::CloudSigner;
+pub use cloud::{CloudSigner, CloudStore};
 pub use error::{AzureError, ConfigParseError, GcsError, LocalError, S3Error, StorageError};
 pub use handle::{StorageHandle, StorageHealthError};
 pub use local::LocalSigner;

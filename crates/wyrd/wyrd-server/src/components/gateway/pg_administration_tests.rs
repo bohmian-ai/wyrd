@@ -34,7 +34,7 @@ use wyrd_spec::ids::{
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::security::SecretRef;
 use wyrd_sql::queries::gateway::{GatewayAccountingEntryWrite, append_gateway_accounting_entry};
-use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+use wyrd_storage::{LocalSigner, StorageHandle};
 
 use super::capture::recording::RecordingScribe;
 use super::{GatewayAdministration, GatewayCredentialSource};
@@ -61,7 +61,7 @@ pub(super) async fn test_state(fixture: &PgFixture) -> AppState {
     let signer = LocalSigner::new(root).expect("local signer creates");
     crate::test_support::test_app_state(
         postgres,
-        Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+        Arc::new(StorageHandle::new(signer)),
         crate::test_support::test_catalog().await,
     )
     .with_gateway(gateway_config(fixture.data_tenant_id()))

@@ -30,7 +30,6 @@ arrow = { workspace = true }
 async-trait = { workspace = true }
 crc32c = { workspace = true }
 num-traits = { workspace = true }
-opendal = { workspace = true }
 datafusion = { workspace = true }
 iceberg = { workspace = true, optional = true }
 hex = { workspace = true }
@@ -109,7 +108,7 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
 [dev-dependencies]
-opendal = { workspace = true }
+object_store = { workspace = true }
 workspace-hack.workspace = true
 tracing-subscriber = { workspace = true }
 insta = { workspace = true }

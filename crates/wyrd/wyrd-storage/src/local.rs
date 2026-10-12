@@ -325,7 +325,7 @@ mod integration_tests {
         let path = storage_path(tenant);
 
         let input = UploadPlanReplayInput {
-            wire_protocol: WireProtocol::S3MultipartV1,
+            wire_protocol: WireProtocol::MultipartV1,
             backend_upload_id: None,
             part_count_planned: 1,
             part_size_bytes: 10,

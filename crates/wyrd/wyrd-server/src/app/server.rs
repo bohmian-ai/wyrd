@@ -980,7 +980,7 @@ mod pg_tests {
     use tempfile::tempdir;
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use super::*;
     use crate::components::auth::ServerAuth;
@@ -1013,7 +1013,7 @@ mod pg_tests {
             "wyrd",
             WyrdAuthVerifySettings::default(),
         ));
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        let storage = Arc::new(StorageHandle::new(signer));
         let shutdown = tokio_util::sync::CancellationToken::new();
         let bifrost = crate::state::Bifrost::test_shell(Arc::clone(&verifier));
         AppState::new(postgres, storage, bifrost, shutdown).with_auth(ServerAuth {

@@ -23,7 +23,7 @@
       }
     },
     {
-      "description": "S3 multipart completion.",
+      "description": "multipart completion.",
       "type": "object",
       "required": [
         "data",
@@ -31,31 +31,12 @@
       ],
       "properties": {
         "data": {
-          "$ref": "#/definitions/S3MultipartComplete"
+          "$ref": "#/definitions/MultipartComplete"
         },
         "protocol": {
           "type": "string",
           "enum": [
-            "s3_multipart"
-          ]
-        }
-      }
-    },
-    {
-      "description": "GCS resumable completion.",
-      "type": "object",
-      "required": [
-        "data",
-        "protocol"
-      ],
-      "properties": {
-        "data": {
-          "$ref": "#/definitions/GcsResumableComplete"
-        },
-        "protocol": {
-          "type": "string",
-          "enum": [
-            "gcs_resumable"
+            "multipart"
           ]
         }
       }
@@ -97,13 +78,8 @@
       },
       "additionalProperties": false
     },
-    "GcsResumableComplete": {
-      "description": "GCS resumable completion payload.",
-      "type": "object",
-      "additionalProperties": false
-    },
-    "S3CompletedPart": {
-      "description": "Completed S3 part descriptor.",
+    "CompletedPart": {
+      "description": "Completed part descriptor.",
       "type": "object",
       "required": [
         "e_tag",
@@ -111,7 +87,7 @@
       ],
       "properties": {
         "e_tag": {
-          "description": "S3 ETag returned by the part upload.",
+          "description": "ETag the backend returned for the part upload.",
           "type": "string"
         },
         "part_number": {
@@ -123,8 +99,8 @@
       },
       "additionalProperties": false
     },
-    "S3MultipartComplete": {
-      "description": "S3 multipart completion payload.",
+    "MultipartComplete": {
+      "description": "multipart completion payload.",
       "type": "object",
       "required": [
         "parts"
@@ -134,7 +110,7 @@
           "description": "Parts uploaded by the client.",
           "type": "array",
           "items": {
-            "$ref": "#/definitions/S3CompletedPart"
+            "$ref": "#/definitions/CompletedPart"
           }
         }
       },

@@ -22,12 +22,6 @@ arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20
 arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337", default-features = false, features = ["prettyprint"] }
 arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337", features = ["lz4", "zstd"] }
 arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337", default-features = false, features = ["canonical_extension_types"] }
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
-aws-runtime = { version = "1", default-features = false, features = ["event-stream", "http-02x", "sigv4a"] }
-aws-sigv4 = { version = "1", features = ["http0-compat", "sign-eventstream", "sigv4a"] }
-aws-smithy-runtime-api = { version = "1", features = ["client", "http-02x", "http-auth", "test-util"] }
-aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-0-4-x", "http-body-1-x", "rt-tokio", "test-util"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
@@ -37,20 +31,15 @@ bitflags = { version = "2", default-features = false, features = ["std"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
 chrono = { version = "0.4", features = ["serde"] }
-cipher = { version = "0.4", default-features = false, features = ["block-padding"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
-concurrent-queue = { version = "2" }
 console = { version = "0.16", default-features = false, features = ["ansi-parsing", "std", "unicode-width"] }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
-crypto-bigint = { version = "0.5", features = ["generic-array", "zeroize"] }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
-deranged = { version = "0.5", features = ["serde"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["serde", "use_std"] }
-elliptic-curve = { version = "0.13", default-features = false, features = ["ecdh", "hazmat", "pem", "std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 foldhash = { version = "0.2" }
 form_urlencoded = { version = "1" }
@@ -69,15 +58,13 @@ hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hex = { version = "0.4" }
-hmac = { version = "0.12", default-features = false, features = ["reset"] }
+httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 indexmap = { version = "2", features = ["serde"] }
-inout = { version = "0.1", default-features = false, features = ["block-padding"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
-md-5-93f6ce9d446188ac = { package = "md-5", version = "0.10" }
-md-5-a6292c17cd707f01 = { package = "md-5", version = "0.11" }
+md-5 = { version = "0.11" }
 memchr = { version = "2" }
 moka = { version = "0.12", features = ["future", "sync"] }
 nom = { version = "8" }
@@ -94,24 +81,18 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 parking_lot = { version = "0.12" }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.8" }
-pkcs8 = { version = "0.10", default-features = false, features = ["encryption", "pem", "std"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 prost = { version = "0.14" }
-quick-xml = { version = "0.41", features = ["overlapped-lists", "serialize"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
-rand_chacha-274715c4dabd11b0 = { package = "rand_chacha", version = "0.9", default-features = false, features = ["std"] }
-rand_chacha-468e82937335b1c9 = { package = "rand_chacha", version = "0.3", default-features = false, features = ["std"] }
+rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "brotli", "charset", "form", "gzip", "http2", "json", "multipart", "query", "rustls", "rustls-no-provider", "stream"] }
-reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "default-tls", "json", "stream"] }
-ring = { version = "0.17", features = ["std"] }
+reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "brotli", "form", "gzip", "http2", "json", "query", "rustls", "rustls-no-provider", "stream"] }
+reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "json"] }
 rmcp = { version = "3", default-features = false, features = ["client", "macros", "server", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
-rsa = { version = "0.9", features = ["pkcs5", "sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "prefer-post-quantum", "std", "tls12"] }
 secrecy = { version = "0.10", default-features = false, features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
@@ -128,9 +109,8 @@ subtle = { version = "2" }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 temp-env = { version = "0.3", features = ["async_closure"] }
 thiserror = { version = "2" }
-time = { version = "0.3", features = ["local-offset", "macros", "serde-well-known"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 toml_edit = { version = "0.22", features = ["serde"] }
@@ -145,7 +125,7 @@ typenum = { version = "1", default-features = false, features = ["const-generics
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["js", "serde", "v4", "v5", "v7"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1" }
 zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
 
 [build-dependencies]
@@ -155,12 +135,6 @@ arrow-array = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20
 arrow-cast = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337", default-features = false, features = ["prettyprint"] }
 arrow-ipc = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337", features = ["lz4", "zstd"] }
 arrow-schema = { git = "https://github.com/bohmian-ai/arrow-rs", rev = "e0f604e20f76a1f55da0970c9269ecb9b2dc1337", default-features = false, features = ["canonical_extension_types"] }
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
-aws-runtime = { version = "1", default-features = false, features = ["event-stream", "http-02x", "sigv4a"] }
-aws-sigv4 = { version = "1", features = ["http0-compat", "sign-eventstream", "sigv4a"] }
-aws-smithy-runtime-api = { version = "1", features = ["client", "http-02x", "http-auth", "test-util"] }
-aws-smithy-types = { version = "1", default-features = false, features = ["byte-stream-poll-next", "http-body-0-4-x", "http-body-1-x", "rt-tokio", "test-util"] }
 axum = { version = "0.8" }
 axum-core = { version = "0.5", default-features = false, features = ["tracing"] }
 base64-2b5c6dc72f624058 = { package = "base64", version = "0.23" }
@@ -171,20 +145,15 @@ byteorder = { version = "1" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 chrono = { version = "0.4", features = ["serde"] }
-cipher = { version = "0.4", default-features = false, features = ["block-padding"] }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
-concurrent-queue = { version = "2" }
 console = { version = "0.16", default-features = false, features = ["ansi-parsing", "std", "unicode-width"] }
 crossbeam-epoch = { version = "0.9" }
 crossbeam-utils = { version = "0.8" }
-crypto-bigint = { version = "0.5", features = ["generic-array", "zeroize"] }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
-deranged = { version = "0.5", features = ["serde"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["mac", "oid", "std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["serde", "use_std"] }
-elliptic-curve = { version = "0.13", default-features = false, features = ["ecdh", "hazmat", "pem", "std"] }
 flate2 = { version = "1", features = ["zlib-rs"] }
 foldhash = { version = "0.2" }
 form_urlencoded = { version = "1" }
@@ -203,15 +172,13 @@ hashbrown-3575ec1268b04181 = { package = "hashbrown", version = "0.15" }
 hashbrown-582f2526e08bb6a0 = { package = "hashbrown", version = "0.14", features = ["raw"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hex = { version = "0.4" }
-hmac = { version = "0.12", default-features = false, features = ["reset"] }
+httparse = { version = "1" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "server-auto", "service"] }
 indexmap = { version = "2", features = ["serde"] }
-inout = { version = "0.1", default-features = false, features = ["block-padding"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
-md-5-93f6ce9d446188ac = { package = "md-5", version = "0.10" }
-md-5-a6292c17cd707f01 = { package = "md-5", version = "0.11" }
+md-5 = { version = "0.11" }
 memchr = { version = "2" }
 moka = { version = "0.12", features = ["future", "sync"] }
 nom = { version = "8" }
@@ -228,25 +195,19 @@ opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 parking_lot = { version = "0.12" }
 percent-encoding = { version = "2" }
 petgraph = { version = "0.8" }
-pkcs8 = { version = "0.10", default-features = false, features = ["encryption", "pem", "std"] }
 ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 proc-macro2 = { version = "1" }
 prost = { version = "0.14" }
-quick-xml = { version = "0.41", features = ["overlapped-lists", "serialize"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
-rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8" }
-rand_chacha-274715c4dabd11b0 = { package = "rand_chacha", version = "0.9", default-features = false, features = ["std"] }
-rand_chacha-468e82937335b1c9 = { package = "rand_chacha", version = "0.3", default-features = false, features = ["std"] }
+rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa", "hybrid", "meta", "nfa", "perf", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
-reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "brotli", "charset", "form", "gzip", "http2", "json", "multipart", "query", "rustls", "rustls-no-provider", "stream"] }
-reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "default-tls", "json", "stream"] }
-ring = { version = "0.17", features = ["std"] }
+reqwest-594e8ee84c453af0 = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "brotli", "form", "gzip", "http2", "json", "query", "rustls", "rustls-no-provider", "stream"] }
+reqwest-5ef9efb8ec2df382 = { package = "reqwest", version = "0.12", default-features = false, features = ["blocking", "json"] }
 rmcp = { version = "3", default-features = false, features = ["client", "macros", "server", "transport-io", "transport-streamable-http-client-reqwest", "transport-streamable-http-server"] }
-rsa = { version = "0.9", features = ["pkcs5", "sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "prefer-post-quantum", "std", "tls12"] }
 secrecy = { version = "0.10", default-features = false, features = ["serde"] }
 semver = { version = "1", features = ["serde"] }
@@ -266,10 +227,8 @@ syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-trai
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 temp-env = { version = "0.3", features = ["async_closure"] }
 thiserror = { version = "2" }
-time = { version = "0.3", features = ["local-offset", "macros", "serde-well-known"] }
-time-macros = { version = "0.2", default-features = false, features = ["formatting", "parsing", "serde"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tokio-stream = { version = "0.1", features = ["fs", "net", "sync"] }
 tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 toml_edit = { version = "0.22", features = ["serde"] }
@@ -284,7 +243,7 @@ typenum = { version = "1", default-features = false, features = ["const-generics
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["js", "serde", "v4", "v5", "v7"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1" }
 zstd-sys = { version = "2", default-features = false, features = ["legacy", "std", "zdict_builder"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
@@ -296,8 +255,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
-rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 zstd = { version = "0.13" }
@@ -312,8 +272,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
-rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 zstd = { version = "0.13" }
@@ -328,8 +289,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
-rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 zstd = { version = "0.13" }
@@ -344,8 +306,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "if_ether", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
-rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
+linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 zstd = { version = "0.13" }
@@ -361,8 +324,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
 security-framework-sys = { version = "2" }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 zstd = { version = "0.13" }
@@ -378,8 +342,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
 security-framework-sys = { version = "2" }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 zstd = { version = "0.13" }
@@ -395,8 +360,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
 security-framework-sys = { version = "2" }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 zstd = { version = "0.13" }
@@ -412,8 +378,9 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc
 libc = { version = "0.2", features = ["extra_traits"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-rustix = { version = "1", features = ["event", "fs", "net", "pipe", "process", "termios", "time"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
 security-framework-sys = { version = "2" }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 zstd = { version = "0.13" }
@@ -427,7 +394,7 @@ getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-f
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "native-tokio", "tls12"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-rustix = { version = "1", features = ["fs", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
@@ -442,7 +409,7 @@ getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-f
 hyper-rustls = { version = "0.27", default-features = false, features = ["aws-lc-rs", "http1", "http2", "native-tokio", "tls12"] }
 liblzma = { version = "0.4", features = ["static"] }
 liblzma-sys = { version = "0.4", default-features = false, features = ["bindgen", "static"] }
-rustix = { version = "1", features = ["fs", "net"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "logging", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["retry"] }
 tower-http = { version = "0.6", features = ["catch-panic", "decompression-br", "decompression-gzip", "follow-redirect", "trace"] }
 windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }

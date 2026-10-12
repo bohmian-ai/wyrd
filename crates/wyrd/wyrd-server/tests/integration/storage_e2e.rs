@@ -26,11 +26,13 @@ use wyrd_spec::storage::{
     DownloadInitRequest, DownloadInitResponse, DownloadPlan, StorageBackendKind, UploadInitRequest,
     UploadInitResponse, UploadPlan,
 };
-use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings, settings};
+use wyrd_storage::{BackendConfig, StorageSettings, settings};
 use wyrd_testing::WyrdTestServer;
 
 /// Card identity every journey plans against; storage paths are scoped by tenant, so reuse is safe.
 const FIXED_CARD_UID: &str = "018f0000-0000-7000-8000-000000000001";
+/// Payload size below [`LOW_THRESHOLD_BYTES`], so plans are a single PUT.
+const SINGLE_PUT_PAYLOAD_BYTES: usize = 512 * 1024;
 /// Cloud payload size: above [`LOW_THRESHOLD_BYTES`], so cloud plans are multipart.
 const MULTIPART_PAYLOAD_BYTES: usize = 20 * 1024 * 1024;
 /// Multipart threshold lowered so a 20 MiB payload exercises multipart planning.
@@ -151,35 +153,37 @@ fn configured_settings(kind: StorageBackendKind) -> StorageSettings {
 /// bucket across runs, so each run removes exactly the prefixes it can produce
 /// instead of accumulating 20 MiB artifacts and metadata forever.
 ///
-/// Objects are listed and deleted one at a time rather than through opendal's
-/// recursive delete, because `fake-gcs-server` refuses that backend's batch
-/// delete request with HTTP 400 while real GCS accepts it.
+/// Objects are listed and deleted one at a time through the backend's own
+/// store, because `fake-gcs-server` refuses a batch delete request with HTTP
+/// 400 while real GCS accepts it.
 ///
 /// # Panics
-/// Panics when the cleanup handle cannot be built, a prefix cannot be listed,
+/// Panics when the cleanup store cannot be built, a prefix cannot be listed,
 /// or an object cannot be deleted, so a lane that silently stops cleaning fails
 /// loudly.
 async fn purge_journey_objects(settings: &StorageSettings, tenant: DataTenantId) {
-    let handle = StorageHandle::from_settings(settings.clone())
+    use futures_util::TryStreamExt as _;
+    use object_store::ObjectStoreExt as _;
+
+    let objects = wyrd_storage::factory::build_signer(&settings.backend)
         .await
-        .expect("cleanup handle builds from the journey settings");
-    let operator = handle.operator();
+        .expect("cleanup signer builds from the journey settings")
+        .objects()
+        .expect("cleanup store opens");
     for prefix in [
-        format!("{tenant}/"),
-        format!("tenants/{tenant}/"),
-        format!("tenants/{}/", DataTenantId::SYSTEM_OWNER),
+        tenant.to_string(),
+        format!("tenants/{tenant}"),
+        format!("tenants/{}", DataTenantId::SYSTEM_OWNER),
     ] {
-        let entries = operator
-            .list_with(&prefix)
-            .recursive(true)
+        let locations: Vec<_> = objects
+            .list(Some(&object_store::path::Path::from(prefix)))
+            .map_ok(|meta| meta.location)
+            .try_collect()
             .await
             .expect("journey prefix lists");
-        for entry in entries {
-            if entry.metadata().is_dir() {
-                continue;
-            }
-            operator
-                .delete(entry.path())
+        for location in locations {
+            objects
+                .delete(&location)
                 .await
                 .expect("journey object is deleted");
         }
@@ -189,8 +193,8 @@ async fn purge_journey_objects(settings: &StorageSettings, tenant: DataTenantId)
 /// Drives one complete upload → download round trip through the real client and server.
 ///
 /// Starts a bound server over `settings`, initializes an upload for
-/// `relative_path` (512 KiB for `local/` paths, otherwise a multipart payload),
-/// uploads and completes it through `WyrdStorageClient`, plans a download, and
+/// `relative_path` with `content_size` patterned bytes (which selects the
+/// single-PUT or multipart plan against [`LOW_THRESHOLD_BYTES`]), uploads and completes it through `WyrdStorageClient`, plans a download, and
 /// streams it back with digest and size verification. The server is shut down
 /// and every object the run could produce is purged *before* the download
 /// outcome is asserted, so a failed transfer still cleans shared cloud buckets.
@@ -202,17 +206,16 @@ async fn purge_journey_objects(settings: &StorageSettings, tenant: DataTenantId)
 /// Cancellation or a panic before cleanup can leave the uploaded artifact and
 /// audit metadata under this run's tenant prefixes; the next run's purge only
 /// covers its own tenant, so such residue must be removed manually.
-async fn run_client_server_journey(settings: StorageSettings, relative_path: &str) {
+async fn run_client_server_journey(
+    settings: StorageSettings,
+    relative_path: &str,
+    content_size: usize,
+) {
     let srv = server_from_settings(settings.clone()).await;
     let tenant = srv.data_tenant_id();
     let token = bootstrap_service_jwt(&srv, "storage-client-journey").await;
     let client = client_for(&srv, &token);
     let storage = WyrdStorageClient::new(&client);
-    let content_size = if relative_path.starts_with("local/") {
-        512 * 1024
-    } else {
-        MULTIPART_PAYLOAD_BYTES
-    };
     let content = patterned_payload(content_size);
     let card_uid = CardUid::new(FIXED_CARD_UID).expect("card UID");
     let idempotency_key = "storage-client-journey-001";
@@ -297,7 +300,12 @@ async fn run_client_server_journey(settings: StorageSettings, relative_path: &st
 #[tokio::test(flavor = "current_thread")]
 async fn local_client_server_round_trip() {
     let storage_root = tempfile::tempdir().expect("storage root creates");
-    run_client_server_journey(local_settings(storage_root.path()), "local/weights.bin").await;
+    run_client_server_journey(
+        local_settings(storage_root.path()),
+        "local/weights.bin",
+        SINGLE_PUT_PAYLOAD_BYTES,
+    )
+    .await;
 }
 
 /// A principal holding no Card permission is refused at both storage entry
@@ -467,13 +475,33 @@ async fn s3_multipart_e2e() {
     run_client_server_journey(
         configured_settings(StorageBackendKind::S3),
         "s3-multipart/weights.bin",
+        MULTIPART_PAYLOAD_BYTES,
     )
     .await;
 }
 
-/// Multipart client/server round trip against the configured GCS bucket or emulator.
+/// Single-PUT client/server round trip against the configured GCS bucket or
+/// emulator: a presigned PUT, the server's signed verification HEAD, and a
+/// presigned download.
 ///
 /// Selected by the owning mise task; `WYRD_STORAGE_URL` must select GCS.
+///
+/// # Panics
+/// Panics when the environment selects another backend or the journey fails.
+#[tokio::test(flavor = "current_thread")]
+async fn gcs_single_put_e2e() {
+    run_client_server_journey(
+        configured_settings(StorageBackendKind::Gcs),
+        "gcs-single-put/weights.bin",
+        SINGLE_PUT_PAYLOAD_BYTES,
+    )
+    .await;
+}
+
+/// Multipart client/server round trip against the configured GCS bucket.
+///
+/// Selected by the real-GCS mise task only: `fake-gcs-server` does not
+/// implement GCS XML multipart uploads. `WYRD_STORAGE_URL` must select GCS.
 ///
 /// # Panics
 /// Panics when the environment selects another backend or the journey fails.
@@ -482,6 +510,7 @@ async fn gcs_multipart_e2e() {
     run_client_server_journey(
         configured_settings(StorageBackendKind::Gcs),
         "gcs-multipart/weights.bin",
+        MULTIPART_PAYLOAD_BYTES,
     )
     .await;
 }
@@ -497,6 +526,7 @@ async fn azure_multipart_e2e() {
     run_client_server_journey(
         configured_settings(StorageBackendKind::Azure),
         "azure-multipart/weights.bin",
+        MULTIPART_PAYLOAD_BYTES,
     )
     .await;
 }

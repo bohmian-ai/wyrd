@@ -136,7 +136,7 @@ mod pg_tests {
         grant_role_to_service_account, insert_service_account, role_by_name, upsert_trusted_issuer,
         upsert_workload_binding,
     };
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use crate::AppState;
     use crate::auth::issue_api_key::WyrdApiKey;
@@ -573,7 +573,7 @@ mod pg_tests {
         let signer = LocalSigner::new(storage_root).expect("local signer creates");
         crate::test_support::test_app_state(
             postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            Arc::new(StorageHandle::new(signer)),
             crate::test_support::test_catalog().await,
         )
     }

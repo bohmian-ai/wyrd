@@ -1,22 +1,20 @@
-//! Backend SDK and opendal operator construction.
-
-#[cfg(feature = "cloud")]
-pub mod azure;
-#[cfg(feature = "cloud")]
-pub mod gcs;
-pub mod local;
-#[cfg(feature = "cloud")]
-pub mod s3;
+//! Backend store and signer construction shared by every storage consumer.
+//!
+//! [`build_signer`] builds the handle's signer, whose store is also the
+//! handle's data plane; Bifrost builds its analytical store through
+//! the [`crate::cloud::CloudStore`] constructors with [`client_options`], so artifact and
+//! analytical storage share one client implementation per backend.
 
 use std::time::Duration;
 
+#[cfg(feature = "cloud")]
+use crate::cloud::{CloudSigner, CloudStore};
 use crate::error::StorageError;
+use crate::local::LocalSigner;
 use crate::settings::BackendConfig;
 use crate::signer::BackendSigner;
-use opendal::Operator;
-use opendal::layers::HttpClientLayer;
-use opendal::raw::HttpClient;
-use wyrd_spec::storage::StorageBackendKind;
+#[cfg(feature = "cloud")]
+use object_store::ClientOptions;
 
 /// Idle-connection lifetime for a self-hosted or emulated object store
 /// reached through a configured endpoint.
@@ -63,63 +61,82 @@ pub fn pool_idle_timeout(backend: &BackendConfig) -> Duration {
     }
 }
 
-#[cfg(not(feature = "cloud"))]
-fn cloud_disabled(backend: &BackendConfig) -> StorageError {
-    let backend_kind = match backend {
-        BackendConfig::Local { .. } => StorageBackendKind::Local,
-        BackendConfig::S3(_) => StorageBackendKind::S3,
-        BackendConfig::Gcs(_) => StorageBackendKind::Gcs,
-        BackendConfig::Azure(_) => StorageBackendKind::Azure,
+/// Return the HTTP options every client for `backend` shares.
+///
+/// The idle-pool lifetime comes from [`pool_idle_timeout`]; plain HTTP is
+/// allowed only for an `http://` endpoint (an emulator or local service).
+/// Callers add their own request timeout.
+#[cfg(feature = "cloud")]
+#[must_use]
+pub fn client_options(backend: &BackendConfig) -> ClientOptions {
+    let endpoint = match backend {
+        BackendConfig::Local { .. } => None,
+        BackendConfig::S3(config) => config.endpoint_url.as_deref(),
+        BackendConfig::Gcs(config) => config.endpoint_url.as_deref(),
+        BackendConfig::Azure(config) => config.endpoint_url.as_deref(),
     };
-    StorageError::Backend {
-        backend: backend_kind,
-        op: "build_signer",
-        message: "cloud storage backends are not compiled in this build; rebuild with the `cloud` feature".to_owned(),
-    }
+    ClientOptions::new()
+        .with_pool_idle_timeout(pool_idle_timeout(backend))
+        .with_allow_http(endpoint.is_some_and(|endpoint| endpoint.starts_with("http://")))
 }
 
-/// Refuse a GCS or Azure endpoint override in a build without `emulator`.
+/// Returns the service-account JSON from Wyrd's GCS credential variables.
 ///
-/// The production GCS and Azure signers address only the public provider, so
-/// honoring `WYRD_STORAGE_ENDPOINT_URL` for the data plane while signing
-/// against the real provider would split one backend across two services.
-#[cfg(all(feature = "cloud", not(feature = "emulator")))]
-fn endpoint_requires_emulator(backend: StorageBackendKind) -> StorageError {
-    StorageError::Backend {
-        backend,
-        op: "build_signer",
-        message: "WYRD_STORAGE_ENDPOINT_URL is supported for this backend only in builds with the `emulator` feature".to_owned(),
+/// `GOOGLE_ACCOUNT_JSON_BASE64` is decoded, else
+/// `GOOGLE_APPLICATION_CREDENTIALS_JSON` is returned as is. `None` leaves
+/// `object_store`'s default chain (a credentials file path or ambient
+/// identity) in charge.
+#[cfg(feature = "cloud")]
+pub(crate) fn service_account_json() -> Option<String> {
+    use base64::Engine as _;
+    if let Ok(encoded) = std::env::var("GOOGLE_ACCOUNT_JSON_BASE64") {
+        return base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()
+            .and_then(|json| String::from_utf8(json).ok());
     }
+    std::env::var("GOOGLE_APPLICATION_CREDENTIALS_JSON").ok()
 }
 
 /// Build the active backend signer in a cloud-enabled build.
 ///
-/// Cloud backends may perform SDK setup and boot probing, so this variant
-/// awaits the backend-specific construction IO. Local construction remains
-/// synchronous inside the same future.
+/// A cloud signer owns the backend's one `object_store` client, built with no
+/// request timeout and no retries because Wyrd never retries storage writes
+/// behind the caller, and proves its credentials with one root listing.
 ///
 /// # Errors
 /// Returns [`StorageError::CryptoProvider`] when another Rustls provider
-/// already owns the process. Other storage errors report backend SDK
-/// construction or boot-probe failures. Cancellation can interrupt a remote
-/// probe without constructing a signer; it makes no durable storage changes.
+/// already owns the process, a backend error when the local root or the store
+/// configuration is unusable, or [`StorageError::CredentialChain`] when the
+/// boot probe fails. Cancellation interrupts the probe without constructing a
+/// signer and makes no durable storage changes.
 #[cfg(feature = "cloud")]
 pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, StorageError> {
     wyrd_tls::install_crypto_provider()?;
-    match backend {
+    let retry = object_store::RetryConfig {
+        max_retries: 0,
+        ..object_store::RetryConfig::default()
+    };
+    let options = client_options(backend).with_timeout_disabled();
+    let store = match backend {
         BackendConfig::Local { root } => {
-            Ok(BackendSigner::Local(local::build_signer(root.clone())?))
+            return Ok(BackendSigner::Local(LocalSigner::new(root.clone())?));
         }
-        BackendConfig::S3(config) => Ok(BackendSigner::Cloud(Box::new(
-            crate::cloud::CloudSigner::S3(s3::build_signer(config).await?),
-        ))),
-        BackendConfig::Gcs(config) => Ok(BackendSigner::Cloud(Box::new(
-            crate::cloud::CloudSigner::Gcs(gcs::build_signer(config).await?),
-        ))),
-        BackendConfig::Azure(config) => Ok(BackendSigner::Cloud(Box::new(
-            crate::cloud::CloudSigner::Azure(azure::build_signer(config).await?),
-        ))),
-    }
+        BackendConfig::S3(config) => CloudStore::s3(config, options, retry)?,
+        BackendConfig::Gcs(config) => CloudStore::gcs(config, options, retry)?,
+        BackendConfig::Azure(config) => CloudStore::azure(config, options, retry)?,
+    };
+    let http = reqwest::Client::builder()
+        .pool_idle_timeout(pool_idle_timeout(backend))
+        .build()
+        .map_err(|error| StorageError::Backend {
+            backend: backend.kind(),
+            op: "build_signer",
+            message: error.to_string(),
+        })?;
+    let signer = CloudSigner::new(store, http);
+    signer.probe().await?;
+    Ok(BackendSigner::Cloud(Box::new(signer)))
 }
 
 /// Build the active backend signer in a build without cloud support.
@@ -137,123 +154,24 @@ pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, Stor
 pub fn build_signer(
     backend: &BackendConfig,
 ) -> std::future::Ready<Result<BackendSigner, StorageError>> {
-    let result = match wyrd_tls::install_crypto_provider() {
-        Ok(()) => match backend {
-            BackendConfig::Local { root } => {
-                local::build_signer(root.clone()).map(BackendSigner::Local)
-            }
+    let result = wyrd_tls::install_crypto_provider()
+        .map_err(StorageError::from)
+        .and_then(|()| match backend {
+            BackendConfig::Local { root } => LocalSigner::new(root.clone()).map(BackendSigner::Local),
             BackendConfig::S3(_) | BackendConfig::Gcs(_) | BackendConfig::Azure(_) => {
-                Err(cloud_disabled(backend))
+                Err(StorageError::Backend {
+                    backend: backend.kind(),
+                    op: "build_signer",
+                    message: "cloud storage backends are not compiled in this build; rebuild with the `cloud` feature".to_owned(),
+                })
             }
-        },
-        Err(error) => Err(StorageError::from(error)),
-    };
+        });
     std::future::ready(result)
 }
 
-/// Finish an `OpenDAL` operator over the operator-owned HTTP client.
-///
-/// Every operator gets its own client whose idle pool lasts `pool_idle`
-/// (see [`pool_idle_timeout`]) instead of `OpenDAL`'s process-global default,
-/// whose 90-second idle pool outlives some servers' keep-alive and hands out
-/// connections the server is closing.
-///
-/// # Errors
-/// Returns [`StorageError::Backend`] when the HTTP client or the operator
-/// cannot be constructed.
-fn finish_op<B: opendal::Builder>(
-    builder: B,
-    backend: StorageBackendKind,
-    pool_idle: Duration,
-) -> Result<Operator, StorageError> {
-    let backend_error = |message: String| StorageError::Backend {
-        backend,
-        op: "build_operator",
-        message,
-    };
-    let client = reqwest::Client::builder()
-        .pool_idle_timeout(pool_idle)
-        .build()
-        .map_err(|e| backend_error(e.to_string()))?;
-    Ok(Operator::new(builder)
-        .map_err(|e| backend_error(e.to_string()))?
-        .layer(HttpClientLayer::new(HttpClient::with(client)))
-        .finish())
-}
-
-/// Build the opendal `Operator` for the selected backend.
-///
-/// # Errors
-/// Returns [`StorageError::CryptoProvider`] when another Rustls provider
-/// already owns the process, or a storage error when operator construction
-/// fails.
-pub fn build_operator(backend: &BackendConfig) -> Result<Operator, StorageError> {
-    wyrd_tls::install_crypto_provider()?;
-    let pool_idle = pool_idle_timeout(backend);
-    match backend {
-        BackendConfig::Local { root } => finish_op(
-            local::fs_service(root),
-            StorageBackendKind::Local,
-            pool_idle,
-        ),
-        #[cfg(feature = "cloud")]
-        BackendConfig::S3(c) => finish_op(s3::s3_service(c), StorageBackendKind::S3, pool_idle),
-        #[cfg(feature = "cloud")]
-        BackendConfig::Gcs(c) => finish_op(gcs::gcs_service(c), StorageBackendKind::Gcs, pool_idle),
-        #[cfg(feature = "cloud")]
-        BackendConfig::Azure(c) => finish_op(
-            azure::azblob_service(c),
-            StorageBackendKind::Azure,
-            pool_idle,
-        ),
-        #[cfg(not(feature = "cloud"))]
-        BackendConfig::S3(_) => Err(cloud_disabled(backend)),
-        #[cfg(not(feature = "cloud"))]
-        BackendConfig::Gcs(_) => Err(cloud_disabled(backend)),
-        #[cfg(not(feature = "cloud"))]
-        BackendConfig::Azure(_) => Err(cloud_disabled(backend)),
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "cloud"))]
 mod tests {
     use super::*;
-    #[cfg(feature = "cloud")]
-    use crate::settings::{AzureConfig, GcsConfig, S3Config};
-    use opendal::ErrorKind;
-
-    #[tokio::test]
-    async fn fs_operator_round_trip() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let backend = BackendConfig::Local {
-            root: dir.path().to_path_buf(),
-        };
-        let op = build_operator(&backend).expect("build local operator");
-
-        op.write("probe.txt", b"hello" as &[u8])
-            .await
-            .expect("write");
-        let meta = op.stat("probe.txt").await.expect("stat");
-        assert_eq!(meta.content_length(), 5);
-        let buf = op.read("probe.txt").await.expect("read");
-        assert_eq!(buf.to_bytes().as_ref(), b"hello");
-        op.delete("probe.txt").await.expect("delete");
-    }
-
-    #[tokio::test]
-    async fn fs_stat_missing_is_not_found() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let backend = BackendConfig::Local {
-            root: dir.path().to_path_buf(),
-        };
-        let op = build_operator(&backend).expect("build local operator");
-
-        let err = op
-            .stat("does-not-exist.txt")
-            .await
-            .expect_err("should be NotFound");
-        assert_eq!(err.kind(), ErrorKind::NotFound);
-    }
 
     /// Managed cloud stores keep warm connections for as long as each
     /// provider holds them; any configured endpoint takes the short bound
@@ -262,9 +180,9 @@ mod tests {
     /// # Panics
     /// Panics when any backend selects an idle bound other than the one its
     /// provider or configured endpoint requires.
-    #[cfg(feature = "cloud")]
     #[test]
     fn pool_idle_timeout_matches_the_storage_server() {
+        use crate::settings::{AzureConfig, GcsConfig, S3Config};
         let endpoint = Some("http://127.0.0.1:9000".to_owned());
         let s3 = |endpoint_url| {
             BackendConfig::S3(S3Config {
@@ -294,95 +212,30 @@ mod tests {
             assert_eq!(pool_idle_timeout(&backend), ENDPOINT_POOL_IDLE_TIMEOUT);
         }
     }
-}
 
-/// Operator tests that bind a local socket and serve HTTP.
-///
-/// They need a live listener, so they live in `pg_tests`, which the fast
-/// family lanes skip, and run only through their exact focused invocation.
-#[cfg(all(test, feature = "cloud"))]
-mod pg_tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use opendal::ErrorKind;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    use tokio::net::TcpListener;
-
-    use super::*;
-    use crate::settings::S3Config;
-
-    /// Serves one S3 `HEAD` per connection with `404`, then closes the
-    /// connection as soon as a second request arrives on it without answering,
-    /// the way an object store closing an idle keep-alive connection races a
-    /// reused one. Returns the endpoint and the accepted-connection counter.
-    ///
-    /// # Panics
-    /// Panics when the loopback listener cannot bind or report its address.
-    async fn closing_keep_alive_server() -> (String, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&accepted);
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                counter.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let mut request = Vec::new();
-                    let mut chunk = [0_u8; 1024];
-                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
-                        match socket.read(&mut chunk).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => request.extend_from_slice(&chunk[..n]),
-                        }
-                    }
-                    let reply = b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
-                    if socket.write_all(reply).await.is_err() {
-                        return;
-                    }
-                    // Any further request on this connection is dropped unanswered.
-                    let _ = socket.read(&mut chunk).await;
-                });
-            }
-        });
-        (endpoint, accepted)
-    }
-
-    /// A request after an idle gap longer than [`ENDPOINT_POOL_IDLE_TIMEOUT`] opens a
-    /// fresh connection instead of reusing one the server is closing, so the
-    /// second `stat` still reports `NotFound` rather than a transport error.
-    ///
-    /// # Panics
-    /// Panics when the listener or operator cannot be built, when either
-    /// `stat` does not fail with `NotFound`, or when the server did not accept
-    /// exactly two connections.
-    #[tokio::test]
-    async fn idle_connection_is_not_reused_after_the_pool_timeout() {
-        let (endpoint, accepted) = closing_keep_alive_server().await;
-        let backend = BackendConfig::S3(S3Config {
-            bucket: "probe".to_owned(),
-            region: Some("us-east-1".to_owned()),
-            endpoint_url: Some(endpoint),
-        });
-        temp_env::async_with_vars(
+    /// Wyrd's GCS credential variables yield the service-account JSON:
+    /// the base64 variable decoded, else the JSON variable verbatim.
+    #[test]
+    fn service_account_json_reads_wyrd_gcs_variables() {
+        use base64::Engine as _;
+        let raw = r#"{"type":"service_account"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        let from_b64 = temp_env::with_vars(
             [
-                ("AWS_ACCESS_KEY_ID", Some("test-key")),
-                ("AWS_SECRET_ACCESS_KEY", Some("test-secret")),
-                ("AWS_EC2_METADATA_DISABLED", Some("true")),
+                ("GOOGLE_ACCOUNT_JSON_BASE64", Some(encoded.as_str())),
+                ("GOOGLE_APPLICATION_CREDENTIALS_JSON", None),
             ],
-            async {
-                let op = build_operator(&backend).expect("build s3 operator");
-                let first = op.stat("_wyrd/health.sentinel").await.expect_err("404");
-                assert_eq!(first.kind(), ErrorKind::NotFound);
-                tokio::time::sleep(ENDPOINT_POOL_IDLE_TIMEOUT + Duration::from_millis(500)).await;
-                let second = op.stat("_wyrd/health.sentinel").await.expect_err("404");
-                assert_eq!(second.kind(), ErrorKind::NotFound, "{second}");
-            },
-        )
-        .await;
-        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+            service_account_json,
+        );
+        let from_json = temp_env::with_vars(
+            [
+                ("GOOGLE_ACCOUNT_JSON_BASE64", None),
+                ("GOOGLE_APPLICATION_CREDENTIALS_JSON", Some(raw)),
+            ],
+            service_account_json,
+        );
+
+        assert_eq!(from_b64.as_deref(), Some(raw));
+        assert_eq!(from_json.as_deref(), Some(raw));
     }
 }

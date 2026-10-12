@@ -24,7 +24,7 @@ default = []
 bench-support = []
 test-support = []
 # Cloud object stores, enabled with `wyrd-storage/cloud` by the server.
-cloud = ["wyrd-storage/cloud", "object_store/aws", "object_store/gcp", "object_store/azure"]
+cloud = ["wyrd-storage/cloud"]
 
 [dependencies]
 metrics.workspace = true

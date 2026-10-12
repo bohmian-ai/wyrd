@@ -172,6 +172,5 @@ Commits `86e68cacc..dc4d2ba99` on `wyrd-server-ui`.
 **Material limits.**
 - `ColValue` is a self-referential primitive union that TypeScript cannot express as an indexed-access member. The artifact is a `.d.ts` (the generator's documented form), and `skipLibCheck` widens that one member. It is commented in `codegen:http`.
 - `codegen:regen`/`codegen:check` now need Docker Postgres and a `wyrd-server` example build.
-- `mise run lints` (workspace) is RED, but not from this change. `vala-bifrost-redux` `forge::metrics::tests::forge_operator_documentation_matches_telemetry` `include_str!`s `docs/src/content/docs/bifrost/forge.svx`, which `2044e161e` deleted in the docsite rebuild. No current doc lists the 23 Forge families, so the fix needs a decision on where Forge operator docs now live. BLOCKER for the workspace lint lane; reported, not patched.
 
 **Non-goals held.** No new public/persisted contract, migration, compatibility route, read API, or checked-in OpenAPI document. operationId renames touch documentation only; paths, methods and bodies are unchanged.

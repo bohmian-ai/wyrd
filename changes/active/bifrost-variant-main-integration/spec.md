@@ -376,7 +376,8 @@ immutable commit combining source compatibility with main's no-REST/Ring
 narrowing. The supplied commit is
 `22cd178d14009468bc951a14d7acf63237af808a` on the fork’s `wyrd/main`,
 already pinned by integration commit `914495674`; preserve it when importing
-source manifests. Neither old source 6965606 nor main 4e9f325 is sufficient. No
+source manifests (superseded by Revision 5's fork rule: `5f401029…` on
+`wyrd-production`, 22cd178 minus the unused Glue catalog). Neither old source 6965606 nor main 4e9f325 is sufficient. No
 Ring waiver is allowed. Preserve unrelated locked versions during directed graph
 resolution rather than performing a blanket dependency update; preserve main unrelated deps,
 features, profiles, pedantic rules, tier boundaries, and removed Ring/unearned
@@ -553,7 +554,20 @@ metrics; emulator-only endpoint overrides. Credentials resolve through
 **Emulators.** RustFS and Azurite are unchanged. GCS runs
 `tustvold/fake-gcs-server`, the emulator `object_store`'s CI uses; emulator
 lanes sign with a throwaway service-account key generated per run and send
-data-plane requests unauthenticated.
+data-plane requests unauthenticated. No `fake-gcs-server` implements GCS XML
+multipart (fsouza/fake-gcs-server#852), so GCS multipart is proven only
+against real GCS in `test:storage:gcs:cloud` (user ruling 2026-10-12, “Do 1”);
+the emulator proves GCS single PUT, HEAD and handle CRUD.
+
+**Fork dependencies.** The user ruled on 2026-10-12 “remove all outdated
+storage dependencies” and “I want to standardize a common name across all used
+forks”. Every `bohmian-ai` fork Wyrd uses (iceberg-rust, iceberg-compaction,
+datafusion, datafusion-distributed, arrow-rs) publishes the revision Wyrd pins
+on one branch, `wyrd-production`; manifests still pin literal revisions.
+`iceberg-compaction-core` declared `iceberg-catalog-glue` without using it,
+which pulled OpenDAL, the AWS Glue SDK and `aws-config` into Wyrd; the pin
+moves to `5f4010291869ed4fb71357aa3dec96746010319a` on `wyrd-production`,
+which is 22cd178 with only that dependency removed.
 
 ## Open material decisions and revision history
 

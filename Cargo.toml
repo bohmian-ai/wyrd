@@ -242,7 +242,7 @@ iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev =
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "22cd178d14009468bc951a14d7acf63237af808a" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "5f4010291869ed4fb71357aa3dec96746010319a" }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.

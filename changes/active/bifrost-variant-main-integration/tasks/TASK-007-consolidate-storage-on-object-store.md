@@ -116,7 +116,7 @@ the object_store emulator: `mise run test:storage:gcs-emu`.
 
 ## Acceptance Criteria
 
-- `cargo tree` for the workspace shows no `gcloud-*` or `azure_*` crate, no `aws-sdk-s3`, and no OpenDAL edge from a Wyrd crate. Amended: `opendal` 0.58, `aws-sdk-glue`, `aws-config` and its SSO/STS crates remain only through S's `vala-bifrost-redux → iceberg-compaction-core → iceberg-catalog-glue`, a non-optional dependency of S's fork, out of scope here.
+- `cargo tree` for the workspace shows no `opendal*`, `aws-sdk-*`, `aws-config`, `aws-smithy-*`, `reqsign*`, `gcloud-*`, `azure_*`, `iceberg-storage-opendal` or `iceberg-catalog-glue` crate. The unused Glue catalog that pulled OpenDAL and the AWS SDK in through `iceberg-compaction-core` is removed in the fork (spec Revision 5, fork dependencies).
 - No `GcsResumable`/`gcs_resumable` or `S3Multipart*`/`S3CompletedPart`/`s3_multipart_v1` symbol, schema or SQL value remains.
 - Codegen is clean.
 - These lanes pass:
@@ -163,7 +163,7 @@ Status: `IMPLEMENTED` on 2026-10-12.
 | Acceptance criterion | Implementation evidence | Verification evidence | Result |
 |---|---|---|---|
 | One store per backend shared by handle, signer, Bifrost | `wyrd-storage/src/cloud.rs` `CloudStore`/`CloudSigner`; `factory::build_signer`; `StorageHandle` over `BackendSigner::objects()`; Bifrost `storage::backend_store` → `CloudStore::{s3,gcs,azure}` | redux `storage::` 2/2; handle CRUD on all emulators 4/4 | PASS |
-| No `gcloud-*`/`azure_*`/`aws-sdk-s3`; no Wyrd OpenDAL (amended) | workspace and crate manifests; workspace-hack regenerated | `cargo tree -i opendal@0.58.2` and `-i aws-sdk-glue` show only `iceberg-catalog-glue` via S's `iceberg-compaction-core`; `cargo hakari generate --diff`/`manage-deps --dry-run`/`verify` clean | PASS |
+| No outdated storage crate in the tree | workspace and crate manifests; `iceberg-compaction-core` pinned to `5f401029` on the fork's `wyrd-production` (Glue dependency dropped); workspace-hack regenerated | `cargo tree --workspace --all-features -e normal,build,dev` lists no opendal, aws-sdk/aws-config/aws-smithy, reqsign, gcloud, azure_, iceberg-storage-opendal or iceberg-catalog-glue crate (only `aws-lc-rs`/`aws-lc-sys`, the Rustls provider); hakari clean | PASS |
 | No GCS resumable / S3-named multipart symbols, schemas, SQL value | wyrd-spec `storage::{protocol,upload}`; `multipart_v1` SQL check; wyrd-client `upload/multipart.rs` | `mise run codegen:check`; wyrd-client `storage_dispatch::` 6/6 | PASS |
 | GCS multipart round trip, abort, re-mint, part signing | signer `MultipartStore` path; `persist_multipart_upload_id` | real GCS via `mise run test:storage:gcs:real` (local `mise.local.toml`, credentials from pass) → `test:storage:gcs:cloud`: `integration_gcs::gcs_multipart_*` 3/3, `gcs_handle_crud`, `storage_e2e::gcs_multipart_e2e`, `gcs_single_put_e2e` | PASS |
 | Typed HEAD not-found and HEAD metadata | `CloudSigner::head_for_verification` | `test:storage:gcs-emu` 1/1, `test:storage:rustfs` 4/4, `test:storage:azurite` 5/5 | PASS |

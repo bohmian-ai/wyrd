@@ -418,6 +418,9 @@ pub enum ColValue {
     /// UTC timestamp predicate value.
     Timestamp(DateTime<Utc>),
     /// List predicate value used by membership checks.
+    // `no_recursion` stops OpenAPI schema collection from re-entering this
+    // enum; the variant still references it by name.
+    #[cfg_attr(feature = "server", schema(no_recursion))]
     List(Vec<ColValue>),
 }
 

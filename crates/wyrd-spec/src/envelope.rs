@@ -293,6 +293,12 @@ impl utoipa::ToSchema for Spec {
         std::borrow::Cow::Borrowed("Spec")
     }
 
+    /// Register every variant's component and that component's dependency closure.
+    ///
+    /// The union inlines each variant body, and those bodies carry `$ref`s of
+    /// their own (`DataInterface`, `NonSecretValue`, `WorkflowStep`, ...).
+    /// Forwarding each variant's own `schemas` is what keeps those references
+    /// defined in the served document.
     fn schemas(
         schemas: &mut Vec<(
             String,
@@ -305,6 +311,7 @@ impl utoipa::ToSchema for Spec {
                     <$schema as utoipa::ToSchema>::name().into(),
                     <$schema as utoipa::PartialSchema>::schema(),
                 ));
+                <$schema as utoipa::ToSchema>::schemas(schemas);
             };
         }
 

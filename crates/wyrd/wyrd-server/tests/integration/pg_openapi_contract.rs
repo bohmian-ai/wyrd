@@ -123,6 +123,33 @@ fn catalog_status(code: &str) -> Option<u16> {
         .or_else(|| code.split('_').nth(2)?.parse().ok())
 }
 
+/// Collect every `#/components/schemas/` name referenced anywhere under `value`.
+///
+/// Used to prove the served document is self-contained: a generated client
+/// cannot resolve a reference whose component the document never defines.
+fn component_refs<'a>(value: &'a Value, found: &mut BTreeSet<&'a str>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(name) = object
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|target| target.strip_prefix("#/components/schemas/"))
+            {
+                found.insert(name);
+            }
+            for nested in object.values() {
+                component_refs(nested, found);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                component_refs(nested, found);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The served document describes the routes the server mounts.
 ///
 /// Routing and documentation come out of one `utoipa-axum` registration for
@@ -131,7 +158,9 @@ fn catalog_status(code: &str) -> Option<u16> {
 /// that the surfaces mounted on both planes are present. It also pins that
 /// platform connection configuration, which discovers the issuer before
 /// storing it, publishes that discovery's
-/// `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` as problem+json.
+/// `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` as problem+json. Every component
+/// reference resolves, so the UI's generated HTTP contract types can be built
+/// from the document alone.
 #[tokio::test]
 async fn the_served_document_describes_the_composed_surface() {
     let server = WyrdTestServer::start_in_process()
@@ -205,6 +234,17 @@ async fn the_served_document_describes_the_composed_surface() {
             .is_some_and(|text| text.contains("WYRD_AUTH_503_DISCOVERY_UNAVAILABLE")),
         "the 503 names the stable discovery code: {configure}"
     );
+
+    let mut referenced = BTreeSet::new();
+    component_refs(&document, &mut referenced);
+    let defined = document["components"]["schemas"]
+        .as_object()
+        .expect("components.schemas object");
+    let dangling: Vec<&str> = referenced
+        .into_iter()
+        .filter(|name| !defined.contains_key(*name))
+        .collect();
+    assert!(dangling.is_empty(), "undefined components: {dangling:?}");
 
     server.shutdown().await.expect("server shuts down");
 }

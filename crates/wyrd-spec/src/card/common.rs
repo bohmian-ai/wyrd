@@ -97,8 +97,12 @@ pub enum NonSecretValue {
     /// Boolean value.
     Bool(bool),
     /// List of non-secret values.
+    // `no_recursion` stops OpenAPI schema collection from re-entering this
+    // enum; both recursive variants still reference it by name.
+    #[cfg_attr(feature = "server", schema(no_recursion))]
     List(Vec<NonSecretValue>),
     /// Object of non-secret values.
+    #[cfg_attr(feature = "server", schema(no_recursion))]
     Object(BTreeMap<String, NonSecretValue>),
 }
 

@@ -1433,7 +1433,10 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .iter()
         .filter(|sample| sample.family == "bifrost_forge_active_tasks")
     {
-        assert!(sample.value.abs() < f64::EPSILON, "settled ownership: {sample:?}");
+        assert!(
+            sample.value.abs() < f64::EPSILON,
+            "settled ownership: {sample:?}"
+        );
     }
 }
 

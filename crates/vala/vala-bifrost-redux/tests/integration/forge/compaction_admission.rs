@@ -2901,8 +2901,7 @@ async fn successor_reconciles_before_publishing(
         operation_phases(&promoted.fixture).await
     );
     let settled = tokio::time::timeout(ADMISSION_BOUND, async {
-        while small_files_in_state(&promoted.fixture, &["claimed", "running", "prepared"]).await
-            > 0
+        while small_files_in_state(&promoted.fixture, &["claimed", "running", "prepared"]).await > 0
         {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }

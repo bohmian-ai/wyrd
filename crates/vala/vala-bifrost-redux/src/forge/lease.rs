@@ -5,9 +5,11 @@
 //! the table lease: claiming it acquires the table, its terminal transition
 //! releases it, and its heartbeat renews it. Contention is a refused claim at
 //! admission, never a failure after work was admitted. This type carries that
-//! claim's identity into every renewal, pre-commit window check, and tenant
-//! transaction fence of the attempt that owns it.
+//! claim's identity into every renewal and pre-commit window check of the
+//! attempt that owns it, and opens every fenced tenant transaction that
+//! attempt commits.
 
+use std::ops::{Deref, DerefMut};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -15,8 +17,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-use vala_sql::TenantConn;
 use vala_sql::queries::forge_tasks::ForgeTasks;
+use vala_sql::{TenantConn, ValaPostgres};
+use wyrd_spec::DataTenantId;
 
 use super::error::ForgeError;
 
@@ -144,25 +147,34 @@ impl ForgeLease {
         self.require_renewal().await
     }
 
-    /// Locks this claim as the first statement of a fenced tenant transaction.
+    /// Opens a tenant transaction whose first statement locks this live claim.
     ///
     /// The task row is the first lock in Forge's canonical order and is held
-    /// for the rest of the transaction, so the claim cannot be reclaimed or
-    /// taken over before the commit. It must precede any transition in the
-    /// same transaction that moves the row out of an active state, and no
-    /// renewal may run while the transaction is open, because renewal updates
-    /// the same row from another connection.
+    /// until the returned transaction ends, so the claim cannot be reclaimed or
+    /// taken over before the commit, and every statement the caller adds runs
+    /// after the fence: a transition that moves the row out of an active state
+    /// cannot precede it. Renew before opening, never inside: renewal updates
+    /// the same row from another connection and would wait on this lock.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::FenceLost`] when the claim no longer belongs to
-    /// this live attempt, and [`ForgeError::Sql`] for other statement failures.
-    pub async fn assert_transaction_fence(
+    /// this live attempt, and [`ForgeError::Sql`] when the tenant transaction
+    /// cannot be opened or the lock statement fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the returned transaction rolls it back and releases the lock.
+    pub async fn begin_fenced<'v>(
         &self,
-        conn: &mut TenantConn<'_>,
-    ) -> Result<(), ForgeError> {
-        match ForgeTasks::lock_live_claim(conn, self.task_id, self.attempt_id, self.owner).await {
-            Ok(()) => Ok(()),
+        vala: &'v ValaPostgres,
+        tenant: DataTenantId,
+    ) -> Result<FencedTransaction<'v>, ForgeError> {
+        let mut conn = vala.tenant_conn(tenant).await.map_err(ForgeError::Sql)?;
+        match ForgeTasks::lock_live_claim(&mut conn, self.task_id, self.attempt_id, self.owner)
+            .await
+        {
+            Ok(()) => Ok(FencedTransaction { conn }),
             Err(vala_sql::SqlError::Conflict { .. }) => Err(self.fence_lost()),
             Err(error) => Err(ForgeError::Sql(error)),
         }
@@ -193,5 +205,43 @@ impl ForgeLease {
     /// Returns the saturated monotonic nanosecond offset for shared renewal state.
     fn elapsed_nanos(&self) -> u64 {
         u64::try_from(self.clock_started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+/// A tenant transaction that already holds one attempt's live claim.
+///
+/// Only [`ForgeLease::begin_fenced`] constructs it, so every statement run
+/// through it is ordered after the claim lock and commits only while that
+/// claim is still this attempt's.
+pub struct FencedTransaction<'v> {
+    /// The tenant transaction whose first statement locked the claim.
+    conn: TenantConn<'v>,
+}
+
+impl FencedTransaction<'_> {
+    /// Commits the fenced statements and releases the claim lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the commit fails, which rolls back
+    /// every statement of the transaction.
+    pub async fn commit(self) -> Result<(), ForgeError> {
+        self.conn.commit().await.map_err(ForgeError::Sql)
+    }
+}
+
+impl<'v> Deref for FencedTransaction<'v> {
+    type Target = TenantConn<'v>;
+
+    /// Exposes the fenced tenant transaction to tenant-scoped queries.
+    fn deref(&self) -> &Self::Target {
+        &self.conn
+    }
+}
+
+impl DerefMut for FencedTransaction<'_> {
+    /// Exposes the fenced tenant transaction to tenant-scoped writes.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.conn
     }
 }

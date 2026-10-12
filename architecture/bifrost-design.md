@@ -40,6 +40,13 @@ components perform bounded computation behind Vala-owned contracts; they do not
 authenticate callers, serve the network, own tenant authority, or commit
 durable Wyrd state independently.
 
+Each role on a pod renews its own `vala.cluster_nodes` heartbeat, and one
+process-wide membership poller reads the live set for every role. Internal
+Scribe writes route to a peer by its Scribe capability alone, so a pod without
+Oracle still reaches Scribe. At the entrance, Gate admits only a verified
+principal, OTLP authenticates its API key before decoding a body, and every
+Bifrost SQL path takes a `TenantConn` or an `OperatorPool`, never a bare pool.
+
 ## Table and row identity
 
 Every Bifrost table has one server-owned managed envelope with these required,
@@ -1014,7 +1021,13 @@ one table is logged and the pass continues. Durable task rows record attempt
 evidence and recovery; retryable rows are reclaimed with tenant-fair
 admission, but no durable queue decides what runs next.
 
-At most one durable task attempt owns the lease and fence for a
+A table's one `claimed`, `running`, or `prepared` task row is its exclusive
+lease: claiming the row acquires the table, contention is a refused claim at
+admission, the attempt's heartbeat renews the claim, and the attempt's single
+terminal transition, committed only after that heartbeat has stopped, releases
+it. A strategy that decides its own outcome returns that decision for the
+settlement seam to commit; it never releases the claim itself. At most one
+durable task attempt therefore owns the lease and fence for a
 tenant-qualified table. Within that attempt, admitted ordinary compaction plans are independent child
 operations: fitting siblings may rewrite and publish concurrently, while
 bounded per-tenant and per-worker admission also permits independent tables to
@@ -1356,7 +1369,8 @@ The surface includes:
 - `AppendReceipt { batch_id, accepted_rows, durability }`, where `durability`
   is the closed `AppendDurability::Acknowledged` value; the synchronous append
   response never reports staged, published, promoted, or rewritten state;
-- terminal-safe query streaming at `POST /v1/query`;
+- terminal-safe query streaming at `POST /v1/query`, with ordered typed bind
+  values (`params`) for the `$1..$n` placeholders in its SQL;
 - canonical SQL observation reads through the ordinary Bifrost query contract;
 - gRPC ingestion through `wyrd.v1.BifrostIngestService`;
 - gRPC query projection through `wyrd.v1.BifrostQueryService`;

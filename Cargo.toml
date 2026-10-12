@@ -75,6 +75,7 @@ wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
 workspace-hack = { path = "crates/shared/workspace-hack" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
+pin-project = "1"
 async-trait = "0.1"
 async-stream = "0.3"
 clap = { version = "4", features = ["derive", "env"] }

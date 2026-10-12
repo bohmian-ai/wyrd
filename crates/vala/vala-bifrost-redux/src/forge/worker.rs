@@ -24,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
 use vala_sql::queries::oracle_reader_authority::ExclusiveTableAuthority;
-use vala_sql::row_types::forge_operations::ForgeExpirationAuthority;
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
+use vala_sql::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
     FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate, ForgePreparedTaskClaim,
@@ -40,7 +40,7 @@ use wyrd_spec::vala::api::{
 
 use super::compact::ForgeGroupKey;
 use super::error::{ForgeError, ForgeFailureClass};
-use super::expire::ExpiryTaskAuthority;
+use super::expire::{ExpiryTaskAuthority, ExpiryTerminal};
 use super::identity::task_table_binding;
 use super::leader::{ForgeCompactionDispatch, ForgeCompactionOutcome};
 use super::lease::ForgeLease;
@@ -233,17 +233,11 @@ impl ForgeSnapshotExpiryIntent {
 /// Exact result one dispatched snapshot-expiration pass returns.
 ///
 /// The pass reloads the table after its own commits so the completion path
-/// derives evidence from current metadata, and reports whether the expiration
-/// already settled its own task atomically.
+/// derives evidence from current metadata. An expiration that decided its
+/// terminal transition returns [`ForgeTerminal::Expiry`] instead.
 struct ForgeSnapshotExpiryResult {
     /// Current table after the expiration's metadata commits.
     table: Table,
-    /// Final task evidence an atomic snapshot-expiration settlement stored.
-    ///
-    /// `Some` means the expiration already moved its task to `Succeeded` with
-    /// exact cleanup candidates and advanced planning demand, so the worker
-    /// owes the task no further terminal transition and performs no delete.
-    expiry_evidence: Option<ForgeTaskEvidence>,
 }
 
 /// Exact file and byte volume one committed Forge effect moved.
@@ -549,8 +543,9 @@ enum OpenedFrame {
 
 /// What planning one compaction attempt selected.
 enum RewriteAdmission {
-    /// Planning selected nothing, so the table is already compact.
-    SelfSettled,
+    /// Planning selected nothing, so the table is already compact; carries the
+    /// audited no-op success the settlement seam commits.
+    Compact(ForgeTerminal),
     /// Plans to admit, with the managed context every one of them shares.
     Planned(
         Arc<ForgeRewriteAttempt>,
@@ -627,20 +622,48 @@ enum ForgeDispatchResult {
     /// The owner therefore releases the attempt rather than settling the task,
     /// leaving the durable row for the table-wide reconciliation owner.
     AcceptanceUnknown(Box<ForgeUnknownAcceptance>),
-    /// A dispatch that already wrote its own durable task transition and owes
-    /// the worker no further one.
+    /// A dispatch that decided its task's terminal transition itself.
     ///
-    /// Two dispatches settle themselves. A bounded orphan-cleanup pass writes
-    /// either a cursor checkpoint plus a non-consuming release or the audited
-    /// terminal success that exhaustion earns. A compaction attempt whose
-    /// planning selected nothing writes the audited no-op success directly,
-    /// because it holds no operation and produced no evidence for the ordinary
-    /// Prepared path to reconcile.
-    ///
-    /// Carries the result the dispatch's own transition committed: a bounded
-    /// orphan pass releases as a retry, and every other self-settlement
-    /// succeeds.
-    SelfSettled(ForgeTaskResult),
+    /// A bounded orphan-cleanup pass decides a cursor checkpoint plus a
+    /// non-consuming release or the terminal success exhaustion earns, and a
+    /// manifest rewrite decides its success once its catalog commit lands. The
+    /// settlement seam commits the decision after the claim heartbeat stops.
+    Terminal(ForgeTerminal),
+}
+
+/// The terminal task transition a strategy decided and left uncommitted.
+///
+/// The task claim is the table's only authority, and the attempt's heartbeat
+/// renews it for as long as the strategy runs. No strategy therefore releases
+/// the claim itself: each returns the transition it decided, and
+/// [`ForgeWorker::commit_terminal`] commits it once the heartbeat has stopped.
+/// That leaves exactly one release point per attempt, so a renewal can never
+/// observe a claim its own attempt already released.
+#[derive(Debug)]
+enum ForgeTerminal {
+    /// Compaction planning selected nothing: the audited no-op success.
+    NoOpAcknowledged {
+        /// Current snapshot the acknowledgement records.
+        snapshot_id: i64,
+        /// Commits since the table's first snapshot.
+        commit_count: u64,
+    },
+    /// A committed manifest rewrite's audited success.
+    ManifestRewritten,
+    /// A bounded orphan pass: checkpoint its frontier, then release for retry.
+    OrphanPassBounded {
+        /// Registered table the cleanup authority is bound to.
+        table: ForgeClaimTable,
+        /// Last completely processed key, when the pass processed any.
+        frontier: Option<String>,
+    },
+    /// An exhausted orphan scan's terminal success.
+    OrphanScanComplete {
+        /// Registered table the cleanup authority is bound to.
+        table: ForgeClaimTable,
+    },
+    /// A snapshot expiration's settlement or reset.
+    Expiry(ExpiryTerminal),
 }
 
 /// What one plan knows about an operation it could not prove the fate of.
@@ -664,14 +687,9 @@ enum ForgeExecutionEvidenceState {
     RecoveredCommit,
     /// Maintenance already persisted the task's Prepared evidence transaction.
     Prepared,
-    /// The dispatch already committed the task's own transition, so this
-    /// worker owes it no further one; carries the result that transition
-    /// committed.
-    ///
-    /// An atomic snapshot-expiration settlement moved the task to `Succeeded`,
-    /// stored its exact cleanup candidates, and advanced planning demand; a
-    /// self-settled dispatch wrote its own success or bounded release.
-    Settled(ForgeTaskResult),
+    /// The dispatch decided the task's terminal transition, which the
+    /// settlement seam commits instead of its ordinary success.
+    Terminal(ForgeTerminal),
 }
 
 /// Exact durable ownership required to advance a Prepared cleanup cursor.
@@ -912,25 +930,18 @@ pub struct ForgeWorkerCompletionObserver {
     /// One-shot injected failure of the next execution-failure settlement.
     #[cfg(feature = "test-support")]
     fail_next_failure_settlement: Arc<AtomicBool>,
-    /// One-shot passive barrier after a dispatch returns durable settlement.
+    /// One-shot passive barrier after a dispatch decides its terminal transition.
     #[cfg(feature = "test-support")]
     pause_after_next_settlement: Arc<AtomicBool>,
-    /// Whether a durably settled dispatch is currently held at that barrier.
+    /// Whether a decided dispatch is currently held at that barrier.
     #[cfg(feature = "test-support")]
     settlement_paused: Arc<AtomicBool>,
-    /// Wakeup for tests waiting until the settled dispatch is held.
+    /// Wakeup for tests waiting until the decided dispatch is held.
     #[cfg(feature = "test-support")]
     settlement_pause_ready: Arc<tokio::sync::Notify>,
-    /// Release for the one settled dispatch held by the barrier.
+    /// Release for the one decided dispatch held by the barrier.
     #[cfg(feature = "test-support")]
     settlement_pause_release: Arc<tokio::sync::Notify>,
-    /// Extra trigger that makes the running claim heartbeat take one real beat.
-    ///
-    /// Part of the same settlement barrier: while a settled dispatch is held,
-    /// a test uses this to drive the already-running heartbeat through its
-    /// genuine post-settlement conflict instead of waiting on wall-clock ticks.
-    #[cfg(feature = "test-support")]
-    heartbeat_beat_now: Arc<tokio::sync::Notify>,
 }
 
 /// Typed causal evidence from the production Forge scheduler and worker owners.
@@ -1403,24 +1414,23 @@ impl ForgeWorkerCompletionObserver {
         self.rewrite_settlement_pause_release.notify_one();
     }
 
-    /// Hold the next dispatch that returned durable settlement.
+    /// Hold the next snapshot expiration that decided its terminal transition.
     ///
     /// The barrier is passive and sits immediately after the dispatch returned
-    /// [`ForgeExecutionEvidenceState::Settled`] and before the worker reads
-    /// shutdown or joins the claim heartbeat. The task and its operation are
-    /// already terminal when it runs, so holding there changes only fixture
-    /// timing: it lets a test make a concurrent shutdown or an obsolete
-    /// heartbeat conflict provably precede the worker's own interpretation.
+    /// a decided terminal and before the worker reads shutdown, joins the
+    /// claim heartbeat, or commits that transition. Holding there changes only
+    /// fixture timing: it lets a test make a concurrent shutdown provably
+    /// precede the worker's own settlement.
     #[cfg(feature = "test-support")]
-    pub fn hold_after_next_durable_settlement_for_test(&self) {
+    pub fn hold_after_next_terminal_decision_for_test(&self) {
         self.settlement_paused.store(false, Ordering::Release);
         self.pause_after_next_settlement
             .store(true, Ordering::Release);
     }
 
-    /// Wait until the armed post-settlement barrier is holding one dispatch.
+    /// Wait until the armed terminal-decision barrier is holding one dispatch.
     #[cfg(feature = "test-support")]
-    pub async fn wait_for_held_durable_settlement_for_test(&self) {
+    pub async fn wait_for_held_terminal_decision_for_test(&self) {
         loop {
             let notified = self.settlement_pause_ready.notified();
             if self.settlement_paused.load(Ordering::Acquire) {
@@ -1430,28 +1440,10 @@ impl ForgeWorkerCompletionObserver {
         }
     }
 
-    /// Release the one dispatch held after its durable settlement.
+    /// Release the one dispatch held after its terminal decision.
     #[cfg(feature = "test-support")]
-    pub fn release_held_durable_settlement_for_test(&self) {
+    pub fn release_held_terminal_decision_for_test(&self) {
         self.settlement_pause_release.notify_one();
-    }
-
-    /// Make the running claim heartbeat take one immediate real beat.
-    ///
-    /// The permit is stored, so the beat happens on the heartbeat's next select
-    /// pass whether or not it is already parked, and it takes priority over
-    /// cancellation. The beat itself is the production statement: against an
-    /// already-settled task it returns the genuine obsolete-claim conflict.
-    #[cfg(feature = "test-support")]
-    pub fn beat_claim_heartbeat_now_for_test(&self) {
-        self.heartbeat_beat_now.notify_one();
-    }
-
-    /// Shares the extra heartbeat trigger with the spawned heartbeat task.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn heartbeat_beat_signal(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.heartbeat_beat_now)
     }
 
     /// Wait until successful tasks have been completed by `expected` distinct workers.
@@ -1749,9 +1741,9 @@ impl ForgeWorkerCompletionObserver {
         self.handoff_paused.store(false, Ordering::Release);
     }
 
-    /// Pause once after an armed dispatch returned durable settlement.
+    /// Pause once after an armed dispatch decided its terminal transition.
     #[cfg(feature = "test-support")]
-    async fn pause_after_settlement_for_test(&self) {
+    async fn pause_after_terminal_decision_for_test(&self) {
         if !self
             .pause_after_next_settlement
             .swap(false, Ordering::AcqRel)
@@ -3393,15 +3385,16 @@ impl ForgeWorker {
         }
     }
 
-    /// Apply the observer's one-shot passive post-settlement barrier.
+    /// Apply the observer's one-shot passive terminal-decision barrier.
     ///
-    /// Called only after a dispatch returned durable settlement and before the
-    /// worker reads shutdown or joins the heartbeat. Without an armed observer
-    /// it is a no-op, so no production decision depends on it.
+    /// Called only after a dispatch decided its terminal transition and before
+    /// the worker reads shutdown, joins the heartbeat, or commits it. Without
+    /// an armed observer it is a no-op, so no production decision depends on
+    /// it.
     #[cfg(feature = "test-support")]
-    async fn pause_after_settlement_for_test(&self) {
+    async fn pause_after_terminal_decision_for_test(&self) {
         if let Some(observer) = &self.completion_observer {
-            observer.pause_after_settlement_for_test().await;
+            observer.pause_after_terminal_decision_for_test().await;
         }
     }
 
@@ -3656,7 +3649,8 @@ impl ForgeWorker {
     /// pre-effect durable work performed, so releasing the claim is lossless: a
     /// successor reclaims the `retryable` task immediately. This is deliberately
     /// distinct from crash recovery, where cancellation is never observed and
-    /// the claim is retained for `reclaim_expired` after its lease TTL.
+    /// the claim is retained for [`ForgeTasks::reclaim_expired_attempts`] after
+    /// its lease TTL.
     ///
     /// The release is guarded to pre-effect ownership. [`ForgeTasks::retry`]
     /// matches only `state IN ('claimed','running')` for this attempt and owner,
@@ -4466,10 +4460,11 @@ impl ForgeWorker {
         }
         let result = async {
             heartbeat_result?;
-            if reconciliation? {
-                return Ok(());
-            }
+            let terminal = reconciliation?;
             lease.require_fence().await?;
+            if let Some(terminal) = terminal {
+                return self.forge.commit_expiry_terminal(terminal).await;
+            }
             self.persist_terminal_success(
                 ForgeTaskTransition {
                     task_id: task.task_id,
@@ -4499,11 +4494,12 @@ impl ForgeWorker {
 
     /// Verifies and resumes every external effect owned by one Prepared task.
     ///
-    /// Returns whether the resumed effect already settled its own task. A
-    /// prepared snapshot expiration owns that transition: takeover preserves
-    /// `attempt_id`, replaces the current owner and renews the claim, and then
-    /// settles or retains the operation its own claim rows
-    /// name. Every other strategy leaves its terminal transition to the caller.
+    /// Returns the terminal transition a resumed snapshot expiration decided.
+    /// Takeover preserves `attempt_id`, replaces the current owner and renews
+    /// the claim, and the expiration then decides to settle or release the
+    /// operation its own claim rows name; the caller commits that decision
+    /// after the heartbeat stops. Every other strategy returns `None` and
+    /// leaves the ordinary Prepared success to the caller.
     ///
     /// # Errors
     ///
@@ -4518,14 +4514,14 @@ impl ForgeWorker {
         lease: &mut ForgeLease,
         evidence: &ForgeTaskEvidence,
         stop: &CancellationToken,
-    ) -> Result<bool, ForgeError> {
+    ) -> Result<Option<ExpiryTerminal>, ForgeError> {
         lease.require_fence().await?;
         if task.strategy == ForgeTaskStrategy::SnapshotExpiry {
             let key = super::compact::ForgeTableKey {
                 tenant: task.data_tenant_id,
                 table_ref: binding.table_ref.clone(),
             };
-            let settled = self
+            return self
                 .forge
                 .run_snapshot_expiry_for_table(
                     lease,
@@ -4540,18 +4536,12 @@ impl ForgeWorker {
                     stop,
                 )
                 .await?
-                .settled_evidence
-                .is_some();
-            if !settled {
-                return Err(ForgeError::Reconciliation {
+                .terminal
+                .map(Some)
+                .ok_or_else(|| ForgeError::Reconciliation {
                     detail: "prepared snapshot expiration could not be settled or released"
                         .to_owned(),
                 });
-            }
-            if stop.is_cancelled() {
-                return Err(ForgeError::Shutdown);
-            }
-            return Ok(true);
         }
         let table = self.forge.load_table(&binding.table_ident()).await?;
         self.verify_committed_evidence(binding, &table, evidence)
@@ -4575,7 +4565,7 @@ impl ForgeWorker {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Validates the closed strategy and payload contract without IO.
@@ -4876,7 +4866,7 @@ impl ForgeWorker {
                     unknown.operation_id
                 ),
             }),
-            ForgeDispatchResult::SelfSettled(result) => Ok(Self::self_settled_evidence(result)),
+            ForgeDispatchResult::Terminal(terminal) => Ok(Self::terminal_evidence(terminal)),
             ForgeDispatchResult::SnapshotExpiry(result) => self
                 .complete_snapshot_expiry(claim, attempt, binding, lease, *result, stop)
                 .await
@@ -4926,11 +4916,9 @@ impl ForgeWorker {
                     Ok(RewriteAdmission::Planned(shared, plans)) => {
                         return Ok(OpenedFrame::Planned(shared, plans, fenced));
                     }
-                    // The no-op acknowledgement committed `Running` to `Succeeded`.
-                    Ok(RewriteAdmission::SelfSettled) => (
-                        Ok(Self::self_settled_evidence(ForgeTaskResult::Succeeded)),
-                        fenced,
-                    ),
+                    Ok(RewriteAdmission::Compact(terminal)) => {
+                        (Ok(Self::terminal_evidence(terminal)), fenced)
+                    }
                     Err(error) => (Err(error), fenced),
                 }
             }
@@ -4953,19 +4941,21 @@ impl ForgeWorker {
             .map(|result| OpenedFrame::Complete(ForgeSettledAttempt::committed(true, result)))
     }
 
-    /// Returns the evidence an attempt that produced no effect settles with.
+    /// Returns the evidence a dispatch that decided its own terminal settles with.
     ///
-    /// The dispatch already wrote its own durable transition, committing
-    /// `result`, so this evidence names no snapshot and no candidate.
-    fn self_settled_evidence(
-        result: ForgeTaskResult,
+    /// An expiry terminal carries the evidence its settlement derived; every
+    /// other decided transition records no publication, so its evidence names
+    /// no snapshot and no candidate.
+    fn terminal_evidence(
+        terminal: ForgeTerminal,
     ) -> (
         ForgeTaskEvidence,
         ForgeExecutionEvidenceState,
         Option<ForgeCommittedVolume>,
     ) {
-        (
-            ForgeTaskEvidence {
+        let evidence = match &terminal {
+            ForgeTerminal::Expiry(expiry) => expiry.evidence(),
+            _ => ForgeTaskEvidence {
                 version: FORGE_TASK_PAYLOAD_VERSION,
                 committed_snapshot_id: None,
                 committed_metadata_location: None,
@@ -4974,7 +4964,10 @@ impl ForgeWorker {
                 deleted_candidate_count: 0,
                 prepared_candidate_index: None,
             },
-            ForgeExecutionEvidenceState::Settled(result),
+        };
+        (
+            evidence,
+            ForgeExecutionEvidenceState::Terminal(terminal),
             None,
         )
     }
@@ -5091,8 +5084,8 @@ impl ForgeWorker {
     /// same seam as an inline one.
     ///
     /// Returns the durable result the settling transaction committed: the
-    /// dispatch's own committed result when it settled itself, and otherwise
-    /// the `Succeeded` transition this method's finish commits.
+    /// dispatch's decided terminal result, and otherwise the `Succeeded`
+    /// transition this method's finish commits.
     ///
     /// # Errors
     ///
@@ -5134,17 +5127,17 @@ impl ForgeWorker {
         } = fenced;
         #[cfg(not(feature = "test-support"))]
         let _ = maintenance_recovery;
-        // Test-only barrier: a durably settled snapshot expiration is held
-        // here, after its atomic task and operation settlement committed and
-        // before this worker reads shutdown or joins the heartbeat.
+        // Test-only barrier: a snapshot expiration that decided its terminal
+        // transition is held here, before this worker reads shutdown, joins
+        // the heartbeat, or commits that transition.
         #[cfg(feature = "test-support")]
         if maintenance_recovery
             && matches!(
                 execution,
-                Ok((_, ForgeExecutionEvidenceState::Settled(_), _))
+                Ok((_, ForgeExecutionEvidenceState::Terminal(_), _))
             )
         {
-            self.pause_after_settlement_for_test().await;
+            self.pause_after_terminal_decision_for_test().await;
         }
         // A pre-effect cancellation surfaces as `execution == Err(Shutdown)`
         // (dispatch stopped mid-rewrite before its catalog commit, or a
@@ -5156,28 +5149,25 @@ impl ForgeWorker {
         // propagates as `ForgeError::ShutdownRetained` to keep the event loop from
         // matching and releasing it; it stays durable for lease-expiry recovery.
         //
-        // Durable settlement is the exception to both. `Settled` means the
-        // atomic task-and-operation transition has already committed, so a
-        // shutdown that raced it and a now-obsolete heartbeat conflict can
-        // neither undo it nor be retried into a different outcome: reporting
-        // either as this attempt's result would contradict durable state. The
-        // heartbeat is still cancelled and joined so no task is detached.
-        let settled_dispatch = matches!(
+        // A decided terminal transition is the exception to the shutdown
+        // check: its strategy finished, so committing that transition under
+        // the claim is this attempt's close whether or not shutdown arrived.
+        //
+        // The heartbeat is stopped and joined before anything below commits,
+        // so the claim is released only after nothing renews it any more.
+        let decided = matches!(
             execution,
-            Ok((_, ForgeExecutionEvidenceState::Settled(_), _))
+            Ok((_, ForgeExecutionEvidenceState::Terminal(_), _))
         );
         let completion = match execution {
-            Ok(evidence) if settled_dispatch || !operation_stop.is_cancelled() => Ok(evidence),
+            Ok(evidence) if decided || !operation_stop.is_cancelled() => Ok(evidence),
             Ok(_) => Err(ForgeError::ShutdownRetained),
             Err(error) => Err(error),
         };
         operation_stop.cancel();
-        let heartbeat_result = heartbeat.await.map_err(|error| ForgeError::Invariant {
+        heartbeat.await.map_err(|error| ForgeError::Invariant {
             detail: format!("Forge claim heartbeat panicked: {error}"),
-        })?;
-        if !settled_dispatch {
-            heartbeat_result?;
-        }
+        })??;
         let (evidence, state, volume) = completion?;
         self.settle_promotion_evidence(claim, binding, lease, &evidence, &state)
             .await?;
@@ -5185,18 +5175,11 @@ impl ForgeWorker {
             .await?;
         #[cfg(feature = "test-support")]
         self.record_rewrite_evidence(claim, &evidence);
-        let committed = match state {
-            ForgeExecutionEvidenceState::Settled(result) => Some(result),
-            _ => None,
-        };
-        self.finish_claim_execution(claim, attempt, lease, &evidence, state)
+        let result = self
+            .finish_claim_execution(claim, attempt, lease, &evidence, state)
             .await?;
-        if committed.is_none() {
-            Self::record_committed_volume(claim, volume);
-        }
-        // Every non-settled state is closed by `finish_claim_execution`'s own
-        // `Succeeded` transition.
-        Ok(committed.unwrap_or(ForgeTaskResult::Succeeded))
+        Self::record_committed_volume(claim, volume);
+        Ok(result)
     }
 
     /// Settles a rewrite whose commit was discovered rather than observed.
@@ -5209,7 +5192,7 @@ impl ForgeWorker {
     /// second terminal audit writer that could disagree with it.
     ///
     /// Every other strategy and every other evidence state is a no-op: their
-    /// terminal transition was already written by the owner that produced it.
+    /// terminal transition is committed by the finish that follows.
     ///
     /// # Errors
     ///
@@ -5299,7 +5282,7 @@ impl ForgeWorker {
                         }
                         ForgeExecutionEvidenceState::Fresh
                         | ForgeExecutionEvidenceState::Prepared
-                        | ForgeExecutionEvidenceState::Settled(_) => {
+                        | ForgeExecutionEvidenceState::Terminal(_) => {
                             ForgeScribePromotionPhase::Committed
                         }
                     },
@@ -5353,8 +5336,8 @@ impl ForgeWorker {
 
     /// Counts committed file and byte throughput after durable settlement.
     ///
-    /// Called only once the settlement transition for this attempt commits, and
-    /// never for a state another owner already settled. A strategy this build
+    /// Called only once the settlement transition for this attempt commits. A
+    /// decided terminal transition carries no volume, and a strategy this build
     /// does not know carries no `task_type`.
     fn record_committed_volume(claim: &ForgeTaskClaim, volume: Option<ForgeCommittedVolume>) {
         let (Some(volume), Some(task_type)) = (volume, Self::metric_strategy(&claim.strategy))
@@ -5365,7 +5348,12 @@ impl ForgeWorker {
         ForgeTelemetry::record_output(task_type, volume.output_files, volume.output_bytes);
     }
 
-    /// Refreshes final authority and commits the appropriate success transition.
+    /// Refreshes final authority and commits the attempt's one terminal transition.
+    ///
+    /// This is the attempt's single release point: it runs after the claim
+    /// heartbeat stopped, renews the claim once, and commits either the
+    /// strategy's decided transition or the ordinary success for its state.
+    /// Returns the result that transition committed.
     ///
     /// # Errors
     ///
@@ -5377,22 +5365,16 @@ impl ForgeWorker {
         lease: &mut ForgeLease,
         evidence: &ForgeTaskEvidence,
         state: ForgeExecutionEvidenceState,
-    ) -> Result<(), ForgeError> {
-        // Atomic expiration settlement already wrote the terminal task
-        // transition, cleared ownership, removed the claims, advanced planning
-        // demand, and appended both terminal audits in one transaction. The row
-        // no longer names this attempt, so heartbeating it would report a
-        // conflict after durable success. The worker performs no second
-        // transition and no further authority refresh at all.
-        if matches!(state, ForgeExecutionEvidenceState::Settled(_)) {
-            return Ok(());
-        }
+    ) -> Result<ForgeTaskResult, ForgeError> {
         lease.require_fence().await?;
         match state {
             ForgeExecutionEvidenceState::Fresh | ForgeExecutionEvidenceState::RecoveredCommit => {
-                self.persist_success(claim, attempt, lease, evidence).await
+                self.persist_success(claim, attempt, lease, evidence)
+                    .await?;
             }
-            ForgeExecutionEvidenceState::Settled(_) => Ok(()),
+            ForgeExecutionEvidenceState::Terminal(terminal) => {
+                return self.commit_terminal(claim, attempt, lease, terminal).await;
+            }
             ForgeExecutionEvidenceState::Prepared => {
                 self.persist_terminal_success(
                     ForgeTaskTransition {
@@ -5413,7 +5395,106 @@ impl ForgeWorker {
                             || evidence.deleted_candidate_count > 0,
                     ),
                 )
-                .await
+                .await?;
+            }
+        }
+        Ok(ForgeTaskResult::Succeeded)
+    }
+
+    /// Commits one strategy's decided terminal transition.
+    ///
+    /// Each arm is the one statement or transaction that strategy's
+    /// transition always was; only its position moved, to after the heartbeat
+    /// stopped. Returns the result the transition committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when the claim is no longer this
+    /// attempt's, and the SQL, audit, and expiry-settlement failures of the
+    /// committing transition.
+    async fn commit_terminal(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        lease: &ForgeLease,
+        terminal: ForgeTerminal,
+    ) -> Result<ForgeTaskResult, ForgeError> {
+        let running_success = ForgeTaskTransition {
+            task_id: claim.task_id,
+            attempt_id: attempt,
+            owner: self.owner,
+            expected: ForgeTaskState::Running,
+            next: ForgeTaskState::Succeeded,
+        };
+        let authority = ForgeExpirationAuthority {
+            task_id: claim.task_id,
+            attempt_id: attempt,
+            worker_id: self.owner,
+        };
+        match terminal {
+            ForgeTerminal::NoOpAcknowledged {
+                snapshot_id,
+                commit_count,
+            } => {
+                self.persist_terminal_success(
+                    running_success,
+                    claim.data_tenant_id,
+                    &claim.table_ref,
+                    lease,
+                    TaskProgressEffect::NoOpAcknowledged {
+                        snapshot_id,
+                        commit_count,
+                    },
+                )
+                .await?;
+                Ok(ForgeTaskResult::Succeeded)
+            }
+            ForgeTerminal::ManifestRewritten => {
+                self.persist_terminal_success(
+                    running_success,
+                    claim.data_tenant_id,
+                    &claim.table_ref,
+                    lease,
+                    TaskProgressEffect::Progressed,
+                )
+                .await?;
+                Ok(ForgeTaskResult::Succeeded)
+            }
+            ForgeTerminal::OrphanPassBounded { table, frontier } => {
+                if let Some(frontier) = frontier.as_deref() {
+                    self.tasks
+                        .checkpoint_orphan_cleanup_cursor(
+                            claim.data_tenant_id,
+                            &authority,
+                            &table,
+                            frontier,
+                        )
+                        .await
+                        .map_err(ForgeError::Sql)?;
+                }
+                // A bounded pass is progress, not a failure: the same task
+                // returns to the pool with its position intact and its budget
+                // untouched.
+                self.tasks
+                    .retry(claim.task_id, attempt, self.owner, None)
+                    .await
+                    .map_err(ForgeError::Sql)?;
+                Ok(ForgeTaskResult::Retry)
+            }
+            ForgeTerminal::OrphanScanComplete { table } => {
+                self.tasks
+                    .complete_orphan_cleanup(claim.data_tenant_id, &authority, &table)
+                    .await
+                    .map_err(ForgeError::Sql)?;
+                Ok(ForgeTaskResult::Succeeded)
+            }
+            ForgeTerminal::Expiry(terminal) => {
+                let result = match terminal {
+                    ExpiryTerminal::Settle(_) => ForgeTaskResult::Succeeded,
+                    ExpiryTerminal::Reset(_) => ForgeTaskResult::Cancelled,
+                };
+                self.forge.commit_expiry_terminal(terminal).await?;
+                Ok(result)
             }
         }
     }
@@ -5567,8 +5648,9 @@ impl ForgeWorker {
                         .to_owned(),
             });
         }
-        let expiry_evidence = if intent.snapshot_expiry_due {
-            self.forge
+        if intent.snapshot_expiry_due {
+            let terminal = self
+                .forge
                 .run_snapshot_expiry_for_table(
                     lease,
                     &key,
@@ -5582,19 +5664,21 @@ impl ForgeWorker {
                     stop,
                 )
                 .await?
-                .settled_evidence
-        } else {
-            None
-        };
+                .terminal;
+            // A decided settlement or reset is the strategy's end: it returns
+            // before the shutdown check so the seam commits it regardless.
+            if let Some(terminal) = terminal {
+                return Ok(ForgeDispatchResult::Terminal(ForgeTerminal::Expiry(
+                    terminal,
+                )));
+            }
+        }
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
         let table = self.forge.load_table(&binding.table_ident()).await?;
         Ok(ForgeDispatchResult::SnapshotExpiry(Box::new(
-            ForgeSnapshotExpiryResult {
-                table,
-                expiry_evidence,
-            },
+            ForgeSnapshotExpiryResult { table },
         )))
     }
 
@@ -5650,11 +5734,11 @@ impl ForgeWorker {
                     .await
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::OrphanCleanup) => {
-                self.dispatch_orphan_cleanup(claim, attempt, binding, lease, &table, stop)
+                self.dispatch_orphan_cleanup(claim, binding, lease, &table, stop)
                     .await
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite) => {
-                self.dispatch_manifest_rewrite(claim, attempt, binding, lease, stop)
+                self.dispatch_manifest_rewrite(claim, binding, lease, stop)
                     .await
             }
             _ => Err(ForgeError::Invariant {
@@ -5716,9 +5800,17 @@ impl ForgeWorker {
             policy,
         } = rewrite.plan(Self::claim_compaction_type(claim)).await?;
         if plans.is_empty() {
-            self.acknowledge_compact_table(claim, attempt, &table, lease)
-                .await?;
-            return Ok(RewriteAdmission::SelfSettled);
+            // Planning that selects nothing means the table is already
+            // compact, not that this attempt failed: reporting a failure would
+            // consume the attempt budget and terminalize an idle table. The
+            // no-op is acknowledged against the exact snapshot and commit
+            // backlog, which keeps the next planning demand honest.
+            let metadata = table.metadata();
+            return Ok(RewriteAdmission::Compact(ForgeTerminal::NoOpAcknowledged {
+                snapshot_id: metadata.current_snapshot_id().unwrap_or(0),
+                commit_count: u64::try_from(metadata.snapshots().count().saturating_sub(1))
+                    .unwrap_or(u64::MAX),
+            }));
         }
         Ok(RewriteAdmission::Planned(
             Arc::new(ForgeRewriteAttempt {
@@ -6039,47 +6131,6 @@ impl ForgeWorker {
             }
         }
         refusals
-    }
-
-    /// Settles an attempt whose planning selected nothing as a success.
-    ///
-    /// Planning that selects nothing means the table is already compact, not
-    /// that this attempt failed. Reporting a failure would consume the task's
-    /// attempt budget and terminalize an idle table after five passes, so the
-    /// no-op is acknowledged instead: the task succeeds and its planning demand
-    /// records the exact snapshot and commit backlog the acknowledgement was
-    /// made against, which is what keeps the next demand honest.
-    ///
-    /// # Errors
-    ///
-    /// Returns the audit, fence, and SQL failures the terminal transition
-    /// raises; the caller has already refused to publish anything.
-    async fn acknowledge_compact_table(
-        &self,
-        claim: &ForgeTaskClaim,
-        attempt: Uuid,
-        table: &Table,
-        lease: &ForgeLease,
-    ) -> Result<(), ForgeError> {
-        let metadata = table.metadata();
-        self.persist_terminal_success(
-            ForgeTaskTransition {
-                task_id: claim.task_id,
-                attempt_id: attempt,
-                owner: self.owner,
-                expected: ForgeTaskState::Running,
-                next: ForgeTaskState::Succeeded,
-            },
-            claim.data_tenant_id,
-            &claim.table_ref,
-            lease,
-            TaskProgressEffect::NoOpAcknowledged {
-                snapshot_id: metadata.current_snapshot_id().unwrap_or(0),
-                commit_count: u64::try_from(metadata.snapshots().count().saturating_sub(1))
-                    .unwrap_or(u64::MAX),
-            },
-        )
-        .await
     }
 
     /// Reduces one attempt's per-plan refusals and outcomes to one task result.
@@ -7532,33 +7583,19 @@ impl ForgeWorker {
         stop: &CancellationToken,
     ) -> Result<(ForgeTaskEvidence, ForgeExecutionEvidenceState), ForgeError> {
         require_running(stop)?;
-        // A snapshot expiration settled its own task, operation, claims, audits,
-        // and planning demand in one transaction and deliberately deleted
-        // nothing: its exact candidates are the handoff to separate cleanup.
-        if let Some(evidence) = result.expiry_evidence {
-            return Ok((
-                evidence,
-                ForgeExecutionEvidenceState::Settled(ForgeTaskResult::Succeeded),
-            ));
-        }
         let evidence = self.committed_evidence(binding, &result.table).await?;
         evidence.validate(false).map_err(ForgeError::Sql)?;
 
         require_running(stop)?;
         lease.require_fence().await?;
-        let mut prepared = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(claim.data_tenant_id)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut prepared).await?;
+        let mut prepared = lease
+            .begin_fenced(&self.forge.core.vala, claim.data_tenant_id)
+            .await?;
         self.tasks
             .prepared(&mut prepared, claim.task_id, attempt, self.owner, &evidence)
             .await
             .map_err(ForgeError::Sql)?;
-        prepared.commit().await.map_err(ForgeError::Sql)?;
+        prepared.commit().await?;
         #[cfg(feature = "test-support")]
         if self
             .forge
@@ -7575,21 +7612,6 @@ impl ForgeWorker {
         Ok((evidence, ForgeExecutionEvidenceState::Prepared))
     }
 
-    /// Runs one claimed expired-cleanup task to its drained frontier.
-    ///
-    /// The immutable payload is the whole work: it names the succeeded
-    /// expiration this task consumes, the committed identity that expiration
-    /// left behind, and the exact ordered candidates that commit made
-    /// unreachable. Nothing here is re-derived from the catalog, so a task that
-    /// runs much later deletes exactly the objects its handoff named or nothing
-    /// at all.
-    ///
-    /// # Errors
-    ///
-    /// Returns payload-decoding, protection, path-binding, object-store,
-    /// fencing, audit, SQL, or cancellation failures. Every failure leaves the
-    /// durable cursor authoritative, so the exact candidate is replayed by this
-    /// or a successor attempt.
     /// Runs one bounded orphan-collection pass for an already-claimed task.
     ///
     /// The task row's tenant and table plus its immutable prefix and cutoff are
@@ -7601,16 +7623,18 @@ impl ForgeWorker {
     /// Everything destructive stays with the retained owner: listing,
     /// protection, the sorted batch, its `OrphanGc` prepare/delete/reconcile
     /// protocol, and crash recovery. What this adds is the durable scan
-    /// position. After the selected batch settles, a partial pass checkpoints
-    /// the last completely processed key and releases the task without
-    /// consuming failure budget, which is what keeps a leading run of protected
-    /// objects from starving the pages behind it. An exhausted prefix instead
-    /// clears the cursor and takes the audited terminal transition.
+    /// position. After the selected batch settles, a partial pass decides to
+    /// checkpoint the last completely processed key and release the task
+    /// without consuming failure budget, which is what keeps a leading run of
+    /// protected objects from starving the pages behind it. An exhausted prefix
+    /// instead decides to clear the cursor and take the audited terminal
+    /// transition. The settlement seam commits either decision after the claim
+    /// heartbeat stops.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the plan is not the closed orphan
-    /// contract or a durable transition is refused, [`ForgeError::Invariant`]
+    /// contract, [`ForgeError::Invariant`]
     /// when the plan prefix is not this table's current Forge recipe root, and
     /// every lease, catalog, protection, object-store, audit, and cancellation
     /// failure the retained collection owner raises.
@@ -7623,7 +7647,6 @@ impl ForgeWorker {
     async fn dispatch_orphan_cleanup(
         &self,
         claim: &ForgeTaskClaim,
-        attempt: Uuid,
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
         table: &Table,
@@ -7686,46 +7709,25 @@ impl ForgeWorker {
             elapsed_seconds = elapsed.as_secs_f64(),
             "Forge orphan collection scan returned"
         );
-        let authority = ForgeExpirationAuthority {
-            task_id: claim.task_id,
-            attempt_id: attempt,
-            worker_id: self.owner,
-        };
-        let claim_table = self.forge.expiry_claim_table(&key, table).await?;
-        if outcome.partial {
-            if let Some(frontier) = outcome.frontier.as_deref() {
-                self.tasks
-                    .checkpoint_orphan_cleanup_cursor(
-                        claim.data_tenant_id,
-                        &authority,
-                        &claim_table,
-                        frontier,
-                    )
-                    .await
-                    .map_err(ForgeError::Sql)?;
+        let table = self.forge.expiry_claim_table(&key, table).await?;
+        Ok(ForgeDispatchResult::Terminal(if outcome.partial {
+            ForgeTerminal::OrphanPassBounded {
+                table,
+                frontier: outcome.frontier,
             }
-            // A bounded pass is progress, not a failure: the same task returns
-            // to the pool with its position intact and its budget untouched.
-            self.tasks
-                .retry(claim.task_id, attempt, self.owner, None)
-                .await
-                .map_err(ForgeError::Sql)?;
-            return Ok(ForgeDispatchResult::SelfSettled(ForgeTaskResult::Retry));
-        }
-        self.tasks
-            .complete_orphan_cleanup(claim.data_tenant_id, &authority, &claim_table)
-            .await
-            .map_err(ForgeError::Sql)?;
-        Ok(ForgeDispatchResult::SelfSettled(ForgeTaskResult::Succeeded))
+        } else {
+            ForgeTerminal::OrphanScanComplete { table }
+        }))
     }
 
-    /// Commits one claimed manifest rewrite and settles it from Running.
+    /// Commits one claimed manifest rewrite and decides its success from Running.
     ///
     /// The plan's inputs are the manifests the leader selected. The commit
     /// reloads the table and rewrites only the selected paths still in the
     /// head, so a manifest another commit already replaced is skipped rather
     /// than resurrected. The claim is renewed immediately before the catalog
-    /// commit and asserted inside the settling transaction. The rewrite
+    /// commit, and the settlement seam commits the decided success after the
+    /// claim heartbeat stops. The rewrite
     /// changes no data and leaves no outputs to reconcile, so a commit whose
     /// settlement is lost needs no recovery: the expired claim is reclaimed
     /// and the next pass plans from the rewritten head.
@@ -7734,11 +7736,10 @@ impl ForgeWorker {
     ///
     /// Returns [`ForgeError::Shutdown`] when `stop` is cancelled before the
     /// commit, [`ForgeError::FenceLost`] when the claim lapsed, and the
-    /// catalog, timeout, fence, and SQL failures of the commit and settlement.
+    /// catalog and timeout failures of the commit.
     async fn dispatch_manifest_rewrite(
         &self,
         claim: &ForgeTaskClaim,
-        attempt: Uuid,
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
         stop: &CancellationToken,
@@ -7751,24 +7752,27 @@ impl ForgeWorker {
             .forge
             .commit_manifest_rewrite(binding, claim.plan.inputs.iter().cloned().collect())
             .await?;
-        self.persist_terminal_success(
-            ForgeTaskTransition {
-                task_id: claim.task_id,
-                attempt_id: attempt,
-                owner: self.owner,
-                expected: ForgeTaskState::Running,
-                next: ForgeTaskState::Succeeded,
-            },
-            claim.data_tenant_id,
-            &claim.table_ref,
-            lease,
-            TaskProgressEffect::Progressed,
-        )
-        .await?;
         tracing::info!(task_id = %claim.task_id, selected, "Forge manifest rewrite committed");
-        Ok(ForgeDispatchResult::SelfSettled(ForgeTaskResult::Succeeded))
+        Ok(ForgeDispatchResult::Terminal(
+            ForgeTerminal::ManifestRewritten,
+        ))
     }
 
+    /// Runs one claimed expired-cleanup task to its drained frontier.
+    ///
+    /// The immutable payload is the whole work: it names the succeeded
+    /// expiration this task consumes, the committed identity that expiration
+    /// left behind, and the exact ordered candidates that commit made
+    /// unreachable. Nothing here is re-derived from the catalog, so a task that
+    /// runs much later deletes exactly the objects its handoff named or nothing
+    /// at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns payload-decoding, protection, path-binding, object-store,
+    /// fencing, audit, SQL, or cancellation failures. Every failure leaves the
+    /// durable cursor authoritative, so the exact candidate is replayed by this
+    /// or a successor attempt.
     async fn dispatch_expired_cleanup(
         &self,
         claim: &ForgeTaskClaim,
@@ -8183,16 +8187,6 @@ impl ForgeWorker {
     ) -> tokio::task::JoinHandle<Result<(), ForgeError>> {
         let interval =
             (self.forge.core.config.lease_ttl / 3).min(self.forge.core.maintenance_interval);
-        // A production build never resolves this trigger: nothing outside the
-        // test-support observer holds a handle to it, so the extra select arm
-        // is inert and the loop keeps its interval-only behavior.
-        #[cfg(feature = "test-support")]
-        let beat_now = self.completion_observer.as_ref().map_or_else(
-            || Arc::new(tokio::sync::Notify::new()),
-            ForgeWorkerCompletionObserver::heartbeat_beat_signal,
-        );
-        #[cfg(not(feature = "test-support"))]
-        let beat_now = Arc::new(tokio::sync::Notify::new());
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -8200,7 +8194,6 @@ impl ForgeWorker {
             loop {
                 let beat = tokio::select! {
                     biased;
-                    () = beat_now.notified() => true,
                     () = operation_stop.cancelled() => false,
                     _ = ticker.tick() => true,
                 };
@@ -8474,28 +8467,18 @@ impl ForgeWorker {
         lease: &ForgeLease,
         evidence: &ForgeTaskEvidence,
     ) -> Result<(), ForgeError> {
-        let mut prepared = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(claim.data_tenant_id)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut prepared).await?;
+        let mut prepared = lease
+            .begin_fenced(&self.forge.core.vala, claim.data_tenant_id)
+            .await?;
         self.tasks
             .prepared(&mut prepared, claim.task_id, attempt, self.owner, evidence)
             .await
             .map_err(ForgeError::Sql)?;
-        prepared.commit().await.map_err(ForgeError::Sql)?;
+        prepared.commit().await?;
 
-        let mut terminal = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(claim.data_tenant_id)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut terminal).await?;
+        let mut terminal = lease
+            .begin_fenced(&self.forge.core.vala, claim.data_tenant_id)
+            .await?;
         let progress_effect = task_progress_effect(
             &claim.strategy,
             claim.base_snapshot_id,
@@ -8518,7 +8501,7 @@ impl ForgeWorker {
             )
             .await
             .map_err(ForgeError::Sql)?;
-        terminal.commit().await.map_err(ForgeError::Sql)?;
+        terminal.commit().await?;
         tracing::debug!(
             progressed = matches!(progress_effect, TaskProgressEffect::Progressed),
             "Forge task settled its durable progress effect"
@@ -8539,19 +8522,12 @@ impl ForgeWorker {
         lease: &ForgeLease,
         progress_effect: TaskProgressEffect,
     ) -> Result<(), ForgeError> {
-        let mut terminal = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut terminal).await?;
+        let mut terminal = lease.begin_fenced(&self.forge.core.vala, tenant).await?;
         self.tasks
             .terminal_success(&mut terminal, transition, table_ref, progress_effect)
             .await
             .map_err(ForgeError::Sql)?;
-        terminal.commit().await.map_err(ForgeError::Sql)?;
+        terminal.commit().await?;
         tracing::debug!(
             progressed = matches!(progress_effect, TaskProgressEffect::Progressed),
             "Forge task settled its durable progress effect"
@@ -8989,13 +8965,15 @@ mod tests {
                 ),
                 (
                     1,
-                    Ok(ForgeDispatchResult::SelfSettled(ForgeTaskResult::Succeeded)),
+                    Ok(ForgeDispatchResult::Terminal(
+                        ForgeTerminal::ManifestRewritten,
+                    )),
                 ),
             ],
             Vec::new(),
         );
         assert!(
-            matches!(published, Ok(ForgeDispatchResult::SelfSettled(_))),
+            matches!(published, Ok(ForgeDispatchResult::Terminal(_))),
             "one publication makes the task successful whatever its siblings did"
         );
 

@@ -2474,10 +2474,6 @@ async fn write_two_commits(
 /// or the leader and worker metrics disagree with that story.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders these counters and gauges as whole numbers, so f64 equality is exact"
-)]
 async fn failed_worker_restarts_while_the_api_serves() {
     let (_telemetry_guard, telemetry) =
         shared_process_telemetry_for_test().expect("process production telemetry");
@@ -2546,6 +2542,9 @@ async fn failed_worker_restarts_while_the_api_serves() {
     await_worker_readiness(&cluster, false, "failing worker").await;
     assert_public_rows(&client, &failing, &failing_rows, "while the worker fails").await;
 
+    // The unsettled claim is left to lapse on its production TTL before a
+    // successor can reclaim it; the journey proves the recovery, not the wait.
+    expire_running_claims(&cluster, tenant).await;
     observer.release_fatal_observation_for_test();
     await_worker_readiness(&cluster, true, "rebuilt worker").await;
     assert_public_rows(&client, &failing, &failing_rows, "after the restart").await;
@@ -2587,9 +2586,9 @@ async fn failed_worker_restarts_while_the_api_serves() {
             "bifrost_forge_leader_held",
         ])
     );
-    assert_eq!(
-        counter_delta(&running, "bifrost_forge_leader_acquisitions_total", &[]),
-        1.0
+    assert!(
+        (counter_delta(&running, "bifrost_forge_leader_acquisitions_total", &[]) - 1.0).abs()
+            < f64::EPSILON
     );
     assert!(
         counter_delta(
@@ -2598,17 +2597,17 @@ async fn failed_worker_restarts_while_the_api_serves() {
             &[("outcome", "ok")]
         ) >= 1.0
     );
-    assert_eq!(
-        counter_delta(&running, "bifrost_forge_worker_restarts_total", &[]),
-        1.0,
+    assert!(
+        (counter_delta(&running, "bifrost_forge_worker_restarts_total", &[]) - 1.0).abs()
+            < f64::EPSILON,
         "the injected failure restarted the worker exactly once"
     );
-    assert_eq!(
-        gauge_final(&running, "bifrost_forge_worker_restart_backoff_seconds"),
-        1.0
+    assert!(
+        (gauge_final(&running, "bifrost_forge_worker_restart_backoff_seconds") - 1.0).abs()
+            < f64::EPSILON
     );
-    assert_eq!(gauge_final(&running, "bifrost_forge_worker_ready"), 1.0);
-    assert_eq!(gauge_final(&running, "bifrost_forge_leader_held"), 1.0);
+    assert!((gauge_final(&running, "bifrost_forge_worker_ready") - 1.0).abs() < f64::EPSILON);
+    assert!((gauge_final(&running, "bifrost_forge_leader_held") - 1.0).abs() < f64::EPSILON);
 
     let running_end = telemetry
         .checkpoint()
@@ -2617,17 +2616,18 @@ async fn failed_worker_restarts_while_the_api_serves() {
     let stopped = telemetry
         .delta_since(&running_end)
         .expect("production telemetry shutdown window");
-    assert_eq!(
-        counter_delta(
+    assert!(
+        (counter_delta(
             &stopped,
             "bifrost_forge_leader_revocations_total",
             &[("reason", "shutdown")]
-        ),
-        1.0,
+        ) - 1.0)
+            .abs()
+            < f64::EPSILON,
         "shutdown resigned the one held term"
     );
-    assert_eq!(gauge_final(&stopped, "bifrost_forge_leader_held"), 0.0);
-    assert_eq!(gauge_final(&stopped, "bifrost_forge_worker_ready"), 0.0);
+    assert!(gauge_final(&stopped, "bifrost_forge_leader_held").abs() < f64::EPSILON);
+    assert!(gauge_final(&stopped, "bifrost_forge_worker_ready").abs() < f64::EPSILON);
 }
 
 /// Reads one unlabelled gauge's value at the close of a telemetry window.

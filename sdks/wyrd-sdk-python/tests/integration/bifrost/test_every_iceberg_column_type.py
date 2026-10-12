@@ -33,7 +33,7 @@ NARROW = pyarrow.ipc.open_file(FIXTURES / "narrow_types.arrow").get_batch(0)
 def all_types(wyrd_server: WyrdTestServer) -> pyarrow.Table:
     """Register ``ALL_TYPES``, write ``EVERY_TYPE``, and read it back."""
 
-    all_types = Bifrost(TableConfig.from_arrow(EVERY_TYPE.schema, ALL_TYPES))
+    all_types = Bifrost(TableConfig.from_arrow(ALL_TYPES, EVERY_TYPE.schema))
     all_types.register()
     all_types.write_batch(ALL_TYPES, EVERY_TYPE)
     wyrd_server.flush_bifrost()
@@ -44,7 +44,7 @@ def all_types(wyrd_server: WyrdTestServer) -> pyarrow.Table:
 def narrow_types(wyrd_server: WyrdTestServer) -> pyarrow.Table:
     """Register ``NARROW_TYPES``, write ``NARROW``, and read it back."""
 
-    narrow_types = Bifrost(TableConfig.from_arrow(NARROW.schema, NARROW_TYPES))
+    narrow_types = Bifrost(TableConfig.from_arrow(NARROW_TYPES, NARROW.schema))
     narrow_types.register()
     narrow_types.write_batch(NARROW_TYPES, NARROW)
     wyrd_server.flush_bifrost()
@@ -96,6 +96,6 @@ def test_a_type_bifrost_cannot_store_is_refused_when_declared(
     column_type: pyarrow.DataType,
 ) -> None:
     with pytest.raises(WyrdError) as refused:
-        TableConfig.from_arrow(pyarrow.schema([("c", column_type)]), "vala.datasets.no_wire_form")
+        TableConfig.from_arrow("vala.datasets.no_wire_form", pyarrow.schema([("c", column_type)]))
 
     assert refused.value.code == UNSUPPORTED_TYPE

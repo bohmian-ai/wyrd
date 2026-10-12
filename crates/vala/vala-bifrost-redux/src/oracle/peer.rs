@@ -750,7 +750,7 @@ pub trait PeerSecurityAudit: Send + Sync {
     /// Stages a rejection whose claims cannot select an audit tenant.
     fn stage_unverified_ticket_rejection(&self, violation: BifrostSecurityViolationKind);
 
-    /// Stages a violation on the context-named tenant's audit chain.
+    /// Stages a violation on the context-named tenant's audit history.
     fn stage_verified_ticket_violation(
         &self,
         tenant_id: DataTenantId,

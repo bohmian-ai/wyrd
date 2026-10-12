@@ -1184,7 +1184,7 @@ impl ForgeTasks {
     /// This is the durable half of the per-candidate protocol: it opens and
     /// commits its own short operator transaction. Locks are taken in the
     /// canonical order — exact live cleanup task/attempt/current owner (the
-    /// table's claim), cleanup evidence, then the tenant audit chain.
+    /// table's claim), then cleanup evidence.
     ///
     /// The first preparation of a task copies the immutable plan handoff into
     /// evidence and moves `Running -> Prepared`; every later preparation mutates

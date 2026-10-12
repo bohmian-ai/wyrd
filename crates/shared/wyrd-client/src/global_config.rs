@@ -228,6 +228,14 @@ mod tests {
             "# retain this comment\n[client]\ngrpc_url = 'https://stale.example.com:50051'\n[client.token_cache]\nkind = 'disk'\n",
         )
         .expect("config fixture");
+        // An existing config is owner-only, as the store requires; `fs::write`
+        // follows the umask and may leave it group-writable.
+        #[cfg(unix)]
+        fs::set_permissions(
+            dir.path().join("config.toml"),
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        )
+        .expect("owner-only config fixture");
         let key = SecretString::from("first-key".to_owned());
         GlobalConfig::save_local(
             &environment,

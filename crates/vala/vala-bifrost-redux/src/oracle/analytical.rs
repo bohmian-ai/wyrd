@@ -53,7 +53,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use url::Url;
 use uuid::Uuid;
 use wyrd_spec::vala::BifrostError;
@@ -1882,7 +1882,9 @@ impl AnalyticalStageIngress {
     ///
     /// The returned lease is meant to be carried by the call's own request
     /// body, so the follower's ownership ends exactly when the coordinator's
-    /// connection does. Nested calls for the same graph share one release.
+    /// connection does. Nested calls for the same graph share one release. The
+    /// lease also carries the graph's cancellation, so settling the graph ends
+    /// that body and, with it, everything upstream keeps for the call.
     ///
     /// # Errors
     ///
@@ -1894,7 +1896,8 @@ impl AnalyticalStageIngress {
     ) -> Result<AnalyticalConnectionLease, BifrostError> {
         let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
         let Some(AnalyticalGraphEntry::Active {
-            open_connections, ..
+            lease,
+            open_connections,
         }) = graphs.get_mut(&graph)
         else {
             return Err(BifrostError::QueryExecutionFailed);
@@ -1903,6 +1906,7 @@ impl AnalyticalStageIngress {
         Ok(AnalyticalConnectionLease {
             ingress: Arc::clone(self),
             graph,
+            cancel: lease.cancel.clone(),
         })
     }
 
@@ -2758,14 +2762,28 @@ impl Drop for AnalyticalGraphLifecycle {
 
 /// Follower ownership of one graph, held for one open coordinator call.
 ///
-/// Dropping it is the release signal. The release itself is asynchronous — an
-/// attempt settles through the supervisor — so the drop spawns it onto the
-/// current runtime rather than blocking whatever dropped the connection.
+/// Dropping it is the release signal: the drop hands the graph to the
+/// ingress's settlement driver once its last connection closes. The lease also
+/// carries the graph's cancellation the other way, so a graph that settles
+/// first ends the coordinator call that holds it.
 pub struct AnalyticalConnectionLease {
     /// Follower ingress that owns the graph this lease keeps alive.
     ingress: Arc<AnalyticalStageIngress>,
     /// Graph this lease is one open connection for.
     graph: AnalyticalGraphKey,
+    /// The graph's own cancellation, cancelled on every settlement path.
+    cancel: CancellationToken,
+}
+
+impl AnalyticalConnectionLease {
+    /// Resolves once the graph this call holds has settled.
+    ///
+    /// Settlement cancels the graph unconditionally, so this is the one signal
+    /// the coordinator call's request body ends on. Upstream drops the stage's
+    /// cached task data, and every reservation in it, only when that body ends.
+    pub(crate) fn graph_settled(&self) -> WaitForCancellationFutureOwned {
+        self.cancel.clone().cancelled_owned()
+    }
 }
 
 impl fmt::Debug for AnalyticalConnectionLease {
@@ -4538,6 +4556,84 @@ mod tests {
         );
     }
 
+    /// A coordinator request body that never resolves on its own.
+    ///
+    /// Stands in for a coordinator that keeps its channel open after the graph
+    /// it addressed has settled, so only the graph itself can end the body.
+    struct OpenCoordinatorBody;
+
+    impl http_body::Body for OpenCoordinatorBody {
+        /// Matches the coordinator channel's chunk type.
+        type Data = bytes::Bytes;
+        /// The open body never fails.
+        type Error = std::convert::Infallible;
+
+        /// Stays pending forever, as an idle coordinator channel does.
+        fn poll_frame(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A settled graph ends the coordinator body that still holds it.
+    ///
+    /// Upstream keeps a stage's task data, and every reservation inside it,
+    /// until the coordinator channel's request body ends. A graph that settles
+    /// while its coordinator keeps the channel open must therefore end that
+    /// body itself, or those reservations outlive the graph with no owner.
+    ///
+    /// Required mutation RED: drop the settlement check from
+    /// [`ReplayBody::poll_frame`] and the body stays pending after settlement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the body ends before settlement or stays open after it.
+    #[tokio::test]
+    async fn settled_graph_ends_its_open_coordinator_body() {
+        use http_body::Body as _;
+
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let plan = fixture.leader_message(StageOperationV1::SetPlan);
+        fixture
+            .send(&plan, now)
+            .await
+            .expect("the reserving leader activates the graph");
+        let lease = fixture
+            .ingress
+            .retain_connection(fixture.graph)
+            .expect("a live graph retains a coordinator connection");
+        let mut body = std::pin::pin!(
+            super::super::analytical_transport::ReplayBody::new(
+                std::collections::VecDeque::new(),
+                OpenCoordinatorBody,
+            )
+            .with_lease(lease)
+        );
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(body.as_mut().poll_frame(cx)))
+                .await
+                .is_pending(),
+            "a live graph leaves its coordinator body open"
+        );
+
+        fixture
+            .ingress
+            .shutdown()
+            .await
+            .expect("the follower settles its graph without a poisoned lock");
+        assert!(
+            matches!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(body.as_mut().poll_frame(cx)))
+                    .await,
+                std::task::Poll::Ready(None)
+            ),
+            "the settled graph ends the body its coordinator still holds open"
+        );
+    }
+
     /// A graph is released only after every holder of it has ended.
     ///
     /// Coordinator connections and attempts are separate holders of the same
@@ -4711,12 +4807,18 @@ mod tests {
     /// driver observes it, moves the graph to draining, cancels it, and runs
     /// the same joined settlement every other terminal path runs.
     ///
+    /// A sibling graph whose attempt retains a driver that never observes
+    /// cancellation holds its own settlement open across the target's whole
+    /// deadline, which is what proves the driver settles concurrently rather
+    /// than serially: a slow cleanup may not stop the driver from cancelling
+    /// another graph on time.
+    ///
     /// # Panics
     ///
     /// Panics when a live `ExecuteTask`-first graph is released by the end of
-    /// its unary request, when it outlives its signed deadline, or when the
-    /// bounded settlement queue cannot hold one wake plus one settlement per
-    /// admitted graph.
+    /// its unary request, when it outlives its signed deadline, when a blocked
+    /// sibling settlement delays it, or when the bounded settlement queue
+    /// cannot hold one wake plus one settlement per admitted graph.
     #[tokio::test]
     async fn execute_task_first_without_set_plan_settles_at_signed_deadline() {
         let now = Utc::now();
@@ -4731,13 +4833,27 @@ mod tests {
             "the settlement queue must hold one wake plus one settlement per admitted graph"
         );
 
-        // The sibling activates first and is handed to the driver immediately.
-        let (sibling_graph, sibling_message, sibling_grant) =
+        // The sibling activates first and is handed to the driver immediately,
+        // with one retained driver that keeps its settlement join from
+        // completing until the gate opens.
+        let (sibling_graph, mut sibling_message, sibling_grant) =
             fixture.sibling(now, now + chrono::Duration::seconds(60));
-        fixture
+        sibling_message.operation = StageOperationV1::SetPlan;
+        sibling_message.task_id = None;
+        let sibling_attempt = fixture
             .send(&sibling_message, now)
             .await
             .expect("the reserving leader activates the sibling graph");
+        let (gate, gate_closed) = tokio::sync::oneshot::channel::<()>();
+        fixture
+            .supervisor
+            .retain_driver(
+                sibling_attempt,
+                tokio::spawn(async move {
+                    let _ = gate_closed.await;
+                }),
+            )
+            .expect("the sibling's live attempt retains one driver");
         drop(
             fixture
                 .ingress
@@ -4760,7 +4876,8 @@ mod tests {
             "a completed unary ExecuteTask must not release valid work"
         );
 
-        // Past the signed deadline the target settles and releases everything.
+        // Past the signed deadline the target settles and releases everything,
+        // while the sibling's blocked settlement is still in flight.
         tokio::time::timeout(Duration::from_secs(3), async {
             while fixture.ingress.published(fixture.graph).is_ok() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4780,8 +4897,14 @@ mod tests {
             fixture.supervisor.graph_runtime(fixture.graph).is_err(),
             "a settled graph released its supervisor registration and query runtime"
         );
+        assert!(
+            fixture.ingress.published(sibling_graph).is_ok(),
+            "the blocked sibling is still owned by the same driver"
+        );
 
-        // Shutdown joins the one driver rather than a detached cleanup task.
+        // Opening the gate lets the sibling's own settlement complete, and
+        // shutdown joins the one driver rather than a detached cleanup task.
+        drop(gate);
         let inspection = tokio::time::timeout(Duration::from_secs(10), fixture.ingress.shutdown())
             .await
             .expect("the one settlement driver joins within the bound")

@@ -61,13 +61,7 @@ impl Forge {
         if !lease.renew().await? {
             return Err(lease.fence_lost());
         }
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut conn).await?;
+        let mut conn = lease.begin_fenced(&self.core.vala, key.tenant).await?;
         #[cfg(feature = "test-support")]
         if operation == "forge.iceberg_rewrite.prepared"
             && FAIL_NEXT_PREPARED_LIVE_TRANSITION.swap(false, Ordering::AcqRel)
@@ -112,6 +106,6 @@ impl Forge {
                 .await
                 .map_err(ForgeError::Sql)?;
         }
-        conn.commit().await.map_err(ForgeError::Sql)
+        conn.commit().await
     }
 }

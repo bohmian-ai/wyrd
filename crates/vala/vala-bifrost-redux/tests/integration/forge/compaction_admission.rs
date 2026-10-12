@@ -2329,7 +2329,8 @@ async fn acceptance_unknown_recovers_from_durable_state() {
     assert_eq!(
         promoted.fixture.live_claims().await,
         0,
-        "every settled attempt released its table claim"
+        "every settled attempt released its claim: {:?}",
+        promoted.fixture.forge_tasks().await
     );
 }
 
@@ -2898,6 +2899,18 @@ async fn successor_reconciles_before_publishing(
         "the released rewrite settles its own publication: {:?} / {:?}",
         tenant_tasks(&promoted.fixture).await,
         operation_phases(&promoted.fixture).await
+    );
+    let settled = tokio::time::timeout(ADMISSION_BOUND, async {
+        while small_files_in_state(&promoted.fixture, &["claimed", "running", "prepared"]).await > 0
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "the published rewrite commits its own terminal: {:?}",
+        tenant_tasks(&promoted.fixture).await
     );
     supervisor.stop_worker().await;
 }

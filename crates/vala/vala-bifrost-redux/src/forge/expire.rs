@@ -61,12 +61,78 @@ pub(crate) struct ExpiryReconciliationOutcome {
     pub(crate) unresolved: usize,
     /// Fail-closed destructive-maintenance disposition.
     pub(crate) destructive_maintenance: DestructiveMaintenance,
-    /// Final task evidence an atomic settlement in this pass already stored.
+    /// The terminal transition this pass decided and left uncommitted.
     ///
-    /// `Some` means the task row is already `Succeeded` with its exact cleanup
-    /// candidates and its planning demand advanced, so the worker owes it no
-    /// further terminal transition. `None` means this pass settled nothing.
-    pub(crate) settled_evidence: Option<ForgeTaskEvidence>,
+    /// `Some` means the pass proved its selection's fate and ended; the
+    /// caller commits it with [`Forge::commit_expiry_terminal`] once nothing
+    /// renews the task claim any more. `None` means the pass decided nothing
+    /// terminal and the task stays this attempt's.
+    pub(crate) terminal: Option<ExpiryTerminal>,
+}
+
+/// The terminal transition one snapshot-expiration pass decided.
+///
+/// A pass ends at this decision and writes no terminal task state itself. The
+/// attempt's settlement seam commits it after the claim heartbeat stops, so
+/// the task claim, which is the table's only authority, is released in exactly
+/// one place and never while it is still being renewed.
+#[derive(Debug)]
+pub(crate) enum ExpiryTerminal {
+    /// The selection's commit was proven: settle operation and task together.
+    Settle(Box<ExpirySettlement>),
+    /// The selection provably never committed: release it for replanning.
+    Reset(Box<ExpiryReset>),
+}
+
+impl ExpiryTerminal {
+    /// Returns the task evidence this terminal transition stores.
+    ///
+    /// A settlement carries its exact cleanup candidates; a reset stores no
+    /// evidence, so it reports the empty pre-commit evidence.
+    pub(crate) fn evidence(&self) -> ForgeTaskEvidence {
+        match self {
+            Self::Settle(settlement) => settlement.evidence.clone(),
+            Self::Reset(_) => prepared_expiry_evidence(),
+        }
+    }
+}
+
+/// One proven expiration settlement, derived and ready to commit.
+///
+/// Every read the settlement needs — the committed table, its evidence, and
+/// the cleanup candidates — happened when the pass decided it, so committing
+/// is the single atomic SQL transition and nothing else.
+#[derive(Debug)]
+pub(crate) struct ExpirySettlement {
+    /// Tenant whose transaction settles the operation.
+    tenant: DataTenantId,
+    /// Current mutation authority, which need not be the preparing worker.
+    authority: ForgeExpirationAuthority,
+    /// Registered table the resolved claims are bound to.
+    table: ForgeClaimTable,
+    /// Whether this attempt proved the commit or recovered a predecessor's.
+    settlement: ForgeExpirationSettlement,
+    /// Final task evidence, including the exact cleanup candidates.
+    evidence: ForgeTaskEvidence,
+    /// Prepared detail whose selected snapshots the expiry counter reports.
+    prepared: AuditDetail,
+    /// Terminal detail recorded as the operation's lineage.
+    terminal: AuditDetail,
+}
+
+/// One unproven expiration selection, ready to release.
+#[derive(Debug)]
+pub(crate) struct ExpiryReset {
+    /// Tenant whose transaction releases the operation.
+    tenant: DataTenantId,
+    /// Current mutation authority releasing the selection.
+    authority: ForgeExpirationAuthority,
+    /// Registered table whose claims are released.
+    table: ForgeClaimTable,
+    /// Immutable Prepared detail the released operation was opened with.
+    detail: AuditDetail,
+    /// Why the selection is provably uncommitted, for the release log.
+    cause: String,
 }
 
 /// The claimed Forge task one snapshot-expiration pass acts under.
@@ -135,7 +201,9 @@ impl Forge {
     ///
     /// The fixture supplies the claimed task authority the production worker
     /// would supply, so the same three [`ForgeOperations`] transactions bracket
-    /// the same pinned Iceberg call.
+    /// the same pinned Iceberg call. The fixture runs no heartbeat, so it
+    /// commits the pass's decided terminal as soon as the pass returns, and
+    /// returns the settled task evidence when that terminal was a settlement.
     ///
     /// # Errors
     ///
@@ -174,8 +242,13 @@ impl Forge {
                 self.core.clock.now()?,
                 &CancellationToken::new(),
             )
-            .await;
-        outcome.map(|outcome| outcome.settled_evidence)
+            .await?;
+        let Some(terminal) = outcome.terminal else {
+            return Ok(None);
+        };
+        let settled = matches!(terminal, ExpiryTerminal::Settle(_)).then(|| terminal.evidence());
+        self.commit_expiry_terminal(terminal).await?;
+        Ok(settled)
     }
 }
 
@@ -200,9 +273,10 @@ impl Forge {
     /// an SQL conflict when an Oracle query still holds the table's read
     /// authority, policy and metadata errors from snapshot selection, and the
     /// catalog, SQL, or object-store error of any reconciliation, preparation,
-    /// commit, or settlement step. Drift and a definite optimistic-commit
-    /// rejection are not errors: they reset the claims and return a blocked
-    /// outcome.
+    /// commit, or settlement derivation. Drift and a definite optimistic-commit
+    /// rejection are not errors: they decide a reset and return a blocked
+    /// outcome. A proven commit decides a settlement; neither is committed
+    /// here, the caller commits [`ExpiryReconciliationOutcome::terminal`].
     ///
     /// # Cancellation and partial progress
     /// Cancellation is observed only at stage boundaries before preparation
@@ -285,8 +359,13 @@ impl Forge {
         authority_conn.commit().await.map_err(ForgeError::Sql)?;
         let expired_files = match effect {
             Err(drift) => {
-                self.reset_expiration(key, authority, &claim_table, &detail, &drift)
-                    .await?;
+                outcome.terminal = Some(reset_expiration(
+                    key,
+                    authority,
+                    claim_table,
+                    detail,
+                    &drift,
+                ));
                 outcome.unresolved = outcome.unresolved.saturating_add(1);
                 outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
                 return Ok(outcome);
@@ -302,26 +381,30 @@ impl Forge {
             // reconciliation.
             Ok(Err(ForgeError::Catalog(error))) if !error.retryable() => {
                 let rejection = ForgeError::Catalog(error);
-                self.reset_expiration(key, authority, &claim_table, &detail, &rejection)
-                    .await?;
+                outcome.terminal = Some(reset_expiration(
+                    key,
+                    authority,
+                    claim_table,
+                    detail,
+                    &rejection,
+                ));
                 outcome.unresolved = outcome.unresolved.saturating_add(1);
                 outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
                 return Ok(outcome);
             }
             Ok(Err(error)) => return Err(error),
         };
-        let evidence = self
-            .settle_expiration(
+        outcome.terminal = Some(
+            self.settle_expiration(
                 binding,
                 &expiration_authority(authority),
-                &claim_table,
-                &detail,
+                claim_table,
+                detail,
                 &expired_files,
                 ForgeExpirationSettlement::Committed,
             )
-            .await?;
-        Self::record_expired_snapshots(&detail);
-        outcome.settled_evidence = Some(evidence);
+            .await?,
+        );
         outcome.recovered = outcome.recovered.saturating_add(1);
         Ok(outcome)
     }
@@ -1073,18 +1156,17 @@ impl Forge {
                     .await?
             }
         };
-        let evidence = self
-            .settle_expiration(
+        outcome.terminal = Some(
+            self.settle_expiration(
                 binding,
                 &expiration_authority(authority),
-                &claim_table,
-                &detail,
+                claim_table,
+                detail,
                 &expired_files,
                 settlement,
             )
-            .await?;
-        Self::record_expired_snapshots(&detail);
-        outcome.settled_evidence = Some(evidence);
+            .await?,
+        );
         outcome.recovered = 1;
         Ok(outcome)
     }
@@ -1216,67 +1298,32 @@ impl Forge {
         Ok(())
     }
 
-    /// Releases an unproven selection so a successor can replan against fresh
-    /// reader protection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Sql`] when the reset preconditions do not match
-    /// and [`ForgeError::SnapshotExpiry`] for non-canonical detail.
-    async fn reset_expiration(
-        &self,
-        key: &ForgeTableKey,
-        authority: &ExpiryTaskAuthority,
-        table: &ForgeClaimTable,
-        detail: &AuditDetail,
-        cause: &ForgeError,
-    ) -> Result<(), ForgeError> {
-        let resource = expiry_resource(detail)?;
-        ForgeOperations::new(resource, ForgeOperationFamily::SnapshotExpire)
-            .map_err(ForgeError::Sql)?
-            .reset_snapshot_expiration(
-                &self.core.operator_pool,
-                key.tenant,
-                &ForgeExpirationResetRequest {
-                    authority: &expiration_authority(authority),
-                    table,
-                    detail,
-                },
-            )
-            .await
-            .map_err(ForgeError::Sql)?;
-        tracing::warn!(
-            task_id = %authority.task,
-            cause = %cause,
-            "Forge released a prepared snapshot expiration without expiring anything"
-        );
-        Ok(())
-    }
-
-    /// Stores exact candidates and settles both owners in one transaction.
+    /// Derives one proven expiration's settlement without committing it.
     ///
     /// Cleanup candidates are derived here and handed to separate cleanup
-    /// through task evidence; this owner performs no delete of its own.
+    /// through task evidence; this owner performs no delete of its own. The
+    /// returned terminal is committed by [`Self::commit_expiry_terminal`], so
+    /// this pass leaves operation, task, and claims Prepared.
     ///
     /// Tenant and table identity come from `binding`, and the caller projects
-    /// its claimed task and live lease into `authority` before calling, so
-    /// this operation carries exactly the terms the settlement transaction
-    /// verifies and nothing that would have to agree with them.
+    /// its claimed task into `authority`, so the settlement carries exactly
+    /// the terms the settling transaction verifies and nothing that would have
+    /// to agree with them.
     ///
     /// # Errors
     ///
     /// Returns path-binding, evidence, object-store, or [`ForgeError::Sql`]
-    /// failures. A failure before the settlement commit leaves operation, task,
-    /// and claims Prepared for exact replay.
+    /// failures. Every failure leaves operation, task, and claims Prepared for
+    /// exact replay.
     async fn settle_expiration(
         &self,
         binding: &TenantTableBinding,
         authority: &ForgeExpirationAuthority,
-        table: &ForgeClaimTable,
-        detail: &AuditDetail,
+        table: ForgeClaimTable,
+        detail: AuditDetail,
         expired_files: &ExpiredFileSet,
         settlement: ForgeExpirationSettlement,
-    ) -> Result<ForgeTaskEvidence, ForgeError> {
+    ) -> Result<ExpiryTerminal, ForgeError> {
         let committed = self.load_table(&binding.table_ident()).await?;
         let identity = ForgeTaskTableIdentity::new(
             BIFROST_CATALOG_NAME,
@@ -1293,34 +1340,118 @@ impl Forge {
             &identity,
         )?;
         evidence.validate(false).map_err(ForgeError::Sql)?;
-        let operation = match settlement {
-            ForgeExpirationSettlement::Committed => "forge.snapshot_expire.committed",
-            ForgeExpirationSettlement::Recovered => "forge.snapshot_expire.recovered",
-        };
         let phase = match settlement {
             ForgeExpirationSettlement::Committed => ForgeSnapshotExpirePhase::Committed,
             ForgeExpirationSettlement::Recovered => ForgeSnapshotExpirePhase::Recovered,
         };
-        let terminal_detail = terminal_expiry_detail(detail, phase);
-        let resource = expiry_resource(&terminal_detail)?;
-        ForgeOperations::new(resource, ForgeOperationFamily::SnapshotExpire)
-            .map_err(ForgeError::Sql)?
-            .settle_snapshot_expiration(
-                &self.core.operator_pool,
-                binding.tenant,
-                &ForgeExpirationSettlementRequest {
-                    authority,
-                    table,
-                    settlement,
-                    evidence: &evidence,
-                    operation,
-                    detail: &terminal_detail,
-                },
-            )
-            .await
-            .map_err(ForgeError::Sql)?;
-        Ok(evidence)
+        let terminal = terminal_expiry_detail(&detail, phase);
+        Ok(ExpiryTerminal::Settle(Box::new(ExpirySettlement {
+            tenant: binding.tenant,
+            authority: authority.clone(),
+            table,
+            settlement,
+            evidence,
+            prepared: detail,
+            terminal,
+        })))
     }
+
+    /// Commits one decided expiration terminal in its single SQL transaction.
+    ///
+    /// A settlement resolves the operation, deletes every claim, moves the
+    /// task to `Succeeded` with its cleanup evidence, and advances planning
+    /// demand; a reset deletes the claims and cancels the task. Either
+    /// transition releases the task claim, so the caller commits it only once
+    /// nothing renews that claim any more.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the authority, task, table, operation
+    /// phase, or claim set no longer matches the decided selection, and
+    /// [`ForgeError::SnapshotExpiry`] for non-canonical detail.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation drops the uncommitted transaction; the operation stays
+    /// Prepared with its claims intact for exact replay.
+    pub(crate) async fn commit_expiry_terminal(
+        &self,
+        terminal: ExpiryTerminal,
+    ) -> Result<(), ForgeError> {
+        match terminal {
+            ExpiryTerminal::Settle(settlement) => {
+                let operation = match settlement.settlement {
+                    ForgeExpirationSettlement::Committed => "forge.snapshot_expire.committed",
+                    ForgeExpirationSettlement::Recovered => "forge.snapshot_expire.recovered",
+                };
+                ForgeOperations::new(
+                    expiry_resource(&settlement.terminal)?,
+                    ForgeOperationFamily::SnapshotExpire,
+                )
+                .map_err(ForgeError::Sql)?
+                .settle_snapshot_expiration(
+                    &self.core.operator_pool,
+                    settlement.tenant,
+                    &ForgeExpirationSettlementRequest {
+                        authority: &settlement.authority,
+                        table: &settlement.table,
+                        settlement: settlement.settlement,
+                        evidence: &settlement.evidence,
+                        operation,
+                        detail: &settlement.terminal,
+                    },
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
+                Self::record_expired_snapshots(&settlement.prepared);
+            }
+            ExpiryTerminal::Reset(reset) => {
+                ForgeOperations::new(
+                    expiry_resource(&reset.detail)?,
+                    ForgeOperationFamily::SnapshotExpire,
+                )
+                .map_err(ForgeError::Sql)?
+                .reset_snapshot_expiration(
+                    &self.core.operator_pool,
+                    reset.tenant,
+                    &ForgeExpirationResetRequest {
+                        authority: &reset.authority,
+                        table: &reset.table,
+                        detail: &reset.detail,
+                    },
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
+                tracing::warn!(
+                    task_id = %reset.authority.task_id,
+                    cause = %reset.cause,
+                    "Forge released a prepared snapshot expiration without expiring anything"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Decides the release of an unproven selection without committing it.
+///
+/// The selection never reached Iceberg, so a successor can replan it against
+/// fresh reader protection once [`Forge::commit_expiry_terminal`] commits the
+/// reset.
+fn reset_expiration(
+    key: &ForgeTableKey,
+    authority: &ExpiryTaskAuthority,
+    table: ForgeClaimTable,
+    detail: AuditDetail,
+    cause: &ForgeError,
+) -> ExpiryTerminal {
+    ExpiryTerminal::Reset(Box::new(ExpiryReset {
+        tenant: key.tenant,
+        authority: expiration_authority(authority),
+        table,
+        detail,
+        cause: cause.to_string(),
+    }))
 }
 
 /// Projects the pass's claimed task into mutation authority.

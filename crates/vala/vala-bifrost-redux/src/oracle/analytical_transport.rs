@@ -65,6 +65,7 @@ use datafusion_distributed::{
 use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::WaitForCancellationFutureOwned;
 use tower::Layer as _;
 use url::Url;
 use uuid::Uuid;
@@ -229,25 +230,33 @@ impl StageMessageReader {
 
 /// A body that re-emits already-read bytes before delegating to its source.
 ///
-/// The auth and mint layers must consume the head of a request body to bind it,
-/// then hand the *same* request onward. This body replays the exact chunks that
-/// were consumed — the framed message and any trailing bytes from the same data
-/// frame — and then forwards the untouched remainder, including its trailers,
-/// errors, end-of-stream, and backpressure. Chunk boundaries are not preserved
-/// across the replay seam, which HTTP/2 does not require: message framing is
-/// independent of data-frame boundaries.
+/// The auth and mint layers must consume the head of a request body to bind
+/// it, then hand the *same* request onward. This body replays the exact
+/// chunks that were consumed — the framed message and any trailing bytes
+/// from the same data frame — and then forwards the untouched remainder,
+/// including its trailers, errors, end-of-stream, and backpressure. Chunk
+/// boundaries are not preserved across the replay seam, which HTTP/2 does
+/// not require: message framing is independent of data-frame boundaries.
+///
+/// A coordinator channel's body also ends when the graph it holds settles.
+/// Upstream keeps a stage's task data, and the reservations inside it, for
+/// exactly as long as this body runs, so this end is what returns them.
+#[pin_project::pin_project]
 #[derive(Debug)]
 pub struct ReplayBody<B> {
     /// Consumed chunks awaiting replay, in wire order.
     replay: VecDeque<Bytes>,
     /// The source body, resumed once every replayed chunk is delivered.
     inner: B,
-    /// Follower ownership held for exactly as long as this request body lives.
-    ///
-    /// Present only on the bidirectional coordinator channel, whose request
-    /// stream tonic holds for the whole call. Dropping this body is therefore
-    /// the single honest signal that the coordinator is gone, whatever removed
-    /// it, and it is what releases the graph this call admitted.
+    /// Resolves when the held graph settles; present exactly when `lease` is.
+    #[pin]
+    graph_settled: Option<WaitForCancellationFutureOwned>,
+    /// Follower ownership held for exactly as long as this request body
+    /// lives. Present only on the bidirectional coordinator channel, whose
+    /// request stream tonic holds for the whole call. Dropping this body is
+    /// therefore the single honest signal that the coordinator is gone,
+    /// whatever removed it, and it is what releases the graph this call
+    /// admitted.
     lease: Option<AnalyticalConnectionLease>,
 }
 
@@ -258,13 +267,18 @@ impl<B> ReplayBody<B> {
         Self {
             replay,
             inner,
+            graph_settled: None,
             lease: None,
         }
     }
 
     /// Attaches follower graph ownership to this body's lifetime.
+    ///
+    /// The body then also ends, as a clean end-of-stream, once that graph
+    /// settles, whatever the coordinator is still doing.
     #[must_use]
     pub fn with_lease(mut self, lease: AnalyticalConnectionLease) -> Self {
+        self.graph_settled = Some(lease.graph_settled());
         self.lease = Some(lease);
         self
     }
@@ -279,15 +293,22 @@ where
     /// Replay never fails, so every error observed is the source body's own.
     type Error = B::Error;
 
-    /// Delivers the replayed chunks in order, then polls the source body.
+    /// Ends once the held graph has settled; otherwise delivers the replayed
+    /// chunks in order, then polls the source body.
     fn poll_frame(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        if let Some(chunk) = self.replay.pop_front() {
+        let this = self.project();
+        if let Some(settled) = this.graph_settled.as_pin_mut()
+            && settled.poll(cx).is_ready()
+        {
+            return Poll::Ready(None);
+        }
+        if let Some(chunk) = this.replay.pop_front() {
             return Poll::Ready(Some(Ok(Frame::data(chunk))));
         }
-        Pin::new(&mut self.inner).poll_frame(cx)
+        Pin::new(this.inner).poll_frame(cx)
     }
 
     /// Reports end-of-stream only once no replayed chunk remains.
@@ -2130,7 +2151,7 @@ mod tests {
 
     impl<B> tower::Service<Request<B>> for RecordingUpstream
     where
-        B: Body<Data = Bytes> + Unpin + Send + 'static,
+        B: Body<Data = Bytes> + Send + 'static,
     {
         type Response = Response<()>;
         type Error = std::convert::Infallible;
@@ -2146,11 +2167,12 @@ mod tests {
             self.probe.reached.store(true, Ordering::SeqCst);
             let probe = Arc::clone(&self.probe);
             let seen = Arc::clone(&self.seen);
-            let mut body = request.into_body();
+            let body = request.into_body();
             Box::pin(async move {
+                let mut body = std::pin::pin!(body);
                 let mut collected = Vec::new();
                 while let Some(frame) =
-                    std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+                    std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await
                 {
                     let Ok(frame) = frame else { break };
                     if let Ok(data) = frame.into_data() {
@@ -2475,11 +2497,9 @@ mod tests {
             .await
             .expect("the first message must be read");
         assert_eq!(assembled, message);
-        let mut replayed = ReplayBody::new(replay, body);
+        let mut replayed = std::pin::pin!(ReplayBody::new(replay, body));
         let mut delivered = Vec::new();
-        while let Some(frame) =
-            std::future::poll_fn(|cx| Pin::new(&mut replayed).poll_frame(cx)).await
-        {
+        while let Some(frame) = std::future::poll_fn(|cx| replayed.as_mut().poll_frame(cx)).await {
             let frame = frame.expect("the fixture remainder must not error");
             if let Ok(data) = frame.into_data() {
                 delivered.extend_from_slice(&data);

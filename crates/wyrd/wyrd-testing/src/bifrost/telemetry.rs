@@ -64,15 +64,6 @@ pub(crate) enum TelemetryUnit {
     Seconds,
 }
 
-/// Closed requirement policy for the current representative workload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TelemetryRequirement {
-    /// Every canonical cluster window requires the binding.
-    Always,
-    /// Only windows executing the named role require the binding.
-    Role(&'static str),
-}
-
 /// One exact allowed value domain for a bounded metric label.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TelemetryLabelValues {
@@ -110,12 +101,6 @@ pub(crate) struct TelemetryBinding {
     unit: TelemetryUnit,
     /// Required window aggregation.
     aggregation: TelemetryAggregation,
-    /// Closed workload requirement.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "only the binding contract test reads it")
-    )]
-    requirement: TelemetryRequirement,
     /// Closed categorical label domains.
     allowed_label_values: &'static [TelemetryLabelValues],
 }
@@ -214,7 +199,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -242,7 +226,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -264,7 +247,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -286,7 +268,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -308,7 +289,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -336,7 +316,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -355,7 +334,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -365,7 +343,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[TelemetryLabelValues {
             key: "operation",
             values: &["query"],
@@ -378,7 +355,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
-        requirement: TelemetryRequirement::Role("scribe"),
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -388,7 +364,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
-        requirement: TelemetryRequirement::Role("scribe"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "lane",
             values: &["ingress", "persistence", "wal_io"],
@@ -401,7 +376,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
-        requirement: TelemetryRequirement::Role("scribe"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "lane",
             values: &["ingress", "persistence", "wal_io"],
@@ -414,7 +388,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
-        requirement: TelemetryRequirement::Role("scribe"),
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -424,7 +397,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
-        requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "class",
             values: &["interactive", "analytical"],
@@ -437,7 +409,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Final,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "backend",
@@ -456,7 +427,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "rejected", "failed", "cancelled"],
@@ -472,7 +442,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "rejected", "failed", "cancelled"],
@@ -485,7 +454,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::HistogramBucket,
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "operation",
@@ -504,7 +472,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::HistogramBucket,
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "rejected", "failed", "cancelled"],
@@ -517,7 +484,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("scribe"),
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -527,7 +493,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: ORACLE_ADMISSION_LABELS,
     },
     TelemetryBinding {
@@ -537,7 +502,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::HistogramBucket,
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
-        requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "class",
             values: &["interactive", "analytical"],
@@ -550,7 +514,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("scribe"),
         allowed_label_values: &[],
     },
     TelemetryBinding {
@@ -563,7 +526,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("forge"),
         allowed_label_values: FORGE_TASK_ATTEMPT_LABELS,
     },
     TelemetryBinding {
@@ -573,7 +535,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("forge"),
         allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
@@ -583,7 +544,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("forge"),
         allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
@@ -593,7 +553,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("forge"),
         allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
@@ -603,7 +562,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("forge"),
         allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
@@ -613,7 +571,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "class",
             values: &["interactive", "analytical"],
@@ -626,7 +583,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "class",
             values: &["interactive", "analytical"],
@@ -639,7 +595,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "class",
             values: &["interactive", "analytical"],
@@ -652,7 +607,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "class",
             values: &["interactive", "analytical"],
@@ -665,7 +619,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "class",
             values: &["interactive", "analytical"],
@@ -678,7 +631,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Gauge,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Peak,
-        requirement: TelemetryRequirement::Role("oracle"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "class",
             values: &["interactive", "analytical"],
@@ -691,7 +643,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::HistogramBucket,
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "outcome",
@@ -710,7 +661,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[TelemetryLabelValues {
             key: "pool",
             values: &["runtime"],
@@ -723,7 +673,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::HistogramBucket,
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "backend",
@@ -746,7 +695,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
-        requirement: TelemetryRequirement::Always,
         allowed_label_values: &[
             TelemetryLabelValues {
                 key: "backend",
@@ -769,7 +717,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
         kind: BifrostMetricKind::HistogramBucket,
         unit: TelemetryUnit::Seconds,
         aggregation: TelemetryAggregation::P99,
-        requirement: TelemetryRequirement::Role("scribe"),
         allowed_label_values: &[TelemetryLabelValues {
             key: "outcome",
             values: &["success", "failed", "cancelled"],
@@ -2784,7 +2731,6 @@ mod tests {
     use super::*;
     use BifrostMetricKind::{Counter, Gauge, HistogramBucket};
     use TelemetryAggregation::{Delta, Final, P99, Peak};
-    use TelemetryRequirement::{Always, Role};
     use TelemetryUnit::{Bytes, Count, Seconds};
 
     /// Construct one normalized captured production span for mapper tests.
@@ -3444,8 +3390,6 @@ mod tests {
         unit: TelemetryUnit,
         /// Destination aggregation required by the report.
         aggregation: TelemetryAggregation,
-        /// Workload role that owns the emitter.
-        requirement: TelemetryRequirement,
         /// Exact report destination fed by this binding.
         destination: &'static str,
     }
@@ -3465,7 +3409,6 @@ mod tests {
                 ],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "pillars.gate_accepted",
             },
             EmitterContractFixture {
@@ -3480,7 +3423,6 @@ mod tests {
                 ],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "reconciliation.successful_queries",
             },
             EmitterContractFixture {
@@ -3495,7 +3437,6 @@ mod tests {
                 ],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "phase.gate_rejected",
             },
             EmitterContractFixture {
@@ -3510,7 +3451,6 @@ mod tests {
                 ],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "phase.gate_failed",
             },
             EmitterContractFixture {
@@ -3525,7 +3465,6 @@ mod tests {
                 ],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "phase.gate_cancelled",
             },
             EmitterContractFixture {
@@ -3540,7 +3479,6 @@ mod tests {
                 ],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "phase.gate_write_request_cancelled",
             },
             EmitterContractFixture {
@@ -3552,7 +3490,6 @@ mod tests {
                 domains: &[],
                 unit: Bytes,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "phase.gate_bytes",
             },
             EmitterContractFixture {
@@ -3564,7 +3501,6 @@ mod tests {
                 domains: &[("operation", &["query"])],
                 unit: Count,
                 aggregation: Final,
-                requirement: Always,
                 destination: "cleanup.gate_active",
             },
             EmitterContractFixture {
@@ -3576,7 +3512,6 @@ mod tests {
                 domains: &[],
                 unit: Count,
                 aggregation: Final,
-                requirement: Role("scribe"),
                 destination: "cleanup.scribe_ingress",
             },
             EmitterContractFixture {
@@ -3588,7 +3523,6 @@ mod tests {
                 domains: &[("lane", &["ingress", "persistence", "wal_io"])],
                 unit: Count,
                 aggregation: Final,
-                requirement: Role("scribe"),
                 destination: "cleanup.scribe_lane_active",
             },
             EmitterContractFixture {
@@ -3600,7 +3534,6 @@ mod tests {
                 domains: &[("lane", &["ingress", "persistence", "wal_io"])],
                 unit: Count,
                 aggregation: Final,
-                requirement: Role("scribe"),
                 destination: "cleanup.scribe_lane_queued",
             },
             EmitterContractFixture {
@@ -3612,7 +3545,6 @@ mod tests {
                 domains: &[],
                 unit: Count,
                 aggregation: Final,
-                requirement: Role("scribe"),
                 destination: "cleanup.scribe_persistence_queue",
             },
             EmitterContractFixture {
@@ -3624,7 +3556,6 @@ mod tests {
                 domains: &[("class", &["interactive", "analytical"])],
                 unit: Count,
                 aggregation: Final,
-                requirement: Role("oracle"),
                 destination: "cleanup.oracle_active",
             },
             EmitterContractFixture {
@@ -3639,7 +3570,6 @@ mod tests {
                 ],
                 unit: Count,
                 aggregation: Final,
-                requirement: Always,
                 destination: "cleanup.storage_active",
             },
             EmitterContractFixture {
@@ -3651,7 +3581,6 @@ mod tests {
                 domains: &[("outcome", &["success", "rejected", "failed", "cancelled"])],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "binding validation",
             },
             EmitterContractFixture {
@@ -3663,7 +3592,6 @@ mod tests {
                 domains: &[("outcome", &["success", "rejected", "failed", "cancelled"])],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "phase.gate_query_stream_cancelled",
             },
             EmitterContractFixture {
@@ -3678,7 +3606,6 @@ mod tests {
                 ],
                 unit: Seconds,
                 aggregation: P99,
-                requirement: Always,
                 destination: "binding validation",
             },
             EmitterContractFixture {
@@ -3690,7 +3617,6 @@ mod tests {
                 domains: &[("outcome", &["success", "rejected", "failed", "cancelled"])],
                 unit: Seconds,
                 aggregation: P99,
-                requirement: Always,
                 destination: "binding validation",
             },
             EmitterContractFixture {
@@ -3702,7 +3628,6 @@ mod tests {
                 domains: &[],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Role("scribe"),
                 destination: "reconciliation.scribe_rows",
             },
             EmitterContractFixture {
@@ -3727,7 +3652,6 @@ mod tests {
                 ],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Role("oracle"),
                 destination: "binding validation",
             },
             EmitterContractFixture {
@@ -3739,7 +3663,6 @@ mod tests {
                 domains: &[("class", &["interactive", "analytical"])],
                 unit: Seconds,
                 aggregation: P99,
-                requirement: Role("oracle"),
                 destination: "oracle admission queue",
             },
             EmitterContractFixture {
@@ -3751,7 +3674,6 @@ mod tests {
                 domains: &[],
                 unit: Bytes,
                 aggregation: Delta,
-                requirement: Role("scribe"),
                 destination: "pillars.scribe_wal_bytes",
             },
             EmitterContractFixture {
@@ -3786,7 +3708,6 @@ mod tests {
                 ],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Role("forge"),
                 destination: "pillars.forge_publications",
             },
             EmitterContractFixture {
@@ -3808,7 +3729,6 @@ mod tests {
                 )],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Role("forge"),
                 destination: "phase.forge_input_files",
             },
             EmitterContractFixture {
@@ -3830,7 +3750,6 @@ mod tests {
                 )],
                 unit: Bytes,
                 aggregation: Delta,
-                requirement: Role("forge"),
                 destination: "phase.forge_input_bytes",
             },
             EmitterContractFixture {
@@ -3852,7 +3771,6 @@ mod tests {
                 )],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Role("forge"),
                 destination: "phase.forge_output_files",
             },
             EmitterContractFixture {
@@ -3874,7 +3792,6 @@ mod tests {
                 )],
                 unit: Bytes,
                 aggregation: Delta,
-                requirement: Role("forge"),
                 destination: "phase.forge_output_bytes",
             },
             EmitterContractFixture {
@@ -3886,7 +3803,6 @@ mod tests {
                 domains: &[("class", &["interactive", "analytical"])],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Role("oracle"),
                 destination: "pillars.oracle_decoded_rows/reconciliation.oracle_rows",
             },
             EmitterContractFixture {
@@ -3898,7 +3814,6 @@ mod tests {
                 domains: &[("class", &["interactive", "analytical"])],
                 unit: Bytes,
                 aggregation: Delta,
-                requirement: Role("oracle"),
                 destination: "phase.oracle_stream_bytes",
             },
             EmitterContractFixture {
@@ -3910,7 +3825,6 @@ mod tests {
                 domains: &[("class", &["interactive", "analytical"])],
                 unit: Bytes,
                 aggregation: Delta,
-                requirement: Role("oracle"),
                 destination: "oracle physical bytes",
             },
             EmitterContractFixture {
@@ -3922,7 +3836,6 @@ mod tests {
                 domains: &[("class", &["interactive", "analytical"])],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Role("oracle"),
                 destination: "oracle files",
             },
             EmitterContractFixture {
@@ -3934,7 +3847,6 @@ mod tests {
                 domains: &[("class", &["interactive", "analytical"])],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Role("oracle"),
                 destination: "oracle partitions",
             },
             EmitterContractFixture {
@@ -3946,7 +3858,6 @@ mod tests {
                 domains: &[("class", &["interactive", "analytical"])],
                 unit: Count,
                 aggregation: Peak,
-                requirement: Role("oracle"),
                 destination: "oracle queued peak",
             },
             EmitterContractFixture {
@@ -3961,7 +3872,6 @@ mod tests {
                 ],
                 unit: Seconds,
                 aggregation: P99,
-                requirement: Always,
                 destination: "dependencies.postgres_pool_wait_us",
             },
             EmitterContractFixture {
@@ -3973,7 +3883,6 @@ mod tests {
                 domains: &[("pool", &["runtime"])],
                 unit: Count,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "dependencies.postgres_transactions",
             },
             EmitterContractFixture {
@@ -3989,7 +3898,6 @@ mod tests {
                 ],
                 unit: Seconds,
                 aggregation: P99,
-                requirement: Always,
                 destination: "dependencies.storage_p99_us",
             },
             EmitterContractFixture {
@@ -4005,7 +3913,6 @@ mod tests {
                 ],
                 unit: Bytes,
                 aggregation: Delta,
-                requirement: Always,
                 destination: "dependencies.storage_bytes",
             },
             EmitterContractFixture {
@@ -4017,7 +3924,6 @@ mod tests {
                 domains: &[("outcome", &["success", "failed", "cancelled"])],
                 unit: Seconds,
                 aggregation: P99,
-                requirement: Role("scribe"),
                 destination: "dependencies.wal_fsync_p99_us",
             },
         ]
@@ -4051,8 +3957,8 @@ mod tests {
             expected_keys.sort_unstable();
             assert_eq!(keys, expected_keys);
             assert_eq!(
-                (binding.unit, binding.aggregation, binding.requirement),
-                (contract.unit, contract.aggregation, contract.requirement)
+                (binding.unit, binding.aggregation),
+                (contract.unit, contract.aggregation)
             );
             let actual = binding
                 .allowed_label_values

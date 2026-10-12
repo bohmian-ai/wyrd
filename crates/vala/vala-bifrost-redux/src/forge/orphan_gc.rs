@@ -1804,13 +1804,7 @@ impl Forge {
             }
         };
         lease.require_fence().await?;
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut conn).await?;
+        let mut conn = lease.begin_fenced(&self.core.vala, tenant).await?;
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
             .map_err(ForgeError::Sql)?;
         let transition = if operation == "forge.orphan_gc.prepared" {
@@ -1826,7 +1820,7 @@ impl Forge {
         match transition {
             ForgeOperationTransition::Applied | ForgeOperationTransition::AlreadyApplied => {}
         }
-        conn.commit().await.map_err(ForgeError::Sql)
+        conn.commit().await
     }
 
     /// Drive the production orphan-GC transition writer from DB integration tests.

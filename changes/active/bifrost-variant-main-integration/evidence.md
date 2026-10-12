@@ -2641,3 +2641,859 @@ Main served OpenAPI exact suite lives in `wyrd-server --test integration` under 
 
 Geometry facts: gate's Bifrost share explicitly excludes exact `qualification::scribe_512_mib_physical_object_qualifies`. Separate existing Scribe geometry lane is `mise run test:bifrost:journey:scribe:production-geometry` (repository wrapper + migrations, `wyrd-testing --test scribe -P journey --run-ignored=only -E test(=qualification::scribe_512_mib_physical_object_qualifies)`). Forge geometry lane `mise run test:bifrost:journey:forge:production-geometry` sets WYRD_FORGE_PRODUCTION_GEOMETRY=1 for existing exact `production_closeout::compaction_geometry_exact_rows_and_non_destructive_second_pass` in `wyrd-testing --test forge`. Normal Forge suite can run reduced geometry; full production sizes require separate env/lane. Include any required geometry only in spec change-closeout, not broad task proof. Gate does not include opt-in capacity benchmarks, live provider/Operator smoke or real cloud storage tests.
 
+
+## P-028 — AC-028 hunk ledger (TASK-002-CLOSE-03)
+
+Scope: `git diff cfe21dc9007d5d22d9ae4411be07fb5504b0cc05 -- <P-028 paths>`. The per-part ledgers below were built at `622299986` in seven read-only passes (each hunk compared with S, main and the post-S log). Every item they flagged is resolved in the disposition table, against the candidate named in the TASK-002 evidence.
+
+Classification legend: **X1–X10** spec exceptions; **main-lint** conformance to main's workspace `[lints]` (REQ-026), with any behaviour change flagged; **main base** a main surface outside Bifrost's engine that the user rule keeps ("Main is the base and the starting point"); **restored** reverted to S.
+
+### Mechanical checks
+
+| P-028 step | Command | Result |
+| --- | --- | --- |
+| 2 struck symbols | `rg -n 'OwnedMembers\|owns_any\|…\|chain_hash' crates/vala crates/wyrd/wyrd-server/src crates/wyrd/wyrd-testing architecture/bifrost-design.md` | no output |
+| 3 migrations | `git diff --stat cfe21dc9… -- crates/vala/vala-sql/migrations` | 27 files. **X2**: `20260802000000_vala_audit_staging`, `…26_audit_tenant_admin_principal_kind`, `…27_audit_staging_credential_id`, `…29_audit_system_principal_kind` absent. **X10**: `20260906000001_maintenance_leases` and `20260910000007_forge_lease_fence_assertion` absent; `forge_snapshot_expiration_claims` drops `lease_key`/`lease_fencing_token`; `forge_tasks` strategy CHECK adds `manifest_rewrite`; `cluster_nodes` comment. **X7**: `20260801000002/3` grant migrations absent; every other `GRANT`/`REVOKE`/role-existence block replaced by main's `operator_access` policy (`wyrd.operator_session()`), `_sqlx_migrations`/`forge_scheduler_state`/`forge_worker_claim_state` get RLS; `assert_scribe_publication_fence` and `scribe_wal_newest_fence` follow main's operator raise/restore. **main**: one trailing blank line in `20260910000018` (main's `diff --check`). No forward, drop or main-only Bifrost migration added. No X5 edit exists (`vala.dev.agent_traces` was never a Postgres object) |
+| 4 table schema | `git diff --stat cfe21dc9… -- crates/vala/vala-bifrost-redux/src/tables`; `tables::tests::` | only X1 (`card_uid`), X2 (audit content), X5 (`dev/agent_traces.rs` removed), X9 (`assertion_result`, also in `SENSITIVE_PAYLOAD_COLUMNS`) |
+| 5 `agent_traces` wording | `rg -n agent_traces crates architecture docs sdks` | no output |
+
+Privilege note (X7): main's two-login model grants `wyrd_tenant` CRUD on every `wyrd`/`vala` table and execution of every Wyrd function, with RLS confining rows (`scripts/postgres/test-database-setup.sql`). S's `REVOKE`s (claim-row `UPDATE` refusal, no tenant `INSERT` on `forge_tasks`, definer functions executable only by `wyrd_app`) presupposed S's role set and have no main equivalent; migrations name no role under main. The two Scribe definer functions return only fence booleans and WAL positions, never tenant rows.
+
+### Disposition of every flagged item
+
+| # | Item | Disposition | Evidence |
+| --- | --- | --- | --- |
+| 1 | `server/query.rs` expects `WYRD_VALA_500_QUERY_EXECUTION_FAILED`, not S's 502 | X8 | main `5dfee4d3f` is the test half of `c63e2ff46`: a cancel before the first batch settles through `settle_distributed_failure(QueryExecutionFailed)` |
+| 2 | `verification_runtime.rs` `run_id: None` | false positive | REQ-016: task Verifier results carry the judged application Run, absent for a direct run; rustdoc corrected `6f370a205` |
+| 3 | Scribe test seams from main `6aaccebf9` | X2 | the shared outbox makes `audit_log` a Scribe table, so lifecycle tests target their own table |
+| 4 | `analytical_cleanup_pause_for_test` hook | main base | used by main's `oracle/workflow.rs` journey and S's `oracle/mcp.rs`; `cfg(feature = "test-support")` |
+| 5 | first-batch cancel sets `cancellation_marker` | X8 | X8 text: "a cancel observed before the first batch is recorded as `cancelled`". Removing it fails `oracle mcp::pg_tests::agent_runs_three_table_analytical_query_through_mcp` ("did not record Analytical cancellation") |
+| 6 | lapsed claim mid-commit closes `cancelled`, not `failed` | X10 | the claim is the table authority; losing it is a cancellation of that attempt, not a strategy failure |
+| 7 | two fence checks removed from snapshot expiry | X10 | they preceded only reads; the catalog commit stays behind `require_fence` + `commit_window_fits` and every write opens through `begin_fenced` |
+| 8 | expiry `AlreadyApplied` returns before a fence check | X10 | the replay writes nothing |
+| 9 | `ForgeTasks::reclaim_expired` deleted | X10 | dead after X10; `reclaim_expired_attempts` is the one path; doc fixed `6f370a205` |
+| 10 | dropped privilege assertions; `scribe_wal_newest_fence` raise/restore | X7; fixed | privilege note above; function converted `82c89ff94` (vala-sql 77/77, `check:tenant-isolation`) |
+| 11 | `#[cfg(feature = "internal")]` gates on the Bifrost client API | main base | main's client API (`wyrd-client`) |
+| 12 | client renames `describe_table`, `stream(.., deadline)`, `to_bytes` | main base | same |
+| 13 | `whole_count` errors where S saturated | main-lint | main's `whole_count` is identical; main denies truncating `as` casts. A negative or non-finite count is a broken binding |
+| 14 | Oracle and Gate audit rows had a null credential | fixed (REQ-011) | `f23eb1716`: both builders call `with_credential_id(principal.credential_id)`; `server query::service_b_acts_for_service_a_with_only_a_table_authority` asserts B's direct write names B's API key and the delegated refusal names none |
+| 15 | main `capacity.rs` FIFO, `owner_inspection` shutdown tests, `peer_cluster` histogram helper | main base | main journeys over S behaviour; lanes pass |
+| 16 | main product journeys (`workflow`, `observe_ingest`, `query_lifecycle`, `trace_export`, `ambiguous_retry`) | main base | they assert S's query/ingest contract and pass |
+| 17 | four main client tests (`grpc.rs`, `mod.rs`) | main base | main `6f25f42b4` moved S's queue/stall/register-race mechanics into these unit tests |
+| 18 | `production_closeout` filters `ForgeError::Shutdown`; schedule sizes include `audit_log` | X2 | under X2 the stopping node can be promoting `audit_log`; the filter matches only the exact clean-stop error the worker itself releases (`worker.rs` clean-cancel match), so `ShutdownRetained` and real failures still fail |
+| 19 | `fail_next_failure_settlement`; claim aged in SQL | X10 | replaces S's `fail_next_lease_release` at the runtime fatal path X10 leaves (`ca978e169`); ageing the claim is X10's form of ageing the lease |
+| 20 | sibling settlement proof lost | restored | `ab56a47c9` |
+| 21 | `follower_retains_a_graph_it_cannot_release` asserts released | X8 | no-wait release: a follower releases its graph inline |
+| 22 | Forge claim/ownership assertions dropped | restored | `3b91313c2`, `52c7cd529` |
+| 23 | S Gate SYSTEM-writer tests deleted | unrepresentable | `AccessTokenClaims::into_verified` refuses every system claim set, so a SYSTEM principal cannot reach Gate |
+| 24 | journey assertions loosened | restored / X2 | `describe.rs`, `ambiguous_retry.rs` durable rows `6bf7dee46`; `scribe/telemetry.rs` counters carry no table label and `audit_log` shares the Scribe (X2); `verification_runtime.rs` "no runner" negative unreachable under X2 |
+| 25 | stalled-tenant audit proof deleted with `audit_publication.rs` | X2 | `wyrd-runtime/src/outbox.rs::a_failing_tenant_does_not_delay_another_tenant` |
+| 26 | five S `pg_bifrost_e2e` tests absent | main base | main `6f25f42b4` re-homed them: canonical read-back split by signal (`canonical_*`), queue/backpressure and register race to `wyrd_client::bifrost` unit tests (item 17), ambiguous retry and describe to Scribe journeys (item 24) |
+| 27 | `trace_export.rs:737` integer vs `Timestamp(ns)` | fixed | `dff848928` (`to_timestamp_nanos`) |
+| 28 | `#[expect(clippy::float_cmp)]`, `#[expect(clippy::struct_field_names)]` | restored / main | removed from S-origin tests and harness (`3b91313c2`); the six remaining are in main-authored journeys and `otlp_decode.rs`, as in main |
+| 29 | `Box::pin` in the harness | main-lint | main's `large_futures` |
+| 30 | capacity bench conversions | main-lint / X6 | inputs, thresholds, windows and output paths unchanged; benchmark qualification is TASK-006 |
+| 31 | capacity files outside the P-028 path list | TASK-006 | benchmark qualification owns them |
+| 32 | doc leftovers | fixed / main | `6f370a205` (audit chain wording, `pg_migration` Panics, `production_closeout` comment, result `run_id`); X3/X4/X6/X7 design prose `fcc3aceb1`; `IngestError::CardUnresolved` is main's (dead in main too); `20260910000018` whitespace is main's |
+
+### Per-part ledgers (at `622299986`)
+
+Each part's "Unmapped / suspicious" list is resolved by the table above.
+
+
+
+#### Part: P-028 ledger, part A: `crates/vala/vala-sql`
+
+Diff base: S = `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05`. 47 files. Moved test files (`tests/*.rs` to `tests/integration/*.rs`) were diffed against their S originals.
+
+Commit legend. Main-side commits that arrived through the merge: `6c23a6f45` (main: supply Postgres credentials externally, operator_session RLS role model), `515f16c97` (main: pedantic lints and test binary layout), `ce866229d` (main merge of the Forge rewrite), `d47c7fafb` (main: audit retention through Scribe), plus main audit-outbox commits `70a6f4a4e`, `d2af088b9`, `5a5542cbb`, `52e1144b5`, `e54b1244f`. Integration commits: `b356c948f` (merge), `4f9a5c1d1`, `eaa129c4a`, `516479cd5`, `87e9d3f48` (X10 plus S closeout port), `fb23a5d37`.
+
+"Lint" in the table means an adaptation forced by main's workspace `[lints]` (pedantic Clippy): `r#"…"#` to `r"…"` (needless_raw_string_hashes), inlined format args, `Duration::from_mins`, `impl<'a>` to `'_`, items-before-statements `const` moves, `other @ Variant` arms (wildcard_enum_match_arm), `.unwrap()` to `.expect()`, `Path::extension` instead of `ends_with(".sql")`. "Fixture API" means main's `PgFixture::superuser_pool()` is now synchronous (`.await` dropped).
+
+##### 1. Ledger
+
+| File | Hunk summary | Exception / reason | Commit(s) |
+|---|---|---|---|
+| Cargo.toml | drop `sha2` dep (only used by the deleted migration-checksum pins) | Rev 3 Migrations: tests that pin shipped-migration bytes are deleted | 87e9d3f48, 515f16c97 |
+| Cargo.toml | drop eight `[[test]]` targets (one consolidated `tests/integration` binary, main layout); `[lints] workspace = true` | main layout and lints (main's Cargo.toml is byte-identical here) | 515f16c97 |
+| migrations/20260601000000_vala_init.sql | `GRANT SELECT ON vala._sqlx_migrations TO wyrd_app, wyrd_platform_admin` replaced by ENABLE/FORCE RLS plus an `operator_access` policy | X7 (main role/RLS convention) | 6c23a6f45 |
+| migrations/20260619000000_iceberg_catalog.sql | drop GRANT/REVOKE on schema `iceberg_catalog`; comment rewritten (the platform login owns the schema) | X7 | 6c23a6f45 |
+| migrations/20260619000001_olap_minimal.sql | `GRANT … TO wyrd_app` replaced by an `operator_access` policy | X7 | 6c23a6f45, 4f9a5c1d1 |
+| migrations/20260801000002_vala_app_schema_usage.sql (deleted) | `GRANT USAGE ON SCHEMA vala TO wyrd_app` | X7 (main roles; the brief names this deletion) | 6c23a6f45 |
+| migrations/20260801000003_grant_vala_schema_usage.sql (deleted) | same | X7 | 6c23a6f45 |
+| migrations/20260802000000_vala_audit_staging.sql (deleted) | audit staging and chain head never created | X2 | 87e9d3f48 |
+| migrations/20260821000000_add_drift_alerts.sql | GRANT replaced by an `operator_access` policy | X7 | 6c23a6f45 |
+| migrations/20260906000001_maintenance_leases.sql (deleted) | `vala.maintenance_leases` never created | X10 | 87e9d3f48 |
+| migrations/20260910000002_vala_file_list.sql | drop the `wyrd_platform_admin` existence DO-block and GRANTs; add an `operator_access` policy | X7 | 6c23a6f45 |
+| migrations/20260910000003_vala_cluster_nodes.sql | comment: Forge coordinates through task rows, not `maintenance_leases` | X10 | 87e9d3f48 |
+| migrations/20260910000003_vala_cluster_nodes.sql | drop the DO-block and GRANTs; "BYPASSRLS" comment rewritten | X7 | 6c23a6f45 |
+| migrations/20260910000007_forge_lease_fence_assertion.sql (deleted) | `vala.assert_maintenance_lease_fence` never created | X10 | 87e9d3f48 |
+| migrations/20260910000009_forge_operation_state.sql | DO-block and GRANTs replaced by an `operator_access` policy | X7 | 6c23a6f45 |
+| migrations/20260910000010_forge_tasks.sql | strategy CHECK adds `'manifest_rewrite'` | X10 ("manifest rewrite included, runs as a task") | 87e9d3f48 |
+| migrations/20260910000010_forge_tasks.sql | GRANTs replaced by `operator_access` policies; `forge_scheduler_state` gets RLS; the singleton INSERT moves after the policy | X7 | 6c23a6f45 |
+| migrations/20260910000011_forge_planning_demands.sql | GRANTs replaced by an `operator_access` policy | X7 | 6c23a6f45 |
+| migrations/20260910000012_forge_worker_claim_state.sql | GRANT replaced by RLS plus `operator_access`; the INSERT moves after the policy | X7 | 6c23a6f45 |
+| migrations/20260910000013_oracle_coordination.sql | REVOKE/GRANTs replaced by an `operator_access` policy | X7 | 6c23a6f45 |
+| migrations/20260910000015_scribe_publication_authority.sql | `assert_scribe_publication_fence`: sql to plpgsql with `app.operator` raise/restore; REVOKE/GRANT EXECUTE dropped | X7 (REQ-022 operator raise/restore convention) | 6c23a6f45 |
+| migrations/20260910000018_forge_task_envelope_progress.sql | trailing blank line removed | whitespace only; no exception (see U-7) | 6c23a6f45 |
+| migrations/20260910000021_scribe_batch_commits.sql | GRANT replaced by an `operator_access` policy | X7 | 6c23a6f45 |
+| migrations/20260910000022_oracle_admission_blocks.sql | REVOKE/GRANTs replaced by two `operator_access` policies | X7 | 6c23a6f45 |
+| migrations/20260910000025_oracle_reader_authority.sql | GRANT/REVOKEs replaced by `operator_access` policies; `ALTER FUNCTION … OWNER TO wyrd_platform_admin` and EXECUTE grants dropped; "request role" comment wording | X7 | 6c23a6f45 |
+| migrations/20260910000025_oracle_reader_authority.sql | `forge_snapshot_expiration_claims` drops the `lease_key` and `lease_fencing_token` columns; comment now says "current claim on the task row" | X10 | 87e9d3f48 |
+| migrations/20260910000026/27/29 (deleted) | ALTERs of `vala.audit_staging` (principal kinds, credential_id, chain-head grants) | X2 | 87e9d3f48 |
+| migrations/20261009000000_bifrost_snapshot_retention.sql | REVOKE/GRANT EXECUTE on `oracle_read_table_cut` dropped; supersessions GRANT replaced by an `operator_access` policy | X7 | 4f9a5c1d1 |
+| migrations/20261010000000_bifrost_cut_notify.sql | `REVOKE ALL ON FUNCTION notify_bifrost_cut() FROM PUBLIC` dropped | X7 | 4f9a5c1d1 |
+| migrations/20261011000000_scribe_wal_fenced_lsn.sql | REVOKE/GRANT EXECUTE on `scribe_wal_newest_fence` dropped | X7 (see U-4) | 4f9a5c1d1, 87e9d3f48 |
+| src/lib.rs | re-export `RowScope` instead of `SchemaAccess` (main renamed type) | X7 (main API) | 6c23a6f45 |
+| src/lib.rs | `verify_schema` calls `verify_row_security(vala, RowScope::Tenant)` instead of schema-privilege checks; docs | X7 | 6c23a6f45 |
+| src/lib.rs | delete the OLAP migration SHA-256 pin and the `GRANT … wyrd_platform_admin` content assertion; docs and `# Panics` | Rev 3 Migrations (byte pins deleted) plus X7 | 87e9d3f48 |
+| src/lib.rs | `.sql` extension check via `Path::extension` (two places) | lint | 515f16c97 |
+| src/postgres.rs | `verify_login_name(WYRD_APP_ROLE)` replaced by `verify_tenant_pool`; new `shared_login` field from `ResolvedDsns::shares_login`; docs | X7 (main identity/credential model) | 6c23a6f45, eaa129c4a |
+| src/postgres.rs | `Duration::from_mins(5/30)` | lint (same values) | 515f16c97 |
+| src/queries/mod.rs, src/row_types/mod.rs | drop the `audit_staging` and `maintenance_leases`/`maintenance` modules | X2, X10 | 70a6f4a4e, 87e9d3f48 |
+| src/queries/audit_staging.rs, src/row_types/audit_staging.rs (deleted) | audit staging queries and rows | X2 | 70a6f4a4e |
+| src/queries/maintenance_leases.rs, src/row_types/maintenance.rs (deleted) | lease acquire/renew/release/assert_fence and `MaintenanceLeaseKey` | X10 | 87e9d3f48 |
+| src/queries/cluster_nodes.rs | raw-string hashes | lint | 515f16c97 |
+| src/queries/file_list.rs | raw strings; test `superuser_pool()` without `.await` | lint; fixture API | 515f16c97 |
+| src/queries/forge_catalog_operator.rs | doc: no "BYPASSRLS"; raw string | X7 wording; lint | 6c23a6f45 |
+| src/queries/forge_leader.rs | comments: no "(BYPASSRLS)" | X7 wording | 6c23a6f45 |
+| src/queries/olap_catalog.rs | doc: no "wyrd_app"; raw strings | X7 wording; lint | 6c23a6f45 |
+| src/queries/scribe_batch_commits.rs | `newest_wal_fence` takes `&OperatorPool` instead of `&mut PgConnection`; `// tenant-isolation:` marker; doc | X7 (OperatorPool capability type; "WAL fences on OperatorPool") | eaa129c4a |
+| src/queries/forge_operations.rs | delete `assert_lease_fence` and its three call sites; drop `lease_key`/`lease_fencing_token` from claim INSERT/SELECTs; lock-order and `# Errors` docs say the claim is the fence | X10 | 87e9d3f48 |
+| src/queries/forge_operations.rs | raw strings, `impl ForgeOperations<'_>`, inlined `format!` args | lint | 515f16c97 |
+| src/row_types/forge_operations.rs | `ForgeExpirationAuthority` and the claim SQL row lose `lease_key`/`lease_fencing_token` | X10 | 87e9d3f48 |
+| src/queries/forge_tasks.rs | module doc: the active task row is the table's exclusive authority | X10 | 87e9d3f48 |
+| src/queries/forge_tasks.rs | new `ForgeTasks::lock_live_claim` (unexpired-claim `FOR UPDATE`) | X10 (`begin_fenced` locks the live claim first, 3278de536) | 87e9d3f48 |
+| src/queries/forge_tasks.rs | `claim_expires_at > statement_timestamp()` added to the Prepared transition and to `apply_transition` | X10 ("every durable transition … fences on it") | 87e9d3f48 |
+| src/queries/forge_tasks.rs | successful continuation reads `strategy`; `manifest_rewrite` settles Running to Succeeded | X10 (manifest rewrite as a task) | 87e9d3f48 |
+| src/queries/forge_tasks.rs | `assert_lease_fence` calls removed from expired-cleanup prepare/settle and orphan checkpoint/complete; lock-order docs | X10 | 87e9d3f48 |
+| src/queries/forge_tasks.rs | **`reclaim_expired` (S public fn) deleted**; its doc text folded into `reclaim_expired_attempts` | not named by X10 (see U-1) | 87e9d3f48 |
+| src/queries/forge_tasks.rs | raw strings; `values.push(value);` | lint | 515f16c97 |
+| src/row_types/forge_tasks.rs | `ForgeTaskStrategy::ManifestRewrite` (enum, `MAINTENANCE_STRATEGIES`, `is_maintenance`, `as_str`, `FromStr`); docs say "lapsed claim" | X10 | 87e9d3f48 |
+| src/row_types/forge_tasks.rs | `const` items moved before statements (4 places) | lint | 515f16c97 |
+| tests/integration/main.rs (new) | one consolidated integration binary declaring the 10 surviving modules | main layout (main's file has the same shape, plus `pg_maintenance_leases`, deleted under X10) | 515f16c97, 87e9d3f48 |
+| tests/pg_audit_staging.rs (deleted) | | X2 | 515f16c97 |
+| tests/pg_maintenance_leases.rs (deleted) | | X10 | 87e9d3f48 |
+| tests/integration/pg_file_list_cluster_nodes.rs | `.expect`, inlined args, raw strings, fixture API; "BYPASSRLS" comments become "operator_access" | lint; fixture API; X7 wording | 6c23a6f45, 515f16c97 |
+| tests/integration/pg_forge_file_list.rs, pg_forge_leader.rs, pg_olap_catalog.rs | path move plus fixture API/raw-string only | main layout; lint | 515f16c97 |
+| tests/integration/pg_schema_usage.rs | test renamed `tenant_login_registers_bifrost_table`; docs and expect message reworded from `wyrd_app` to the tenant login | X7 | 6c23a6f45 |
+| tests/integration/pg_oracle_membership.rs | `grants()` helper deleted; function-owner check becomes `proowner = nspowner`; `has_function_privilege('wyrd_tenant')`; PUBLIC-execute and `forge_snapshot_supersessions` grant assertions deleted | X7 (see U-3) | 6c23a6f45, eaa129c4a |
+| tests/integration/pg_migration.rs | `ResolvedDsns::from_env` platform DSN instead of `WYRD_TEST_DATABASE_ADMIN_URL`; `include_str!` paths `../../` | X7 (main credential env); layout | 6c23a6f45, 515f16c97 |
+| tests/integration/pg_migration.rs | delete `shipped_audit_staging_migration_is_immutable` and `staged_rows_survive_the_credential_attribution_upgrade` | X2 plus Rev 3 Migrations (byte pins deleted) | 87e9d3f48 |
+| tests/integration/pg_migration.rs | `# Panics` doc: "a retired relation or function still resolves" | leftover main doc (see U-6) | 6c23a6f45/d47c7fafb |
+| tests/integration/pg_stream_identity.rs | new `newest_wal_fence_spans_tenants_on_one_stream` (cross-tenant OperatorPool fence lookup); raw strings | X7 (proof for the OperatorPool fence read; "Rehome the cross-tenant WAL fence assertion") | 516479cd5, 515f16c97 |
+| tests/integration/pg_forge_operations.rs | `count_audit` helper and ~14 "Forge transitions append no audit" assertions deleted; docs | X2 (`vala.audit_staging` is gone) | 87e9d3f48, d47c7fafb |
+| tests/integration/pg_forge_operations.rs | policy assertion expects `operator_access` plus `tenant_isolation`; `forge_operation_state` grant assertion deleted | X7 | 6c23a6f45 |
+| tests/integration/pg_forge_operations.rs | claim-table grant assertion ("claims are immutable: no role holds UPDATE") deleted | X7 (see U-2) | 6c23a6f45 |
+| tests/integration/pg_forge_operations.rs | lease seeding, `lease_key`/`lease_fencing_token` fields and columns, and the "lease key disagreement"/"lease fence disagreement" cases deleted | X10 | 87e9d3f48 |
+| tests/integration/pg_forge_operations.rs | `other @ ForgeOperationTransition::AlreadyApplied` arms; setup moved below helper items; raw strings | lint | 515f16c97 |
+| tests/integration/pg_forge_tasks.rs | audit_staging counts and assertions deleted (reclaim, rollback, settlement, refused enqueue) | X2 | d47c7fafb, 87e9d3f48 |
+| tests/integration/pg_forge_tasks.rs | `operator_cannot_read_or_mutate_tenant_audit_rows` deleted | X2 | d47c7fafb |
+| tests/integration/pg_forge_tasks.rs | `forge_tasks` grant assertions deleted ("tenant role cannot bypass operator-owned enqueue") | X7 (see U-2) | 6c23a6f45 |
+| tests/integration/pg_forge_tasks.rs | `reclaim_expired(10)` calls become `reclaim_expired_attempts(10).len()` | follows U-1 | 87e9d3f48 |
+| tests/integration/pg_forge_tasks.rs | lease seeding and the stale-fence case deleted; `seed_cleanup_roots` signature narrowed; new lapsed-claim refusal for `checkpoint_orphan_cleanup_cursor` | X10 | 87e9d3f48, fb23a5d37 |
+
+P-028 item 3 (migrations):
+- No migration was added, whether forward, drop, or main-only. HEAD's migration set equals S's minus 8 files.
+- Main's `20261003000200_audit_publication_progress.sql` and `20261008000000_drop_audit_staging.sql` are absent.
+- Deletions: X2 (4 files: `20260802000000`, `…026`, `…027`, `…029`), X10 (2 files: `20260906000001`, `20260910000007`), X7 (2 files: `20260801000002`, `20260801000003`).
+- In-place edits:
+  - X10: `manifest_rewrite` in the strategy CHECK, the claim columns dropped, and one comment.
+  - X7, in 19 files: every GRANT/REVOKE/DO-block is replaced by `operator_access` RLS policies, and `assert_scribe_publication_fence` gains the `app.operator` raise/restore.
+  - One whitespace hunk.
+- There are no X5 edits. `vala.dev.agent_traces` was never a Postgres object; the `vala.dev` namespace CHECK values are S's, unchanged.
+- **Item 3's wording ("only the in-place X2 edits … and X5 edits") is incomplete.** The diff also holds X7 (19 files, 2 deletions) and X10 (3 files, 2 deletions) edits. Fix the P-028 text so it lists X2, X5, X7 and X10, or this criterion cannot pass as written.
+
+##### 2. Unmapped / suspicious
+
+- **U-1. `src/queries/forge_tasks.rs` ~L860 (S L860–872): S public API `ForgeTasks::reclaim_expired` deleted.**
+  - Excerpt: `- pub async fn reclaim_expired(&self, cap: u32) -> Result<u64, SqlError> { let changed=sqlx::query("WITH victims AS (… state IN ('claimed','running') AND claim_expires_at<statement_timestamp() …`
+  - Why unmapped: X10 deletes `maintenance_leases`, the lease-fence function and the separate lease. It does not delete the expired-claim reclaim. In S, nothing in production called it (only `tests/integration/forge/orphan_cleanup.rs` and `pg_forge_tasks.rs`), and `reclaim_expired_attempts` covers the behaviour. So this is dead-code cleanup of an S symbol, not exception-forced. S tests were rewritten to the sibling.
+  - Stale reference left behind: `crates/vala/vala-bifrost-redux/src/forge/worker.rs:3652` still says "retained for `reclaim_expired` after its lease TTL" (outside part A).
+- **U-2. Privilege-boundary assertions in tests deleted with no replacement property.**
+  - `tests/integration/pg_forge_operations.rs` (S ~L1908): `- "claims are immutable: no role holds UPDATE"`
+  - `tests/integration/pg_forge_tasks.rs` (S ~L1395): `- "tenant role cannot bypass operator-owned enqueue"`
+  - Why flagged: X7 removes the `wyrd_app`/`wyrd_platform_admin` GRANT model, so these exact assertions cannot stand. But the properties they protected now have no enforcement or test:
+    - Claim rows are still described as immutable (migration 25 comment), yet nothing refuses an UPDATE.
+    - The tenant login, which gets default table DML per `pg_schema_usage`, can INSERT `forge_tasks` under `tenant_isolation`.
+  - Mapped to X7 in the ledger, but a reviewer should confirm this loss is accepted under main's convention rather than an unrecorded weakening.
+- **U-3. `tests/integration/pg_oracle_membership.rs` (S ~L…, `public_exec`): assertion "PUBLIC holds no execute privilege" deleted**, together with every `REVOKE ALL ON FUNCTION … FROM PUBLIC` in migrations 25, 20261009, 20261010 and 20261011.
+  - Effect: the SECURITY DEFINER functions are now PUBLIC-executable: `oracle_catalog_metadata_location`, `oracle_acquire_table_cut`, `oracle_read_table_cut`, `scribe_wal_newest_fence` and `assert_scribe_publication_fence`.
+  - Main's `wyrd-sql` migrations contain no `REVOKE … ON FUNCTION`, so this follows main's convention (X7).
+  - Still, a weakened security assertion; list it for review. `scribe_wal_newest_fence` in particular returns cross-tenant WAL positions to any caller.
+- **U-4. `migrations/20261011000000_scribe_wal_fenced_lsn.sql`: `scribe_wal_newest_fence` stays `LANGUAGE sql` with no `app.operator` raise/restore.**
+  - REQ-022 says this exact function "follows main's operator raise/restore and bounded search_path/privilege conventions".
+  - It works only because the caller now runs on `OperatorPool` (`eaa129c4a`). Under FORCE RLS, a tenant-session caller would see only its own tenant's fences.
+  - The hunk itself (grant removal) maps to X7. The REQ-022 shape is not met; record as a deviation or fix.
+- **U-5. `src/queries/forge_operations.rs` apply/reset paths: the `AlreadyApplied` idempotent return now happens before any fence check.**
+  - Before, `assert_lease_fence` ran first. Now `lock_expiration_task` runs only after the AlreadyApplied branch.
+  - Consistent with X10 (a settled claim has no live fence to check), so mapped. Noted because replay-without-fence is a behaviour change.
+- **U-6. `tests/integration/pg_migration.rs:17–18`: stale `# Panics` doc.**
+  - Excerpt: `+ /// Panics when … a retired relation or function still resolves after migrating.`
+  - Main `d47c7fafb` added this together with an `audit_staging`/`audit_chain_head`/`audit_publication` absence check. `87e9d3f48` deleted the check but kept main's doc wording; the body checks only `vala.drift_alerts`.
+  - A leftover main doc hunk. Revert to S's "or `vala.drift_alerts` still resolves", or restore an absence check.
+- **U-7. `migrations/20260910000018_forge_task_envelope_progress.sql` EOF: trailing blank line removed (`-` empty line).**
+  - Whitespace-only edit to an S migration. No exception covers it (probably a `git diff --check` fix in main `6c23a6f45`).
+  - Harmless, but item 3 says only exception edits.
+- **U-8. P-028 item 3 text mismatch (process finding).** The migration diff contains X7 and X10 in-place edits and deletions, which item 3 does not list (see section 1). The criterion as written fails, even though every content hunk except U-7 maps to an exception.
+
+No `#[allow]`/`#[expect]`/`cfg_attr`, `Box::pin`, timeout/deadline changes, status-code changes, compatibility shims, or leftover main Forge tests were found in vala-sql. The `vala_pool_config` durations are unchanged in value.
+
+##### 3. Counts
+
+- Ledger rows: 78.
+- Mapped: 72 (X7 34, X10 21, X2 10, lint/layout/fixture-API main-forced 17; some rows carry two labels).
+- Unmapped: 3 hunks (U-1 `reclaim_expired` deletion, U-6 stale doc, U-7 whitespace).
+- Suspicious but mapped: 4 (U-2, U-3, U-4, U-5).
+- Process finding: 1 (U-8, item 3 wording).
+
+#### Part: P-028 ledger — Part B: Forge (X10 area)
+
+Scope: `crates/vala/vala-bifrost-redux/src/forge/*`, `crates/vala/vala-bifrost-redux/tests/integration/forge/*`,
+`crates/wyrd/wyrd-testing/tests/bifrost/forge/*`, `crates/wyrd/wyrd-testing/src/bifrost/forge_harness.rs`.
+Diff base S = `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05`. 28 files, 253 `@@` hunks (worker.rs alone 87).
+
+Struck-commit check: `expiry_gates.rs`, `leader.rs` and `scheduler.rs` are byte-identical to S, so 985aa12f8 (Forge gate part) and the expiry_gates part of 136e460d6 are reverted. `rg 'PreparedExpiry|Unsubmitted|ForgeLoopQuiescence|maintenance_lease|forge_lease_key|lease_fencing_token'` over the scope prints nothing. Main Forge commits that show up in path history (3bf7b0d97 fast-reclaim, 3af5bdb5b quiescence, 6aaccebf9, 5ff25deb6 retry-count commits, a26fda2e3, 0e1968570) leave no hunk against S. The merge resolved them to S.
+
+##### 1. Ledger
+
+| File | Hunk summary | Exception / reason | Commit(s) |
+|---|---|---|---|
+| src/forge/lease.rs | `ForgeLease` rebound from the `maintenance_leases` row (lease_key, fencing_token, takeover, acquire/release/assert_transaction_fence) to a task claim (`tasks, task_id, attempt_id, owner`). Adds `confirm`, `renew` → `ForgeTasks::heartbeat`, `require_fence`, `begin_fenced` → `FencedTransaction` (locks the live claim first), and `fence_lost`. Deletes `forge_lease_key` and its unit test. Adds a custom `Debug`. | X10 | 87e9d3f48, ce8cac7d4, 3278de536 |
+| src/forge/error.rs | `ForgeError::Lease` variant removed, along with its test assertion and failure-class arm. `FenceLost` doc reworded to name the claim. | X10 | 87e9d3f48 |
+| src/forge/mod.rs | Re-export drops `forge_lease_key`. `operator_pool` doc says "task claims". | X10 | 87e9d3f48 |
+| src/forge/metrics.rs, phase.rs | `ForgeTaskStrategy::ManifestRewrite` added to `TASK_TYPES` (5→6) and to `admits_new_effect`, with a test line. | X10 ("manifest rewrite included, runs as a task") | 87e9d3f48 |
+| src/forge/compact.rs | S test `forge_transition_writers_do_not_append_audit_directly` deleted. Its source contains the literal `audit_staging::append_`, which the P-028 struck-symbol grep forbids, and the guarded call no longer exists. | X2 (audit staging removed) | 70a6f4a4e via merge b356c948f |
+| src/forge/live_reconcile.rs, live_replace.rs, publication.rs, scribe_promotion.rs | `lease.renew(&operator_pool)` / `require_fence(&operator_pool)` → pool-free calls. `ForgeError::FenceLost{lease_key}` → `lease.fence_lost()`. `tenant_conn` + `assert_transaction_fence` + commit → `lease.begin_fenced(...)` + `commit()`. | X10 | 87e9d3f48, ce8cac7d4, 3278de536, fb23a5d37 |
+| src/forge/expire.rs | `settled_evidence` → `terminal: Option<ExpiryTerminal>`. New `ExpiryTerminal{Settle,Reset}`, `ExpirySettlement`, `ExpiryReset`. `reset_expiration`/`settle_expiration` now decide without committing. New `commit_expiry_terminal` (the single commit point). Test fixture uses `ForgeLease::confirm` and commits the decided terminal. `expiration_authority` loses lease_key/token. 20 hunks. | X10 (strategy returns ForgeTerminal; settlement seam commits) | 87e9d3f48, 531ed0d26, fb23a5d37 |
+| src/forge/gc.rs | Manifest rewrite no longer takes `ForgeLease::acquire` on a table lease. It builds a `ManifestRewrite` `NewForgeTask` (`manifest_rewrite_task`, `MANIFEST_REWRITE_PARAMETER_KIND`) and runs `executor.execute_accepted`. `commit_manifest_rewrite` takes paths and is `pub(super)`. `orphan_cleanup_task` is `pub(super)`. Module doc updated. | X10 | 87e9d3f48, fb23a5d37 |
+| src/forge/orphan_gc.rs | Test entry `run_orphan_gc_report_for_test` admits through `insert_claimed` + `start` + `confirm`, then settles via `retry` or `complete_orphan_cleanup` (previously lease acquire/release). Fence calls rebound. Orphan transition opens through `begin_fenced`. | X10 | 87e9d3f48, ce8cac7d4, 3278de536 |
+| src/forge/worker.rs (claim/lease) | `acquire_table_lease` → `confirm_claim`. `release_table_lease`, `release_prepared_lease` and the release step in `settle_claim_execution`/`release_unresolved_attempt` deleted. `ClaimExecutionOutcome.lease` removed. `spawn_authority_heartbeat` renews only through `lease.renew()` (the double heartbeat+lease renew is gone) and is now infallible. `begin_attempt` drops its extra heartbeat (the caller's `require_fence` renews). | X10 | 87e9d3f48, ce8cac7d4, 3278de536 |
+| src/forge/worker.rs (terminal seam) | `SelfSettled`/`Settled(result)` → `ForgeDispatchResult::Terminal(ForgeTerminal)` / `ForgeExecutionEvidenceState::Terminal`. New `ForgeTerminal{NoOpAcknowledged, ManifestRewritten, OrphanPassBounded, OrphanScanComplete, Expiry}`. `RewriteAdmission::Compact(ForgeTerminal)` replaces `acknowledge_compact_table`. Orphan dispatch returns a decision. New `commit_terminal`. `finish_claim_execution` returns `ForgeTaskResult` and is the single release point after the heartbeat joins (`??`). | X10 (single release point) | 531ed0d26 |
+| src/forge/worker.rs (manifest rewrite) | `dispatch_manifest_rewrite`, the `ManifestRewrite` stage/validation arm, `tolerates_base_drift` arm, and `ForgeExecutionStage::ManifestRewrite`. | X10 | 87e9d3f48 |
+| src/forge/worker.rs (test seams) | Deleted: `fail_next_lease_release`, `hold_before_next_lease_release_for_test`/wait/release, `heartbeat_beat_now`/`beat_claim_heartbeat_now_for_test`. Renamed: `hold_after_next_durable_settlement_for_test` → `…terminal_decision…`. **New:** `fail_next_failure_settlement` (+ armed/take) injected in failure settlement. | X10 (deleted seams' sites no longer exist; new seam replaces the lease-release fatal path) — see U9 | 87e9d3f48, 531ed0d26, ca978e169 |
+| src/forge/worker.rs (unit test) | `SelfSettled(Succeeded)` → `Terminal(ManifestRewritten)` in the publication-priority test | X10 | 531ed0d26 |
+| tests/integration/forge/support.rs | `expire_table_lease` → `lapse_table_claim` (ages `forge_tasks.claim_expires_at`). `live_leases` → `live_claims`. | X10 | 87e9d3f48 |
+| tests/integration/forge/support.rs | `superuser_pool().await` → `superuser_pool()` (3×) | Main-forced: main `wyrd-dev-fixtures::pg::PgFixture::superuser_pool` is sync (S had it async) | b356c948f / cac9c4969 |
+| tests/integration/forge/support.rs | `CreateTableRequest { audit: None }` field removed | X2 (catalog no longer carries an `AuditEvent`; audit on the outbox) | d2af088b9 via merge |
+| tests/integration/forge/compaction_admission.rs | `expire_table_lease` → `lapse_table_claim`. `live_leases` → `live_claims` (crash: 1, drained: 0). `release_one_unresolvable_attempt` loses the held lease-release boundary; readiness is still asserted afterwards in `assert_unready_takes_no_new_authority` (l.1633). | X10 | 87e9d3f48, 27f65d206 |
+| tests/integration/forge/compaction_admission.rs:2281 | `acceptance_unknown_recovers_from_durable_state`: final `live_leases()==0` assertion deleted, no claim replacement | X10 (partial) — see U1 | 87e9d3f48 |
+| tests/integration/forge/publication.rs | `live_leases`→`live_claims`. A drained attempt now keeps 1 claim (previously 0 leases). `HeldAuthorityMutation::expected_state` makes LeaseExpired close `cancelled` instead of `failed`. | X10 — see U11 | 27f65d206 |
+| tests/integration/forge/promotion.rs | `live_claims` rename. Barrier seed stops inserting a `maintenance_leases` row and drops lease_key/token. | X10 | 87e9d3f48 |
+| tests/integration/forge/expired_cleanup.rs | `live_leases` helper deleted. `assert_prepared_candidate_excludes_competitors` loses its orphan-GC `FenceLost` arm. The cross-table refusal loses its leases-unchanged check. | X10 — see U2 | 87e9d3f48 |
+| tests/integration/forge/orphan_cleanup.rs | Lease-count check removed from `cross_table_plan_refuses_before_lease_or_io`. `assert_lease_and_fence_refuse_deletion` → `assert_claim_loss_refuses_deletion` (peer-lease refusal case deleted; fence bump → `expire_claims`). `reclaim_expired` → `reclaim_expired_attempts().len()`. | X10 — see U3; the `reclaim_expired` rename is forced by its deletion in vala-sql (outside this part) | 87e9d3f48, 6b13254ad |
+| tests/integration/forge/orphan_cleanup.rs | `superuser_pool().await` → sync | Main-forced (wyrd-dev-fixtures API) | b356c948f |
+| tests/integration/forge/production_routes.rs | S test `worker_duration_includes_claim_and_failed_release` deleted. `worker_prepared_fatal_closes_before_release_and_observation` → `…_before_observation`, with lease-release hold/fault and the active-task gauge check at that boundary removed. | X10 — see U4 | 87e9d3f48 |
+| tests/integration/forge/snapshot_expiration.rs | 3× `UPDATE vala.maintenance_leases` removed. `settled_expiration_outranks{Shutdown,ObsoleteHeartbeat}` → `decided_expiration_commits_through_shutdown` (the heartbeat case's seam is gone). | X10 (Q16 coverage) | 87e9d3f48, 531ed0d26 |
+| src/bifrost/forge_harness.rs | `CommitUncertaintyControls.target_table` + `targets()` + `CommitUncertaintyCatalog::target_table`, so the tenant `audit_log` commits pass through | X2 (audit_log is a maintained Bifrost table) | f6c841d57 via merge |
+| src/bifrost/forge_harness.rs | `audit: None` removed from `CreateTableRequest` | X2 | d2af088b9 via merge |
+| src/bifrost/forge_harness.rs | Seven `# Panics` doc sections, `from_secs(60)`→`from_mins(1)`, `map().unwrap_or(false)`→`is_ok_and` | Main-forced lint/rustdoc rules (pedantic clippy, AGENTS §16) | 515f16c97 via merge |
+| tests/bifrost/forge/live_rewrite.rs | `uncertainty.target_table(shared.binding.table_ident())` | X2 | f6c841d57 |
+| tests/bifrost/forge/live_rewrite.rs | `failed_worker_restarts_while_the_api_serves`: tenant `audit_log` opted out of compaction | Q14 | 87e9d3f48 |
+| tests/bifrost/forge/live_rewrite.rs | Same journey: fault moved from `fail_next_lease_release` to `fail_next_forge_prepared_audit_for_test` + `fail_next_failure_settlement`, then `expire_running_claims` before release | X10-forced seam move — see U9 | ca978e169, db50b1c76 |
+| tests/bifrost/forge/live_rewrite.rs | `RELEASE_BOUND` 120 s → `from_mins(2)` (same value). Imports. Closure → `BifrostRoleResources::forge` path. | Main-forced lints | 515f16c97 |
+| tests/bifrost/forge/live_rewrite.rs:2477 | `#[expect(clippy::float_cmp, …)]` added | — see U6 | 515f16c97 |
+| tests/bifrost/forge/production_closeout.rs | `compact()` judges on state (non-empty, all `/data/forge/`). Adds `promoted_files`, `load_table`, `snapshot_files`. `snapshot_count` → `rewrite_snapshot_count` (Replace only). `drain_tasks()` before the clock jump in the geometry and ReaderCleanup journeys. | Q15, Q17 | a21f335ac |
+| tests/bifrost/forge/production_closeout.rs | `assert_rewrite_evidence(binding)` filters `forge_operation_state` by `resource` | X2 (audit_log rewrites settle beside) | 2880705a0 via merge |
+| tests/bifrost/forge/production_closeout.rs | `LeaderJourney::failures()` filters `ForgeError::Shutdown`. `key_in`. Successor/restart/empty-maintenance schedule-size assertions loosened to tolerate `audit_log` membership. | X2 (audit_log maintained) — see U7 | f6c841d57 via merge |
+| tests/bifrost/forge/production_closeout.rs | `audit: None` removed | X2 | d2af088b9 |
+| tests/bifrost/forge/production_closeout.rs | `REWRITE_BOUND` 600 s → `from_mins(10)` (same value). `scribe_roles` local. `.map(WyrdTestServer::node_id)`. | Main-forced lints | 515f16c97 |
+| tests/bifrost/forge/production_closeout.rs:213 | Comment "The one worker drains only the journey's tables…" with no code behind it. S's "Audited reads above keep publishing retained audit…" comment removed. | — see U8 | 2d25fac7c via merge |
+| tests/bifrost/forge/production_closeout.rs:1262 | `#[expect(clippy::float_cmp, …)]` added | — see U6 | 515f16c97 |
+| tests/bifrost/forge/scribe_promotion.rs | `steal_forge_lease`/`release_forge_lease`/`live_forge_leases` → `lapse_forge_claim`. Test renamed `…claim_loss_and_takeover_settle_once`. Cancellation test loses its lease assertion. | X10 — see U5 | 87e9d3f48, 6b13254ad |
+| tests/bifrost/forge/scribe_promotion.rs | `let` moved after nested `fn` items (items_after_statements). `from_secs(60)`→`from_mins(1)`. | Main-forced lints | 515f16c97, 5e7b177b0 |
+| tests/bifrost/forge/public_support.rs | `audit: None` removed. `params: Vec::new()` added to `BifrostQueryRequest`. | X2; X6 | d2af088b9, 82972f9f9 |
+| tests/bifrost/forge/support.rs | `from_secs(3600)`→`from_hours(1)` | Main-forced lint | 515f16c97 |
+
+##### 2. Unmapped / suspicious
+
+The S defect was two Forge table authorities, and every production-code hunk here maps to the X10 rebinding of that defect. The items below are test-side weakenings, recording gaps, and main leftovers. Nothing below restores a struck main mechanism.
+
+- **U1 — compaction_admission.rs:2281 (`acceptance_unknown_recovers_from_durable_state`), end of test.** Removed with no replacement:
+  ```
+  -    assert_eq!(promoted.fixture.live_leases().await, 0, "every settled attempt released its table fence");
+  ```
+  Every other `live_leases` site was renamed to `live_claims`. This one was deleted, so the "every settled attempt released its authority" property is no longer asserted in this test. X10 makes the claim the authority. It does not remove the property. Weakened assertion.
+
+- **U2 — expired_cleanup.rs:262 and :415.** Two checks removed with no claim equivalent: the competing destructive effect check (`run_orphan_gc_report_for_test` → `Err(FenceLost)`) and the cross-table refusal's "acquires no table lease" check (`live_leases` before/after). The orphan test entry still returns `FenceLost` when a table has an active task (orphan_gc.rs `insert_claimed … ok_or_else FenceLost`), so the first check could have stayed. The second could have become a `live_claims` / active-task count. The new doc ("refusing a second claim … refuses every competitor") replaces a test with an argument. Weakened coverage. X10 does not require it.
+
+- **U3 — orphan_cleanup.rs:~766 (`cross_table_plan_refuses_before_lease_or_io`).** Lease-count assertion deleted (`assert_eq!(leases, 0, "the refusal precedes table fence acquisition")`). The test name still promises "before_lease", but nothing checks claim/authority acquisition now. In the same file, the peer-lease-refusal half of `assert_lease_and_fence_refuse_deletion` was deleted. Under X10 that case is a refused claim, and claim refusal is covered in vala-sql pg tests. Stale name plus a dropped assertion.
+
+- **U4 — production_routes.rs:1142.** S test `worker_duration_includes_claim_and_failed_release` deleted entirely (−112 lines). Its release-failure half is gone with X10. Its claim-held/settlement-interval duration half has no direct replacement. Only `worker_prepared_recovery_observes_one_ownership_episode` still exercises `assert_completed_episode`. Also in `worker_prepared_fatal_closes_before_observation`, `assert!((active_tasks(..) - 1.0).abs() < EPSILON)` at the boundary was removed. S test removed without a replacement for the non-lease part.
+
+- **U5 — wyrd-testing tests/bifrost/forge/scribe_promotion.rs:734 (`scribe_promotion_cancellation_drains_without_settlement`).** `live_forge_leases == 0` removed and no claim assertion added. The doc now says the claim is "left to lapse for a successor". The redux counterpart `tests/integration/forge/promotion.rs` (`scribe_promotion_integration_cancellation_drains_without_settlement`) instead asserts `live_claims() == 0, "the drained attempt released its claim"`. The two tests disagree about the same drain, and the journey no longer asserts either. Weakened, and internally inconsistent.
+
+- **U6 — `#[expect(clippy::float_cmp, reason = …)]` added**:
+  - `tests/bifrost/forge/live_rewrite.rs:2477` (`failed_worker_restarts_while_the_api_serves`)
+  - `tests/bifrost/forge/production_closeout.rs:1262` (`compaction_geometry_exact_rows_and_non_destructive_second_pass`)
+
+  Both come from main 515f16c97 (pedantic lint closeout). S has no such attribute. AGENTS §12 forbids adding `#[allow]`/`#[expect]` to pass a gate unless a sanctioned mechanism applies. No exception covers this; the fix is to compare via `to_bits()` or integer counters (the capacity bin already does `to_bits`).
+
+- **U7 — production_closeout.rs:2418 `LeaderJourney::failures()` plus the schedule assertions at ~2508, ~2856, ~2957.** S asserted `observer.returned_errors().is_empty()` in three journeys. HEAD filters out every `ForgeError::Shutdown` string first. S's exact `sizes_for_test() == (0,0,0)` / `(1,1,1)` checks became `(audit, audit, 0)` / `(1+audit, …)` or per-key membership checks. These came from main commit f6c841d57 (TASK-003 r4 era), not from a TASK-002 Q row. X2 plausibly motivates them, since audit_log is now maintained, but they weaken S assertions: any Shutdown error, not only one from the stopping node's audit attempt, is now silently tolerated. No Q row records a diagnosis.
+
+- **U8 — production_closeout.rs:213–214, stale main prose.**
+  ```
+  +        // The one worker drains only the journey's tables, so the tenant's audit
+  +        // table cannot take a slot a geometry or competing-table plan is owed.
+  ```
+  Main 2d25fac7c paired this comment with `.without_audit_publication_for_test()`. That call is gone, so the comment describes behaviour that does not exist and contradicts `assert_rewrite_evidence`'s new doc ("the tenant's audit table is maintained alongside it"). The same main commit also removed S's comment "Audited reads above keep publishing retained audit, so the coordinator can plan and start audit-log maintenance after the last drain", which is true again under X2. This is main residue.
+
+- **U9 — live_rewrite.rs `failed_worker_restarts_while_the_api_serves` and worker.rs `fail_next_failure_settlement`.** The new production-crate test-support seam (`fail_next_failure_settlement`, `failure_settlement_failure_armed`, `take_failure_settlement_failure`, plus the injection in failure settlement) is neither S nor main. The journey now also arms `fail_next_forge_prepared_audit_for_test` (S seam) and calls `expire_running_claims` to SQL-lapse the unsettled claim before the restart is released ("proves the recovery, not the wait"). Under S the lease-release fault fired after durable settlement, so the rebuilt worker recovered with no manual claim aging. Under HEAD the failing task stays `running` and the test ages it by SQL. This is a real change in what the journey proves. It is X10-forced (the lease-release site no longer exists), but Q14 records only the `audit_log` opt-out and does not mention ca978e169/db50b1c76 or the new seam. Recording gap.
+
+- **U10 — worker.rs, snapshot-expiry dispatch and `complete_snapshot_expiry`.** Two S fence checks removed outright rather than rebound:
+  ```
+  -        lease.require_fence(&self.forge.core.operator_pool).await?;
+           let table = self.forge.load_table(&binding.table_ident()).await?;      // dispatch_snapshot_expiry tail
+  ...
+           require_running(stop)?;
+  -        lease.require_fence(&self.forge.core.operator_pool).await?;             // complete_snapshot_expiry head
+  ```
+  Every durable write still opens through `begin_fenced`, and `finish_claim_execution` renews once, so no transition goes unfenced. Still, these deletions go beyond mechanical rebinding. Same for `begin_attempt` dropping its post-`start` heartbeat (the following `require_fence` renews). X10 text ("every … pre-commit check fences on it") does not call for dropping checks. Low severity; confirm intent.
+
+- **U11 — publication.rs `HeldAuthorityMutation::expected_state`.** A claim lapsed mid-commit now closes the row `cancelled` (via the loop's expired-claim reclaim) instead of S's classified `failed`. This X10 consequence changes observable task outcome and retry accounting, since a reclaimed dispatch is `cancelled`. Neither spec X10 nor Q16 states it. Mapped to X10, but the behaviour change should be recorded.
+
+Outside this part (noted only): orphan_cleanup.rs moved from `ForgeTasks::reclaim_expired` to `reclaim_expired_attempts` because HEAD deleted `reclaim_expired` from vala-sql `forge_tasks.rs`. That deletion belongs to the vala-sql part of the ledger.
+
+##### 3. Counts
+
+- Files: 28. Hunks (`@@`): 253.
+- Mapped: about 241 hunks. X10: ~205, including all 87 in worker.rs. X2: ~12. X6: 1. Q14/Q15/Q17: ~8. Main-forced lint/rustdoc/fixture-API: ~15.
+- Unmapped/suspicious: 11 items (U1–U11) over ~12 hunks.
+  - Hard findings: U6 (`#[expect]` ×2) and U8 (stale main comment).
+  - Weakened or removed S assertions: U1, U2, U3, U4, U5, U7.
+  - Recording gaps for X10-forced changes: U9, U10, U11.
+- No struck main Forge mechanism (SQL, leadership, reclaim, expiry, publication-retry, operation-state) is present in scope.
+
+#### Part: P-028 ledger — part C1 (redux oracle/*, resources.rs, cluster/mod.rs, catalog/*, contracts.rs, namespaces.rs)
+
+Diff base: `git diff cfe21dc9007d5d22d9ae4411be07fb5504b0cc05 -- <paths>` (2886 diff lines, 13 files). Main comparison against `main` HEAD; X8 source c63e2ff46 / 087cc0416.
+
+##### 1. Ledger
+
+| File | Hunk summary | Exception / reason | Commit(s) |
+|---|---|---|---|
+| catalog/bifrost_catalog.rs | Drop `audit: Option<AuditEvent>` from `CreateTableRequest`, `register_dataset` arg, built-in request; delete `append_registration_audit` (audit_staging append in catalog txn) and its two call sites; doc `# Errors` lose "audit" | X2 (no audit staging; registration audit staged on outbox by caller) | 70a6f4a4e, d2af088b9 (main) via b356c948f/597533616 |
+| catalog/bifrost_catalog.rs | `use vala_sql::{TenantConn, ValaPostgres}` -> `ValaPostgres` only | X2 fallout (TenantConn only used by deleted append) | 597533616 |
+| catalog/bifrost_catalog.rs | `ensure_builtin` doc: built-ins eager (provision + boot), ingest/describe never create; `describe` no longer calls `ensure_builtin` | X5 (eager provisioning) | 1090580f2 (main) |
+| catalog/bifrost_catalog.rs | `create_table_locked` doc names `ReservedColumn` (variant exists in S) | doc only; X5/X2 doc sweep | 597533616 |
+| catalog/bifrost_catalog.rs | Test `physical_schema_rejects_reordered_columns`: `seq`/`entry_hash` -> `attempt`/`operation` | X2 (no chain column names) | 4056d79e6 (main) |
+| catalog/bifrost_catalog.rs | Test docs/panic text "lazy" -> "eager"; new test `every_builtin_is_created_through_ensure_builtin` | X5 | 1090580f2 (main) |
+| catalog/bifrost_catalog.rs | Tests drop trailing `None` audit arg (x3) | X2 fallout | 597533616/cac9c4969 |
+| catalog/error.rs | Remove `BifrostCatalogError::AuditUnavailable` and its `PublicError::AuditUnavailable` mapping | X2 (no AuditUnavailable) | f451d52be (main) |
+| catalog/wire.rs | Describe correlation fields: synthesized `card_ref` Gate input (INPUT_CLASS_GATE_CORRELATION) replaced by stored-or-synthesized `card_uid`; test expects `[CARD_UID, RUN_ID]` | X1 (card_uid correlation) | dadaa3ab9, b5ab2dd5d (main) |
+| cluster/mod.rs | New `ClusterTask` (stop token + join/abort, Drop aborts) | X4 | 6aaccebf9 (main), merged b356c948f |
+| cluster/mod.rs | Delete `start_heartbeat`; `start_readiness_heartbeat`/`start_snapshot_poller` return `ClusterTask`, no shared shutdown token | X4 (role-owned heartbeat, one poller, no process-token cancellation) | 6aaccebf9 |
+| cluster/mod.rs | `publish_snapshot_for_test` (test-support) — used only by `wyrd-server/src/scribe_outbox.rs:1629` | X3/X2 test seam (outbox peer routing) | dd14c0436 (main) |
+| cluster/mod.rs | Three `ClusterTask` unit tests | X4 | 6aaccebf9 |
+| contracts.rs | Fingerprint projection drops `CARD_REF` | X1 | dadaa3ab9 |
+| contracts.rs | `ScribeIngressFrame.attributed_cards: Option<Vec<CardUid>>` | X1 (Gate attribution of unbound writers) + X2 (gateway capture subjects) | b5ab2dd5d, 70a6f4a4e |
+| contracts.rs | Remove `ScribeError::CardUnresolved` (+ clone arm) | X1 (card_ref resolution gone) | dadaa3ab9 |
+| namespaces.rs | Remove `BifrostNamespace::Dev` / `vala.dev`; `ALL` 11 -> 10 | X5 | 1090580f2 |
+| oracle/admission.rs | Delete `AdmittedQueryGuard::drain_children` / `children_idle`; doc of `release_physical_projections` reworded | X8 (no wait on nested children; struck GRAPH_DRAIN/drain_children) | ba86fe129 superseded by 87e9d3f48 (X8 port) |
+| oracle/analytical.rs | Delete `GRAPH_DRAIN_INTERVAL`/`GRAPH_DRAIN_POLLS`, `GraphLease::drain`, `AnalyticalGraphRelease` (+`release`/`reclaim` spawned task), `RECLAIM_WITHOUT_RUNTIME`; graph released inline in lifecycle settle and `Drop` | X8 (inline release, no spawned release work) | c63e2ff46 (main), 87e9d3f48 |
+| oracle/analytical.rs | `AnalyticalCleanupPause::hold` -> `pub(super)` (called from oracle/mod.rs) | X8 test seam relocation (see Unmapped U2) | 87e9d3f48 |
+| oracle/analytical.rs | Peer stage refusal: drop `PeerSecurityError::AuditUnavailable => QueryAuditUnavailable` arm, always `QueryPeerSecurity`; doc | X2 | f451d52be |
+| oracle/analytical.rs | Remove `#[allow(clippy::type_complexity)]` + justification on activation return | main lint hygiene (main 8d98c3ceb removed the same dead allow) — deletion of an allow, not an addition | 8d98c3ceb (main) |
+| oracle/analytical.rs | Tests: delete `assert_release_stops_at_the_graph_deadline`, `a_dropped_owner_with_an_undrained_envelope_retains_its_graph`, `await_until`; replace `..._is_not_released` with main's `assert_an_idle_graph_past_the_deadline_is_released` (byte-equal to main); drop-revokes test asserts inline release; follower tests use a stray attempt instead of a stuck memory child, renamed `follower_graph_release_waits_for_every_holder` (main name) / `follower_retains_a_graph_it_cannot_release` (integration name); shutdown now asserts `(attempts_settled, graphs_retained) == (1, 0)`; sibling-gate concurrency proof removed from `execute_task_first_without_set_plan_settles_at_signed_deadline` | X8 (tests of the struck drain mechanism removed/adapted) | c63e2ff46, 87e9d3f48 |
+| oracle/analytical.rs | Test mock path `PeerSecurityError` -> `super::super::peer::PeerSecurityError` | import fallout of X2 | 87e9d3f48 |
+| oracle/analytical_supervisor.rs | `resources` -> `_resources`; delete `graph_children_idle`/`graph_children_debt`/`graph_children` and the live-child refusal in `release_graph`; docs/test text | X8 | c63e2ff46, 87e9d3f48 |
+| oracle/mod.rs | `OracleAudit::append_*` -> `stage_*`; blanket `impl<T: AuditStage> OracleAudit for T` + `query_audit_event` builder (byte-equal to main) | X2 (shared outbox, audit content) | 70a6f4a4e/d2af088b9 (main) |
+| oracle/mod.rs | All `QueryAuditUnavailable` returns/docs -> `QueryExecutionFailed` (read decision, digests, topology, permission digest) | X2 (no AuditUnavailable); matches main | f451d52be (main) |
+| oracle/mod.rs | `build_physical_root` takes `&BifrostQueryRequest`; `plan_logical(..., params)` with `with_param_values(bind_values(params))`; `bind_values`; test `bound_values_replace_placeholders_as_data`; tests pass `&[]` / `params: Vec::new()` | X6 | b620b069f, 82972f9f9 (main) |
+| oracle/mod.rs | `settle_attempt_output`: `select!` on `admitted.cancellation` before first batch -> `settle_distributed_failure(QueryExecutionFailed, "first-batch cancellation")`; integration additionally stores `cancellation_marker` true on query telemetry | X8 (one cancellation token; cancel before first batch recorded as `cancelled`) — the marker is the integration's adaptation of 087cc0416 onto S's telemetry owner | c63e2ff46/087cc0416, 87e9d3f48 |
+| oracle/mod.rs | Remove `admitted.drain_children()` calls (2); `mut admitted` -> `admitted`; doc on `settle_distributed_failure` | X8 | 87e9d3f48 |
+| oracle/mod.rs | Docs: "fail-closed audit" -> "non-blocking audit" | X2 | 70a6f4a4e |
+| oracle/peer.rs | Remove `PeerSecurityError::AuditUnavailable`; `PeerSecurityAudit` becomes sync `stage_unverified_ticket_rejection` / `stage_verified_ticket_violation` (no `async_trait`, no Result); `PeerSecurityAuditError` text | X2 (non-blocking audit) | f451d52be, d2af088b9 (main) |
+| oracle/query_stream.rs | Remove failed-outcome `drain_children()` before release | X8 | 87e9d3f48 |
+| resources.rs | Delete `LiveConsumers` type, view field, register/unregister bookkeeping, `memory_consumers`, `nested_idle`/`nested_memory_consumers`/`nested_memory_bytes`, and the fail-closed nested-child poison in `OracleQueryResources::release` | X8 (late child returns bytes through shared root; view drop is the leak check; struck LiveConsumers) | c63e2ff46, 87e9d3f48 |
+| resources.rs | New test `oracle_view_dropped_holding_bytes_poisons_the_root` | Q2 / X8 | Q2 commit (1b5f4d7b3 era) |
+| resources.rs | Delete S test `a_registered_zero_byte_child_keeps_its_query_busy`; `oracle_release_paths_are_exact_and_idempotent` now asserts a late child does not poison and returns its bytes | X8 (tests the removed mechanism) | 87e9d3f48 |
+
+##### 2. Unmapped / suspicious
+
+U1. `oracle/mod.rs:868-927` (`query_audit_event`) — REQ-011 gap, not a P-028 mismatch.
+```
+AuditEvent::new(context.request_id.clone(), ..., context.principal.id, context.principal.kind.tag(), ...)
+    .with_detail(detail)
+```
+The X2 Oracle event builder is byte-equal to main, but it never calls `.with_credential_id(context.principal.credential_id)`. `Principal` carries `credential_id` (`wyrd-runtime/src/principal.rs:37`), and nothing in redux or the server stage sets it on Bifrost events. The only `with_credential_id` callers are `platform_extractor.rs`. REQ-011 asks for "nullable credential attribution through actual Gate/Oracle event builders". The same problem probably applies to the Gate builder (another fork's scope). Oracle audit rows will always have a null `credential_id`.
+
+U2. `oracle/mod.rs:3939-3940` (`settle_distributed_failure`) — a test-support hook in a production function that neither S nor main has.
+```
++    #[cfg(feature = "test-support")]
++    analytical::analytical_cleanup_pause_for_test().hold().await;
+```
+S holds this pause only in `AnalyticalGraphRelease::release`. Main holds it only in analytical.rs (lifecycle settle, plus a spawned drop release). Main's `settle_distributed_failure` has no hold. This second hold point arrived in 87e9d3f48 ("port S closeout code") and is consumed by the new journey `wyrd-testing/tests/bifrost/oracle/workflow.rs:202-228` through `peer_cluster.rs::arm_cleanup_pause`. No exception names it. It is X8-adjacent at most (the first-batch cancellation cleanup path). Every first-batch failure, timeout and cancellation in a test-support build now passes through the pause.
+
+U3. `oracle/mod.rs:3653-3664` — X8 adaptation that goes beyond main.
+```
++            if let Some(telemetry) = query_telemetry.as_ref() {
++                telemetry.cancellation_marker().store(true, Ordering::Release);
++            }
+```
+Main c63e2ff46 has the `select!` but no telemetry marker. 087cc0416 recorded the pre-stream cancel through the registry instead. This marker is the integration's mechanism for "recorded as `cancelled`" on S's telemetry owner. It plausibly fits X8's wording, but it is new code that is neither S nor main, so it needs a reviewer to confirm. A user-observable pin should also be confirmed (journey asserts outcome `cancelled`).
+
+U4. `oracle/analytical.rs` tests (hunks @@ -4943 / -4968 / -5006 / -5027) — S coverage was dropped and not replaced. `execute_task_first_without_set_plan_settles_at_signed_deadline` lost its concurrency proof: "a slow sibling settlement does not delay another graph's cancellation on time" (`sibling-gate` memory child, assertion `the blocked sibling is still owned by the same driver`). X8 removes the memory-drain blocker, but the property "settlement driver settles concurrently, not serially" is S behaviour that is still reachable, for example through a stray attempt as the follower tests now use. Losing that assertion weakens an S test beyond what X8 requires.
+
+U5. `oracle/analytical.rs` `follower_retains_a_graph_it_cannot_release` — the assertion was inverted and is not main-equivalent. S asserted that `shutdown` reports `graphs_retained == 1`. The integration asserts `(attempts_settled, graphs_retained) == (1, 0)` because the blocker is now a cancellable stray attempt. The test name is integration-authored (absent on main). Mapped to X8 as an adaptation, but the scenario changed meaning: it no longer proves that shutdown reports unreleasable residue.
+
+U6. Wording residue (not hunks, but AC-028 "no trace"): `oracle/peer.rs` new doc "Stages a violation on the context-named tenant's **audit chain**". `oracle/mod.rs:760` "not on the audit chain". The `BifrostQueryReadDecision` field doc says "appended to the tenant audit chain". X2/REQ-011 removes the chain. Doc-only.
+
+No `#[allow]`/`#[expect]`/`cfg_attr` was added (one `#[allow(clippy::type_complexity)]` was removed). No new `Box::pin` (the one changed line renames an S call). No production timeout or deadline constant changed (GRAPH_DRAIN_* were deleted under X8). No status-code change beyond X2's `QueryAuditUnavailable -> QueryExecutionFailed`, which matches main. No compatibility shims.
+
+##### 3. Counts
+
+- Logical hunks mapped: 36 (X1: 4, X2: 13, X3/X2 seam: 1, X4: 3, X5: 4, X6: 1, X8: 11, Q2: 1, lint hygiene: 1 — some rows carry two).
+- Unmapped / suspicious: 6 (U2 unmapped test hook; U3 new X8 code needing confirmation; U4/U5 weakened or inverted S test coverage; U1 REQ-011 credential gap at parity with main; U6 doc wording).
+
+#### Part: P-028 ledger part C2: vala-bifrost-redux gate/, scribe/, tables/
+
+Scope: `git diff cfe21dc9007d5d22d9ae4411be07fb5504b0cc05 -- crates/vala/vala-bifrost-redux/src/{gate,scribe,tables}`: 34 files.
+`crates/vala/vala-bifrost-redux/Cargo.toml` has no diff against S. Every other redux file outside the
+forge/oracle/resources/cluster/catalog/contracts/namespaces/tests-forge areas falls in gate/, scribe/ or tables/.
+Main-ancestor commits (on `main`, merged in): dadaa3ab9, b5ab2dd5d, bcf4b9248, 70a6f4a4e, 1090580f2, c8febbd49,
+71fe71c35, 82972f9f9, 8b7218a92, 6aaccebf9, 515f16c97, 753916bd0, d2af088b9, 5a5542cbb, f451d52be, 52e1144b5, e54b1244f.
+Branch commits: b356c948f (merge), 597533616, eaa129c4a, 87e9d3f48, f10f735dd/53dfc2a1c (struck; reverted by 87e9d3f48).
+
+##### 1. Ledger
+
+| File | Hunk summary | Exception / reason | Commit(s) |
+|---|---|---|---|
+| gate/attribution.rs (new, 298) | `CardRegistry` resolves an unbound writer's distinct `card_uid`s (at most 32) to registered observation-target Cards on `tenant_conn`. Includes per-signal UID collectors and `parse_distinct` | X1 (REQ-013 unbound writer, 32-UID cap, TenantConn per X7) | b5ab2dd5d, dadaa3ab9 |
+| gate/auth.rs | `AuthContext::from_verified(VerifiedToken, metadata)`; `authenticate` builds through it. Tenant comes from `principal.tenant_id`, which `verify_on` already pins equal to `expected_tenant`, so behavior is unchanged | X7 (verified-principal Gate entrance, API-key OTLP) | 71fe71c35 |
+| gate/error.rs | `CardScopeDenied` becomes fieldless (`card_ref` field dropped) | X1 (REQ-013, c8febbd49 "fieldless denial") | c8febbd49, dadaa3ab9 |
+| gate/error.rs | `AuditUnavailable` variant, its `audit_unavailable` rejection reason (array 9→8), and the BifrostError mapping are deleted | X2 (no public AuditUnavailable) | f451d52be, b356c948f |
+| gate/error.rs | `ScribeError::CardUnresolved` mapping and its test row are deleted | X1 (Scribe no longer resolves CardRef text) | dadaa3ab9 |
+| gate/mod.rs | `pub mod attribution`; `cards: Option<CardRegistry>`, `with_card_registry`, `attributed_cards`. Each OTLP signal and the native path resolve attributed UIDs (else the signed scope `CardRefScope::uids`) and pass `attributed_cards` on `ScribeIngressFrame` | X1 | b5ab2dd5d, dadaa3ab9, bcf4b9248 |
+| gate/mod.rs | `GateAudit` blanket impl over `wyrd_runtime::audit::AuditStage` builds `AuditEvent` (`bifrost.record.write`, delegation detail) and stages it. Docs reworded to non-blocking | X2 (shared outbox; REQ-011 credential/delegation attribution) | 70a6f4a4e, d2af088b9, 5a5542cbb |
+| gate/mod.rs | A missing audit sink now refuses with `Internal` instead of `AuditUnavailable` (test updated) | X2 | f451d52be |
+| gate/mod.rs | SYSTEM-writer branch deleted (`native_frame` param, `require_frame_card_scope`, system→result-table-only rule). All three result tables and `gateway.calls` are now refused for every public principal | X2 (REQ-012: results go through the private internal writer; SYSTEM tokens removed) | 8b7218a92 |
+| gate/mod.rs | `admit_otlp_verified(VerifiedToken, metadata)` | X7 (API-key OTLP auth before decode) | 71fe71c35 |
+| gate/mod.rs tests | `card_ref`→`card_uid` renames in CountingScribe/scoped fixtures; mixed-OTLP test uses `REFERENCE_TEXT` | X1 | dadaa3ab9 |
+| gate/mod.rs tests | `query_request` adds `params: Vec::new()` | X6 | 82972f9f9 |
+| gate/mod.rs tests | S tests deleted: `gate_denies_system_result_writes_outside_the_exact_card_scope`, `gate_confines_verification_result_tables_to_the_system_writer`, `gate_refuses_the_system_writer_on_otlp_ingest`. Replaced by `public_result_table_writes_are_refused_for_every_principal` | X2 (REQ-012); see suspicious S3 | 8b7218a92 |
+| gate/mod.rs | rustdoc link `logical_data_identity`→`LogicalIdentity` | doc-link fix for an S symbol (compile/doc lint) | b356c948f |
+| scribe/execution_lanes.rs | `CardRef`/`CARD_REF` correlation replaced by `card_uid`. `authorized_card_uids(rows, scope)` replaces `validate_card_scope`, `require_card_scope` and `resolve_card_uids`. `card_scope` is added to `IngressDecodeInputs`/`DecodeContext`/`ManagedValues`. `card_uid` is allowed as a caller column, then authorized and restamped | X1 | dadaa3ab9, b5ab2dd5d |
+| scribe/execution_lanes.rs | `CorrelationPolicy` argument removed from `source_schema_fingerprint`/`user_fields`/`user_columns`/`is_server_owned` (no CodeAxis `owns_run_id`). Test `code_axis_decode_keeps_declared_run_id_content` deleted | X5 (agent_traces/CodeAxis removed) | 1090580f2, ce866229d |
+| scribe/execution_lanes.rs tests | Fixtures rewritten for UID text (`uid_text`, `SuppliedCardUid`). The "client UID loses to signed UID" forged case is removed (no CardRef text exists any more). Expected error `CardUnresolved`→`CardScopeDenied` | X1 | dadaa3ab9 |
+| scribe/ingress.rs | `AdmittedRowContext.card_scope` = `frame.attributed_cards` or the signed-scope UIDs; threaded into native/canonical decode | X1 | b5ab2dd5d, dadaa3ab9 |
+| scribe/ingress.rs | Lazy `ensure_builtin` removed from `resolve_logical_frame` and `resolve_write_table_uid`; a missing built-in is `TableNotFound` | X5 (eager provisioning) | 1090580f2 |
+| scribe/preprocess.rs | `NativeAdmittedRows.card_scope` threaded to `DecodeContext` | X1 | b5ab2dd5d |
+| scribe/mod.rs | `control_postgres: Option<Arc<ValaPostgres>>` → `fence_operator: Option<OperatorPool>` for WAL replay fences (`config.operator_pool`). `AdmissionClock` keeps the control pool | X7 (OperatorPool) | eaa129c4a |
+| scribe/mod.rs | `attributed_cards: None` on the internal-write frame; `ScribeError::CardUnresolved` removed from the invalid-outcome match | X1 | dadaa3ab9 |
+| scribe/mod.rs | `staging_backlog_for_test(table_name: Option<&str>)` | Test seam forced by X2 (pod's `audit_log` stages beside test tables); main mechanism, see S1 | 6aaccebf9 |
+| scribe/replay.rs | `ReplayFences` holds `OperatorPool`; `newest_wal_fence(&operator, …)` | X7 | eaa129c4a |
+| scribe/replay.rs, tests/scribe_persistence_path.rs, tests/wal_closeout.rs | `attributed_cards: None` added to test frames | X1 (struct field) | b5ab2dd5d |
+| scribe/assembly.rs | `backlog()` delegates to new `backlog_of(Option<&str>)`, which filters ready keys and claims by table name | X2-forced test seam (main 6aaccebf9); see S1 | 6aaccebf9 (87e9d3f48 reverted the f10f735dd extension) |
+| scribe/staging_runtime.rs | `backlog(table_name)` signature; tests pass `None` | same as above, S1 | 6aaccebf9 |
+| scribe/persistence.rs | `PersistenceFaults.target_table` + `target_table_for_test`/`targets`. Claim faults (`take_object_write`, `take_post_commit_client_error`, `take_claim_retirement`) and `note_claim_published` are scoped by table; `staging_backlog_for_test(table_name)` | X2-forced test seam (cfg test/test-support only); main mechanism, see S1 | 6aaccebf9 (f10f735dd/53dfc2a1c reverted by 87e9d3f48) |
+| scribe/claim_publication.rs | `fail_claim_retirement(&key.table().name)` (cfg test) | same seam, S1 | 6aaccebf9 |
+| scribe/persistence.rs, shards.rs, staging_runtime.rs (pg tests) | `superuser_pool().await` → `superuser_pool()` | Main fixture API (`wyrd_dev_fixtures::pg::PgFixture`) rename forced on S tests | b356c948f / 515f16c97 |
+| scribe/registry.rs | Module doc: "do not emit `audit_staging` rows" → "audit events" | X2 (no audit staging) | 70a6f4a4e |
+| scribe/wal.rs | `WalWriter::stream_dir()`. `initialize_existing_stream` lists only the current `(node, epoch)` directory, and `open_segment` uses the helper | Q1 (S production fix; recorded diagnosis) | 87e9d3f48 |
+| tables/audit/audit_log.rs | Drops `seq`, `entry_hash`, `prev_hash` fields and the `sort_asc("seq")` sort key; 15→12 content columns; docs: publisher→Scribe/internal audit write | X2 (no chain; 12 content fields) | 70a6f4a4e |
+| tables/audit/projection.rs | `project_audit_rows` (staging rows, seq contiguity, hash validation, `derive_batch_id`, `AuditProjection`) replaced by `project_audit_event(&AuditEvent, decided_at)`. Error enum reduced to Arrow; tests replaced | X2 (no staging/publisher/chain; direct AuditEvent projection, REQ-011) | 70a6f4a4e, 52e1144b5, e54b1244f, 597533616 |
+| tables/dev/agent_traces.rs, tables/dev/mod.rs (deleted) | `vala.dev.agent_traces` table removed | X5 | 1090580f2 |
+| tables/mod.rs | `pub mod dev`, `AgentTracesTable`, `CorrelationPolicy::CodeAxis` removed; `BUILTIN_TABLES` 11→10; layout and variant test rows drop `dev.agent_traces` | X5 | 1090580f2, ce866229d |
+| tables/mod.rs tests | `verification_results_contract` adds `variant_field("assertion_result", true)`; variant-column matrix adds `verification.results`→`assertion_result` | X9 | b356c948f |
+| tables/managed_columns.rs | `CodeAxis` arm, `owns_run_id`, `code_axis_policy_omits_run_id` test removed | X5 | 1090580f2 |
+| tables/signal.rs | `CARD_REF_ATTRIBUTE wyrd.card_ref`→`CARD_UID_ATTRIBUTE wyrd.card_uid`; `RecordCorrelation.card_uid`; `extract` takes `Option<&[CardUid]>`; `authorize_card_ref` replaced by `card_uid_text`; `correlation_fields` emits `card_uid`; correlation fixture becomes UID-based | X1 | dadaa3ab9, b5ab2dd5d |
+| tables/{traces,metrics,logs}/projection.rs | `card_scope: Option<&CardRefScope>`→`Option<&[CardUid]>`; `card_ref` column→`card_uid` | X1 | dadaa3ab9 |
+| tables/{traces,metrics,logs}/mod.rs tests | `wyrd.card_ref`→`wyrd.card_uid`; `WITHOUT_UID`→`REFERENCE_TEXT`; `scope().as_slice()` | X1 | dadaa3ab9 |
+| tables/eval/observations.rs | `acknowledged(frame)` reads the stored `card_uid` column instead of re-resolving through the principal (`resolve_card_uids` removed); a bad UID is `InvalidFrame` instead of `CardUnresolved`; test rewritten | X1 (REQ-013/REQ-014 activation from stored UID) | bcf4b9248, dadaa3ab9 |
+| tables/verification/results.rs, verification/mod.rs | `ASSERTION_RESULT` nullable Variant column, re-export, docs; added to `SENSITIVE_PAYLOAD_COLUMNS` | X9 | b356c948f, 7f79fb341 |
+
+##### 2. Unmapped / suspicious
+
+No hunk in this scope is purely unmapped. Every table-schema difference in `tables/` maps to X1 (`card_uid` correlation), X2 (audit content and no chain), X5 (agent_traces/CodeAxis) or X9 (`assertion_result`). There are no time-axis, precision or column changes outside those exceptions. These hunks need a reviewer's judgement:
+
+- **S1. Table-scoped Scribe test seams are a main mechanism no Q row records.**
+  - Where:
+    - `scribe/assembly.rs:1043` `pub fn backlog_of(&self, table_name: Option<&str>)`
+    - `scribe/staging_runtime.rs:305` `pub fn backlog(&self, table_name: Option<&str>)`
+    - `scribe/persistence.rs:150,181-192,413-449` (`target_table`, `target_table_for_test`, `targets`, table-scoped `take_*` faults)
+    - `scribe/claim_publication.rs:475`
+    - `scribe/mod.rs:2237`
+  - Source: main commit 6aaccebf9 ("Repair shared-outbox Scribe routing, Forge self-reclaim, and Oracle settle and shutdown drain"), carried through the merge.
+  - Justification: forced by X2. Every audited call stages an `audit_log` member on the same pod, so S's pod-wide backlog and one-shot faults are no longer test-deterministic. Consumers are `wyrd-testing/tests/bifrost/scribe/{lifecycle,source_boundary_recovery,sustained,telemetry}.rs`.
+  - Why flagged:
+    - (a) It is main code; no TASK-002 Q row or spec exception names it.
+    - (b) `backlog_of` and the re-signed `ScribeStagingRuntime::backlog(Option<&str>)` are not cfg-gated, so a production `pub` API changed shape for a test-only need.
+    - (c) The struck commit f10f735dd ("Prove flush ownership under competing audit staging traffic", REQ-005) extended this same seam. 87e9d3f48 reverted that extension, but the base seam remains.
+  - Recommend: record it as an X2-forced test seam (add a Q row), or cfg-gate `backlog_of`.
+- **S2. Dead `IngestError::CardUnresolved { card_ref }` variant.** `gate/error.rs:49-55,166,220`.
+  - X1 removed `ScribeError::CardUnresolved` and its `from_scribe` mapping, so this variant now has no production constructor in redux. Its only remaining uses are the `gate/error.rs:459` test and `wyrd-server/src/http/otlp.rs:667`, which is outside this scope (check whether that is a test).
+  - Its doc still speaks of a `card_ref` that "cannot be resolved to card_uid". That is S text, so it is not a diff hunk, but X1/REQ-013 ("UID everywhere") leaves it incomplete: a leftover CardRef-resolution error surface.
+- **S3. Deleted S Gate tests with no direct replacement for one property.** `gate/mod.rs` tests.
+  - `gate_refuses_the_system_writer_on_otlp_ingest` and the "system writer refused every non-result table" cells of `gate_confines_verification_result_tables_to_the_system_writer` are deleted along with the production rule at old `gate/mod.rs:534-557` (`system && !result_table → RbacDenied`).
+  - Under X2/REQ-012 no SYSTEM token reaches Gate, which justifies dropping the rule. But a `PrincipalKind::System` with a wildcard is now governed only by ordinary RBAC on public tables, and nothing asserts the old confinement.
+  - Mapped to X2. Flagged because a negative-path S test was deleted rather than adapted.
+- **S4. `assertion_result` added to `SENSITIVE_PAYLOAD_COLUMNS`.** `tables/verification/results.rs:1331`.
+  - It follows S's rule that the results table's summaries are sensitive, so it is X9-consistent.
+  - REQ-016 says "do not add a general elevated-read requirement for verification summaries". Confirm this matches main's X9 column behavior (main 7f79fb341), not a new gate.
+- **S5. Results-table rustdoc still says "The managed `run_id` is the Verifier run".** `tables/verification/results.rs` (unchanged S line, near :1309).
+  - REQ-016 says result `run_id` is the application Run being judged.
+  - This is S text, not a hunk, so it is out of P-028's strict scope. It conflicts with the X9/REQ-016 adaptation next to it; worth a check by the Part C owner.
+
+Searched with no hits in this scope's added lines: `#[allow`, `#[expect(clippy`, `cfg_attr`, `Box::pin`, `Duration::from_secs/millis` changes, 502/`BAD_GATEWAY`, `run_id` None in results. No compatibility shims. None of the struck symbols (`OwnedMembers`, `owns_any`, `audit_staging`, `AuditUnavailable`, `prev_hash`, `chain_hash`, `CodeAxis`, `agent_traces`) appear in the gate/scribe/tables sources.
+
+##### 3. Counts
+
+- Files: 34 (gate 4, scribe 15, tables 15). Logical hunks in the table: 43.
+- Mapped to an exception, Q row or forced rename: 43 (X1 18, X2 9, X5 6, X6 1, X7 4, X9 2, Q1 1, main fixture rename 1, doc-link fix 1). Four of these also carry suspicious flags, S1 or S3.
+- Unmapped: 0.
+- Suspicious: 5 (S1 is the main-mechanism test seam, the most material; S2 dead variant; S3 deleted negative test; S4 and S5 are minor X9/REQ-016 checks).
+
+#### Part: P-028 part D: server seams, wyrd_client::bifrost, bifrost-design.md
+
+Base: `git diff cfe21dc9007d5d22d9ae4411be07fb5504b0cc05 -- <file>`.
+
+Attribution: first-parent history after the merge (`b356c948f^1..HEAD`) touches only
+`client/{facade,handle,query}.rs` and `server/bifrost/mod.rs` (`87e9d3f48`, `597533616`),
+plus `bifrost-design.md` (`eaa129c4a`, `1b5f4d7b3`, `e01e60b3b`). Every other hunk in this
+part arrived as main's side of the merge resolution `b356c948f`. The originating main commit is
+given where `git log S..HEAD -- <path>` names it.
+
+##### 1. Ledger
+
+| File | Hunk summary | Exception / reason | Commit(s) |
+|---|---|---|---|
+| wyrd-server/src/bifrost/gate_audit.rs | File deleted (`OutboxGateAudit` sink over `OracleQueryAudit`, "tenant audit chain") | X2: one Scribe outbox, no audit chain; Gate audit is staged through the shared outbox | b356c948f (main 70a6f4a4e, d2af088b9); 87e9d3f48 removed the leftover doc line |
+| wyrd-server/src/bifrost/mod.rs | `pub mod gate_audit` and its doc removed | X2 | b356c948f, 87e9d3f48 |
+| wyrd-server/src/bifrost/routes.rs | 3× OpenAPI `default` response no longer lists `WYRD_VALA_500_AUDIT_UNAVAILABLE` | X2 (no public AuditUnavailable error) | b356c948f (main f451d52be) |
+| wyrd-server/src/bifrost/service.rs | `register_table`: fail-closed `authorize_recording_denial`/`record_audit`, with the allowed row committed inside `register_dataset`, replaced by a synchronous `audit::authorize(...)?` staged on the outbox; the per-branch `record_allowed()` calls are gone and the `Some(allowed)` arg is dropped from `register_dataset`; doc rewritten | X2 (permission blocks, audit non-blocking, no staging) | b356c948f (main d2af088b9, f451d52be, 70a6f4a4e) |
+| wyrd-server/src/bifrost/service.rs | `list_tables`/`describe_table`: `authorize(...).await?` becomes sync `authorize(...)?`; `AuditUnavailable` removed from docs | X2 | b356c948f |
+| wyrd-server/src/bifrost/service.rs (pg_tests) | `audit_rows_for` reads `RecordingScribe::audit_decisions()` after `scribe_outbox.settle(30 s)` instead of `audit_staging::list_audit_events_for_resource`; `AuditStagingRow` becomes `AuditDecision`, `principal_id` becomes `audit_principal_id`; tests use `RecordingScribe::attach` | X2 | b356c948f (main 37e3b2ddd) |
+| wyrd-server/src/bifrost/service.rs (pg_tests) | `test_pool()`/`test_tenant()` no longer awaited; `caller_with` made sync | Main test-support API (non-Bifrost `crate::test_support`) | b356c948f |
+| wyrd-server/src/bifrost/service.rs (pg_tests) | `Duration::from_secs(600)` becomes `Duration::from_mins(10)` (same value) | Main pedantic lint (non-behavioral) | b356c948f (main 515f16c97) |
+| wyrd-server/src/grpc/capture_peer.rs | Peer writer widened from two capture tables to six destinations (`ScribeTable`: audit log, gateway calls, trace spans, three result tables); system owner admitted only for `AuditLog`; `VerifierAttribution` required exactly on result tables; `CaptureBatch` becomes `ScribeBatch` from `crate::scribe_outbox`; module/fn docs | X2 (six trusted destinations, REQ-012) + X3 (internal writes routed to a Scribe pod) | b356c948f (main 8b7218a92, f7b962d9e, 70a6f4a4e) |
+| wyrd-server/src/grpc/capture_peer.rs (tests) | Acceptance/refusal matrix for six destinations, attribution and system owner | X2 | b356c948f |
+| wyrd-server/src/grpc/mod.rs | `mod capture_peer` becomes `pub(crate) mod capture_peer` (used by `scribe_outbox.rs:928` tests) | X2 | b356c948f |
+| wyrd-server/src/grpc/mod.rs | Peer capture service gets `.max_decoding_message_size(transport.message_limit_bytes())` | X2/X3: outbox frame bounded by the configured ceiling, not tonic's 4 MiB default (proved by b7b2de753) | b356c948f (main dd14c0436) |
+| wyrd-server/src/grpc/mod.rs | `match try_acquire { Err => return }` becomes `let Ok(_lease) = … else` | Main pedantic lint (`manual_let_else`); same behavior | b356c948f (main 515f16c97) |
+| wyrd-server/src/grpc/mod.rs | OTLP services built from `&AppState` instead of `Arc<Bifrost>` | X7 (API-key auth needs auth owners in state) | b356c948f (main 71fe71c35) |
+| wyrd-server/src/grpc/otlp.rs | New `OtlpGrpcAuthentication`: a call carrying only `x-wyrd-api-key` (no access token) is verified through `TokenGrants::api_key_principal`, then `gate.admit_otlp_verified`; anything else goes through Gate's `authenticate_otlp_metadata`. Runs before decode in all three signal services | X7 (API-key OTLP auth before decode) | b356c948f (main 53d044191→41ae7eb91→71fe71c35) |
+| wyrd-server/src/otlp_decode.rs | About 10 `match` arms whose bodies are all `{}` merged into or-patterns (`visit_scope/span/status/span_event/span_link`, `decode_resource_spans/scope_spans/span/key_value`) | Main pedantic lint (`match_same_arms`); behavior unchanged (every arm is still before its `(1..=N, _)` wrong-wire arm) | b356c948f (main 515f16c97) |
+| wyrd-server/src/otlp_decode.rs | `#[expect(clippy::struct_field_names, reason = …)]` added on `OtlpDecodePlan` | Main pedantic lint; see suspicious D-S1 | b356c948f (main 515f16c97) |
+| wyrd-client/bifrost/{facade,blocking}.rs | `sql`, `sql_as`, `stream` gain `params: &[QueryParam]`; the request carries `params`; `QueryParam` re-exported from `bifrost/mod.rs`; doc says `params[i]` binds `$(i+1)` | X6 | b356c948f (main 82972f9f9) |
+| wyrd-client/bifrost/query.rs (tests) | `query_body_server` + `sql_forwards_bind_values_without_interpolation` | X6 | b356c948f |
+| wyrd-client/bifrost/query.rs | `validate().map_err(... QueryInvalidSql{detail})` becomes `validate().map_err(\|e\| Transport(e.into()))`; doc lists invalid SQL, non-finite bind and deadline under one code | X6 (non-finite bind refusal) + main `wyrd-spec` validator type (spec now returns a catalog error); code stays `WYRD_VALA_400_QUERY_INVALID_SQL` | b356c948f (main aa0aeb52b, cb54cbb11), 87e9d3f48 (doc) |
+| wyrd-client/bifrost/{facade,handle,observe,table,mod}.rs | `Correlation.card_ref: Option<CardRef>` becomes `card_uid: Option<CardUid>` across `insert*`, `observe::record`, `WriterPool::insert/insert_rows`; docs and reserved-column name `card_uid`; tests use a fixed UUID | X1 | b356c948f (main dadaa3ab9) |
+| wyrd-client/bifrost/query.rs (tests) | Describe fixture: `card_ref` becomes `card_uid`; its metadata changes from `wyrd:input_class=gate_correlation` to `PARQUET:field_id=1001` | X1 (fixture JSON only; neither key is produced by the server in either tree) | b356c948f |
+| wyrd-client/bifrost/facade.rs | `insert_rows_into` delegates to new `pub(crate) insert_observation`; `writer_table` delegates to `resolve_writer_table`; `cached_writer_table` delegates to private `described_table`, so `observe` works without `internal` | Main `internal` feature gate (crate-wide wyrd-client feature, consumed by CLI/MCP/SDK manifests); 87e9d3f48 removed main's `wyrd_event_time` client stamping from it (REQ-017) | b356c948f, 87e9d3f48 |
+| wyrd-client/bifrost/{facade,blocking,handle,query,scope,sink,mod}.rs | About 35 `#[cfg(feature = "internal")]` gates on `query`, `collect_bounded`, `with_sink`, `query_only`, `writer_table`, `insert_into`, `insert_rows_into`, `enqueue_batch`, `scope`, `metrics`, `observe_losses`, `into_async`, `register_outcome_name`, `client_from_options`, `QueryOnlySink`, `ClientScope` re-export, `BifrostIngestSink::new`, `QueryResultStream::{settle, collect_bounded, encoded_bytes, client field}`, etc.; `BifrostIngestSink.transport` made `pub(crate)`; `ClientScope::from_client` made `pub(crate)` | Main-forced: the `internal` feature exists only on main (S's Cargo.toml has none) and all main consumers enable it. Not an X item; see D-S2 | b356c948f |
+| wyrd-client/bifrost/{facade,blocking}.rs | `describe(fqn)` becomes `describe_table(namespace, name)`; `split_fqn` call removed; facade-surface compile test renamed | Main SDK consumer-forced rename (`sdks/wyrd-sdk-python/src/bifrost/mod.rs`, TS `index.d.ts` call `describe_table`); see D-S3 | b356c948f |
+| wyrd-client/bifrost/{facade,blocking}.rs | `stream(query)` gains `deadline: Option<Duration>`; ms saturate to `i64::MAX` and the server validates the range | Main API (consumer-forced); see D-S3 | b356c948f |
+| wyrd-client/bifrost/facade.rs | `QueryResult::to_ipc` renamed `to_bytes` | Main SDK consumer-forced (`wyrd-sdk-python/src/bifrost/mod.rs:324`); see D-S3 | b356c948f |
+| wyrd-client/bifrost/facade.rs | `from_env`/`client_from_env`/`client_from_options` resolve via `GlobalConfig::load_in(&Environment)` + `ClientConfig::from_environment`; blank explicit `server_url`/`grpc_url`/`credential` refused with `WYRD_CLIENT_400_CONFIG_INVALID`; new `client_from_options_in`; 2 unit tests | Main non-Bifrost client config API (`environment`, `global_config`) forced | b356c948f (main 1ca7a4316, 753916bd0) |
+| wyrd-client/bifrost/{facade,query,grpc}.rs | `self.query.client().request_json` becomes `.client().http.request_json`; `client.connect_grpc()` becomes `GrpcConnection::connect(&client.grpc_config, Arc::clone(&client.auth))`; `client.auth()` becomes `&client.auth` | Main `WyrdClient` struct shape (non-Bifrost) forced | b356c948f |
+| wyrd-client/bifrost/facade.rs | `BifrostIngestSink::new(..)` becomes a struct literal (because `new` is internal-gated) | Main `internal` gate fallout | b356c948f |
+| wyrd-client/bifrost/scope.rs | `fingerprint_credential` handles `ResolvedCredential::Renewable(source) => source.identity()` | Main credential model (renewable credential pooling identity; X7 identity entrance, non-Bifrost auth type) forced by exhaustive match | b356c948f |
+| wyrd-client/bifrost/grpc.rs (tests) | `unauthenticated_refusal_forces_one_shared_refresh_and_resends` moves from API-key exchange (wiremock `/auth/token`, `expires_at`) to `ResolvedCredential::Renewable(SequencedSource)`; `retain_held_batch` takes `credential` and `http_timeout_ms` and returns the auth owner | Main credential model forced (API-key exchange removed on main by 71fe71c35) | b356c948f |
+| wyrd-client/bifrost/grpc.rs (tests) | New `delayed_refresh_spends_one_transport_budget_then_retains`, `blocking_mint_spends_one_transport_budget_then_retains`, `RefreshHeldIngest`, `HeldSource`, `SequencedSource` | Main tests; see D-S4 | b356c948f |
+| wyrd-client/bifrost/mod.rs (tests) | `http://x` becomes `http://127.0.0.1:1` in scope/client fixtures | Main client URL validation forced | b356c948f |
+| wyrd-client/bifrost/mod.rs (tests) | New `downstream_stall_remains_bounded_and_recovers_after_drain` (+`ReleasingSink`) and `register_never_stamps_one_tables_identity_onto_another` | Main tests; see D-S4 | b356c948f |
+| wyrd-client/bifrost/query.rs | `match u64::try_from` becomes `let Ok(rows) = … else` | Main pedantic lint | b356c948f |
+| wyrd-client/bifrost/query.rs | Doc path `tests/pg_bifrost_e2e.rs` becomes `tests/integration/pg_bifrost_e2e.rs` | Main test-binary layout (non-Bifrost) | b356c948f |
+| wyrd-client/bifrost/* (all files) | About 60 `# Arguments` rustdoc blocks added; intra-doc links demoted to code spans where the target is internal-gated | Main doc convention / `internal` gate fallout (non-behavioral) | b356c948f |
+| wyrd-client/bifrost/{facade,handle}.rs | 87e9d3f48: removes main's `event_time_micros`/`wyrd_event_time` client stamping (`Some(Utc::now()...)`), so the queue call matches S's 3-arg `enqueue_rows` | Restores S (REQ-017 time axes); no residual diff vs S apart from the `insert_observation` indirection | 87e9d3f48 |
+| bifrost-design.md §Correlation (L81–91) | `wyrd.card_ref` becomes `wyrd.card_uid`; a client UID is stored only when the verified scope (or, for an unbound principal, the tenant registry) confirms it | X1 | b356c948f (main dadaa3ab9) |
+| bifrost-design.md §Built-in tables (L127–138) | Lazy first-use materialization replaced by eager provisioning plus a startup backfill of the canonical inventory | X5 (eager provisioning) | b356c948f (main 1090580f2) |
+| bifrost-design.md §Variant columns (L231–237) | `vala.dev.agent_traces` columns removed; `vala.verification.results.assertion_result` added as Variant | X5 + X9 | b356c948f, 1b5f4d7b3 |
+| bifrost-design.md §Oracle memory (L668–676) | "after the graph drains" becomes "when the graph ends, without waiting for nested children"; late child returns bytes via shared root; view drop poisons; "Cleanup timeout or failure" becomes "Cleanup failure" | X8 | b356c948f (main c63e2ff46), 1b5f4d7b3 |
+| bifrost-design.md §Read audit (L910–925) | Oracle read audit moves from the hash-chain staging + `AuditPublisher` to the Scribe outbox (`outbox_write_failures_total`, `outbox_events_lost_total`, `outbox_pending`) | X2 | b356c948f, 1b5f4d7b3 (main 1e57da5cb) |
+| bifrost-design.md §Audit history (L948–965) | `vala.audit_staging` watermark/publisher/in-flight bound prose replaced by the outbox writer, platform audit principal for the system owner, no chain/sequence | X2 | same |
+| bifrost-design.md §Forge authority (L1014–1024) | Active `claimed/running/prepared` task row is the table's exclusive lease; heartbeat renews; one terminal transition after the heartbeat stops releases; strategies return their decision to the settlement seam | X10 | e01e60b3b |
+| bifrost-design.md §Audit rules (L1232–1240) | "Surfaces not yet converted … fail closed" removed; "audit publication" dropped from engine-internal transitions | X2 | b356c948f, 1b5f4d7b3 |
+| bifrost-design.md §Namespaces/permissions (L1370–1393) | `vala.dev` namespace removed; public writes refused for gateway calls and three result tables; peer `IngestCapture` accepts five tables + audit log, attribution exactly on result tables, system owner only for audit | X5 + X2 (six destinations) + X3 | b356c948f, 1b5f4d7b3 |
+
+Checked: post-merge `eaa129c4a` (TenantConn/OperatorPool) and the struck main Forge
+"within the original deadline" wording (from main 5ff25deb6) were present at intermediate
+commits but leave **no residual diff** against S; `1b5f4d7b3` reverted them.
+
+##### 2. Unmapped / suspicious
+
+None of these brings back a struck main Bifrost mechanism: no audit staging, no publisher, no deadline-refusal code, no Forge SQL. All are either lint/convention attributes or main client surface. That client surface fits no X1–X10 item and is justified only as "main-forced". The reviewer must rule on whether that covers it.
+
+- **D-S1 `crates/wyrd/wyrd-server/src/otlp_decode.rs:19`, `#[expect(...)]` added**
+  ```rust
+  #[expect(
+      clippy::struct_field_names,
+      reason = "every field is a byte count; the shared suffix names the unit"
+  )]
+  pub(crate) struct OtlpDecodePlan {
+  ```
+  This is a lint suppression attribute added to S code. It comes from main's pedantic-lint closeout (515f16c97). It maps to no exception. AGENTS.md §12 prohibits adding `#[allow]` to make a gate pass. `#[expect]` with a reason is the main-wide precedent, but it is still a suppression on S code. The alternative is renaming the `*_bytes` fields.
+
+- **D-S2 `wyrd-client/src/bifrost/*`, main `internal` feature gates on Bifrost client API (about 35 sites)**
+  The gates cover facade, blocking, handle, query, scope, sink and mod. Example, `query.rs:2102`:
+  ```rust
+  /// owes; only internal settlement reads it.
+  #[cfg(feature = "internal")]
+  client: QueryClient,
+  ```
+  plus `#[cfg(not(feature = "internal"))] let _ = client;`.
+  - **Behavioral consequence:** without `internal`, `QueryResultStream::settle`, `collect_bounded`, `Bifrost::query`, `with_sink`, `query_only`, `insert_into`, `enqueue_batch`, `metrics`, `observe_losses`, `scope`, `register_outcome_name` and `client_from_options` do not exist. In S they are always public.
+  - **Mapping:** this is main's REQ-021 "keep main internal feature gates". Revision 3 struck "retain main's …" obligations inside Bifrost scope, so it is covered by no X item.
+  - **Mitigation:** the feature is a crate-wide main wyrd-client feature, and every in-tree consumer enables it (`wyrd-cli`, `wyrd-mcp`, `wyrd-testing`, both SDK native crates). It is effectively main-forced, but it needs an explicit ruling or a recorded "non-Bifrost wyrd-client feature" justification.
+
+- **D-S3 `wyrd-client/src/bifrost/facade.rs` and `blocking.rs`, main public-API reshapes**
+  - `describe(fqn)` becomes `describe_table(namespace, name)` (`facade.rs:806`, `blocking.rs:166`).
+  - `stream(query)` becomes `stream(query, params, deadline: Option<Duration>)` (`facade.rs:705`). The deadline is converted with `i64::try_from(deadline.as_millis()).unwrap_or(i64::MAX)`: an over-range value saturates to `i64::MAX`, and the server then refuses it.
+  - `QueryResult::to_ipc` becomes `to_bytes` (`facade.rs:845`).
+
+  These are main Bifrost-client API shapes, not X6. X6 covers only `params`. The callers that force them sit outside Bifrost scope: the Python SDK (`sdks/wyrd-sdk-python/src/bifrost/mod.rs:324` `to_bytes`; `describe_table` in the `.pyi` and TS `index.d.ts`). Classify them as consumer-forced renames and record that explicitly, or revert to S names and adapt the SDKs.
+
+- **D-S4 leftover main tests inside Bifrost-scope client code** (tests not present in S):
+  - `grpc.rs`: `delayed_refresh_spends_one_transport_budget_then_retains` and `blocking_mint_spends_one_transport_budget_then_retains`, with the helpers `RefreshHeldIngest`, `HeldSource` and `SequencedSource`. They test main's renewable-credential refresh against the S Bifrost transport budget.
+  - `mod.rs` (`mod sdk`): `downstream_stall_remains_bounded_and_recovers_after_drain` (+`ReleasingSink`) and `register_never_stamps_one_tables_identity_onto_another`. They test main behavior, the register/use_table race and stall recovery. Both appear to hold against S's code paths, since the facade register logic is S's.
+
+  None maps to X1–X10. The renewable ones can be argued as X7-adjacent, because main's credential model is forced. The two `mod sdk` tests are plain main tests. Per the AC-028 rule ("no main … test except X1–X9") they are findings unless kept by ruling.
+
+- **D-S5 `wyrd-client/src/bifrost/facade.rs`, `client_from_options_in`**
+  It adds blank-argument refusal (`WYRD_CLIENT_400_CONFIG_INVALID`) and global-config-file resolution, with 2 new unit tests. This is main client config behavior (non-Bifrost owners `environment`/`global_config`), forced by API, but the blank-refusal check is new behavior on a Bifrost-scope door. Low severity. Record it as main-forced.
+
+- **D-S6 `wyrd-client/src/bifrost/query.rs:1920`, describe fixture metadata**
+  The fixture changes `wyrd:input_class: gate_correlation` to `PARQUET:field_id: 1001`. Neither value is emitted by the server in S or HEAD (`git grep` finds `1001` only in client fixtures), so this is fixture-only. It is low severity, but the fixture no longer mirrors S's describe output for the correlation column. Confirm against the actual X1 describe output.
+
+- **D-S7 `architecture/bifrost-design.md`, coverage gap (not a hunk)**
+  The design doc has no prose for X3 (Scribe peer routing beyond the capture paragraph), X4 (role heartbeat / one membership poller), X6 (typed bind params), or X7 (API-key OTLP auth, TenantConn/OperatorPool); `grep` finds none of these terms. REQ-027 asks the owning architecture to reflect changed contracts, so the change review should decide whether these belong in the doc.
+
+Checked and clean in this part:
+- No `Box::pin` was added (the `Box::pin(async move …)` in `otlp.rs` is S's existing tower `call` shape).
+- No status-code change: capture refusals are still `PermissionDenied`/`InvalidArgument`, and the API-key refusal maps through `wyrd_error_to_status`.
+- No timeout change in production code. The test-only `settle(30 s)` is new with the X2 fixture; `Duration::from_mins(10)` equals 600 s.
+- No `#[allow]`, and no compatibility route or alias in the server files.
+
+##### 3. Counts
+
+- Logical hunks recorded: 52.
+  - Mapped directly to an exception: 26 (X1: 4, X2: 13, X3: 2 shared, X5: 3, X6: 3, X7: 3, X8: 1, X9: 1, X10: 1; counted once per row).
+  - Mapped to a forced non-Bifrost adaptation or lint: 19 (main lint, test-support, WyrdClient shape, config, credential model, layout, docs).
+  - Restores S (87e9d3f48): 1.
+- Unmapped / suspicious: 7 items (D-S1 to D-S7). D-S2, D-S3 and D-S4 are the substantive ones: main Bifrost-client surface and main tests with no X item. D-S1 is a lint suppression. D-S5 and D-S6 are low. D-S7 is a documentation-coverage note.
+
+#### Part: P-028 part E1: wyrd-testing harness (src/bifrost minus forge_harness) and bin/capacity
+
+Base S = cfe21dc9007d5d22d9ae4411be07fb5504b0cc05. Tree read at HEAD 861e6f19d. The branch moved during the audit: 861e6f19d "Delete the unread telemetry requirement and restore S's cluster docs" landed on top of 622299986.
+
+"Main lint" below means a main commit's workspace pedantic-clippy conformance change, carried into the S file by the merge (mostly main 515f16c97 "Close out the repository check audit, pedantic lints, and test binary layout", via b356c948f). That is not an X exception. The closest authority is REQ-026, "preserve main ... pedantic rules". I count these as forced adaptations and list each behaviour-changing one under Unmapped / suspicious.
+
+##### 1. Ledger
+
+| File | Hunk summary | Exception / reason | Commit(s) |
+|---|---|---|---|
+| src/bifrost/peer_ca.rs | `.finish()` → `.finish_non_exhaustive()` in the redacted Debug | Main lint (`missing_fields_in_debug`) | 515f16c97 |
+| src/bifrost/query_fixture.rs | Removes `audit: None` from the two `TableRegistration` literals. S's `bifrost_catalog.rs:122 pub audit: Option<AuditEvent>` field is gone | X2: audit is no longer carried on catalog registration; decisions go through the Scribe outbox | d2af088b9 (main), b356c948f |
+| src/bifrost/query_fixture.rs | Adds a `# Panics` doc ("server started without the Bifrost catalog") | Main lint (`missing_panics_doc`) | 515f16c97 |
+| src/bifrost/scribe_workload.rs | Removes `audit: None` from the registration literal | X2 | d2af088b9 |
+| src/bifrost/scribe_workload.rs | Adds `params: Vec::new()` to `BifrostQueryRequest` | X6 | 82972f9f9 (main) |
+| src/bifrost/scribe_workload.rs | `running_pod(&Option<_>)` → `running_pod(Option<&_>)` with `cluster.as_ref()` at 7 call sites | Main lint (`ref_option`) | 515f16c97 |
+| src/bifrost/scribe_workload.rs | `owner.restart_node(node)` → `Box::pin(owner.restart_node(node))` | Main lint (`large_futures`); see S-list | 515f16c97 |
+| src/bifrost/write.rs | `Correlation { card_ref: Some(..) }` → `card_uid: self.card_ref.uid.clone()`; doc says "correlated to its UID" | X1 | dadaa3ab9 (main) |
+| src/bifrost/telemetry.rs | `FORGE_TASK_TYPES` gains `"manifest_rewrite"`; doc "five" → "six" strategies; test label domains gain `manifest_rewrite` (4 places) | X10: manifest rewrite runs as a durable `ManifestRewrite` task | 87e9d3f48 |
+| src/bifrost/telemetry.rs | Deletes `enum TelemetryRequirement`, the `TelemetryBinding.requirement` field, every `requirement:` initialiser (≈40 bindings plus ≈30 test rows), and the unread `let _required = match ...` in `evaluate_cluster_bindings_required` | Not an exception: S dead-data removal; see S-list | 861e6f19d (main had a cfg_attr dead-code expect instead) |
+| src/bifrost/telemetry.rs | `as u64` casts of aggregated samples → `whole_count(binding, v)?` (new fn), which errors on a negative, non-finite or overflowing value | Main lint (`cast_possible_truncation`/`cast_sign_loss`). Behaviour change; see S-list | 515f16c97 |
+| src/bifrost/telemetry.rs | `seconds_to_micros` rewritten to `.round().to_u64().ok_or_else(..)` | Main lint. Equivalent except that a value just above `u64::MAX` after rounding is now refused instead of saturating | 515f16c97 |
+| src/bifrost/telemetry.rs | `begin_gauge_sampling` `async fn` → `fn`; `_checkpoint` → `checkpoint`; caller drops `.await` | Main lint (`unused_async`, `used_underscore_binding`) | 515f16c97 |
+| src/bifrost/telemetry.rs | `if kind != Gauge {..} else {..}` and `if identity != .. {..} else {..}` arms swapped (logic identical); `flat_map(\|v\| v.into_iter())` → `flat_map(IntoIterator::into_iter)`; `use num_traits::ToPrimitive` | Main lint (`if_not_else`, `redundant_closure`) | 515f16c97 |
+| src/bifrost/cluster.rs | `OracleInspection.audit_pending` → `scribe_pending` (field, doc, aggregation) | X2: one Scribe outbox replaces S's Oracle audit outbox | 70a6f4a4e (main), b356c948f |
+| src/bifrost/cluster.rs | `add_tenant` ensures built-ins through `BuiltinTables::new(catalog).ensure_tenant(tenant)` (new import) | X5: eager provisioning | 1090580f2 (main) |
+| src/bifrost/cluster.rs | New `await_audit_retained()` loops over servers | X2 | 70a6f4a4e / d47c7fafb (main) |
+| src/bifrost/cluster.rs | New `stop_node_restarting_another_during_drain(drained, restarted)`, used by `tests/bifrost/server/query.rs:810` (`oracle_only_pod_retains_audit_staged_before_its_drain`) | X2 + X4: membership keeps refreshing through drain so the outbox finds a late Scribe (REQ-008/REQ-010) | 3712b9ba3 |
+| src/bifrost/cluster.rs | `fixture.superuser_pool().await` → `superuser_pool()` (sync) | Main-side API (wyrd-dev-fixtures `PgFixture`; X7 SQL capability work) | b356c948f / 597533616 |
+| src/bifrost/cluster.rs | 30+ `Box::pin(...)` wraps around `start_spec*`, `start_with_*`, `build_node`, `restart_node`, `start_with_resources`, `shutdown_and_inspect`, and 3 in-file tests | Main lint (`large_futures`); see S-list | 515f16c97 |
+| src/bifrost/cluster.rs | `#[expect(clippy::float_cmp, reason = ..)]` on `OracleTelemetryCapture::delta_since` | Main lint; see S-list (an `#[expect]` was added) | 515f16c97 |
+| src/bifrost/cluster.rs | `Duration::from_secs(60/600)` → `from_mins(1/10)` (×3); `match bool` → `if/else`; `# Panics` doc on `terminate_node_abruptly_for_test` | Main lint (`duration_suboptimal_units`, `match_bool`, `missing_panics_doc`); values unchanged | 515f16c97 |
+| bin/capacity/query/{logs,report,run,telemetry,workload}.rs | S `bin/bifrost_query_capacity/*` moved under `capacity/query/`; `crate::X` → `crate::query::X` | Spec "Benchmarks": compile into main's one capacity build | 87e9d3f48 |
+| bin/capacity/query/mod.rs | S `main.rs` → `mod.rs`. `#[tokio::main] async fn main()` reading `env::args()` → `pub(crate) async fn main(arguments: Vec<String>)`. Docs, consts, output paths and the rest unchanged | Benchmarks (dispatch glue) | 87e9d3f48 |
+| bin/capacity/query/run.rs | `params: Vec::new()` in 2 `BifrostQueryRequest` literals | X6 | 87e9d3f48 |
+| bin/capacity/query/*.rs | `as usize/u64/i64` → `.to_usize().unwrap_or(0)`, `.cast_unsigned()/.cast_signed()`, `.to_i64().unwrap_or(i64::MAX)`; `Role::ALL: [Self; N]` → `&[Self]` plus `ROLES` const; manual hex loop → `hex::encode`; `AsArray as _` → `AsArray` and `.map(AsArray::as_primitive)`; `assert_eq!(f64, f64)` → `.to_bits()` compare | Main lint (`cast_*`, `float_cmp`, `redundant_closure`). Values identical for all in-range inputs; see S-list | 87e9d3f48 |
+| bin/capacity/client_queue/{fixture,proxy,step,mod}.rs | S `bin/bifrost_client_queue/*` moved; `crate::Result` → `crate::client_queue::Result` | Benchmarks | 87e9d3f48 |
+| bin/capacity/client_queue/mod.rs | `main()` → `pub(crate) main(arguments)` with `Cli::parse_from(arguments)`; final summary built with `push_str` instead of `format!` (byte-identical output) | Benchmarks glue + main lint (`format_push_string`) | 87e9d3f48 |
+| bin/capacity/client_queue/fixture.rs | `.sql_as(sql)` → `.sql_as(sql, &[])` | X6 | 87e9d3f48 |
+| bin/capacity/client_queue/step.rs | `WyrdState::from_path(bundle)` + `start_bifrost_with_config(&client, ..)` → `WyrdState::from_path_with_client(bundle, client)` + `start_bifrost_with_config(None, ..)` | Main-side client API (main `state.rs:490`) | 87e9d3f48 |
+| bin/capacity/client_queue/step.rs | Cast rewrites (`to_u64().unwrap_or(0)`, `to_f64().unwrap_or(0.0)`, `try_from(..).unwrap_or(u64::MAX)`), `==` on f64 → `total_cmp().is_eq()`, `format!` arg inlined, slope assert → `.to_bits()` | Main lint; see S-list | 87e9d3f48 |
+| bin/capacity/{main,evidence,fixture,judge,load,profile,report,step}.rs | Main's consolidated `bench:capacity` (verification mix, not a Bifrost workload). evidence/fixture/judge/profile/report are byte-identical to main | Main non-Bifrost file, kept beside S's workloads per spec | main |
+| bin/capacity/main.rs | Adds `mod query; mod client_queue;`, crate docs for the named workloads, and a `main()` that dispatches argv[1] `query-capacity` / `client-queue` (removing the subcommand so flags parse as before), else `capacity()`. Each branch is `Box::pin`ned | Benchmarks dispatch glue | 87e9d3f48 |
+| bin/capacity/main.rs | `LocalServer::start(.., Envelope::POD)` → `Placement::Scoped(Envelope::POD)` (×2) | S `release_server::Placement` API (REQ-026 Host vs scoped placement) | 597533616/cac9c4969 |
+| bin/capacity/load.rs | Drift SQL `wyrd_event_time` → `created_at` (3 places) | Forced by S schema (REQ-017: managed `wyrd_event_time` removed, drift axis `created_at`) | 4f9a5c1d1 |
+| bin/capacity/step.rs | Local `fn cpu_usec(replica)` deleted; uses S's `LocalServer::cpu_usec` | S release_server API | 597533616/cac9c4969 |
+| mise.toml (context, read-only) | `bench:bifrost:query-capacity` and `write-capacity` build `--bin capacity` and run `capacity query-capacity --tier ..`; `client-queue` runs `--bin capacity -- client-queue`. Only the binary name and subcommand differ from S; flags, tiers, the `--heavy` branch and env are unchanged | Benchmarks | 87e9d3f48 |
+
+S's `bin/verification_capacity/*` (8 files) is absent at HEAD. Main replaced it with `bench:capacity` (main dec4213fa). It is not a Bifrost workload and is not in the P-028 path list.
+
+##### 2. Unmapped / suspicious
+
+S1. **telemetry.rs: S's `TelemetryRequirement` deleted (861e6f19d).** Removed: `enum TelemetryRequirement { Always, Role(&'static str) }`, the field `TelemetryBinding.requirement`, ≈70 initialisers, and S's `let _required = match binding.requirement {..}` (old ~L1746). The data was unread in S (only `_required`), so behaviour is unchanged. Still, it removes an S structure under no exception. Main kept the field behind a cfg_attr dead-code expect, so this is neither S nor main. Severity: low. Record it as a deliberate deviation, or restore S's field (it would need main's lint expect).
+
+S2. **telemetry.rs ~L2244 `whole_count`, used at the Delta, peak and final_value aggregation sites.** `selected..sum::<f64>() as u64` became `whole_count(binding, ..)?`. S saturated: a negative value became 0, NaN became 0, overflow became `u64::MAX`. HEAD returns `InvalidBinding("metric value is not a representable count")` instead. A Forge telemetry report that S accepted can now fail. This is a behaviour change from main lint, under no exception. Severity: medium (test-harness reporting only).
+
+S3. **telemetry.rs `seconds_to_micros` (~L2542).** S checked `micros.round() > u64::MAX as f64`; HEAD uses `.to_u64()` on the rounded value. These are equivalent except at the boundary. Severity: negligible. Listed only because it changes S code.
+
+S4. **`#[expect(clippy::float_cmp, reason = "Prometheus renders these metrics as whole numbers ...")]` added at cluster.rs:647** on `OracleTelemetryCapture::delta_since`. An added lint expectation in S code (main lint). Not an exception. Severity: low.
+
+S5. **`Box::pin` added through the harness.** cluster.rs has 30+ sites; scribe_workload.rs:1560 has `Box::pin(owner.restart_node(node))`; bin/capacity/main.rs has the 3 dispatch branches. They come from main's `large_futures` lint, are not in S, and are not an exception. Behaviour is unchanged (heap allocation only). The parent listed "Box::pin in tests" as a flag. Severity: low.
+
+S6. **bin/capacity cast rewrites alter S's overflow semantics** (spec: S's workloads must be restored exactly). Examples:
+   - query/workload.rs:300,302,315,320: `as usize` → `.to_usize().unwrap_or(0)`.
+   - query/run.rs:177-180, 864, 891, 946, 1000.
+   - query/telemetry.rs:441, 452: `EXCEPTIONS[(index % len as i64) as usize]` → `EXCEPTIONS[index.to_usize().unwrap_or(0) % len]`. For negative `index` this picks a different element (S wrapped; HEAD uses 0). Indexes are non-negative in practice.
+   - query/telemetry.rs:625, 638, 909: `.to_i64().unwrap_or(i64::MAX)`.
+   - query/logs.rs:183.
+   - query/report.rs:581.
+   - client_queue/step.rs:207 (`offered` → 0 on a NaN/negative rate).
+   - client_queue/step.rs:219-222: `((sequence as usize + feature*7) % 100) as f64` → `((sequence + feature as u64 * 7) % 100).to_f64().unwrap_or(0.0)`. Same value for in-range inputs.
+
+   For every in-range input these give the values S gives, so reports and assertions are unchanged. Edge semantics differ. Severity: low. They are main-lint adaptations, not exceptions.
+
+S7. **query/telemetry.rs:186 `Role::ALL: [Self; SPANS_PER_TRACE as usize]` → `pub const ALL: &[Self]`, plus new `ROLES` const; query/telemetry.rs:640 manual `{byte:02x}` loop → `hex::encode`.** Same output: `hex::encode` is lowercase. But the array type no longer pins its length to `SPANS_PER_TRACE` at compile time. Severity: low.
+
+S8. **Float-equality changes in S code.**
+   - client_queue/step.rs:154: `other == bound` → `other.total_cmp(bound).is_eq()`. This differs for -0.0 vs 0.0 and for NaN.
+   - query/run.rs:1329 and client_queue/step.rs:423: test asserts now compare `.to_bits()`. That is stricter (a -0.0 slope now fails), not weaker.
+   Severity: negligible.
+
+S9. **Out-of-path S/Bifrost files that differ from S and are not covered by the P-028 path list.** I did not ledger them, but S's restored workloads depend on them:
+   - `crates/wyrd/wyrd-testing/src/release_server.rs`: +234/−59 vs S. `migrate` no longer uses `WYRD_TEST_DATABASE_ADMIN_URL` (main external Postgres credentials, REQ-022/X7). There is a new `OperatorRun` with stderr files, new `JOINED_GRPC_PORT=30051`/`JOINED_PEER_PORT=30052` replica ports, `READY_TIMEOUT` written as `from_mins(2)` (same value), `pub STOP_GRACE`, `pub Metrics::parse`, and abnormal-stop log retention.
+   - `src/capacity.rs`: percentile cast → `.to_usize().unwrap_or(0)`.
+   - `src/profile.rs`: `push_str(&format!)` → `writeln!`.
+   - `bin/bifrost_forge_capacity/report.rs`: new `#[expect(clippy::float_cmp)]` on `Report::checks`.
+
+   Recommend that P-028 extend the path list to `crates/wyrd/wyrd-testing/src/{release_server,capacity,profile}.rs` and `src/bin/bifrost_forge_capacity`, or record why they are out of scope. The release_server port and migrate changes feed every S benchmark, which bears on the "S's exact inputs ... output paths" claim.
+
+No unmapped hunk in this part reintroduces a struck main mechanism (audit staging, publisher, maintenance lease), adds a compatibility shim, or changes a timeout, deadline or HTTP status. The `from_mins`/`from_secs` rewrites keep their values.
+
+##### 3. Counts
+
+- Files in E1 scope with diffs: 7 harness files (cluster, peer_ca, query_fixture, scribe_workload, telemetry, write; forge_harness excluded) and 18 capacity files.
+- Logical hunk groups in the ledger: 37. Mapped to an X exception or a forced main-side API: 15 (X1 ×1, X2 ×5, X5 ×1, X6 ×4, X10 ×1, main API ×3). Benchmarks relocation/glue or main-owned capacity: 9. Main pedantic-lint conformance (forced-adaptation class, REQ-026): 13.
+- Unmapped / suspicious: 9 items (S1–S9).
+  - Medium: 1 (S2).
+  - Low: 5 (S1, S4–S7).
+  - Negligible: 2 (S3, S8).
+  - Scope gap: 1 (S9).
+  - None reintroduces a struck mechanism.
+
+#### Part: E2 - Bifrost journeys ledger (oracle/, otlp/, scribe/, server/)
+
+Scope: crates/wyrd/wyrd-testing/tests/bifrost/{oracle,otlp,scribe,server}/** (forge/ excluded).
+Method: per file `git diff S HEAD`, `git diff main HEAD`, `git log S..HEAD`. Read-only.
+"lint" = forced by main's workspace clippy pedantic config (515f16c97): Box::pin (large_futures),
+Duration::from_mins/from_hours, cast lints, #[expect(clippy::float_cmp)], method-path closures.
+
+##### 1. Hunk table
+
+| File | Hunk summary | Exception / reason | Commit(s) |
+|---|---|---|---|
+| oracle/analytical_activation.rs | AnalyticalCleanupPause hold/release test removed; renamed transport_drop_retains_running_status_until_cleanup_joins -> transport_drop_retires_and_releases_the_graph | X8 | 87e9d3f48 |
+| oracle/analytical_activation.rs | physical_build_evidence `?` dropped (infallible); client_from_bootstrap sync; params | peer_cluster refactor (main); X6 | 87e9d3f48 |
+| oracle/analytical_lifecycle.rs | Box::pin x3; params | lint; X6 | 515f16c97 era |
+| oracle/capacity.rs | from_mins, Box::pin, superuser_pool sync | lint | - |
+| oracle/capacity.rs | `audit: None` removed from CreateTableRequest | X2 | - |
+| oracle/capacity.rs | 2x #[expect(cast_precision_loss)] removed, #[expect(float_cmp)] added | lint | - |
+| oracle/capacity.rs | prove_queue_is_fifo_and_tenant_rotated rewritten (completion-order Mutex -> granted_tx grant-order via stall_next_query_after_schema) | UNMAPPED (see 2) | f6c841d57 |
+| oracle/distributed.rs | params; timeouts from_mins (same value); `_ =>` -> explicit HotAuthority::Published; RowGroupMetaData method path | X6; lint | - |
+| oracle/distributed.rs | `.describe(&fqn)` -> `.describe_table(ns, name)` + expect | main client facade (fork D scope) | 6f25f42b4 |
+| oracle/main.rs | `mod workflow;` | main-only journey registration | 114ae55e8 |
+| oracle/mcp.rs | token request JSON WyrdApiKey -> RFC token-exchange form | X7 | d841b9b46 |
+| oracle/mcp.rs | `release_execute_pause(paused)?` after cancel removed | X8 | c63e2ff46 |
+| oracle/peer_cluster.rs | MEMBERSHIP_DEADLINE/await_membership moved in from join.rs; start_with_gateway_provider_root + Url launch param; terminate releases a held execute pause | main workflow.rs support | 114ae55e8, f047831b8, 304166d7f, 047d8bebd |
+| oracle/peer_cluster.rs | metric_totals_labeled skips HistogramBucket/HistogramSum samples | UNMAPPED semantic change (see 2) | 047d8bebd era |
+| oracle/peer_cluster.rs | physical_build_evidence infallible; READY/STATEMENT_DEADLINE from_mins (same); `audit: None` removed | refactor; lint; X2 | - |
+| oracle/peer_network/analytical.rs | Box::pin x3; #[expect(float_cmp)]; usize::try_from INGEST_CHUNK; params | lint; X6 | - |
+| oracle/peer_network/join.rs | uses cluster.await_membership; Box::pin; params | refactor; lint; X6 | - |
+| oracle/peer_network/listener.rs | new a_frame_above_the_tonic_default_is_acknowledged_and_retained (6 MiB audit row over mTLS peer capture) | X3/X2 (REQ-009 decode ceilings) | b7b2de753 |
+| oracle/peer_network/listener.rs | Box::pin; params | lint; X6 | 7d3eb319a |
+| oracle/peer_network/security.rs | `ADAPTERS.iter()` -> `&ADAPTERS` | lint | - |
+| oracle/published.rs | from_mins; `.sql(&sql,&[])`; #[expect(float_cmp)] | lint; X6 | - |
+| oracle/published.rs | WORKLOAD_ROLE -> seeded role variant_sql_no_payload (bifrost_table_read + bifrost_query_read) | X7 | 1678da1ac |
+| oracle/support.rs | `audit: None` removed; seed_foreign_hot_row drops AuditEvent + audit_staging::append_audit | X2 | - |
+| oracle/support.rs | client_from_bootstrap sync; #[allow(cast_sign_loss)] removed for cast_unsigned; write!; COMPACTION_BUDGET from_mins(3) | lint | - |
+| oracle/workflow.rs | NEW main-only: forwarded Workflow bifrost.query settles through cancel / deadline / pod loss | main Workflow product surface consuming Bifrost, + X8 (see 2) | 114ae55e8, c63e2ff46, c6a3276ad, 7ad33ac2d |
+| otlp/negative.rs | clone_into | lint | - |
+| otlp/negative.rs | new card_attributed_resource_spans + unbound_writer_attributes_spans_to_registered_cards_only | X1 | dadaa3ab9, b5ab2dd5d |
+| otlp/support.rs | stores api_key; start_on(builder); api_key(); params | X7; X6 | 53d044191 |
+| otlp/trace_export.rs | new stock_exporter_authenticates_with_api_key_after_token_lifetime | X7 (API-key OTLP auth) | 53d044191 |
+| scribe/ambiguous_retry.rs | NEW: re-home of S pg_bifrost_e2e public_sdk_owned_batch_timeout_retry_retains_then_deduplicates; card_uid | S test re-homed; X1 | 6f25f42b4, dadaa3ab9 |
+| scribe/describe.rs | NEW: re-home of S described_canonical_and_dynamic_schemas_reach_exact_physical_schema; describe_table; writable_schema path; is_extension_key | S test re-homed; X1; Q13 | 6f25f42b4, 005c19b1e, dadaa3ab9, 87e9d3f48 |
+| scribe/describe.rs | card_ref INPUT_CLASS metadata assertion -> nullable Utf8 card_uid check | X1 | dadaa3ab9 |
+| scribe/describe.rs | vala.file_list row_count==2 durable assertion dropped | UNMAPPED weakening (see 2) | 6f25f42b4 |
+| scribe/backpressure.rs, qualification.rs, horizontal_ingest.rs | lint casts, from_mins; `audit: None` removed; params | lint; X2; X6 | - |
+| scribe/budgets.rs | start_scribe_server -> builder; await_audit_retained; journey_buckets filter | X2 | f6c841d57, 70a6f4a4e, e03e3b9c8 |
+| scribe/lifecycle.rs | .without_audit_publication_for_test() x5 removed; faults.target_table_for_test; staging_backlog(Some(name)) | X2 | f6c841d57 |
+| scribe/lifecycle.rs | idle-clock rationale (audit publisher as other writer) deleted, no replacement guard | X2, guard gap (see 2) | f6c841d57 |
+| scribe/main.rs | mod ambiguous_retry; mod describe | re-home | 6f25f42b4 |
+| scribe/recovery.rs | params; `audit: None`; Box::pin(restart_bound) | X6; X2; lint | 5e7b177b0 |
+| scribe/source_boundary_recovery.rs | target_table fault; async assert_no_leaked_scribe_ownership; memory==0 -> memory==audit_log bucket bytes | X2 (weakened, see 2) | f6c841d57 |
+| scribe/support.rs | `audit: None`; params; ADMISSION_DEADLINE from_mins(1) | X2; X6; lint | - |
+| scribe/sustained.rs | "lazy built-in" wording removed; await_audit_published -> await_audit_retained; staging_backlog(None); lint casts | X5; X2; lint | - |
+| scribe/telemetry.rs | without_audit_publication removed; settled_writable_rows / audit_files helpers; #[expect(float_cmp)] x2 | X2; lint | f6c841d57, 70a6f4a4e, e03e3b9c8 |
+| scribe/telemetry.rs | exact metric counts -> ranges / audit-inclusive totals | X2 (weakened, see 2) | same |
+| scribe/write_read.rs | Box::pin x3; superuser_pool sync; params; from_mins | lint; X6 | - |
+| scribe/write_read.rs | card_ref -> registry card_uid; refusal uses random UUID; new scribe_unbound_writer_card_attribution_journey | X1 | b5ab2dd5d, dadaa3ab9 |
+| server/main.rs | audit_publication -> audit_retention; + observe_ingest, query_lifecycle | X2; re-home; main journey | - |
+| server/audit_publication.rs | DELETED (5 S tests: frozen range replay, reads during chain wait, stalled tenant isolation, service decisions ahead, retire-only-into-retained) | X2 (staging/publisher/chain removed) | 1e57da5cb |
+| server/audit_retention.rs | NEW: retained_history_carries_both_credential_shapes, system_owner_security_rejections_retain_once | X2 (REQ-011/012) | 1e57da5cb |
+| server/query_lifecycle.rs | NEW: re-home of S oracle_query_grpc_status_cancel_impl as grpc_lifecycle_controls_are_tenant_scoped_and_audited; denied_describe_is_audited_before_admission; staged -> retained audit | S test re-homed; X2 | 6f25f42b4 |
+| server/owner_inspection.rs | `bytes[60] ^= 0xff` fixture + doc | Q1 | 87e9d3f48 |
+| server/owner_inspection.rs | Box::pin x2; from_mins; `audit: None` | lint; X2 | - |
+| server/owner_inspection.rs | new unready_roles_heartbeat_until_teardown_ends_membership_tasks | X4 | f6c841d57 |
+| server/owner_inspection.rs | new dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles, router_only_shutdown_settles_bifrost_before_fixture_release | UNMAPPED main Bifrost shutdown behaviour (see 2) | 5eff7ec29, a14896e34 |
+| server/query.rs | await_audit_published -> retained; `audit: None`; Box::pin x3; params; Correlation::default() | X2; lint; X6 | - |
+| server/query.rs | AUDIT_UNAVAILABLE fail-closed test removed | X2 (no audit-write error exists) | - |
+| server/query.rs | audit count moved before pause; 30 s wait for victim to leave membership | X2/X4 | 21d02b174, e069dbcdc |
+| server/query.rs | new oracle_only_pod_retains_audit_staged_before_its_drain | X2/X4 | 3712b9ba3 |
+| server/query.rs | prove_scheduled_analytical_completion: pause.release() removed, 502 STREAM_INCOMPLETE -> 500 EXECUTION_FAILED | UNMAPPED status change (see 2) | 5dfee4d3f |
+| server/eval_verification.rs | HEAD = main verification product journeys on S time axes (created_at / wyrd_ingested_at, context->>'marker', RowPreflight) | main non-Bifrost verification surface (REQ-014/015), consumes Bifrost | main + adaptation |
+| server/eval_verification.rs | `assertion_result ->> field` | Q6 / X9 | - |
+| server/eval_verification.rs | SECURITY DEFINER trigger | Q7 / X7 | - |
+| server/eval_verification.rs | eval_runs_follow_the_writing_owner, direct_task_judgment_records_one_correlated_result | X1/X9 | - |
+| server/eval_verification.rs | S integrated_enqueue_failure_preserves_ack + blocked_activations -> main integrated_enqueue_outage_preserves_ack_and_recovers; EvalReadAuthority checks, direct ProviderRegistry runtime, emit-window assertion removed | REQ-015 gateway (main product); partial weakening (see 2) | - |
+| server/verification_runtime.rs | runner ..._through_the_ingest_endpoint -> ..._through_a_peer_scribe; outbox settle; StraddleScribe; SYSTEM token + facade writer -> ScribeSink::local_outbox | X2/X3 | - |
+| server/verification_runtime.rs | `unrouted.composes(RuntimeCapability::Runner)` negative check removed | X2/X3 (see 2) | - |
+| server/verification_runtime.rs | `{RUN_ID} = '{run}'` -> `{RUN_ID} IS NULL`; RUN_ID join dropped; ResultLayoutJourney run_id: None x2 | UNMAPPED vs REQ-016 (see 2) | ad27e71f3 |
+| server/verification_runtime.rs | audit seq/prev_hash/entry_hash recompute -> detail-only check | X2 | - |
+| server/verification_runtime.rs | card_ref -> card_uid | X1 | - |
+| server/verification_runtime.rs | agent_traces -> vala.eval.observations (messages/tool_io -> context/media) | X5 | - |
+| server/verification_runtime.rs | WAIT from_mins(1), DAY from_hours(24) | lint | - |
+| server/observe_ingest.rs | NEW main-only: client emit-time, drift burst under byte budget, sustained 100-feature drift exactly-once; adapted: wyrd_event_time -> created_at, dataset record() emits + caller-supplied event time case removed | main observe SDK surface consuming Bifrost; X5 time axes (see 2) | 15155ba5d, 753916bd0, 3e9b80458, 4f9a5c1d1 |
+
+##### 2. Unmapped / suspicious
+
+1. oracle/capacity.rs prove_queue_is_fifo_and_tenant_rotated - completion-order Mutex assertion replaced by `stall_next_query_after_schema` + `granted_tx` grant-order. From f6c841d57 (TASK-003 r4 audit scoping). Not an exception mechanism, no Q row. The test now proves something different (grant order vs completion order); needs a recorded reason or revert to S's assertion.
+2. oracle/peer_cluster.rs metric_totals_labeled - now excludes HistogramBucket/HistogramSum samples. Changes the meaning of an S helper used by S assertions; no exception covers it. Check every S caller still sums what it meant to.
+3. oracle/workflow.rs (whole file, 671 lines, HEAD == main) - main Workflow product journey. Justifiable as a non-Bifrost surface (Workflow tool) consuming Bifrost query forwarding, with X8 cancellation. But it asserts Bifrost settlement semantics (`POD_LOSS_CODE = "WYRD_VALA_500_QUERY_EXECUTION_FAILED"` at :327, `QUERY_TIMEOUT_CODE` 504 at :64, leader graph cleanup holding the run non-terminal) and pulls peer_cluster changes (execute pause released on terminate). Confirm these codes match S's Oracle; otherwise finding.
+4. otlp/trace_export.rs stock_exporter_authenticates_with_api_key_after_token_lifetime - readback `... WHERE scope_name = '{}' OR start_time_unix_nano = {start}` compares a Timestamp(ns) column with an integer literal. Q8 established DataFusion refuses Timestamp(ns) vs Int64; likely a planning failure unless this predicate coerces. Run it.
+5. scribe/describe.rs - S's durable `vala.file_list` row_count==2 assertion removed in the re-home; only SQL readback remains. Weakened, not exception-justified (X1 only touches card_ref). The INPUT_CLASS_KEY metadata check -> nullable Utf8 is X1 and fine.
+6. scribe/ambiguous_retry.rs - durable check file_list row_count==1 -> sorted_values==[41]; `max_message_bytes: 32 MiB` dropped. Roughly equivalent (dedup still proven) but the physical single-file proof is gone. Minor.
+7. scribe/telemetry.rs - exact asserts loosened: ACK `== 4.0` -> `acks >= 4.0 && acks - 4 <= audit_rows`; retry ACK `1.0` -> range; inserted `0.0`/`64.0` -> `audit_rows`/`inserted_rows`; publication files/bytes now include audit_log deltas. X2 makes audit share Scribe, so some looseness is forced, but filtering to the journey table (as budgets.rs does via journey_buckets) would keep exact counts. Weakened.
+8. scribe/source_boundary_recovery.rs assert_no_leaked_scribe_ownership - `memory[Active/Immutable] == 0` -> `== bytes held by audit_log buckets`. A leak inside an audit bucket is undetectable. Weakened under X2.
+9. scribe/lifecycle.rs idle-clock test - S rationale ("the audit publisher is the one other writer in the pod, and its generations would publish the table without the tick") deleted. Under X2 the outbox still writes audit_log through the same Scribe; no replacement guard that the observed publication is the tick's and not an outbox flush. Guard gap.
+10. server/owner_inspection.rs dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles, router_only_shutdown_settles_bifrost_before_fixture_release (5eff7ec29, a14896e34) - main Bifrost shutdown-order/harness behaviour (REQ-023), not an exception. Forge claim test also touches main Forge design (struck). Finding. Also main->HEAD dropped main's `metadata_cache_enabled()` assertion (outside S diff; informational).
+11. server/query.rs prove_scheduled_analytical_completion - `pause.release()` removed and expectation `WYRD_VALA_502_QUERY_STREAM_INCOMPLETE` -> `WYRD_VALA_500_QUERY_EXECUTION_FAILED` (main 5dfee4d3f "expect the owner's failure for a scheduled query cancelled while opening"). 502->500 change. X8 records cancel-before-first-batch as `cancelled`; this is neither S's code nor clearly X8. Finding unless X8 text covers it.
+12. server/verification_runtime.rs - result rows queried with `{RUN_ID} IS NULL` (was `= '{run}'`), RUN_ID join dropped, ResultLayoutJourney `run_id: None` x2 (ad27e71f3). REQ-016 says result run_id is the application Run being judged. `run_id` None in results; verify against X2/ad27e71f3 or finding.
+13. server/verification_runtime.rs - S negative "a node without Scribe or an endpoint composed no runner" (`unrouted.composes(RuntimeCapability::Runner)`) removed. Under X2 every node has the outbox, so arguably unreachable, but no replacement negative for an unroutable outbox. Record reason.
+14. server/eval_verification.rs - S EvalReadAuthority::resolve checks and the emit-window assertion removed with the main replacement. Main product journey, but the authority negative flow has no equivalent visible in HEAD. Check main's test covers read-authority refusal.
+15. server/observe_ingest.rs - main observe SDK journeys (justified as non-Bifrost client surface consuming Bifrost), but drift_burst_survives_a_byte_budget_override / sustained_..._exactly_once assert Scribe exactly-once and byte budgets, i.e. Bifrost ingest behaviour. Adaptation removed the dataset `record()` path and the caller-supplied event-time case outright rather than mapping to S time axes. Borderline finding.
+16. server/audit_publication.rs deleted - all 5 tests are staging/publisher/chain mechanics removed by X2, except the property "a stalled tenant does not block another tenant's history": the outbox batches per tenant slice, but no audit_retention journey proves cross-tenant isolation. Coverage gap.
+17. oracle/distributed.rs, scribe/describe.rs - depend on `describe_table(namespace, name)` (main client API) instead of S `describe(fqn)`. Mapped only if fork D accepts the facade rename.
+18. oracle/analytical_activation.rs - AnalyticalCleanupPause test removed under X8, but the pause still exists in redux src (oracle/analytical.rs:2517, :2884; oracle/mod.rs:3940). Either dead test hook (delete) or untested path.
+19. Mechanical lint changes (not findings, listed per directive): Box::pin added in analytical_lifecycle, capacity, peer_network/{analytical,join,listener}, recovery, write_read, owner_inspection, query, workflow; #[expect(clippy::float_cmp)] added in capacity, peer_network/analytical, published, telemetry x2; #[expect(cast_precision_loss)] x2 and #[allow(cast_sign_loss)] removed (replaced by checked/unsigned casts). No new #[allow], cfg_attr, or #[ignore] beyond the lane-standard `#[ignore = "requires ..."]` on new journeys. Timeouts converted to from_mins/from_hours keep identical values; the only new bound is query.rs' 30 s membership-leave wait (X4).
+20. Out of scope, for the parent: S crates/shared/wyrd-client/tests/pg_bifrost_e2e.rs tests not found anywhere in HEAD: multi_batch_query_stream_reuses_schema, public_sdk_bidi_write_ack_and_durable_readback, observe_and_bifrost_roundtrip, backpressure_and_drain_no_silent_drops, canonical_signal_arrow_write_and_sql_read_round_trip.
+
+##### 3. Counts
+
+- Files reviewed: 41 (oracle 15, otlp 3, scribe 15, server 8 incl. 1 deleted).
+- Table rows: 72.
+  - Exception-mapped (X1-X9) or re-homed S tests: 46
+  - Lint-only: 13
+  - Q fixes: 3 (Q1, Q6, Q7; Q13 within describe re-home)
+  - Main-only / unmapped rows: 10
+- New main-only journey files: 3 (oracle/workflow.rs, server/observe_ingest.rs, server/audit_retention.rs [X2-justified]); re-homed S files: 3 (scribe/ambiguous_retry.rs, scribe/describe.rs, server/query_lifecycle.rs).
+- Deleted S tests: 7 in scope (5 audit_publication [X2], 1 AnalyticalCleanupPause [X8], 1 AUDIT_UNAVAILABLE [X2]) + 2 eval_verification replaced; 5 out of scope missing.
+- Suspicious / unmapped items: 18 (items 1-18; 19-20 informational).
+  - Weakened assertions: 6 (items 5, 6, 7, 8, 13, 14)
+  - Status code change 502->500: 1 (item 11)
+  - run_id None: 1 (item 12)
+  - Main Bifrost behaviour without exception: 3 (items 1, 2, 10) + 2 borderline (3, 15)

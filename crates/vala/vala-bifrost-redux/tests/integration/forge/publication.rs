@@ -710,8 +710,9 @@ fn expired_publication_deadline(
 ///
 /// A drained attempt is the ambiguous case: the catalog may or may not have
 /// accepted it, so the only honest durable state is the prepared record it
-/// wrote before the call. The live cut must be untouched and the table lease
-/// released, or a successor could neither read the table nor take over.
+/// wrote before the call. The live cut must be untouched, and the prepared
+/// task keeps the table's one claim: that claim is the authority the
+/// reconciling successor takes over, so no fresh rewrite can start between.
 async fn assert_drained_attempt_is_unsettled(
     promoted: &PromotedRewriteFixture,
     inputs: &BTreeSet<String>,
@@ -734,8 +735,8 @@ async fn assert_drained_attempt_is_unsettled(
     );
     assert_eq!(
         promoted.fixture.live_claims().await,
-        0,
-        "the drained attempt released its table claim"
+        1,
+        "the prepared attempt keeps its table claim for reconciliation"
     );
 }
 
@@ -863,7 +864,7 @@ async fn rewrite_publication_ambiguity_restart_settles_once() {
 /// involved anywhere.
 #[derive(Debug, Clone, Copy)]
 enum HeldAuthorityMutation {
-    /// The durable lease row stops being renewable.
+    /// The held attempt's task claim lapses.
     LeaseExpired,
     /// The worker's own cancellation token is cancelled.
     AttemptCancelled,
@@ -896,6 +897,20 @@ impl HeldAuthorityMutation {
             Self::LeaseExpired => "LeaseLost",
             Self::AttemptCancelled => "Cancelled",
             Self::DeadlineElapsed => "Deadline",
+        }
+    }
+
+    /// The terminal state the held rewrite's row closes in.
+    ///
+    /// A lapsed claim belongs to the worker loop's expired-claim reclaim, which
+    /// runs on the first plan completion — before the held attempt drains — and
+    /// closes a dispatched row `cancelled`; the attempt's own settlement then
+    /// finds the row already closed. The other refusals are settled by the
+    /// attempt itself as a classified `failed`.
+    const fn expected_state(self) -> &'static str {
+        match self {
+            Self::LeaseExpired => "cancelled",
+            Self::AttemptCancelled | Self::DeadlineElapsed => "failed",
         }
     }
 }
@@ -1172,8 +1187,8 @@ async fn assert_refused_publication_left_no_trace(aftermath: HeldAuthorityAfterm
 ///
 /// # Panics
 ///
-/// Panics when the held rewrite's row is not closed failed, its lease is not
-/// released, it did not report exactly one task span, or a catalog commit span
+/// Panics when the held rewrite's row is not closed in the mutation's expected
+/// state, its claim is not released, it did not report exactly one task span, or a catalog commit span
 /// was reported for an attempt that never committed.
 async fn assert_refused_attempt_settled_and_reported(
     promoted: &PromotedRewriteFixture,
@@ -1193,7 +1208,8 @@ async fn assert_refused_attempt_settled_and_reported(
     // The leader owns a dispatched rewrite's retry, so the refused attempt's
     // row closes rather than becoming claimable by a second owner.
     assert_eq!(
-        tasks[0].state, "failed",
+        tasks[0].state,
+        mutation.expected_state(),
         "a coordination refusal closes the held rewrite for the leader to retry ({mutation:?}): {tasks:?}"
     );
     assert_eq!(

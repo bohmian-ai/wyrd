@@ -734,7 +734,7 @@ mod pg_tests {
         let batches = journey
             .query(&format!(
                 "SELECT name FROM {SPANS_TABLE} WHERE scope_name = '{}' \
-                 OR start_time_unix_nano = {start}",
+                 OR start_time_unix_nano = to_timestamp_nanos({start})",
                 support::STOCK_TRACE_SCOPE
             ))
             .await;

@@ -277,7 +277,8 @@ impl<T: AuditStage> GateAudit for T {
     /// Stages the decision for the caller's tenant.
     ///
     /// The row is attributed to the verified principal — the subject a
-    /// delegated token acts for — and, when the token carries a non-empty
+    /// delegated token acts for — and the credential it authenticated with,
+    /// when it has one, and, when the token carries a non-empty
     /// delegation chain, names its actors through the same
     /// [`AuditDetail::DelegationAttribution`] projection HTTP and Oracle audit
     /// use. A direct call keeps no detail.
@@ -292,7 +293,8 @@ impl<T: AuditStage> GateAudit for T {
             auth.principal.kind.tag(),
             "bifrost:record:write".to_owned(),
             outcome,
-        );
+        )
+        .with_credential_id(auth.principal.credential_id);
         if !auth.delegation_chain.is_empty() {
             event = event.with_detail(AuditDetail::DelegationAttribution {
                 delegation_chain: wyrd_runtime::audit_delegation_chain(&auth.delegation_chain),

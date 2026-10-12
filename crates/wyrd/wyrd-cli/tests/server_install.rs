@@ -5,6 +5,7 @@
 //! these prove release selection, signature and digest verification, and
 //! failure-safe replacement without live GitHub access.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -145,10 +146,14 @@ fn run_installed(installer: &ServerInstaller) -> String {
 
 /// The newest stable, non-draft release by version is installed and run;
 /// prereleases, drafts, and newer-by-date older versions are not selected,
-/// and an incompatible newest release is refused before download.
+/// and an incompatible newest release is refused before download. The
+/// install root lies in a config directory that does not exist yet, which
+/// installation creates private to the user whatever the umask, so a saved
+/// login can later be stored there.
 ///
 /// # Panics
-/// Panics when a different release is selected or the refusal differs.
+/// Panics when a different release is selected, the refusal differs, or the
+/// created config directory is accessible to other users.
 #[tokio::test]
 async fn server_install_selects_latest_stable() {
     let server = MockServer::start().await;
@@ -167,14 +172,24 @@ async fn server_install_selects_latest_stable() {
         ],
     )
     .await;
-    let root = tempfile::tempdir().expect("install root");
+    let home = tempfile::tempdir().expect("config home");
+    let root = home.path().join("wyrd/server");
 
-    let compatible = installer(&server, root.path(), "0.2.1");
+    let compatible = installer(&server, &root, "0.2.1");
     let installed = compatible.install().await.expect("install succeeds");
     assert_eq!(installed.version, Version::new(0, 2, 3));
     assert_eq!(run_installed(&compatible), "wyrd-server 0.2.3");
+    let config_mode = std::fs::metadata(home.path().join("wyrd"))
+        .expect("config directory created")
+        .permissions()
+        .mode();
+    assert_eq!(
+        config_mode & 0o077,
+        0,
+        "config directory mode {config_mode:o}"
+    );
 
-    let incompatible = installer(&server, root.path(), "0.1.0");
+    let incompatible = installer(&server, &root, "0.1.0");
     let refused = incompatible
         .install()
         .await

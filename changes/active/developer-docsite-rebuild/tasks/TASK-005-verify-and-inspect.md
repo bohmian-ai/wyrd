@@ -81,3 +81,19 @@ produce the approved attributable result without new Wyrd behavior.
 - [Wyrd design](../../../../architecture/wyrd-design.md)
 - [Wyrd doctrine](../../../../architecture/wyrd-doctrine.mdx)
 - [Testing workflow](../../../../architecture/references/languages/testing-workflows.md)
+
+## MCP investigation slice evidence
+
+The local-server-bootstrap MCP supplement contributed four draft pages:
+Connect agent-through-MCP, Reference MCP tools, Observe custom Bifrost data,
+and Verify retained evidence. This is a bounded contribution; it does not
+complete the remaining SDK, observation, verification, or Connect task scope.
+
+Source and real-server example proof live in the supplement at
+`local-server-bootstrap-task-003/changes/active/local-server-bootstrap/mcp-investigation-supplement.md`.
+All four pages follow human-tech-docs, passed five fresh reader questions,
+and passed the humanizer lint. `mise run docs:check:commands`,
+`mise run docs:linkcheck`, `mise run docs:build`, and `mise run docs:a11y`
+passed. Because these pages retain draft:true, the published accessibility
+lane checks zero draft pages; existing check_page checks also passed on all
+four rendered dev previews. No page was published or marked task-complete.

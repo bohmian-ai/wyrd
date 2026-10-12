@@ -5,7 +5,7 @@ pillar: wyrd
 section: Connect
 order: 3
 draft: true
-status: partial
+status: runnable
 ---
 
 `wyrd mcp install` adds Wyrd to your coding agent's MCP servers. The agent then launches `wyrd mcp proxy`, which serves your Wyrd server's tools over stdio and signs each request with your ordinary Wyrd credential. The agent's configuration file never holds that credential.
@@ -39,6 +39,7 @@ wyrd auth login --server https://acme.wyrd.cloud --tenant acme
 For the local server, or any server where you hold an API key (such as the `admin_credential` from [Set up Wyrd](/get-started/setup/#4-create-the-first-credential)), put the key in `~/.config/wyrd/credentials.toml`, readable only by you. It is used for every server you have no saved login for:
 
 ```bash
+umask 077
 mkdir -p ~/.config/wyrd
 printf '[default]\napi_key = "%s"\n' "$WYRD_API_KEY" > ~/.config/wyrd/credentials.toml
 chmod 600 ~/.config/wyrd/credentials.toml
@@ -81,7 +82,21 @@ The URL is stored in that agent's entry; open the file from the table above to s
 
 ## 4. Check the connection
 
-Ask the agent to list its MCP tools. Wyrd's appear with names such as `cards.get` and `bifrost.list_tables`. What each one may do is decided by your credential's roles on the server, exactly as for any other Wyrd client.
+Ask the agent to list its MCP tools, then call `wyrd.guide` with `{"topic":"overview"}`. The guide returns `topic`, ordered `steps`, and `examples` containing tool names and argument objects. Its other topics are `cards`, `verification`, and `bifrost_sql`.
+
+Try a question about a Service you registered:
+
+```text
+Analyze service support-desk. Discover its exact version, follow its component
+references, and explain what the retained evidence supports. State missing
+evidence and permission refusals explicitly.
+```
+
+The agent should discover versions with `cards.list`, read one with `cards.get_by_ref`, and follow the exact references in `card.relationships.outbound_refs` and `inbound_refs`. Each edge stores its identity under `ref`. It should discover and describe Bifrost tables before querying evidence.
+
+Read the [MCP tool reference](/reference/mcp-tools/) for every shipped capability and its permissions. For complete procedures, see [Write and query custom data with Bifrost](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/) and [Run a verification and inspect its evidence](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/).
+
+Tool discovery grants no permission. The server checks your credential's roles on each call, exactly as for any other Wyrd client. A query error or empty result does not establish that a component passed verification.
 
 ## What the entry contains
 

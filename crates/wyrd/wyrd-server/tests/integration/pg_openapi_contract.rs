@@ -159,8 +159,8 @@ fn component_refs<'a>(value: &'a Value, found: &mut BTreeSet<&'a str>) {
 /// platform connection configuration, which discovers the issuer before
 /// storing it, publishes that discovery's
 /// `503 WYRD_AUTH_503_DISCOVERY_UNAVAILABLE` as problem+json. Every component
-/// reference resolves, so the UI's generated HTTP contract types can be built
-/// from the document alone.
+/// reference resolves and every `operationId` is unique, as `OpenAPI` requires,
+/// so the UI's generated HTTP contract types can be built from the document alone.
 #[tokio::test]
 async fn the_served_document_describes_the_composed_surface() {
     let server = WyrdTestServer::start_in_process()
@@ -245,6 +245,15 @@ async fn the_served_document_describes_the_composed_surface() {
         .filter(|name| !defined.contains_key(*name))
         .collect();
     assert!(dangling.is_empty(), "undefined components: {dangling:?}");
+
+    let mut operation_ids = BTreeSet::new();
+    for item in paths.values() {
+        for method in METHODS {
+            if let Some(id) = item[method]["operationId"].as_str() {
+                assert!(operation_ids.insert(id), "operationId {id} is not unique");
+            }
+        }
+    }
 
     server.shutdown().await.expect("server shuts down");
 }

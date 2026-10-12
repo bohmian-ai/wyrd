@@ -1575,7 +1575,10 @@ cargo run --locked -q -p wyrd-server --example served_openapi -- "$document" > /
 pnpm --dir "$ui" install --frozen-lockfile
 # Cleared first so a file the generator no longer writes is reported as drift.
 rm -rf "$generated" && mkdir -p "$generated"
-pnpm --dir "$ui" exec openapi-typescript "$document" -o "$PWD/$generated/wyrd-http.ts"
+# A declaration file, the generator's documented output: `skipLibCheck` tolerates its one
+# self-referential primitive union (`ColValue`), which TypeScript cannot express as an
+# indexed-access member and so widens; consumers are still checked against every other type.
+pnpm --dir "$ui" exec openapi-typescript "$document" -o "$PWD/$generated/wyrd-http.d.ts"
 """
 
 [tasks."codegen:stubs"]

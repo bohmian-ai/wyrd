@@ -63,6 +63,7 @@ pub fn platform_credentials_router() -> OpenApiRouter<AppState> {
 /// does not exist, or the write fails.
 #[utoipa::path(
     post,
+    operation_id = "issue_platform_admin_credential",
     path = "/platform/admins/{principal_id}/credentials",
     params(("principal_id" = Uuid, Path, description = "Platform principal to issue for")),
     request_body = IssuePlatformCredentialRequest,
@@ -122,6 +123,7 @@ async fn issue_credential(
 /// fails.
 #[utoipa::path(
     get,
+    operation_id = "list_platform_admin_credentials",
     path = "/platform/admins/{principal_id}/credentials",
     params(("principal_id" = Uuid, Path, description = "Platform principal whose credentials to list")),
     responses(
@@ -185,6 +187,7 @@ async fn list_credentials(
 /// is not this principal's or is already retired, or the write fails.
 #[utoipa::path(
     delete,
+    operation_id = "revoke_platform_admin_credential",
     path = "/platform/admins/{principal_id}/credentials/{credential_id}",
     params(
         ("principal_id" = Uuid, Path, description = "Platform principal that owns the credential"),

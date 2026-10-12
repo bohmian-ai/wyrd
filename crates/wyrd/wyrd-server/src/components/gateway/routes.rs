@@ -319,6 +319,7 @@ pub(crate) async fn get_credential(
 
 #[utoipa::path(
     get,
+    operation_id = "list_provider_credentials",
     path = "/admin/gateway/provider-credentials",
     responses(
         (status = 200, body = Vec<ProviderCredentialView>),
@@ -352,6 +353,7 @@ pub(crate) async fn list_credentials(
 
 #[utoipa::path(
     post,
+    operation_id = "revoke_provider_credential",
     path = "/admin/gateway/provider-credentials/{name}/revoke",
     params(("name" = String, Path, description = "Tenant-scoped resource name")),
     responses(

@@ -365,6 +365,7 @@ async fn read_connection(
 /// fails.
 #[utoipa::path(
     delete,
+    operation_id = "remove_platform_connection",
     path = "/platform/oidc/connection",
     responses(
         (status = 204, description = "Connection removed; the global credential still administers"),

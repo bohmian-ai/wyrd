@@ -101,6 +101,7 @@ async fn create_connection(
 /// read fails.
 #[utoipa::path(
     get,
+    operation_id = "list_operator_connections",
     path = "/operator-connections",
     responses(
         (status = 200, description = "Redacted connections", body = Vec<OperatorConnectionView>),

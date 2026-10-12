@@ -388,7 +388,7 @@ export interface paths {
          *     Returns a stable Wyrd error when the caller is unauthorized or the read
          *     fails.
          */
-        get: operations["list_credentials"];
+        get: operations["list_platform_admin_credentials"];
         put?: never;
         /**
          * Mint a credential for an existing platform principal.
@@ -399,7 +399,7 @@ export interface paths {
          *     Returns a stable Wyrd error when the caller is unauthorized, the principal
          *     does not exist, or the write fails.
          */
-        post: operations["issue_credential"];
+        post: operations["issue_platform_admin_credential"];
         delete?: never;
         options?: never;
         head?: never;
@@ -433,7 +433,7 @@ export interface paths {
          *     Returns a stable Wyrd error when the caller is unauthorized, the credential
          *     is not this principal's or is already retired, or the write fails.
          */
-        delete: operations["revoke_credential"];
+        delete: operations["revoke_platform_admin_credential"];
         options?: never;
         head?: never;
         patch?: never;
@@ -513,7 +513,7 @@ export interface paths {
          *     Returns a stable Wyrd error when the caller is unauthorized or the delete
          *     fails.
          */
-        delete: operations["remove_connection"];
+        delete: operations["remove_platform_connection"];
         options?: never;
         head?: never;
         patch?: never;
@@ -735,7 +735,7 @@ export interface paths {
          *     # Errors
          *     Returns authentication, permission, or storage errors.
          */
-        get: operations["list_credentials"];
+        get: operations["list_provider_credentials"];
         put?: never;
         post?: never;
         delete?: never;
@@ -803,7 +803,7 @@ export interface paths {
          *     Returns `GatewayInvalidConfiguration` for an invalid name, `GatewayResourceNotFound`
          *     when absent, and authentication, permission, or storage errors.
          */
-        post: operations["revoke_credential"];
+        post: operations["revoke_provider_credential"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1991,7 +1991,7 @@ export interface paths {
          *     Returns a stable Wyrd error when the caller lacks `operators:read` or the
          *     read fails.
          */
-        get: operations["list_connections"];
+        get: operations["list_operator_connections"];
         put?: never;
         /**
          * Create one Operator connection and return its redacted view.
@@ -9471,7 +9471,7 @@ export interface operations {
             };
         };
     };
-    list_credentials: {
+    list_platform_admin_credentials: {
         parameters: {
             query?: never;
             header?: never;
@@ -9530,7 +9530,7 @@ export interface operations {
             };
         };
     };
-    issue_credential: {
+    issue_platform_admin_credential: {
         parameters: {
             query?: never;
             header?: never;
@@ -9593,7 +9593,7 @@ export interface operations {
             };
         };
     };
-    revoke_credential: {
+    revoke_platform_admin_credential: {
         parameters: {
             query?: never;
             header?: never;
@@ -9865,7 +9865,7 @@ export interface operations {
             };
         };
     };
-    remove_connection: {
+    remove_platform_connection: {
         parameters: {
             query?: never;
             header?: never;
@@ -10701,7 +10701,7 @@ export interface operations {
             };
         };
     };
-    list_credentials: {
+    list_provider_credentials: {
         parameters: {
             query?: never;
             header?: never;
@@ -10987,7 +10987,7 @@ export interface operations {
             };
         };
     };
-    revoke_credential: {
+    revoke_provider_credential: {
         parameters: {
             query?: never;
             header?: never;
@@ -15834,7 +15834,7 @@ export interface operations {
             };
         };
     };
-    list_connections: {
+    list_operator_connections: {
         parameters: {
             query?: never;
             header?: never;

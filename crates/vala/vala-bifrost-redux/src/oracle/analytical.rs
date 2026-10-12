@@ -4711,12 +4711,18 @@ mod tests {
     /// driver observes it, moves the graph to draining, cancels it, and runs
     /// the same joined settlement every other terminal path runs.
     ///
+    /// A sibling graph whose attempt retains a driver that never observes
+    /// cancellation holds its own settlement open across the target's whole
+    /// deadline, which is what proves the driver settles concurrently rather
+    /// than serially: a slow cleanup may not stop the driver from cancelling
+    /// another graph on time.
+    ///
     /// # Panics
     ///
     /// Panics when a live `ExecuteTask`-first graph is released by the end of
-    /// its unary request, when it outlives its signed deadline, or when the
-    /// bounded settlement queue cannot hold one wake plus one settlement per
-    /// admitted graph.
+    /// its unary request, when it outlives its signed deadline, when a blocked
+    /// sibling settlement delays it, or when the bounded settlement queue
+    /// cannot hold one wake plus one settlement per admitted graph.
     #[tokio::test]
     async fn execute_task_first_without_set_plan_settles_at_signed_deadline() {
         let now = Utc::now();
@@ -4731,13 +4737,27 @@ mod tests {
             "the settlement queue must hold one wake plus one settlement per admitted graph"
         );
 
-        // The sibling activates first and is handed to the driver immediately.
-        let (sibling_graph, sibling_message, sibling_grant) =
+        // The sibling activates first and is handed to the driver immediately,
+        // with one retained driver that keeps its settlement join from
+        // completing until the gate opens.
+        let (sibling_graph, mut sibling_message, sibling_grant) =
             fixture.sibling(now, now + chrono::Duration::seconds(60));
-        fixture
+        sibling_message.operation = StageOperationV1::SetPlan;
+        sibling_message.task_id = None;
+        let sibling_attempt = fixture
             .send(&sibling_message, now)
             .await
             .expect("the reserving leader activates the sibling graph");
+        let (gate, gate_closed) = tokio::sync::oneshot::channel::<()>();
+        fixture
+            .supervisor
+            .retain_driver(
+                sibling_attempt,
+                tokio::spawn(async move {
+                    let _ = gate_closed.await;
+                }),
+            )
+            .expect("the sibling's live attempt retains one driver");
         drop(
             fixture
                 .ingress
@@ -4760,7 +4780,8 @@ mod tests {
             "a completed unary ExecuteTask must not release valid work"
         );
 
-        // Past the signed deadline the target settles and releases everything.
+        // Past the signed deadline the target settles and releases everything,
+        // while the sibling's blocked settlement is still in flight.
         tokio::time::timeout(Duration::from_secs(3), async {
             while fixture.ingress.published(fixture.graph).is_ok() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4780,8 +4801,14 @@ mod tests {
             fixture.supervisor.graph_runtime(fixture.graph).is_err(),
             "a settled graph released its supervisor registration and query runtime"
         );
+        assert!(
+            fixture.ingress.published(sibling_graph).is_ok(),
+            "the blocked sibling is still owned by the same driver"
+        );
 
-        // Shutdown joins the one driver rather than a detached cleanup task.
+        // Opening the gate lets the sibling's own settlement complete, and
+        // shutdown joins the one driver rather than a detached cleanup task.
+        drop(gate);
         let inspection = tokio::time::timeout(Duration::from_secs(10), fixture.ingress.shutdown())
             .await
             .expect("the one settlement driver joins within the bound")

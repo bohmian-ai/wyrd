@@ -1397,7 +1397,7 @@ mod tests {
 
     /// A media URI's private object key reaches neither the judge error nor
     /// the log: an absent object, a foreign tenant's object, and a storage
-    /// read failure (the key names a directory) each yield only the binding
+    /// read failure (the key's parent is a regular file) each yield only the binding
     /// ID and a fixed category, and a read failure stays retryable.
     #[tokio::test]
     async fn media_failures_name_only_the_binding_and_a_category() {
@@ -1409,8 +1409,10 @@ mod tests {
         ));
         let tenant = DataTenantId::new_v7();
         let card = uuid::Uuid::now_v7();
-        let directory = format!("{tenant}/cards/{card}/{LOCATOR_SENTINEL}-dir.png");
-        std::fs::create_dir_all(root.path().join(&directory)).expect("the directory exists");
+        let parent = format!("{tenant}/cards/{card}/{LOCATOR_SENTINEL}-file");
+        std::fs::create_dir_all(root.path().join(format!("{tenant}/cards/{card}")))
+            .expect("the card directory exists");
+        std::fs::write(root.path().join(&parent), b"x").expect("the parent file exists");
         let media = TenantMedia { storage, tenant };
 
         let mut reasons = Vec::new();
@@ -1426,7 +1428,7 @@ mod tests {
                 ),
                 false,
             ),
-            (format!("file:///{directory}"), true),
+            (format!("file:///{parent}/x.png"), true),
         ] {
             let reason = match media.resolve(&descriptor(&uri, "image/png")).await {
                 Err(JudgeError::Terminal { reason }) if !retryable => reason,

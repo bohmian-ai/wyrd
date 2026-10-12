@@ -14,8 +14,8 @@ mod pg_tests {
     ///
     /// # Panics
     ///
-    /// Panics when a migration fails, an owned schema is missing, or a
-    /// retired relation or function still resolves after migrating.
+    /// Panics when a migration fails, an owned schema is missing, or
+    /// `vala.drift_alerts` still resolves after migrating.
     #[tokio::test]
     async fn vala_migrations_apply_and_are_idempotent() {
         let Ok(dsns) = ResolvedDsns::from_env() else {

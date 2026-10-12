@@ -709,7 +709,7 @@ fn query_audit_event(
 /// Locked T1 projection of one immutable local Oracle read decision.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BifrostQueryReadDecision {
-    /// Exact validated T1 detail appended to the tenant audit chain.
+    /// Exact validated T1 detail staged on the tenant audit history.
     detail: AuditDetail,
 }
 
@@ -758,7 +758,7 @@ pub struct BifrostSecurityViolation {
 /// Audit writer that accepts every decision without persisting it.
 ///
 /// Peer transport and fencing proofs assert on routing, reservation, and frame
-/// behavior, not on the audit chain. Binding this writer keeps the worker's
+/// behavior, not on audit history. Binding this writer keeps the worker's
 /// real non-blocking audit call on the path while removing the Postgres
 /// dependency those proofs do not need. Any test that asserts audit content
 /// must use a writer that actually records.

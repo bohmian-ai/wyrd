@@ -210,8 +210,6 @@ impl CloseoutJourney {
     /// Panics if the real role graph cannot start or its observer is absent.
     async fn start_with_config(config: ForgeConfig) -> Self {
         let profile = GeometryProfile::selected();
-        // The one worker drains only the journey's tables, so the tenant's audit
-        // table cannot take a slot a geometry or competing-table plan is owed.
         let mut spec = BifrostClusterSpec::dedicated_forge_workers().with_scribe_geometry_for_test(
             vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
                 .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
@@ -1427,7 +1425,9 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         journey.rewrite_snapshot_count(&table.binding).await,
         "every snapshot the rewrite passes published carries its own operation"
     );
-    // Ownership is judged once every role has drained, when every attempt
+    // Audited reads above keep publishing retained audit, so the coordinator
+    // can plan and start audit-log maintenance after the last drain. Ownership
+    // is therefore judged once every role has drained, when every attempt
     // guard must have returned its increment.
     let telemetry = journey.cluster.telemetry().clone();
     journey.cluster.shutdown().await.expect("all roles drain");

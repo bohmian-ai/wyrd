@@ -26,7 +26,8 @@ use wyrd_spec::vala::api::PhysicalLayoutWire;
 /// `AssertionResult` as a Variant, because a task has no detail table; a
 /// completed Drift execution that could not score valid input sets none, which
 /// is recorded rather than fabricated.
-/// The managed `run_id` is the Verifier run and the managed `card_uid` is the
+/// The managed `run_id` is the application Run judged, null when there is
+/// none, as for scheduled Drift; the managed `card_uid` is the
 /// Verifier Card; the verified subject and binding owner are separate payload
 /// columns, both null for a direct Verifier run with no binding.
 pub struct ResultsTable;
@@ -82,7 +83,7 @@ impl DomainTable for ResultsTable {
     const NAMESPACE: &'static str = "verification";
     /// Table segment of the fixed `vala.verification.results` FQN.
     const NAME: &'static str = "results";
-    /// The server appends and stamps the managed Verifier `run_id`, Verifier `card_uid`, and `principal_id`.
+    /// The server appends and stamps the managed judged-Run `run_id`, Verifier `card_uid`, and `principal_id`.
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     /// The implementation summaries make projecting this table require the elevated payload permission.
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;

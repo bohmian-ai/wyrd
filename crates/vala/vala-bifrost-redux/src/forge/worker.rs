@@ -3649,7 +3649,8 @@ impl ForgeWorker {
     /// pre-effect durable work performed, so releasing the claim is lossless: a
     /// successor reclaims the `retryable` task immediately. This is deliberately
     /// distinct from crash recovery, where cancellation is never observed and
-    /// the claim is retained for `reclaim_expired` after its lease TTL.
+    /// the claim is retained for [`ForgeTasks::reclaim_expired_attempts`] after
+    /// its lease TTL.
     ///
     /// The release is guarded to pre-effect ownership. [`ForgeTasks::retry`]
     /// matches only `state IN ('claimed','running')` for this attempt and owner,

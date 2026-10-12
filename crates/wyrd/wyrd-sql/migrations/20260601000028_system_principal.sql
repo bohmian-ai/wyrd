@@ -86,9 +86,6 @@ BEGIN
     RETURN provisioned;
 END $$;
 
-REVOKE ALL ON FUNCTION wyrd.provision_system_principal() FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION wyrd.provision_system_principal() TO wyrd_app, wyrd_platform_admin;
-
 -- ---------------------------------------------------------------------------
 -- Backfill every existing data tenant
 --

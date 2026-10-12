@@ -2,14 +2,13 @@
 //!
 //! Gate hands every Eval observation frame Scribe has durably acknowledged to
 //! [`ObservationEnqueue`], which derives each row's exact `record_id`,
-//! subject, and committed `wyrd_event_time`, tags it with the Card the writing
+//! subject, and `created_at`, the table's time column, tags it with the Card the writing
 //! principal is bound to, and stages one run request per record on the
 //! [`ObservationRunOutbox`] without waiting. A Card-bound writer activates only
 //! the bindings its Card owns on the subject; a writer bound to no Card, such
 //! as a user, activates every `observations_ready` binding of the subject. Gate
 //! hands over only the acknowledgement that first committed a batch, so a
-//! suppressed replay never queues and its later receipt instant can never be
-//! frozen as a run's event time.
+//! suppressed replay never queues a second run.
 //!
 //! The generic [`Outbox`] owns the unbounded queue, per-tenant batching,
 //! retry with backoff, and shutdown; [`ObservationRunSink`] is its one durable
@@ -117,17 +116,18 @@ impl ObservationEnqueue {
 }
 
 impl ObservationAck for ObservationEnqueue {
-    /// Decodes the acknowledged frame's records and stages one run request
-    /// per record, tagged with the Card `auth`'s principal is bound to as its
-    /// writer, without waiting.
+    /// Decodes the acknowledged frame's records, keyed by the `card_uid`
+    /// Scribe authorized and stored, and stages one run request per record,
+    /// tagged with the Card `auth`'s principal is bound to as its writer,
+    /// without waiting.
     ///
     /// A writer bound to no Card is staged without a writer, so its records
     /// activate every matching binding of their subject. A frame that does
     /// not decode is logged and counted as lost; the acknowledged
     /// observation is never affected.
-    fn acknowledged(&self, auth: &AuthContext, frame: Bytes, receipt_micros: i64) {
+    fn acknowledged(&self, auth: &AuthContext, frame: Bytes) {
         let writer = bound_card(&auth.principal);
-        match EvalObservationsTable::acknowledged(&frame, &auth.principal, receipt_micros) {
+        match EvalObservationsTable::acknowledged(&frame) {
             Ok(keys) => {
                 for key in keys {
                     self.runs.stage(
@@ -136,7 +136,7 @@ impl ObservationAck for ObservationEnqueue {
                             subject: key.card_uid,
                             writer: writer.clone(),
                             record_id: key.record_id,
-                            event_time: key.event_time,
+                            event_time: key.created_at,
                         },
                     );
                 }

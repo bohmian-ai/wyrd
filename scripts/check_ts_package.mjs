@@ -177,6 +177,14 @@ try {
     throw new Error("platform addon manifest points at TypeScript");
   }
   console.log(`packed @wyrd/sdk with ${platformManifest.name} and imported compiled facade`);
+  if (process.argv.length > 2) {
+    const { stdout, stderr } = await exec(process.argv[2], process.argv.slice(3), {
+      cwd: repository,
+      env: { ...process.env, WYRD_TEST_INSTALLED_CLI: join(staging, "node_modules", ".bin", "wyrd") },
+    });
+    process.stdout.write(stdout);
+    process.stderr.write(stderr);
+  }
 } finally {
   await rm(staging, { recursive: true, force: true });
 }

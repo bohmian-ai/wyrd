@@ -19,7 +19,7 @@
 [tools]
 node = "26.2.0"
 uv = "0.11.16"
-rust    = "1.97.1"
+rust    = "1.98.1"
 "npm:pnpm" = "11.4.0"
 cmake = "3.26.4"
 protoc = "33.2"
@@ -161,6 +161,19 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 hide = true
 description = "Run the real-server CLI Card lifecycle journey with its lifecycle already provisioned"
 run = "cargo test --locked -p wyrd-cli --test cli -- --nocapture --test-threads=1"
+
+[tasks."test:local-dev:journey"]
+description = "Installed CLI bootstrap and fresh saved-config Rust, Python, TypeScript, and MCP callers"
+depends = ["py:setup", "ts:build", "ts:build:testing"]
+run = [
+  "cargo build --locked -p wyrd-cli -p wyrd-server",
+  "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads)'",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[exit]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]",
+  "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]",
+]
 
 [tasks."test:wyrdstate:journey"]
 description = "Run the real-server CLI and Rust SDK typed WyrdState and gateway administration journeys"
@@ -447,8 +460,8 @@ description = "Tier-1 journeys: the scoped observation surface over one WyrdStat
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:observe:inner'"
 [tasks."test:bifrost:journey:observe:inner"]
 hide = true
-description = "wyrd-sdk-rust observe_a_run, query_bifrost, otel_export, and local_development stories"
-run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development)::/)'"
+description = "wyrd-sdk-rust observe_a_run, query_bifrost, otel_export, local_development, and support_desk stories"
+run = "cargo nextest run --locked -p wyrd-sdk-rust --test integration -P journey --run-ignored=all -E 'test(/^(observe_a_run|query_bifrost|otel_export|local_development|support_desk)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'"
 
 [tasks."test:bifrost:journey:drift"]
 description = "Tier-1 journeys: Verifiers judge in real time, and a failed scheduled drift run alerts its Operator"
@@ -552,6 +565,46 @@ fi
 phase 30 20 cargo run --locked --release -p wyrd-testing --bin capacity -- "${binary[@]}" "$@"' _
 '''
 
+[tasks."bench:bifrost:query-capacity"]
+description = "Opt-in benchmark (the capacity binary's query-capacity workload): one release wyrd-server started through the local-development journey (migrate, serve, setup) on the whole host, Linux or macOS (the report title carries the host fingerprint; compare only matching hosts), driven through the public Rust client, once with the rows held in the memtable (hot) and once, under a fresh Postgres, with them published as Parquet (WYRD_MAX_FILE_RETENTION_TIME=30, waiting until nothing is in a memtable or staged), each checked and reported under target/bifrost-query-capacity/<mode>/<tier>/: write 10M events, check every answer, selective and small-aggregate sweeps, medium, table, broad-window and full-scan reads, reads while writing, and a full query queue. `-- --fixture telemetry` instead exports 10M GenAI/HTTP spans over OTLP gRPC into vala.traces.spans, checks exact answers, and on Parquet judges which span attribute keys shred. `-- --heavy` writes 100M rows and runs the broad window and full scan on Parquet only. Always builds with frame pointers into target/profiling and records each query window of the server with perf under <tier>/profiles/, printing a per-query latency Pareto from the Oracle query profile and a CPU Pareto by crate. Fails on any FAIL row. Part of no gate or verify lane."
+run = '''
+bash -lc '
+set -uo pipefail
+target=target/profiling
+export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
+cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
+tiers=(hot parquet)
+[[ " $* " == *" --heavy "* ]] && tiers=(parquet)
+status=0
+for tier in "${tiers[@]}"; do
+  scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" query-capacity --tier "$tier" "$@" || status=1
+done
+exit "$status"' _
+'''
+
+[tasks."bench:bifrost:write-capacity"]
+description = "Opt-in benchmark: the capacity binary's query-capacity workload in --writes mode. One release wyrd-server with production Scribe settings (one shard, Parquet rotation and publication on) on the whole host, driven through the public Rust client: 10M events written per step at 1, 4, 16 and 64 writers into one table, each step recorded with perf under target/bifrost-query-capacity/writes/parquet/profiles/ and reported in retained Arrow MB/s, MB/s per server core and rows/s, with each write-path stage's mean time per batch, fsyncs per batch and a CPU Pareto by crate. `-- --fixture telemetry` or `-- --fixture logs` sweeps OTLP gRPC exports instead (2M fresh spans into vala.traces.spans, or 2M ~1 KiB-body Kubernetes log records into vala.logs.records, per step, under target/bifrost-query-capacity/{telemetry,logs}-writes/parquet/), additionally reported in OTLP wire MiB/s and wire MiB/s and rows/s per server core, and judged on the fastest step: at least 200k rows/s and 30 MiB/s OTLP wire per server core. The native sweep fails on any step under 200k rows/s. Part of no gate or verify lane."
+run = '''
+bash -lc '
+set -uo pipefail
+target=target/profiling
+export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only RUSTFLAGS="-C force-frame-pointers=yes"
+cargo build --locked --release -p wyrd-server -p wyrd-testing --bin wyrd-server --bin capacity --target-dir "$target" || exit 1
+scripts/postgres/with-test-postgres.sh -- "$target/release/capacity" query-capacity --tier parquet --writes "$@"' _
+'''
+
+[tasks."bench:bifrost:client-queue"]
+description = "Opt-in benchmark (AC-041, the capacity binary's client-queue workload): one release cloud wyrd-server over the storage emulators' RustFS service and its provisioned test bucket, on the whole host (report.json's envelope carries the host fingerprint), started through the local-development journey. One WyrdState emits open-loop Drift observations of 100 features: 500 obs/s for --seconds (default 60) with the default queue, judged on zero QUEUE_FULL, flat client bytes, drain within 1 s and exactly 100 durable rows per record_id; then a 1,000 obs/s step, a 50 ms acknowledgement-delay step and a --max-in-flight sweep (default 1,2,4,8), reported only. Writes target/bifrost-client-queue/. Part of no gate or verify lane."
+env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
+run = '''
+docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml up -d --wait rustfs
+docker compose -f crates/wyrd/wyrd-storage/docker/docker-compose.yml run --rm rustfs-setup
+scripts/postgres/with-test-postgres.sh -- bash -lc '
+set -euo pipefail
+cargo build --locked --release -p wyrd-server --features cloud
+cargo run --locked --release -p wyrd-testing --bin capacity -- client-queue "$@"' _
+'''
+
 [tasks."bench:bifrost:forge-capacity"]
 description = "Opt-in benchmark (forge-concurrent-planning Scenario 4, about 25 min): samples host load first and discards the run (exit 2) unless 8 host CPUs are free; drives the in-process Forge schedule (10,000 tracked / 1,000 due) open-loop with 32 compactors at the production pull rate (6.4 pulls/s), 10x and rising multiples to the p99 knee; starts one release cloud wyrd-server leader (WYRD_TARGET=server, 1 CPU / 4 GiB systemd scope) in peer mode over the storage emulators' RustFS bucket and test Postgres; per fleet size registers a fresh set of --tables (default 128) public tables with compaction on at the default type and target and a trigger equal to --backlog-snapshots (default 2), writes them through Scribe with no worker running until every table holds that many snapshots, probes the live leader's peer pull route open-loop at 1x and 10x under the first fill's writes, then stops the writes and drains the backlog with 1, 2, then 3 fresh dedicated WYRD_TARGET=forge-worker replicas (7/3 CPU / 4 GiB each; 8 CPU / 16 GiB in all). Gates p99 commit/pull/report decisions below 1 ms at 1x and 10x in-process and on the live leader's bifrost_forge_leader_decision_seconds, 2- and 3-worker drain rates at 1.7x and 2.5x one worker, no pull answered short while a table stayed due (leader debug log), and leader CPU below 70%; records rewrites/s, bytes/s, the bounding resource and Postgres and RustFS utilization. Builds with wyrd-server/cloud to commit table properties as an operator. Writes target/bifrost-forge-capacity/. Linux with a delegating systemd user manager; part of no gate or verify lane."
 env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
@@ -597,7 +650,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost/test_bifrost_e2e.py tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
+run = "uv run python -m pytest -q -m integration tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -608,7 +661,7 @@ hide = true
 description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-ts/wyrd"
 depends = ["ts:build", "ts:build:testing"]
-run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/local-development.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
+run = "pnpm exec vitest run tests/integration/query-bifrost.test.ts tests/integration/query-results.test.ts tests/integration/variant-tables.test.ts tests/integration/every-iceberg-column-type.test.ts tests/integration/register-a-table-from-a-model.test.ts tests/integration/three-timestamp-types.test.ts tests/integration/table-time-column.test.ts tests/integration/bifrost-write.test.ts tests/integration/otel-export.test.ts tests/integration/otel-signals.test.ts tests/integration/observe-a-run.test.ts tests/integration/observation-surface.test.ts tests/integration/verify-in-real-time.test.ts tests/integration/local-development.test.ts tests/integration/support-desk.test.ts tests/integration/scheduled-drift-alerts-operator.test.ts tests/integration/operator-connections.test.ts tests/integration/operator-connection-refusals.test.ts"
 
 [tasks."verify:bifrost"]
 description = "Complete Bifrost change gate: fmt, Clippy, dependency and tenant-isolation checks, plus every Bifrost test tier and language surface."
@@ -619,19 +672,19 @@ description = """Complete Python SDK gate: fmt, Clippy, codegen, Python format/l
 every Python test tier. py:test:integration selects every integration-marked test, so it already runs the Bifrost,
 gateway, Card, WyrdState, and story journeys. The identity journeys need Keycloak and Dex, which one run owns at a
 time, so every verify task shares the one test:identity:journey dependency and gate runs it once."""
-depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "test:identity:journey"]
+depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "test:identity:journey", "test:local-dev:journey"]
 
 [tasks."verify:rust-sdk"]
 description = """Complete Rust SDK gate: fmt, Clippy, the wyrd-sdk-rust unit tests and every story journey on one
 Postgres lifecycle, plus the shared identity journeys (see verify:python-sdk)."""
-depends = ["check", "test:identity:journey"]
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^saved_user_auth::/)'\""
+depends = ["check", "test:identity:journey", "test:local-dev:journey"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'\""
 
 [tasks."verify:typescript-sdk"]
 description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit
 tests, every integration journey (Bifrost, gateway, and story journeys), plus the shared identity journeys (see
 verify:python-sdk)."""
-depends = ["check", "codegen:check", "ts:napi:check", "ts:pack:check", "ts:format:check", "ts:lints", "ts:typecheck", "ts:test:unit", "ts:test:integration", "test:identity:journey"]
+depends = ["check", "codegen:check", "ts:napi:check", "ts:pack:check", "ts:format:check", "ts:lints", "ts:typecheck", "ts:test:unit", "ts:test:integration", "test:identity:journey", "test:local-dev:journey"]
 
 [tasks."test:rust"]
 description = """Aggregate Rust test gate: the family lanes + storage emulator matrix. Every workspace crate belongs to
@@ -911,8 +964,16 @@ description = "Build the wyrd-server release binary"
 run = "cargo build --release --locked -p wyrd-server --features cloud"
 
 [tasks."test:server:startup"]
-description = "Official image journey: external Postgres, migrate, setup, nginx HTTP and gRPC, restart, migration refusal and retry"
-run = "bash scripts/server/test-startup.sh"
+description = "Official image journeys: the development setup, then the team deployment"
+run = ["mise run test:server:startup:dev", "mise run test:server:startup:prod"]
+
+[tasks."test:server:startup:dev"]
+description = "Official image, development setup: one ordinary login that owns its database, migrate, serve, setup"
+run = "bash scripts/server/test-startup-dev.sh"
+
+[tasks."test:server:startup:prod"]
+description = "Official image, team deployment: platform and tenant logins, migrate, setup, nginx HTTP and gRPC, restart, migration refusal and retry"
+run = "bash scripts/server/test-startup-prod.sh"
 
 [tasks."test:server:peer"]
 description = "Peer mode across real server processes: join and remote query, mTLS-only admission, typed-context and incompatible-protocol refusals"
@@ -1267,6 +1328,22 @@ description = "Run the split-registry gateway workflow example"
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
 run = "uv run python ../../examples/python/workflow_gateway.py"
+
+[tasks."examples:python:support-desk"]
+description = "Run the support desk example against WYRD_SERVER_URL (Python)"
+dir = "sdks/wyrd-sdk-python"
+depends = ["py:setup"]
+run = "uv run python ../../examples/support-desk/python/support_desk.py"
+
+[tasks."examples:rust:support-desk"]
+description = "Run the support desk example against WYRD_SERVER_URL (Rust)"
+run = "cargo run -p wyrd-rust-examples --bin support_desk"
+
+[tasks."examples:typescript:support-desk"]
+description = "Run the support desk example against WYRD_SERVER_URL (TypeScript)"
+dir = "examples/support-desk/typescript"
+depends = ["ts:build"]
+run = "pnpm start"
 
 [tasks."examples:rust:smoke"]
 hide = true
@@ -1630,30 +1707,28 @@ depends = [
 [tasks."db:migrate"]
 hide = true
 description = """Verify wyrd-sql migrations are idempotent against the local docker-compose Postgres.
-Runs as the database owner, as `wyrd-server migrate` does, after checking that the serving
-roles (wyrd_app no-BYPASSRLS, wyrd_platform_admin BYPASSRLS) are present.
+Runs as the platform login that owns the database, as `wyrd-server migrate` does.
 """
 
 run = "scripts/postgres/with-test-postgres.sh -- mise run db:migrate:inner"
 [tasks."db:migrate:inner"]
 hide = true
 description = """Verify wyrd-sql migrations are idempotent against the local docker-compose Postgres.
-Runs as the database owner, as `wyrd-server migrate` does, after checking that the serving
-roles (wyrd_app no-BYPASSRLS, wyrd_platform_admin BYPASSRLS) are present.
+Runs as the platform login that owns the database, as `wyrd-server migrate` does.
 """
 run = "cargo nextest run --locked -p wyrd-sql --test integration -E 'test(=pg_migration::pg_tests::migrations_apply_and_are_idempotent)'"
 
 [tasks."test:sql"]
 hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
-Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
+Brings up Postgres, creates the platform and tenant logins, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
 """
 
 run = "scripts/postgres/with-test-postgres.sh -- mise run test:sql:inner"
 [tasks."test:sql:inner"]
 hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
-Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
+Brings up Postgres, creates the platform and tenant logins, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
 """
 run = """
 cargo nextest run --locked -p wyrd-sql --test-threads=1
@@ -1685,11 +1760,6 @@ run = "bash scripts/postgres/test-contract.sh"
 hide = true
 description = "Prove two isolated Postgres wrappers use distinct projects and ports"
 run = "bash scripts/postgres/test-concurrency.sh"
-
-[tasks."test:postgres:roles"]
-hide = true
-description = "Audit production-shaped Postgres role attributes, memberships, and connectivity"
-run = "bash scripts/postgres/test-roles.sh"
 
 [tasks."test:postgres:inventory"]
 hide = true

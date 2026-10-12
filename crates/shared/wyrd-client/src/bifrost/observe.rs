@@ -40,7 +40,7 @@ pub fn record(
             table,
             schema,
             json,
-            correlation.card_ref,
+            correlation.card_uid,
             correlation.run_id,
         )
         .is_err()

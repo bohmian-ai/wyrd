@@ -6,10 +6,12 @@ use crate::auth::AuthCommand;
 use crate::card::{ApplyArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, LoadArgs, PlanArgs};
 use crate::eval::run::EvalCommand;
 use crate::gateway::GatewayCommand;
+use crate::mcp::McpCommand;
 use crate::operator_connection::OperatorConnectionCommand;
 use crate::platform::PlatformCommand;
 use crate::principal::PrincipalCommand;
 use crate::query::QueryCommand;
+use crate::server::ServerCommand;
 use crate::workflow::WorkflowCommand;
 
 /// Wyrd command-line interface.
@@ -59,6 +61,8 @@ impl Cli {
                 .map_err(Into::into),
             Command::Query(command) => crate::query::dispatch(command).await,
             Command::Gateway(command) => command.dispatch().await,
+            Command::Server(command) => command.dispatch().await.map_err(Into::into),
+            Command::Mcp(command) => command.dispatch().await,
             Command::Workflow(command) => command.dispatch().await.map_err(Into::into),
         }
     }
@@ -104,6 +108,12 @@ pub enum Command {
     Gateway(GatewayCommand),
     /// Run Workflows locally or on the server, and inspect or cancel server runs.
     Workflow(WorkflowCommand),
+    /// Install and manage the official Wyrd server for this host.
+    #[command(subcommand)]
+    Server(ServerCommand),
+    /// Connect MCP hosts to Wyrd and serve Wyrd's tools to them.
+    #[command(subcommand)]
+    Mcp(McpCommand),
 }
 
 /// Structural checks over the assembled command tree.

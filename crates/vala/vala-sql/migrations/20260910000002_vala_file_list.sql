@@ -74,17 +74,8 @@ ALTER TABLE vala.file_list FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.file_list
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON vala.file_list TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
--- OperatorPool grants (wyrd_platform_admin BYPASSRLS). BYPASSRLS skips RLS
--- policies but NOT privilege checks. Scribe INSERTs via TenantConn (RLS-bound);
--- Forge/Oracle maintenance work goes through OperatorPool (audited).
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wyrd_platform_admin') THEN
-    RAISE EXCEPTION 'wyrd_platform_admin missing — run bootstrap/roles.sql / db:setup-roles';
-  END IF;
-END $$;
-
-GRANT SELECT, INSERT, UPDATE ON vala.file_list TO wyrd_platform_admin;
-
--- wyrd_app grants for tenant-scoped work via TenantConn.
-GRANT SELECT, INSERT, UPDATE ON vala.file_list TO wyrd_app;
+-- Scribe INSERTs via TenantConn (RLS-bound); Forge/Oracle maintenance work goes
+-- through OperatorPool (audited).

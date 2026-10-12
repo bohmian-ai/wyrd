@@ -1388,7 +1388,6 @@ async fn run_worker_over_invalid_prepared_evidence(
     server: &WyrdTestServer,
     observer: &vala_bifrost_redux::forge::ForgeWorkerCompletionObserver,
     table: &str,
-    arm_release_failure: bool,
 ) -> (String, uuid::Uuid, sqlx::PgPool) {
     register_forge_table(server, table).await;
     let pool = server
@@ -1404,9 +1403,6 @@ async fn run_worker_over_invalid_prepared_evidence(
     )
     .await;
     prepare_lapsed_attempt(&pool, task_id, UNRETAINED_EVIDENCE).await;
-    if arm_release_failure {
-        observer.fail_next_lease_release();
-    }
     let stop = server.state().shutdown_token.child_token();
     let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
@@ -1447,8 +1443,7 @@ async fn prepared_evidence_validation_failure_never_publishes_ready() {
         .expect("the default target selects Forge")
         .worker_readiness();
     let (error, task_id, pool) =
-        run_worker_over_invalid_prepared_evidence(&server, &observer, "prepared_validation", false)
-            .await;
+        run_worker_over_invalid_prepared_evidence(&server, &observer, "prepared_validation").await;
     assert!(
         error.contains("Prepared evidence snapshot is no longer retained"),
         "recovery returned an unrelated error: {error}"
@@ -1465,48 +1460,6 @@ async fn prepared_evidence_validation_failure_never_publishes_ready() {
     assert_eq!(
         state, "prepared",
         "invalid evidence was settled instead of retained for a later owner"
-    );
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// A reconciliation failure stays the reported error when its table-lease
-/// release fails too.
-///
-/// Both failures are fatal, but they are not equally diagnostic: the release
-/// failure is downstream of a reconciliation that already refused to proceed,
-/// so surfacing the release error would name the wrong cause.
-///
-/// # Panics
-///
-/// Panics when the release failure displaces the reconciliation error or
-/// readiness survives the pair.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reconciliation_failure_outranks_its_release_failure() {
-    let (server, observer) = Box::pin(server_with_forge_observer()).await;
-    let readiness = server
-        .state()
-        .forge()
-        .expect("the default target selects Forge")
-        .worker_readiness();
-    let (error, _, _) =
-        run_worker_over_invalid_prepared_evidence(&server, &observer, "prepared_release", true)
-            .await;
-    assert!(
-        error.contains("Prepared evidence snapshot is no longer retained"),
-        "the release failure displaced the reconciliation error: {error}"
-    );
-    assert!(
-        !error.contains("injected Forge lease release failure"),
-        "the secondary release failure was reported as the cause: {error}"
-    );
-    assert!(
-        !observer.lease_release_failure_armed(),
-        "the release site was never reached, so nothing outranked anything"
-    );
-    assert!(
-        !readiness.is_ready(),
-        "a worker advertised ready after a fatal reconciliation and release pair"
     );
     server.shutdown().await.expect("test server shuts down");
 }
@@ -2035,23 +1988,22 @@ async fn live_foreign_claim_does_not_block_readiness() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// A worker whose table-fence release fails after a durable settlement returns
-/// that release error, clears readiness, and recovers on respawn.
+/// A worker whose failed attempt cannot settle durably returns that settlement
+/// error, clears readiness, and recovers on respawn.
 ///
-/// The settlement itself already committed, so the release failure is the only
-/// unsafe part: the fence is still held by an owner that is no longer running
-/// it. Readiness must clear before anything can claim behind that fence, and
-/// the stopping worker must take no further work of its own — newly eligible
+/// The claim is still held by an owner that can no longer prove what it did.
+/// Readiness must clear before anything is routed to that owner, and the
+/// stopping worker must take no further work of its own — newly eligible
 /// demand has to wait for a successor.
 ///
 /// # Panics
 ///
-/// Panics when the release failure is swallowed, readiness survives it, the
+/// Panics when the settlement failure is swallowed, readiness survives it, the
 /// stopping worker claims newly eligible work, or the respawned worker does not
 /// recover.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn release_failure_clears_readiness() {
+async fn settlement_failure_clears_readiness() {
     let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
         .install_recorder()
         .expect("process-local Prometheus recorder");
@@ -2076,25 +2028,23 @@ async fn release_failure_clears_readiness() {
         .expect("the worker composes");
     let mut handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
     // The fault is a one-shot, so it is armed only after the recovery drain has
-    // published ready. Arming it before startup would spend it on a recovery
-    // release and leave the claim under test running unfaulted.
+    // published ready.
     await_forge_role(
         &server,
         true,
         wyrd_server::state::Forge::worker_readiness,
-        "worker before its release fault is armed",
+        "worker before its settlement fault is armed",
     )
     .await;
     observer.hold_before_fatal_observation_for_test();
-    observer.fail_next_lease_release();
+    observer.fail_next_failure_settlement();
 
-    // A well-formed payload on a table this catalog does not carry reaches the
-    // table fence, settles its attempt durably, and then releases: exactly the
-    // ordering this fault needs.
+    // A well-formed payload on a table this catalog does not carry fails its
+    // attempt, so its settlement is the one this fault meets.
     let task_id = seed_ready_forge_task(
         &pool,
         uuid::Uuid::from(server.data_tenant_id()),
-        "release_only",
+        "settlement_only",
         "small_files",
         LIVE_REWRITE_PLAN,
     )
@@ -2110,18 +2060,18 @@ async fn release_failure_clears_readiness() {
         stop.cancel();
         handle.abort();
         panic!(
-            "release attempt did not reach its barrier: ready={}, attempts={}",
+            "settlement attempt did not reach its barrier: ready={}, attempts={}",
             readiness.is_ready(),
             observer.attempts()
         );
     }
     assert!(
-        !observer.lease_release_failure_armed(),
-        "the first task consumed the release fault"
+        !observer.failure_settlement_failure_armed(),
+        "the first task consumed the settlement fault"
     );
     assert!(
         !readiness.is_ready(),
-        "known fatal release must close readiness before telemetry"
+        "a known fatal settlement must close readiness before telemetry"
     );
 
     // Demand that becomes eligible while the worker is stopping belongs to a
@@ -2129,7 +2079,7 @@ async fn release_failure_clears_readiness() {
     let successor_work = seed_ready_forge_task(
         &pool,
         uuid::Uuid::from(server.data_tenant_id()),
-        "release_successor_work",
+        "settlement_successor_work",
         "small_files",
         LIVE_REWRITE_PLAN,
     )
@@ -2151,7 +2101,7 @@ async fn release_failure_clears_readiness() {
     let error = if let Ok(outcome) = joined {
         outcome
             .expect("worker joins")
-            .expect_err("the injected release failure is returned")
+            .expect_err("the injected settlement failure is returned")
     } else {
         handle.abort();
         panic!(
@@ -2161,26 +2111,20 @@ async fn release_failure_clears_readiness() {
         )
     };
     assert!(
-        format!("{error}").contains("injected Forge table lease release failure"),
+        format!("{error}").contains("injected Forge failure settlement failure"),
         "the worker returned an unrelated error: {error}"
     );
     assert!(
         !readiness.is_ready(),
-        "a worker still holding an unreleased table fence advertised ready"
+        "a worker holding an unsettled claim advertised ready"
     );
     let rendered = metrics.render();
-    let sample = rendered
-        .lines()
-        .find(|line| {
+    assert!(
+        !rendered.lines().any(|line| {
             line.starts_with("bifrost_forge_task_attempts_total")
                 && line.contains("task_type=\"small_files\"")
-                && line.contains("result=\"retry\"")
-        })
-        .expect("the durable Retryable ownership episode is observed");
-    assert_eq!(
-        sample.rsplit_once(' ').expect("Prometheus sample").1,
-        "1",
-        "{sample}"
+        }),
+        "an attempt whose settlement never committed has no durable result to observe"
     );
     let active = rendered
         .lines()
@@ -2198,10 +2142,10 @@ async fn release_failure_clears_readiness() {
         .bind(task_id)
         .fetch_one(&pool)
         .await
-        .expect("the settled task row is readable");
-    assert_ne!(
-        state, "ready",
-        "the attempt settled before its release failed"
+        .expect("the unsettled task row is readable");
+    assert!(
+        matches!(state.as_str(), "claimed" | "running"),
+        "the unsettled claim is retained for expiry recovery, not released: {state}"
     );
     let after: (String, i32, Option<uuid::Uuid>) = sqlx::query_as(
         "SELECT state,attempt_count,attempt_id FROM vala.forge_tasks WHERE task_id=$1",
@@ -2222,7 +2166,7 @@ async fn release_failure_clears_readiness() {
         "newly eligible work must receive no claim from the stopping worker"
     );
     eprintln!("after worker join: new demand={after:?}; no later claim or attempt");
-    await_forge_role_while_running(&server, "worker after its release recovers").await;
+    await_forge_role_while_running(&server, "worker after its settlement failure recovers").await;
     server.shutdown().await.expect("test server shuts down");
 }
 

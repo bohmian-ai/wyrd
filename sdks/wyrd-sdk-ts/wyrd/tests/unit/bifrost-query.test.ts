@@ -77,26 +77,41 @@ describe("internal native query stream wrapper", () => {
   });
 
   test("failed terminal keeps its step details and status", async () => {
-    const terminal = { outcome: "failed", error: { code: "query_execution_failed", detail: "source unavailable" } };
+    const details = {
+      variant: "variant_invalid_json",
+      data: { field: "parse_json", row: 1, path: "" },
+    };
+    const terminal = {
+      outcome: "failed",
+      error: {
+        type: "https://wyrd.dev/problems/WYRD_VALA_400_VARIANT_INVALID_JSON",
+        title: "Invalid Variant JSON",
+        status: 400,
+        detail: "invalid Variant JSON in field parse_json row 1 at ",
+        code: "WYRD_VALA_400_VARIANT_INVALID_JSON",
+        details,
+        remediation: "Supply valid JSON text.",
+      },
+    };
     const { stream } = fakeStream(
       [
         {
-          errorCode: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
-          errorStatus: 500,
-          errorTitle: "Query execution failed",
-          errorDetail: "source unavailable",
-          errorRemediation: "Inspect the retained terminal error.",
-          errorDetailsJson: JSON.stringify(terminal),
+          errorCode: terminal.error.code,
+          errorStatus: terminal.error.status,
+          errorTitle: terminal.error.title,
+          errorDetail: terminal.error.detail,
+          errorRemediation: terminal.error.remediation,
+          errorDetailsJson: JSON.stringify(details),
         },
       ],
       JSON.stringify(terminal),
     );
 
     await expect(stream.next()).rejects.toMatchObject({
-      code: "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
-      status: 500,
-      detail: "source unavailable",
-      details: terminal,
+      code: "WYRD_VALA_400_VARIANT_INVALID_JSON",
+      status: 400,
+      detail: terminal.error.detail,
+      details,
     });
   });
 

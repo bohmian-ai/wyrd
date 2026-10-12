@@ -194,9 +194,9 @@ fn correlated_resource_spans(anchor: i64) -> Vec<ResourceSpans> {
     resource_spans
 }
 
-/// Builds the negative trace export with each span naming its own `card_ref`.
+/// Builds the negative trace export with each span naming its own `card_uid`.
 ///
-/// Position `i` carries `cards[i]` as its final `wyrd.card_ref`, and a `None`
+/// Position `i` carries `cards[i]` as its final `wyrd.card_uid`, and a `None`
 /// position names no Card, so one export mixes attributable, unattributable,
 /// and uncorrelated siblings.
 fn card_attributed_resource_spans(anchor: i64, cards: [Option<&str>; 3]) -> Vec<ResourceSpans> {
@@ -204,7 +204,7 @@ fn card_attributed_resource_spans(anchor: i64, cards: [Option<&str>; 3]) -> Vec<
     for (span, card) in resource_spans[0].scope_spans[0].spans.iter_mut().zip(cards) {
         if let Some(card) = card {
             span.attributes
-                .push(support::string_attribute("wyrd.card_ref", card));
+                .push(support::string_attribute("wyrd.card_uid", card));
         }
     }
     resource_spans
@@ -484,7 +484,7 @@ mod pg_tests {
     /// An unbound tenant administrator attributes spans to registered Cards.
     ///
     /// The administrator's signed claims name no Card scope, so the Gate
-    /// resolves each span's `wyrd.card_ref` against the tenant registry. A span
+    /// resolves each span's `wyrd.card_uid` against the tenant registry. A span
     /// naming a registered Service is stored with that Card's registry UID, a
     /// span naming no Card is stored uncorrelated, and a span naming an
     /// unregistered Card is rejected alone with the stable scope reason.
@@ -514,11 +514,7 @@ mod pg_tests {
         .await
         .expect("the observed Service is registered");
         let uid = uid.to_string();
-        let identity = wyrd_spec::reference::CardRef {
-            uid: None,
-            ..observed
-        }
-        .to_string();
+        let never_registered = uuid::Uuid::now_v7().to_string();
         let admin = server
             .exchange_api_key(&server.tenant_admin_key().await.expect("tenant admin key"))
             .await
@@ -527,14 +523,7 @@ mod pg_tests {
         let partial = export_traces_over_grpc_as(
             &journey,
             &admin,
-            card_attributed_resource_spans(
-                anchor,
-                [
-                    Some(&identity),
-                    Some("default/Service/never-registered@1.0.0"),
-                    None,
-                ],
-            ),
+            card_attributed_resource_spans(anchor, [Some(&uid), Some(&never_registered), None]),
         )
         .await
         .expect("an unregistered Card rejects its span");
@@ -544,7 +533,7 @@ mod pg_tests {
         );
         assert_eq!(
             partial.error_message,
-            "wyrd.card_ref is outside the principal's Card scope"
+            "wyrd.card_uid is outside the principal's Card scope"
         );
 
         journey.publish().await;

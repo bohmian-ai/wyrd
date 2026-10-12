@@ -206,9 +206,9 @@ where
         (status = 200, description = "OTLP `ExportTraceServiceResponse`, encoded the way \
           the request was, carrying `partial_success` when spans were rejected",
          content_type = "application/x-protobuf"),
-        (status = 400, description = "The export could not be decoded, or an event time fell \
-          outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
-          WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
+        (status = 400, description = "The export could not be decoded, or it touched more \
+          than 32 time partitions of the table (WYRD_VALA_400_OTLP_REQUEST_MALFORMED)",
+         body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token, its \
           `x-wyrd-api-key` (accepted on OTLP routes in place of an access token and verified on \
           every request) is not valid, or the token named no resolvable principal \
@@ -320,9 +320,9 @@ async fn export_traces(
         (status = 200, description = "OTLP `ExportMetricsServiceResponse`, encoded the way \
           the request was, carrying `partial_success` when data points were rejected",
          content_type = "application/x-protobuf"),
-        (status = 400, description = "The export could not be decoded, or an event time fell \
-          outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
-          WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
+        (status = 400, description = "The export could not be decoded, or it touched more \
+          than 32 time partitions of the table (WYRD_VALA_400_OTLP_REQUEST_MALFORMED)",
+         body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token, its \
           `x-wyrd-api-key` (accepted on OTLP routes in place of an access token and verified on \
           every request) is not valid, or the token named no resolvable principal \
@@ -435,9 +435,9 @@ async fn export_metrics(
         (status = 200, description = "OTLP `ExportLogsServiceResponse`, encoded the way \
           the request was, carrying `partial_success` when log records were rejected",
          content_type = "application/x-protobuf"),
-        (status = 400, description = "The export could not be decoded, or an event time fell \
-          outside the accepted window (WYRD_VALA_400_OTLP_REQUEST_MALFORMED, \
-          WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE)", body = WyrdProblem),
+        (status = 400, description = "The export could not be decoded, or it touched more \
+          than 32 time partitions of the table (WYRD_VALA_400_OTLP_REQUEST_MALFORMED)",
+         body = WyrdProblem),
         (status = 401, description = "The request carried no usable access token, its \
           `x-wyrd-api-key` (accepted on OTLP routes in place of an access token and verified on \
           every request) is not valid, or the token named no resolvable principal \
@@ -659,9 +659,7 @@ mod tests {
                 403,
             ),
             (
-                IngestError::CardScopeDenied {
-                    card_ref: "c".to_owned(),
-                },
+                IngestError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
                 403,
             ),

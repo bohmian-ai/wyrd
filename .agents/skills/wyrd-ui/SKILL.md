@@ -51,8 +51,8 @@ The authority is `crates/wyrd/wyrd-server/wyrd-ui/brand/`: read `DESIGN.md` firs
 
 - **Tokens only.** Use `var(--token)` or the Tailwind utilities that resolve through
   `brand/theme.css`. Never hardcode a hex in a component.
-- **Semantics.** `--declare` (indigo) is Declaration, links, selection, focus, and the primary
-  action; `--observe` (green) is observed fact; `--evidence` (lime) is retained Evidence
+- **Semantics.** `--declare` (cobalt/periwinkle) is Declaration, links, selection, focus, and the primary
+  action; `--observe` (lime) is observed fact; `--evidence` (lime) is retained Evidence
   only — never an accent, hover, or secondary action; `--ok`/`--warn`/`--danger` keep status
   meaning and always pair with a glyph or word.
 - **Geometry.** 1px rules (`--border`, `--border-soft`), 2px radius (`--r`), no decorative

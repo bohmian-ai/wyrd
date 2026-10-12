@@ -19,6 +19,8 @@ ALTER TABLE wyrd.auth_user_identities FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_user_identities
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_user_identities TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 ALTER TABLE wyrd.auth_users ALTER COLUMN email DROP NOT NULL;
 ALTER TABLE wyrd.auth_users DROP CONSTRAINT auth_users_auth_type_check;
@@ -44,3 +46,5 @@ ALTER TABLE wyrd.auth_login_state FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_login_state
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_login_state TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

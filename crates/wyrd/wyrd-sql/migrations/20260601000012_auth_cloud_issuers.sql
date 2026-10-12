@@ -13,8 +13,8 @@
 -- (ON DELETE RESTRICT, Decision 6). A bulk --cascade delete is the only path
 -- to remove an issuer with bindings.
 --
--- Both tables use a combined USING + WITH CHECK tenant_isolation policy so the
--- wyrd_app role can SELECT, INSERT, UPDATE, and DELETE its own tenant's rows.
+-- Both tables use a combined USING + WITH CHECK tenant_isolation policy so a
+-- tenant session can SELECT, INSERT, UPDATE, and DELETE its own tenant's rows.
 -- The 04-seed and 05-CRUD tasks both write these tables; a read-only policy
 -- would silently break both.
 
@@ -59,6 +59,8 @@ ALTER TABLE wyrd.auth_trusted_issuers FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_trusted_issuers
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_trusted_issuers TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Workload identity binding: (tenant, issuer, subject) → CardRef
@@ -92,3 +94,5 @@ ALTER TABLE wyrd.auth_workload_bindings FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_workload_bindings
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_workload_bindings TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

@@ -11,25 +11,29 @@
 -- exchange — rather than in each handler, where it would be a rule every new
 -- route had to remember.
 --
--- `wyrd_app` cannot read `platform.tenants`, and granting it that would widen
+-- Tenant sessions cannot read `platform.tenants`, and admitting them would widen
 -- the tenant plane's reach into the directory for one boolean. A SECURITY
--- DEFINER function, the pattern `platform.resolve_tenant_by_slug` already
--- establishes, answers the one question without exposing the table.
+-- DEFINER operator-session function, the pattern
+-- `platform.resolve_tenant_by_slug` already establishes, answers the one
+-- question without exposing the table.
 CREATE FUNCTION platform.tenant_admits_credentials(p_tenant uuid)
 RETURNS boolean
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
-STABLE
 SET search_path = pg_catalog, platform
 AS $$
+DECLARE
+    prior text := coalesce(current_setting('app.operator', true), '');
+    admits boolean;
+BEGIN
+    PERFORM set_config('app.operator', 'on', true);
     SELECT EXISTS (
         SELECT 1 FROM platform.tenants
         WHERE data_tenant_id = p_tenant
           AND status = 'active'
           AND deleted_at IS NULL
-    )
+    ) INTO admits;
+    PERFORM set_config('app.operator', prior, true);
+    RETURN admits;
+END;
 $$;
-
-REVOKE EXECUTE ON FUNCTION platform.tenant_admits_credentials(uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION platform.tenant_admits_credentials(uuid) TO wyrd_app;
-GRANT EXECUTE ON FUNCTION platform.tenant_admits_credentials(uuid) TO wyrd_platform_admin;

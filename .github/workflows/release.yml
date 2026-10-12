@@ -451,8 +451,10 @@ jobs:
           path: crates/wyrd/wyrd-server/wyrd-ui/build
           retention-days: 1
 
+  # One bundle per local-server target `wyrd server install` selects by
+  # `wyrd-server-<target>.tar.gz`; Linux bundles also feed the images.
   build-server:
-    name: server - ${{ matrix.target_name }}
+    name: server - ${{ matrix.target }}
     needs: [changes, build-ui]
     if: ${{ !cancelled() && needs.build-ui.result == 'success' && (github.event_name == 'release' || needs.changes.outputs.package_server == 'true') }}
     strategy:
@@ -461,10 +463,12 @@ jobs:
         include:
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            target_name: x86_64-linux
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            target_name: aarch64-linux
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -477,6 +481,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system deps
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
 
       - uses: actions/download-artifact@v4
@@ -494,19 +499,23 @@ jobs:
           chmod +x release/wyrd-server
           cp -r crates/wyrd/wyrd-server/wyrd-ui/build release/ui/build
           cp crates/wyrd/wyrd-server/wyrd-ui/package.json release/ui/package.json
-          tar -czf wyrd-server-${{ matrix.target_name }}.tar.gz -C release .
+          tar -czf wyrd-server-${{ matrix.target }}.tar.gz -C release .
 
       - name: Smoke-test and record the server bundle
+        env:
+          BUNDLE: wyrd-server-${{ matrix.target }}.tar.gz
         run: |
           release/wyrd-server --version
-          shasum -a 256 wyrd-server-${{ matrix.target_name }}.tar.gz > SHA256SUMS.wyrd-server-${{ matrix.target_name }}
+          tar -tzf "$BUNDLE" | grep -qx './wyrd-server'
+          tar -tzf "$BUNDLE" | grep -qx './ui/build/'
+          shasum -a 256 "$BUNDLE" > SHA256SUMS.wyrd-server-${{ matrix.target }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wyrd-server-${{ matrix.target_name }}
+          name: wyrd-server-${{ matrix.target }}
           path: |
-            wyrd-server-${{ matrix.target_name }}.tar.gz
-            SHA256SUMS.wyrd-server-${{ matrix.target_name }}
+            wyrd-server-${{ matrix.target }}.tar.gz
+            SHA256SUMS.wyrd-server-${{ matrix.target }}
           retention-days: 1
 
   publish-docker:
@@ -524,9 +533,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            artifact: wyrd-server-x86_64-linux
+            artifact: wyrd-server-x86_64-unknown-linux-gnu
           - arch: arm64
-            artifact: wyrd-server-aarch64-linux
+            artifact: wyrd-server-aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
 
@@ -612,6 +621,22 @@ jobs:
           bash .github/scripts/verify-release-artifacts.sh dist
           cat dist/SHA256SUMS.* > checksums.txt
 
+      # `wyrd server install` trusts a bundle only through checksums.txt
+      # signed by this key; the CLI embeds its public half. Refuse to publish
+      # when the secret is not that key.
+      - name: Sign the release checksums
+        env:
+          WYRD_RELEASE_SIGNING_KEY: ${{ secrets.WYRD_RELEASE_SIGNING_KEY }}
+          PUBLIC_KEY: crates/wyrd/wyrd-cli/src/server/release-signing-key.pem
+        run: |
+          test -n "$WYRD_RELEASE_SIGNING_KEY"
+          key="$(mktemp)"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$WYRD_RELEASE_SIGNING_KEY" > "$key"
+          openssl pkey -in "$key" -pubout | cmp - "$PUBLIC_KEY"
+          openssl pkeyutl -sign -inkey "$key" -rawin -in checksums.txt -out checksums.txt.sig
+          openssl pkeyutl -verify -pubin -inkey "$PUBLIC_KEY" -rawin -in checksums.txt -sigfile checksums.txt.sig
+
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/*.tar.gz
@@ -620,7 +645,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for f in dist/*.tar.gz checksums.txt; do
+          for f in dist/*.tar.gz checksums.txt checksums.txt.sig; do
             gh release upload ${{ github.event.release.tag_name }} "$f" --clobber
           done
 

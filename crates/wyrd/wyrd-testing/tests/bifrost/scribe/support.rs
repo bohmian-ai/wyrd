@@ -10,6 +10,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::geometry::ScribeGeometry;
 use vala_bifrost_redux::scribe::telemetry::{ScribeBucketMemorySnapshot, ScribeInspectionSnapshot};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::api::{PhysicalLayoutWire, TimeGranularityWire};
 use wyrd_testing::WyrdTestServer;
 
 use arrow::datatypes::{DataType, Field};
@@ -40,22 +41,102 @@ pub(super) async fn start_scribe_server_with_geometry(geometry: ScribeGeometry) 
 }
 
 /// Registers one single-column table for a tenant through the real catalog.
+///
+/// The table declares no time column, so every row partitions on the
+/// `wyrd_ingested_at` Scribe stamps on its request.
+///
+/// # Panics
+///
+/// Panics when the catalog refuses the registration.
 pub(super) async fn register_table(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     namespace: BifrostNamespace,
     name: &str,
 ) -> String {
+    register(
+        server,
+        tenant,
+        TableRef::new(namespace, name),
+        value_schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+        None,
+    )
+    .await;
+    format!("{}.{name}", namespace.as_str())
+}
+
+/// Registers one table whose rows partition on the caller's own event time.
+///
+/// The table carries the `value` column plus a non-null [`EVENT_TIME`] column
+/// and declares that column as its hourly time column, which is how a case
+/// selects the physical partition its rows land in instead of accepting the
+/// ingest instant. Rows reach it through [`append_values_at`].
+///
+/// # Panics
+///
+/// Panics when the catalog refuses the registration.
+pub(super) async fn register_timed_table(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    namespace: BifrostNamespace,
+    name: &str,
+) -> String {
+    register(
+        server,
+        tenant,
+        TableRef::new(namespace, name),
+        event_time_schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect(),
+        Some(timed_layout()),
+    )
+    .await;
+    format!("{}.{name}", namespace.as_str())
+}
+
+/// Returns the hourly layout that partitions on [`EVENT_TIME`].
+///
+/// Every table in this suite that selects its own partitions declares exactly
+/// this layout, so a case controls placement only through the value it writes.
+pub(super) fn timed_layout() -> PhysicalLayoutWire {
+    PhysicalLayoutWire {
+        partition_granularity: TimeGranularityWire::Hour,
+        time_column: Some(EVENT_TIME.to_owned()),
+        sort_keys: Vec::new(),
+        bloom_columns: Vec::new(),
+    }
+}
+
+/// Registers one table for a tenant through the real catalog.
+///
+/// The single registration path every Scribe fixture shares, so fixtures
+/// differ only in their fields and layout.
+///
+/// # Panics
+///
+/// Panics when the catalog refuses the registration.
+pub(super) async fn register(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    table: TableRef,
+    user_fields: Vec<Field>,
+    physical_layout: Option<PhysicalLayoutWire>,
+) {
     server
         .create_bifrost_table_for_test(CreateTableRequest {
-            table: TableRef::new(namespace, name),
-            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            table,
+            user_fields,
             tenant,
-            physical_layout: None,
+            physical_layout,
         })
         .await
         .expect("the catalog registers the table");
-    format!("{}.{name}", namespace.as_str())
 }
 
 /// Builds a unique table name for one case.
@@ -102,20 +183,28 @@ pub(super) fn value_schema() -> std::sync::Arc<arrow::datatypes::Schema> {
     )]))
 }
 
-/// Returns the ingress schema that also carries the client's own event time.
+/// The user time column [`register_timed_table`] declares.
+pub(super) const EVENT_TIME: &str = "event_time";
+
+/// Returns the ingress schema [`register_timed_table`] declares.
 ///
-/// `wyrd_event_time` is a managed column: a caller may supply it and Scribe
-/// lifts the value verbatim into the managed slot, which is how a case selects
-/// the physical partition its rows land in rather than accepting wall clock.
+/// [`EVENT_TIME`] is an ordinary non-null user column that the table names as
+/// its time column, so the value a caller writes decides the row's partition.
 pub(super) fn event_time_schema() -> std::sync::Arc<arrow::datatypes::Schema> {
     std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
         Field::new("value", DataType::Int64, false),
-        Field::new(
-            wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
+        event_time_field(),
     ]))
+}
+
+/// Returns the non-null microsecond UTC [`EVENT_TIME`] field [`timed_layout`]
+/// partitions on.
+pub(super) fn event_time_field() -> Field {
+    Field::new(
+        EVENT_TIME,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )
 }
 
 /// Encodes one batch as the native Arrow IPC stream public ingest accepts.
@@ -183,6 +272,9 @@ pub(super) async fn append_batch(
 }
 
 /// Appends one batch whose rows all carry the caller's chosen event time.
+///
+/// The table must be one [`register_timed_table`] registered, so the event time
+/// decides the hour partition every row lands in.
 ///
 /// # Errors
 ///

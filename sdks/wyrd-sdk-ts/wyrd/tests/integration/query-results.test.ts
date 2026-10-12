@@ -46,6 +46,6 @@ test("collected result converts to arrow and ipc bytes", async ({ bifrost }) => 
 // The deadline is range-checked with the rest of the query request.
 test.for([0, 2 ** 32, 1.5, Number.NaN])("out of range deadline is refused: %s", async (deadlineMs, { bifrost }) => {
   await expect(bifrost.stream("SELECT 1", [], { deadlineMs })).rejects.toMatchObject({
-    code: "WYRD_VALA_400_QUERY_INVALID_DEADLINE",
+    code: "WYRD_VALA_400_QUERY_INVALID_SQL",
   });
 });

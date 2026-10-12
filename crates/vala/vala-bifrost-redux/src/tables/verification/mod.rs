@@ -5,4 +5,4 @@
 
 mod results;
 
-pub use results::ResultsTable;
+pub use results::{ASSERTION_RESULT, DRIFT_REPORT, EVAL_SUMMARY, ResultsTable};

@@ -1,52 +1,45 @@
 //! Read-only serving readiness checks over a migrated database.
 //!
 //! Serving Wyrd never runs DDL. Before a serving process reports ready, and
-//! again after the one-off owner migration, each schema owner (`wyrd-sql`,
-//! `vala-sql`) proves through these [`OperatorPool`] checks that its embedded
-//! migrations are applied unchanged, that its tenant tables are isolated by the
-//! policies its migrations create, and that the two serving roles carry exactly
-//! the authority the tenant model assumes. Every check reads the system
-//! catalogs by role name, so it proves the same contract whichever login runs
-//! it; which login each *serving pool* actually uses is checked by the serving
-//! owners themselves.
+//! again after the one-off migration, each schema owner (`wyrd-sql`,
+//! `vala-sql`) proves through these checks that its embedded migrations are
+//! applied unchanged and that every table it owns forces the row-level
+//! security its migrations create. Serving boot also proves each pool's login
+//! can keep that security meaningful: the tenant login is policy-bound, and the
+//! platform login is the operator session that owns Wyrd's objects. Wyrd names
+//! no role; every check reads properties of the connected login and the
+//! catalog.
 
+use sqlx::PgPool;
 use sqlx::migrate::Migrator;
 
-use crate::dsn::{WYRD_APP_ROLE, WYRD_PLATFORM_ADMIN_ROLE};
+use crate::dsn::OPERATOR_SETTING;
 use crate::{OperatorPool, SqlError};
 
-/// Name of the policy every tenant-keyed table uses to confine the app role.
+/// Name of the policy every tenant-keyed table uses to confine tenant sessions.
 const TENANT_ISOLATION_POLICY: &str = "tenant_isolation";
 /// The deparsed `USING` and `WITH CHECK` expression that policy must carry.
 ///
 /// Readiness compares `pg_get_expr` output to this exactly, so a policy keyed
 /// on any other column (for example the row's own `id`) is refused.
 const TENANT_ISOLATION_EXPR: &str = "(data_tenant_id = wyrd.current_tenant())";
+/// Name of the policy every table uses to admit operator sessions.
+const OPERATOR_ACCESS_POLICY: &str = "operator_access";
+/// The deparsed `USING` and `WITH CHECK` expression that policy must carry.
+const OPERATOR_ACCESS_EXPR: &str = "wyrd.operator_session()";
 
-/// Schema-level authority one serving role must hold on an owned schema.
+/// Whether an owned schema's tenant-keyed tables are tenant-visible.
 ///
-/// The closed set of postures Wyrd and Vala migrations establish. Any other
-/// privilege a readiness check observes is drift that widens a serving role.
+/// The closed set of schema postures Wyrd and Vala migrations establish.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaAccess {
-    /// No usage at all; the role must not even resolve the schema's objects.
-    None,
-    /// `USAGE` without `CREATE`: the role uses objects the owner created.
-    Usage,
-    /// `USAGE` and `CREATE`: the role owns DDL inside this one schema.
-    UsageCreate,
-}
-
-impl SchemaAccess {
-    /// Whether this posture includes schema `USAGE`.
-    fn usage(self) -> bool {
-        self != Self::None
-    }
-
-    /// Whether this posture includes schema `CREATE`.
-    fn create(self) -> bool {
-        self == Self::UsageCreate
-    }
+pub enum RowScope {
+    /// Tables carrying `data_tenant_id` admit their tenant through
+    /// `tenant_isolation` and operators through `operator_access`; other
+    /// tables admit operators only.
+    Tenant,
+    /// Platform-plane schema: every table admits operators only, whatever its
+    /// columns, so no tenant session reads the tenant directory.
+    Platform,
 }
 
 impl OperatorPool {
@@ -100,160 +93,120 @@ impl OperatorPool {
         Ok(())
     }
 
-    /// Prove the operator pool itself logs in as exactly `wyrd_platform_admin`.
+    /// Prove this pool is an operator session on the login that owns Wyrd's
+    /// objects.
     ///
-    /// Both the session login and the effective role must match, so neither a
-    /// differently named BYPASSRLS login nor a `SET ROLE` in the DSN passes.
-    ///
-    /// # Errors
-    /// Returns [`SqlError::SchemaNotReady`] naming the observed role when it
-    /// differs, and [`SqlError::Connect`] on query failure.
-    pub async fn verify_platform_login(&self) -> Result<(), SqlError> {
-        let (session, current): (String, String) =
-            sqlx::query_as("SELECT session_user::text, current_user::text")
-                .fetch_one(self.pool())
-                .await
-                .map_err(SqlError::Connect)?;
-        verify_login_name(WYRD_PLATFORM_ADMIN_ROLE, &session, &current)
-    }
-
-    /// Prove both serving roles carry exactly their approved role attributes.
-    ///
-    /// Each role must exist and log in; neither may be a superuser, create
-    /// roles or databases, replicate, create objects in the database, or be a
-    /// member of any other role (membership would inherit grants outside the
-    /// migrations' narrow ones). `wyrd_app` must not bypass row-level security;
-    /// `wyrd_platform_admin` must.
+    /// `operator_access` policies apply only to the owner role and admit only
+    /// sessions with the operator flag, so a platform login that does not own
+    /// the tables in `schemas`, or a session without the flag, would see no
+    /// rows. A superuser is refused: Postgres exempts it from every policy, so
+    /// it proves nothing about the deployment's posture.
     ///
     /// # Errors
-    /// Returns [`SqlError::SchemaNotReady`] naming the first non-conforming
-    /// role, and [`SqlError::Connect`] on query failure.
-    pub async fn verify_serving_roles(&self) -> Result<(), SqlError> {
-        for (role, bypass_rls) in [(WYRD_APP_ROLE, false), (WYRD_PLATFORM_ADMIN_ROLE, true)] {
-            let conforms: Option<bool> = sqlx::query_scalar(
-                "SELECT r.rolcanlogin AND NOT r.rolsuper AND NOT r.rolcreaterole \
-                   AND NOT r.rolcreatedb AND NOT r.rolreplication AND r.rolbypassrls = $2 \
-                   AND NOT has_database_privilege(r.oid, current_database(), 'CREATE') \
-                   AND NOT EXISTS (SELECT 1 FROM pg_auth_members m WHERE m.member = r.oid) \
-                 FROM pg_roles r WHERE r.rolname = $1",
+    /// Returns [`SqlError::SchemaNotReady`] naming the login and the failed
+    /// requirement, and [`SqlError::Connect`] on query failure.
+    pub async fn verify_operator_session(&self, schemas: &[&str]) -> Result<(), SqlError> {
+        let (login, superuser, flagged, foreign): (String, bool, bool, Option<String>) =
+            sqlx::query_as(
+                "SELECT current_user::text, r.rolsuper, \
+                    coalesce(current_setting($2, true), '') = 'on', \
+                    (SELECT n.nspname || '.' || c.relname FROM pg_class c \
+                     JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE n.nspname = ANY($1) AND c.relkind IN ('r', 'p') \
+                       AND NOT pg_has_role(current_user, c.relowner, 'MEMBER') \
+                     ORDER BY 1 LIMIT 1) \
+                 FROM pg_roles r WHERE r.rolname = current_user",
             )
-            .bind(role)
-            .bind(bypass_rls)
-            .fetch_optional(self.pool())
+            .bind(schemas)
+            .bind(OPERATOR_SETTING)
+            .fetch_one(self.pool())
             .await
             .map_err(SqlError::Connect)?;
-            if conforms != Some(true) {
-                return Err(SqlError::SchemaNotReady {
-                    detail: format!(
-                        "serving role {role} must exist as a login with BYPASSRLS={bypass_rls}, \
-                         no superuser, role, database, or replication authority, and no role \
-                         memberships"
-                    ),
-                });
-            }
+        let failure = if superuser {
+            Some("is a superuser, which row-level security cannot scope".to_owned())
+        } else if !flagged {
+            Some("did not connect as an operator session".to_owned())
+        } else {
+            foreign.map(|table| {
+                format!("does not own {table}; run wyrd-server migrate as this platform login")
+            })
+        };
+        match failure {
+            Some(failure) => Err(SqlError::SchemaNotReady {
+                detail: format!("platform login {login} {failure}"),
+            }),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    /// Prove the serving roles hold exactly `app` and `platform` on `schema`.
+    /// Prove every table in `schema` forces the row-level security its
+    /// migrations create.
     ///
-    /// Beyond the schema posture, neither serving role may own a relation in
-    /// the schema (ownership confers `ALTER TABLE`, including disabling
-    /// row-level security), nor hold `TRUNCATE`,
-    /// `REFERENCES`, or `TRIGGER` on tables it does not own — `TRUNCATE` in
-    /// particular ignores row-level security. A schema whose posture grants
-    /// `CREATE` exists precisely so that role owns its objects, so ownership
-    /// (and the table rights it implies) is only refused where it is not granted.
+    /// Each table, the SQLx ledger included, must enable and force row-level
+    /// security and carry the permissive, all-command `operator_access` policy
+    /// for exactly its owner, whose `USING` and `WITH CHECK` are both
+    /// [`OPERATOR_ACCESS_EXPR`]. Under [`RowScope::Tenant`], a table carrying
+    /// `data_tenant_id` must also carry the permissive, all-command
+    /// `tenant_isolation` policy for `PUBLIC` whose expressions are both
+    /// exactly [`TENANT_ISOLATION_EXPR`]. No other permissive policy may exist,
+    /// because permissive policies are OR-ed and one more would widen what a
+    /// session sees.
     ///
-    /// # Errors
-    /// Returns [`SqlError::SchemaNotReady`] naming the role and the widened
-    /// privilege, and [`SqlError::Connect`] on query failure.
-    pub async fn verify_schema_privileges(
-        &self,
-        schema: &str,
-        app: SchemaAccess,
-        platform: SchemaAccess,
-    ) -> Result<(), SqlError> {
-        for (role, access) in [(WYRD_APP_ROLE, app), (WYRD_PLATFORM_ADMIN_ROLE, platform)] {
-            let (usage, create, owns, table_rights): (bool, bool, bool, bool) = sqlx::query_as(
-                "SELECT has_schema_privilege($1, n.oid, 'USAGE'), \
-                        has_schema_privilege($1, n.oid, 'CREATE'), \
-                        EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = n.oid \
-                                  AND c.relowner = r.oid), \
-                        EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = n.oid \
-                                  AND c.relkind IN ('r', 'p') AND c.relowner <> r.oid \
-                                  AND has_table_privilege(r.oid, c.oid, \
-                                        'TRUNCATE, REFERENCES, TRIGGER')) \
-                 FROM pg_namespace n, pg_roles r WHERE n.nspname = $2 AND r.rolname = $1",
-            )
-            .bind(role)
-            .bind(schema)
-            .fetch_optional(self.pool())
-            .await
-            .map_err(SqlError::Connect)?
-            .ok_or_else(|| SqlError::SchemaNotReady {
-                detail: format!("schema {schema} or serving role {role} does not exist"),
-            })?;
-            let widened = if usage != access.usage() || create != access.create() {
-                Some(format!("schema privileges other than {access:?}"))
-            } else if owns && !access.create() {
-                Some("ownership of schema relations".to_owned())
-            } else if table_rights {
-                Some("TRUNCATE, REFERENCES, or TRIGGER on a table".to_owned())
-            } else {
-                None
-            };
-            if let Some(widened) = widened {
-                return Err(SqlError::SchemaNotReady {
-                    detail: format!("serving role {role} holds {widened} in schema {schema}"),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Prove every tenant-keyed table in `schema` is isolated by its policies.
-    ///
-    /// Each table carrying `data_tenant_id` must enable and force row-level
-    /// security and carry the permissive, all-command `tenant_isolation` policy
-    /// for `PUBLIC` whose `USING` and `WITH CHECK` are both exactly
-    /// [`TENANT_ISOLATION_EXPR`], so the policy keys on `data_tenant_id` and
-    /// not on another column of the same type. Any other permissive policy must apply
-    /// only to `wyrd_platform_admin`, because permissive policies are OR-ed and
-    /// one more for the app role would widen what a tenant session sees.
+    /// The check runs in its own transaction with `search_path` pinned to
+    /// `pg_catalog`: `pg_get_expr` omits the qualifier of any schema on the
+    /// search path, and the default `"$user"` entry puts `wyrd` there for a
+    /// login named `wyrd`.
     ///
     /// # Errors
     /// Returns [`SqlError::SchemaNotReady`] naming the first unprotected table,
     /// and [`SqlError::Connect`] on query failure.
-    pub async fn verify_tenant_isolation(&self, schema: &str) -> Result<(), SqlError> {
+    pub async fn verify_row_security(&self, schema: &str, scope: RowScope) -> Result<(), SqlError> {
+        let mut tx = self.pool().begin().await.map_err(SqlError::Connect)?;
+        sqlx::query("SET LOCAL search_path = pg_catalog")
+            .execute(&mut *tx)
+            .await
+            .map_err(SqlError::Connect)?;
         let unprotected: Option<String> = sqlx::query_scalar(
-            "SELECT c.relname::text FROM pg_class c \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'data_tenant_id' \
-             WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND NOT c.relispartition \
-               AND NOT (c.relrowsecurity AND c.relforcerowsecurity \
-                 AND EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid \
-                   AND p.polname = $2 AND p.polpermissive AND p.polcmd = '*' \
+            "WITH t AS ( \
+                SELECT c.oid, c.relname, c.relowner, c.relrowsecurity, c.relforcerowsecurity, \
+                       $2 AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid \
+                                        AND a.attname = 'data_tenant_id' AND NOT a.attisdropped) \
+                         AS tenant_keyed \
+                FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') AND NOT c.relispartition) \
+             SELECT t.relname::text FROM t \
+             WHERE NOT (t.relrowsecurity AND t.relforcerowsecurity \
+                 AND EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = t.oid \
+                   AND p.polname = $5 AND p.polpermissive AND p.polcmd = '*' \
+                   AND p.polroles = ARRAY[t.relowner] \
+                   AND pg_get_expr(p.polqual, p.polrelid) = $6 \
+                   AND pg_get_expr(p.polwithcheck, p.polrelid) = $6) \
+                 AND (NOT t.tenant_keyed OR EXISTS (SELECT 1 FROM pg_policy p \
+                   WHERE p.polrelid = t.oid \
+                   AND p.polname = $3 AND p.polpermissive AND p.polcmd = '*' \
                    AND p.polroles = '{0}'::oid[] \
                    AND pg_get_expr(p.polqual, p.polrelid) = $4 \
-                   AND pg_get_expr(p.polwithcheck, p.polrelid) = $4) \
-                 AND NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid \
-                   AND p.polpermissive AND p.polname <> $2 \
-                   AND p.polroles <> ARRAY[(SELECT oid FROM pg_roles WHERE rolname = $3)]))\
-             ORDER BY c.relname LIMIT 1",
+                   AND pg_get_expr(p.polwithcheck, p.polrelid) = $4)) \
+                 AND NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = t.oid \
+                   AND p.polpermissive AND p.polname <> $5 \
+                   AND (p.polname <> $3 OR NOT t.tenant_keyed))) \
+             ORDER BY t.relname LIMIT 1",
         )
         .bind(schema)
+        .bind(scope == RowScope::Tenant)
         .bind(TENANT_ISOLATION_POLICY)
-        .bind(WYRD_PLATFORM_ADMIN_ROLE)
         .bind(TENANT_ISOLATION_EXPR)
-        .fetch_optional(self.pool())
+        .bind(OPERATOR_ACCESS_POLICY)
+        .bind(OPERATOR_ACCESS_EXPR)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(SqlError::Connect)?;
+        tx.commit().await.map_err(SqlError::Connect)?;
         match unprotected {
             Some(table) => Err(SqlError::SchemaNotReady {
                 detail: format!(
-                    "{schema}.{table} does not force row-level security under its \
-                     {TENANT_ISOLATION_POLICY} policy alone"
+                    "{schema}.{table} does not force row-level security under exactly its \
+                     {OPERATOR_ACCESS_POLICY} and {TENANT_ISOLATION_POLICY} policies"
                 ),
             }),
             None => Ok(()),
@@ -261,34 +214,84 @@ impl OperatorPool {
     }
 }
 
-/// Require a serving pool's session and effective role to be `expected`.
+/// Prove a tenant pool's login stays bound by row-level security.
 ///
-/// Shared by both serving owners so the app and platform pools refuse a
-/// substituted login the same way.
+/// The login must not be a superuser or hold `BYPASSRLS`, which Postgres
+/// exempts from every policy, and must not connect as an operator session.
+/// When `separate_login` is set (a distinct platform login exists), it also
+/// must not own, or be a member of the owner of, any table in `schemas`, so
+/// setting the operator flag gains it nothing; must not hold `TRUNCATE`,
+/// `REFERENCES`, or `TRIGGER` on them, since `TRUNCATE` in particular ignores
+/// row-level security; and must hold no privilege on a table there that
+/// row-level security does not protect, such as the cross-tenant Iceberg
+/// catalog. A login shared with the platform pool is the owner by design and
+/// is scoped by the pool instead.
 ///
 /// # Errors
-/// Returns [`SqlError::SchemaNotReady`] naming both observed roles when either
-/// differs from `expected`.
-pub fn verify_login_name(expected: &str, session: &str, current: &str) -> Result<(), SqlError> {
-    if session == expected && current == expected {
-        return Ok(());
-    }
-    Err(SqlError::SchemaNotReady {
-        detail: format!(
-            "serving login must be {expected}, found session role {session} acting as {current}"
-        ),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::verify_login_name;
-
-    /// Only an exact session and effective role match is a valid serving login.
-    #[test]
-    fn login_name_must_match_session_and_effective_role() {
-        assert!(verify_login_name("wyrd_app", "wyrd_app", "wyrd_app").is_ok());
-        assert!(verify_login_name("wyrd_app", "wyrd_owner", "wyrd_app").is_err());
-        assert!(verify_login_name("wyrd_app", "wyrd_app", "wyrd_owner").is_err());
+/// Returns [`SqlError::SchemaNotReady`] naming the login and the failed
+/// requirement, and [`SqlError::Connect`] on query failure.
+pub async fn verify_tenant_pool(
+    pool: &PgPool,
+    separate_login: bool,
+    schemas: &[&str],
+) -> Result<(), SqlError> {
+    let (login, exempt, flagged, owned, widened, unprotected): (
+        String,
+        bool,
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT current_user::text, r.rolsuper OR r.rolbypassrls, \
+            coalesce(current_setting($2, true), '') = 'on', \
+            (SELECT n.nspname || '.' || c.relname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = ANY($1) AND c.relkind IN ('r', 'p') \
+               AND pg_has_role(current_user, c.relowner, 'MEMBER') ORDER BY 1 LIMIT 1), \
+            (SELECT n.nspname || '.' || c.relname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = ANY($1) AND c.relkind IN ('r', 'p') \
+               AND has_table_privilege(current_user, c.oid, 'TRUNCATE, REFERENCES, TRIGGER') \
+             ORDER BY 1 LIMIT 1), \
+            (SELECT n.nspname || '.' || c.relname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = ANY($1) AND c.relkind IN ('r', 'p') AND NOT c.relrowsecurity \
+               AND has_table_privilege(current_user, c.oid, 'SELECT, INSERT, UPDATE, DELETE') \
+             ORDER BY 1 LIMIT 1) \
+         FROM pg_roles r WHERE r.rolname = current_user",
+    )
+    .bind(schemas)
+    .bind(OPERATOR_SETTING)
+    .fetch_one(pool)
+    .await
+    .map_err(SqlError::Connect)?;
+    let failure = if exempt {
+        Some(
+            "is a superuser or has BYPASSRLS, which row-level security cannot scope; \
+             use an ordinary login"
+                .to_owned(),
+        )
+    } else if flagged {
+        Some("connected as an operator session".to_owned())
+    } else if !separate_login {
+        None
+    } else if let Some(table) = owned {
+        Some(format!(
+            "owns {table}; with a separate WYRD_PLATFORM_DATABASE_URL the tenant login must \
+             not own Wyrd's objects"
+        ))
+    } else if let Some(table) = widened {
+        Some(format!("holds TRUNCATE, REFERENCES, or TRIGGER on {table}"))
+    } else {
+        unprotected.map(|table| {
+            format!("holds privileges on {table}, which row-level security does not protect")
+        })
+    };
+    match failure {
+        Some(failure) => Err(SqlError::SchemaNotReady {
+            detail: format!("tenant login {login} {failure}"),
+        }),
+        None => Ok(()),
     }
 }

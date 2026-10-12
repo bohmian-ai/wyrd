@@ -32,8 +32,8 @@ DataTypeSpec = str | DataTypeSpecVariants
 class _FieldSpecOptional(TypedDict, total=False):
     """The described-column keys the server omits when they carry nothing.
 
-    `metadata` holds the stable field id under `PARQUET:field_id` and, for a
-    write-time correlation input, `wyrd:input_class`; an empty map is omitted.
+    `metadata` holds the stable field id under `PARQUET:field_id`; an empty
+    map is omitted.
     """
 
     metadata: dict[str, str]
@@ -67,11 +67,13 @@ class SortKey(TypedDict):
 class PhysicalLayout(TypedDict):
     """A table's server-resolved partitioning, sort order, and Bloom columns.
 
-    ``partition_granularity`` is ``"hour"`` or ``"day"`` on
-    ``wyrd_event_time``; ``bloom_columns`` begins with the managed columns.
+    ``partition_granularity`` is ``"hour"`` or ``"day"`` on ``time_column``,
+    which is ``wyrd_ingested_at`` unless the table declared its own;
+    ``bloom_columns`` begins with the managed columns.
     """
 
     partition_granularity: str
+    time_column: str
     sort_keys: list[SortKey]
     bloom_columns: list[str]
 
@@ -91,14 +93,12 @@ class TableDescription(_TableDescriptionOptional):
     """Server projection of one registered table's stored physical schema.
 
     ``user_fields`` are the declared columns, ``correlation_fields`` the
-    write-time ``card_ref``/``run_id`` inputs, and ``managed_candidates`` the
-    managed columns a writer may supply itself.
+    write-time ``card_uid``/``run_id`` inputs.
     """
 
     entry: TableEntry
     user_fields: list[FieldSpec]
     correlation_fields: list[FieldSpec]
-    managed_candidates: list[FieldSpec]
     physical_layout: PhysicalLayout
 
 class RunningQueryProgress(TypedDict):
@@ -185,7 +185,7 @@ class ResolvedTable(TypedDict):
 class Correlation(TypedDict, total=False):
     """Optional per-row correlation; an omitted key is a null on the wire."""
 
-    card_ref: str
+    card_uid: str
     run_id: str
 
 class TableConfig:
@@ -203,33 +203,41 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        time_column: str | None = None,
         compaction_target_file_size_bytes: int | None = None,
         compaction_type: str | None = None,
     ) -> None:
         """Declare a table from a Pydantic model class.
 
-        The three layout arguments travel as one layout request. Omitting all
-        of them lets the server choose its default layout: hourly partitions,
-        ``wyrd_event_time`` descending with nulls last, and only the managed
-        Bloom columns. Layout column names are checked against the table's
+        The four layout arguments travel as one layout request. Omitting all
+        of them lets the server choose its default layout: hourly partitions
+        on ``wyrd_ingested_at``, sorted by it descending with nulls last, and
+        only the managed Bloom columns. Layout column names are checked against the table's
         full physical schema, managed columns included, at register time.
 
         Args:
             model: a Pydantic model class, not an instance. Its
                 ``model_json_schema()`` becomes the declared user columns.
-                ``card_ref``, ``run_id``, and ``wyrd_*`` names are reserved.
+                Datetime fields declare the timestamp types in
+                ``wyrd.types``: ``NaiveDatetime`` is ``TIMESTAMP_NTZ`` and any
+                other ``datetime`` is ``TIMESTAMP_LTZ``.
+                ``card_uid``, ``run_id``, and ``wyrd_*`` names are reserved.
             table: the ``"<namespace>.<name>"`` name SQL uses.
             partition_granularity: ``"hour"`` or ``"day"`` partitions on
-                ``wyrd_event_time``. Omitted while another layout argument is
+                the time column. Omitted while another layout argument is
                 set, ``"hour"`` is sent.
             sort_keys: up to four ``SortKey`` mappings in priority order;
                 ``direction`` is ``"asc"`` or ``"desc"`` and ``null_order``
                 is ``"first"`` or ``"last"``. Omitted or empty, the table
-                sorts by ``wyrd_event_time`` descending with nulls last.
+                sorts by the time column descending with nulls last.
             bloom_columns: extra columns to Bloom-filter. The managed
                 ``run_id``, ``card_uid``, and ``principal_id`` columns the
                 table has always come first, and naming one is harmless.
                 Omitted or empty, only those managed columns are filtered.
+            time_column: the non-null ``TIMESTAMP_LTZ`` or ``TIMESTAMP_NTZ``
+                column that partitions the table and leads its default sort
+                order. Any instant is accepted. Omitted, it is
+                ``wyrd_ingested_at``, the server's receipt time.
             compaction_target_file_size_bytes: the file size Forge compacts
                 this table toward, at least 134217728 (128 MiB). Omitted, the
                 table follows the deployment default (1 GiB unless the
@@ -244,7 +252,10 @@ class TableConfig:
                 ``namespace.name`` or the model schema has no column mapping;
                 ``WYRD_VALA_400_BIFROST_RESERVED_COLUMN`` for a reserved
                 column; ``WYRD_SPEC_400_VALIDATION`` for an unknown
-                granularity, sort-key, or compaction-type spelling. Column,
+                granularity, sort-key, or compaction-type spelling.
+                ``WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT`` from
+                ``Bifrost.register()`` names a ``time_column`` that is absent,
+                nullable, or not a timestamp. Column,
                 file-size, and stored-setting conflicts raise from
                 ``Bifrost.register()``.
 
@@ -257,6 +268,7 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        time_column: str | None = None,
         compaction_target_file_size_bytes: int | None = None,
         compaction_type: str | None = None,
     ) -> TableConfig:
@@ -270,12 +282,14 @@ class TableConfig:
         Args:
             table: the ``"<namespace>.<name>"`` name SQL uses.
             schema: a JSON Schema object with a ``properties`` mapping.
-                ``card_ref``, ``run_id``, and ``wyrd_*`` names are reserved.
+                ``card_uid``, ``run_id``, and ``wyrd_*`` names are reserved.
             partition_granularity: ``"hour"`` or ``"day"``, as for
                 ``TableConfig()``.
             sort_keys: up to four ``SortKey`` mappings, as for
                 ``TableConfig()``.
             bloom_columns: extra columns to Bloom-filter, as for
+                ``TableConfig()``.
+            time_column: the partitioning timestamp column, as for
                 ``TableConfig()``.
             compaction_target_file_size_bytes: the Forge compaction file
                 target, at least 134217728 bytes. Omitted, the deployment
@@ -300,13 +314,15 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        time_column: str | None = None,
         compaction_target_file_size_bytes: int | None = None,
         compaction_type: str | None = None,
     ) -> TableConfig:
         """Declare a table from an explicit ``pyarrow.Schema``.
 
         Use this for column types JSON Schema cannot express, such as
-        ``int32``, a non-UTC timestamp, or ``decimal128``. ``schema`` holds
+        ``int32`` or ``decimal128``. A Variant column is a field carrying the
+        ``arrow.parquet.variant`` extension. ``schema`` holds
         user columns only; every other error is as for ``TableConfig()``.
 
         Args:
@@ -317,6 +333,8 @@ class TableConfig:
             sort_keys: up to four ``SortKey`` mappings, as for
                 ``TableConfig()``.
             bloom_columns: extra columns to Bloom-filter, as for
+                ``TableConfig()``.
+            time_column: the partitioning timestamp column, as for
                 ``TableConfig()``.
             compaction_target_file_size_bytes: the Forge compaction file
                 target, at least 134217728 bytes. Omitted, the deployment
@@ -526,12 +544,12 @@ class _BifrostBase:
         Args:
             row: a Pydantic model instance, a mapping, or a JSON object string
                 holding the table's declared columns.
-            correlation: optional ``card_ref`` and ``run_id`` for this row.
+            correlation: optional ``card_uid`` and ``run_id`` for this row.
                 Omitted keys are stored as null.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unparsable
-                ``card_ref``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
+                ``card_uid``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
                 is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
                 queue is full.
 
@@ -588,9 +606,9 @@ class Bifrost(_BifrostBase):
         The precision write door, beside ``insert``: it names its destination
         instead of using the active binding, carries correlation as ordinary
         columns, and is durable when it returns, so no ``flush`` follows it.
-        Build the batch against ``TableConfig.describe(...).arrow_schema``; a
-        canonical table compares an incoming block against its declared fields
-        exactly, metadata included.
+        Build the batch against ``TableConfig.describe(...).arrow_schema``.
+        Columns match the table's declared columns by name, in any order; the
+        server judges every column's type and refuses a stale declaration.
 
         Args:
             table: the destination ``"<namespace>.<name>"`` table.

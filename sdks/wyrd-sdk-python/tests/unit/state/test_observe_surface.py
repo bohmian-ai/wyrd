@@ -250,14 +250,14 @@ def _correlation(exporter: InMemorySpanExporter) -> dict[str, tuple[str, str] | 
     out: dict[str, tuple[str, str] | None] = {}
     for span in exporter.get_finished_spans():
         attributes = span.attributes or {}
-        card_ref, run_id = attributes.get("wyrd.card_ref"), attributes.get("wyrd.run_id")
-        out[span.name] = None if card_ref is None else (str(card_ref), str(run_id))
+        card_uid, run_id = attributes.get("wyrd.card_uid"), attributes.get("wyrd.run_id")
+        out[span.name] = None if card_uid is None else (str(card_uid), str(run_id))
     return out
 
 
 def _ref(state: WyrdState, view: Run) -> str:
-    """The exact Card reference text a view's spans carry."""
-    return str(state.card_ref(view.alias))
+    """The Card UID a view's spans carry."""
+    return str(state.card_ref(view.alias).uid)
 
 
 def test_entering_a_run_returns_it_and_correlates_active_and_child_spans(
@@ -271,7 +271,7 @@ def test_entering_a_run_returns_it_and_correlates_active_and_child_spans(
         with run as entered:
             assert entered is run
             with tracer.start_as_current_span("child"):
-                tracer.start_span("grandchild", attributes={"wyrd.card_ref": "x"}).end()
+                tracer.start_span("grandchild", attributes={"wyrd.card_uid": "x"}).end()
         tracer.start_span("after").end()
     expected = (_ref(state, run), run.run_id)
     assert _correlation(exporter) == {

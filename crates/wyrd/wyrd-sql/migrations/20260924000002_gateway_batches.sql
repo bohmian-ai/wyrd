@@ -30,6 +30,8 @@ ALTER TABLE wyrd.gateway_batch_files FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.gateway_batch_files
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.gateway_batch_files TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE TABLE wyrd.gateway_batches (
     data_tenant_id      UUID        NOT NULL REFERENCES platform.tenants(data_tenant_id),
@@ -55,3 +57,5 @@ ALTER TABLE wyrd.gateway_batches FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.gateway_batches
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.gateway_batches TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

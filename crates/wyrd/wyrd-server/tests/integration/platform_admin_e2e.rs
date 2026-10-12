@@ -1848,7 +1848,6 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
-    let batches_before = system_audit_batches(&srv).await;
     let provider = wyrd_testing::DiscoveryFixture::start().await;
     let issuer = provider.issuer();
 
@@ -2049,15 +2048,44 @@ async fn an_operator_configures_and_removes_federated_platform_sign_in() {
         "the global credential administers the platform with federated login gone"
     );
 
-    // Both principals' platform decisions are retained. They are staged under
-    // the reserved system owner, which Oracle refuses to read, so the recorded
-    // principal kind and the absent credential of a federated session are
-    // proven by `wyrd_auth::platform_authz` recorder tests
-    // (`a_decision_records_the_stored_principal_kind`,
-    // `a_decision_records_the_credential_it_was_made_with`).
+    // Both principals performed the same operation on the same plane, so the
+    // retained kind is the only thing separating the machine root's decision
+    // from the registered human's. A federated sign-in presents a provider
+    // token, not a credential, so its decisions name none.
+    let root_id: String =
+        sqlx::query_scalar("SELECT id::text FROM platform.principals WHERE name = $1")
+            .bind(wyrd_server::boot::init::PLATFORM_ROOT_NAME)
+            .fetch_one(srv.operator_pool().pool())
+            .await
+            .expect("the root principal exists");
+    let registered_id = registered_id.to_string();
+    let decisions = system_audit_decisions(&srv).await;
+    for (principal, expected) in [
+        (root_id.as_str(), "global_admin"),
+        (registered_id.as_str(), "user"),
+    ] {
+        let mut kinds = decisions
+            .iter()
+            .filter(|row| {
+                row["operation"].as_deref() == Some("platform.authz")
+                    && row["audit_principal_id"].as_deref() == Some(principal)
+            })
+            .map(|row| row["principal_kind"].clone())
+            .collect::<Vec<_>>();
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(
+            kinds,
+            vec![Some(expected.to_owned())],
+            "decisions by {principal} were retained as {kinds:?}, expected only {expected}"
+        );
+    }
     assert!(
-        system_audit_batches(&srv).await > batches_before,
-        "the platform decisions of both principals are retained"
+        decisions
+            .iter()
+            .filter(|row| row["audit_principal_id"].as_deref() == Some(registered_id.as_str()))
+            .all(|row| row["credential_id"].is_none()),
+        "a federated session names no credential, so its decisions must not claim one"
     );
 }
 
@@ -2383,7 +2411,6 @@ async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
-    let batches_before = system_audit_batches(&srv).await;
 
     let created = body_json(
         srv.oneshot(platform_post(
@@ -2491,13 +2518,22 @@ async fn a_failed_provisioning_can_be_retried_with_the_same_slug() {
         "exactly one credential is usable, and it is the one the retry disclosed"
     );
 
-    // Both creation decisions are retained. They are staged under the
-    // reserved system owner, which Oracle refuses to read, so the resource each
-    // names (the requested slug, never a proposed tenant id) is proven by the
-    // `wyrd_auth::platform_authz` recorder tests.
-    assert!(
-        system_audit_batches(&srv).await > batches_before,
-        "every provisioning decision is retained"
+    // Both creation decisions name the slug. The retry proposed a fresh tenant
+    // id that the directory discarded in favour of the original, so a decision
+    // retained against a proposed id would name a tenant that does not exist.
+    let creation_resources = system_audit_decisions(&srv)
+        .await
+        .into_iter()
+        .filter(|row| {
+            row["operation"].as_deref() == Some("platform.authz")
+                && row["permission"].as_deref() == Some("tenants:write")
+        })
+        .map(|row| row["resource"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        creation_resources,
+        vec![Some("tenant_slug:retryable".to_owned()); 2],
+        "every provisioning decision names the requested slug, never a proposed tenant id"
     );
 }
 
@@ -2618,7 +2654,6 @@ async fn an_operator_rotates_the_deployment_root_credential() {
         .await
         .expect("deployment initializes");
     let session = platform_session(&srv, secrecy::ExposeSecret::expose_secret(&root)).await;
-    let batches_before = system_audit_batches(&srv).await;
 
     let resp = srv
         .oneshot(platform_request(
@@ -2750,13 +2785,23 @@ async fn an_operator_rotates_the_deployment_root_credential() {
         .expect("revoke responds");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-    // The rotation's decisions are retained. They are staged under the
-    // reserved system owner, which Oracle refuses to read, so that each names
-    // the credential's non-secret id and never the credential is proven by
-    // `wyrd_auth::platform_authz::pg_tests::a_decision_records_the_credential_it_was_made_with`.
+    // The credential's non-secret id is what travels into audit; the secret
+    // itself never reaches a retained row.
+    let decisions = system_audit_decisions(&srv).await;
+    let replacement_id = issued["id"].as_str().expect("the replacement's id");
     assert!(
-        system_audit_batches(&srv).await > batches_before,
-        "the rotation's platform decisions are retained"
+        decisions.iter().any(|row| {
+            row["audit_principal_id"].as_deref() == Some(principal_id.as_str())
+                && row["credential_id"].as_deref() == Some(replacement_id)
+        }),
+        "the replacement session's decisions name its credential id"
+    );
+    assert!(
+        decisions
+            .iter()
+            .flat_map(|row| row.values().flatten())
+            .all(|value| !value.contains(&replacement)),
+        "no retained audit row carries credential material"
     );
 }
 
@@ -4327,6 +4372,69 @@ async fn system_audit_batches(srv: &WyrdTestServer) -> i64 {
     .expect("system audit batches read");
     conn.commit().await.expect("batch read commits");
     batches
+}
+
+/// Every system-owner audit decision Scribe has acknowledged, one map of
+/// column name to text value per row.
+///
+/// Platform-plane decisions are retained under [`DataTenantId::SYSTEM_OWNER`],
+/// which Oracle refuses to read on every production surface, so the journey
+/// reads them from the durable Scribe WAL instead: Scribe acknowledges only
+/// after the WAL fsync, so every settled decision is already replayable.
+/// Settles `srv`'s Scribe outbox first, and must run before a Scribe drain
+/// seals the generation, because replay suppresses sealed records.
+///
+/// # Panics
+///
+/// Panics when audit retention does not settle, or the WAL cannot be replayed
+/// or decoded.
+async fn system_audit_decisions(
+    srv: &WyrdTestServer,
+) -> Vec<std::collections::HashMap<String, Option<String>>> {
+    use arrow::array::Array as _;
+
+    srv.await_audit_retained()
+        .await
+        .expect("audit retention settles");
+    let replayed = vala_bifrost_redux::scribe::replay::replay_wal_directory(
+        srv.scribe_wal_root_for_test()
+            .expect("the in-process server owns a WAL root"),
+    )
+    .expect("acknowledged WAL replays");
+    let mut decisions = Vec::new();
+    for stream in replayed.values().filter(|stream| {
+        stream.seal_key.tenant == DataTenantId::SYSTEM_OWNER
+            && vala_bifrost_redux::tables::AuditLogTable::admits_system_owner(
+                &stream.seal_key.table,
+            )
+    }) {
+        for record in &stream.data_records {
+            let reader =
+                arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(record), None)
+                    .expect("a WAL record is an Arrow IPC stream");
+            for batch in reader {
+                let batch = batch.expect("a WAL record decodes");
+                for row in 0..batch.num_rows() {
+                    decisions.push(
+                        batch
+                            .schema()
+                            .fields()
+                            .iter()
+                            .zip(batch.columns())
+                            .map(|(field, column)| {
+                                let value = (!column.is_null(row)).then(|| {
+                                    arrow::util::display::array_value_to_string(column, row)
+                                        .expect("a retained value displays")
+                                });
+                                (field.name().clone(), value)
+                            })
+                            .collect(),
+                    );
+                }
+            }
+        }
+    }
+    decisions
 }
 
 /// Resolve the data tenant provisioned under `slug`.

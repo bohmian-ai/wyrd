@@ -25,5 +25,5 @@ ALTER TABLE vala.drift_alerts FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.drift_alerts
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-GRANT SELECT, INSERT, UPDATE ON vala.drift_alerts TO wyrd_app;
+CREATE POLICY operator_access ON vala.drift_alerts TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

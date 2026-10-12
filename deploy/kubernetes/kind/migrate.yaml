@@ -1,4 +1,4 @@
-# One-off migration: the only workload that receives the database-owner URL.
+# One-off migration as the platform login, which then owns Wyrd's objects.
 apiVersion: batch/v1
 kind: Job
 metadata: {name: wyrd-migrate, namespace: wyrd-kind}
@@ -15,7 +15,9 @@ spec:
           command: [wyrd-server, migrate]
           env:
             - name: WYRD_DATABASE_URL
-              valueFrom: {secretKeyRef: {name: wyrd-owner, key: database-url}}
+              valueFrom: {secretKeyRef: {name: wyrd-secrets, key: database-url}}
+            - name: WYRD_PLATFORM_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: wyrd-secrets, key: platform-database-url}}
           resources:
             requests: {cpu: 100m, memory: 128Mi}
             limits: {cpu: "1", memory: 512Mi}

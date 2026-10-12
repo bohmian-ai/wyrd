@@ -48,10 +48,6 @@ mod tests {
             .is_database_unavailable()
         );
         assert!(!ForgeError::Sql(vala_sql::SqlError::NoRows).is_database_unavailable());
-        assert!(
-            !ForgeError::Lease(vala_sql::SqlError::Query(sqlx::Error::PoolTimedOut))
-                .is_database_unavailable()
-        );
     }
 }
 
@@ -66,10 +62,7 @@ pub enum ForgeError {
     /// for now. It is released without consuming retry budget.
     #[error("Forge resources are temporarily unavailable: {detail}")]
     Capacity { detail: String },
-    /// A lease acquisition, renewal, fence, or release query failed.
-    #[error("Forge lease query failed: {0}")]
-    Lease(#[source] vala_sql::SqlError),
-    /// A non-lease Forge SQL transition failed.
+    /// A Forge SQL transition failed.
     #[error("Forge SQL operation failed: {0}")]
     Sql(#[source] vala_sql::SqlError),
     /// An Iceberg catalog, manifest, or transaction operation failed.
@@ -77,7 +70,7 @@ pub enum ForgeError {
     Catalog(#[source] iceberg::Error),
     /// A staging or rewritten object operation failed.
     #[error("Forge staging object read failed: {0}")]
-    ObjectStore(#[source] opendal::Error),
+    ObjectStore(#[source] object_store::Error),
     /// Snapshot-expiry planning or reconciliation failed.
     #[error("Forge snapshot expiry failed: {detail}")]
     SnapshotExpiry { detail: String },
@@ -86,17 +79,18 @@ pub enum ForgeError {
     LiveSet { detail: String },
     /// A table-owned object prefix could not be listed.
     #[error("Forge object listing failed: {0}")]
-    ObjectList(#[source] opendal::Error),
+    ObjectList(#[source] object_store::Error),
     /// A fenced orphan object could not be deleted.
     #[error("Forge object deletion failed: {0}")]
-    ObjectDelete(#[source] opendal::Error),
+    ObjectDelete(#[source] object_store::Error),
     /// A staging batch did not match the registered physical schema.
     #[error("Forge schema validation failed: {detail}")]
     Schema { detail: String },
     /// Durable candidate identity or values were invalid.
     #[error("Forge candidate group is invalid: {detail}")]
     Group { detail: String },
-    /// Another owner acquired the table fence before this operation completed.
+    /// This attempt's task claim lapsed or passed to another attempt before
+    /// the operation completed.
     #[error("Forge lost lease fence `{lease_key}`")]
     FenceLost { lease_key: String },
     /// Prepared or terminal durable state could not be reconciled safely.
@@ -228,8 +222,7 @@ impl ForgeError {
             | Self::Timeout { .. }
             | Self::SnapshotExpiry { .. }
             | Self::LiveSet { .. } => ForgeFailureClass::TransientObjectStore,
-            Self::Lease(_)
-            | Self::Sql(_)
+            Self::Sql(_)
             | Self::FenceLost { .. }
             | Self::LeaderPeer { .. }
             | Self::Reconciliation { .. }

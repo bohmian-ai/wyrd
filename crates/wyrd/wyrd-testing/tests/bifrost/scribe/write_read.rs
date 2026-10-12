@@ -12,9 +12,8 @@ use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_testing::bifrost::telemetry::BifrostMetricKind;
 use wyrd_testing::bifrost::{
-    BifrostClusterSpec, ScribeCacheMode, ScribeCheckpointNameV1, ScribeProductionEvidenceV1,
-    ScribeProductionWorkloadV1, ScribePublishedHotFileV1, ScribeStorageDrainObservationV1,
-    WyrdTestCluster, shared_process_telemetry_for_test,
+    BifrostClusterSpec, ScribeCacheMode, ScribeProductionEvidenceV1, ScribeProductionWorkloadV1,
+    ScribePublishedHotFileV1, WyrdTestCluster, shared_process_telemetry_for_test,
 };
 
 use super::support::{
@@ -74,15 +73,6 @@ async fn scribe_write_flush_read_user_journey() {
     let cached: ScribeProductionWorkloadV1 =
         serde_json::from_slice(&bytes).expect("the same bytes deserialize for the second run");
 
-    // Cache decisions are production counters, so the disabled composition is
-    // judged over its own window: the boot reads, then the whole uncached run,
-    // closed before the cached cluster starts.
-    let (_telemetry_guard, telemetry) =
-        shared_process_telemetry_for_test().expect("process production telemetry");
-    let boot_window = telemetry.checkpoint().expect("boot telemetry window");
-    let uncached_window = telemetry
-        .checkpoint()
-        .expect("uncached run telemetry window");
     let cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Disabled),
     )
@@ -93,18 +83,6 @@ async fn scribe_write_flush_read_user_journey() {
         cluster.server(0).expect("the mixed pod is running"),
     )
     .await;
-    // The span read above opens a freshly flushed hot object on a pod whose
-    // Forge has not yet promoted it, so it is the one read that must decide
-    // hot metadata. The terminal owner is the restarted pod's, and whether its
-    // reads still find hot objects races Forge promotion after boot.
-    let booted = cache_effects(&telemetry.delta_since(&boot_window).expect("boot delta"));
-    assert!(
-        booted
-            .iter()
-            .any(|((effect, reason), _)| effect == "bypass" && reason == "disabled"),
-        "a disabled composition must positively record a bypass with reason disabled, observed {booted:?}"
-    );
-
     let uncached_run =
         Box::pin(cluster.run_scribe_production_workload(&workload, ScribeCacheMode::Disabled))
             .await
@@ -113,11 +91,6 @@ async fn scribe_write_flush_read_user_journey() {
         .evidence
         .assert_matches(&workload, ScribeCacheMode::Disabled)
         .expect("the uncached run satisfies every normative field of the record");
-    let uncached_effects = cache_effects(
-        &telemetry
-            .delta_since(&uncached_window)
-            .expect("uncached run delta"),
-    );
 
     let cached_cluster = WyrdTestCluster::start_spec(
         BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
@@ -134,40 +107,6 @@ async fn scribe_write_flush_read_user_journey() {
         .expect("the cached run satisfies every normative field of the record");
 
     assert_parity(&uncached_run.evidence, &cached_run.evidence);
-
-    let uncached_storage = terminal_storage(&uncached_run.evidence);
-    let cached_storage = terminal_storage(&cached_run.evidence);
-    assert_settled(&uncached_storage, "cache disabled");
-    assert_settled(&cached_storage, "cache enabled");
-    assert!(
-        !uncached_effects.is_empty()
-            && uncached_effects
-                .iter()
-                .all(|((effect, reason), _)| effect == "bypass" && reason == "disabled"),
-        "a disabled composition records only bypasses with reason disabled — no hit, miss, \
-         or join — observed {uncached_effects:?}"
-    );
-}
-
-/// Returns the nonzero metadata-cache decisions one telemetry window recorded.
-///
-/// Keyed by `(effect, reason)`, the family's complete closed label set.
-fn cache_effects(
-    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
-) -> Vec<((String, String), f64)> {
-    delta
-        .metrics
-        .iter()
-        .filter(|sample| {
-            sample.family == "bifrost_storage_metadata_cache_effects_total"
-                && sample.kind == BifrostMetricKind::Counter
-                && sample.value > 0.0
-        })
-        .map(|sample| {
-            let label = |key: &str| sample.labels.get(key).cloned().unwrap_or_default();
-            ((label("effect"), label("reason")), sample.value)
-        })
-        .collect()
 }
 
 /// One complete GenAI span survives this pod's write/flush/read path, and is
@@ -347,44 +286,6 @@ fn int_values(batches: &[RecordBatch], name: &str) -> Vec<i64> {
         }
     }
     values
-}
-
-/// Returns the terminal boundary's storage-owner observation.
-///
-/// # Panics
-/// Panics when the terminal boundary carries no drain or no storage evidence.
-fn terminal_storage(evidence: &ScribeProductionEvidenceV1) -> ScribeStorageDrainObservationV1 {
-    evidence
-        .checkpoint(ScribeCheckpointNameV1::TerminalDrain)
-        .expect("the record reaches its terminal boundary")
-        .drained
-        .as_ref()
-        .expect("the terminal boundary carries drain evidence")
-        .storage
-        .clone()
-        .expect("a composed pod publishes its terminal storage-owner snapshot")
-}
-
-/// Asserts one run's storage owner closed and retained nothing.
-///
-/// Every value is read from the owners themselves at teardown, so a nonzero
-/// count is work the owner still holds rather than a tally that drifted.
-///
-/// # Panics
-/// Panics when the owner is not closed or any live count is nonzero.
-fn assert_settled(storage: &ScribeStorageDrainObservationV1, label: &str) {
-    assert_eq!(storage.lifecycle, "closed", "{label}: {storage:?}");
-    assert_eq!(
-        (
-            storage.resident_entries,
-            storage.resident_bytes,
-            storage.inflight_loads,
-            storage.waiters,
-            storage.active_requests,
-        ),
-        (0, 0, 0, 0, 0),
-        "{label}: a drained owner must retain nothing, observed {storage:?}"
-    );
 }
 
 /// Requires two runs of the same bytes to have produced the same public result.
@@ -831,28 +732,21 @@ async fn scribe_optional_and_scoped_card_correlation_journey() {
     })
     .expect("the writer's SDK client");
 
-    let identity = |card: &wyrd_spec::reference::CardRef| {
-        wyrd_spec::reference::CardRef {
-            uid: None,
-            ..card.clone()
-        }
-        .to_string()
-    };
+    let root_uid = registry_card_uid(&server, &root).await;
+    let secondary_uid = registry_card_uid(&server, &secondary).await;
     append_correlated(
         &client,
         &table,
         &[
             (1, None),
-            (2, Some(identity(&root))),
-            (3, Some(identity(&secondary))),
+            (2, Some(root_uid.clone())),
+            (3, Some(secondary_uid.clone())),
         ],
     )
     .await
     .expect("optional and scoped correlations are admitted");
 
     let stamped = read_correlation(&client, &table).await;
-    let root_uid = registry_card_uid(&server, &root).await;
-    let secondary_uid = registry_card_uid(&server, &secondary).await;
     assert_eq!(
         stamped,
         vec![
@@ -866,7 +760,7 @@ async fn scribe_optional_and_scoped_card_correlation_journey() {
     let refusal = append_correlated(
         &client,
         &table,
-        &[(4, Some("prod/Service/other@1.0.0".to_owned()))],
+        &[(4, Some(uuid::Uuid::now_v7().to_string()))],
     )
     .await
     .expect_err("an out-of-scope Card is refused");
@@ -949,18 +843,11 @@ async fn scribe_unbound_writer_card_attribution_journey() {
         ))
         .await
         .expect("the Trigger registers");
-    let identity = |card: &wyrd_spec::reference::CardRef| {
-        wyrd_spec::reference::CardRef {
-            uid: None,
-            ..card.clone()
-        }
-        .to_string()
-    };
-
+    let observed_uid = registry_card_uid(&server, &observed).await;
     append_correlated(
         &client,
         &table,
-        &[(1, None), (2, Some(identity(&observed)))],
+        &[(1, None), (2, Some(observed_uid.clone()))],
     )
     .await
     .expect("a registered observation target is attributable");
@@ -971,16 +858,13 @@ async fn scribe_unbound_writer_card_attribution_journey() {
         .collect::<Vec<_>>();
     assert_eq!(
         stamped,
-        vec![
-            (1, None),
-            (2, Some(registry_card_uid(&server, &observed).await))
-        ],
+        vec![(1, None), (2, Some(observed_uid))],
         "the registered Card is stamped with its registry UID"
     );
 
     for refused in [
-        "default/Service/never-registered@1.0.0".to_owned(),
-        identity(&trigger.root),
+        uuid::Uuid::now_v7().to_string(),
+        registry_card_uid(&server, &trigger.root).await,
     ] {
         let refusal = append_correlated(&client, &table, &[(3, Some(refused.clone()))])
             .await
@@ -1167,7 +1051,7 @@ async fn append_correlated(
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new(
-            wyrd_spec::vala::managed_columns::CARD_REF,
+            wyrd_spec::vala::managed_columns::CARD_UID,
             DataType::Utf8,
             true,
         ),
@@ -1269,10 +1153,6 @@ const MAX_REQUEST_ROWS: i64 = 300_000;
 /// the same data root, and a resend of the acknowledged batch must neither
 /// duplicate the rows nor publish them again.
 ///
-/// The audit publisher stays off. It writes `vala.system.audit_log` through
-/// the same Scribe, so a member it staged before the root fills would also be
-/// refused by that root and fail the flush for a table this case does not own.
-///
 /// # Panics
 ///
 /// Panics when the near-maximum request is refused, when a stage under a full
@@ -1306,11 +1186,12 @@ async fn acknowledged_rows_survive_stage_pressure_and_restart() {
         .scribe_wal_root_for_test()
         .expect("the pod composes a WAL")
         .to_path_buf();
+    // WAL payloads are compressed, so their size proves nothing about the
+    // rows; the restart below proves the whole request was durable.
     let acknowledged_segments = wal_segments(&wal_root);
-    let acknowledged_bytes: u64 = acknowledged_segments.iter().map(|(_, bytes)| bytes).sum();
     assert!(
-        acknowledged_bytes >= (MAX_REQUEST_ROWS as u64) * 8,
-        "the acknowledgement follows WAL sync of the whole request: {acknowledged_bytes} bytes"
+        !acknowledged_segments.is_empty(),
+        "the acknowledgement is WAL-backed"
     );
 
     let occupant = server

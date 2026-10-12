@@ -24,7 +24,7 @@ pub const BIND_CURRENT_TENANT_SQL: &str = "SELECT set_config('app.current_tenant
 
 /// Tenant-scoped transaction for queries that must run under RLS.
 ///
-/// Acquiring a `TenantConn` opens a transaction on the runtime `wyrd_app` pool
+/// Acquiring a `TenantConn` opens a transaction on the RLS-scoped tenant pool
 /// and binds `app.current_tenant` to the supplied tenant UUID for that
 /// transaction only. Dropping without [`commit`](Self::commit) rolls the
 /// transaction back through SQLx's normal `Transaction` drop behavior. The same

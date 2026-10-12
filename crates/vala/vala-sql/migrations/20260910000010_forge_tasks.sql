@@ -6,7 +6,7 @@ CREATE TABLE vala.forge_tasks (
     catalog_name text NOT NULL CHECK (catalog_name = 'wyrd-redux'),
     namespace_name text NOT NULL CHECK (namespace_name IN ('vala.system','vala.bifrost','vala.traces','vala.metrics','vala.logs','vala.eval','vala.drift','vala.dev','vala.datasets')),
     table_name text NOT NULL CHECK (table_name <> '' AND length(table_name) <= 63 AND table_name ~ '^[A-Za-z0-9_.-]+$' AND table_name NOT LIKE '%..%' AND table_name !~ '^\\.|\\.$'),
-    strategy text NOT NULL CHECK (strategy IN ('scribe_promotion','small_files','snapshot_expiry','expired_cleanup','orphan_cleanup')),
+    strategy text NOT NULL CHECK (strategy IN ('scribe_promotion','small_files','snapshot_expiry','expired_cleanup','orphan_cleanup','manifest_rewrite')),
     base_snapshot_id bigint NOT NULL,
     plan jsonb NOT NULL,
     plan_hash bytea NOT NULL CHECK (octet_length(plan_hash) = 32),
@@ -37,6 +37,8 @@ ALTER TABLE vala.forge_tasks FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.forge_tasks
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON vala.forge_tasks TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE UNIQUE INDEX forge_tasks_idempotency ON vala.forge_tasks
  (data_tenant_id, catalog_name, namespace_name, table_name, strategy, base_snapshot_id, plan_hash);
@@ -67,8 +69,9 @@ CREATE TABLE vala.forge_scheduler_state (
     last_tenant_id uuid,
     updated_at timestamptz NOT NULL DEFAULT now()
 );
-INSERT INTO vala.forge_scheduler_state (singleton) VALUES (true);
 
-GRANT SELECT, INSERT, UPDATE, DELETE ON vala.forge_tasks TO wyrd_platform_admin;
-GRANT SELECT, UPDATE, DELETE ON vala.forge_tasks TO wyrd_app;
-GRANT SELECT, UPDATE ON vala.forge_scheduler_state TO wyrd_platform_admin;
+ALTER TABLE vala.forge_scheduler_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.forge_scheduler_state FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON vala.forge_scheduler_state TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
+INSERT INTO vala.forge_scheduler_state (singleton) VALUES (true);

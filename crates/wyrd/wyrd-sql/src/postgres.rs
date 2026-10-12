@@ -7,10 +7,9 @@ use wyrd_spec::auth::Sha256Hex;
 use wyrd_spec::{DataTenantId, TenantSlug};
 
 use crate::dsn::ResolvedDsns;
-use crate::dsn::WYRD_APP_ROLE;
 use crate::operator_pool::OperatorPool;
 use crate::pool::{PoolConfig, build_pool};
-use crate::schema_check::verify_login_name;
+use crate::schema_check::verify_tenant_pool;
 use crate::{SqlError, TenantConn};
 
 /// Drop-safe telemetry for one Wyrd application-pool acquisition.
@@ -70,13 +69,20 @@ impl Drop for PoolAcquireLifecycle<'_> {
 pub struct WyrdPostgres {
     app: PgPool,
     platform_admin: Option<PgPool>,
+    /// Whether both pools were built from one shared login
+    /// ([`ResolvedDsns::shares_login`]), which selects the tenant-login checks.
+    shared_login: bool,
 }
 
 impl WyrdPostgres {
-    /// Build the serving `wyrd_app` and `wyrd_platform_admin` pools.
+    /// Build the serving tenant and platform pools from the effective DSNs.
     ///
-    /// No DDL runs and nothing is validated; call [`Self::validate_schema`]
-    /// before serving.
+    /// The tenant pool connects with [`ResolvedDsns::app`] as supplied; the
+    /// platform pool connects with [`ResolvedDsns::platform`], an operator
+    /// session on the platform login, which is the same login when no
+    /// platform DSN is set. Each pool keeps its own size and timeout
+    /// configuration. No DDL runs and nothing is validated; call
+    /// [`Self::validate_schema`] before serving.
     ///
     /// # Errors
     /// Returns [`SqlError::Connect`] when either pool cannot be built.
@@ -85,7 +91,7 @@ impl WyrdPostgres {
             .await
             .map_err(SqlError::Connect)?;
         let platform_admin = build_pool(
-            dsns.platform_admin.expose_secret(),
+            dsns.platform().expose_secret(),
             PoolConfig::platform_admin_from_env(),
         )
         .await
@@ -93,16 +99,19 @@ impl WyrdPostgres {
         Ok(Self {
             app,
             platform_admin: Some(platform_admin),
+            shared_login: dsns.shares_login(),
         })
     }
 
     /// Prove the database is ready for serving Wyrd control-plane traffic.
     ///
-    /// Checks, in order: the app pool logs in as exactly `wyrd_app`; the
-    /// platform pool logs in as exactly `wyrd_platform_admin`; and the Wyrd
-    /// schema contract ([`crate::verify_schema`]) — role attributes, every
-    /// embedded migration and checksum, schema privileges, and tenant
-    /// isolation policies. Read-only; no DDL runs.
+    /// The platform pool must be an operator session on the login that owns
+    /// Wyrd's objects ([`OperatorPool::verify_operator_session`]); the tenant
+    /// pool's login must stay bound by row-level security, and with a separate
+    /// platform login must not own those objects ([`verify_tenant_pool`]).
+    /// Then the Wyrd schema contract ([`crate::verify_schema`]) holds: every
+    /// embedded migration and checksum, and forced row-level security on every
+    /// table. Read-only; no DDL runs.
     ///
     /// # Errors
     /// Returns [`SqlError::SchemaNotReady`] for the first failed check (including
@@ -112,25 +121,13 @@ impl WyrdPostgres {
         let operator = self
             .operator_pool()
             .ok_or_else(|| SqlError::SchemaNotReady {
-                detail: "no wyrd_platform_admin pool is configured".to_owned(),
+                detail: "no platform pool is configured".to_owned(),
             })?;
-        self.verify_app_login().await?;
-        operator.verify_platform_login().await?;
+        operator
+            .verify_operator_session(crate::OWNED_SCHEMAS)
+            .await?;
+        verify_tenant_pool(&self.app, !self.shared_login, crate::OWNED_SCHEMAS).await?;
         crate::verify_schema(&operator).await
-    }
-
-    /// Prove the app pool logs in, and acts, as exactly `wyrd_app`.
-    ///
-    /// # Errors
-    /// Returns [`SqlError::SchemaNotReady`] naming the observed role when it
-    /// differs, and [`SqlError::Connect`] on query failure.
-    async fn verify_app_login(&self) -> Result<(), SqlError> {
-        let (session, current): (String, String) =
-            sqlx::query_as("SELECT session_user::text, current_user::text")
-                .fetch_one(&self.app)
-                .await
-                .map_err(SqlError::Connect)?;
-        verify_login_name(WYRD_APP_ROLE, &session, &current)
     }
 
     /// Wrap pre-built pools into a handle.
@@ -146,10 +143,11 @@ impl WyrdPostgres {
         Self {
             app,
             platform_admin,
+            shared_login: false,
         }
     }
 
-    /// Borrow the RLS-enforced runtime app pool.
+    /// Borrow the RLS-scoped tenant pool.
     #[must_use]
     pub fn app_pool(&self) -> &PgPool {
         &self.app
@@ -199,8 +197,7 @@ impl WyrdPostgres {
         let operator = self
             .operator_pool()
             .ok_or_else(|| SqlError::InsufficientPrivilege {
-                detail: "tenant slug resolution requires the wyrd_platform_admin operator pool"
-                    .to_owned(),
+                detail: "tenant slug resolution requires the platform operator pool".to_owned(),
             })?;
         crate::queries::platform::tenant_resolver::resolve_by_slug(&operator, slug).await
     }
@@ -209,9 +206,8 @@ impl WyrdPostgres {
     ///
     /// The common OIDC callback carries only the provider's `state`; it has no
     /// tenant selector and never trusts `Host` or forwarded headers. The
-    /// SECURITY DEFINER function `wyrd.auth_login_state_tenant`, granted only
-    /// to the runtime `wyrd_app` role this handle's app pool connects as,
-    /// answers this one question across tenant RLS: the tenant id of the row
+    /// SECURITY DEFINER function `wyrd.auth_login_state_tenant`, called on the
+    /// tenant pool, answers this one question across tenant RLS: the tenant id of the row
     /// whose SHA-256 state hash is `state_hash`, or `None` when the state is
     /// unknown, consumed, or expired. It exposes no other column, so the
     /// caller learns only which tenant transaction to open.
@@ -246,8 +242,7 @@ impl WyrdPostgres {
         let operator = self
             .operator_pool()
             .ok_or_else(|| SqlError::InsufficientPrivilege {
-                detail: "tenant directory reads require the wyrd_platform_admin operator pool"
-                    .to_owned(),
+                detail: "tenant directory reads require the platform operator pool".to_owned(),
             })?;
         let Some(row) = crate::queries::platform::tenants::tenant_by_id(&operator, tenant).await?
         else {
@@ -261,8 +256,8 @@ impl WyrdPostgres {
 
     /// Run one SECURITY DEFINER hash-to-tenant lookup on the app pool.
     ///
-    /// Each lookup function is granted only to `wyrd_app` and returns one
-    /// nullable tenant id for a SHA-256 key.
+    /// Each lookup function runs as its owner in an operator session and
+    /// returns one nullable tenant id for a SHA-256 key.
     ///
     /// # Errors
     /// Returns [`SqlError::Query`] when Postgres rejects the lookup and

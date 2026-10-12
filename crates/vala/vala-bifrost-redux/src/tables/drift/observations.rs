@@ -5,7 +5,6 @@ use crate::tables::{
     CorrelationPolicy, DomainTable, PayloadClass, daily_layout, sort_asc_nulls_first, sort_desc,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
-use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// `vala.drift.observations` — one tall row per observed feature.
 ///
@@ -39,7 +38,8 @@ impl DomainTable for ObservationsTable {
     /// Daily partitions sorted newest first then by series, Bloom-pruned on `series` for one-feature scans.
     fn physical_layout() -> PhysicalLayoutWire {
         daily_layout(
-            vec![sort_desc(WYRD_EVENT_TIME), sort_asc_nulls_first("series")],
+            "created_at",
+            vec![sort_desc("created_at"), sort_asc_nulls_first("series")],
             &["series"],
         )
     }

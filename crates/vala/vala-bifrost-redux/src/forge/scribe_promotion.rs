@@ -314,31 +314,6 @@ fn first_metric_disagreement(
     None
 }
 
-/// Reads one event-time bound of the object's own footer as epoch microseconds.
-///
-/// # Errors
-///
-/// Returns [`ForgeError::Invariant`] when the bound is absent or is not the
-/// timestamp literal the partitioned column must produce, either of which means
-/// the object cannot be placed in a time partition at all.
-fn event_time_bound_micros(
-    bounds: &std::collections::HashMap<i32, iceberg::spec::Datum>,
-    field_id: i32,
-    edge: &str,
-) -> Result<i64, ForgeError> {
-    let datum = bounds.get(&field_id).ok_or_else(|| ForgeError::Invariant {
-        detail: format!("promoted object footer carries no {edge} event-time bound"),
-    })?;
-    match datum.literal() {
-        iceberg::spec::PrimitiveLiteral::Long(micros) => Ok(*micros),
-        other => Err(ForgeError::Invariant {
-            detail: format!(
-                "promoted object {edge} event-time bound is not a timestamp: {other:?}"
-            ),
-        }),
-    }
-}
-
 /// Proves one immutable object physically agrees with the evidence promoting it.
 ///
 /// The checks run cheapest-and-most-decisive first: table policy identity needs
@@ -352,7 +327,7 @@ fn event_time_bound_micros(
 /// sort order the table no longer carries, the footer cannot be decoded under
 /// the writer's bounds, the footer's schema fingerprint differs from the
 /// record's, any persisted metric disagrees with the footer, or the object's own
-/// event-time bounds fall outside the partition the record claims.
+/// time-column bounds are unusable or fall outside the partition the record claims.
 fn validate_promoted_object(
     record: &ScribePublishedHotFileV1,
     bytes: &Bytes,
@@ -418,20 +393,33 @@ fn validate_promoted_object(
     .map_err(|error| ForgeError::Invariant {
         detail: format!("promotion evidence names a non-canonical partition: {error}"),
     })?;
-    let field_id = schema
-        .field_by_name(wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME)
+    let field_id = crate::catalog::TimeAxis::iceberg_field_id(metadata.default_partition_spec())
         .ok_or_else(|| ForgeError::Invariant {
-            detail: "table schema carries no event-time column to partition on".to_owned(),
-        })?
-        .id;
-    let lowest = event_time_bound_micros(footer.data_file().lower_bounds(), field_id, "lower")?;
-    let highest = event_time_bound_micros(footer.data_file().upper_bounds(), field_id, "upper")?;
+            detail: "table partition spec has no time partition field".to_owned(),
+        })?;
+    // Promotion is fail-closed: bounds that would merely retain a file at
+    // query time are an invariant violation for the evidence promoting it.
+    let crate::catalog::event_time::EventTimeStatistics::Bounded {
+        min_micros: lowest,
+        max_micros: highest,
+    } = crate::catalog::event_time::EventTimeStatistics::from_manifest_bounds(
+        footer.data_file(),
+        field_id,
+    )
+    else {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "promoted object {} carries no usable time-column bounds",
+                record.object_key
+            ),
+        });
+    };
     let start = partition.start_utc().timestamp_micros();
     let end = partition.end_utc().timestamp_micros();
     if lowest < start || highest >= end {
         return Err(ForgeError::Invariant {
             detail: format!(
-                "promoted object {} holds event times outside the partition its evidence claims",
+                "promoted object {} holds time-column values outside the partition its evidence claims",
                 record.object_key
             ),
         });
@@ -873,7 +861,7 @@ impl Forge {
                 live.insert(super::path::catalog_path_to_object_key(
                     table_location,
                     binding,
-                    &self.core.staging,
+                    &self.core.warehouse,
                     entry.file_path(),
                 )?);
             }
@@ -945,7 +933,7 @@ impl Forge {
                 .map_err(ForgeError::ObjectStore)?;
             let observed_checksum = {
                 use sha2::Digest as _;
-                hex::encode(sha2::Sha256::digest(bytes.to_bytes()))
+                hex::encode(sha2::Sha256::digest(&bytes))
             };
             let file_size = u64::try_from(bytes.len()).map_err(|_| ForgeError::Invariant {
                 detail: format!("hot object {} size exceeds u64", record.object_key),
@@ -959,7 +947,7 @@ impl Forge {
                 .map_err(|error| ForgeError::Invariant {
                     detail: format!("hot object failed promotion revalidation: {error}"),
                 })?;
-            validate_promoted_object(record, &bytes.to_bytes(), file_size, table)?;
+            validate_promoted_object(record, &bytes, file_size, table)?;
             data_files.push(record.data_file().map_err(|error| ForgeError::Invariant {
                 detail: format!("promotion evidence does not rebuild a data file: {error}"),
             })?);
@@ -1013,12 +1001,8 @@ impl Forge {
             "scribe_promotion",
             Some((task_id, attempt_id)),
         );
-        if !lease.renew(&self.core.operator_pool).await?
-            || !lease.commit_window_fits(self.core.config.commit_window())
-        {
-            return Err(ForgeError::FenceLost {
-                lease_key: lease.lease_key.clone(),
-            });
+        if !lease.renew().await? || !lease.commit_window_fits(self.core.config.commit_window()) {
+            return Err(lease.fence_lost());
         }
         let transaction = iceberg::transaction::Transaction::new(table);
         let action = transaction
@@ -1032,11 +1016,9 @@ impl Forge {
             ]));
         let transaction = iceberg::transaction::ApplyTransactionAction::apply(action, transaction)
             .map_err(ForgeError::Catalog)?;
-        lease.require_fence(&self.core.operator_pool).await?;
+        lease.require_fence().await?;
         if !lease.commit_window_fits(self.core.config.commit_window()) {
-            return Err(ForgeError::FenceLost {
-                lease_key: lease.lease_key.clone(),
-            });
+            return Err(lease.fence_lost());
         }
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
@@ -1164,10 +1146,8 @@ impl Forge {
             base_snapshot_id,
             committed_snapshot_id,
         } = settlement;
-        if !lease.renew(&self.core.operator_pool).await? {
-            return Err(ForgeError::FenceLost {
-                lease_key: lease.lease_key.clone(),
-            });
+        if !lease.renew().await? {
+            return Err(lease.fence_lost());
         }
         let resource = ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref);
         let detail = AuditDetail::ForgeScribePromotion {
@@ -1185,13 +1165,14 @@ impl Forge {
             ForgeOperationFamily::ScribePromotion.operation_prefix(),
             phase_suffix(phase)
         );
+        lease.require_fence().await?;
         let mut conn = self
             .core
             .vala
             .tenant_conn(binding.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        lease.require_fence(&self.core.operator_pool).await?;
+        lease.assert_transaction_fence(&mut conn).await?;
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::ScribePromotion)
             .map_err(ForgeError::Sql)?;
         let transition = if phase == ForgeScribePromotionPhase::Prepared {
@@ -1216,7 +1197,6 @@ impl Forge {
             .await
             .map_err(ForgeError::Sql)?;
         }
-        lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
     }
 }

@@ -1,0 +1,27 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: support-desk
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  tables:
+    - name: tickets
+      schema:
+        type: object
+        properties:
+          ticket_id: {type: string}
+          question: {type: string}
+          answer: {type: string}
+          refund: {type: boolean}
+        required: [ticket_id, question, answer, refund]
+  components:
+    - alias: agent
+      ref: ./support-agent.yaml
+      verified_by:
+        - verifier: ./answer-quality.yaml
+          runs_on: {kind: observations_ready}
+        - verifier: ./no-refund-promise.yaml
+    - alias: prompt
+      ref: ./support-prompt.yaml

@@ -5,10 +5,10 @@
 //! `(issuer, subject)` pin that maps a federated human onto a platform
 //! principal.
 //!
-//! All of it runs on the BYPASSRLS [`OperatorPool`], because `platform.*` sits
-//! outside the row-level-security tenant boundary. The `wyrd_app` role holds no
-//! privilege here at all, which is what keeps "no tenant-plane path confers
-//! platform authority" a property of the database rather than of server code.
+//! All of it runs on the [`OperatorPool`], because `platform.*` admits only
+//! operator sessions. Row-level security shows a tenant session no row here at
+//! all, which is what keeps "no tenant-plane path confers platform authority"
+//! a property of the database rather than of server code.
 // raw-query grep allowlist: platform administrative tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use std::time::Duration;

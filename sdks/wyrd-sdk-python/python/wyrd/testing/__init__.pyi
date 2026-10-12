@@ -387,4 +387,27 @@ class WyrdTestServer:
         """
         ...
 
-__all__ = ["WyrdTestServer"]
+class UnmigratedDatabase:
+    """One isolated, empty Postgres database (testing feature only).
+
+    Entering creates the database inside the repository-managed test Postgres;
+    exiting drops it. Hand ``url`` to a deployment process under test as its
+    ``WYRD_DATABASE_URL``; that process applies migrations itself.
+    """
+
+    def __init__(self) -> None:
+        """Create an unentered handle; entering the ``with`` block creates the database."""
+        ...
+
+    def __enter__(self) -> UnmigratedDatabase: ...
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool: ...
+    @property
+    def url(self) -> str:
+        """Platform-login URL of the entered database.
+
+        Raises:
+            WyrdError: The harness error outside the context manager.
+        """
+        ...
+
+__all__ = ["UnmigratedDatabase", "WyrdTestServer"]

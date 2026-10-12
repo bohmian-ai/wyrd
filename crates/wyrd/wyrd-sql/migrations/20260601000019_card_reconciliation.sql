@@ -42,4 +42,3 @@ CREATE INDEX cards_reconciliation_claim_idx
     WHERE reconcile_status IN ('pending', 'leased');
 
 -- Cleanup reconciliation deletes metadata only after backend cleanup succeeds.
-GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_artifact_metadata TO wyrd_app;

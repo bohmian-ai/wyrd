@@ -14,7 +14,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 
 use super::support::{
-    append_batch, append_values_at, read_sql, register_table, sorted_values, span_batch,
+    append_batch, append_values_at, read_sql, register_timed_table, sorted_values, span_batch,
     start_scribe_server, tenant_client, unique_table, until_admitted,
 };
 
@@ -185,7 +185,7 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
     );
     assert!(
         server
-            .scribe_staging_backlog_for_test()
+            .scribe_staging_backlog_for_test(None)
             .expect("the pod's staged backlog is inspectable")
             .live_members
             > 0,
@@ -259,7 +259,7 @@ async fn build_participants(server: &WyrdTestServer) -> Vec<Participant> {
             .expect("the built-in traces table is provisioned");
         let dynamic_name = unique_table("sustained");
         let dynamic_table =
-            register_table(server, tenant, BifrostNamespace::Datasets, &dynamic_name).await;
+            register_timed_table(server, tenant, BifrostNamespace::Datasets, &dynamic_name).await;
         participants.push(Participant {
             tenant,
             client: Arc::new(tenant_client(server, tenant).await),
@@ -362,7 +362,7 @@ fn batch_values(tenant_ordinal: usize, batch: usize) -> Vec<i64> {
 /// Panics when the totals are not inspectable or any of them does not settle.
 fn assert_terminal_reconciliation(server: &WyrdTestServer) {
     let staging = server
-        .scribe_staging_backlog_for_test()
+        .scribe_staging_backlog_for_test(None)
         .expect("the pod's staged backlog is inspectable");
     assert_eq!(
         staging.outstanding_claims, 0,

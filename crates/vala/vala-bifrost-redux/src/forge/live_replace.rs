@@ -4,6 +4,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::queries::oracle_reader_authority::{BifrostTableMaintenanceAuthority, CutTableRef};
 use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
 use wyrd_spec::vala::api::AuditDetail;
 
@@ -42,10 +43,13 @@ impl Forge {
 
     /// Record one live-replacement operation-state transition atomically.
     ///
+    /// A terminal transition also announces the table's cut change in the
+    /// same transaction, so Oracle cut caches drop the replaced pointer.
+    ///
     /// # Errors
     ///
     /// Returns [`ForgeError`] when lease renewal, tenant transaction creation,
-    /// the operation-state transition, fence assertion, or transaction commit
+    /// the operation-state transition, the cut announcement, fence assertion, or transaction commit
     /// fails. The caller-owned transaction rolls back the durable row.
     pub(super) async fn append_live_transition(
         &self,
@@ -54,10 +58,8 @@ impl Forge {
         operation: &str,
         detail: AuditDetail,
     ) -> Result<(), ForgeError> {
-        if !lease.renew(&self.core.operator_pool).await? {
-            return Err(ForgeError::FenceLost {
-                lease_key: lease.lease_key.clone(),
-            });
+        if !lease.renew().await? {
+            return Err(lease.fence_lost());
         }
         let mut conn = self
             .core
@@ -65,7 +67,7 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        lease.require_fence(&self.core.operator_pool).await?;
+        lease.assert_transaction_fence(&mut conn).await?;
         #[cfg(feature = "test-support")]
         if operation == "forge.iceberg_rewrite.prepared"
             && FAIL_NEXT_PREPARED_LIVE_TRANSITION.swap(false, Ordering::AcqRel)
@@ -98,7 +100,18 @@ impl Forge {
         match transition {
             ForgeOperationTransition::Applied | ForgeOperationTransition::AlreadyApplied => {}
         }
-        lease.assert_transaction_fence(&mut conn).await?;
+        // A terminal rewrite transition follows the catalog's answer, and a
+        // committed or recovered rewrite moved the pointer without touching
+        // `vala.file_list`; a Reset costs each warm Oracle one cut reread.
+        if operation != "forge.iceberg_rewrite.prepared" {
+            BifrostTableMaintenanceAuthority::new(&mut conn)
+                .announce_cut_change(CutTableRef {
+                    namespace_name: key.table_ref.namespace.as_str(),
+                    table_name: &key.table_ref.name,
+                })
+                .await
+                .map_err(ForgeError::Sql)?;
+        }
         conn.commit().await.map_err(ForgeError::Sql)
     }
 }

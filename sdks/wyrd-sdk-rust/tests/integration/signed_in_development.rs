@@ -1,5 +1,5 @@
 //! A person signs in once with the CLI and completes the local workflow from
-//! the saved login, on the Keycloak identity lane; the stock exporter and
+//! the saved login, on the Keycloak identity lane; the telemetry exporter and
 //! Gateway caller keep working after the original access token expires.
 
 use std::time::Duration;
@@ -34,6 +34,7 @@ struct Attributed {
 async fn saved_login_completes_the_workflow_past_token_expiry() {
     let local = Box::pin(Local::start(
         WyrdTestServer::builder()
+            .without_process_telemetry_for_test()
             .with_public_origin(HUMAN_PUBLIC_ORIGIN.parse().expect("origin parses"))
             .with_access_ttl(ACCESS_TTL)
             .with_auth_verify_settings(wyrd_auth_verify::WyrdAuthVerifySettings {
@@ -82,19 +83,20 @@ async fn saved_login_completes_the_workflow_past_token_expiry() {
         .expect("the server answers");
     assert_eq!(lapsed.status(), reqwest::StatusCode::UNAUTHORIZED);
     assert_eq!(invoke(&local.deployment, &client).await, "hi");
-    export(&worked.provider, &worked.agent, "after-expiry");
+    let run = worked.state.run_for_card("agent").expect("agent run");
+    export(&run).await;
+    worked.telemetry.shutdown().expect("the later span exports");
     let rows: Vec<Attributed> = Bifrost::connect(&client)
         .await
         .expect("Bifrost connects")
         .sql_as(
             "SELECT card_uid FROM vala.traces.spans WHERE run_id = $1",
-            &[QueryParam::String("after-expiry".to_owned())],
+            &[QueryParam::String(run.run_id().to_string())],
         )
         .await
         .expect("the later span reads back");
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(rows[0].card_uid.as_ref(), Some(&worked.agent_uid));
 
-    worked.provider.shutdown().expect("the provider stops");
     local.deployment.shutdown().await;
 }

@@ -21,5 +21,7 @@ mod scheduled_drift_alerts_operator;
 /// The same workflow from a saved login, past access-token expiry.
 mod signed_in_development;
 mod support;
+/// The canonical support desk, from the checked-in example.
+mod support_desk;
 mod verify_in_real_time;
 mod workflow_loading;

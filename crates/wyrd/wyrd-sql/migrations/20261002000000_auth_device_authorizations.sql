@@ -39,3 +39,5 @@ ALTER TABLE wyrd.auth_device_authorizations FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.auth_device_authorizations
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.auth_device_authorizations TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

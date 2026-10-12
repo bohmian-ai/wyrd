@@ -15,13 +15,17 @@ path = "src/lib.rs"
 [dependencies]
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
+wyrd-types = { workspace = true }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 futures-util = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
+parquet-variant-json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
@@ -31,6 +35,8 @@ tokio = { workspace = true, features = ["full"] }
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
 serde_json = { workspace = true }
+parquet-variant = { workspace = true }
+parquet-variant-json = { workspace = true }
 wyrd-spec = { workspace = true }
 async-trait = { workspace = true }
 

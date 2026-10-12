@@ -137,8 +137,8 @@ buffer bounds, and failure behavior against the exact DataFusion/Arrow version
 cone. Cargo resolving two compatible-looking versions does not make their
 native plans, arrays, sessions, or protobuf codecs interchangeable.
 
-The analytical dependency cone is DataFusion 55.0.0, Arrow/Parquet 59.2.0,
-and `datafusion-distributed` 4.0.0 at its pinned revision. Managed Iceberg and
+The analytical dependency cone is DataFusion 55.1.0 (the Wyrd fork), Arrow/Parquet
+60.0.0, and `datafusion-distributed` 4.0.0 at its pinned Wyrd-fork revision. Managed Iceberg and
 the managed compaction core must resolve that same native universe. Change the
 cone as one verified dependency decision; never bridge duplicate universes
 with JSON, IPC, FFI, trait erasure, or a sidecar process.

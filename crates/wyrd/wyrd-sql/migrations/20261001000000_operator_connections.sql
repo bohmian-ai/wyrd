@@ -42,12 +42,11 @@ ALTER TABLE wyrd.operator_connections FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.operator_connections
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.operator_connections TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
-REVOKE ALL ON TABLE wyrd.operator_connections FROM wyrd_app, wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON wyrd.operator_connections TO wyrd_app;
 -- Rotation discovers which tenants and key versions are still referenced;
 -- it never needs ciphertext across tenants.
-GRANT SELECT (data_tenant_id, key_version) ON wyrd.operator_connections TO wyrd_platform_admin;
 
 -- ---------------------------------------------------------------------------
 -- Dispatch failure context

@@ -3919,7 +3919,7 @@ export interface ServiceTable {
    */
   readonly name: string;
   /**
-   * JSON Schema object describing the table's user fields.
+   * JSON Schema object describing the table's user fields, whose `properties` order is the table's column order.
    */
   readonly schema: unknown;
 }

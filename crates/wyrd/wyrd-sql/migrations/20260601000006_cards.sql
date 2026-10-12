@@ -106,15 +106,8 @@ ALTER TABLE wyrd.cards FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.cards
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
--- wyrd_platform_admin requires cross-tenant access for sweepers and
--- operator restore. Named permissive policy avoids cluster-level
--- BYPASSRLS on this role at runtime. Role name confirmed at
--- crates/wyrd/wyrd-sql/migrations/20260601000000_platform.sql:27-33.
-CREATE POLICY admin_cross_tenant ON wyrd.cards
-    TO wyrd_platform_admin
-    USING (true)
-    WITH CHECK (true);
+CREATE POLICY operator_access ON wyrd.cards TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- BEFORE UPDATE trigger -------------------------------------------------
 -- Enforces spec_hash immutability and bumps updated_at on every update.
@@ -147,14 +140,3 @@ CREATE TRIGGER cards_before_update
     BEFORE UPDATE ON wyrd.cards
     FOR EACH ROW
     EXECUTE FUNCTION wyrd.cards_before_update();
-
--- Grants ---------------------------------------------------------------
--- Matches the storage-table grant pattern at
--- crates/wyrd/wyrd-sql/migrations/20260601000002_storage.sql:135-138.
--- wyrd_app: read + register + soft-delete (UPDATE status).
--- wyrd_platform_admin: read + status repair only; never INSERT here
--- because tenant-scoped writes must flow through wyrd_app for audit.
-REVOKE ALL ON TABLE wyrd.cards FROM wyrd_app;
-REVOKE ALL ON TABLE wyrd.cards FROM wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON wyrd.cards TO wyrd_app;
-GRANT SELECT, UPDATE ON wyrd.cards TO wyrd_platform_admin;

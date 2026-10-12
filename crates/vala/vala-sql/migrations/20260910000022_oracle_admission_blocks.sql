@@ -15,6 +15,8 @@ ALTER TABLE vala.oracle_admission_policies FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.oracle_admission_policies
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON vala.oracle_admission_policies TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE TABLE vala.oracle_admission_blocks (
     block_id uuid PRIMARY KEY,
@@ -44,9 +46,5 @@ ALTER TABLE vala.oracle_admission_blocks FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.oracle_admission_blocks
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-REVOKE ALL ON vala.oracle_admission_policies FROM PUBLIC, wyrd_app;
-REVOKE ALL ON vala.oracle_admission_blocks FROM PUBLIC, wyrd_app;
-GRANT SELECT, INSERT, UPDATE ON vala.oracle_admission_policies TO wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON vala.oracle_admission_blocks TO wyrd_platform_admin;
-GRANT SELECT ON vala.cluster_nodes TO wyrd_platform_admin;
+CREATE POLICY operator_access ON vala.oracle_admission_blocks TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

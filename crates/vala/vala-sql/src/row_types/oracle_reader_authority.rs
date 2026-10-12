@@ -1,6 +1,6 @@
-//! Validated identity behind Oracle's durable reader authority.
+//! Validated identity behind Oracle cuts and Forge table maintenance.
 //!
-//! One thing is durable here: which registered table a cut acquisition or
+//! One thing is durable here: which registered table a cut resolves or a
 //! destructive maintenance decision serializes on. This module owns its pure
 //! validation so the query owners stay statements.
 
@@ -15,7 +15,7 @@ fn invariant(detail: &str) -> SqlError {
     }
 }
 
-/// The durable identity every active-read and maintenance statement is keyed by.
+/// The durable identity every cut and maintenance statement is keyed by.
 ///
 /// `table_uid` is the identity; the catalog, namespace, and table names are
 /// checked payload that makes registry drift visible rather than silent. A
@@ -23,7 +23,7 @@ fn invariant(detail: &str) -> SqlError {
 /// the registered table has contradictory evidence, not a naming preference.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct TableAuthorityIdentity {
-    /// Tenant owning both the table and its active reads.
+    /// Tenant owning the table.
     pub tenant: DataTenantId,
     /// Durable 16-byte table UID from `vala.bifrost_tables`.
     pub table_uid: [u8; 16],

@@ -19,6 +19,7 @@ pub mod gateway;
 pub mod graph;
 pub mod ids;
 pub mod intel;
+pub mod mcp;
 pub mod metadata;
 pub mod operator_connection;
 pub mod origin;

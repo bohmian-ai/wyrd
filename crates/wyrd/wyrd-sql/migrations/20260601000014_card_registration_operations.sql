@@ -44,16 +44,8 @@ ALTER TABLE wyrd.card_registration_operations FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.card_registration_operations
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-CREATE POLICY admin_cross_tenant ON wyrd.card_registration_operations
-    TO wyrd_platform_admin
-    USING (true)
-    WITH CHECK (true);
-
-REVOKE ALL ON TABLE wyrd.card_registration_operations FROM wyrd_app;
-REVOKE ALL ON TABLE wyrd.card_registration_operations FROM wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON wyrd.card_registration_operations TO wyrd_app;
-GRANT SELECT, UPDATE, DELETE ON wyrd.card_registration_operations TO wyrd_platform_admin;
+CREATE POLICY operator_access ON wyrd.card_registration_operations TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- Registration lifecycle state and pending-card bookkeeping.
 
@@ -138,17 +130,8 @@ ALTER TABLE wyrd.card_artifact_manifest FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.card_artifact_manifest
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-CREATE POLICY admin_cross_tenant ON wyrd.card_artifact_manifest
-    TO wyrd_platform_admin
-    USING (true)
-    WITH CHECK (true);
-
-REVOKE ALL ON TABLE wyrd.card_artifact_manifest FROM wyrd_app;
-REVOKE ALL ON TABLE wyrd.card_artifact_manifest FROM wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON wyrd.card_artifact_manifest TO wyrd_app;
-GRANT SELECT, UPDATE, DELETE ON wyrd.card_artifact_manifest TO wyrd_platform_admin;
+CREATE POLICY operator_access ON wyrd.card_artifact_manifest TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- Composite Service/Agent registration projects its principal on the same
 -- tenant transaction as the card row.
-GRANT SELECT, INSERT, UPDATE ON wyrd.auth_service_accounts TO wyrd_app;

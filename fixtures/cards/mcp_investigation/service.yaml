@@ -1,0 +1,31 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: investigation-service
+  version: 1.0.0
+  space: default
+spec:
+  components:
+    - alias: model
+      ref:
+        kind: Model
+        name: support-model
+        version: 1.0.0
+        space: default
+    - alias: agent
+      ref:
+        kind: Agent
+        name: support-agent
+        version: 1.0.0
+        space: default
+  tables:
+    - name: investigation_events
+      schema:
+        type: object
+        properties:
+          id:
+            type: integer
+          value:
+            type: string
+        required: [id, value]
+        additionalProperties: false

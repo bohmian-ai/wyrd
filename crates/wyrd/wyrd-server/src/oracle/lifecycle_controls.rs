@@ -1,6 +1,7 @@
 //! Tenant-authorized logical lifecycle controls over all current Oracle owners.
 
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::StreamExt as _;
@@ -134,28 +135,35 @@ impl RunningQueryControls {
     /// owner signal and the rest of the open share that one instant; neither
     /// starts a fresh budget.
     ///
+    /// The caller pins `open` in its own frame and lends it here, so the open
+    /// future is stored exactly once: an `async fn` that took it by value
+    /// would keep its argument and the awaited value as two copies of the
+    /// whole Oracle open.
+    ///
     /// # Errors
     /// Returns the open's own error, and `QueryStreamIncomplete` when the
     /// query's deadline passes after cancellation before the open returns;
-    /// the open is then dropped, which releases its query guards. A refused
-    /// cancellation is not an error.
-    pub async fn open_cancellable(
+    /// the caller then drops the open, which releases its query guards. A
+    /// refused cancellation is not an error.
+    pub async fn open_cancellable<F>(
         &self,
-        open: impl Future<Output = Result<OracleQueryStream, WyrdError>>,
+        open: Pin<&mut F>,
         tenant_id: DataTenantId,
         request_id: &RequestId,
         requested_deadline_ms: Option<i64>,
         cancel: &CancellationToken,
-    ) -> Result<OracleQueryStream, WyrdError> {
+    ) -> Result<OracleQueryStream, WyrdError>
+    where
+        F: Future<Output = Result<OracleQueryStream, WyrdError>>,
+    {
         let duration = requested_deadline_ms
             .and_then(|deadline_ms| u64::try_from(deadline_ms).ok())
             .filter(|deadline_ms| *deadline_ms != 0)
             .map_or(DEFAULT_QUERY_DEADLINE, std::time::Duration::from_millis);
         let deadline = Instant::now() + duration;
-        // Boxed so every caller's future carries a pointer, not the open.
         cancel_while_opening(
-            Box::pin(open),
-            self.cancel(tenant_id, request_id.clone()),
+            open,
+            || self.cancel(tenant_id, request_id.clone()),
             cancel,
             deadline,
         )
@@ -299,30 +307,35 @@ impl RunningQueryControls {
     }
 }
 
-/// Awaits `open`; if `cancel` fires first, awaits `cancel_owner` once and then
-/// the same `open`, both before `deadline`.
+/// Awaits `open`; if `cancel` fires first, starts `cancel_owner` once, awaits
+/// it, and then awaits the same `open`, both before `deadline`.
 ///
-/// While the deadline holds, the open is never dropped, so its result reaches
-/// the caller. The cancellation request's own refusal is only logged, because
-/// the caller settles whatever the open returns.
+/// While the deadline holds, the open is never abandoned, so its result
+/// reaches the caller. The cancellation request's own refusal is only logged,
+/// because the caller settles whatever the open returns. `open` is borrowed
+/// pinned and `cancel_owner` is built only once cancellation wins, so neither
+/// future is copied into this one's state.
 ///
 /// # Errors
 /// Returns the open's own error, and `QueryStreamIncomplete` when `deadline`
 /// passes after cancellation before the open returns.
-async fn cancel_while_opening<T, C>(
-    open: impl Future<Output = Result<T, WyrdError>>,
-    cancel_owner: impl Future<Output = Result<C, WyrdError>>,
+async fn cancel_while_opening<T, C, F, O>(
+    mut open: Pin<&mut F>,
+    cancel_owner: impl FnOnce() -> O,
     cancel: &CancellationToken,
     deadline: Instant,
-) -> Result<T, WyrdError> {
-    tokio::pin!(open);
+) -> Result<T, WyrdError>
+where
+    F: Future<Output = Result<T, WyrdError>>,
+    O: Future<Output = Result<C, WyrdError>>,
+{
     tokio::select! {
         biased;
-        opened = &mut open => return opened,
+        opened = open.as_mut() => return opened,
         () = cancel.cancelled() => {}
     }
     tokio::time::timeout_at(deadline, async {
-        if let Err(error) = cancel_owner.await {
+        if let Err(error) = cancel_owner().await {
             tracing::debug!(
                 code = error.code(),
                 "the opening query had no cancellable owner yet"
@@ -336,6 +349,7 @@ async fn cancel_while_opening<T, C>(
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -360,10 +374,14 @@ mod tests {
             requested.store(true, Ordering::Release);
             Ok::<(), WyrdError>(())
         };
-        let opened =
-            cancel_while_opening(async { Ok(7) }, owner(), &CancellationToken::new(), later())
-                .await
-                .expect("an uncancelled open returns its stream");
+        let opened = cancel_while_opening(
+            pin!(async { Ok(7) }),
+            owner,
+            &CancellationToken::new(),
+            later(),
+        )
+        .await
+        .expect("an uncancelled open returns its stream");
         assert_eq!(opened, 7);
         assert!(!requested.load(Ordering::Acquire));
 
@@ -372,8 +390,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let (opening, open) = tokio::sync::oneshot::channel::<u32>();
         let (asked, request) = tokio::sync::oneshot::channel::<()>();
-        let open = async { Ok(open.await.expect("the test sends the open result")) };
-        let owner = async {
+        let open = pin!(async { Ok(open.await.expect("the test sends the open result")) });
+        let owner = || async {
             asked.send(()).expect("the test awaits the request");
             Ok::<(), WyrdError>(())
         };
@@ -386,10 +404,10 @@ mod tests {
             tokio::join!(cancel_while_opening(open, owner, &cancel, later()), signal);
         assert_eq!(opened.expect("a cancelled open still returns"), 9);
 
-        let refused = async { Err::<(), WyrdError>(BifrostError::RunningQueryNotFound.into()) };
+        let refused = || async { Err::<(), WyrdError>(BifrostError::RunningQueryNotFound.into()) };
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let opened = cancel_while_opening(async { Ok(3) }, refused, &cancel, later()).await;
+        let opened = cancel_while_opening(pin!(async { Ok(3) }), refused, &cancel, later()).await;
         assert_eq!(opened.expect("a refused cancellation keeps the open"), 3);
     }
 
@@ -408,7 +426,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancel_while_opening_ends_at_the_original_deadline() {
         let asked = AtomicUsize::new(0);
-        let owner = async {
+        let owner = || async {
             asked.fetch_add(1, Ordering::AcqRel);
             tokio::time::sleep(Duration::from_secs(3)).await;
             Ok::<(), WyrdError>(())
@@ -418,7 +436,7 @@ mod tests {
         let started = Instant::now();
         let deadline = started + Duration::from_millis(500);
         let error = cancel_while_opening(
-            std::future::pending::<Result<u32, WyrdError>>(),
+            pin!(std::future::pending::<Result<u32, WyrdError>>()),
             owner,
             &cancel,
             deadline,

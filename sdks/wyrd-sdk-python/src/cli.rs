@@ -5,6 +5,7 @@
 //! functions are a test surface and live in `wyrd.testing.cli`, built only
 //! with the `testing` feature.
 
+use pyo3::exceptions::PyKeyboardInterrupt;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
@@ -17,7 +18,7 @@ use pyo3::types::PyModule;
 /// # Errors
 ///
 /// Returns a Python error when `sys.argv` is unavailable or contains a
-/// non-string value.
+/// non-string value, or a pending Python signal raises another exception.
 #[pyfunction]
 #[pyo3(signature = ())]
 fn run_wyrd_cli(py: Python<'_>) -> PyResult<u8> {
@@ -25,7 +26,15 @@ fn run_wyrd_cli(py: Python<'_>) -> PyResult<u8> {
         .import("sys")?
         .getattr("argv")?
         .extract::<Vec<String>>()?;
-    Ok(py.detach(|| wyrd_runtime::runtime().block_on(wyrd_cli::run_cli_code(args))))
+    let code = py.detach(|| wyrd_runtime::runtime().block_on(wyrd_cli::run_cli_code(args)));
+    // Tokio already settled the interrupted command; preserve its exit code.
+    if code == 130
+        && let Err(error) = py.check_signals()
+        && !error.is_instance_of::<PyKeyboardInterrupt>(py)
+    {
+        return Err(error);
+    }
+    Ok(code)
 }
 
 /// Register the installed console-script entrypoint on the extension root.

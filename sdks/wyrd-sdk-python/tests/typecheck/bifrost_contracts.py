@@ -39,12 +39,12 @@ def described_field_types_are_recursive_without_any() -> None:
         },
         "user_fields": [attributes],
         "correlation_fields": [],
-        "managed_candidates": [],
         "canonical_physical_fingerprint": "canonical-fp",
         "compaction_target_file_size_bytes": 1_073_741_824,
         "compaction_type": "small-files",
         "physical_layout": {
             "partition_granularity": "Hour",
+            "time_column": "start_time_unix_nano",
             "sort_keys": [{"column": "trace_id", "direction": "Ascending", "null_order": "Last"}],
             "bloom_columns": ["trace_id"],
         },
@@ -60,6 +60,7 @@ def described_field_types_are_recursive_without_any() -> None:
     assert description["compaction_target_file_size_bytes"] == 1_073_741_824
     assert description["compaction_type"] == "small-files"
     assert description["physical_layout"]["sort_keys"][0]["column"] == "trace_id"
+    assert description["physical_layout"]["time_column"] == "start_time_unix_nano"
 
 
 def client_value_types_are_declared_without_any() -> None:
@@ -71,11 +72,11 @@ def client_value_types_are_declared_without_any() -> None:
     server does.
     """
 
-    correlation: Correlation = {"card_ref": "test/Service/writer@1.0.0"}
+    correlation: Correlation = {"card_uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01"}
     resolved: ResolvedTable = {"table_uid": "01J0", "fingerprint": "fp"}
-    key: SortKey = {"column": "wyrd_event_time", "direction": "desc", "null_order": "last"}
+    key: SortKey = {"column": "created_at", "direction": "desc", "null_order": "last"}
 
-    assert correlation["card_ref"].endswith("@1.0.0")
+    assert correlation["card_uid"].endswith("1b01")
     assert "run_id" not in correlation
     assert resolved["table_uid"] == "01J0"
-    assert key["column"] == "wyrd_event_time"
+    assert key["column"] == "created_at"

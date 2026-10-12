@@ -37,7 +37,7 @@ pub struct PoolConfig {
 }
 
 impl PoolConfig {
-    /// Defaults for the runtime `wyrd_app` pool.
+    /// Defaults for the RLS-scoped tenant pool.
     #[must_use]
     pub fn app_defaults() -> Self {
         Self {
@@ -51,7 +51,7 @@ impl PoolConfig {
         }
     }
 
-    /// Defaults for the one-off migration pool opened with the database-owner
+    /// Defaults for the one-off migration pool opened with the platform
     /// login by `wyrd-server migrate`.
     #[must_use]
     pub fn migrator_defaults() -> Self {
@@ -66,7 +66,7 @@ impl PoolConfig {
         }
     }
 
-    /// Defaults for the `wyrd_platform_admin` pool.
+    /// Defaults for the platform operator pool.
     #[must_use]
     pub fn platform_admin_defaults() -> Self {
         Self {
@@ -150,7 +150,7 @@ pub async fn build_pool(database_url: &str, config: PoolConfig) -> Result<PgPool
     connect_pool(database_url, config).await
 }
 
-/// Build the runtime `wyrd_app` pool from `WYRD_DB_*` tuning.
+/// Build the RLS-scoped tenant pool from `WYRD_DB_*` tuning.
 ///
 /// # Errors
 /// Returns [`sqlx::Error::Configuration`] when another Rustls provider already
@@ -160,7 +160,7 @@ pub async fn build_app_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     build_pool(database_url, PoolConfig::app_from_env()).await
 }
 
-/// Build the audited `wyrd_platform_admin` pool from
+/// Build the audited platform operator pool from
 /// `WYRD_DB_*_PLATFORM_ADMIN` tuning.
 ///
 /// # Errors

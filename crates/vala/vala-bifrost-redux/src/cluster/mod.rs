@@ -82,6 +82,78 @@ pub struct RegisteredRole {
     pub capabilities: ClusterCapabilities,
 }
 
+/// One recurring membership task and the only signal that stops it.
+///
+/// Readiness heartbeats and the membership poller outlive the process drain
+/// signal, so each is owned by exactly one lifecycle owner through this
+/// handle rather than by a shared cancellation token. Stopping is idempotent.
+#[derive(Debug)]
+pub struct ClusterTask {
+    /// Cancelled when the owner stops the task.
+    stop: CancellationToken,
+    /// Joinable task, taken by the first [`Self::stop`].
+    task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Aborts the task without taking the join lock.
+    abort: tokio::task::AbortHandle,
+}
+
+impl ClusterTask {
+    /// Spawns `run` with the token that will ask it to return.
+    fn spawn<F>(run: impl FnOnce(CancellationToken) -> F) -> Self
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(run(stop.clone()));
+        Self {
+            abort: task.abort_handle(),
+            task: std::sync::Mutex::new(Some(task)),
+            stop,
+        }
+    }
+
+    /// Asks the task to return and waits for it until `deadline`.
+    ///
+    /// A task still running at `deadline` is aborted. Returns whether it
+    /// returned on its own; a repeated stop returns `true`.
+    pub async fn stop(&self, deadline: tokio::time::Instant) -> bool {
+        self.stop.cancel();
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(mut task) = task else {
+            return true;
+        };
+        if tokio::time::timeout_at(deadline, &mut task).await.is_ok() {
+            return true;
+        }
+        task.abort();
+        false
+    }
+
+    /// Cancels and aborts the task without waiting.
+    pub fn abort(&self) {
+        self.stop.cancel();
+        self.abort.abort();
+    }
+
+    /// Reports whether the task has ended.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.abort.is_finished()
+    }
+}
+
+impl Drop for ClusterTask {
+    /// Aborts a task its owner never stopped, such as after a failed boot.
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 /// Immutable projection of ready, live cluster role leases.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterSnapshot {
@@ -433,6 +505,16 @@ impl ClusterRegistry {
         self.snapshot.load_full()
     }
 
+    /// Publishes `snapshot` as the live-role snapshot without reading
+    /// durable membership.
+    ///
+    /// Lets a database-free test route peer work to fixture endpoints. The
+    /// next refresh, which no such test runs, would replace it.
+    #[cfg(feature = "test-support")]
+    pub fn publish_snapshot_for_test(&self, snapshot: ClusterSnapshot) {
+        self.snapshot.store(Arc::new(snapshot));
+    }
+
     /// Refreshes both role projections from durable membership and publishes one snapshot.
     ///
     /// # Errors
@@ -479,38 +561,26 @@ impl ClusterRegistry {
         Ok(())
     }
 
-    /// Starts the bounded cadence heartbeat for one independently fenced role.
+    /// Starts the fenced heartbeat for one role, preserving its readiness.
     ///
-    /// The task exits with the provided server lifecycle token. A stale fence is
-    /// terminal for this registration because a replacement now owns the role.
-    #[must_use]
-    pub fn start_heartbeat(
-        self: Arc<Self>,
-        registered: RegisteredRole,
-        shutdown: CancellationToken,
-    ) -> JoinHandle<()> {
-        self.start_readiness_heartbeat(registered, Arc::new(AtomicBool::new(true)), shutdown)
-    }
-
-    /// Starts a heartbeat that preserves the owner's current readiness state.
-    ///
-    /// Role shutdown flips `ready` before durable deactivation, allowing the
-    /// heartbeat to continue fencing the role during transport drain without
-    /// accidentally advertising it as serving again.
+    /// Each tick republishes `ready`, so a draining role keeps its fence and
+    /// heartbeat timestamp current without advertising itself as serving
+    /// again. The returned handle is the task's only lifetime owner: the role
+    /// stops it at final role shutdown or abort, never at `deactivate`. A stale
+    /// fence ends the task because a replacement now owns the role.
     #[must_use]
     pub fn start_readiness_heartbeat(
         self: Arc<Self>,
         registered: RegisteredRole,
         ready: Arc<AtomicBool>,
-        shutdown: CancellationToken,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    ) -> ClusterTask {
+        ClusterTask::spawn(|stop| async move {
             let mut interval = tokio::time::interval(self.heartbeat_interval());
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
             loop {
                 tokio::select! {
-                    () = shutdown.cancelled() => return,
+                    () = stop.cancelled() => return,
                     _ = interval.tick() => match self.set_readiness(
                         &registered,
                         ready.load(Ordering::Acquire),
@@ -527,18 +597,20 @@ impl ClusterRegistry {
         })
     }
 
-    /// Starts the membership poller that publishes immutable role snapshots.
+    /// Starts the process membership poller that publishes immutable snapshots.
     ///
-    /// The task exits with the provided server lifecycle token and leaves the
-    /// last valid snapshot installed when one transient refresh fails.
+    /// One poller serves every reader of this registry. The process owner
+    /// stops the returned handle after every role and the Scribe outbox have
+    /// drained, so membership stays current for the whole drain. A failed
+    /// refresh leaves the last valid snapshot installed.
     #[must_use]
-    pub fn start_snapshot_poller(self: Arc<Self>, shutdown: CancellationToken) -> JoinHandle<()> {
-        tokio::spawn(async move {
+    pub fn start_snapshot_poller(self: Arc<Self>) -> ClusterTask {
+        ClusterTask::spawn(|stop| async move {
             let mut interval = tokio::time::interval(self.heartbeat_interval());
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
-                    () = shutdown.cancelled() => return,
+                    () = stop.cancelled() => return,
                     _ = interval.tick() => {
                         if let Err(error) = self.refresh_snapshot().await {
                             tracing::warn!(%error, "cluster membership snapshot refresh failed");
@@ -689,7 +761,7 @@ impl ClusterRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::ClusterSnapshot;
+    use super::{ClusterSnapshot, ClusterTask};
     use chrono::Utc;
     use wyrd_spec::vala::api::{
         ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, ScribeCapabilitiesV1,
@@ -750,5 +822,58 @@ mod tests {
                 .live_oracle_at_fence(wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()), 7)
                 .is_none()
         );
+    }
+
+    /// Stopping a task cancels and joins it; a repeated stop is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the task outlives its stop or a second stop reports failure.
+    #[tokio::test]
+    async fn stop_joins_the_task_once() {
+        let task = ClusterTask::spawn(|stop| async move { stop.cancelled().await });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        assert!(!task.is_finished());
+        assert!(task.stop(deadline).await, "a cancelled task returns");
+        assert!(task.is_finished());
+        assert!(task.stop(deadline).await, "a second stop is a no-op");
+    }
+
+    /// Spawns a task that ignores cancellation, returning it with a receiver
+    /// that resolves once the task is gone.
+    fn stuck_task() -> (ClusterTask, tokio::sync::oneshot::Receiver<()>) {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<()>();
+        let task = ClusterTask::spawn(|_| async move {
+            let _held = sender;
+            std::future::pending::<()>().await;
+        });
+        (task, receiver)
+    }
+
+    /// A task that ignores cancellation is aborted at the deadline.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a stuck task is reported as joined or left running.
+    #[tokio::test]
+    async fn stop_aborts_a_task_past_its_deadline() {
+        let (task, gone) = stuck_task();
+        assert!(!task.stop(tokio::time::Instant::now()).await);
+        assert!(gone.await.is_err(), "the stuck task was aborted");
+    }
+
+    /// Abort and drop both end a task without waiting for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an aborted or dropped task keeps running.
+    #[tokio::test]
+    async fn abort_and_drop_end_the_task() {
+        let (task, gone) = stuck_task();
+        task.abort();
+        assert!(gone.await.is_err(), "abort ends the task");
+        let (task, gone) = stuck_task();
+        drop(task);
+        assert!(gone.await.is_err(), "dropping the handle ends the task");
     }
 }

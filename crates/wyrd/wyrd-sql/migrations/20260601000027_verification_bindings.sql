@@ -96,6 +96,5 @@ ALTER TABLE wyrd.verification_bindings FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.verification_bindings
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-REVOKE ALL ON TABLE wyrd.verification_bindings FROM wyrd_app;
-GRANT SELECT, INSERT, UPDATE ON wyrd.verification_bindings TO wyrd_app;
+CREATE POLICY operator_access ON wyrd.verification_bindings TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

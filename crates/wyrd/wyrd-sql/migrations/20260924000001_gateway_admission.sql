@@ -23,6 +23,8 @@ ALTER TABLE wyrd.gateway_limit_windows FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.gateway_limit_windows
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.gateway_limit_windows TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Concurrency leases: one row per admitted call per concurrency limit. A
@@ -45,6 +47,8 @@ ALTER TABLE wyrd.gateway_call_leases FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.gateway_call_leases
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.gateway_call_leases TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Ledger idempotency fences: one creation and one settlement per reservation,

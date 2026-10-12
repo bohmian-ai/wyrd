@@ -160,12 +160,16 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
     let right = format!("contention_right_{suffix}");
     let ui_a = format!("contention_ui_a_{suffix}");
     let ui_b = format!("contention_ui_b_{suffix}");
+    // The join's two tables publish two objects each so the statement
+    // distributes as Analytical; the two UI tables publish one each so their
+    // scans stay Interactive.
     seed_fixture_table(
         ingest,
         tenant_a,
         &left,
         CONTENTION_LEFT_ROWS,
         ANALYTICAL_INGEST_GROUPS,
+        2,
     )
     .await?;
     seed_fixture_table(
@@ -174,6 +178,7 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         &right,
         CONTENTION_RIGHT_ROWS,
         ANALYTICAL_INGEST_GROUPS,
+        2,
     )
     .await?;
     seed_fixture_table(
@@ -182,6 +187,7 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         &ui_a,
         INTERACTIVE_ROWS,
         INTERACTIVE_GROUPS,
+        1,
     )
     .await?;
     seed_fixture_table(
@@ -190,6 +196,7 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         &ui_b,
         INTERACTIVE_ROWS,
         INTERACTIVE_GROUPS,
+        1,
     )
     .await?;
     cluster.refresh_oracle_snapshots().await?;
@@ -381,11 +388,12 @@ async fn prove_interactive_window(
     let mut stream = wyrd_client::Bifrost::query_only(&client)
         .query(&BifrostQueryRequest {
             params: Vec::new(),
-            // A flat bounded projection on purpose. Any global operator — a
-            // sort, an aggregate, a join — is a "complex" plan, which the
-            // planner classifies Analytical however few rows it reads, and an
-            // Analytical query would never reach the Interactive floor this
-            // window exists to observe. Rows are counted, not ordered.
+            // The UI table publishes one object: one partition with no
+            // repartition and so no stage boundary, so its scan stays on the
+            // leader as Interactive. Class follows table layout, not the
+            // statement's operators. An Analytical query would never reach
+            // the Interactive floor this window exists to observe. Rows are
+            // counted, not ordered.
             sql: format!("SELECT id, filter_key FROM vala.bifrost.{table}"),
             deadline_ms: Some(INTERACTIVE_DEADLINE_MS),
         })
@@ -673,7 +681,7 @@ fn expected_analytical_grant(
     let envelope = oracle.try_acquire_query(
         vala_bifrost_redux::resources::OracleResourceRequest::for_class(
             wyrd_spec::vala::api::QueryClass::Analytical,
-            0.0,
+            8,
         ),
     )?;
     let granted = u64::try_from(envelope.execution().granted_memory_bytes())?;
@@ -744,11 +752,17 @@ fn accept_frame(
     Ok(())
 }
 
-/// Registers and publishes one `(id, filter_key)` fixture table.
+/// Registers and publishes one `(id, filter_key)` fixture table as `objects`
+/// published objects.
 ///
 /// Rows are admitted through the same logical ingress seam the public write
 /// surface uses and then frozen and published, so the files a later query reads
-/// are ones this cluster's own Scribe encoded.
+/// are ones this cluster's own Scribe encoded. Ids `0..rows` are split into
+/// `objects` contiguous ranges, each flushed on its own so it publishes as one
+/// object. Query class follows that layout, not the statement's operators: a
+/// table of more than one object distributes as Analytical, while a
+/// one-object table is one partition with no repartition and so no stage
+/// boundary, and stays on the leader as Interactive.
 ///
 /// # Errors
 ///
@@ -759,6 +773,7 @@ async fn seed_fixture_table(
     table: &str,
     rows: i64,
     groups: i64,
+    objects: i64,
 ) -> Result<(), JourneyError> {
     let catalog = ingest
         .state()
@@ -783,23 +798,53 @@ async fn seed_fixture_table(
     let scribe = ingest
         .bifrost_scribe()
         .ok_or("ingest node composed no Scribe")?;
+    let objects = objects.max(1);
     let mut start_id = 0;
-    while start_id < rows {
-        let chunk = INGEST_CHUNK.min(rows - start_id);
-        scribe
-            .ingest_native_for_test(vala_bifrost_redux::scribe::NativeIngressTestFrame {
-                principal: fixture_principal(tenant),
-                table: table_ref.clone(),
-                expected_schema_fingerprint: fingerprint,
-                request_id: wyrd_spec::request_id::RequestId::now_v7(),
-                batch_id: uuid::Uuid::now_v7(),
-                payload: fixture_rows_ipc(start_id, chunk, groups)?,
-            })
-            .await?;
-        start_id += chunk;
+    for object in 1..=objects {
+        let end_id = rows * object / objects;
+        while start_id < end_id {
+            let chunk = INGEST_CHUNK.min(end_id - start_id);
+            scribe
+                .ingest_native_for_test(vala_bifrost_redux::scribe::NativeIngressTestFrame {
+                    principal: fixture_principal(tenant),
+                    table: table_ref.clone(),
+                    expected_schema_fingerprint: fingerprint,
+                    request_id: wyrd_spec::request_id::RequestId::now_v7(),
+                    batch_id: uuid::Uuid::now_v7(),
+                    payload: fixture_rows_ipc(start_id, chunk, groups)?,
+                })
+                .await?;
+            start_id += chunk;
+        }
+        ingest.flush_bifrost().await?;
     }
-    ingest.flush_bifrost().await?;
     Ok(())
+}
+
+/// Seeds the table pair one scheduling tenant queries.
+///
+/// `{table}` publishes two objects, so `scheduling_analytical_sql` distributes
+/// as Analytical; `{table}_ui` publishes one, so `scheduling_interactive_sql`
+/// stays Interactive. Both hold the same `SCHEDULING_ROWS` rows.
+///
+/// # Errors
+///
+/// Returns a catalog, ingest, or publication error.
+async fn seed_scheduling_tables(
+    ingest: &WyrdTestServer,
+    tenant: DataTenantId,
+    table: &str,
+) -> Result<(), JourneyError> {
+    seed_fixture_table(ingest, tenant, table, SCHEDULING_ROWS, SCHEDULING_GROUPS, 2).await?;
+    seed_fixture_table(
+        ingest,
+        tenant,
+        &format!("{table}_ui"),
+        SCHEDULING_ROWS,
+        SCHEDULING_GROUPS,
+        1,
+    )
+    .await
 }
 
 /// Builds the tenant-bound principal one fixture ingest is admitted under.
@@ -1254,7 +1299,12 @@ async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
     // Both controls arm the same next query: it takes its share of the root
     // and then parks after its schema frame, so the occupancy the refusal below
     // meets is real queries' own reservations rather than a harness counter.
-    let held_floor = root_limit.saturating_sub(REFUSAL_HOLDER_HEADROOM_BYTES);
+    // The holds share what the root has free, because the footer cache keeps
+    // its whole budget charged to the root from composition onward.
+    let idle = resources.snapshot().map_err(|error| error.to_string())?;
+    let held_floor = root_limit
+        .saturating_sub(idle.governed_memory_used_bytes)
+        .saturating_sub(REFUSAL_HOLDER_HEADROOM_BYTES);
     let mut holders = Vec::new();
     for index in 0..REFUSAL_HOLDERS {
         server.stall_next_query_after_schema();
@@ -1695,7 +1745,7 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
     let server = cluster.server(0).ok_or("missing query node")?;
     for (index, tenant) in tenants.iter().enumerate() {
         let table = format!("scheduling_{index}_{suffix}");
-        seed_fixture_table(ingest, *tenant, &table, SCHEDULING_ROWS, SCHEDULING_GROUPS).await?;
+        seed_scheduling_tables(ingest, *tenant, &table).await?;
         clients.push(
             client_for_tenant(server, *tenant, &format!("scheduling-{index}-{suffix}")).await?,
         );
@@ -1754,15 +1804,18 @@ async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
     Ok(())
 }
 
-/// Builds the flat bounded projection the planner keeps Interactive.
+/// Builds the scan of a scheduling tenant's one-object `{table}_ui` table.
 ///
-/// Any global operator would make the plan distributed, and therefore
-/// Analytical, however few rows it reads.
+/// Class follows table layout, not the operator: a one-object table plans as
+/// one scan task, so the statement stays on the leader as Interactive.
 fn scheduling_interactive_sql(table: &str) -> String {
-    format!("SELECT id, filter_key FROM vala.bifrost.{table}")
+    format!("SELECT id, filter_key FROM vala.bifrost.{table}_ui")
 }
 
-/// Builds the grouped aggregate the planner distributes as Analytical.
+/// Builds the grouped aggregate over a scheduling tenant's two-object table.
+///
+/// The table publishes two objects, more than one partition, so the plan
+/// distributes as Analytical.
 fn scheduling_analytical_sql(table: &str) -> String {
     format!("SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key")
 }
@@ -2093,9 +2146,11 @@ async fn queued_tenants_are_granted_fifo_and_rotated() {
 /// The pod is saturated by parked queries, three identified requests are
 /// enqueued in a known order behind them, each enqueue is confirmed through the
 /// node's own inspection, and exactly one parked query is then released. From
-/// there a single free slot unit passes down the queue, so completion order is
-/// grant order: the first tenant's older request precedes the second tenant's,
-/// which precedes the first tenant's newer one.
+/// there a single free slot unit passes down the queue one grant at a time:
+/// each granted waiter parks on its schema stall holding the unit until the
+/// test frees it, so the observed order is the grant order. The first tenant's
+/// older request precedes the second tenant's, which precedes the first
+/// tenant's newer one.
 ///
 /// # Errors
 ///
@@ -2120,7 +2175,7 @@ async fn prove_queue_is_fifo_and_tenant_rotated() -> Result<(), JourneyError> {
     let mut clients = Vec::new();
     for (index, tenant) in tenants.iter().enumerate() {
         let table = format!("queue_{index}_{suffix}");
-        seed_fixture_table(ingest, *tenant, &table, SCHEDULING_ROWS, SCHEDULING_GROUPS).await?;
+        seed_scheduling_tables(ingest, *tenant, &table).await?;
         clients.push(client_for_tenant(server, *tenant, &format!("queue-{index}-{suffix}")).await?);
         tables.push(table);
     }
@@ -2151,43 +2206,62 @@ async fn prove_queue_is_fifo_and_tenant_rotated() -> Result<(), JourneyError> {
         );
     }
 
-    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let mut waiters = Vec::new();
+    let (granted_tx, mut granted_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut waiters = std::collections::HashMap::new();
     for (label, tenant) in [("first-older", 0), ("second", 1), ("first-newer", 0)] {
         // The ring visits tenants in first-enqueue order, so the first tenant's
         // older request must be enqueued before the second tenant appears.
         let query = wyrd_client::Bifrost::query_only(&clients[tenant]);
-        let sql = scheduling_interactive_sql(&tables[tenant]);
-        let order = Arc::clone(&order);
-        waiters.push(tokio::spawn(async move {
-            let outcome = drain_query(&query, &sql).await;
-            if outcome.is_ok()
-                && let Ok(mut order) = order.lock()
-            {
-                order.push(label);
-            }
-            outcome.map(|_| label)
-        }));
+        let request = BifrostQueryRequest {
+            params: Vec::new(),
+            sql: scheduling_interactive_sql(&tables[tenant]),
+            deadline_ms: Some(QUEUED_QUERY_DEADLINE_MS),
+        };
+        let granted_tx = granted_tx.clone();
+        waiters.insert(
+            label,
+            tokio::spawn(async move {
+                let mut stream = query
+                    .query(&request)
+                    .await
+                    .map_err(|refusal| format!("{label} was never granted: {refusal}"))?;
+                let _ = granted_tx.send(label);
+                let _ = stream.next_batch().await;
+                Ok::<(), String>(())
+            }),
+        );
         wait_for_queued(server, waiters.len()).await?;
     }
 
-    // One released unit is enough: each granted waiter returns it on completion,
-    // so the queue drains one grant at a time and completion order is grant
-    // order.
-    let released = held.pop().ok_or("no held envelope to release")?;
-    released.abort();
-    let _ = released.await;
-
-    for waiter in waiters {
-        waiter
-            .await
-            .map_err(|error| format!("a queued waiter panicked: {error}"))?
-            .map_err(|refusal| format!("a queued waiter was never granted: {refusal}"))?;
+    // Exactly one slot unit is ever free, and each grant parks on its schema
+    // stall holding it until the test frees it for the next waiter. Nothing
+    // else can be granted meanwhile, so observation order is grant order.
+    server.stall_next_query_after_schema();
+    let first = held.pop().ok_or("no held envelope to release")?;
+    first.abort();
+    let _ = first.await;
+    let mut granted = Vec::new();
+    for remaining in (0..waiters.len()).rev() {
+        server.wait_query_schema_stall().await?;
+        let label = granted_rx.recv().await.ok_or("the grant channel closed")?;
+        if let Ok(other) = granted_rx.try_recv() {
+            return Err(format!("{other} was granted while {label} held the only unit").into());
+        }
+        if server.oracle_runtime_inspection()?.queued_queries != u64::try_from(remaining)? {
+            return Err(format!("{label}'s grant left the queue at the wrong depth").into());
+        }
+        granted.push(label);
+        if remaining > 0 {
+            server.stall_next_query_after_schema();
+        }
+        let holder = waiters
+            .remove(label)
+            .ok_or("an unknown waiter was granted")?;
+        holder.abort();
+        if let Ok(Err(refusal)) = holder.await {
+            return Err(refusal.into());
+        }
     }
-    let granted = order
-        .lock()
-        .map_err(|_| "queue order lock poisoned")?
-        .clone();
     if granted != ["first-older", "second", "first-newer"] {
         return Err(format!(
             "the queue granted {granted:?}, which is not per-tenant FIFO with equal tenant weight"
@@ -2396,7 +2470,7 @@ async fn prove_saturated_query_waits() -> Result<(), JourneyError> {
         .ok_or("missing ingest node")?;
     let server = cluster.server(0).ok_or("missing query node")?;
     let table = format!("saturated_{}", uuid::Uuid::now_v7().simple());
-    seed_fixture_table(ingest, tenant, &table, SCHEDULING_ROWS, SCHEDULING_GROUPS).await?;
+    seed_scheduling_tables(ingest, tenant, &table).await?;
     let client = client_for_tenant(server, tenant, &format!("saturated-{table}")).await?;
     cluster.refresh_oracle_snapshots().await?;
     let sql = scheduling_interactive_sql(&table);
@@ -2690,7 +2764,7 @@ async fn prove_full_queue_refuses_overflow() -> Result<(), JourneyError> {
         .ok_or("missing ingest node")?;
     let server = cluster.server(0).ok_or("missing query node")?;
     let table = format!("overflow_{}", uuid::Uuid::now_v7().simple());
-    seed_fixture_table(ingest, tenant, &table, SCHEDULING_ROWS, SCHEDULING_GROUPS).await?;
+    seed_scheduling_tables(ingest, tenant, &table).await?;
     let client = client_for_tenant(server, tenant, &format!("overflow-{table}")).await?;
     cluster.refresh_oracle_snapshots().await?;
     let sql = scheduling_interactive_sql(&table);

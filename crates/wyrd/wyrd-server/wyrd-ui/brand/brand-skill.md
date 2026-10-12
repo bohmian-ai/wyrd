@@ -3,7 +3,7 @@
 Scientific provenance, flat and ruled, in light and dark: a neutral mineral canvas, 1px
 rules, 2px corners, no elevation, no glow, no arcade.
 
-**Indigo `--declare` is Declaration and the primary action. Green `--observe` is observed
+**Cobalt/periwinkle `--declare` is Declaration and the primary action. Lime `--observe` is observed
 fact. Lime `--evidence` is retained Evidence only** — never an accent, hover, or secondary
 action. Familjen Grotesk carries the interface and reading; Fragment Mono carries
 machine-shaped values. Both ship locally.

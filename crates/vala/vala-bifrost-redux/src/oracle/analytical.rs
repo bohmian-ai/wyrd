@@ -11,7 +11,7 @@
 //! # Why the upstream crate rather than a Wyrd scheduler
 //!
 //! `datafusion-distributed` is pinned into the same native `DataFusion` 55 /
-//! Arrow 59.2 cone Bifrost already uses (proved by
+//! Arrow 60 cone Bifrost already uses (proved by
 //! `tests/integration/distributed_compat.rs`). It supplies the distributed
 //! physical planner, stage graph, network boundaries, and worker task cache.
 //! Wyrd supplies exactly the three things the upstream crate deliberately
@@ -69,19 +69,21 @@ use super::analytical_supervisor::{
 };
 use super::analytical_transport::AnalyticalDestination;
 use super::analytical_transport::{
-    AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalGraphExchanges,
-    AnalyticalParticipantCut, AnalyticalStageSigning, StageWireIdentity, read_context,
+    AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalParticipantCut,
+    AnalyticalStageSigning, StageWireIdentity, read_context,
 };
 use super::dispatcher::{
     BifrostPeerTls, DispatchCandidate, GraphLeaseRequest, OraclePeerTransportDirectory,
     ParticipantGrant, PendingGraphActivation, ReservationRegistry,
 };
+use super::exec::TenantWarehouseReads;
 use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, StageOperationV1};
 use super::query_stream::RunningQueryTerminalOwner;
 use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
 };
+use crate::catalog::iceberg_storage::BifrostIcebergStorage;
 use crate::resources::OracleExecution;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
@@ -402,8 +404,6 @@ fn poisoned_registry() -> BifrostError {
 pub struct AnalyticalSessionBuilder {
     /// Node-local graph material resolved per stage operation.
     registry: Arc<AnalyticalRuntimeRegistry>,
-    /// Capability an Analytical leaf needs to resolve its own source locally.
-    leaf: super::codec::AnalyticalLeafBinding,
     /// Outbound capability this node's own middle stages sign through.
     egress: Arc<AnalyticalStageEgress>,
     /// Local-worker context installed in place of upstream's own.
@@ -416,6 +416,9 @@ pub struct AnalyticalSessionBuilder {
     /// wraps an empty worker at an address no peer advertises, so the cycle
     /// cannot form and every stage operation takes the governed peer transport.
     detached_local_worker: Arc<LocalWorkerContext>,
+    /// The node's warehouse store, which every decoded stage scan reads through
+    /// behind the graph tenant's footer proof.
+    objects: Arc<BifrostIcebergStorage>,
 }
 
 impl fmt::Debug for AnalyticalSessionBuilder {
@@ -428,7 +431,8 @@ impl fmt::Debug for AnalyticalSessionBuilder {
 }
 
 impl AnalyticalSessionBuilder {
-    /// Binds the builder to one node-local runtime registry.
+    /// Binds the builder to one node-local runtime registry, egress owner,
+    /// and warehouse store.
     ///
     /// # Panics
     ///
@@ -437,18 +441,18 @@ impl AnalyticalSessionBuilder {
     #[must_use]
     pub fn new(
         registry: Arc<AnalyticalRuntimeRegistry>,
-        leaf: super::codec::AnalyticalLeafBinding,
         egress: Arc<AnalyticalStageEgress>,
+        objects: Arc<BifrostIcebergStorage>,
     ) -> Self {
         let detached_url = Url::parse("detached://oracle.invalid")
             .expect("the detached worker address is a valid URL");
         Self {
             registry,
-            leaf,
             egress,
             detached_local_worker: Arc::new(
                 Worker::default().to_local_worker_context(detached_url),
             ),
+            objects,
         }
     }
 
@@ -471,14 +475,16 @@ impl AnalyticalSessionBuilder {
 
 #[async_trait]
 impl WorkerSessionBuilder for AnalyticalSessionBuilder {
-    /// Replaces the worker's process runtime with this query's own runtime.
+    /// Replaces the worker's process runtime with this query's own runtime,
+    /// and binds every scan the decoded stage holds to the graph tenant's
+    /// footer-proved warehouse reads.
     ///
     /// # Errors
     ///
     /// Returns [`DataFusionError::Execution`] when the stage operation's
-    /// headers do not resolve to a registered graph. Upstream surfaces this as
-    /// the task's terminal error, so no partition of an unresolvable graph ever
-    /// executes.
+    /// headers do not resolve to a registered graph, or this node recorded no
+    /// authorized identity for it. Upstream surfaces this as the task's
+    /// terminal error, so no partition of an unresolvable graph ever executes.
     async fn build_session_state(
         &self,
         ctx: WorkerQueryContext,
@@ -496,14 +502,9 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
         // Parquet pushdown, page indexes, and bloom filters are leader
         // decisions that a follower must repeat: the leader planned the stage
         // graph against them, and a follower that reads without them scans more
-        // than the plan says it does. The session's own codec is installed here
-        // too, because a leaf's assignment travels inside the plan and only
-        // this codec knows how to rebuild it.
+        // than the plan says it does.
         let mut builder = ctx.builder;
         let mut config = graph.configure(builder.config().clone().unwrap_or_default());
-        config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
-            self.leaf.clone(),
-        ));
         // A stage that only feeds the leader never opens a channel of its own.
         // A stage in the middle of a deeper graph does: it pulls from another
         // follower, so this session needs the same signed transport the leader
@@ -523,6 +524,25 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
             config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
             config.set_distributed_channel_resolver(resolver);
         }
+        // A decoded scan carries no reader factory; without this one it would
+        // read through `DataFusion`'s default and skip the footer tenant proof.
+        let tenant = self
+            .egress
+            .tenant(key)
+            .map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "Oracle analytical stage cannot resolve its tenant: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Oracle analytical stage was never authorized on this node".to_owned(),
+                )
+            })?;
+        config.set_distributed_worker_plan_rewrite_handler(TenantWarehouseReads::new(
+            Arc::clone(&self.objects),
+            tenant,
+        ));
         config.set_extension(Arc::clone(&self.detached_local_worker));
         builder = builder.with_config(config);
         Ok(builder
@@ -566,14 +586,6 @@ struct RecordedEgress {
     deadline_ms: i64,
     /// Participant cut adopted from the ticket that authorized this graph.
     cut: Arc<AnalyticalParticipantCut>,
-    /// The graph's own exchange registry, which owns every stream it opens.
-    ///
-    /// An outbound exchange stream is the only thing on this node that a
-    /// settling graph cannot reach by joining an attempt: upstream hands the
-    /// stream out and keeps its own reader task alive until every partition of
-    /// it has been dropped, and a consumer that stopped polling will never drop
-    /// it. Owning the stream is what lets the graph close it.
-    exchanges: Arc<AnalyticalGraphExchanges>,
 }
 
 /// One graph's verified outbound identity, deadline, and frozen destinations.
@@ -584,8 +596,6 @@ struct AnalyticalEgressIdentity {
     deadline_ms: i64,
     /// Participant cut adopted from the ticket that authorized this graph.
     cut: Arc<AnalyticalParticipantCut>,
-    /// The graph's own exchange registry, which owns every stream it opens.
-    exchanges: Arc<AnalyticalGraphExchanges>,
 }
 
 impl fmt::Debug for AnalyticalStageEgress {
@@ -635,7 +645,6 @@ impl AnalyticalStageEgress {
         &self,
         graph: AnalyticalGraphKey,
         authorized: &AuthorizedStage,
-        exchanges: Arc<AnalyticalGraphExchanges>,
     ) -> Result<(), BifrostError> {
         let claims = &authorized.claims;
         let tenant_id = Uuid::from_slice(&claims.tenant_id)
@@ -658,7 +667,6 @@ impl AnalyticalStageEgress {
             // Adopted, never widened: this node can address exactly the
             // destinations its own coordinator was authorized to address.
             cut: Arc::new(AnalyticalParticipantCut::adopt(&claims.participants)?),
-            exchanges,
         };
         self.identities
             .lock()
@@ -703,7 +711,6 @@ impl AnalyticalStageEgress {
             // A follower adopts a cut that is already complete, so its cell is
             // published at construction and never observed unset.
             Arc::new(OnceLock::from(recorded.cut)),
-            recorded.exchanges,
             AnalyticalStageSigning {
                 absolute_deadline_ms: recorded.deadline_ms,
                 ticket_ttl: self.ticket_ttl,
@@ -726,6 +733,19 @@ impl AnalyticalStageEgress {
             .unwrap_or_default())
     }
 
+    /// Returns the tenant one authorized graph's stages read as.
+    ///
+    /// Returns `None` when this node holds no recorded identity for `graph`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned.
+    fn tenant(&self, graph: AnalyticalGraphKey) -> Result<Option<DataTenantId>, BifrostError> {
+        Ok(self
+            .recorded(graph)?
+            .map(|recorded| recorded.identity.tenant_id))
+    }
+
     /// Reads one graph's recorded identity, deadline, and frozen cut.
     ///
     /// Returns `None` when this node holds no recorded identity for `graph`.
@@ -741,7 +761,6 @@ impl AnalyticalStageEgress {
             identity: Arc::clone(&entry.identity),
             deadline_ms: entry.deadline_ms,
             cut: Arc::clone(&entry.cut),
-            exchanges: Arc::clone(&entry.exchanges),
         }))
     }
 }
@@ -951,8 +970,6 @@ pub struct GraphLease {
     attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptGuard>>,
     /// Whether settlement has already run, so it can never run twice.
     settled: AtomicBool,
-    /// Every outbound exchange stream this graph opened, owned by the graph.
-    exchanges: Arc<AnalyticalGraphExchanges>,
     /// Upstream worker whose task cache is scoped to exactly this graph.
     ///
     /// Upstream caches a stage's decoded task data on the worker that served
@@ -1001,15 +1018,6 @@ impl GraphLease {
             .map_err(|_| poisoned_ingress())?
             .as_ref()
             .cloned())
-    }
-
-    /// Returns the registry owning every outbound exchange this graph opened.
-    ///
-    /// Settlement closes them, which is the only way this node can end an
-    /// upstream reader task it does not own.
-    #[must_use]
-    pub(crate) fn exchanges(&self) -> Arc<AnalyticalGraphExchanges> {
-        Arc::clone(&self.exchanges)
     }
 
     /// Returns how many attempts of this graph are still admitted.
@@ -1087,6 +1095,10 @@ impl GraphLease {
             outcome = ?outcome,
             "Oracle analytical follower is settling a graph"
         );
+        // Stop admitting before the live attempts are read. A request that
+        // resolved this lease earlier is then refused by the supervisor, or
+        // its attempt was already inserted and is joined below.
+        self.supervisor.begin_draining(self.graph)?;
         if outcome != AnalyticalAttemptOutcome::Success {
             self.cancel.cancel();
         }
@@ -1101,19 +1113,10 @@ impl GraphLease {
         // the worker connections that hold this envelope's reservations, so
         // the cache has to go first or the release would find bytes that
         // nothing in the graph's own lifetime will ever release.
-        // Unconditional, and only after every attempt has been joined. The
-        // graph is over on every terminal path, and its outbound exchanges are
-        // the one thing joining an attempt cannot reach: upstream keeps a
-        // reader task, and the buffers that task charges to this envelope,
-        // alive until every partition stream it handed out has been dropped.
-        // Cancelling here is what drops them. Cancelling any earlier would have
-        // turned a successful graph into a cancelled one.
+        // Unconditional, and only after every attempt has been joined: the
+        // graph is over on every terminal path. Cancelling any earlier would
+        // have turned a successful graph into a cancelled one.
         self.cancel.cancel();
-        // Cancellation alone cannot end an exchange whose consumer stopped
-        // polling it, and upstream's reader task lives until every partition
-        // stream it handed out is dropped. The graph owns those streams, so it
-        // drops them here.
-        self.exchanges.close();
         drop(self.worker.lock().map_err(|_| poisoned_ingress())?.take());
         let guard = self.guard.lock().map_err(|_| poisoned_ingress())?.take();
         if let Some(guard) = guard {
@@ -1234,10 +1237,10 @@ pub struct AnalyticalStageIngressConfig {
     /// makes a follower's charge for a distributed plan the one the leader was
     /// told it would be, and what lets that stream's end end the graph.
     pub reservations: Arc<ReservationRegistry>,
-    /// Capability every Analytical leaf decoded on this node resolves through.
-    pub leaf: super::codec::AnalyticalLeafBinding,
     /// Outbound capability a middle stage on this node signs its peers with.
     pub egress: Arc<AnalyticalStageEgress>,
+    /// The node's warehouse store every stage scan on this node reads through.
+    pub objects: Arc<BifrostIcebergStorage>,
 }
 
 /// Authenticated follower entry point for Analytical stage operations.
@@ -1269,16 +1272,12 @@ pub struct AnalyticalStageIngress {
     /// Grant owner this follower activates graph leases from and whose
     /// stream closes the settlement driver watches.
     reservations: Arc<ReservationRegistry>,
-    /// Capability an Analytical leaf needs to resolve its own source locally.
-    ///
-    /// Retained rather than consumed once, because every graph builds its own
-    /// upstream worker from it and each of those workers owns a task cache that
-    /// must not outlive its graph.
-    leaf: super::codec::AnalyticalLeafBinding,
     /// This follower's graphs, each in exactly one state, under one mutex.
     graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphEntry>>,
     /// Outbound capability this node's own middle stages sign through.
     egress: Arc<AnalyticalStageEgress>,
+    /// The node's warehouse store every graph worker's stage scans read through.
+    objects: Arc<BifrostIcebergStorage>,
     /// Bounded queue the caller-drop path hands graphs to for settlement.
     ///
     /// Cleared by shutdown, which is how the driver learns to finish. A send
@@ -1337,10 +1336,7 @@ impl AnalyticalExecutePause {
     }
 
     /// Holds only the first `ExecuteTask` and lets every later one proceed.
-    ///
-    /// The held task also continues once `graph_cancel` fires, so a graph
-    /// cancelled or expired while held settles exactly as it would unpaused.
-    async fn hold(&self, graph_cancel: &CancellationToken) {
+    async fn hold(&self) {
         if self
             .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1350,10 +1346,7 @@ impl AnalyticalExecutePause {
         }
         self.paused.notify_waiters();
         while !self.released.load(Ordering::Acquire) {
-            tokio::select! {
-                () = self.release.notified() => {}
-                () = graph_cancel.cancelled() => return,
-            }
+            self.release.notified().await;
         }
     }
 }
@@ -1480,8 +1473,8 @@ impl AnalyticalStageIngress {
             authority,
             supervisor,
             reservations,
-            leaf,
             egress,
+            objects,
         } = config;
         // Sized from the one capacity root that already bounds graph
         // admission, so the queue can always hold every graph this node is
@@ -1515,9 +1508,9 @@ impl AnalyticalStageIngress {
                 authority,
                 supervisor,
                 reservations,
-                leaf,
                 graphs: Mutex::new(HashMap::new()),
                 egress,
+                objects,
                 settlement: Mutex::new(Some(sender)),
                 driver: Mutex::new(driver),
                 accepting: AtomicBool::new(true),
@@ -1537,8 +1530,8 @@ impl AnalyticalStageIngress {
     fn build_worker(&self) -> Worker {
         Worker::from_session_builder(AnalyticalSessionBuilder::new(
             Arc::clone(self.supervisor.registry()),
-            self.leaf.clone(),
             Arc::clone(&self.egress),
+            Arc::clone(&self.objects),
         ))
     }
 
@@ -1626,8 +1619,7 @@ impl AnalyticalStageIngress {
         // Recorded from the verified claims, after the graph accepted them, so a
         // stage that this node runs in the middle of a deeper graph can sign its
         // own outbound pulls with exactly the authority it was granted.
-        self.egress
-            .record(key.graph(), &authorized, lease.exchanges())?;
+        self.egress.record(key.graph(), &authorized)?;
         match operation {
             StageOperationV1::SetPlan => {
                 lease.admit_attempt(key)?;
@@ -1652,7 +1644,7 @@ impl AnalyticalStageIngress {
                     .ok()
                     .and_then(|pause| pause.as_ref().map(Arc::clone))
                 {
-                    pause.hold(&lease.cancel).await;
+                    pause.hold().await;
                 }
             }
         }
@@ -1753,7 +1745,8 @@ impl AnalyticalStageIngress {
     ///
     /// # Errors
     ///
-    /// Returns the untouched activation with the failure that stopped it.
+    /// Returns the untouched activation with the failure that stopped it, so
+    /// the caller can hand the envelope back to its still-open grant.
     fn publish(
         &self,
         graph: AnalyticalGraphKey,
@@ -1790,14 +1783,6 @@ impl AnalyticalStageIngress {
             grant_closed,
             attempts: Mutex::new(HashMap::new()),
             settled: AtomicBool::new(false),
-            // The supervisor's, not a fresh one: a leader session composed for
-            // this same graph opens its exchanges through the same registry.
-            exchanges: self
-                .supervisor
-                .graph_exchanges(graph)
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
             worker: Mutex::new(Some(self.build_worker())),
         }))
     }
@@ -2236,15 +2221,13 @@ impl fmt::Debug for AnalyticalParticipantGrants {
 ///
 /// Dropping this value before settlement reaches a verdict revokes, before
 /// `Drop` returns, everything this node can revoke: the graph moves to
-/// `Draining`, its cancellation fires, its exchanges close, every participant
-/// grant is dropped — each follower observes its admit stream end and cancels
+/// `Draining`, its cancellation fires, every participant grant is dropped — each follower observes its admit stream end and cancels
 /// what it built on the grant — and the attempt's local drivers are aborted.
-/// The graph and its query envelope are then released without waiting on the
-/// aborted drivers: a child still finishing keeps the memory view alive and
-/// returns its bytes through the shared root. Remote IO already in flight when
-/// the grants drop has no consumer left and may complete after that.
+/// The graph, and with it the query envelope, is then released in place.
+/// Remote IO already in flight when the grants drop has no consumer left and
+/// may complete after that.
 pub(super) struct AnalyticalGraphLifecycle {
-    /// The graph every reservation belongs to.
+    /// The graph every reservation and retained release belongs to.
     graph: AnalyticalGraphKey,
     /// Supervisor the graph's registry entry and retained cleanup live in.
     supervisor: Arc<AnalyticalSupervisor>,
@@ -2313,13 +2296,6 @@ const METRIC_FOLD_EXPIRED: &str =
 /// says the dependency could not build the metric-carrying plan at all. Both
 /// retain the graph; only this one names an error the dependency reported.
 const METRIC_FOLD_REFUSED: &str = "Oracle analytical distributed metric rewrite failed";
-
-/// Detail one graph records when its owner was dropped outside a runtime.
-///
-/// Nothing can run the graph's release there, so the graph is retained as
-/// attributable residue rather than released unconfirmed.
-const RECLAIM_WITHOUT_RUNTIME: &str =
-    "Oracle analytical graph owner was dropped outside a Tokio runtime";
 
 impl AnalyticalGraphLifecycle {
     /// Composes one graph's stream-owned lifecycle over its registered entry.
@@ -2482,11 +2458,10 @@ impl AnalyticalGraphLifecycle {
     ///
     /// The order is the invariant, and this is the only place it exists: move
     /// the graph out of `Active` so nothing new is admitted, cancel unless the
-    /// graph succeeded, join the attempt and every driver it retained, close
-    /// the graph's exchanges, drop every participant grant, release the graph,
-    /// and only then release the admission owner. A nested child still
-    /// finishing is not waited on; it returns its bytes through the shared
-    /// root, and the memory view's own drop is the leak check. Cleanup that cannot be confirmed
+    /// graph succeeded, join the attempt and every driver it retained, drop its
+    /// unfolded plan and every participant grant, release the graph, and only
+    /// then release the admission owner. The pinned distributed executor releases every
+    /// partition stream it opened when the root stream ends or is dropped. Cleanup that cannot be confirmed
     /// leaves every unresolved owner in the `Draining` entry and returns the
     /// failure, so a success terminal is unreachable and readiness stays false.
     ///
@@ -2528,30 +2503,21 @@ impl AnalyticalGraphLifecycle {
                 }
             }
         }
-        // Cancellation alone cannot end an exchange whose consumer stopped
-        // polling it: upstream keeps a reader task, and the buffers it charges
-        // to this query's pool, alive until every partition stream it handed
-        // out is dropped. Closing the graph's own exchange registry is what
-        // drops them.
-        self.close_exchanges();
+        // An unfolded graph's fold still owns the executed root plan, whose
+        // nodes keep reservations past their streams (a `CollectLeft` hash
+        // join's build side), so it is dropped before the envelope is
+        // released. A folded graph already took it.
+        drop(self.supervisor.take_metric_fold(self.graph));
         // Closing every admit stream is the release: each follower drops its
         // grant and cancels whatever it built on it.
         drop(self.grants.take());
-
-        #[cfg(feature = "test-support")]
-        super::planner::record_leader_ownership(
-            self.graph.public_query_id.as_uuid(),
-            super::planner::LeaderOwnershipEvent::GraphRevoked,
-        );
         let mut running_query = None;
         if failure.is_none() {
             #[cfg(feature = "test-support")]
             analytical_cleanup_pause_for_test().hold().await;
             // Removing the entry drops the envelope and only then the
             // admission permit it retained, so the counters that wake the next
-            // query are returned last. A child still finishing keeps the
-            // memory view alive and returns its bytes through the shared root;
-            // the view's own drop remains the leak check.
+            // query are returned last.
             match self.supervisor.release_graph(self.graph) {
                 Ok(owner) => running_query = owner,
                 Err(error) => failure = Some(error.to_string()),
@@ -2559,7 +2525,7 @@ impl AnalyticalGraphLifecycle {
         }
         // Every step below is synchronous, so nothing is left for `Drop`.
         self.settled = true;
-        // Retired only here, after every attempt, exchange, participant,
+        // Retired only here, after every attempt, participant,
         // runtime, and admission owner joined: the public entry
         // describes the graph, so it outlives the stream that settled it.
         if let Some(mut owner) = running_query {
@@ -2586,48 +2552,6 @@ impl AnalyticalGraphLifecycle {
                 Err(BifrostError::Internal { detail })
             }
         }
-    }
-
-    /// Closes the graph's own exchange registry, dropping every partition stream.
-    fn close_exchanges(&self) {
-        if let Ok(Some(exchanges)) = self.supervisor.graph_exchanges(self.graph) {
-            exchanges.close();
-        }
-    }
-
-    /// Returns a dropped graph's envelope and admission on the current runtime.
-    ///
-    /// `Drop` has already revoked every other owner; this is the one step that
-    /// runs afterwards. Aborted drivers drop their memory reservations on a
-    /// later runtime poll; they keep the memory view alive and return their
-    /// bytes through the shared root, so nothing here waits for them. A graph
-    /// dropped outside any runtime, or one the supervisor refuses to release,
-    /// is retained as draining residue, which fails readiness.
-    fn reclaim(&self) {
-        let supervisor = Arc::clone(&self.supervisor);
-        let graph = self.graph;
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            supervisor.retain_graph_cleanup(graph, RECLAIM_WITHOUT_RUNTIME.to_owned());
-            return;
-        };
-        runtime.spawn(async move {
-            #[cfg(feature = "test-support")]
-            analytical_cleanup_pause_for_test().hold().await;
-            match supervisor.release_graph(graph) {
-                Ok(Some(mut owner)) => {
-                    owner.finish(wyrd_spec::vala::api::QueryTerminalOutcome::Failed);
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        public_query_id = %graph.public_query_id,
-                        "Oracle analytical dropped graph could not return its envelope"
-                    );
-                    supervisor.retain_graph_cleanup(graph, error.to_string());
-                }
-            }
-        });
     }
 
     /// Admits every remote participant and publishes the complete cut once.
@@ -2793,10 +2717,11 @@ impl Drop for AnalyticalGraphLifecycle {
     /// away, a raw stream drop, or a settlement dropped mid-await — so no
     /// consumer can receive data from this graph any more. In order and
     /// without awaiting: the graph stops admitting work, its cancellation
-    /// fires, its exchanges close, every participant grant is dropped (which
+    /// fires, every participant grant is dropped (which
     /// revokes each follower), the attempt is abandoned (which aborts every
-    /// local driver), and the retained metric fold is discarded. Only the
-    /// query envelope is left, handed to a bounded capacity release.
+    /// local driver), the retained metric fold is discarded, and the graph is
+    /// released. A child still being torn down returns its bytes through the
+    /// shared memory root as it frees them.
     fn drop(&mut self) {
         if self.settled {
             return;
@@ -2809,16 +2734,25 @@ impl Drop for AnalyticalGraphLifecycle {
             );
         }
         self.cancel.cancel();
-        self.close_exchanges();
         drop(self.grants.take());
         drop(self.attempt.take());
-        #[cfg(feature = "test-support")]
-        super::planner::record_leader_ownership(
-            self.graph.public_query_id.as_uuid(),
-            super::planner::LeaderOwnershipEvent::GraphRevoked,
-        );
         drop(self.supervisor.take_metric_fold(self.graph));
-        self.reclaim();
+        match self.supervisor.release_graph(self.graph) {
+            Ok(owner) => {
+                if let Some(mut owner) = owner {
+                    owner.finish(wyrd_spec::vala::api::QueryTerminalOutcome::Failed);
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    public_query_id = %self.graph.public_query_id,
+                    "Oracle analytical dropped graph could not return its envelope"
+                );
+                self.supervisor
+                    .retain_graph_cleanup(self.graph, error.to_string());
+            }
+        }
     }
 }
 
@@ -2985,7 +2919,7 @@ impl AnalyticalCleanupPause {
     ///
     /// Unarmed graphs pass straight through, so production release behavior is
     /// unchanged when nothing is testing it.
-    async fn hold(&self) {
+    pub(super) async fn hold(&self) {
         if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
@@ -3024,7 +2958,6 @@ fn install_graph_runtime(
 
 #[cfg(test)]
 mod tests {
-    use crate::oracle::follower::{FollowerResolutionError, ResolvedFollowerSource};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Names one full-grant execution over `runtime` for fixtures that do not vary the grant.
@@ -3059,13 +2992,7 @@ mod tests {
     use wyrd_spec::DataTenantId;
 
     use super::*;
-    use wyrd_spec::vala::api::PeerContext;
     use wyrd_spec::vala::api::QueryClass;
-
-    use super::super::peer::{
-        PeerSecurityError, StageBinding, StageTicketClaims, stage_body_digest,
-    };
-    use wyrd_tonic::prost::Message as _;
 
     /// Counts batches only as the *caller* drives the returned stream.
     ///
@@ -3275,12 +3202,33 @@ mod tests {
         ))
     }
 
-    /// Builds the leaf binding a session fixture needs but never exercises.
-    fn fixture_leaf_binding() -> super::super::codec::AnalyticalLeafBinding {
-        super::super::codec::AnalyticalLeafBinding::new(
-            wyrd_spec::vala::api::ClusterRole::Oracle,
-            Arc::new(super::super::follower::UnresolvableSource),
-        )
+    /// Records `graph` on `egress` as authorized for the fixture tenant, as
+    /// stage ingress does before any of the graph's sessions is built.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the egress refuses the fixture claims.
+    fn record_fixture_tenant(egress: &AnalyticalStageEgress, graph: AnalyticalGraphKey) {
+        let tenant = *super::super::exec::tests::FIXTURE_TENANT;
+        let claims = super::super::peer::StageTicketClaims {
+            tenant_id: tenant.as_uuid().as_bytes().to_vec(),
+            ..Default::default()
+        };
+        egress
+            .record(
+                graph,
+                &AuthorizedStage {
+                    claims,
+                    tenant_id: tenant,
+                },
+            )
+            .expect("the fixture claims record");
+    }
+
+    /// The warehouse store a fixture node's stage scans read through; no
+    /// fixture here reads a file, so the root is never touched.
+    fn fixture_objects() -> Arc<BifrostIcebergStorage> {
+        super::super::exec::tests::warehouse_objects(&std::env::temp_dir())
     }
 
     /// The pinned upstream worker retains all three seams Wyrd's handle needs.
@@ -3320,10 +3268,12 @@ mod tests {
             !Arc::ptr_eq(&process_runtime, &query_runtime),
             "the fixture must distinguish the process runtime from the query runtime"
         );
+        let egress = fixture_egress();
+        record_fixture_tenant(&egress, key);
         let worker = Worker::from_session_builder(AnalyticalSessionBuilder::new(
             Arc::clone(&registry),
-            fixture_leaf_binding(),
-            fixture_egress(),
+            egress,
+            fixture_objects(),
         ))
         .with_runtime_env(Arc::clone(&process_runtime));
 
@@ -3479,35 +3429,6 @@ mod tests {
         assert_eq!(AnalyticalAttemptNumber::from_u8(2), None);
     }
 
-    /// Follower source resolver that counts every provider resolution attempt.
-    ///
-    /// Refusal is the point: a stage message that is refused before consumption
-    /// must never reach a provider at all, so a nonzero count is the failure.
-    #[derive(Debug, Default)]
-    struct CountingSource {
-        /// Provider resolutions attempted under this fixture.
-        resolutions: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl super::super::follower::FollowerSourceResolver for CountingSource {
-        /// Counts the attempt and refuses without touching storage.
-        ///
-        /// # Errors
-        /// Always returns the fixture refusal.
-        async fn resolve(
-            &self,
-            _target_role: wyrd_spec::vala::api::ClusterRole,
-            _assignment: &wyrd_spec::vala::api::FollowerScanAssignment,
-            _session: &SessionState,
-        ) -> Result<ResolvedFollowerSource, FollowerResolutionError> {
-            self.resolutions.fetch_add(1, Ordering::SeqCst);
-            Err(FollowerResolutionError::Fault(
-                "counting fixture resolver refuses every assignment".to_owned(),
-            ))
-        }
-    }
-
     /// A stage authority that enforces exactly the production binding rules.
     ///
     /// Only signature custody is fixture-owned: the presented claims are decoded
@@ -3527,14 +3448,16 @@ mod tests {
         /// Returns the production refusal for any bound-field mismatch.
         async fn authorize_stage(
             &self,
-            context: &PeerContext,
-            binding: &StageBinding,
+            context: &wyrd_spec::vala::api::PeerContext,
+            binding: &super::super::peer::StageBinding,
             body: &[u8],
             _now: DateTime<Utc>,
-        ) -> Result<AuthorizedStage, PeerSecurityError> {
-            let claims = StageTicketClaims::decode(context.claims_bytes.as_slice())
-                .map_err(|_| PeerSecurityError::Claims)?;
-            let digest = stage_body_digest(body)?;
+        ) -> Result<AuthorizedStage, super::super::peer::PeerSecurityError> {
+            let claims = <super::super::peer::StageTicketClaims as prost::Message>::decode(
+                context.claims_bytes.as_slice(),
+            )
+            .map_err(|_| super::super::peer::PeerSecurityError::Claims)?;
+            let digest = super::super::peer::stage_body_digest(body)?;
             claims.verify_binding(binding, &digest)?;
             Ok(AuthorizedStage {
                 claims,
@@ -3570,6 +3493,7 @@ mod tests {
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            oracle_partition_scan_bytes: None,
             scratch_root: None,
             volume_roots: None,
         };
@@ -3623,8 +3547,6 @@ mod tests {
         reservations: Arc<ReservationRegistry>,
         /// Node supervisor owning registered graphs and attempts.
         supervisor: Arc<AnalyticalSupervisor>,
-        /// Provider resolutions attempted by any refused message.
-        resolutions: Arc<AtomicUsize>,
         /// This follower's own node identity.
         node_id: NodeId,
         /// This follower's own role fence.
@@ -3668,7 +3590,6 @@ mod tests {
         /// Panics when the Oracle role or reservation cannot be
         /// composed, which would make every assertion below vacuous.
         fn with_deadline(now: DateTime<Utc>, deadline: DateTime<Utc>) -> Self {
-            let resolutions = Arc::new(AtomicUsize::new(0));
             let node_id = NodeId::new(Uuid::from_u128(2));
             let fence = 7;
             let supervisor = Arc::new(AnalyticalSupervisor::new());
@@ -3679,13 +3600,8 @@ mod tests {
                 authority: Arc::new(VerifyingStageAuthority),
                 supervisor: Arc::clone(&supervisor),
                 reservations: Arc::clone(&reservations),
-                leaf: super::super::codec::AnalyticalLeafBinding::new(
-                    wyrd_spec::vala::api::ClusterRole::Oracle,
-                    Arc::new(CountingSource {
-                        resolutions: Arc::clone(&resolutions),
-                    }),
-                ),
                 egress: fixture_egress(),
+                objects: fixture_objects(),
             });
             let graph = AnalyticalGraphKey::new(
                 PublicQueryId::from_uuid(Uuid::from_u128(11)),
@@ -3694,10 +3610,7 @@ mod tests {
             let leader_node_id = NodeId::new(Uuid::from_u128(1));
             let leader_fence = 3;
             let resources = fixture_oracle_role()
-                .try_acquire_query(OracleResourceRequest::for_class(
-                    QueryClass::Analytical,
-                    0.0,
-                ))
+                .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
                 .expect("an idle Oracle admits one analytical query");
             let grant = reservations
                 .hold(
@@ -3737,7 +3650,6 @@ mod tests {
                 ingress,
                 reservations,
                 supervisor,
-                resolutions,
                 node_id,
                 fence,
                 graph,
@@ -3774,10 +3686,7 @@ mod tests {
                 DataFusionQueryId::from_uuid(Uuid::from_u128(22)),
             );
             let resources = fixture_oracle_role()
-                .try_acquire_query(OracleResourceRequest::for_class(
-                    QueryClass::Analytical,
-                    0.0,
-                ))
+                .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
                 .expect("an idle Oracle admits one analytical query");
             let grant = self
                 .reservations
@@ -3840,8 +3749,8 @@ mod tests {
                     oracle_fence: self.fence,
                     ticket_ttl: chrono::Duration::seconds(30),
                     peer_tls: BifrostPeerTls::unreachable_for_test(),
+                    file_scan_bytes_per_task: None,
                 },
-                fixture_leaf_binding(),
             )
         }
 
@@ -3932,7 +3841,7 @@ mod tests {
     /// lease test hands `lease_session` the same shape rather than letting the
     /// handle invent one.
     fn min_grant_lease_config() -> datafusion::prelude::SessionConfig {
-        crate::resources::OracleSessionShape::new(crate::resources::ORACLE_MIN_TARGET_PARTITIONS)
+        crate::resources::OracleSessionShape::new(crate::scan_sizing::ORACLE_MIN_TARGET_PARTITIONS)
             .session_config()
     }
 
@@ -3977,10 +3886,7 @@ mod tests {
             "the admitted guard has no second envelope to hand out"
         );
         let other = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits a second analytical query");
         assert!(
             !Arc::ptr_eq(pool, other.execution().memory_pool()),
@@ -4046,10 +3952,7 @@ mod tests {
         );
         let handle = fixture.execution_handle_with(Some(directory));
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let (mut admitted, _shared, _cancel) = super::super::admission::admitted_guard_for_test();
         admitted.install_query_resources_for_test(resources);
@@ -4065,7 +3968,6 @@ mod tests {
                 cut: &cut,
                 context: &context_for_leasing(),
                 admitted: &mut admitted,
-                work_units: 4,
                 config: min_grant_lease_config(),
                 deadline,
             })
@@ -4372,19 +4274,14 @@ mod tests {
             .expect("the aborted driver ends promptly")
             .expect_err("the driver was aborted, never completed");
 
-        // The envelope is returned by the bounded release after the graph
-        // leaves the map, so the wait covers both rather than reading the
-        // envelope in the window between them.
-        await_until(|| {
+        assert_eq!(
             fixture
                 .supervisor
                 .live_graphs()
-                .is_ok_and(|graphs| graphs == 0)
-                && oracle
-                    .snapshot()
-                    .is_ok_and(|live| live.oracle_analytical_queries == 0)
-        })
-        .await;
+                .expect("the supervisor reports live graphs"),
+            0,
+            "the dropped graph is released before the drop returns"
+        );
         assert_eq!(
             fixture
                 .supervisor
@@ -4484,8 +4381,8 @@ mod tests {
     /// An idle graph whose query ended by its deadline releases cleanly.
     ///
     /// A query that ends by its deadline begins cleanup at or after that
-    /// instant. Its children being idle is what makes the release safe, so the
-    /// deadline having passed cannot turn a clean cleanup into retained residue.
+    /// instant. Nothing is left to wait for at release, so the deadline having
+    /// passed cannot turn a clean cleanup into retained residue.
     ///
     /// # Panics
     ///
@@ -4495,7 +4392,7 @@ mod tests {
         let oracle = fixture_oracle_role();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
         // Nothing is ever reserved: the only owner this settlement has left to
-        // release is the envelope itself, and it is already idle.
+        // release is the envelope itself.
         let leased = lease_over_lossy_peers_until(&fixture, &oracle, 0, deadline);
         let (admitted, ownership, _transport) = *leased;
         tokio::time::sleep_until(deadline + Duration::from_millis(30)).await;
@@ -4545,10 +4442,7 @@ mod tests {
         let oracle = fixture_oracle_role();
 
         let resources = oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let pool = Arc::clone(resources.execution().memory_pool());
         let admitted_once = oracle
@@ -4574,7 +4468,6 @@ mod tests {
                 cut: &cut,
                 context: &context,
                 admitted: &mut admitted,
-                work_units: 4,
                 config: min_grant_lease_config(),
                 deadline: tokio::time::Instant::now() + Duration::from_mins(1),
             })
@@ -4652,8 +4545,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a graph is released beneath a live holder or when a settled
-    /// graph is retained.
+    /// Panics when a graph is released beneath a live holder, when a settled
+    /// graph is retained, or when a failed cleanup is reported as clean.
     #[tokio::test]
     async fn follower_graph_release_waits_for_every_holder() {
         let now = Utc::now();
@@ -4729,6 +4622,7 @@ mod tests {
             "closing the leader's stream ends the grant"
         );
 
+        follower_retains_a_graph_it_cannot_release().await;
         follower_scopes_one_upstream_worker_to_each_graph().await;
     }
 
@@ -4975,6 +4869,105 @@ mod tests {
         drop(stray);
     }
 
+    /// Proves a graph a settlement cannot release is retained until shutdown.
+    ///
+    /// Split from the release test only to keep each phase readable; it is the
+    /// second half of the same scenario. A live stray attempt is the only owner
+    /// that can block a release, so shutdown, which cancels every attempt
+    /// before it sweeps graphs, is what finally returns the envelope.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a failed cleanup releases a graph or is reported as clean,
+    /// when a lease resolved before settlement admits an attempt after it, or
+    /// when shutdown leaves the graph retained once its stray is cancelled.
+    async fn follower_retains_a_graph_it_cannot_release() {
+        // A graph with a stage its settlement never joins cannot be released.
+        // The follower must report that as a failure and keep everything it
+        // owns.
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let attempt = fixture
+            .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
+            .await
+            .expect("the reserving leader activates the graph");
+        let stray = fixture
+            .supervisor
+            .spawn_attempt(stray_attempt_key(fixture.graph))
+            .expect("an active graph admits one more stage");
+        // A request that resolved the lease before settlement began, as an
+        // in-flight SetPlan does, still holds it once the graph is draining.
+        let in_flight = fixture
+            .ingress
+            .published(fixture.graph)
+            .expect("the live graph is published");
+        fixture
+            .ingress
+            .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
+            .await
+            .expect_err("a graph with a live stray attempt cannot be settled");
+        assert!(
+            matches!(
+                in_flight.admit_attempt(stray_attempt_key(fixture.graph)),
+                Err(BifrostError::QueryExecutionFailed)
+            ),
+            "a lease whose graph began settling admits no attempt"
+        );
+        assert_eq!(
+            in_flight.live_attempts().expect("attempts are readable"),
+            0,
+            "the refused admission left no attempt behind"
+        );
+        drop(in_flight);
+        let retained = fixture.ingress.live().expect("ownership is readable");
+        assert_eq!(retained.graphs, 1, "the unreleased graph is still owned");
+        assert_eq!(
+            retained.cleanup_failures, 1,
+            "the follower recorded exactly why the graph could not be released"
+        );
+        assert!(
+            !retained.is_clean(),
+            "a retained cleanup failure fails follower readiness"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("graphs are readable"),
+            1,
+            "a failed settlement released no supervisor guard"
+        );
+
+        // Shutdown closes admission first, then reports what stayed retained.
+        let refused = fixture
+            .send(&fixture.leader_message(StageOperationV1::ExecuteTask), now)
+            .await;
+        let inspection = fixture
+            .ingress
+            .shutdown()
+            .await
+            .expect("the follower shuts down without a poisoned lock");
+        assert!(
+            matches!(refused, Err(BifrostError::QueryExecutionFailed)),
+            "a draining graph admits nothing new"
+        );
+        assert_eq!(
+            (inspection.attempts_settled, inspection.graphs_retained),
+            (1, 0),
+            "shutdown cancels the stray attempt, and with nothing left holding the graph it returns the envelope"
+        );
+        drop(stray);
+        assert!(
+            matches!(
+                fixture
+                    .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
+                    .await,
+                Err(BifrostError::QueryAdmissionRejected)
+            ),
+            "a shut-down follower admits no further stage work"
+        );
+    }
+
     /// A failed activation publishes nothing and hands the reservation back.
     ///
     /// Activation is a transaction across two fallible steps — the retained
@@ -4994,10 +4987,7 @@ mod tests {
         let now = Utc::now();
         let fixture = GraphFixture::new(now);
         let occupying = fixture_oracle_role()
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
             .expect("an idle Oracle admits one analytical query");
         let occupying_runtime = occupying.execution().clone();
         let occupied = fixture
@@ -5146,11 +5136,6 @@ mod tests {
             1,
             "the refusal did not activate a competing graph"
         );
-        assert_eq!(
-            fixture.resolutions.load(Ordering::SeqCst),
-            0,
-            "no refusal reached a provider"
-        );
     }
 
     /// A live graph lease retains its exact reservation and first-ticket authority.
@@ -5261,11 +5246,6 @@ mod tests {
             1,
             "the live graph survived every refusal unchanged"
         );
-        assert_eq!(
-            fixture.resolutions.load(Ordering::SeqCst),
-            0,
-            "no refused message reached a provider, cache, or source"
-        );
     }
 
     /// Builds the production admission owner with exactly one Analytical query.
@@ -5309,7 +5289,7 @@ mod tests {
             .admit(super::super::admission::PreparedAdmission {
                 tenant: fixture.tenant_id,
                 query_class: QueryClass::Analytical,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: std::time::Instant::now() + Duration::from_mins(1),
                 cancellation: CancellationToken::new(),
             })
@@ -5327,7 +5307,6 @@ mod tests {
                 cut: &cut,
                 context: &context_for_leasing(),
                 admitted: &mut admitted,
-                work_units: 4,
                 config: min_grant_lease_config(),
                 deadline: tokio::time::Instant::now() + Duration::from_mins(1),
             })
@@ -5381,7 +5360,7 @@ mod tests {
                 .admit(super::super::admission::PreparedAdmission {
                     tenant: queued_tenant,
                     query_class: QueryClass::Analytical,
-                    local_ratio: 0.0,
+                    target_partitions: 8,
                     deadline: std::time::Instant::now() + Duration::from_secs(30),
                     cancellation: CancellationToken::new(),
                 })
@@ -5460,95 +5439,6 @@ mod tests {
             0,
             "every admission this query held returns exactly once"
         );
-    }
-
-    /// A dropped owner releases its graph without waiting on a live child.
-    ///
-    /// Dropping the owner revokes every follower at once and returns the graph,
-    /// its envelope, and the query's admission permit immediately. A nested
-    /// child that is still alive keeps only the memory view, and returns its
-    /// bytes through the shared root when it drops; it never holds the graph
-    /// as residue or fails readiness.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the drop leaves a follower grant open, retains the graph or
-    /// its admission, or leaves the node advertising no readiness.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_dropped_owner_releases_its_graph_without_waiting_on_children() {
-        let fixture = GraphFixture::new(Utc::now());
-        let oracle = fixture_oracle_role();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-        let leased = lease_over_lossy_peers_until(&fixture, &oracle, 2, deadline);
-        let (admitted, mut ownership, transport) = *leased;
-        ownership
-            .publish_participants()
-            .await
-            .expect("every addressed follower accepted its reservation");
-        let graph = ownership.key().graph();
-        assert!(
-            ownership.retain_admission(admitted).is_ok(),
-            "the live graph takes this query's admission permit"
-        );
-        let runtime = fixture
-            .supervisor
-            .graph_runtime(graph)
-            .expect("the leased graph installed a query-owned runtime");
-        let stray = datafusion::execution::memory_pool::MemoryConsumer::new("stray-child")
-            .register(&runtime.runtime().memory_pool);
-        stray
-            .try_grow(4_096)
-            .expect("the admitted envelope funds one nested child");
-
-        drop(ownership);
-        assert_eq!(
-            transport.releases().len(),
-            2,
-            "every follower grant is closed before the drop returns"
-        );
-        await_until(|| fixture.supervisor.live_graphs().is_ok_and(|live| live == 0)).await;
-        assert_eq!(
-            (
-                fixture
-                    .supervisor
-                    .live_graphs()
-                    .expect("the supervisor reports live graphs"),
-                fixture
-                    .supervisor
-                    .draining_graphs()
-                    .expect("the supervisor reports retained cleanup"),
-            ),
-            (0, 0),
-            "a live child does not keep the dropped graph registered"
-        );
-        assert!(
-            !fixture.supervisor.retains_admission_for_test(graph),
-            "the dropped graph returns the query's admission permit"
-        );
-        assert!(
-            fixture.execution_handle().is_healthy(),
-            "a released graph leaves the node ready"
-        );
-        drop(stray);
-        drop(runtime);
-    }
-
-    /// Polls `ready` until it holds, bounded so a regression fails rather than hangs.
-    ///
-    /// Ownership effects are observed by their result rather than by a fixed
-    /// sleep.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `ready` does not hold within ten seconds.
-    async fn await_until(ready: impl Fn() -> bool) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !ready() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the awaited ownership state is reached in time");
     }
 
     /// Every peer call this graph makes ends by the envelope's own deadline.
@@ -5965,10 +5855,7 @@ mod tests {
             // not move its graph to draining or retain a failed cleanup.
             let oracle = fixture_oracle_role();
             let resources = oracle
-                .try_acquire_query(OracleResourceRequest::for_class(
-                    QueryClass::Analytical,
-                    0.0,
-                ))
+                .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 8))
                 .expect("an idle Oracle admits one analytical query");
             let runtime = resources.execution().clone();
             let graph_guard = graph
@@ -6030,7 +5917,6 @@ mod tests {
                 }),
                 BifrostPeerTls::unreachable_for_test(),
                 self.lifecycle.participants(),
-                Arc::default(),
                 AnalyticalStageSigning {
                     absolute_deadline_ms: self.graph.deadline_ms,
                     ticket_ttl: chrono::Duration::seconds(30),
@@ -6322,282 +6208,6 @@ mod tests {
             "a cancelled placement publishes no cut"
         );
     }
-
-    /// Builds one frozen destination distinguishable by node identity.
-    fn frozen_destination(endpoint: &str) -> super::super::dispatcher::DispatchCandidate {
-        super::super::dispatcher::DispatchCandidate {
-            node_id: NodeId::new(uuid::Uuid::now_v7()),
-            role: wyrd_spec::vala::api::ClusterRole::Oracle,
-            worker_fence: 7,
-            endpoint: Some(endpoint.to_owned()),
-        }
-    }
-
-    /// Builds one destination-bound remote placeholder over a one-column schema.
-    fn bound_placeholder(
-        scan_id: &str,
-        destination: &super::super::dispatcher::DispatchCandidate,
-    ) -> super::super::codec::RemoteSourcePlaceholderExec {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
-        super::super::codec::RemoteSourcePlaceholderExec::new(scan_id, "fingerprint", schema)
-            .with_source(super::super::codec::PlannedRemoteSource {
-                destination: destination.clone(),
-                tenant: wyrd_spec::DataTenantId::new_v7(),
-                table: "vala.traces.spans".to_owned(),
-                tier: super::super::RemotePersistedTier::Iceberg,
-            })
-    }
-
-    /// Builds the signed assignment a bound placeholder resolves through, with
-    /// distinguishable files so a task's share is identifiable by path.
-    fn split_fixture_assignment(
-        scan_id: &str,
-        files: usize,
-    ) -> wyrd_spec::vala::api::FollowerScanAssignment {
-        wyrd_spec::vala::api::FollowerScanAssignment {
-            scan_id: scan_id.to_owned(),
-            binding: wyrd_spec::vala::api::TenantTableBinding {
-                tenant_id: wyrd_spec::DataTenantId::new_v7(),
-                namespace: "traces".to_owned(),
-                table: "spans".to_owned(),
-            },
-            persisted: wyrd_spec::vala::api::PersistedFileAssignment {
-                files: (0..files)
-                    .map(|index| {
-                        super::super::test_persisted_descriptor(&format!("memory:///f{index}"))
-                    })
-                    .collect(),
-            },
-            scribe_provider_cut: None,
-            schema_fingerprint: "fingerprint".to_owned(),
-            required_columns: vec!["value".to_owned()],
-            predicates: Vec::new(),
-        }
-    }
-
-    /// A substituted leaf receives the cut's budget and is never forced past it.
-    ///
-    /// The placeholder can read its own local plan, so a stage the planner
-    /// leaves on the leader is correct rather than unreadable. Forcing a
-    /// minimum here would inject a boundary above every scannable cut and
-    /// distribute queries the leader could answer alone.
-    async fn assert_leaf_holds_exactly_the_cut_budget(
-        leaf: &Arc<dyn ExecutionPlan>,
-        budget: usize,
-        expected: usize,
-    ) {
-        // `budget` stands for both participants and scannable units; the count
-        // is their minimum, so passing it twice names the cut's real ceiling.
-        let response = datafusion_distributed::DesiredTaskCountHandler::handle(
-            &AnalyticalCutTaskCount::new(budget, budget),
-            datafusion_distributed::DesiredTaskCountEvent {
-                plan: leaf,
-                session_config: &datafusion::prelude::SessionConfig::new(),
-            },
-        )
-        .await
-        .expect("a leaf node is always answered")
-        .expect("the cut count never fails");
-        assert!(
-            matches!(
-                response.task_count,
-                datafusion_distributed::TaskCountAnnotation::Desired(tasks) if tasks == expected
-            ),
-            "a leaf must hold exactly {expected} tasks, saw {:?}",
-            response.task_count
-        );
-    }
-
-    /// Only the frozen participant receives a remote-bearing stage, and a
-    /// contradictory or unauthorized stage fails before any task is submitted.
-    fn assert_stage_routes_only_to_frozen_destination(
-        leaf: &Arc<dyn ExecutionPlan>,
-        destination: &super::super::dispatcher::DispatchCandidate,
-        url: &Url,
-    ) {
-        let stage: Arc<dyn ExecutionPlan> = Arc::new(
-            datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
-                Arc::clone(leaf),
-            ),
-        );
-        let router = OracleRouteTasks {
-            destinations: vec![(url.clone(), destination.clone())],
-        };
-        let task_ctx = Arc::new(datafusion::execution::TaskContext::default());
-        let assigned = datafusion_distributed::RouteTasksHandler::handle(
-            &router,
-            datafusion_distributed::RouteTasksEvent {
-                task_ctx: Arc::clone(&task_ctx),
-                plan: &stage,
-                task_count: 2,
-            },
-        )
-        .expect("a remote-bearing stage is routed")
-        .expect("an in-roster destination routes");
-        assert_eq!(assigned.urls, vec![url.clone(), url.clone()]);
-
-        // A stage with no remote leaf reads only through exchanges. It is
-        // spread over the frozen roster in the roster's own order rather than
-        // deferred: upstream answers an unanswered event with a random
-        // assignment, which can route one task's plan push and its execution to
-        // different peers and leave the executing worker waiting for a plan
-        // that was written elsewhere.
-        let local: Arc<dyn ExecutionPlan> = Arc::new(
-            datafusion::physical_plan::empty::EmptyExec::new(leaf.schema()),
-        );
-        let consumer = datafusion_distributed::RouteTasksHandler::handle(
-            &router,
-            datafusion_distributed::RouteTasksEvent {
-                task_ctx: Arc::clone(&task_ctx),
-                plan: &local,
-                task_count: 2,
-            },
-        )
-        .expect("a consumer stage is placed on the frozen roster")
-        .expect("the frozen roster places every task");
-        assert_eq!(consumer.urls, vec![url.clone(), url.clone()]);
-
-        // Only an empty roster leaves a stage to the ordinary bounded pool.
-        assert!(
-            datafusion_distributed::RouteTasksHandler::handle(
-                &OracleRouteTasks {
-                    destinations: Vec::new(),
-                },
-                datafusion_distributed::RouteTasksEvent {
-                    task_ctx: Arc::clone(&task_ctx),
-                    plan: &local,
-                    task_count: 1,
-                },
-            )
-            .is_none(),
-            "a stage with no frozen roster defers to the bounded worker pool"
-        );
-
-        // Two distinct destinations in one stage fail before dispatch.
-        let other = frozen_destination("http://peer-b:9000/");
-        let conflicted = datafusion::physical_plan::union::UnionExec::try_new(vec![
-            Arc::clone(leaf),
-            Arc::new(bound_placeholder("oracle:spans:persisted", &other)) as Arc<dyn ExecutionPlan>,
-        ])
-        .expect("two identical schemas union");
-        assert!(
-            datafusion_distributed::RouteTasksHandler::handle(
-                &router,
-                datafusion_distributed::RouteTasksEvent {
-                    task_ctx: Arc::clone(&task_ctx),
-                    plan: &conflicted,
-                    task_count: 2,
-                },
-            )
-            .expect("a remote-bearing stage is answered")
-            .is_err(),
-            "a stage naming two frozen destinations must fail before dispatch"
-        );
-
-        // A destination outside the frozen roster is refused the same way.
-        let stranger: Arc<dyn ExecutionPlan> =
-            Arc::new(bound_placeholder("oracle:spans:persisted", &other));
-        assert!(
-            datafusion_distributed::RouteTasksHandler::handle(
-                &router,
-                datafusion_distributed::RouteTasksEvent {
-                    task_ctx: Arc::clone(&task_ctx),
-                    plan: &stranger,
-                    task_count: 1,
-                },
-            )
-            .expect("a remote-bearing stage is answered")
-            .is_err(),
-            "a destination outside the frozen roster must fail before dispatch"
-        );
-    }
-
-    /// The stage's tasks divide the one bound source instead of each reading
-    /// all of it, and a live Scribe source resolves exactly once.
-    fn assert_task_variants_divide_the_bound_source(
-        placeholder: &super::super::codec::RemoteSourcePlaceholderExec,
-        destination: &super::super::dispatcher::DispatchCandidate,
-    ) {
-        let assignment = split_fixture_assignment("oracle:spans:persisted", 5);
-        let mut seen = Vec::new();
-        for task in 0..2_usize {
-            let variant = placeholder.clone().with_task_share(task, 2);
-            seen.extend(
-                variant
-                    .narrow(assignment.clone())
-                    .persisted
-                    .files
-                    .iter()
-                    .map(|file| file.path().to_owned()),
-            );
-        }
-        seen.sort();
-        assert_eq!(
-            seen,
-            vec![
-                "memory:///f0".to_owned(),
-                "memory:///f1".to_owned(),
-                "memory:///f2".to_owned(),
-                "memory:///f3".to_owned(),
-                "memory:///f4".to_owned(),
-            ],
-            "every signed file belongs to exactly one task variant"
-        );
-
-        let scribe = bound_placeholder("oracle:spans:scribe:node:1:live", destination);
-        let variants = AnalyticalLeafSplit::variants(&scribe, 2);
-        assert_eq!(variants.len(), 2, "one variant per stage task");
-        assert!(
-            variants[0]
-                .downcast_ref::<super::super::codec::RemoteSourcePlaceholderExec>()
-                .is_some(),
-            "task index zero retains the live Scribe source"
-        );
-        assert!(
-            variants[1]
-                .downcast_ref::<datafusion::physical_plan::empty::EmptyExec>()
-                .is_some(),
-            "only task index zero resolves a live Scribe source"
-        );
-        assert!(
-            AnalyticalLeafSplit::variants(placeholder, 2)
-                .iter()
-                .all(|variant| variant
-                    .downcast_ref::<super::super::codec::RemoteSourcePlaceholderExec>()
-                    .is_some()),
-            "a file-backed leaf keeps one share-carrying placeholder per task"
-        );
-    }
-
-    /// A single-partition remote leaf keeps a forced, destination-bound stage.
-    ///
-    /// These properties are proved together because they are one contract: a
-    /// leaf the leader cannot read must not collapse back onto the leader, its
-    /// stage must route only to the participant the roster froze for it, a
-    /// contradictory or unauthorized stage must fail before any task is
-    /// submitted, and the stage's tasks must divide the one bound source
-    /// rather than each reading all of it.
-    #[tokio::test]
-    async fn single_partition_remote_leaf_keeps_destination_bound_stage() {
-        let destination = frozen_destination("http://peer-a:9000/");
-        let url = Url::parse("http://peer-a:9000/").expect("frozen endpoint parses");
-        let placeholder = bound_placeholder("oracle:spans:persisted", &destination);
-        let leaf: Arc<dyn ExecutionPlan> = Arc::new(placeholder.clone());
-
-        assert_leaf_holds_exactly_the_cut_budget(&leaf, 3, 3).await;
-        // A leader-owned leaf beside it stays single-task, so its stage can
-        // never be dispatched to a peer whose codec could not decode it.
-        let leader_owned: Arc<dyn ExecutionPlan> = Arc::new(
-            datafusion::physical_plan::empty::EmptyExec::new(placeholder.schema()),
-        );
-        assert_leaf_holds_exactly_the_cut_budget(&leader_owned, 3, 1).await;
-        assert_stage_routes_only_to_frozen_destination(&leaf, &destination, &url);
-        assert_task_variants_divide_the_bound_source(&placeholder, &destination);
-    }
 }
 
 /// The exact worker set one Analytical attempt may place tasks on.
@@ -6611,274 +6221,6 @@ mod tests {
 pub struct AnalyticalWorkerResolver {
     /// Private endpoints of the attempt's ready Oracle participants.
     urls: Vec<Url>,
-}
-
-/// Oracle's own answer to "how many tasks should this scan stage run on?".
-///
-/// Upstream's built-in estimator derives a task count from the total Parquet
-/// bytes a leaf will read, divided by a fixed per-partition byte budget. That
-/// heuristic is wrong for Bifrost: Oracle has already frozen a participant cut
-/// and already knows how many Oracle peers may legally execute this attempt and
-/// how many scannable units the pinned cut holds. A byte heuristic would make
-/// distribution a property of how much data happens to be in the table rather
-/// than a property of the cut, so a correctly-planned distributed query over a
-/// small table would silently collapse onto the leader.
-///
-/// The handler answers for leaf nodes and for the hash repartition that opens a
-/// shuffle. Those are the two places a task count is genuinely decided: a scan
-/// cannot usefully exceed its file count, and an aggregate cannot usefully
-/// exceed the participants frozen for the attempt. Every other node reconciles
-/// from its children. Registered as a *custom* handler, it is consulted before
-/// the built-in byte estimator and therefore replaces it.
-struct AnalyticalCutTaskCount {
-    /// Tasks one scan stage of this attempt may occupy, at least one.
-    tasks: usize,
-    /// Participants frozen for this attempt, the ceiling for a shuffled stage.
-    participants: usize,
-}
-
-impl AnalyticalCutTaskCount {
-    /// Derives the per-stage task count from the frozen cut and its pinned work.
-    ///
-    /// Parallelism is capped at one task per scannable unit, because splitting
-    /// two fragments across six peers buys network hops and empty streams
-    /// rather than throughput, and at the participant count, because a task
-    /// cannot run on a peer that is not in the cut. A cut that pinned nothing
-    /// scannable still yields one task so the empty plan executes normally.
-    fn new(participants: usize, work_units: usize) -> Self {
-        Self {
-            tasks: participants.min(work_units).max(1),
-            participants: participants.max(1),
-        }
-    }
-}
-
-/// Routes every task of one isolated stage to the participant frozen for its
-/// remote leaves.
-///
-/// This is the sole destination validator and router for Oracle sources. It
-/// runs at the actual routing boundary, while the coordinator prepares worker
-/// placement and before any task is submitted or any source IO happens, so a
-/// stage that names an unauthorized or contradictory destination fails before
-/// a follower is ever contacted. Stages the planner created for its own
-/// join, aggregate, or shuffle boundaries carry no remote leaf and are deferred
-/// to the ordinary bounded worker pool.
-struct OracleRouteTasks {
-    /// The complete frozen roster, in the same order the planner sees it.
-    ///
-    /// Membership here is authorization: a leaf naming a peer absent from this
-    /// set was not admitted by the pinned participant cut.
-    destinations: Vec<(Url, DispatchCandidate)>,
-}
-
-impl OracleRouteTasks {
-    /// Collects every remote leaf destination reachable from one stage head.
-    ///
-    /// Called only from [`RouteTasksHandler::handle`]; the same traversal must
-    /// not run at any other call site, because a check that happens before the
-    /// routing boundary can be invalidated by the coordinator's own placement.
-    /// The walk itself is [`super::remote_placeholders`], the one the binder
-    /// also uses, so a plan shape either side cannot see is a single defect
-    /// rather than two divergent ones.
-    fn stage_destinations(plan: &Arc<dyn ExecutionPlan>) -> Vec<DispatchCandidate> {
-        super::remote_placeholders(plan.as_ref())
-            .iter()
-            .filter_map(|placeholder| placeholder.destination().cloned())
-            .collect()
-    }
-}
-
-impl datafusion_distributed::RouteTasksHandler for OracleRouteTasks {
-    /// Assigns every task slot of a remote-bearing stage to its frozen peer.
-    ///
-    /// # Errors
-    ///
-    /// Returns a `DataFusion` execution error, before task submission, when a
-    /// stage names more than one distinct destination or names a peer that is
-    /// not in the frozen roster. Both mean the plan would read a source through
-    /// a participant the cut never authorized.
-    fn handle(
-        &self,
-        ev: datafusion_distributed::RouteTasksEvent<'_>,
-    ) -> Option<Result<datafusion_distributed::RouteTasksEventResponse, DataFusionError>> {
-        let destinations = Self::stage_destinations(ev.plan);
-        // A stage that names no frozen source is a consumer stage: it reads
-        // only through exchanges. Upstream's fallback for an unanswered event
-        // is a random assignment across the worker set, which routes a stage's
-        // plan push and its task execution to different peers and leaves the
-        // executing worker waiting for a plan that was written elsewhere.
-        // Spreading the tasks over the frozen roster in its own canonical order
-        // keeps every task on an authorized participant and keeps the two
-        // halves of one task on the same one.
-        let Some(first) = destinations.first().cloned() else {
-            if self.destinations.is_empty() {
-                return None;
-            }
-            return Some(Ok(datafusion_distributed::RouteTasksEventResponse::new(
-                (0..ev.task_count)
-                    .map(|task| self.destinations[task % self.destinations.len()].0.clone())
-                    .collect(),
-            )));
-        };
-        if destinations.iter().any(|candidate| *candidate != first) {
-            return Some(Err(DataFusionError::Execution(
-                "Oracle stage names more than one frozen destination".to_owned(),
-            )));
-        }
-        let Some((url, _)) = self
-            .destinations
-            .iter()
-            .find(|(_, candidate)| *candidate == first)
-        else {
-            return Some(Err(DataFusionError::Execution(
-                "Oracle stage names a destination outside the frozen roster".to_owned(),
-            )));
-        };
-        Some(Ok(datafusion_distributed::RouteTasksEventResponse::new(
-            vec![url.clone(); ev.task_count],
-        )))
-    }
-}
-
-/// Splits one Analytical leaf's signed files across its stage's final tasks.
-///
-/// Without this, every task of a leaf stage decodes the same plan and therefore
-/// the same complete assignment, so a fixture with one table read once per task
-/// returns each row `task_count` times. Upstream calls this after a stage's task
-/// count is final, which is the only point at which the split is knowable.
-struct AnalyticalLeafSplit;
-
-impl AnalyticalLeafSplit {
-    /// Builds one leaf variant per final stage task.
-    ///
-    /// A file-backed leaf yields one share-carrying placeholder per task. A
-    /// Scribe leaf yields its placeholder at task index zero and a native
-    /// schema-compatible `EmptyExec` everywhere else, because one live memtable
-    /// cut resolves exactly once and cannot be divided.
-    fn variants(
-        placeholder: &super::codec::RemoteSourcePlaceholderExec,
-        tasks: usize,
-    ) -> Vec<Arc<dyn ExecutionPlan>> {
-        let scribe = placeholder.is_scribe();
-        (0..tasks)
-            .map(|task| {
-                if scribe && task > 0 {
-                    return Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
-                        placeholder.schema(),
-                    )) as Arc<dyn ExecutionPlan>;
-                }
-                Arc::new(placeholder.clone().with_task_share(task, tasks)) as Arc<dyn ExecutionPlan>
-            })
-            .collect()
-    }
-}
-
-impl datafusion_distributed::ScaleUpLeafNodeHandler for AnalyticalLeafSplit {
-    /// Replaces a remote source placeholder with one variant per stage task.
-    ///
-    /// The variants share schema and partition count — upstream requires both —
-    /// and differ only in the share of the bound source each names. The share
-    /// is recorded here as an index and a count rather than applied to files,
-    /// because the files do not exist yet: a planning placeholder carries no
-    /// assignment, and the codec narrows the bound assignment by this same
-    /// share when the variant is encoded. A leaf whose files do not divide
-    /// leaves empty slices on the trailing tasks rather than a wider share on
-    /// any of them.
-    ///
-    /// A Scribe leaf resolves one live memtable cut and cannot be divided at
-    /// all, so task index zero alone retains the placeholder and every other
-    /// task becomes a schema-compatible native `EmptyExec`. That is what keeps
-    /// a live tail from being read once per task.
-    fn handle(
-        &self,
-        ev: datafusion_distributed::ScaleUpLeafNodeEvent<'_>,
-    ) -> Option<Result<datafusion_distributed::ScaleUpLeafNodeEventResponse, DataFusionError>> {
-        let placeholder = ev
-            .plan
-            .downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()?;
-        let variants = Self::variants(placeholder, ev.task_count.max(1));
-        Some(
-            datafusion_distributed::DistributedLeafExec::try_new(Arc::clone(ev.plan), variants)
-                .map(|exec| {
-                    datafusion_distributed::ScaleUpLeafNodeEventResponse::new(
-                        Arc::new(exec) as Arc<dyn ExecutionPlan>
-                    )
-                }),
-        )
-    }
-}
-
-#[async_trait]
-impl datafusion_distributed::DesiredTaskCountHandler for AnalyticalCutTaskCount {
-    /// Returns the cut-derived desired task count for every leaf node.
-    ///
-    /// # Errors
-    ///
-    /// Never fails: the count was validated when the attempt cut was frozen.
-    async fn handle(
-        &self,
-        ev: datafusion_distributed::DesiredTaskCountEvent<'_>,
-    ) -> Option<Result<datafusion_distributed::DesiredTaskCountEventResponse, DataFusionError>>
-    {
-        if !ev.plan.children().is_empty() {
-            // A hash repartition is the head of a shuffle, and the stage it
-            // opens is bounded by participants rather than by files. Scan
-            // parallelism cannot exceed the number of objects to open, but a
-            // grouped aggregate spreads by hash of its key, so a cut holding
-            // one file can still occupy every frozen peer above the shuffle.
-            // Without this the whole plan inherits the leaf's single task and
-            // the pinned revision elides the boundary, collapsing a genuinely
-            // distributable aggregate back onto the leader.
-            return ev
-                .plan
-                .downcast_ref::<datafusion::physical_plan::repartition::RepartitionExec>()
-                .filter(|repartition| {
-                    matches!(
-                        repartition.partitioning(),
-                        datafusion::physical_plan::Partitioning::Hash(_, _)
-                    )
-                })
-                .map(|_| {
-                    Ok(
-                        datafusion_distributed::DesiredTaskCountEventResponse::desired(
-                            self.participants,
-                        ),
-                    )
-                });
-        }
-        // The live Scribe leaf is leader-owned and has no wire encoding, so its
-        // stage is capped at one task and stays on the leader;
-        // `LiveUnionBoundary` gives its published siblings their own stages.
-        if ev
-            .plan
-            .downcast_ref::<super::live::LiveScribeExec>()
-            .is_some()
-        {
-            return Some(Ok(
-                datafusion_distributed::DesiredTaskCountEventResponse::maximum(1),
-            ));
-        }
-        // Only a substituted source may occupy more than one task. Every other
-        // leaf is leader-owned and carries no wire encoding, so distributing
-        // its stage would ask the codec to serialize a plan that exists only
-        // on this node.
-        //
-        // A substituted leaf gets the cut's own budget and nothing more. It is
-        // deliberately not forced past one task: the placeholder can read its
-        // local plan here, so a stage the pinned revision chooses to leave on
-        // the leader is correct rather than unreadable, and forcing a minimum
-        // would distribute a query the leader could have answered alone.
-        let tasks = match ev
-            .plan
-            .downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()
-        {
-            Some(_) => self.tasks,
-            None => 1,
-        };
-        Some(Ok(
-            datafusion_distributed::DesiredTaskCountEventResponse::desired(tasks),
-        ))
-    }
 }
 
 impl WorkerResolver for AnalyticalWorkerResolver {
@@ -6902,6 +6244,9 @@ pub struct AnalyticalExecutionConfig {
     pub ticket_ttl: chrono::Duration,
     /// Immutable peer identity every leader-side channel is dialed through.
     pub peer_tls: BifrostPeerTls,
+    /// Parquet bytes each distributed scan task reads; `None` keeps
+    /// `datafusion-distributed`'s default.
+    pub file_scan_bytes_per_task: Option<usize>,
 }
 
 /// What one Analytical execution left behind once it drained.
@@ -6987,8 +6332,6 @@ pub struct AnalyticalExecutionHandle {
     peer_transports: Option<Arc<OraclePeerTransportDirectory>>,
     /// Node-scoped identity, budget, and peer-transport configuration.
     config: AnalyticalExecutionConfig,
-    /// Capability every Analytical leaf this node encodes or decodes resolves through.
-    leaf: super::codec::AnalyticalLeafBinding,
 }
 
 impl fmt::Debug for AnalyticalExecutionHandle {
@@ -7029,11 +6372,7 @@ impl fmt::Debug for AnalyticalExecutionOwners {
 impl AnalyticalExecutionHandle {
     /// Composes the handle over this node's existing Analytical owners.
     #[must_use]
-    pub fn new(
-        owners: AnalyticalExecutionOwners,
-        config: AnalyticalExecutionConfig,
-        leaf: super::codec::AnalyticalLeafBinding,
-    ) -> Self {
+    pub fn new(owners: AnalyticalExecutionOwners, config: AnalyticalExecutionConfig) -> Self {
         let AnalyticalExecutionOwners {
             worker,
             supervisor,
@@ -7044,7 +6383,6 @@ impl AnalyticalExecutionHandle {
             supervisor,
             peer_transports,
             config,
-            leaf,
         }
     }
 
@@ -7135,7 +6473,6 @@ impl AnalyticalExecutionHandle {
             cut,
             context,
             admitted,
-            work_units,
             config,
             deadline,
         } = inputs;
@@ -7202,7 +6539,6 @@ impl AnalyticalExecutionHandle {
                 participants: lifecycle.participants(),
                 permission_digest: &attempt.permission_digest,
                 config,
-                work_units,
             },
             graph,
             cut.deadline().timestamp_millis(),
@@ -7224,8 +6560,9 @@ impl AnalyticalExecutionHandle {
     /// query owns anything Analytical. It reuses the admitted query's own
     /// state — catalog, registered providers, runtime, and grant-derived
     /// config — and adds exactly what the pinned planner consults while it
-    /// transforms: the frozen worker set, the cut-derived task count, the leaf
-    /// split, and this node's codec. It deliberately installs no channel
+    /// transforms: the frozen worker set, the union and live-leaf placement
+    /// rules, and the configured scan bytes per task. Task counts, leaf
+    /// splitting, and the plan's encoding are upstream's own. It deliberately installs no channel
     /// resolver: channels are resolved from the execution `TaskContext`, which
     /// only the authoritative leader session supplies, so nothing built here
     /// can dial a peer.
@@ -7241,21 +6578,14 @@ impl AnalyticalExecutionHandle {
         &self,
         local: &SessionContext,
         oracles: &[OracleQueryParticipant],
-        work_units: usize,
     ) -> Result<SessionContext, BifrostError> {
-        let destinations = self.remote_participants(oracles)?;
-        let urls = destinations
-            .iter()
-            .map(|(url, _)| url.clone())
+        let urls = self
+            .remote_participants(oracles)?
+            .into_iter()
+            .map(|(url, _)| url)
             .collect::<Vec<_>>();
         let mut config = local.copied_config();
-        config.set_distributed_desired_task_count_handler(AnalyticalCutTaskCount::new(
-            urls.len(),
-            work_units,
-        ));
-        config.set_distributed_scale_up_leaf_node_handler(AnalyticalLeafSplit);
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
-        config.set_distributed_route_tasks_handler(OracleRouteTasks { destinations });
         // Bifrost's scan is one union of this table's source kinds —
         // published Iceberg, leader hot files, and the leader-owned live
         // Scribe leaf. Upstream's isolator would give that union one task per child
@@ -7265,11 +6595,11 @@ impl AnalyticalExecutionHandle {
         config
             .set_distributed_children_isolator_unions(false)
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
-        let mut codec = super::codec::OraclePhysicalExtensionCodec::analytical(self.leaf.clone());
-        if let Some(bindings) = config.get_extension::<super::bindings::OracleExecutionLock>() {
-            codec = codec.with_bindings(bindings);
+        if let Some(bytes) = self.config.file_scan_bytes_per_task {
+            config
+                .set_distributed_file_scan_config_bytes_per_partition(bytes)
+                .map_err(|_| BifrostError::QueryExecutionFailed)?;
         }
-        config.set_distributed_user_codec(codec);
         let state = datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
             local.state(),
         )
@@ -7329,7 +6659,6 @@ impl AnalyticalExecutionHandle {
             participants,
             permission_digest,
             mut config,
-            work_units,
         } = inputs;
         let runtime = self.supervisor.graph_runtime(graph)?;
         // The graph's grant sets only the execution-time sort-merge
@@ -7358,26 +6687,20 @@ impl AnalyticalExecutionHandle {
             identity,
             self.config.peer_tls.clone(),
             participants,
-            self.supervisor.graph_exchanges(graph)?.unwrap_or_default(),
             AnalyticalStageSigning {
                 absolute_deadline_ms: deadline_ms,
                 ticket_ttl: self.config.ticket_ttl,
             },
         );
-        config.set_distributed_desired_task_count_handler(AnalyticalCutTaskCount::new(
-            urls.len(),
-            work_units,
-        ));
-        config.set_distributed_scale_up_leaf_node_handler(AnalyticalLeafSplit);
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
         config.set_distributed_channel_resolver(resolver);
-        // No codec is installed here. `config` is the planning session's own
-        // copied configuration, which already carries this node's Oracle codec
-        // — bound to the execution lock, which this one would not be. Upstream
-        // stores user codecs as an ordered list and encodes the position of the
-        // codec that matched, so a second entry shifts every position past the
-        // one a follower builds from its own single install, and the follower
-        // then refuses the plan with "Can't find required codec in codec list".
+        // No user codec is installed on this path: every node the plan
+        // carries is `DataFusion`'s own. Anyone who adds one must install it
+        // exactly once and in the same position on followers. Upstream stores
+        // user codecs as an ordered list and encodes the position of the codec
+        // that matched, so an extra entry shifts every position past it and
+        // the follower refuses the plan with "Can't find required codec in
+        // codec list".
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
@@ -7385,28 +6708,6 @@ impl AnalyticalExecutionHandle {
             .with_distributed_planner()
             .build();
         Ok(SessionContext::new_with_state(state))
-    }
-
-    /// Returns the frozen non-leader participants a cut may delegate a source to.
-    ///
-    /// This is the roster the planner freezes destinations from, in cut order.
-    /// It is deliberately distinct from [`AnalyticalWorkerResolver`]'s
-    /// undifferentiated pool: a source placeholder names exactly one of these,
-    /// and the route handler refuses a stage that names anything else.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when a frozen participant endpoint is
-    /// not a valid URL.
-    pub(super) fn frozen_destinations(
-        &self,
-        oracles: &[OracleQueryParticipant],
-    ) -> Result<Vec<DispatchCandidate>, BifrostError> {
-        Ok(self
-            .remote_participants(oracles)?
-            .into_iter()
-            .map(|(_, candidate)| candidate)
-            .collect())
     }
 
     /// Projects the remote participants this attempt may address, without IO.
@@ -7470,8 +6771,6 @@ pub(super) struct AnalyticalLeaseInputs<'a> {
     pub(super) context: &'a AuthorizedQueryContext,
     /// Admission guard whose query envelope is transferred onto the graph.
     pub(super) admitted: &'a mut AdmittedQueryGuard,
-    /// Scannable work units the frozen cut selected.
-    pub(super) work_units: usize,
     /// The exact `SessionConfig` the retained physical root was built with.
     pub(super) config: datafusion::prelude::SessionConfig,
     /// One absolute execution deadline shared by every stage.
@@ -7502,8 +6801,6 @@ struct AnalyticalSessionInputs<'a> {
     /// Reused verbatim so admission supplies the runtime and pool only; the
     /// channel resolver is the one thing this session adds to it.
     config: datafusion::prelude::SessionConfig,
-    /// Scannable work the pinned cut offers, used to shape parallelism.
-    work_units: usize,
 }
 
 /// The per-query identities one Analytical attempt is leased under.
@@ -7628,8 +6925,8 @@ impl AnalyticalAttemptOwnership {
     ///
     /// Runs the graph's one cleanup sequence inline on the caller. Dropping
     /// this value instead revokes every follower and aborts every local driver
-    /// at once, but only settling joins the attempt's drivers before the
-    /// envelope is returned. A leader stream that ended — for
+    /// at once, but only settling joins the attempt's drivers and confirms the
+    /// envelope idle before it is returned. A leader stream that ended — for
     /// any reason — calls this so follower work is cancelled and joined before
     /// the query envelope is returned.
     ///
@@ -7703,6 +7000,12 @@ pub(super) struct AnalyticalGraphMetricFold {
     /// unexecuted plan's evidence as the query's.
     fold:
         futures_util::future::BoxFuture<'static, datafusion::error::Result<Arc<dyn ExecutionPlan>>>,
+    /// The attempt's profile, which the metric-carrier plan's operator
+    /// metrics fold into once the fold settles.
+    ///
+    /// The graph, not the admission guard, owns an Analytical root, so the
+    /// root is gone before the graph waits for the envelope's children.
+    profile: Arc<super::profile::QueryProfile>,
 }
 
 impl fmt::Debug for AnalyticalGraphMetricFold {
@@ -7715,13 +7018,16 @@ impl fmt::Debug for AnalyticalGraphMetricFold {
 }
 
 impl AnalyticalGraphMetricFold {
-    /// Composes one graph's fold over an executed plan and its scan sink.
+    /// Composes one graph's fold over an executed plan and its scan sink,
+    /// folding the result into `profile`.
     pub(super) fn new(
         plan: Arc<dyn ExecutionPlan>,
         sink: Arc<super::exec::RemoteScanMetrics>,
+        profile: Arc<super::profile::QueryProfile>,
     ) -> Self {
         Self {
             fold: Box::pin(super::exec::record_distributed_scan_metrics(plan, sink)),
+            profile,
         }
     }
 
@@ -7733,10 +7039,15 @@ impl AnalyticalGraphMetricFold {
             datafusion::error::Result<Arc<dyn ExecutionPlan>>,
         >,
     ) -> Self {
-        Self { fold }
+        Self {
+            fold,
+            profile: Arc::new(super::profile::QueryProfile::new()),
+        }
     }
 
-    /// Awaits the follower fold, then reads the plan's own output-sort evidence.
+    /// Awaits the follower fold, folds the metric-carrier plan's operator
+    /// metrics into the attempt's profile, then reads the plan's own
+    /// output-sort evidence.
     ///
     /// The caller bounds this; nothing here imposes a second timer.
     ///
@@ -7758,6 +7069,7 @@ impl AnalyticalGraphMetricFold {
             plan = %datafusion::physical_plan::displayable(executed.as_ref()).indent(true),
             "analytical metric-carrier plan"
         );
+        self.profile.fold_root(executed.as_ref());
         Ok(super::exec::output_sort_evidence(&executed))
     }
 }

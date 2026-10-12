@@ -24,5 +24,5 @@ ALTER TABLE vala.scribe_batch_commits FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.scribe_batch_commits
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-GRANT SELECT, INSERT ON vala.scribe_batch_commits TO wyrd_app;
+CREATE POLICY operator_access ON vala.scribe_batch_commits TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

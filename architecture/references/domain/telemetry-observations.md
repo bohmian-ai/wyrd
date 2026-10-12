@@ -17,26 +17,28 @@ The public correlation spine is:
 authenticated tenant
   + authenticated principal_id
   + Wyrd-Request-Id
-  + optional authorized card_ref/card_uid
+  + optional authorized card_uid
   + optional opaque run_id
 ```
 
-`card_ref` and `run_id` are optional observation-grain values. A buffered
+`card_uid` and `run_id` are optional observation-grain values. A buffered
 request may contain uncorrelated rows and rows for several Cards and Runs, so
 authorize every distinct asserted Card against the principal's signed Card
 scope. Token mint and refresh resolve the bounded scope to authoritative Card
 UIDs; ingest uses that verified in-memory mapping without a Card-registry
 Postgres or cache lookup. The server derives tenant, publisher, and request
-identity from verified authority and stamps physical storage columns such as
-`card_uid`, `principal_id`, `wyrd_request_id`, and `wyrd_ingested_at`; the
+identity from verified authority, stores a client `card_uid` only once that
+authority confirms it, and stamps `principal_id`, `wyrd_request_id`, and
+`wyrd_ingested_at`; the
 tenant is bound to the physical table rather than stored as a column. Missing Card correlation leaves
 `card_uid` null; it never erases the server-stamped publisher identity.
 
 OTLP table projection recognizes the exact record-level attributes
-`wyrd.card_ref` and `wyrd.run_id`. The final duplicate key determines the
+`wyrd.card_uid` and `wyrd.run_id`. The final duplicate key determines the
 correlation value, while all entries remain in the lossless attribute payload.
-Values reuse the existing `CardRef` and `RunId` text grammars; a client-supplied
-Card UID is never trusted over the signed scope mapping.
+Values use the `CardUid` and `RunId` text grammars; a client-supplied Card UID
+is stored only after the signed scope, or for an unbound principal the tenant
+registry, confirms it.
 
 `Wyrd-Request-Id` joins Wyrd hops and audit ancestry. W3C trace/span IDs join
 telemetry causality. Preserve both; never overload one as the other.
@@ -108,7 +110,7 @@ Missing authenticated publisher identity, denied or unresolved asserted Card
 scope, malformed context, schema conflict,
 out-of-range event time, sampling/export loss, redaction failure, and incomplete
 ingest are explicit degraded or failed states. They never become a synthetic
-"no signal" observation. An omitted optional `card_ref` is valid generic
+"no signal" observation. An omitted optional `card_uid` is valid generic
 telemetry, not missing publisher identity. Reject trusting client tenant fields,
 deriving a Card from principal identity alone, metric labels with unbounded values, and payload
 collection before authorization/projection.

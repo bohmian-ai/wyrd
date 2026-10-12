@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use arrow::array::{RecordBatch, StringArray};
+use arrow::array::{ArrayRef, RecordBatch, StringArray};
 use arrow::datatypes::Schema;
 use arrow::json::ReaderBuilder;
 use base64::Engine;
@@ -25,10 +25,11 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use uuid::Uuid;
 use vala_bifrost_redux::tables::DomainTable;
-use vala_bifrost_redux::tables::gateway::CallsTable;
+use vala_bifrost_redux::tables::gateway::{CallsTable, REQUEST_PAYLOAD, RESPONSE_PAYLOAD};
 use vala_bifrost_redux::tables::signal::correlation_fields;
 use vala_bifrost_redux::tables::traces::project_resource_spans;
 use wyrd_gateway::{AttemptRecord, IngressDialect, MediaRequest, UploadContent};
+use wyrd_queue::variant::{EncodedVariant, VariantColumnBuilder};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::gateway::{
@@ -273,38 +274,63 @@ impl CallCapture {
     }
 
     /// Builds the one-row `vala.gateway.calls` batch over the table's user
-    /// fields followed by its `card_ref` and `run_id` correlation inputs.
+    /// fields followed by its `card_uid` and `run_id` correlation inputs.
     ///
-    /// The correlation inputs carry the authorized subject, whose `card_ref`
-    /// text includes the Card UID Scribe stamps as `card_uid`, or are null for
-    /// an uncorrelated call.
+    /// The correlation inputs carry the authorized subject's Card UID, which
+    /// Scribe confirms against the frame's attributed UIDs, or are null for an
+    /// uncorrelated call.
+    ///
+    /// The scalar columns decode from the serialized payload; the
+    /// `request_payload` and `response_payload` Variant columns encode the
+    /// payload's redacted canonical JSON texts, keeping their JSON types.
     ///
     /// # Errors
     ///
-    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the row.
+    /// Returns [`CaptureDrop::Projection`] when Arrow cannot decode the row
+    /// and [`CaptureDrop::Payload`] when a selected payload exceeds a Variant
+    /// limit.
     pub(crate) fn calls_batch(&self) -> Result<RecordBatch, CaptureDrop> {
         let mut fields = CallsTable::arrow_fields();
         fields.extend(correlation_fields());
-        let mut decoder = ReaderBuilder::new(Arc::new(Schema::new(fields)))
+        let schema = Arc::new(Schema::new(fields));
+        let scalars = Schema::new(
+            schema
+                .fields()
+                .iter()
+                .filter(|field| !is_payload_column(field.name()))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        let mut decoder = ReaderBuilder::new(Arc::new(scalars))
             .build_decoder()
             .map_err(|_| CaptureDrop::Projection)?;
         decoder
             .serialize(std::slice::from_ref(&self.payload))
             .map_err(|_| CaptureDrop::Projection)?;
-        let batch = decoder
+        let decoded = decoder
             .flush()
             .ok()
             .flatten()
             .ok_or(CaptureDrop::Projection)?;
-        let Some(subject) = &self.subject else {
-            return Ok(batch);
-        };
-        let mut columns = batch.columns().to_vec();
-        let user = columns.len() - 2;
-        columns.truncate(user);
-        columns.push(Arc::new(StringArray::from(vec![subject.card.to_string()])));
-        columns.push(Arc::new(StringArray::from(vec![subject.run_id.as_str()])));
-        RecordBatch::try_new(batch.schema(), columns).map_err(|_| CaptureDrop::Projection)
+        let mut columns = schema
+            .fields()
+            .iter()
+            .map(|field| match field.name().as_str() {
+                REQUEST_PAYLOAD => payload_column(self.payload.request_payload_json.as_deref()),
+                RESPONSE_PAYLOAD => payload_column(self.payload.response_payload_json.as_deref()),
+                name => decoded
+                    .column_by_name(name)
+                    .cloned()
+                    .ok_or(CaptureDrop::Projection),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(subject) = &self.subject {
+            let user = columns.len() - 2;
+            columns.truncate(user);
+            columns.push(Arc::new(StringArray::from(vec![subject.card_uid.as_str()])));
+            columns.push(Arc::new(StringArray::from(vec![subject.run_id.as_str()])));
+        }
+        RecordBatch::try_new(schema, columns).map_err(|_| CaptureDrop::Projection)
     }
 
     /// Builds the canonical `vala.traces.spans` batch of the attempt spans.
@@ -581,6 +607,24 @@ impl PayloadObjects {
         }
         Ok(())
     }
+}
+
+/// Whether `name` is one of the two Variant payload columns of
+/// `vala.gateway.calls`, which the JSON row decoder cannot build.
+fn is_payload_column(name: &str) -> bool {
+    name == REQUEST_PAYLOAD || name == RESPONSE_PAYLOAD
+}
+
+/// Encodes one optional canonical JSON payload text as a one-row Variant
+/// column; an unselected payload is a null row.
+///
+/// # Errors
+///
+/// Returns [`CaptureDrop::Payload`] when the text is not JSON or exceeds a
+/// Variant limit, so the capture is dropped rather than stored partially.
+fn payload_column(text: Option<&str>) -> Result<ArrayRef, CaptureDrop> {
+    VariantColumnBuilder::encode("payload", [text], EncodedVariant::from_json_text)
+        .map_err(|_| CaptureDrop::Payload)
 }
 
 /// Redacts `value`, collecting substituted binary content into `objects`, and
@@ -965,7 +1009,7 @@ pub(crate) mod tests {
 
         let calls = capture.calls_batch().expect("calls batch");
         assert_eq!(calls.num_rows(), 1);
-        for column in ["card_ref", "run_id", "request_payload_json"] {
+        for column in ["card_uid", "run_id", "request_payload", "response_payload"] {
             let array = calls.column_by_name(column).expect(column);
             assert_eq!(array.null_count(), 1, "{column} is null");
         }
@@ -977,6 +1021,30 @@ pub(crate) mod tests {
             .expect("spans project")
             .expect("one attempt yields spans");
         assert_eq!(spans.num_rows(), 1);
+    }
+
+    /// Proves an unresolved call nulls both `resolved_model` children.
+    ///
+    /// DataFusion `get_field` returns a child without its parent's nulls, so
+    /// `resolved_model['provider']` reads SQL null only when the child slot
+    /// itself is null; the nullable children keep that null through Parquet.
+    #[test]
+    fn unresolved_call_nulls_resolved_model_children() {
+        let mut facts = facts(policy(GatewayCaptureMode::Metadata, &[]));
+        facts.resolved = None;
+        let calls = CallCapture::from_facts(facts)
+            .expect("metadata projects")
+            .calls_batch()
+            .expect("calls batch");
+        let resolved = calls
+            .column_by_name("resolved_model")
+            .and_then(|column| column.as_any().downcast_ref::<arrow::array::StructArray>())
+            .expect("resolved_model Struct");
+        assert!(resolved.is_null(0));
+        for child in ["provider", "model"] {
+            let child = resolved.column_by_name(child).expect(child);
+            assert!(child.is_null(0), "an absent model has no child value");
+        }
     }
 
     /// Proves a selected payload is redacted, binary content becomes a
@@ -1173,7 +1241,8 @@ pub(crate) mod recording {
     };
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::ids::CardUid;
+    use wyrd_spec::reference::CardRefScope;
     use wyrd_spec::request_id::RequestId;
 
     use crate::scribe_outbox::{ScribeSink, ScribeTable};
@@ -1212,9 +1281,10 @@ pub(crate) mod recording {
         pub(crate) tenant: DataTenantId,
         /// Principal the frame was submitted under.
         pub(crate) principal: PrincipalId,
-        /// Card scope Scribe stamps `card_uid` from: the frame's attributed
-        /// Cards when it carries them, otherwise its principal's scope.
-        pub(crate) card_scope: Vec<CardRef>,
+        /// Card UIDs Scribe authorizes `card_uid` against: the frame's
+        /// attributed UIDs when it carries them, otherwise its principal's
+        /// signed scope.
+        pub(crate) card_scope: Vec<CardUid>,
         /// Fully qualified destination table.
         pub(crate) table: String,
         /// Request the frame was admitted under.
@@ -1235,9 +1305,8 @@ pub(crate) mod recording {
                 principal: frame.principal.id,
                 card_scope: frame
                     .attributed_cards
-                    .as_ref()
-                    .or_else(|| frame.principal.card_ref_scope())
-                    .map(|scope| scope.as_slice().to_vec())
+                    .clone()
+                    .or_else(|| frame.principal.card_ref_scope().map(CardRefScope::uids))
                     .unwrap_or_default(),
                 table: frame.table.fqn(),
                 request_id: frame.request_id.clone(),

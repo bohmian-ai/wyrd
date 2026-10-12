@@ -450,10 +450,6 @@ pub struct ForgeExpirationAuthority {
     pub attempt_id: Uuid,
     /// Worker acting on the task right now.
     pub worker_id: Uuid,
-    /// Forge table lease namespace that worker holds.
-    pub lease_key: String,
-    /// Live fencing token of that lease.
-    pub lease_fencing_token: i64,
 }
 
 /// One immutable claim row: exactly one unresolved snapshot of one operation.
@@ -507,7 +503,7 @@ pub enum ForgeExpirationResetOutcome {
 /// cannot present a partial preparation to the single transaction that applies
 /// it.
 pub struct ForgeExpirationPreparation<'request> {
-    /// Live task/attempt/worker/lease identity preparing the selection.
+    /// Live task/attempt/worker identity preparing the selection.
     pub authority: &'request ForgeExpirationAuthority,
     /// Registered table the claims and the maintenance authority row name.
     pub table: &'request ForgeClaimTable,
@@ -567,10 +563,6 @@ pub(crate) struct ForgeSnapshotExpirationClaimSqlRow {
     attempt_id: Uuid,
     /// Worker that prepared the selection.
     worker_id: Uuid,
-    /// Table lease that worker held when preparing.
-    lease_key: String,
-    /// Fencing token of that lease.
-    lease_fencing_token: i64,
     /// Durable table UID the claim is bound to.
     table_uid: Vec<u8>,
     /// Exact catalog wire name.
@@ -607,8 +599,6 @@ impl TryFrom<ForgeSnapshotExpirationClaimSqlRow> for ForgeSnapshotExpirationClai
                 task_id: row.task_id,
                 attempt_id: row.attempt_id,
                 worker_id: row.worker_id,
-                lease_key: row.lease_key,
-                lease_fencing_token: row.lease_fencing_token,
             },
             table: ForgeClaimTable {
                 table_uid,

@@ -26,7 +26,8 @@ use wyrd_client::{PublicWyrdGatewayCaller, Workflows, WyrdClient};
 use wyrd_spec::card::workflow::{CreateWorkflowRunRequest, WorkflowRunStatus};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::gateway::{GatewayFallbackOverride, ModelRef};
-use wyrd_spec::ids::WorkflowRunId;
+use wyrd_spec::ids::{CardUid, WorkflowRunId};
+use wyrd_spec::vala::ids::RunId;
 
 /// Fixed run identity used by every scripted response.
 const RUN_ID: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b20";
@@ -556,6 +557,52 @@ fn problem(outcome: Result<ProviderResponse, ProviderError>) -> RemoteProblem {
         Err(ProviderError::RemoteProblem(problem)) => *problem,
         other => panic!("expected a remote problem, got {other:?}"),
     }
+}
+
+/// A caller bound to an application Run sends that Run and the Card UID as
+/// the paired `wyrd-run-id` and `wyrd-card-uid` headers, and an unbound
+/// caller sends neither.
+///
+/// # Panics
+/// Panics when a call fails or a correlation header differs.
+#[tokio::test]
+async fn public_gateway_call_carries_run_and_card_uid() {
+    let server = MockServer::start().await;
+    mount(
+        &server,
+        "POST",
+        "/v1/chat/completions",
+        ResponseTemplate::new(200).set_body_json(chat_answer()),
+        2,
+    )
+    .await;
+    let run = RunId::from_string("run-1".to_owned());
+    let card_uid = CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").expect("Card UID");
+    let token = CancellationToken::new();
+    let call = || gateway_call(chat_request(), "openai/gpt-a", None, Duration::from_secs(5));
+    PublicWyrdGatewayCaller::new(client(&server.uri()))
+        .with_subject(&run, &card_uid)
+        .call(call(), &token)
+        .await
+        .expect("the correlated call answers");
+    PublicWyrdGatewayCaller::new(client(&server.uri()))
+        .call(call(), &token)
+        .await
+        .expect("the uncorrelated call answers");
+    let requests = received(&server).await;
+    let header = |index: usize, name: &str| {
+        requests[index]
+            .headers
+            .get(name)
+            .map(|value| value.to_str().expect("ASCII header").to_owned())
+    };
+    assert_eq!(header(0, "wyrd-run-id").as_deref(), Some("run-1"));
+    assert_eq!(
+        header(0, "wyrd-card-uid").as_deref(),
+        Some(card_uid.as_str())
+    );
+    assert_eq!(header(1, "wyrd-run-id"), None);
+    assert_eq!(header(1, "wyrd-card-uid"), None);
 }
 
 /// Concurrent public gateway calls keep their own fallback, deadline, and

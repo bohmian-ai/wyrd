@@ -1,5 +1,7 @@
 //! Server-owned scheduled query caller.
 
+use std::pin::pin;
+
 use arrow::record_batch::RecordBatch;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryIpcDecoder};
@@ -142,15 +144,18 @@ impl ScheduledQueryCaller {
             .query_controls()
             .ok_or(BifrostError::RunningQueryControlUnavailable)?;
         let requested_deadline_ms = request.deadline_ms;
-        let mut stream = controls
-            .open_cancellable(
-                self.dispatch(request),
-                self.context.data_tenant_id,
-                &self.context.request_id,
-                requested_deadline_ms,
-                &self.cancellation,
-            )
-            .await?;
+        let mut stream = {
+            let open = pin!(self.dispatch(request));
+            controls
+                .open_cancellable(
+                    open,
+                    self.context.data_tenant_id,
+                    &self.context.request_id,
+                    requested_deadline_ms,
+                    &self.cancellation,
+                )
+                .await?
+        };
         // The stream's absolute deadline becomes one fixed instant before any
         // frame is taken, so no leg of consumption — least of all the wait for
         // clean EOF after a terminal — can start a fresh budget.
@@ -314,13 +319,7 @@ impl ScheduledQueryCaller {
                         .map_err(|_| WyrdError::from(BifrostError::QueryStreamProtocol))?;
                     if terminal.outcome == QueryTerminalOutcome::Failed {
                         *observed = Some(terminal.clone());
-                        return Err(terminal
-                            .error
-                            .as_ref()
-                            .map_or(BifrostError::QueryExecutionFailed, |error| {
-                                super::service::terminal_error_to_bifrost(error.code)
-                            })
-                            .into());
+                        return Err(super::service::terminal_error(terminal.error.as_deref()));
                     }
                     decoder
                         .accept_eos(&terminal.arrow_ipc_eos)
@@ -356,8 +355,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QuerySchemaFrame, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
-        SourceCompletion, SourceCompletionOutcome,
+        QueryBatchFrame, QuerySchemaFrame, QuerySource, SourceCompletion, SourceCompletionOutcome,
     };
 
     use super::*;
@@ -449,10 +447,9 @@ mod tests {
 
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
-            error: Some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryTimeout,
-                detail: None,
-            }),
+            error: Some(Box::new(
+                WyrdError::from(BifrostError::QueryTimeout).problem(),
+            )),
             ..success_terminal(3, Vec::new())
         };
 

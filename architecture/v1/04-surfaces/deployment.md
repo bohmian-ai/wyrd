@@ -33,13 +33,15 @@ replicas * (app_max + platform_admin_max)
 replication, monitoring, failover, and extension roles. It is not silently
 derived from the remainder.
 
-Serving requires `WYRD_DATABASE_URL` (`wyrd_app`) and
-`WYRD_PLATFORM_DATABASE_URL` (`wyrd_platform_admin`). Unsuffixed `WYRD_DB_*`
+Serving requires `WYRD_DATABASE_URL`; `WYRD_PLATFORM_DATABASE_URL` defaults
+to it. Operators create both logins; production sets them to a separate
+tenant login and the platform login that owns Wyrd's objects. Unsuffixed
+`WYRD_DB_*`
 settings tune the tenant application pool, `_PLATFORM_ADMIN` the platform pool,
 and `_MIGRATOR` the pool of the one-off `wyrd-server migrate` process.
 
-`wyrd-server migrate` runs with the database-owner DSN in `WYRD_DATABASE_URL`
-before serving replicas start; serving replicas never run DDL and refuse
+`wyrd-server migrate` runs as the platform login before serving replicas
+start; serving replicas never run DDL and refuse
 readiness until the migrated schema validates. Runtime tenant work uses `TenantConn` under RLS.
 Cross-tenant operator work uses only the narrow `OperatorPool` capabilities
 approved by repository architecture.

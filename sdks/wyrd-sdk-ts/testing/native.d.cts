@@ -272,6 +272,20 @@ export declare function cliIssueKey(options: NativeIssueKey, connection?: Native
 export declare function cliLoad(selector: NativeCardSelector, path?: string | undefined | null, connection?: NativeCliConnection | undefined | null): Promise<NativeCliOutcome>
 
 /**
+ * Connects the named MCP hosts to Wyrd (`wyrd mcp install --host ...`).
+ *
+ * Hosts are located from the process environment; a host that cannot be
+ * connected is reported in the outcome's value, not as a problem.
+ *
+ * # Errors
+ *
+ * Returns a napi error only when the report cannot be serialized; an
+ * unknown or empty host selection or an invalid `server` is returned in the
+ * outcome.
+ */
+export declare function cliMcpInstall(hosts: Array<string>, server?: string | undefined | null): NativeCliOutcome
+
+/**
  * Validates a local Card tree without contacting a server (`wyrd plan`).
  *
  * # Errors

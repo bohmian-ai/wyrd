@@ -3,10 +3,10 @@ mod pg_tests {
     //!
     //! Skipped automatically when env vars are unset so the default test suite
     //! remains credential-free. Run with:
-    //!   WYRD_DATABASE_URL=postgres://wyrd_app:<pw>@localhost/wyrd \
-    //!   WYRD_TEST_DATABASE_ADMIN_URL=postgres://<owner>:<pw>@localhost/wyrd \
-    //!   cargo test -p wyrd-sql --all-features --test migration_pg
+    //!   scripts/postgres/with-test-postgres.sh -- \
+    //!   cargo nextest run -p wyrd-sql --all-features --test integration
 
+    use secrecy::ExposeSecret;
     use serde_json::Value;
     use sqlx::PgPool;
     use sqlx::types::Uuid;
@@ -25,10 +25,13 @@ mod pg_tests {
     // `insert_trusted_issuer`/`insert_workload_binding` are referenced by full path
     // in `cloud_issuer_crud_write_path_conflict_and_cascade` because this test module
     // already defines local helpers of the same name with different signatures.
+    use wyrd_sql::dsn::ResolvedDsns;
     use wyrd_sql::queries::auth::insert_trusted_issuer as insert_trusted_issuer_query;
     use wyrd_sql::queries::auth::insert_workload_binding as insert_workload_binding_query;
     use wyrd_sql::queries::storage;
-    use wyrd_sql::{MIGRATION_LEASE_WAIT, OperatorPool, PoolConfig, SqlError, TenantConn};
+    use wyrd_sql::{
+        MIGRATION_LEASE_WAIT, OperatorPool, PoolConfig, SqlError, TenantConn, WyrdPostgres,
+    };
 
     const SYSTEM_TENANT_MIGRATION_VERSION: i64 = 20_260_601_000_015;
 
@@ -164,6 +167,149 @@ mod pg_tests {
             .validate_schema()
             .await
             .expect("serving validation passes once restored");
+    }
+
+    /// One ordinary `WYRD_DATABASE_URL` login that owns a fresh database
+    /// migrates and serves both pools, and a separate tenant login stays
+    /// confined to its tenant even when it claims an operator session.
+    ///
+    /// On a fresh database the owning login is refused before migration,
+    /// migrates, then passes readiness and runs tenant, platform, and
+    /// slug-resolution work, with row-level security hiding one tenant's rows
+    /// from another while the operator pool sees every tenant. A superuser
+    /// serving alone is refused. With the separate tenant login, readiness
+    /// passes, and a tenant transaction that sets `app.operator` still sees
+    /// only its own tenant's rows.
+    #[tokio::test]
+    async fn single_url_boot_and_separate_url_regression() {
+        let (Some(admin_url), Some(tenant_url)) = (
+            std::env::var("WYRD_TEST_DATABASE_ADMIN_URL").ok(),
+            app_database_url(),
+        ) else {
+            return;
+        };
+        let platform_url =
+            std::env::var("WYRD_PLATFORM_DATABASE_URL").expect("test platform URL is set");
+        let database = UnmigratedDatabase::create()
+            .await
+            .expect("fresh database creates");
+        let name: String = sqlx::query_scalar("SELECT current_database()::text")
+            .fetch_one(database.migrator_pool())
+            .await
+            .expect("database name reads");
+        let on_database = |url: &str| {
+            let mut url = url::Url::parse(url).expect("test URL parses");
+            url.set_path(&name);
+            url.to_string()
+        };
+        let resolve = |app: &str, platform: Option<&str>| {
+            ResolvedDsns::resolve(Some(on_database(app)), platform.map(on_database))
+                .expect("test DSNs resolve")
+        };
+        let readiness = |dsns: ResolvedDsns| async move {
+            WyrdPostgres::connect_from_dsns(&dsns)
+                .await
+                .expect("serving pools build")
+                .validate_schema()
+                .await
+        };
+
+        let shared = resolve(&platform_url, None);
+        assert!(shared.shares_login());
+        assert!(
+            matches!(
+                readiness(shared.clone()).await,
+                Err(SqlError::SchemaNotReady { .. })
+            ),
+            "an unmigrated database must not serve"
+        );
+
+        migrate_under_lease(database.migrator_pool())
+            .await
+            .expect("the owning login migrates");
+        let serving = WyrdPostgres::connect_from_dsns(&shared)
+            .await
+            .expect("shared-login pools build");
+        serving
+            .validate_schema()
+            .await
+            .expect("the owning login serves alone");
+        let operator = serving.operator_pool().expect("platform pool exists");
+        let data_tenant_id = DataTenantId::new_v7();
+        insert_tenant(operator.pool(), data_tenant_id, "single-url").await;
+        let slug = "single-url".parse().expect("slug parses");
+        assert_eq!(
+            serving
+                .resolve_tenant_slug(&slug)
+                .await
+                .expect("platform slug resolution runs"),
+            Some(data_tenant_id)
+        );
+        let mut conn = serving
+            .tenant_conn(data_tenant_id)
+            .await
+            .expect("tenant transaction opens on the shared login");
+        sqlx::query_scalar::<_, Uuid>("SELECT wyrd.provision_system_principal()")
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("tenant work runs on the shared login");
+        conn.commit().await.expect("tenant work commits");
+        let other_tenant = DataTenantId::new_v7();
+        insert_tenant(operator.pool(), other_tenant, "single-url-other").await;
+        let count_accounts = "SELECT count(*) FROM wyrd.auth_service_accounts";
+        let mut other = serving
+            .tenant_conn(other_tenant)
+            .await
+            .expect("second tenant transaction opens");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(count_accounts)
+                .fetch_one(&mut **other.transaction())
+                .await
+                .expect("second tenant reads its accounts"),
+            0,
+            "row-level security must hide the first tenant's rows on the shared login"
+        );
+        drop(other);
+        assert!(
+            sqlx::query_scalar::<_, i64>(count_accounts)
+                .fetch_one(operator.pool())
+                .await
+                .expect("the operator pool reads every tenant")
+                > 0,
+            "the operator pool must see every tenant's rows"
+        );
+
+        assert!(
+            matches!(
+                readiness(resolve(&admin_url, None)).await,
+                Err(SqlError::SchemaNotReady { ref detail }) if detail.contains("superuser")
+            ),
+            "a superuser serving alone must be refused"
+        );
+
+        let separate = WyrdPostgres::connect_from_dsns(&resolve(&tenant_url, Some(&platform_url)))
+            .await
+            .expect("two-login pools build");
+        separate
+            .validate_schema()
+            .await
+            .expect("the separate tenant and platform logins serve");
+        let mut claimed = separate
+            .tenant_conn(other_tenant)
+            .await
+            .expect("tenant transaction opens on the tenant login");
+        sqlx::query("SELECT set_config('app.operator', 'on', true)")
+            .execute(&mut **claimed.transaction())
+            .await
+            .expect("the tenant login sets the operator flag");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(count_accounts)
+                .fetch_one(&mut **claimed.transaction())
+                .await
+                .expect("the flagged tenant reads its accounts"),
+            0,
+            "the operator flag must give a separate tenant login no other tenant's rows"
+        );
     }
 
     /// The system-owner seed is exact, repeatable, and rejects ambiguous ownership.
@@ -673,7 +819,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&url).await.expect("connects to postgres");
-        assert_required_roles(store.pool()).await;
 
         migrate_under_lease(store.pool())
             .await
@@ -746,7 +891,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&url).await.expect("connects to postgres");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -779,7 +923,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&url).await.expect("connects to postgres");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -830,7 +973,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&migrator_url).await.expect("migrator connects");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -899,7 +1041,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&migrator_url).await.expect("migrator connects");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -974,7 +1115,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&url).await.expect("connects to postgres");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -1051,7 +1191,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&migrator_url).await.expect("migrator connects");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -1107,7 +1246,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&migrator_url).await.expect("migrator connects");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -1246,7 +1384,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&migrator_url).await.expect("migrator connects");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -1305,7 +1442,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&url).await.expect("connects to postgres");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -1377,7 +1513,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&url).await.expect("connects to postgres");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -1431,7 +1566,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&url).await.expect("connects to postgres");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -1497,7 +1631,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&url).await.expect("connects to postgres");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -1578,7 +1711,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&migrator_url).await.expect("migrator connects");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -1658,7 +1790,6 @@ mod pg_tests {
         };
 
         let store = owner_pool(&migrator_url).await.expect("migrator connects");
-        assert_required_roles(store.pool()).await;
         migrate_under_lease(store.pool())
             .await
             .expect("migrations apply");
@@ -2077,34 +2208,18 @@ mod pg_tests {
         .expect("workload binding inserts");
     }
 
-    /// Database-owner URL that runs migrations, as `wyrd-server migrate` does.
+    /// Platform-login operator DSN that runs migrations and owns every object,
+    /// as `wyrd-server migrate` does; `None` when the test environment is unset.
     fn database_url() -> Option<String> {
-        std::env::var("WYRD_TEST_DATABASE_ADMIN_URL").ok()
+        ResolvedDsns::from_env()
+            .ok()
+            .map(|dsns| dsns.platform().expose_secret().to_owned())
     }
 
+    /// Tenant-login DSN that serving tenant pools connect with; `None` when
+    /// the test environment is unset.
     fn app_database_url() -> Option<String> {
         std::env::var("WYRD_DATABASE_URL").ok()
-    }
-
-    async fn assert_required_roles(pool: &PgPool) {
-        let rows: Vec<(String, bool)> = sqlx::query_as(
-            "SELECT rolname, rolbypassrls
-         FROM pg_roles
-         WHERE rolname IN ('wyrd_app', 'wyrd_platform_admin')
-         ORDER BY rolname",
-        )
-        .fetch_all(pool)
-        .await
-        .expect("role metadata query succeeds");
-
-        assert_eq!(
-            rows,
-            vec![
-                ("wyrd_app".to_owned(), false),
-                ("wyrd_platform_admin".to_owned(), true),
-            ],
-            "Wyrd Postgres roles must exist with locked BYPASSRLS bits before migrations run"
-        );
     }
 
     async fn assert_regclass_exists(pool: &PgPool, name: &str, expected: bool) {
@@ -2140,7 +2255,7 @@ mod pg_tests {
         let row: (bool, bool, bool) = sqlx::query_as(
             "SELECT
              p.prosecdef,
-             p.provolatile = 's',
+             p.provolatile = 'v',
              COALESCE(p.proconfig, ARRAY[]::text[]) @> ARRAY['search_path=pg_catalog, platform']
          FROM pg_proc p
          JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -2156,39 +2271,13 @@ mod pg_tests {
             row.0,
             "platform.resolve_tenant_by_slug must be SECURITY DEFINER"
         );
-        assert!(row.1, "platform.resolve_tenant_by_slug must be STABLE");
+        assert!(
+            row.1,
+            "platform.resolve_tenant_by_slug must be VOLATILE: it raises the operator flag"
+        );
         assert!(
             row.2,
             "platform.resolve_tenant_by_slug must pin search_path to pg_catalog, platform"
-        );
-
-        // PUBLIC is a pseudo-role and cannot be passed to has_function_privilege
-        // (it errors with `role "PUBLIC" does not exist`). Inspect pg_proc.proacl
-        // directly: aclexplode emits grantee = 0 for the PUBLIC grant entry.
-        let privileges: (bool, bool, bool) = sqlx::query_as(
-        "SELECT
-             EXISTS (
-                 SELECT 1
-                 FROM pg_proc p
-                 JOIN pg_namespace n ON n.oid = p.pronamespace
-                 CROSS JOIN LATERAL aclexplode(p.proacl) a
-                 WHERE n.nspname = 'platform'
-                   AND p.proname = 'resolve_tenant_by_slug'
-                   AND a.grantee = 0
-                   AND a.privilege_type = 'EXECUTE'
-             ),
-             has_function_privilege('wyrd_app', 'platform.resolve_tenant_by_slug(text)', 'EXECUTE'),
-             has_function_privilege('wyrd_platform_admin', 'platform.resolve_tenant_by_slug(text)', 'EXECUTE')",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("platform resolver privilege query succeeds");
-
-        assert!(!privileges.0, "PUBLIC must not execute the tenant resolver");
-        assert!(privileges.1, "wyrd_app must execute the tenant resolver");
-        assert!(
-            privileges.2,
-            "wyrd_platform_admin must execute the tenant resolver"
         );
     }
 

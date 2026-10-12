@@ -56,12 +56,8 @@ async fn each_composed_node_owns_exactly_one_storage_owner() {
                 "node {index} must publish one owner to every role"
             );
             assert!(
-                owner.metadata_cache_enabled(),
-                "an Oracle-serving node must resolve a metadata budget"
-            );
-            assert!(
                 owner.policy().metadata_cache_bytes() > 0,
-                "an enabled cache must have a nonzero budget"
+                "an Oracle-serving node must resolve a metadata budget"
             );
             Arc::clone(owner)
         })
@@ -274,8 +270,11 @@ fn wal_segments(
 
 /// A WAL that fails restart replay leaves only Scribe unready.
 ///
-/// A WAL sync fault keeps the segments on disk; corrupting the final CRC byte
-/// of each segment that holds records makes the next boot's replay fail. The
+/// A WAL sync fault keeps the segments on disk. Corrupting the prologue CRC of
+/// each segment that holds records makes the next boot's replay fail: a bad
+/// prologue is corruption wherever the segment lies, whereas a bad final
+/// record is the unacknowledged tail replay truncates, and the segment holding
+/// the acknowledged seed rows may already be retired. The
 /// restarted combined target must still boot and report `/readyz` 200 with
 /// Scribe named unready, keep answering published Oracle reads, refuse writes
 /// without an ACK, and leave every WAL byte as it found it for operator
@@ -321,8 +320,7 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
     let mut corrupted = 0;
     for (path, mut bytes) in wal_segments(&wal_root)? {
         if bytes.len() > 64 {
-            let last = bytes.len() - 1;
-            bytes[last] ^= 0xff;
+            bytes[60] ^= 0xff;
             std::fs::write(&path, &bytes)?;
             corrupted += 1;
         }
@@ -412,7 +410,7 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
     .await
     .expect("the dedicated worker durably claims the seeded task");
 
-    let storage = Arc::clone(
+    let storage = Arc::downgrade(
         worker
             .state()
             .bifrost_storage()
@@ -429,10 +427,9 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
     worker.shutdown().await?;
     release.await?;
 
-    assert_eq!(
-        storage.inspect().lifecycle,
-        vala_bifrost_redux::storage::StorageLifecycle::Closed,
-        "ordinary shutdown settles storage after the dedicated worker joined"
+    assert!(
+        storage.upgrade().is_none(),
+        "ordinary shutdown releases storage after the dedicated worker joined"
     );
     let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
         .bind(task_id)
@@ -455,9 +452,9 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
 ///
 /// No serve task exists to drain Bifrost, so `WyrdTestServer::shutdown`
 /// cancels the shared shutdown token and settles Bifrost before the Postgres
-/// fixture is dropped. Storage is the last owner that settlement closes, after
-/// the Oracle, so a closed storage owner proves the Oracle reader epoch no
-/// longer outlives the database.
+/// fixture is dropped. The shared storage owner drops only once its last role
+/// does, so a released storage owner proves the Oracle reader epoch no longer
+/// outlives the database.
 ///
 /// # Errors
 ///
@@ -465,13 +462,13 @@ async fn dedicated_forge_worker_shutdown_drains_its_claim_before_storage_settles
 ///
 /// # Panics
 ///
-/// Panics when the token is left uncancelled or storage is left open.
+/// Panics when the token is left uncancelled or storage is still retained.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn router_only_shutdown_settles_bifrost_before_fixture_release()
 -> Result<(), super::query::ServerJourneyError> {
     let server = wyrd_testing::WyrdTestServer::start_in_process().await?;
-    let storage = Arc::clone(
+    let storage = Arc::downgrade(
         server
             .state()
             .bifrost_storage()
@@ -483,10 +480,91 @@ async fn router_only_shutdown_settles_bifrost_before_fixture_release()
         cancelled.is_cancelled(),
         "shutdown cancels the shared token"
     );
-    assert_eq!(
-        storage.inspect().lifecycle,
-        vala_bifrost_redux::storage::StorageLifecycle::Closed,
+    assert!(
+        storage.upgrade().is_none(),
         "router-only shutdown settles Bifrost before the fixture is released"
     );
+    Ok(())
+}
+
+/// Readiness and fence of this node's Oracle row in durable membership.
+///
+/// # Errors
+///
+/// Returns the membership read failure.
+async fn oracle_membership(
+    pool: &sqlx::PgPool,
+    node_id: wyrd_spec::vala::api::NodeId,
+) -> Result<(bool, chrono::DateTime<chrono::Utc>), super::query::ServerJourneyError> {
+    Ok(sqlx::query_as(
+        "SELECT ready, heartbeat_at FROM vala.cluster_nodes \
+         WHERE data_tenant_id=$1 AND node_id=$2 AND role='oracle'",
+    )
+    .bind(uuid::Uuid::from(wyrd_spec::DataTenantId::SYSTEM_OWNER))
+    .bind(node_id.as_uuid())
+    .fetch_one(pool)
+    .await?)
+}
+
+/// A deactivated role keeps heartbeating unready until final shutdown, and
+/// shutdown or abort ends the process membership poller and every heartbeat.
+///
+/// `deactivate` only withdraws readiness: the heartbeat must keep the
+/// unready fence fresh while the process drains, so a peer neither routes to
+/// the role nor reaps it early. The process poller and role heartbeats are
+/// owned tasks, so both teardown paths must end them.
+///
+/// # Errors
+///
+/// Returns startup, membership, or shutdown failures, or the timeout naming
+/// a heartbeat that stopped after deactivation or a task left running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn unready_roles_heartbeat_until_teardown_ends_membership_tasks()
+-> Result<(), super::query::ServerJourneyError> {
+    let timing = vala_bifrost_redux::cluster::RoleTiming::deterministic_test();
+    let server = wyrd_testing::WyrdTestServer::builder()
+        .with_role_timing_for_test(timing)
+        .start_in_process()
+        .await?;
+    let bifrost = Arc::clone(&server.state().bifrost);
+    let oracle = bifrost
+        .oracle()
+        .ok_or("the default target composes Oracle")?;
+    oracle.begin_shutdown().await?;
+    let pool = server.pg_fixture().superuser_pool()?;
+    let (ready, deactivated_at) = oracle_membership(&pool, server.node_id()).await?;
+    assert!(!ready, "deactivate withdraws readiness");
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut poll = tokio::time::interval(timing.heartbeat_interval);
+        loop {
+            poll.tick().await;
+            let (ready, heartbeat_at) = oracle_membership(&pool, server.node_id()).await?;
+            assert!(!ready, "the heartbeat never re-advertises a draining role");
+            if heartbeat_at > deactivated_at {
+                return Ok::<_, super::query::ServerJourneyError>(());
+            }
+        }
+    })
+    .await
+    .map_err(|_| "the heartbeat stopped at deactivate")??;
+    assert!(!bifrost.membership_tasks_finished_for_test());
+    server.shutdown().await?;
+    assert!(
+        bifrost.membership_tasks_finished_for_test(),
+        "shutdown stops the poller and every heartbeat"
+    );
+
+    let server = wyrd_testing::WyrdTestServer::start_in_process().await?;
+    let bifrost = Arc::clone(&server.state().bifrost);
+    bifrost.abort();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !bifrost.membership_tasks_finished_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| "abort left a membership task running")?;
+    server.shutdown().await?;
     Ok(())
 }

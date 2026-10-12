@@ -15,7 +15,7 @@ use wyrd_server::boot::init::{
     InitError, initialize_platform_root, issue_platform_root_credential,
 };
 use wyrd_server::config::ServeMode;
-use wyrd_sql::dsn::{ResolvedDsns, owner_dsn_from_env};
+use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
 use wyrd_sql::{MIGRATION_LEASE_WAIT, PoolConfig, SqlError, WyrdPostgres};
 
@@ -57,8 +57,9 @@ enum Command {
     RecoverRoot,
     /// Apply the Wyrd and Vala schema migrations, validate them, and exit.
     ///
-    /// Run once per release before serving, with `WYRD_DATABASE_URL` set to
-    /// the database-owner login. Serving processes never run DDL and refuse to
+    /// Run once per release before serving, as the platform login
+    /// (`WYRD_PLATFORM_DATABASE_URL`, else `WYRD_DATABASE_URL`), which then
+    /// owns Wyrd's objects. Serving processes never run DDL and refuse to
     /// start until this has succeeded.
     Migrate,
     /// Make a fresh deployment usable: platform root, first tenant, and that
@@ -191,10 +192,11 @@ async fn recover_root() -> Result<(), BootExit> {
     Ok(())
 }
 
-/// Apply every embedded Wyrd then Vala migration with the owner login.
+/// Apply every embedded Wyrd then Vala migration as the platform login.
 ///
-/// Builds one short-lived [`OperatorPool`] on the owner DSN — the only place
-/// the owner credential is used — and holds its database-wide
+/// Builds one short-lived [`OperatorPool`] on the platform operator DSN
+/// ([`ResolvedDsns::platform`]), so the platform login owns every object the
+/// migrations create, and holds its database-wide
 /// [`wyrd_sql::MigrationLease`] across the whole sequence: `wyrd_sql::migrate` (which
 /// creates the `platform` and `wyrd` schemas Vala depends on), then
 /// `vala_sql::migrate`, then both owners' schema contracts — the same checks
@@ -204,16 +206,19 @@ async fn recover_root() -> Result<(), BootExit> {
 /// resumes safely.
 ///
 /// # Errors
-/// Returns [`BootExit::Config`] when the owner DSN is missing or invalid, and
+/// Returns [`BootExit::Config`] when the database URLs are missing or invalid, and
 /// [`BootExit::Other`] when the pool cannot connect, the lease stays held past
 /// its bound, a migration fails, or the post-migration validation does not
 /// pass.
 async fn migrate() -> Result<(), BootExit> {
-    let owner_dsn = owner_dsn_from_env().map_err(|e| BootExit::Config(Box::new(e)))?;
-    let owner = build_pool(owner_dsn.expose_secret(), PoolConfig::migrator_from_env())
-        .await
-        .map(OperatorPool::from)
-        .map_err(|e| BootExit::Other(Box::new(SqlError::Connect(e))))?;
+    let dsns = ResolvedDsns::from_env().map_err(|e| BootExit::Config(Box::new(e)))?;
+    let owner = build_pool(
+        dsns.platform().expose_secret(),
+        PoolConfig::migrator_from_env(),
+    )
+    .await
+    .map(OperatorPool::from)
+    .map_err(|e| BootExit::Other(Box::new(SqlError::Connect(e))))?;
     let result = async {
         let mut lease = owner.migration_lease(MIGRATION_LEASE_WAIT).await?;
         let migrated = async {
@@ -376,7 +381,8 @@ impl<W: Write> Write for Tee<W> {
 /// machine's database access can run either without the server running.
 ///
 /// # Errors
-/// Returns [`BootExit::Config`] when either serving DSN is missing or invalid,
+/// Returns [`BootExit::Config`] when `WYRD_DATABASE_URL` is missing or a
+/// serving DSN is invalid,
 /// and [`BootExit::Other`] when the connection cannot be established or the
 /// schema has not been migrated by `wyrd-server migrate`.
 async fn operator_pool() -> Result<OperatorPool, BootExit> {

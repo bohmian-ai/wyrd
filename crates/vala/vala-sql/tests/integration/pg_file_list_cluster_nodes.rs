@@ -315,7 +315,7 @@ mod pg_tests {
             .await
             .unwrap();
 
-        // Insert a file_list row as tenant A via superuser pool (BYPASSRLS).
+        // Insert a file_list row as tenant A via the superuser pool.
         let file_id = Uuid::now_v7();
         sqlx::query(
             r#"
@@ -362,7 +362,7 @@ mod pg_tests {
 
         let file_id = Uuid::now_v7();
 
-        // Insert via OperatorPool (wyrd_platform_admin BYPASSRLS).
+        // Insert via OperatorPool (the operator session admitted by operator_access).
         sqlx::query(
             r#"
             INSERT INTO vala.file_list (
@@ -385,7 +385,7 @@ mod pg_tests {
         .await
         .expect("OperatorPool INSERT");
 
-        // SELECT via OperatorPool should succeed (BYPASSRLS + SELECT grant).
+        // SELECT via OperatorPool should succeed (operator_access).
         let row: (Uuid,) = sqlx::query_as("SELECT id FROM vala.file_list WHERE id = $1")
             .bind(file_id)
             .fetch_one(&pool)

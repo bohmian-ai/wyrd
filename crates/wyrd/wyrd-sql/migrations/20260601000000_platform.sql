@@ -1,60 +1,44 @@
 -- Wyrd platform schema bootstrap.
 --
--- Cluster role creation is owned by infra bootstrap (bootstrap/roles.sql).
--- This migration runs as the database-owner login through the one-off
--- `wyrd-server migrate` command, validates the two serving roles, and grants
--- object privileges only.
+-- Operators create every Postgres login; Wyrd creates no roles and grants
+-- nothing to a named role. This migration runs through the one-off
+-- `wyrd-server migrate` command as the platform login, which owns every object
+-- these migrations create.
+--
+-- Every table forces row-level security, so the owner is policy-bound too.
+-- Tenant-keyed tables admit the tenant bound by `TenantConn`; every table also
+-- admits an operator session through its `operator_access` policy, which
+-- targets the migrating owner (`TO CURRENT_USER`) and requires the
+-- `app.operator` flag that only `OperatorPool` connections set. A separate
+-- tenant login is not the owner, so setting the flag gives it nothing.
 
 CREATE SCHEMA IF NOT EXISTS platform;
 CREATE SCHEMA IF NOT EXISTS wyrd;
 
-DO $$
-BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_roles
-        WHERE rolname = current_user AND (rolbypassrls OR rolsuper)
-    ) THEN
-        RAISE EXCEPTION
-            'migration login % lacks BYPASSRLS - run wyrd-server migrate as the database owner', current_user;
-    END IF;
+-- Whether this session is an operator session. Only `operator_access`
+-- policies consult it, and they apply only to the owner role.
+CREATE FUNCTION wyrd.operator_session() RETURNS boolean
+LANGUAGE sql STABLE PARALLEL RESTRICTED AS $$
+    SELECT coalesce(current_setting('app.operator', true), '') = 'on'
+$$;
 
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_roles
-        WHERE rolname = 'wyrd_app' AND rolbypassrls = false
-    ) THEN
-        RAISE EXCEPTION
-            'role wyrd_app missing or has BYPASSRLS (must NOT bypass) - infra bootstrap broken';
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_roles
-        WHERE rolname = 'wyrd_platform_admin' AND rolbypassrls = true
-    ) THEN
-        RAISE EXCEPTION
-            'role wyrd_platform_admin missing or lacks BYPASSRLS - infra bootstrap incomplete';
-    END IF;
-END $$;
-
-GRANT USAGE ON SCHEMA platform, wyrd TO wyrd_app, wyrd_platform_admin;
-
--- Default privileges apply to objects the migrating owner creates from here on.
-ALTER DEFAULT PRIVILEGES IN SCHEMA wyrd
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO wyrd_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA wyrd
-    GRANT USAGE, SELECT ON SEQUENCES TO wyrd_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA platform, wyrd
-    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO wyrd_platform_admin;
-ALTER DEFAULT PRIVILEGES IN SCHEMA platform, wyrd
-    GRANT USAGE, SELECT ON SEQUENCES TO wyrd_platform_admin;
-
--- Serving boot proves the applied migrations match its binary; the ledger
--- predates the default privileges above, so it is granted read-only here.
-GRANT SELECT ON TABLE wyrd._sqlx_migrations TO wyrd_app, wyrd_platform_admin;
-
+-- The tenant `TenantConn` bound to this transaction. A tenant session with no
+-- binding fails loudly rather than reading nothing; an operator session, which
+-- evaluates `tenant_isolation` alongside `operator_access`, reads NULL.
 CREATE FUNCTION wyrd.current_tenant() RETURNS uuid
 LANGUAGE sql STABLE PARALLEL RESTRICTED AS $$
-    SELECT current_setting('app.current_tenant')::uuid
+    SELECT CASE WHEN wyrd.operator_session()
+        THEN nullif(current_setting('app.current_tenant', true), '')::uuid
+        ELSE current_setting('app.current_tenant')::uuid
+    END
 $$;
+
+-- The ledger is a table like any other: only operator sessions, which the
+-- migration runs as, may read or write it.
+ALTER TABLE wyrd._sqlx_migrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wyrd._sqlx_migrations FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON wyrd._sqlx_migrations TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE TABLE platform.tenants (
     data_tenant_id  UUID PRIMARY KEY,
@@ -73,22 +57,34 @@ CREATE INDEX tenants_by_slug
 CREATE INDEX tenants_by_status
     ON platform.tenants (status) WHERE status = 'active';
 
+ALTER TABLE platform.tenants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE platform.tenants FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON platform.tenants TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
+
+-- Postgres refuses an ordinary owner a custom parameter in a function's SET
+-- clause, so the body raises the operator flag transaction-locally and restores
+-- the caller's value before returning; an error aborts the transaction, or the
+-- enclosing savepoint, which reverts it too.
 CREATE FUNCTION platform.resolve_tenant_by_slug(p_slug TEXT)
 RETURNS uuid
-LANGUAGE sql
+LANGUAGE plpgsql
 SECURITY DEFINER
-STABLE
 SET search_path = pg_catalog, platform
 AS $$
-    SELECT data_tenant_id FROM platform.tenants
+DECLARE
+    prior text := coalesce(current_setting('app.operator', true), '');
+    tenant uuid;
+BEGIN
+    PERFORM set_config('app.operator', 'on', true);
+    SELECT data_tenant_id INTO tenant FROM platform.tenants
     WHERE slug = p_slug
       AND status = 'active'
-      AND deleted_at IS NULL
+      AND deleted_at IS NULL;
+    PERFORM set_config('app.operator', prior, true);
+    RETURN tenant;
+END;
 $$;
-
-REVOKE EXECUTE ON FUNCTION platform.resolve_tenant_by_slug(TEXT) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION platform.resolve_tenant_by_slug(TEXT) TO wyrd_app;
-GRANT EXECUTE ON FUNCTION platform.resolve_tenant_by_slug(TEXT) TO wyrd_platform_admin;
 
 CREATE TABLE platform.users (
     id              TEXT PRIMARY KEY,
@@ -132,6 +128,3 @@ CREATE TABLE platform.api_keys (
 CREATE INDEX platform_api_keys_by_prefix ON platform.api_keys (prefix);
 CREATE INDEX platform_api_keys_active
     ON platform.api_keys (user_id) WHERE revoked_at IS NULL;
-
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA platform, wyrd TO wyrd_platform_admin;
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA wyrd TO wyrd_app;

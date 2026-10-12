@@ -41,7 +41,7 @@ use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromot
 #[tokio::test]
 async fn independent_plan_publications_compose_on_current_head() {
     let promoted = PromotedRewriteFixture::start_unpromoted("compaction_admission").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let mut supervisor = SupervisedPromotion::start(
         &promoted.fixture,
         promoted.fixture.catalog.iceberg_catalog(),
@@ -164,7 +164,7 @@ async fn independent_plan_publications_compose_on_current_head() {
 async fn admitted_batch_reports_partial_progress_semantics() {
     let _telemetry = super::support::ForgeTelemetryCheckpoint::install();
     let promoted = PromotedRewriteFixture::start_unpromoted("compaction_reduction").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -400,11 +400,11 @@ async fn latest_small_files_task(fixture: &PromotionIntegrationFixture) -> Forge
 async fn reconciliation_walks_every_open_operation_a_page_cannot_hold() {
     let mut promoted = PromotedRewriteFixture::start_unpromoted("compaction_reconcile").await;
     promoted.fixture.config.max_open_operations_per_table = 1;
-    // A stalled commit has to hit the catalog request timeout while the scenario
+    // A stalled commit has to run out of publication budget while the scenario
     // is still watching, so the budget is the seconds a test can wait rather
     // than the production minutes.
-    promoted.fixture.config.catalog_request_timeout = std::time::Duration::from_secs(2);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -477,8 +477,9 @@ async fn reconciliation_walks_every_open_operation_a_page_cannot_hold() {
         .set(settled_at)
         .expect("manual Forge clock advances");
     promoted.fixture.expire_claims().await;
-    // The killed owner released nothing, so its table fence lapses too.
-    promoted.fixture.expire_table_lease().await;
+    // A killed owner's claim may already be `prepared`, which aging the
+    // claimed and running rows does not cover.
+    promoted.fixture.lapse_table_claim().await;
     supervisor.reclaim_expired_claims().await;
     promoted.fixture.clear_task_backoff().await;
     supervisor.restart_worker();
@@ -680,10 +681,10 @@ async fn promote_more_inputs(
 async fn multi_plan_success_counts_all_committed_volume_once() {
     let telemetry = super::support::ForgeTelemetryCheckpoint::install();
     let mut promoted = PromotedRewriteFixture::start_unpromoted("volume_sum").await;
-    // Every stalled plan has to hit the catalog request timeout while the
+    // Every stalled plan has to run out of publication budget while the
     // scenario is still watching.
-    promoted.fixture.config.catalog_request_timeout = std::time::Duration::from_secs(2);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -845,7 +846,7 @@ fn consumed_paths(before: &BTreeSet<String>, after: &BTreeSet<String>) -> usize 
 #[tokio::test]
 async fn stale_planned_input_cannot_be_republished() {
     let promoted = PromotedRewriteFixture::start_unpromoted("compaction_stale_input").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -984,17 +985,12 @@ async fn replace_every_live_data_file(promoted: &PromotedRewriteFixture) {
         let replacement = format!("{}.competing.parquet", file.file_path());
         let bytes = promoted
             .fixture
-            .staging
-            .read(&staging_key(promoted, file.file_path()))
-            .await
-            .expect("a live object is readable")
-            .to_bytes();
+            .read_object(&staging_key(promoted, file.file_path()))
+            .await;
         promoted
             .fixture
-            .staging
-            .write(&staging_key(promoted, &replacement), bytes)
-            .await
-            .expect("the competing copy is writable");
+            .write_object(&staging_key(promoted, &replacement), bytes)
+            .await;
         added.push(
             iceberg::spec::DataFileBuilder::default()
                 .content(iceberg::spec::DataContentType::Data)
@@ -1323,8 +1319,8 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
     // running plans in flight exactly that long. It is set well above the time
     // one turn needs to claim its allowance so a loaded machine cannot end a
     // plan before the turn that admitted it is even observable.
-    promoted.fixture.config.catalog_request_timeout = std::time::Duration::from_secs(20);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(20);
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -1446,12 +1442,12 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn released_authority_gates_readiness_and_new_claims() {
     let mut promoted = PromotedRewriteFixture::start_unpromoted("gated_readiness").await;
-    // The withheld answers have to hit the catalog request timeout inside a
+    // The withheld answers have to run out of publication budget inside a
     // test's patience rather than the production minutes: the release under
-    // test happens exactly when this timeout expires with the commits still in
+    // test happens exactly when this budget expires with the commits still in
     // flight.
-    promoted.fixture.config.catalog_request_timeout = std::time::Duration::from_secs(2);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -1502,20 +1498,16 @@ async fn released_authority_gates_readiness_and_new_claims() {
 /// Drives one attempt into a release nothing durable can account for.
 ///
 /// Every plan of the attempt has its commit answer withheld past the
-/// catalog request timeout. Every plan, because one that published ordinarily would
+/// publication budget. Every plan, because one that published ordinarily would
 /// settle the task by the any-success rule, which is the opposite of the state
 /// under test. The attempt therefore drains with nothing it can say about its
 /// own operations and is released: `Running` task, `Prepared` operations, and a
 /// claim owned until its lease lapses.
 ///
-/// The release is held at its table-lease boundary before it is allowed to
-/// finish, because that hold is the one place the unresolved interval is
-/// observable from outside: the attempt is already classified unresolved and
-/// the release is doing local work that can block. Readiness must already be
-/// false there, with the exact task still `Running` and its operation still
-/// `Prepared`.
-///
-/// # Panics
+/// Releasing the attempt does no further work: the claim stays on the task row
+/// until it lapses, so the unresolved interval is observable right after the
+/// release, with the exact task still `Running` and its operation still
+/// `Prepared`. The caller asserts readiness is retracted in that interval.
 ///
 /// The worker pulls `table` from the leader as soon as it starts, so the
 /// released task is the small-files row that pull recorded for it, and its
@@ -1523,10 +1515,9 @@ async fn released_authority_gates_readiness_and_new_claims() {
 ///
 /// # Panics
 ///
-/// Panics when the release does not reach its lease boundary, when readiness
-/// is still advertised there, when the durable identities are not the ones the
-/// release left behind, or when the attempt settles instead of being released
-/// inside [`ADMISSION_BOUND`].
+/// Panics when the attempt settles instead of being released inside
+/// [`ADMISSION_BOUND`], or when the durable identities are not the ones the
+/// release left behind.
 async fn release_one_unresolvable_attempt(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
@@ -1536,42 +1527,8 @@ async fn release_one_unresolvable_attempt(
 ) -> Uuid {
     let released_before = supervisor.observer().released_attempts_for_test().len();
     catalog.stall_next_commit_responses(usize::MAX);
-    supervisor
-        .observer()
-        .hold_before_next_lease_release_for_test();
     supervisor.restart_worker();
     supervisor.start_worker();
-    let held = tokio::time::timeout(
-        ADMISSION_BOUND,
-        supervisor.observer().wait_for_held_lease_release_for_test(),
-    )
-    .await;
-    assert!(
-        held.is_ok(),
-        "the unresolvable attempt reaches its lease release: {:?} / {:?}",
-        tenant_tasks(&promoted.fixture).await,
-        promoted.fixture.rewrite_operations().await
-    );
-    assert!(
-        !supervisor.is_ready(),
-        "readiness is retracted before the unresolved release does blocking work: {:?}",
-        promoted.fixture.rewrite_operations().await
-    );
-    let (released_task, state) = newest_small_files_task(&promoted.fixture, own_tenant, table)
-        .await
-        .expect("the worker pulled the owed table");
-    assert_eq!(
-        state,
-        "running",
-        "the exact task is still Running at that boundary: {:?}",
-        tenant_tasks(&promoted.fixture).await
-    );
-    assert!(
-        !prepared_operations(promoted).await.is_empty(),
-        "the exact operation is still Prepared at that boundary: {:?}",
-        promoted.fixture.rewrite_operations().await
-    );
-    supervisor.observer().release_held_lease_release_for_test();
     let released = tokio::time::timeout(ADMISSION_BOUND, async {
         while supervisor.observer().released_attempts_for_test().len() == released_before {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1582,6 +1539,20 @@ async fn release_one_unresolvable_attempt(
         released.is_ok(),
         "the owner releases the attempt whose answers were lost: {:?} / {:?}",
         tenant_tasks(&promoted.fixture).await,
+        promoted.fixture.rewrite_operations().await
+    );
+    let (released_task, state) = newest_small_files_task(&promoted.fixture, own_tenant, table)
+        .await
+        .expect("the worker pulled the owed table");
+    assert_eq!(
+        state,
+        "running",
+        "the released task is still Running: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+    assert!(
+        !prepared_operations(promoted).await.is_empty(),
+        "the released operation is still Prepared: {:?}",
         promoted.fixture.rewrite_operations().await
     );
     catalog.stall_next_commit_responses(0);
@@ -1911,9 +1882,9 @@ async fn assert_concurrent_attempts_published(
         "every rewritten input left the live set"
     );
     assert_eq!(
-        promoted.fixture.live_leases().await,
+        promoted.fixture.live_claims().await,
         0,
-        "a drained worker holds no table fence"
+        "a drained worker holds no table claim"
     );
 }
 
@@ -2204,25 +2175,34 @@ fn attempts_ended(supervisor: &SupervisedPromotion) -> usize {
         + observer.released_attempts_for_test().len()
 }
 
-/// Waits until one more attempt than `ended_before` has given its parallelism
-/// back.
+/// Reads the commit-submission count once the attempt's own plans stop adding.
 ///
-/// An attempt ends only once every plan it admitted has returned, so a sibling
-/// still waiting out its definite-conflict backoff keeps the attempt open. That
-/// makes the attempt's end, not a quiet window in the commit count, the point
-/// after which a later window describes reconciliation alone.
+/// Readiness is retracted the moment the first unknown outcome is stored, so
+/// the plans an attempt already admitted may still be reaching the seam: an
+/// owner that cannot account for one operation keeps the work it started moving
+/// and only stops taking more. Reading the count after it has stopped moving is
+/// what makes a later quiet window describe reconciliation alone.
+///
+/// The lull has to outlast a definite refusal's revalidated retry, which is why
+/// it is the publication budget rather than a few hundred milliseconds: a
+/// shorter sample can land between a sibling's retries and read a count that is
+/// still moving.
 ///
 /// # Panics
 ///
-/// Panics when no further attempt ends inside [`ADMISSION_BOUND`].
-async fn await_attempt_ended(supervisor: &SupervisedPromotion, ended_before: usize) {
+/// Panics when submissions never stop inside [`ADMISSION_BOUND`].
+async fn await_settled_submissions(catalog: &PromotionCatalogSeam) -> usize {
     tokio::time::timeout(ADMISSION_BOUND, async {
-        while attempts_ended(supervisor) <= ended_before {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        loop {
+            let before = catalog.attempts();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if catalog.attempts() == before {
+                return before;
+            }
         }
     })
     .await
-    .expect("the attempt ends once every admitted plan has returned");
+    .expect("the attempt's own admitted plans stop reaching the catalog")
 }
 
 /// Reads the phase of every rewrite operation this tenant holds, by id.
@@ -2282,7 +2262,7 @@ async fn await_operation_phase(
 ///
 /// Three shapes are proved against one production worker:
 ///
-/// 1. A commit that hits the catalog request timeout while it is still in flight
+/// 1. A commit that runs out of publication budget while it is still in flight
 ///    leaves nothing landed. The task stays Running and resubmits nothing, and
 ///    only once the uncertainty bound lapses does reconciliation prove the
 ///    operation absent and Reset it.
@@ -2301,11 +2281,11 @@ async fn await_operation_phase(
 async fn acceptance_unknown_recovers_from_durable_state() {
     let _telemetry = super::support::ForgeTelemetryCheckpoint::install();
     let mut promoted = PromotedRewriteFixture::start_unpromoted("unknown_acceptance").await;
-    // A parked commit has to hit the catalog request timeout while the scenario
+    // A parked commit has to run out of publication budget while the scenario
     // is still watching, so the budget is the seconds a test can wait rather
     // than the production minutes.
-    promoted.fixture.config.catalog_request_timeout = std::time::Duration::from_secs(2);
-    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
+    let object_store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -2347,15 +2327,15 @@ async fn acceptance_unknown_recovers_from_durable_state() {
     .await;
     supervisor.shutdown().await;
     assert_eq!(
-        promoted.fixture.live_leases().await,
+        promoted.fixture.live_claims().await,
         0,
-        "every settled attempt released its table fence"
+        "every settled attempt released its table claim"
     );
 }
 
 /// Proves a commit that never landed is Reset only once absence is provable.
 ///
-/// The plan hits the catalog request timeout while its call is still in flight,
+/// The plan runs out of publication budget while its call is still in flight,
 /// so nothing landed and nothing can say so. The attempt is released, and the
 /// operation it opened is durable state nobody in this process owns: it stays
 /// Prepared until the claim lease lapses, a successor reads it, and the
@@ -2373,7 +2353,6 @@ async fn unresolved_commit_resets_once_absence_is_provable(
 ) {
     // 1. Nothing landed, and nobody can say so yet.
     catalog.park_next_commit();
-    let ended_before = attempts_ended(supervisor);
     supervisor.restart_worker();
     supervisor.start_worker();
     supervisor.schedule_only().await;
@@ -2381,9 +2360,8 @@ async fn unresolved_commit_resets_once_absence_is_provable(
         .await
         .expect("one plan reaches the catalog");
     // A sibling that published would settle the task on its own, which is the
-    // *other* case. Refusing every later commit outright leaves this attempt,
-    // once its siblings have spent their retries, with exactly one thing it
-    // cannot explain.
+    // *other* case. Refusing every later commit outright leaves this attempt
+    // with exactly one thing it cannot explain.
     catalog.reject_remaining_commits();
     let unresolved = tokio::time::timeout(ADMISSION_BOUND, async {
         loop {
@@ -2402,11 +2380,10 @@ async fn unresolved_commit_resets_once_absence_is_provable(
     .expect("the parked plan opened its operation");
     await_small_files_in_state(&promoted.fixture, &["claimed", "running"], 1).await;
 
-    // The request timeout lapses, the plan returns with acceptance unknown, its
-    // refused siblings exhaust their retries, and the attempt is released
-    // rather than settled: the task stays Running, and the operation it opened
-    // is now durable state nobody in this process owns.
-    await_attempt_ended(supervisor, ended_before).await;
+    // The budget lapses, the plan returns with acceptance unknown, and the
+    // attempt is released rather than settled: the task stays Running, and the
+    // operation it opened is now durable state nobody in this process owns.
+    await_settled_submissions(catalog).await;
     assert_eq!(
         small_files_in_state(&promoted.fixture, &["claimed", "running"]).await,
         1,
@@ -2493,7 +2470,7 @@ async fn unresolved_commit_resets_once_absence_is_provable(
 /// Proves that a landed replacement whose answer never arrived recovers.
 ///
 /// The seam hands the commit to a task the caller cannot cancel, so the
-/// replacement lands exactly as it would have while the catalog request timeout ends
+/// replacement lands exactly as it would have while the publication budget ends
 /// the call with nothing learned. The attempt then releases the task, and the
 /// successor that reclaims the lapsed claim proves the operation live from
 /// retained evidence and settles it Succeeded — and the first proof is enough,
@@ -2677,7 +2654,7 @@ async fn release_one_unresolved_attempt(
     // pass is only distinguishable from a per-operation reduction when a pass
     // has more than one operation to visit. Re-arming the park while the first
     // call is still held is what removes the race: the arm is in place before
-    // this plan's catalog request timeout releases it and its sibling starts.
+    // this plan's publication budget releases it and its sibling starts.
     catalog.park_next_commit();
     tokio::time::timeout(ADMISSION_BOUND, catalog.wait_for_parked_commit())
         .await
@@ -2769,9 +2746,9 @@ async fn crash_recovery_reconciles_the_exact_operation(
     // there. That is the point: the fence lapses on its own, exactly like the
     // claim lease, and a successor waits it out rather than being handed it.
     assert_eq!(
-        promoted.fixture.live_leases().await,
+        promoted.fixture.live_claims().await,
         1,
-        "a killed owner leaves its table fence to lapse"
+        "a killed owner leaves its table claim to lapse"
     );
     assert_eq!(
         object_store.deletes(),
@@ -2848,9 +2825,9 @@ async fn successor_reconciles_before_publishing(
         .expect("manual Forge clock advances");
     let promoted_before = promotions_succeeded(&promoted.fixture).await;
     promoted.fixture.expire_claims().await;
-    // The killed owner's fence is the third thing that has to lapse before a
-    // successor can take the table at all.
-    promoted.fixture.expire_table_lease().await;
+    // A killed owner's claim may already be `prepared`, which aging the
+    // claimed and running rows does not cover.
+    promoted.fixture.lapse_table_claim().await;
     promoted.fixture.seal_more(4).await;
     supervisor.restart_worker();
     supervisor.start_worker();

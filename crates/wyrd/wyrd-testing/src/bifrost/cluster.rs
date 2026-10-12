@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use metrics_exporter_prometheus::PrometheusHandle;
-use opendal::Operator;
 use sqlx::Row;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -16,8 +15,8 @@ use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
+use vala_bifrost_redux::scan_sizing::ScanScope;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::storage::StorageInspection;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::app::metrics::install_recorder;
@@ -590,13 +589,6 @@ pub struct ClusterShutdownInspection {
     pub forge_active_attempts: u64,
     /// Supervised server tasks retained after every server owner is dropped.
     pub supervised_tasks: u64,
-    /// Each stopped node's terminal storage-owner state, in stop order.
-    ///
-    /// Kept per node rather than summed: the storage owner is a per-node
-    /// resource, and adding two nodes' counts together would turn a per-node
-    /// reconciliation into a cluster-wide one that no single owner ever has to
-    /// satisfy.
-    pub storage: Vec<StorageInspection>,
 }
 
 /// One parsed production Prometheus series.
@@ -1878,9 +1870,16 @@ impl WyrdTestCluster {
         {
             builder = builder.with_oracle_query_slot_limit_for_test(slots);
         }
-        if let Some(oracle) = self.oracle_runtime.clone() {
-            builder = builder.with_oracle_runtime_for_test(oracle);
-        }
+        // Journey tables hold kilobytes. One byte per scan task spreads them
+        // over the cluster's Oracle followers the way a production-sized table
+        // spreads under the default, unless a journey states its own value.
+        let mut oracle = self.oracle_runtime.clone().unwrap_or_default();
+        oracle.file_scan_bytes_per_task.get_or_insert(1);
+        builder = builder
+            .with_oracle_runtime_for_test(oracle)
+            // Likewise one scanned byte earns a partition, so a kilobyte
+            // table plans the distributed shape a production-sized one does.
+            .with_oracle_partition_scan_bytes_for_test(1);
         if let Some(root) = self.gateway_provider_root.clone() {
             builder = builder.with_gateway_provider_root_for_test(root);
         }
@@ -2182,11 +2181,11 @@ impl WyrdTestCluster {
                 .map(|runtime| runtime.tail_service())
                 .ok_or_else(|| ClusterError::Resource("Scribe tail service missing".to_owned()))?;
             let streams = source
-                .list_active_streams(&binding)
+                .list_active_streams(&binding, &ScanScope::default())
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
             if streams
                 .iter()
-                .any(|(partition, _)| partition == time_partition)
+                .any(|stream| stream.time_partition == *time_partition)
             {
                 found = true;
             }
@@ -2215,6 +2214,73 @@ impl WyrdTestCluster {
         server
             .shutdown_and_inspect()
             .await
+            .map(|_| ())
+            .map_err(|error| ClusterError::Shutdown(error.to_string()))
+    }
+
+    /// Drain one node and boot another only once that drain is under way.
+    ///
+    /// `drained` begins its graceful shutdown first. `restarted` boots only
+    /// after every membership role of `drained` is observed unready and its
+    /// shutdown is still running, so anything the drain must deliver to the
+    /// restarted node is discovered by a membership refresh during the drain
+    /// rather than before it. The drain is then awaited to completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown/stopped `drained` or running
+    /// `restarted` node, when readiness withdrawal is not observed within 30
+    /// seconds, when the drain ended before the boot began, or for a failed
+    /// boot, membership read, join, or shutdown.
+    pub async fn stop_node_restarting_another_during_drain(
+        &mut self,
+        drained: NodeId,
+        restarted: NodeId,
+    ) -> Result<(), ClusterError> {
+        let server = self
+            .servers
+            .get_mut(&drained)
+            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", drained.as_uuid())))?
+            .take()
+            .ok_or_else(|| {
+                ClusterError::Resource(format!("node {} is already stopped", drained.as_uuid()))
+            })?;
+        let drain = tokio::spawn(server.shutdown_and_inspect());
+        let pool = self.fixture.operator_pool().pool().clone();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut poll = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                poll.tick().await;
+                let withdrawn: Option<bool> = sqlx::query_scalar(
+                    "SELECT bool_and(NOT ready) FROM vala.cluster_nodes WHERE node_id=$1",
+                )
+                .bind(drained.as_uuid())
+                .fetch_one(&pool)
+                .await
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
+                if withdrawn == Some(true) {
+                    return Ok::<_, ClusterError>(());
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            ClusterError::Resource(format!(
+                "node {} never withdrew readiness while draining",
+                drained.as_uuid()
+            ))
+        })??;
+        if drain.is_finished() {
+            return Err(ClusterError::Resource(format!(
+                "node {} finished draining before node {} booted",
+                drained.as_uuid(),
+                restarted.as_uuid()
+            )));
+        }
+        self.restart_node(restarted).await?;
+        drain
+            .await
+            .map_err(|error| ClusterError::Shutdown(error.to_string()))?
             .map(|_| ())
             .map_err(|error| ClusterError::Shutdown(error.to_string()))
     }
@@ -2449,10 +2515,27 @@ impl WyrdTestCluster {
         &self.fixture
     }
 
-    /// Return the shared object-store operator used by all pods.
+    /// Return the Bifrost object store over the backend every pod shares.
     #[must_use]
-    pub fn storage_operator(&self) -> Operator {
-        self.storage.operator().clone()
+    pub fn storage_objects(&self) -> Arc<dyn object_store::ObjectStore> {
+        Arc::clone(crate::server::test_storage_owner(&self.storage).objects())
+    }
+
+    /// Reports whether `key` exists in the backend every pod shares.
+    ///
+    /// # Errors
+    /// Returns the object store's error for anything other than absence.
+    pub async fn object_exists(&self, key: &str) -> object_store::Result<bool> {
+        use object_store::ObjectStoreExt as _;
+        match self
+            .storage_objects()
+            .head(&object_store::path::Path::from(key))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Iterate independently bound running servers in stable node order.
@@ -2535,7 +2618,6 @@ impl WyrdTestCluster {
         let mut scribe_wal_streams = 0_u64;
         let mut listeners_stopped = true;
         let mut supervised_tasks = 0_u64;
-        let mut storage = Vec::new();
         let node_ids = self.servers.keys().copied().collect::<Vec<_>>();
         let expected_servers = node_ids.len();
         let mut stopped_servers = 0_usize;
@@ -2561,7 +2643,6 @@ impl WyrdTestCluster {
                         listeners_stopped &= server_inspection.listeners_stopped;
                         supervised_tasks =
                             supervised_tasks.saturating_add(server_inspection.supervised_tasks);
-                        storage.extend(server_inspection.storage);
                         if let Some(snapshot) = server_inspection.scribe {
                             scribe_queued =
                                 scribe_queued.saturating_add(snapshot.queued_items as u64);
@@ -2591,7 +2672,6 @@ impl WyrdTestCluster {
                 forge_active_claims: inspection.forge_active_claims,
                 forge_active_attempts: inspection.forge_active_attempts,
                 supervised_tasks,
-                storage,
             }),
         }
     }
@@ -2902,7 +2982,18 @@ mod tests {
             .expect("restarted resource snapshot");
         assert_eq!(restarted_resources.plan, original_resources.plan);
         assert_eq!(restarted_resources.scribe_memory_used_bytes, 0);
-        assert_eq!(restarted_resources.governed_memory_used_bytes, 0);
+        // The footer cache's whole budget is charged once at composition, so
+        // a fresh node holds exactly that and nothing a query left behind.
+        let metadata_cache_bytes = server
+            .state()
+            .bifrost_storage()
+            .expect("restarted storage owner")
+            .policy()
+            .metadata_cache_bytes();
+        assert_eq!(
+            u64::try_from(restarted_resources.governed_memory_used_bytes).expect("fits u64"),
+            metadata_cache_bytes
+        );
         assert!(!restarted_resources.oracle_query_active);
         cluster.shutdown().await.expect("cluster shuts down");
     }

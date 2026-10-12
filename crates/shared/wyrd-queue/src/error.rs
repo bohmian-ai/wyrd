@@ -55,11 +55,18 @@ pub enum WyrdQueueError {
     #[error("schema parse: {0}")]
     SchemaParse(String),
 
-    /// A reserved column name (`wyrd_*`, or `card_ref`/`run_id` presented as a
+    /// A reserved column name (`wyrd_*`, or `card_uid`/`run_id` presented as a
     /// payload key rather than via its argument) appeared where user fields are
     /// expected. Serialization-domain `WYRD_VALA_400_BIFROST_RESERVED_COLUMN`.
     #[error("reserved column: {0}")]
     ReservedColumn(String),
+
+    /// A catalogued Bifrost contract refusal raised before admission: an
+    /// unsupported or undeclared field, or a Variant value that is invalid,
+    /// out of range, too deep, or too large. Carries the stable error with
+    /// its details.
+    #[error("bifrost contract refused: {0}")]
+    Contract(#[source] BifrostError),
 
     /// A sink-reported server error, already mapped to the stable catalog.
     #[error("sink error: {0}")]
@@ -77,38 +84,59 @@ impl WyrdQueueError {
             Self::ConfigInvalid { .. } => "WYRD_CLIENT_400_CONFIG_INVALID",
             Self::SchemaParse(_) => "WYRD_VALA_400_SCHEMA_PARSE",
             Self::ReservedColumn(_) => "WYRD_VALA_400_BIFROST_RESERVED_COLUMN",
+            Self::Contract(err) => err.code(),
             Self::Sink(err) => err.code(),
         }
     }
 }
 
-impl From<WyrdQueueError> for WyrdError {
+impl From<BifrostError> for WyrdQueueError {
+    /// Carry a refusal from the shared column-type mappings.
+    ///
+    /// A schema-parse refusal stays [`WyrdQueueError::SchemaParse`]; every
+    /// other catalogued refusal is a [`WyrdQueueError::Contract`].
+    fn from(error: BifrostError) -> Self {
+        match error {
+            BifrostError::SchemaParse { detail } => Self::SchemaParse(detail),
+            other => Self::Contract(other),
+        }
+    }
+}
+
+impl From<&WyrdQueueError> for WyrdError {
     /// Map to the stable [`WyrdError`] catalog at the surface boundary.
     ///
-    /// The serialization-domain failures become their typed Bifrost errors and
-    /// the queue-domain codes project onto typed `WyrdError` variants via the
-    /// shared `WyrdError::from_code` reconstruction, so every boundary reports
-    /// the real status and code; the `Sink` variant passes its already-mapped
-    /// error straight through.
-    fn from(err: WyrdQueueError) -> Self {
-        let err = match err {
-            WyrdQueueError::Sink(inner) => return inner,
-            WyrdQueueError::SchemaParse(detail) => {
-                return BifrostError::SchemaParse { detail }.into();
+    /// Saturation, drain, payload, and configuration refusals keep their own
+    /// `WYRD_CLIENT_*` codes so a caller can retry a full queue without parsing
+    /// error text; the serialization-domain refusals become their catalogued
+    /// Bifrost error with its details, and a sink failure is already a catalog
+    /// error and passes through unchanged.
+    fn from(error: &WyrdQueueError) -> Self {
+        let message = error.to_string();
+        let details = serde_json::json!({});
+        match error {
+            WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => {
+                WyrdError::ClientQueueFull { message, details }
             }
-            WyrdQueueError::ReservedColumn(column) => {
-                return BifrostError::ReservedColumn { column }.into();
+            WyrdQueueError::FlushTimeout => WyrdError::ClientFlushTimeout { message, details },
+            WyrdQueueError::PayloadTooLarge => {
+                WyrdError::ClientPayloadTooLarge { message, details }
             }
-            other => other,
-        };
-        let code = err.code();
-        let message = err.to_string();
-        WyrdError::from_code(code, message.clone(), serde_json::json!({})).unwrap_or(
-            WyrdError::Internal {
+            WyrdQueueError::ConfigInvalid { field, reason } => WyrdError::ClientConfigInvalid {
                 message,
-                details: serde_json::json!({ "original_code": code }),
+                details: serde_json::json!({ "field": field, "reason": reason }),
             },
-        )
+            WyrdQueueError::SchemaParse(detail) => BifrostError::SchemaParse {
+                detail: detail.clone(),
+            }
+            .into(),
+            WyrdQueueError::ReservedColumn(column) => BifrostError::ReservedColumn {
+                column: column.clone(),
+            }
+            .into(),
+            WyrdQueueError::Contract(error) => error.clone().into(),
+            WyrdQueueError::Sink(inner) => inner.clone(),
+        }
     }
 }
 
@@ -133,7 +161,7 @@ mod tests {
             ),
         ];
         for (error, code) in cases {
-            let mapped = WyrdError::from(error);
+            let mapped = WyrdError::from(&error);
             assert_eq!((mapped.code(), mapped.status()), (code, 400));
         }
     }

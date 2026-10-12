@@ -1959,6 +1959,15 @@ table on `(data_tenant_id, result_id)`.
   cluster-role creation or unrestricted DDL. Tenant API principals MUST NOT
   require individual PostgreSQL logins. The database-owner credential MUST
   never be mounted in a serving process.
+  *Superseded in part by `SPEC-local-server-bootstrap` D-001:*
+  `WYRD_PLATFORM_DATABASE_URL` is optional and defaults to
+  `WYRD_DATABASE_URL`. Operators supply the logins; Wyrd names and provisions
+  no role. The pool decides scope: tenant pools are bound by
+  `tenant_isolation`, and the platform pool's operator session is admitted by
+  `operator_access` only for the login that owns Wyrd's objects. One ordinary
+  login may serve local and small self-hosted deployments; production uses a
+  separate tenant login. Superuser and `BYPASSRLS` logins are refused, and
+  `wyrd-server migrate` runs as the platform login.
 - **REQ-157**: The image MUST expose `wyrd-server migrate` as a one-off mode
   using an existing database-owner URL supplied through `WYRD_DATABASE_URL` to
   that invocation only. Normal server boot MUST NOT run migrations; it MUST

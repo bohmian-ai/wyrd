@@ -143,11 +143,10 @@ ALTER TABLE wyrd.verifier_runs FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.verifier_runs
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.verifier_runs TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
-REVOKE ALL ON TABLE wyrd.verifier_runs FROM wyrd_app, wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON wyrd.verifier_runs TO wyrd_app;
 -- Cross-tenant work discovery and queue-depth telemetry only read.
-GRANT SELECT ON wyrd.verifier_runs TO wyrd_platform_admin;
 
 -- ---------------------------------------------------------------------------
 -- Operator dispatches
@@ -194,10 +193,7 @@ ALTER TABLE wyrd.operator_dispatches FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.operator_dispatches
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-REVOKE ALL ON TABLE wyrd.operator_dispatches FROM wyrd_app, wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON wyrd.operator_dispatches TO wyrd_app;
-GRANT SELECT ON wyrd.operator_dispatches TO wyrd_platform_admin;
+CREATE POLICY operator_access ON wyrd.operator_dispatches TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- The scheduler discovers tenants with due bindings across every tenant.
-GRANT SELECT ON wyrd.verification_bindings TO wyrd_platform_admin;

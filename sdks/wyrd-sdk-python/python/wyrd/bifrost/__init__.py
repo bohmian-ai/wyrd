@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from datetime import datetime
 from typing import Any, Protocol, TypedDict, TypeVar, cast, overload
 
 import pyarrow
 
 from .. import _wyrd as _native
 from ..client import WyrdClient
+from ..types import TIMESTAMP_TYPES, TimestampLTZ, TimestampNTZ, TimestampTZ
 
 QueryTerminal = _native.bifrost.QueryTerminal
 
@@ -146,6 +149,7 @@ def _layout_json(
     partition_granularity: str | None,
     sort_keys: list[SortKey] | None,
     bloom_columns: list[str] | None,
+    time_column: str | None,
 ) -> str | None:
     """Assemble the optional physical-layout declaration for the native edge.
 
@@ -155,15 +159,21 @@ def _layout_json(
     the same value the server would have chosen.
     """
 
-    if partition_granularity is None and sort_keys is None and bloom_columns is None:
+    if (
+        partition_granularity is None
+        and sort_keys is None
+        and bloom_columns is None
+        and time_column is None
+    ):
         return None
-    return json.dumps(
-        {
-            "partition_granularity": partition_granularity or "hour",
-            "sort_keys": sort_keys or [],
-            "bloom_columns": bloom_columns or [],
-        }
-    )
+    layout: dict[str, Any] = {
+        "partition_granularity": partition_granularity or "hour",
+        "sort_keys": sort_keys or [],
+        "bloom_columns": bloom_columns or [],
+    }
+    if time_column is not None:
+        layout["time_column"] = time_column
+    return json.dumps(layout)
 
 
 class ResolvedTable(TypedDict):
@@ -176,7 +186,7 @@ class ResolvedTable(TypedDict):
 class Correlation(TypedDict, total=False):
     """Optional per-row correlation; an omitted key is a null on the wire."""
 
-    card_ref: str
+    card_uid: str
     run_id: str
 
 
@@ -195,33 +205,43 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        time_column: str | None = None,
         compaction_target_file_size_bytes: int | None = None,
         compaction_type: str | None = None,
     ) -> None:
         """Declare a table from a Pydantic model class.
 
-        The three layout arguments travel as one layout request. Omitting all
-        of them lets the server choose its default layout: hourly partitions,
-        ``wyrd_event_time`` descending with nulls last, and only the managed
-        Bloom columns. Layout column names are checked against the table's
+        The four layout arguments travel as one layout request. Omitting all
+        of them lets the server choose its default layout: hourly partitions
+        on ``wyrd_ingested_at``, sorted by it descending with nulls last, and
+        only the managed Bloom columns. Layout column names are checked against the table's
         full physical schema, managed columns included, at register time.
 
         Args:
             model: a Pydantic model class, not an instance. Its
-                ``model_json_schema()`` becomes the declared user columns.
-                ``card_ref``, ``run_id``, and ``wyrd_*`` names are reserved.
+                ``model_json_schema()`` becomes the declared user columns:
+                a nested model is a Struct, a typed list a List, and a
+                free-form (``Any``, open ``dict``) or union field a Variant.
+                Datetime fields declare the timestamp types in
+                ``wyrd.types``: ``NaiveDatetime`` is ``TIMESTAMP_NTZ`` and any
+                other ``datetime`` is ``TIMESTAMP_LTZ``.
+                ``card_uid``, ``run_id``, and ``wyrd_*`` names are reserved.
             table: the ``"<namespace>.<name>"`` name SQL uses.
             partition_granularity: ``"hour"`` or ``"day"`` partitions on
-                ``wyrd_event_time``. Omitted while another layout argument is
+                the time column. Omitted while another layout argument is
                 set, ``"hour"`` is sent.
             sort_keys: up to four ``SortKey`` mappings in priority order;
                 ``direction`` is ``"asc"`` or ``"desc"`` and ``null_order``
                 is ``"first"`` or ``"last"``. Omitted or empty, the table
-                sorts by ``wyrd_event_time`` descending with nulls last.
+                sorts by the time column descending with nulls last.
             bloom_columns: extra columns to Bloom-filter. The managed
                 ``run_id``, ``card_uid``, and ``principal_id`` columns the
                 table has always come first, and naming one is harmless.
                 Omitted or empty, only those managed columns are filtered.
+            time_column: the non-null ``TIMESTAMP_LTZ`` or ``TIMESTAMP_NTZ``
+                column that partitions the table and leads its default sort
+                order. Any instant is accepted. Omitted, it is
+                ``wyrd_ingested_at``, the server's receipt time.
             compaction_target_file_size_bytes: the file size Forge compacts
                 this table toward, at least 134217728 (128 MiB). Omitted, the
                 table follows the deployment default (1 GiB unless the
@@ -234,19 +254,31 @@ class TableConfig:
         Raises:
             WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` when ``table`` is not
                 ``namespace.name`` or the model schema has no column mapping;
+                ``WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE`` for a column type
+                Bifrost cannot store;
                 ``WYRD_VALA_400_BIFROST_RESERVED_COLUMN`` for a reserved
                 column; ``WYRD_SPEC_400_VALIDATION`` for an unknown
-                granularity, sort-key, or compaction-type spelling. Column,
+                granularity, sort-key, or compaction-type spelling.
+                ``WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT`` from
+                ``Bifrost.register()`` names a ``time_column`` that is absent,
+                nullable, or not a timestamp. Column,
                 file-size, and stored-setting conflicts raise from
                 ``Bifrost.register()``.
 
         """
+        if "pydantic" in sys.modules:
+            from ._pydantic import json_schema
+
+            schema = json_schema(model)
+        else:
+            schema = model.model_json_schema()
         self._native = TableConfig.from_json_schema(
             table,
-            model.model_json_schema(),
+            schema,
             partition_granularity,
             sort_keys,
             bloom_columns,
+            time_column,
             compaction_target_file_size_bytes,
             compaction_type,
         )._native
@@ -266,6 +298,7 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        time_column: str | None = None,
         compaction_target_file_size_bytes: int | None = None,
         compaction_type: str | None = None,
     ) -> TableConfig:
@@ -279,7 +312,7 @@ class TableConfig:
             _native.bifrost.TableConfig.from_json_schema(
                 table,
                 json.dumps(dict(schema)),
-                _layout_json(partition_granularity, sort_keys, bloom_columns),
+                _layout_json(partition_granularity, sort_keys, bloom_columns, time_column),
                 compaction_target_file_size_bytes,
                 compaction_type,
             )
@@ -292,13 +325,15 @@ class TableConfig:
         partition_granularity: str | None = None,
         sort_keys: list[SortKey] | None = None,
         bloom_columns: list[str] | None = None,
+        time_column: str | None = None,
         compaction_target_file_size_bytes: int | None = None,
         compaction_type: str | None = None,
     ) -> TableConfig:
         """Declare a table from an explicit ``pyarrow.Schema``.
 
         Use this for column types JSON Schema cannot express, such as
-        ``int32``, a non-UTC timestamp, or ``decimal128``. ``schema`` holds
+        ``int32`` or ``decimal128``. A Variant column is
+        a field carrying the ``arrow.parquet.variant`` extension. ``schema`` holds
         user columns only; every other argument and error is as for
         ``TableConfig()``.
         """
@@ -307,7 +342,7 @@ class TableConfig:
             _native.bifrost.TableConfig.from_arrow_ipc(
                 table,
                 schema.serialize().to_pybytes(),
-                _layout_json(partition_granularity, sort_keys, bloom_columns),
+                _layout_json(partition_granularity, sort_keys, bloom_columns, time_column),
                 compaction_target_file_size_bytes,
                 compaction_type,
             )
@@ -568,12 +603,12 @@ class _BifrostBase:
         Args:
             row: a Pydantic model instance, a mapping, or a JSON object string
                 holding the table's declared columns.
-            correlation: optional ``card_ref`` and ``run_id`` for this row.
+            correlation: optional ``card_uid`` and ``run_id`` for this row.
                 Omitted keys are stored as null.
 
         Raises:
             WyrdError: ``WYRD_SPEC_400_VALIDATION`` for an unparsable
-                ``card_ref``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
+                ``card_uid``; ``WYRD_VALA_412_NO_ACTIVE_TABLE`` when no table
                 is bound; ``WYRD_CLIENT_429_QUEUE_FULL`` when the producer
                 queue is full.
 
@@ -582,7 +617,7 @@ class _BifrostBase:
         correlation = correlation or {}
         self._native.insert(
             _row_json(row),
-            correlation.get("card_ref"),
+            correlation.get("card_uid"),
             correlation.get("run_id"),
         )
 
@@ -639,9 +674,9 @@ class Bifrost(_BifrostBase):
         The precision write door, beside ``insert``: it names its destination
         instead of using the active binding, carries correlation as ordinary
         columns, and is durable when it returns, so no ``flush`` follows it.
-        Build the batch against ``TableConfig.describe(...).arrow_schema``; a
-        canonical table compares an incoming block against its declared fields
-        exactly, metadata included.
+        Build the batch against ``TableConfig.describe(...).arrow_schema``.
+        Columns match the table's declared columns by name, in any order; the
+        server judges every column's type and refuses a stale declaration.
 
         Raises:
             WyrdError: the batch exceeded the byte envelope, or the server
@@ -893,8 +928,9 @@ class DataTypeSpecVariants(TypedDict, total=False):
     """The parameterized `DataTypeSpec` forms, tagged by their variant name.
 
     A scalar type is the bare variant name as a string; everything below carries
-    parameters, so it arrives as a single-key object. `List` and `Struct` hold
-    full field declarations, which is what makes the type recursive.
+    parameters, so it arrives as a single-key object. `List`, `Struct`, and
+    `Map` hold full field declarations, which is what makes the type recursive.
+    `Map` carries its non-nullable `key` and its `value` declarations.
     """
 
     FixedSizeBinary: dict[str, int]
@@ -904,6 +940,7 @@ class DataTypeSpecVariants(TypedDict, total=False):
     Decimal128: dict[str, int]
     List: FieldSpec
     Struct: list[FieldSpec]
+    Map: dict[str, FieldSpec]
 
 
 DataTypeSpec = str | DataTypeSpecVariants
@@ -913,8 +950,8 @@ DataTypeSpec = str | DataTypeSpecVariants
 class _FieldSpecOptional(TypedDict, total=False):
     """The described-column keys the server omits when they carry nothing.
 
-    `metadata` holds the stable field id under `PARQUET:field_id` and, for a
-    write-time correlation input, `wyrd:input_class`; an empty map is omitted.
+    `metadata` holds the stable field id under `PARQUET:field_id`; an empty
+    map is omitted.
     """
 
     metadata: dict[str, str]
@@ -952,11 +989,13 @@ class SortKey(TypedDict):
 class PhysicalLayout(TypedDict):
     """A table's server-resolved partitioning, sort order, and Bloom columns.
 
-    ``partition_granularity`` is ``"hour"`` or ``"day"`` on
-    ``wyrd_event_time``; ``bloom_columns`` begins with the managed columns.
+    ``partition_granularity`` is ``"hour"`` or ``"day"`` on ``time_column``,
+    which is ``wyrd_ingested_at`` unless the table declared its own;
+    ``bloom_columns`` begins with the managed columns.
     """
 
     partition_granularity: str
+    time_column: str
     sort_keys: list[SortKey]
     bloom_columns: list[str]
 
@@ -978,14 +1017,12 @@ class TableDescription(_TableDescriptionOptional):
     """Server projection of one registered table's stored physical schema.
 
     ``user_fields`` are the declared columns, ``correlation_fields`` the
-    write-time ``card_ref``/``run_id`` inputs, and ``managed_candidates`` the
-    managed columns a writer may supply itself.
+    write-time ``card_uid``/``run_id`` inputs.
     """
 
     entry: TableEntry
     user_fields: list[FieldSpec]
     correlation_fields: list[FieldSpec]
-    managed_candidates: list[FieldSpec]
     physical_layout: PhysicalLayout
 
 
@@ -1021,9 +1058,89 @@ def _validated_rows(result: QueryResult, model: type[_Row]) -> list[_Row]:
     The rows come from the Arrow table the result already decoded, so the keys
     ``model`` sees are exactly the columns the server returned. Validation is
     all-or-nothing: the first rejected row raises and no partial list escapes.
+    Variant cells, top level or nested in a Struct or List, arrive as their
+    native ``dict``, ``list``, or scalar value rather than as encoded bytes.
     """
 
-    return [model.model_validate(row) for row in result.to_arrow().to_pylist()]
+    table = result.to_arrow()
+    decode = result._native.variant_to_python
+    variant_columns = [field for field in table.schema if _holds_variant(field)]
+    timestamp_columns = [
+        (name, TIMESTAMP_TYPES[kind]) for name, kind in result._native.timestamp_kinds()
+    ]
+    rows = table.to_pylist()
+    for name, timestamp in timestamp_columns:
+        if timestamp is TimestampTZ:
+            for row, text in zip(rows, result._native.timestamp_tz_texts(name), strict=True):
+                row[name] = text
+    for row in rows:
+        for field in variant_columns:
+            row[field.name] = _native_value(field, row[field.name], decode)
+        for name, timestamp in timestamp_columns:
+            row[name] = _wyrd_timestamp(timestamp, row[name])
+    return [model.model_validate(row) for row in rows]
+
+
+def _wyrd_timestamp(
+    timestamp: type[TimestampNTZ] | type[TimestampLTZ] | type[TimestampTZ], value: Any
+) -> Any:
+    """Convert one top-level timestamp cell to its Wyrd timestamp type.
+
+    A ``TIMESTAMP_TZ`` cell arrives as the RFC 3339 text the native module
+    rendered in the writer's offset; the other two arrive as the ``datetime``
+    pyarrow produced. Every model field, Wyrd or ``datetime``, then validates a
+    Wyrd value.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    return timestamp.of(value)
+
+
+_VARIANT_EXTENSION = b"arrow.parquet.variant"
+
+
+def _is_variant(field: pyarrow.Field) -> bool:
+    """Whether ``field`` carries the Arrow Variant extension.
+
+    pyarrow either keeps the extension as field metadata or, when it knows the
+    type, as an extension type; both spellings name the same column.
+    """
+
+    name = getattr(field.type, "extension_name", None)
+    if name is not None:
+        return bool(name.encode() == _VARIANT_EXTENSION)
+    return (field.metadata or {}).get(b"ARROW:extension:name") == _VARIANT_EXTENSION
+
+
+def _holds_variant(field: pyarrow.Field) -> bool:
+    """Whether ``field`` is a Variant or nests one inside a Struct or List."""
+
+    if _is_variant(field):
+        return True
+    kind = field.type
+    if pyarrow.types.is_struct(kind):
+        return any(_holds_variant(kind.field(index)) for index in range(kind.num_fields))
+    if pyarrow.types.is_list(kind) or pyarrow.types.is_large_list(kind):
+        return _holds_variant(kind.value_field)
+    return False
+
+
+def _native_value(field: pyarrow.Field, value: Any, decode: Any) -> Any:
+    """Replace every Variant cell inside one ``to_pylist`` value with its
+    native Python value, leaving every other value as pyarrow produced it."""
+
+    if value is None or not _holds_variant(field):
+        return value
+    if _is_variant(field):
+        return decode(value["metadata"], value["value"])
+    kind = field.type
+    if pyarrow.types.is_struct(kind):
+        children = (kind.field(index) for index in range(kind.num_fields))
+        return {child.name: _native_value(child, value[child.name], decode) for child in children}
+    return [_native_value(kind.value_field, item, decode) for item in value]
 
 
 __all__ = [

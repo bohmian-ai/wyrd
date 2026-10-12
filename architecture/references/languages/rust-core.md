@@ -584,9 +584,9 @@ async code.
 
 Raw `sqlx::PgPool`, `Pool<Postgres>`, naked `PgConnection`, and caller-passed
 `Transaction<'_, Postgres>` values do not cross into library signatures or
-struct fields. Tenant-scoped behavior accepts `&mut TenantConn<'_>` under the
-non-bypass `wyrd_app` role; cross-tenant operator behavior accepts
-`&OperatorPool` under the explicit platform-admin role. Import these types
+struct fields. Tenant-scoped behavior accepts `&mut TenantConn<'_>`, bound by
+the `tenant_isolation` policy; cross-tenant operator behavior accepts
+`&OperatorPool`, the platform login's operator session. Import these types
 through the owning tier's re-exports.
 
 Postgres row-level security is the load-bearing tenant boundary. Do not add

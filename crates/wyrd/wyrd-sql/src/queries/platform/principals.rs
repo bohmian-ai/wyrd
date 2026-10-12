@@ -2,9 +2,8 @@
 //!
 //! Platform-scope principals are the deployment's administrative identities.
 //! They carry no tenant: the table has no tenant column, so a platform principal
-//! cannot be given one. Every function here takes the BYPASSRLS
-//! [`OperatorPool`], because `platform.*` sits outside the row-level-security
-//! tenant boundary by construction.
+//! cannot be given one. Every function here takes the [`OperatorPool`],
+//! because `platform.*` admits only operator sessions by construction.
 //!
 //! A principal is durable and outlives its credentials. Nothing in this module
 //! reads, writes, or is affected by credential state.

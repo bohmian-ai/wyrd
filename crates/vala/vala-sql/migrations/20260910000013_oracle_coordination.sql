@@ -20,11 +20,8 @@ ALTER TABLE vala.cluster_nodes FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.cluster_nodes
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-REVOKE SELECT, INSERT, UPDATE, DELETE ON vala.cluster_nodes FROM wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE, DELETE ON vala.cluster_nodes TO wyrd_app;
+CREATE POLICY operator_access ON vala.cluster_nodes TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- Oracle's cross-tenant catalog reconciliation authority is introduced with
 -- the coordination migration so the older OLAP migration remains checksum-stable.
-GRANT USAGE ON SCHEMA vala TO wyrd_platform_admin;
-GRANT SELECT ON vala.bifrost_tables TO wyrd_platform_admin;

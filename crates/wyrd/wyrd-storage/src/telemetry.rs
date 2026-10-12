@@ -431,7 +431,7 @@ mod tests {
 
     use metrics::{Counter, Gauge, Histogram, HistogramFn, Key, Metadata, Recorder};
     use opendal::raw::oio::{Delete as _, Write as _};
-    use opendal::raw::{OpDelete, oio};
+    use opendal::raw::{MaybeSend, OpDelete, oio};
     use opendal::{Buffer, EntryMode, Error, ErrorKind, Metadata as ObjectMetadata};
 
     use super::{
@@ -547,28 +547,28 @@ mod tests {
     }
 
     impl oio::Write for FaultWriter {
-        async fn write(&mut self, _: Buffer) -> opendal::Result<()> {
-            if self.write_fails {
+        fn write(&mut self, _: Buffer) -> impl Future<Output = opendal::Result<()>> + MaybeSend {
+            std::future::ready(if self.write_fails {
                 Err(test_error("write"))
             } else {
                 Ok(())
-            }
+            })
         }
 
-        async fn close(&mut self) -> opendal::Result<ObjectMetadata> {
-            if self.close_fails {
+        fn close(&mut self) -> impl Future<Output = opendal::Result<ObjectMetadata>> + MaybeSend {
+            std::future::ready(if self.close_fails {
                 Err(test_error("close"))
             } else {
                 Ok(ObjectMetadata::new(EntryMode::FILE))
-            }
+            })
         }
 
-        async fn abort(&mut self) -> opendal::Result<()> {
-            if self.abort_fails {
+        fn abort(&mut self) -> impl Future<Output = opendal::Result<()>> + MaybeSend {
+            std::future::ready(if self.abort_fails {
                 Err(test_error("abort"))
             } else {
                 Ok(())
-            }
+            })
         }
     }
 
@@ -579,20 +579,24 @@ mod tests {
     }
 
     impl oio::Delete for FaultDeleter {
-        async fn delete(&mut self, _: &str, _: OpDelete) -> opendal::Result<()> {
-            if self.delete_fails {
+        fn delete(
+            &mut self,
+            _: &str,
+            _: OpDelete,
+        ) -> impl Future<Output = opendal::Result<()>> + MaybeSend {
+            std::future::ready(if self.delete_fails {
                 Err(test_error("delete"))
             } else {
                 Ok(())
-            }
+            })
         }
 
-        async fn close(&mut self) -> opendal::Result<()> {
-            if self.close_fails {
+        fn close(&mut self) -> impl Future<Output = opendal::Result<()>> + MaybeSend {
+            std::future::ready(if self.close_fails {
                 Err(test_error("flush"))
             } else {
                 Ok(())
-            }
+            })
         }
     }
 

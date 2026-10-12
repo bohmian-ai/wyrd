@@ -1,10 +1,9 @@
-//! Card and Verification control-plane capabilities over MCP.
+//! Verification control-plane capabilities over MCP.
 //!
 //! Typed projections of the same server operations HTTP serves:
-//! `cards.get` reads a Card (including `card.status.verification`), and the
-//! four `verification.*` tools read binding and run status, request a manual
+//! The four `verification.*` tools read binding and run status, request a manual
 //! Drift run, and judge supplied input directly. Authorization, audit, tenancy, idempotency, and error
-//! mapping stay with [`VerificationControl`] and the Cards read path, so this
+//! mapping stay with [`VerificationControl`], so this
 //! module only parses arguments and projects answers. Queued verdicts are
 //! read with the existing `bifrost.query` tool by `result_id`; a direct
 //! execution returns its verdict.
@@ -14,10 +13,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use wyrd_runtime::permission::{Action, Resource};
-use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{BindingId, CardUid, IdempotencyKey, VerificationRunId};
-use wyrd_spec::registry::GetCardResponse;
+use wyrd_spec::ids::{BindingId, IdempotencyKey, VerificationRunId};
 use wyrd_spec::verification::{
     ExecuteVerificationRequest, Judgment, StartVerificationRunResponse, VerificationBindingStatus,
     VerificationRunInput, VerificationRunStatus, VerificationRunTarget,
@@ -26,11 +23,7 @@ use wyrd_spec::verification::{
 use super::principals::{parse_args, tool};
 use super::{WyrdMcpHandler, structured};
 use crate::components::auth::Caller;
-use crate::components::cards::routes::get_card_for;
 use crate::components::verification::service::{VerificationControl, decode_start_request};
-
-/// Wire name of the Card read.
-pub(super) const CARDS_GET: &str = "cards.get";
 
 /// Wire name of the binding status read.
 pub(super) const GET_BINDING: &str = "verification.get_binding";
@@ -43,16 +36,6 @@ pub(super) const GET_RUN: &str = "verification.get_run";
 
 /// Wire name of the direct execution.
 pub(super) const EXECUTE: &str = "verification.execute";
-
-/// Arguments of `cards.get`.
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct GetCardArgs {
-    /// Card kind namespace of the UID.
-    kind: CardKind,
-    /// Server-minted Card UID.
-    card_uid: CardUid,
-}
 
 /// Arguments of `verification.get_binding`.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -90,14 +73,6 @@ struct StartRunArgs {
 #[must_use]
 pub(super) fn descriptors_unscoped() -> Vec<Tool> {
     vec![
-        tool::<GetCardArgs, GetCardResponse>(
-            CARDS_GET,
-            "Read a Card",
-            "Read one Card in this caller's tenant by kind and Card UID. \
-             card.status.verification carries a Verifier's PSI/SPC baseline status and an owner \
-             Card's derived binding_ids. Requires cards:read.",
-            true,
-        ),
         tool::<GetBindingArgs, VerificationBindingStatus>(
             GET_BINDING,
             "Read a verification binding",
@@ -160,20 +135,6 @@ pub(super) fn may_start_runs(caller: &Caller) -> bool {
 }
 
 impl WyrdMcpHandler {
-    /// Read one Card by kind and UID.
-    ///
-    /// # Errors
-    /// Returns a Wyrd error when the arguments are invalid, the caller lacks
-    /// `cards:read`, the Card is absent, or the read fails.
-    pub(super) async fn mcp_get_card(
-        &self,
-        caller: Caller,
-        arguments: Option<JsonMap<String, JsonValue>>,
-    ) -> Result<CallToolResult, WyrdError> {
-        let args: GetCardArgs = parse_args(arguments, CARDS_GET)?;
-        structured(&get_card_for(&self.state, &caller, &args.kind, &args.card_uid).await?)
-    }
-
     /// Read one verification binding's status.
     ///
     /// # Errors

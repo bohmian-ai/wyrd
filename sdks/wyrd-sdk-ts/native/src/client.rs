@@ -31,7 +31,7 @@ pub struct NativeWyrdClientResult {
 
 impl NativeWyrdClientResult {
     /// Project one client outcome onto the closed result.
-    fn from_outcome(outcome: Result<WyrdClient, WyrdError>) -> Self {
+    pub(crate) fn from_outcome(outcome: Result<WyrdClient, WyrdError>) -> Self {
         match outcome {
             Ok(client) => Self {
                 client: Some(NativeWyrdClient { client }),

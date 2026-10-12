@@ -4,13 +4,13 @@ mod pg_tests {
     //! Skipped automatically when Wyrd database env vars are unset so the default
     //! test suite remains credential-free.
 
-    use sha2::Digest;
+    use secrecy::ExposeSecret;
     use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_sql::dsn::ResolvedDsns;
     use wyrd_sql::{MIGRATION_LEASE_WAIT, OperatorPool};
 
     /// Fresh Vala migrations apply repeatedly without schema drift and leave
-    /// the retired mutable `vala.drift_alerts` table and the retired audit
-    /// staging tables and immutability function absent.
+    /// the retired mutable `vala.drift_alerts` table absent.
     ///
     /// # Panics
     ///
@@ -18,13 +18,15 @@ mod pg_tests {
     /// retired relation or function still resolves after migrating.
     #[tokio::test]
     async fn vala_migrations_apply_and_are_idempotent() {
-        let Some(owner_url) = std::env::var("WYRD_TEST_DATABASE_ADMIN_URL").ok() else {
+        let Ok(dsns) = ResolvedDsns::from_env() else {
             return;
         };
-        let pool =
-            wyrd_sql::pool::build_pool(&owner_url, wyrd_sql::PoolConfig::migrator_defaults())
-                .await
-                .expect("owner pool");
+        let pool = wyrd_sql::pool::build_pool(
+            dsns.platform().expose_secret(),
+            wyrd_sql::PoolConfig::migrator_defaults(),
+        )
+        .await
+        .expect("platform pool");
 
         let mut lease = OperatorPool::from(pool.clone())
             .migration_lease(MIGRATION_LEASE_WAIT)
@@ -58,19 +60,6 @@ mod pg_tests {
         assert!(
             drift_alerts.0,
             "the retired vala.drift_alerts table is absent after vala migrate"
-        );
-        let audit_staging: (bool,) = sqlx::query_as(
-            "SELECT to_regclass('vala.audit_staging') IS NULL \
-                AND to_regclass('vala.audit_chain_head') IS NULL \
-                AND to_regclass('vala.audit_publication') IS NULL \
-                AND to_regprocedure('vala.audit_staging_immutable()') IS NULL",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("retired audit staging query succeeds");
-        assert!(
-            audit_staging.0,
-            "the retired audit staging tables and function are absent after vala migrate"
         );
     }
 
@@ -148,27 +137,5 @@ mod pg_tests {
         .await
         .expect("role count reads");
         assert_eq!(roles, 2);
-    }
-
-    /// The creating audit-staging migration still carries the bytes it shipped
-    /// with.
-    ///
-    /// SQLx records a checksum for every migration it applies and refuses to
-    /// open the pools when a recorded checksum no longer matches the file, so
-    /// editing an already-shipped migration takes every migrated deployment
-    /// down before it can serve. A fresh-database lane cannot see that: it has
-    /// no recorded checksum to disagree with. This pins the shipped digest so
-    /// an edit fails here instead of on an operator's upgrade.
-    #[test]
-    fn shipped_audit_staging_migration_is_immutable() {
-        let digest = sha2::Sha256::digest(
-            include_bytes!("../../migrations/20260802000000_vala_audit_staging.sql").as_slice(),
-        );
-        assert_eq!(
-            format!("{digest:x}"),
-            "ce869581019efb6689d9413efa77245f2381f464127e707458f4026178ca5d84",
-            "20260802000000_vala_audit_staging.sql changed; applied migrations are immutable, \
-             add a forward migration instead"
-        );
     }
 }

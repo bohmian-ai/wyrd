@@ -10153,7 +10153,7 @@
           "type": "string"
         },
         "schema": {
-          "description": "JSON Schema object describing the table's user fields."
+          "description": "JSON Schema object describing the table's user fields, whose `properties` order is the table's column order."
         }
       },
       "additionalProperties": false

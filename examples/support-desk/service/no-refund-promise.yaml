@@ -1,0 +1,19 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: no-refund-promise
+  version: 1.0.0
+  space: default
+spec:
+  description: The agent never promises a refund.
+  implementation:
+    kind: eval
+    spec:
+      pass_gate: {kind: all_pass}
+      tasks:
+        no_refund_promise:
+          kind: assertion
+          id: no_refund_promise
+          context_path: $.answer
+          operator: not_contains
+          expected: guaranteed refund

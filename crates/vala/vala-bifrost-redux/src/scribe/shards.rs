@@ -28,6 +28,7 @@ use crate::scribe::persistence::{
     PersistenceSubmitError,
 };
 use crate::scribe::preprocess::{AppendSliceId, PreparedAppend, PreparedSlice, PreparedSliceSet};
+use crate::scribe::profile::GroupStages;
 use crate::scribe::routing::shard_for;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, HotBatch};
@@ -902,26 +903,28 @@ pub(crate) struct ScribeShardStartConfig {
 }
 
 impl ScribeShardRuntime {
-    /// Returns every writable or pending immutable seal key for one tenant table.
+    /// Returns every live partition of one tenant table, per memtable source,
+    /// with the bytes `scope` reads from it.
     ///
     /// Reads each shard's memtable directly, as [`Self::snapshot`] does for
     /// rows. An owner inserts rows before it acknowledges them but republishes
     /// its inspection snapshot only afterwards, so discovery from published
     /// snapshots could omit the partition of an already acknowledged write.
-    /// Only `table`'s keys are collected; the caller deduplicates.
+    /// Only `table`'s sources are collected; the caller sums per partition.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] when a memtable lock is poisoned.
-    pub(crate) fn active_seal_keys_for_table(
+    pub(crate) fn active_live_bytes_for_table(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
-    ) -> Result<Vec<crate::scribe::seal_key::SealKey>, ScribeError> {
-        let mut keys = Vec::new();
+        scope: &crate::scan_sizing::ScanScope,
+    ) -> Result<Vec<(crate::catalog::layout::TimePartition, u64)>, ScribeError> {
+        let mut partitions = Vec::new();
         for memtable in &self.memtables {
-            keys.extend(memtable.seal_keys_for_table(tenant, table)?);
+            partitions.extend(memtable.live_bytes_for_table(tenant, table, scope)?);
         }
-        Ok(keys)
+        Ok(partitions)
     }
 
     /// Closes shard admission before any potentially stalled graceful wait.
@@ -1184,6 +1187,7 @@ impl ScribeShardRuntime {
                         partition_day: readable.partition_day,
                         generation: readable.generation,
                         rows: readable.batch,
+                        statistics: readable.statistics,
                     }),
             );
         }
@@ -3021,7 +3025,8 @@ struct GroupWalState {
     prepared: Vec<PreparedAppend>,
     /// Slices with WAL records ready for synchronization or insertion.
     durable: Vec<DurableSlice>,
-    /// WAL segments touched by this group.
+    /// WAL segments the group's SLICE records touched, until the group's one
+    /// sync takes them together with its COMMIT segments.
     touched: HashMap<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>,
     /// Rows accepted per original append batch.
     rows_by_append: HashMap<[u8; 16], u64>,
@@ -3063,23 +3068,29 @@ impl PostCommitInsertOwner {
 impl ShardOwner {
     /// Writes, syncs, inserts, rotates, and ACKs one bounded tenant-fair group.
     ///
+    /// Each append's write profile is charged its shard wait when the group
+    /// starts; each serial stage is timed once into [`GroupStages`] and charged
+    /// to every append the group acknowledges.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when WAL write/sync or memtable insertion fails;
     /// prepared ACK waiters receive the same completion error and reservations
     /// are released before the error returns.
     async fn process_group(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
+        for append in &group {
+            append.profile.shard_wait.add_elapsed(append.prepared_at);
+        }
         self.retry_retained_post_commit()?;
         self.rotate_before_append_if_needed(&group)?;
+        let stages = GroupStages::default();
+        let write = stages.write.timer();
         let mut state = self.write_group(group).await?;
-        if let Err(error) = self.sync_group(&state.touched).await {
-            if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
-                tracing::error!(error = %cleanup_error, "active cleanup failed after group sync error");
-            }
-            Self::notify_prepared_error(&mut state.prepared, &error);
-            return Err(error);
-        }
-        if let Err(error) = self.append_and_sync_batch_commits(&mut state).await {
+        write.done();
+        if let Err(error) = self
+            .append_and_sync_batch_commits(&mut state, &stages)
+            .await
+        {
             if self.memory_ownership.is_poisoned() {
                 debug_assert!(
                     self.retained_commit_ambiguity.is_none(),
@@ -3123,7 +3134,10 @@ impl ShardOwner {
             self.retained_commit_ambiguity = Some(post_commit.into_state());
             return Err(error);
         }
-        let touched_keys = match self.insert_committed_group(&mut post_commit.state) {
+        let insert = stages.insert.timer();
+        let inserted = self.insert_committed_group(&mut post_commit.state);
+        insert.done();
+        let touched_keys = match inserted {
             Ok(keys) => keys,
             Err(error) => {
                 self.memory_ownership.poison();
@@ -3134,7 +3148,7 @@ impl ShardOwner {
         };
         let state = post_commit.into_state();
         let _ = touched_keys;
-        Self::acknowledge_visible(state);
+        Self::acknowledge_visible(state, &stages);
         Ok(())
     }
 
@@ -3142,9 +3156,11 @@ impl ShardOwner {
     ///
     /// Each ACK carries the rows its batch accounted for and whether this group
     /// inserted that batch; a replay suppressed by the fence or the memtable
-    /// identity reports no first commit. Reservations drop with each append.
-    fn acknowledge_visible(state: GroupWalState) {
+    /// identity reports no first commit. Each append's write profile is
+    /// charged the group's `stages` first. Reservations drop with each append.
+    fn acknowledge_visible(state: GroupWalState, stages: &GroupStages) {
         for append in state.prepared {
+            append.profile.group.add(stages);
             if let Some(sender) = append.durable_ack {
                 let batch_id = append.batch_id.as_bytes();
                 let rows = state.rows_by_append.get(batch_id).copied().unwrap_or(0);
@@ -3172,12 +3188,16 @@ impl ShardOwner {
         let Some(mut state) = self.retained_commit_ambiguity.take() else {
             return Ok(());
         };
-        if let Err(error) = self.insert_committed_group(&mut state) {
+        let stages = GroupStages::default();
+        let insert = stages.insert.timer();
+        let inserted = self.insert_committed_group(&mut state);
+        insert.done();
+        if let Err(error) = inserted {
             self.memory_ownership.poison();
             self.retained_commit_ambiguity = Some(state);
             return Err(error);
         }
-        Self::acknowledge_visible(state);
+        Self::acknowledge_visible(state, &stages);
         Ok(())
     }
 
@@ -3530,13 +3550,17 @@ impl ShardOwner {
 
     /// Appends one v6 COMMIT record per complete batch, syncs once, then fences.
     ///
-    /// Each batch's SLICE records were fsynced before this method starts. Every
-    /// complete batch's COMMIT is appended first; one sync then covers the
-    /// distinct segments those records touched. Only after that sync does each
-    /// batch commit its own `PostgreSQL` identity fence, serially and in group
-    /// order, so no ACK path can run before its COMMIT is durable. A crash after
+    /// The group's SLICE records are written but not yet synced when this
+    /// method starts. Every complete batch's COMMIT is appended after them; one
+    /// sync then covers every segment the group's SLICE and COMMIT records
+    /// touched. Only after that sync does each batch commit its own `PostgreSQL`
+    /// identity fence, serially and in group order, so no ACK path can run
+    /// before its records are durable. A crash during the sync may persist any
+    /// subset of the group's blocks; replay ends the shard chain at the first
+    /// bad record, which the absent fences prove unacknowledged. A crash after
     /// the sync but before a fence leaves an unfenced COMMIT that replay and a
-    /// same-ID retry settle exactly once.
+    /// same-ID retry settle exactly once. The COMMIT appends accrue to
+    /// `stages.commit`, the sync to `stages.sync`, the fences to `stages.fence`.
     ///
     /// # Errors
     ///
@@ -3546,9 +3570,11 @@ impl ShardOwner {
     async fn append_and_sync_batch_commits(
         &mut self,
         state: &mut GroupWalState,
+        stages: &GroupStages,
     ) -> Result<(), ScribeError> {
+        let commit = stages.commit.timer();
         let mut commits = Vec::with_capacity(state.prepared.len());
-        let mut commit_segments = HashMap::new();
+        let mut group_segments = std::mem::take(&mut state.touched);
         for (index, append) in state.prepared.iter().enumerate() {
             let Some(identity) = Self::batch_commit_identity(state, append)? else {
                 continue;
@@ -3583,128 +3609,179 @@ impl ShardOwner {
                 .header()
                 .clone();
             for segment in result.touched_segments {
-                commit_segments.insert(segment.path().to_path_buf(), segment);
+                group_segments.insert(segment.path().to_path_buf(), segment);
             }
             commits.push((index, identity, header, result.lsn));
         }
-        self.sync_group(&commit_segments).await?;
+        commit.done();
+        let sync = stages.sync.timer();
+        self.sync_group(&group_segments).await?;
+        sync.done();
+        let _fence = stages.fence.timer();
         let Some(postgres) = self.control_postgres.clone() else {
             return Ok(());
         };
+        let mut fences =
+            Vec::<(DataTenantId, Vec<(usize, ScribeBatchCommit, DateTime<Utc>)>)>::new();
         for (index, identity, header, commit_lsn) in commits {
             let append = &state.prepared[index];
-            let first = &state.durable[identity.first_index];
-            let commit = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
-                tenant: append.tenant,
-                logical_table_fqn: append.table.fqn(),
-                batch_id: append.batch_id,
-                slice_set_digest: identity.logical_digest,
-                slice_count: i32::try_from(identity.slice_count).map_err(|_| {
-                    ScribeError::Internal {
-                        detail: "WAL v6 slice count exceeds SQL integer range".to_owned(),
-                    }
-                })?,
-                wal_node_id: uuid::Uuid::from_bytes(header.node_id),
-                wal_writer_epoch: header.writer_epoch,
-                wal_shard_id: i16::from(header.shard_id),
-                wal_segment_sequence: i64::try_from(header.seg_seq).map_err(|_| {
-                    ScribeError::Internal {
-                        detail: "WAL segment sequence exceeds SQL bigint range".to_owned(),
-                    }
-                })?,
-                wal_lsn_min: i64::try_from(first.lsn.as_u64()).map_err(|_| {
-                    ScribeError::Internal {
-                        detail: "WAL slice LSN exceeds SQL bigint range".to_owned(),
-                    }
-                })?,
-                wal_lsn_max: i64::try_from(commit_lsn.as_u64()).map_err(|_| {
-                    ScribeError::Internal {
-                        detail: "WAL commit LSN exceeds SQL bigint range".to_owned(),
-                    }
-                })?,
-                request_id: first.request_id,
-            };
-            let ingested_at = chrono::DateTime::from_timestamp_micros(append.ingested_at_micros)
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "Scribe admission instant exceeds the PostgreSQL range".to_owned(),
-                })?;
-            if self
-                .commit_batch_control_fence(&postgres, &commit, ingested_at)
-                .await?
+            let (commit, ingested_at) = Self::batch_commit_fence(
+                append,
+                &state.durable[identity.first_index],
+                &identity,
+                &header,
+                commit_lsn,
+            )?;
+            match fences
+                .iter_mut()
+                .find(|(tenant, _)| *tenant == append.tenant)
             {
-                tracing::debug!(
-                    tenant = %append.tenant,
-                    table = %append.table.fqn(),
-                    batch_id = %append.batch_id,
-                    "Scribe batch identity already committed; suppressing a second insertion"
-                );
-                state.spent_batch_ids.insert(*append.batch_id.as_bytes());
+                Some((_, batch)) => batch.push((index, commit, ingested_at)),
+                None => fences.push((append.tenant, vec![(index, commit, ingested_at)])),
+            }
+        }
+        for (tenant, batch) in fences {
+            let spent = self
+                .commit_batch_control_fences(&postgres, tenant, &batch)
+                .await?;
+            for ((index, _, _), already) in batch.iter().zip(spent) {
+                if already {
+                    let append = &state.prepared[*index];
+                    tracing::debug!(
+                        tenant = %append.tenant,
+                        table = %append.table.fqn(),
+                        batch_id = %append.batch_id,
+                        "Scribe batch identity already committed; suppressing a second insertion"
+                    );
+                    state.spent_batch_ids.insert(*append.batch_id.as_bytes());
+                }
             }
         }
         Ok(())
     }
 
-    /// Commits or durably reconciles one exact WAL batch-control fence.
+    /// Builds the durable batch-control fence for one synced batch COMMIT.
     ///
-    /// `ingested_at` is the batch's admission instant, the value stamped on
-    /// its rows as `wyrd_ingested_at`; the fence stores it unchanged.
-    ///
-    /// A `PostgreSQL` COMMIT error is always ambiguous. The method opens a fresh
-    /// tenant transaction and compares every durable identity field. An exact
-    /// row completes once; an absent row retries the identical insert. An unavailable or contradictory lookup poisons the shared
-    /// governor so [`Self::process_group`] retains the complete admitted owner
-    /// without ACK or cleanup.
+    /// The fence carries the batch's logical identity, the WAL coordinates
+    /// from its first durable slice to its COMMIT record, and its admission
+    /// instant, which the fence stores unchanged as `ingested_at`. It reads
+    /// its inputs only.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] for a known pre-COMMIT SQL failure or when exact
-    /// durable reconciliation is unavailable or contradictory. The latter
-    /// failures poison admission and retain the group until restart.
-    async fn commit_batch_control_fence(
+    /// Returns [`ScribeError::Internal`] when a count, sequence, or LSN
+    /// exceeds its SQL integer range, or the admission instant leaves the
+    /// `PostgreSQL` timestamp range.
+    fn batch_commit_fence(
+        append: &PreparedAppend,
+        first: &DurableSlice,
+        identity: &BatchCommitIdentity,
+        header: &crate::scribe::wal::SegmentHeader,
+        commit_lsn: crate::scribe::wal::WalLsn,
+    ) -> Result<(ScribeBatchCommit, DateTime<Utc>), ScribeError> {
+        let commit = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+            tenant: append.tenant,
+            logical_table_fqn: append.table.fqn(),
+            batch_id: append.batch_id,
+            slice_set_digest: identity.logical_digest,
+            slice_count: i32::try_from(identity.slice_count).map_err(|_| {
+                ScribeError::Internal {
+                    detail: "WAL v6 slice count exceeds SQL integer range".to_owned(),
+                }
+            })?,
+            wal_node_id: uuid::Uuid::from_bytes(header.node_id),
+            wal_writer_epoch: header.writer_epoch,
+            wal_shard_id: i16::from(header.shard_id),
+            wal_segment_sequence: i64::try_from(header.seg_seq).map_err(|_| {
+                ScribeError::Internal {
+                    detail: "WAL segment sequence exceeds SQL bigint range".to_owned(),
+                }
+            })?,
+            wal_lsn_min: i64::try_from(first.lsn.as_u64()).map_err(|_| ScribeError::Internal {
+                detail: "WAL slice LSN exceeds SQL bigint range".to_owned(),
+            })?,
+            wal_lsn_max: i64::try_from(commit_lsn.as_u64()).map_err(|_| ScribeError::Internal {
+                detail: "WAL commit LSN exceeds SQL bigint range".to_owned(),
+            })?,
+            request_id: first.request_id,
+        };
+        let ingested_at = chrono::DateTime::from_timestamp_micros(append.ingested_at_micros)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "Scribe admission instant exceeds the PostgreSQL range".to_owned(),
+            })?;
+        Ok((commit, ingested_at))
+    }
+
+    /// Commits or durably reconciles one tenant's WAL batch-control fences
+    /// from one group commit in a single `PostgreSQL` transaction.
+    ///
+    /// Every fence in `batch` belongs to `tenant`. Each is recorded in the
+    /// same tenant transaction, so the group pays one COMMIT instead of one
+    /// per batch. `ingested_at` is each batch's admission instant, the value
+    /// stamped on its rows as `wyrd_ingested_at`; the fence stores it
+    /// unchanged. The result holds, per fence and in order, whether the batch
+    /// was already committed by an earlier attempt and must not become
+    /// visible again.
+    ///
+    /// A `PostgreSQL` COMMIT error is always ambiguous. The method then opens
+    /// a fresh tenant transaction and resolves every fence by comparing its
+    /// durable identity fields. When every fence resolves, the result is
+    /// returned; when any is absent, the method retries the identical inserts,
+    /// which reclassify the fences that did land. An unavailable or
+    /// contradictory lookup poisons the shared governor so
+    /// [`Self::process_group`] retains the complete admitted owner without ACK
+    /// or cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] for a known pre-COMMIT SQL failure, which
+    /// commits none of the fences, or when exact durable reconciliation is
+    /// unavailable or contradictory. The latter failures poison admission and
+    /// retain the group until restart.
+    async fn commit_batch_control_fences(
         &self,
         postgres: &ValaPostgres,
-        commit: &ScribeBatchCommit,
-        ingested_at: DateTime<Utc>,
-    ) -> Result<bool, ScribeError> {
+        tenant: DataTenantId,
+        batch: &[(usize, ScribeBatchCommit, DateTime<Utc>)],
+    ) -> Result<Vec<bool>, ScribeError> {
+        use vala_sql::queries::scribe_batch_commits::{
+            ScribeBatchCommitResolution, record, resolve,
+        };
         loop {
-            let mut conn = postgres.tenant_conn(commit.tenant).await?;
-            let recorded =
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit, ingested_at)
-                    .await?;
-            if conn.commit().await.is_ok() {
-                return Ok(matches!(
+            let mut conn = postgres.tenant_conn(tenant).await?;
+            let mut spent = Vec::with_capacity(batch.len());
+            for (_, commit, ingested_at) in batch {
+                let recorded = record(&mut conn, commit, *ingested_at).await?;
+                spent.push(matches!(
                     recorded,
-                    vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::AlreadyCommitted
+                    ScribeBatchCommitResolution::AlreadyCommitted
                 ));
             }
+            if conn.commit().await.is_ok() {
+                return Ok(spent);
+            }
 
-            let mut reconciliation = match postgres.tenant_conn(commit.tenant).await {
+            let mut reconciliation = match postgres.tenant_conn(tenant).await {
                 Ok(conn) => conn,
                 Err(error) => {
                     self.memory_ownership.poison();
                     return Err(error.into());
                 }
             };
-            match vala_sql::queries::scribe_batch_commits::resolve(&mut reconciliation, commit)
-                .await
-            {
-                Ok(
-                    vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Committed,
-                ) => {
-                    return Ok(false);
+            let mut resolved = Vec::with_capacity(batch.len());
+            for (_, commit, _) in batch {
+                match resolve(&mut reconciliation, commit).await {
+                    Ok(ScribeBatchCommitResolution::Committed) => resolved.push(false),
+                    Ok(ScribeBatchCommitResolution::AlreadyCommitted) => resolved.push(true),
+                    Ok(ScribeBatchCommitResolution::Absent) => break,
+                    Err(error) => {
+                        self.memory_ownership.poison();
+                        return Err(error.into());
+                    }
                 }
-                Ok(
-                    vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::AlreadyCommitted,
-                ) => {
-                    return Ok(true);
-                }
-                Ok(
-                    vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Absent,
-                ) => {}
-                Err(error) => {
-                    self.memory_ownership.poison();
-                    return Err(error.into());
-                }
+            }
+            if resolved.len() == batch.len() {
+                return Ok(resolved);
             }
         }
     }
@@ -4045,7 +4122,9 @@ impl ShardOwner {
     /// Inserts one post-fence slice and transfers its active owner to memtable.
     ///
     /// Counts the slice's rows in `bifrost_scribe_memtable_rows_inserted_total`
-    /// only after the memtable accepted them; a spent-batch replay is settled
+    /// and its charged Arrow bytes in
+    /// `bifrost_scribe_memtable_bytes_inserted_total` only after the memtable
+    /// accepted them; a spent-batch replay is settled
     /// by [`Self::discard_already_committed_slice`] and adds nothing.
     ///
     /// # Errors
@@ -4091,6 +4170,8 @@ impl ShardOwner {
             })?;
         metrics::counter!("bifrost_scribe_memtable_rows_inserted_total")
             .increment(u64::try_from(row_count).unwrap_or(u64::MAX));
+        metrics::counter!("bifrost_scribe_memtable_bytes_inserted_total")
+            .increment(u64::try_from(slice.memtable_bytes).unwrap_or(u64::MAX));
         self.active_json_bytes = self.active_json_bytes.saturating_add(payload_len);
         touched_keys.insert(slice.seal_key.clone());
         self.synced_not_inserted.remove(&AppendSliceId {
@@ -4944,9 +5025,9 @@ mod tests {
     #[tokio::test]
     async fn replay_insert_adoption_failure_rolls_back_identity_and_immutable() {
         let owner_resources =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let foreign_resources =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let ownership =
             crate::scribe::memory::ScribeOwnership::new(&owner_resources).expect("shard ownership");
         let owner_baseline = owner_resources.snapshot().expect("owner baseline");
@@ -5110,7 +5191,7 @@ mod tests {
     #[tokio::test]
     async fn replay_chunk_serializes_identity_across_multiple_states() {
         let resources =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let identity = resources
             .try_reserve_maintenance(MemoryCategory::Decode, 64)
             .expect("identity lease");
@@ -5835,12 +5916,6 @@ mod tests {
         assert!(!is_expected_wal_capacity(&ScribeError::Internal {
             detail: "unexpected failure".to_owned(),
         }));
-        assert!(!is_expected_wal_capacity(
-            &ScribeError::ObjectStorePutFailed(opendal::Error::new(
-                opendal::ErrorKind::Unexpected,
-                "object failure"
-            ),)
-        ));
     }
 
     #[derive(Debug)]
@@ -6124,7 +6199,7 @@ mod tests {
             Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int64, false),
                 Field::new(
-                    "wyrd_event_time",
+                    "event_time",
                     DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                     false,
                 ),
@@ -6201,7 +6276,7 @@ mod tests {
         let completion_tx = command_tx.clone();
         let (pressure_tx, pressure_receiver) = watch::channel(None);
         let budget =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let _ = wal;
         let owner = ShardOwner {
             id: 0,
@@ -6297,7 +6372,7 @@ mod tests {
             .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
             .expect("seal second generation");
 
-        let immutable = owner.memtable.immutable.lock().expect("immutable lock");
+        let immutable = owner.memtable.immutable.write().expect("immutable lock");
         let generations = immutable.get(&key).expect("whole generation");
         assert_eq!(generations.len(), 1);
         assert!(
@@ -6455,15 +6530,19 @@ mod tests {
                 batch_id,
                 request_id: uuid::Uuid::now_v7(),
                 ingested_at_micros: 0,
-                rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
+                rows: crate::scribe::preprocess::AdmittedRows::Projected(
+                    owner_prepared_batch(),
+                    None,
+                ),
                 measured_wire_bytes: initial_bytes,
                 reservation,
                 memory,
                 tenant: key.tenant,
                 table: key.table,
-                partition_granularity: key.partition.granularity(),
+                time_axis: crate::catalog::TimeAxis::new("event_time", key.partition.granularity()),
                 queued_at: std::time::Instant::now(),
                 durable_ack: None,
+                profile: Arc::default(),
             })
             .expect("prepared append");
         let prepared_bytes = prepared.prepared_bytes;
@@ -6533,6 +6612,7 @@ mod tests {
             shard_senders,
             memory: budget.clone(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            fences: None,
         });
         tokio::pin!(replay);
         let replayed = loop {
@@ -6896,16 +6976,16 @@ mod tests {
         assert!(!owner.memory_ownership.is_poisoned());
     }
 
-    /// One multi-batch group submits exactly one SLICE sync and one COMMIT sync.
+    /// One multi-batch group submits exactly one sync.
     ///
-    /// Every batch's COMMIT record is appended before the single distinct-
-    /// segment sync, so the WAL lane sees two sync submissions per group no
-    /// matter how many complete batches the group carries.
+    /// Every batch's SLICE and COMMIT records are appended before the single
+    /// distinct-segment sync, so the WAL lane sees one sync submission per
+    /// group no matter how many complete batches the group carries.
     ///
     /// # Panics
     ///
     /// Panics if the isolated owner cannot be built, the group fails, or the
-    /// WAL lane observes any sync count other than one per record kind.
+    /// WAL lane observes any sync count other than one.
     #[tokio::test]
     async fn group_commit_syncs_once() {
         let wal_root = tempfile::tempdir().expect("WAL directory");
@@ -6929,7 +7009,7 @@ mod tests {
 
         owner.process_group(group).await.expect("group commits");
 
-        assert_eq!(owner.wal_io.sync_submissions_for_test(), 2);
+        assert_eq!(owner.wal_io.sync_submissions_for_test(), 1);
     }
 
     /// A batch resent while its original is still queued commits once.
@@ -7011,8 +7091,9 @@ mod tests {
     /// A crash after the group COMMIT sync but before the last fence replays once.
     ///
     /// An uncommitted row holds the third batch's fence key, so the real owner
-    /// syncs all three COMMIT records, commits two fences, and blocks inside the
-    /// third. Dropping the owner there is the crash: no ACK was delivered. A
+    /// syncs all three COMMIT records and blocks inside the group's one fence
+    /// transaction. Dropping the owner there is the crash: no ACK was delivered
+    /// and, because the group's fences commit together, none is durable. A
     /// next-epoch owner replays the same WAL against `PostgreSQL`, and a retry
     /// of the same IDs acknowledges every batch without a second row.
     ///
@@ -7106,7 +7187,7 @@ mod tests {
         .fetch_all(&superuser)
         .await
         .expect("fence rows");
-        assert_eq!(fenced, batch_ids[..2].to_vec());
+        assert!(fenced.is_empty(), "a group's fences commit atomically");
 
         let (mut owner, budget, command_tx, wal, stream) = open_owner(2);
         replay_into_owner(&mut owner, &wal, stream, command_tx, &budget).await;

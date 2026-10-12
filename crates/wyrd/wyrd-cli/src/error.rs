@@ -6,6 +6,20 @@ use wyrd_error_derive::WyrdError;
 /// Errors raised by the `wyrd` binary.
 #[derive(Debug, Error, WyrdError)]
 pub enum WyrdCliError {
+    /// Local startup failed after zero or more committed server-owned stages.
+    #[error("local server {stage} failed: {recovery}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_503_SERVER_DEV",
+        status = 503,
+        title = "Local server setup failed",
+        remediation = "Follow the stage's recovery guidance and rerun with the same tenant and configuration directory; active tenant credentials are never reissued."
+    )]
+    ServerDev {
+        /// Failed lifecycle stage, never a URL or credential.
+        stage: &'static str,
+        /// Static recovery guidance that identifies retained partial state.
+        recovery: &'static str,
+    },
     /// Required Oracle client configuration was not supplied.
     #[error("query configuration is missing {field}")]
     #[wyrd_error(
@@ -291,6 +305,107 @@ pub enum WyrdCliError {
         remediation = "Pass --uid, or pass --kind, --space, --name, and --version."
     )]
     DeleteSelectorRequiresExact,
+
+    /// This host's OS and CPU have no official Wyrd server bundle.
+    #[error("no official wyrd-server bundle for {os}/{arch}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_SERVER_HOST_UNSUPPORTED",
+        status = 400,
+        title = "Server host unsupported",
+        remediation = "Run the server on macOS or Linux (glibc) on x86_64 or aarch64, or use the official container image."
+    )]
+    ServerHostUnsupported {
+        /// Detected operating system.
+        os: &'static str,
+        /// Detected CPU architecture.
+        arch: &'static str,
+    },
+
+    /// No stable release, or no bundle for this host, could be fetched.
+    #[error("server release unavailable: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_503_SERVER_RELEASE_UNAVAILABLE",
+        status = 503,
+        title = "Server release unavailable",
+        remediation = "Check network access to github.com, then retry; the current installation is unchanged."
+    )]
+    ServerReleaseUnavailable {
+        /// What could not be fetched.
+        detail: String,
+    },
+
+    /// A downloaded release failed signature, digest, or extraction checks.
+    #[error("server release failed verification: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_422_SERVER_RELEASE_UNVERIFIED",
+        status = 422,
+        title = "Server release unverified",
+        remediation = "Retry the install; if it fails again, report the release. The current installation is unchanged."
+    )]
+    ServerReleaseUnverified {
+        /// Which check failed.
+        detail: String,
+    },
+
+    /// The newest server release does not share this CLI's compatible version line.
+    #[error("wyrd CLI {cli} cannot run wyrd-server {server}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_409_SERVER_VERSION_INCOMPATIBLE",
+        status = 409,
+        title = "Server version incompatible",
+        remediation = "Upgrade the wyrd CLI to the server's version line (pip install -U wyrd, or npm install @wyrd/sdk@latest), then retry."
+    )]
+    ServerVersionIncompatible {
+        /// This CLI's version.
+        cli: semver::Version,
+        /// The server release's version.
+        server: semver::Version,
+    },
+
+    /// `wyrd mcp install` had no host to configure.
+    ///
+    /// A non-interactive run never selects a host implicitly, and an
+    /// interactive run needs at least one detected host to offer.
+    #[error("MCP host selection required: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_MCP_HOST_SELECTION",
+        status = 400,
+        title = "MCP host selection required",
+        remediation = "Pass --host for each host to connect (codex, claude-code, copilot-cli, vscode, cursor, pi, hermes); install and open the host first if none is detected."
+    )]
+    McpHostSelection {
+        /// Which hosts were detected, or that none was.
+        detail: String,
+    },
+
+    /// One or more selected MCP hosts could not be connected.
+    ///
+    /// Each host's reason is printed on its own line; the failed hosts' files
+    /// are unchanged and every other selected host was installed.
+    #[error("MCP host installation failed for {hosts}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_409_MCP_HOST_INSTALL",
+        status = 409,
+        title = "MCP host installation failed",
+        remediation = "Fix the problem reported for each failed host, then rerun; hosts reported as added, updated, or unchanged are already connected."
+    )]
+    McpHostInstall {
+        /// Names of the hosts that failed.
+        hosts: String,
+    },
+
+    /// `wyrd mcp proxy` could not establish the host or Wyrd MCP session.
+    #[error("MCP proxy failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_503_MCP_PROXY",
+        status = 503,
+        title = "MCP proxy failed",
+        remediation = "Check that the Wyrd server URL is reachable and serves /mcp, and that the host launches `wyrd mcp proxy` over stdio, then reconnect the host."
+    )]
+    McpProxy {
+        /// Which session failed and why, without credential values.
+        detail: String,
+    },
 }
 
 impl WyrdCliError {
@@ -332,9 +447,10 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             WyrdCliError::ClientConfig { .. } => {
                 WyrdError::ClientConfigInvalid { message, details }
             }
-            WyrdCliError::ClientTransport { .. } => {
-                WyrdError::ClientTransportDown { message, details }
-            }
+            WyrdCliError::ClientTransport { .. }
+            | WyrdCliError::ServerDev { .. }
+            | WyrdCliError::ServerReleaseUnavailable { .. }
+            | WyrdCliError::McpProxy { .. } => WyrdError::ClientTransportDown { message, details },
             WyrdCliError::CardLoad(error) => WyrdError::from(error),
             WyrdCliError::InvalidArgument { field, .. } => WyrdError::Validation {
                 message,
@@ -348,14 +464,17 @@ impl From<WyrdCliError> for wyrd_spec::error::WyrdError {
             | WyrdCliError::RecordsParse { .. }
             | WyrdCliError::Parse { .. }
             | WyrdCliError::EvalSpecInvalid { .. }
-            | WyrdCliError::DeleteSelectorRequiresExact => {
-                WyrdError::Validation { message, details }
-            }
+            | WyrdCliError::DeleteSelectorRequiresExact
+            | WyrdCliError::ServerHostUnsupported { .. }
+            | WyrdCliError::ServerVersionIncompatible { .. }
+            | WyrdCliError::McpHostSelection { .. } => WyrdError::Validation { message, details },
             WyrdCliError::Query { .. }
             | WyrdCliError::Io { .. }
             | WyrdCliError::EvalEngine { .. }
             | WyrdCliError::Orchestrator { .. }
-            | WyrdCliError::Output { .. } => WyrdError::Internal { message, details },
+            | WyrdCliError::Output { .. }
+            | WyrdCliError::ServerReleaseUnverified { .. }
+            | WyrdCliError::McpHostInstall { .. } => WyrdError::Internal { message, details },
         }
     }
 }

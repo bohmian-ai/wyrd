@@ -4,5 +4,9 @@
 
 CREATE SCHEMA IF NOT EXISTS vala;
 
--- Serving boot proves the applied migrations match its binary.
-GRANT SELECT ON TABLE vala._sqlx_migrations TO wyrd_app, wyrd_platform_admin;
+-- The ledger is a table like any other: only operator sessions, which the
+-- migration runs as, may read or write it.
+ALTER TABLE vala._sqlx_migrations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala._sqlx_migrations FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON vala._sqlx_migrations TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

@@ -2,8 +2,8 @@
 --
 -- A deployment may let its platform administrators sign in individually instead
 -- of sharing the one global credential. Three objects carry that, and all three
--- sit in `platform.*` outside row-level security, because a platform principal
--- has no tenant to key an RLS policy by.
+-- sit in `platform.*`, where only operator sessions pass row-level security,
+-- because a platform principal has no tenant to key a tenant policy by.
 --
 -- The connection is deliberately singular. A tenant may trust many issuers; the
 -- platform plane trusts at most one, so the entry point selects the connection
@@ -100,13 +100,22 @@ CREATE UNIQUE INDEX platform_principal_identities_match_claim
     ON platform.principal_identities (issuer, match_claim) WHERE subject IS NULL;
 
 -- ---------------------------------------------------------------------------
--- Privileges
+-- Row-level security
 -- ---------------------------------------------------------------------------
--- Only the BYPASSRLS operator role reaches the platform plane. `wyrd_app` is
--- never granted here: that is what makes "no tenant-plane path confers platform
--- authority" a property of the database rather than of the server code.
-GRANT SELECT, INSERT, UPDATE, DELETE
-    ON platform.oidc_connection,
-       platform.login_state,
-       platform.principal_identities
-    TO wyrd_platform_admin;
+-- Only operator sessions reach the platform plane. No tenant policy exists
+-- here: that is what makes "no tenant-plane path confers platform authority"
+-- a property of the database rather than of the server code.
+ALTER TABLE platform.oidc_connection ENABLE ROW LEVEL SECURITY;
+ALTER TABLE platform.oidc_connection FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON platform.oidc_connection TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
+
+ALTER TABLE platform.login_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE platform.login_state FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON platform.login_state TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
+
+ALTER TABLE platform.principal_identities ENABLE ROW LEVEL SECURITY;
+ALTER TABLE platform.principal_identities FORCE ROW LEVEL SECURITY;
+CREATE POLICY operator_access ON platform.principal_identities TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

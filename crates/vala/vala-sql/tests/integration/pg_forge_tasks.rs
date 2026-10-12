@@ -30,9 +30,7 @@ mod pg_tests {
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::Conflict`] when an Oracle read still holds
-    /// the table, so no authority exists, and otherwise the preparation's own
-    /// result.
+    /// Returns the authority's or the preparation's own error.
     async fn prepare_exclusively(
         app: &PgPool,
         tasks: &ForgeTasks,
@@ -49,10 +47,7 @@ mod pg_tests {
         };
         let exclusive = BifrostTableMaintenanceAuthority::new(&mut conn)
             .exclusive(identity)
-            .await?
-            .ok_or_else(|| SqlError::Conflict {
-                detail: "an Oracle query is still reading this table".to_owned(),
-            })?;
+            .await?;
         let prepared = tasks
             .prepare_expired_cleanup_candidate(tenant, &exclusive, request)
             .await;
@@ -456,7 +451,14 @@ mod pg_tests {
         .await
         .expect("committed cancellation state");
         assert_eq!(terminal, ("cancelled".to_owned(), None, None));
-        assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 0);
+        assert_eq!(
+            tasks
+                .reclaim_expired_attempts(10)
+                .await
+                .expect("reclaim")
+                .len(),
+            0
+        );
     }
 
     /// Claims and starts one task with a caller-selected watermark.
@@ -600,7 +602,14 @@ mod pg_tests {
                 .is_err(),
             "expired claim cannot be revived by heartbeat"
         );
-        assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 1);
+        assert_eq!(
+            tasks
+                .reclaim_expired_attempts(10)
+                .await
+                .expect("reclaim")
+                .len(),
+            1
+        );
         let successor = Uuid::now_v7();
         let second = tasks
             .claim_fair(successor, claim_limits, None)
@@ -1363,17 +1372,6 @@ mod pg_tests {
                 .is_empty()
         );
         conn_b.commit().await.expect("commit b");
-        let grants:Vec<(String,String)>=sqlx::query_as("SELECT grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name='forge_tasks'").fetch_all(&admin).await.expect("grants");
-        assert!(grants.iter().any(|v| v.0 == "wyrd_app" && v.1 == "SELECT"));
-        assert!(
-            !grants.iter().any(|v| v.0 == "wyrd_app" && v.1 == "INSERT"),
-            "tenant role cannot bypass operator-owned enqueue"
-        );
-        assert!(
-            grants
-                .iter()
-                .any(|v| v.0 == "wyrd_platform_admin" && v.1 == "UPDATE")
-        );
         let invalid_id = tasks
             .enqueue(&task(tenant, "invalid-tenant", 9))
             .await
@@ -1654,17 +1652,12 @@ mod pg_tests {
         }
     }
 
-    /// Seeds the registered table, its maintenance-authority row, and one live
-    /// lease so fenced cleanup transitions have every durable root they check.
+    /// Seeds the registered table and its maintenance-authority row so fenced
+    /// cleanup transitions have every durable root they check.
     ///
     /// # Panics
     /// Panics when any seeding statement fails.
-    async fn seed_cleanup_roots(
-        superuser: &PgPool,
-        tenant: DataTenantId,
-        authority: &ForgeExpirationAuthority,
-        table: &ForgeClaimTable,
-    ) {
+    async fn seed_cleanup_roots(superuser: &PgPool, tenant: DataTenantId, table: &ForgeClaimTable) {
         sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout) VALUES ($1,$2,'vala.bifrost.cleanup',decode(repeat('00',32),'hex'),'{}'::jsonb)")
             .bind(tenant.as_uuid())
             .bind(table.table_uid.as_slice())
@@ -1680,13 +1673,6 @@ mod pg_tests {
             .execute(superuser)
             .await
             .expect("seed maintenance authority");
-        sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
-            .bind(&authority.lease_key)
-            .bind(authority.worker_id)
-            .bind(authority.lease_fencing_token)
-            .execute(superuser)
-            .await
-            .expect("seed lease");
     }
 
     /// Inserts one old succeeded snapshot-expiration source carrying candidates.
@@ -2004,10 +1990,8 @@ mod pg_tests {
             task_id: cleanup_id,
             attempt_id: Uuid::now_v7(),
             worker_id: Uuid::now_v7(),
-            lease_key: "forge:table:cleanup".to_owned(),
-            lease_fencing_token: 7,
         };
-        seed_cleanup_roots(&admin, tenant, &authority, &table).await;
+        seed_cleanup_roots(&admin, tenant, &table).await;
         sqlx::query("UPDATE vala.forge_tasks SET state='running',attempt_id=$2,claimed_by=$3,claim_expires_at=now()+interval '10 minutes',watermark_snapshot_id=4242,watermark_timestamp_ms=1 WHERE task_id=$1")
             .bind(cleanup_id)
             .bind(authority.attempt_id)
@@ -2015,48 +1999,6 @@ mod pg_tests {
             .execute(&admin)
             .await
             .expect("claim cleanup task");
-
-        // An active Oracle read on the table refuses candidate preparation
-        // under the table's maintenance authority until the read releases.
-        let reader = Uuid::now_v7();
-        sqlx::query("INSERT INTO vala.oracle_active_table_reads (data_tenant_id,query_id,table_uid,catalog_name,namespace_name,table_name,node_id,fencing_token,acquired_at,abandon_after) VALUES ($1,$2,$3,$4,$5,$6,$7,1,now(),now()+interval '6 hours')")
-            .bind(tenant.as_uuid())
-            .bind(reader)
-            .bind(table.table_uid.as_slice())
-            .bind(&table.catalog_name)
-            .bind(&table.namespace_name)
-            .bind(&table.table_name)
-            .bind(Uuid::now_v7())
-            .execute(&admin)
-            .await
-            .expect("seed an active table read");
-        assert!(
-            matches!(
-                prepare_exclusively(
-                    fixture.app_pool(),
-                    &tasks,
-                    tenant,
-                    ExpiredCleanupCandidateRequest {
-                        authority: &authority,
-                        table: &table,
-                        index: 0,
-                        candidate: &candidates[0]
-                    },
-                )
-                .await,
-                Err(SqlError::Conflict { .. })
-            ),
-            "an active table read refuses cleanup preparation"
-        );
-        assert!(
-            evidence_of(&admin, cleanup_id).await.is_none(),
-            "the refused preparation wrote no evidence"
-        );
-        sqlx::query("DELETE FROM vala.oracle_active_table_reads WHERE query_id=$1")
-            .bind(reader)
-            .execute(&admin)
-            .await
-            .expect("release the active table read");
 
         let index = 0_u32;
         assert_eq!(
@@ -2523,7 +2465,6 @@ mod pg_tests {
             .await
             .expect("orphan cleanup enqueue");
         let owner = Uuid::now_v7();
-        let fence = 1_i64;
         let table = ForgeClaimTable {
             table_uid: [7_u8; 16],
             catalog_name: "wyrd-redux".to_owned(),
@@ -2580,16 +2521,7 @@ mod pg_tests {
             task_id: id,
             attempt_id: attempt,
             worker_id: owner,
-            lease_key: format!("forge:table:{tenant}:vala.bifrost.orphan"),
-            lease_fencing_token: fence,
         };
-        sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
-            .bind(&authority.lease_key)
-            .bind(authority.worker_id)
-            .bind(authority.lease_fencing_token)
-            .execute(&admin)
-            .await
-            .expect("seed lease");
 
         // The cursor records traversal only, and only inside this task's own
         // prefix. A sibling table's key, a traversal segment, and the prefix
@@ -2654,13 +2586,6 @@ mod pg_tests {
                 },
                 "a foreign owner never held this claim",
             ),
-            (
-                ForgeExpirationAuthority {
-                    lease_fencing_token: fence + 1,
-                    ..authority.clone()
-                },
-                "a stale fence has lost table authority",
-            ),
         ] {
             assert!(
                 tasks
@@ -2690,6 +2615,28 @@ mod pg_tests {
                 .is_err(),
             "a cross-table checkpoint cannot reach this task"
         );
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
+            .bind(id)
+            .execute(&admin)
+            .await
+            .expect("lapse orphan claim");
+        assert!(
+            tasks
+                .checkpoint_orphan_cleanup_cursor(
+                    tenant,
+                    &authority,
+                    &table,
+                    &format!("{prefix}/zzz/object.parquet")
+                )
+                .await
+                .is_err(),
+            "a lapsed claim has lost table authority"
+        );
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()+interval '10 minutes' WHERE task_id=$1")
+            .bind(id)
+            .execute(&admin)
+            .await
+            .expect("restore orphan claim");
         assert_eq!(
             raw_evidence(&admin, id).await.expect("cursor evidence"),
             serde_json::json!({"version": 1, "start_after": first_key}),

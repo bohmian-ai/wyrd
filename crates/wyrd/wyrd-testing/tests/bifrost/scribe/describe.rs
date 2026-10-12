@@ -10,14 +10,13 @@ use super::support::{start_scribe_server, unique_table};
 ///
 /// For a canonical signal table the description's projected Arrow schema is
 /// the registry's physical schema — every name, type shape, and nullability —
-/// plus the one Gate input (`card_ref`) the write path resolves rather than
-/// stores, and the exact canonical physical fingerprint. Types compare through
-/// the storage layer's own round-trip equivalence, which is what "the stored
-/// schema" means once Iceberg has widened a byte or string column. For a
-/// dynamic table, a batch built straight from the description is accepted by
-/// the real ingest wire and lands with optional Card correlation: the
-/// correlated row keeps its `card_uid`, the uncorrelated row stores none and
-/// still carries its authenticated principal.
+/// including the `card_uid` correlation input a writer supplies, and the
+/// exact canonical physical fingerprint. Types compare exactly, because the
+/// description projects the registry's own physical schema. For a dynamic
+/// table, batches prepared straight from the description are accepted by the
+/// real ingest wire and land with optional Card correlation: the correlated
+/// row keeps its `card_uid`, the uncorrelated row stores none and still
+/// carries its authenticated principal.
 ///
 /// # Panics
 ///
@@ -80,15 +79,13 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
         ),
         "the description publishes the registry's exact canonical fingerprint"
     );
-    let described_schema = wyrd_queue::schema::writable_schema(&canonical, true)
+    let described_schema = wyrd_types::writable_schema(&canonical)
         .expect("the canonical description projects an Arrow schema");
     for stored in (definition.schema)().fields() {
         let name = stored.name().as_str();
-        // Server-resolved columns are not a writer's to supply; `wyrd_event_time`
-        // and `run_id` are the two managed columns a writer may still send.
-        if vala_bifrost_redux::tables::managed_columns::is_managed_column(name)
-            && name != "wyrd_event_time"
-            && name != "run_id"
+        // Server-resolved columns are not a writer's to supply; `run_id` is the
+        // one managed column a writer may still send.
+        if vala_bifrost_redux::tables::managed_columns::is_managed_column(name) && name != "run_id"
         {
             continue;
         }
@@ -96,11 +93,8 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
             .field_with_name(name)
             .unwrap_or_else(|_| panic!("described schema keeps `{name}`"));
         assert!(
-            vala_bifrost_redux::tables::arrow_type_shape_matches(
-                stored.data_type(),
-                described.data_type()
-            ),
-            "`{name}` keeps its stored type shape"
+            stored.data_type().equals_datatype(described.data_type()),
+            "`{name}` keeps its stored type"
         );
         assert_eq!(
             described.is_nullable(),
@@ -108,23 +102,23 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
             "`{name}` keeps its stored nullability"
         );
         assert!(
-            described.metadata().is_empty(),
-            "`{name}` sends no field identity; ingress compares by shape"
+            described
+                .metadata()
+                .keys()
+                .all(|key| wyrd_types::is_extension_key(key)),
+            "`{name}` sends no field identity beyond its extension type; ingress compares by shape"
         );
     }
-    assert_eq!(
-        canonical
-            .correlation_fields
-            .iter()
-            .find(|field| field.name == "card_ref")
-            .expect("the Gate correlation input is described")
-            .metadata
-            .get(wyrd_spec::vala::api::INPUT_CLASS_KEY)
-            .map(String::as_str),
-        Some(wyrd_spec::vala::api::INPUT_CLASS_GATE_CORRELATION),
-        "card_ref is a resolved Gate input, not a stored column"
+    let card_uid = canonical
+        .correlation_fields
+        .iter()
+        .find(|field| field.name == "card_uid")
+        .expect("the Card correlation input is described");
+    assert!(
+        card_uid.nullable && card_uid.data_type == wyrd_spec::vala::api::DataTypeSpec::Utf8,
+        "card_uid is the optional text column the writer supplies"
     );
-    for name in ["card_ref", "run_id", "wyrd_event_time"] {
+    for name in ["card_uid", "run_id"] {
         assert_eq!(
             described_schema
                 .fields()
@@ -146,36 +140,38 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
         "a dynamic table publishes no canonical physical fingerprint"
     );
     assert!(
-        wyrd_queue::schema::writable_schema(&dynamic, false)
+        wyrd_types::writable_schema(&dynamic)
             .expect("the dynamic description projects an Arrow schema")
-            .field_with_name("card_ref")
-            .expect("the Gate correlation input is described")
+            .field_with_name("card_uid")
+            .expect("the Card correlation input is described")
             .is_nullable(),
         "Card correlation is optional, so describe must not demand it"
     );
-    let mut builder = wyrd_queue::batch_builder::BatchBuilder::from_description(&dynamic)
-        .expect("the dynamic description builds a row builder");
-    builder
-        .append_json_row(
-            r#"{"id": 1, "value": "described"}"#,
-            Some(&writer_card),
-            None,
+    let preflight = wyrd_queue::RowPreflight::from_description(&dynamic)
+        .expect("the dynamic description builds a row preflight");
+    let correlated = preflight
+        .prepare(
+            &[r#"{"id": 1, "value": "described"}"#],
+            writer_card.uid.as_ref(),
             None,
         )
         .expect("a described row is accepted");
-    builder
-        .append_json_row(r#"{"id": 2, "value": "uncorrelated"}"#, None, None, None)
+    let uncorrelated = preflight
+        .prepare(&[r#"{"id": 2, "value": "uncorrelated"}"#], None, None)
         .expect("a described row without Card correlation is accepted");
-    wyrd_testing::bifrost::write::RawIngest::connect(&client)
+    let ingest = wyrd_testing::bifrost::write::RawIngest::connect(&client)
         .await
-        .expect("connect the public ingest wire")
-        .insert(
-            &fqn,
-            uuid::Uuid::now_v7(),
-            builder.finish_ipc().expect("seal the described batch"),
-        )
-        .await
-        .expect("the described batch is accepted by the real wire");
+        .expect("connect the public ingest wire");
+    for prepared in [correlated, uncorrelated] {
+        ingest
+            .insert(
+                &fqn,
+                uuid::Uuid::now_v7(),
+                prepared.to_ipc().expect("seal the described batch"),
+            )
+            .await
+            .expect("the described batch is accepted by the real wire");
+    }
     server.flush_bifrost().await.expect("publish the append");
 
     let mut stream = query

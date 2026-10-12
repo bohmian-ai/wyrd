@@ -160,8 +160,9 @@ Every row also carries columns you do not write:
 | `run_id` | The SDK, per run | Which invocation produced it? |
 | `principal_id` | The server, from your credential | Which service or person wrote it? |
 | `wyrd_request_id` | The server, per write request | Which write delivered it, and which audit record goes with it? |
-| `wyrd_event_time` | The SDK, when the row is recorded | When did it happen? |
 | `wyrd_ingested_at` | The server | When did Bifrost receive it? |
+
+Event time lives in each table's own time column: `created_at` for drift and eval observations, `start_time_unix_nano` for spans, and `time_unix_nano` for logs and metrics. Custom tables use their declared `time_column`, or `wyrd_ingested_at` when none is declared. That column drives partitioning and time-range reads; there is no shared `wyrd_event_time` column.
 
 `card_uid` is checked, not trusted. A service's credential is scoped to the Cards in its own graph, and the server rejects an observation about any other Card with `WYRD_VALA_403_BIFROST_CARD_SCOPE`, so one service cannot write evidence about another.
 

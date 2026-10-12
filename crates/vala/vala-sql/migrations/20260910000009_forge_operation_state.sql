@@ -30,18 +30,11 @@ CREATE POLICY tenant_isolation
     ON vala.forge_operation_state
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON vala.forge_operation_state TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE INDEX forge_operation_state_open
     ON vala.forge_operation_state (
         data_tenant_id, resource, family, prepared_at, operation_id
     )
     WHERE phase = 'prepared';
-
-DO $$ BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wyrd_platform_admin') THEN
-    RAISE EXCEPTION 'wyrd_platform_admin missing — run bootstrap/roles.sql / db:setup-roles';
-  END IF;
-END $$;
-
-GRANT SELECT, INSERT, UPDATE ON vala.forge_operation_state TO wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON vala.forge_operation_state TO wyrd_app;

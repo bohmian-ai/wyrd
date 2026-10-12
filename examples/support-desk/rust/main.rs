@@ -1,0 +1,37 @@
+//! Deploy and run the support desk against the server the ambient
+//! configuration names (for example `WYRD_SERVER_URL` and `WYRD_API_KEY`):
+//!     cargo run -p wyrd-rust-examples --bin support_desk
+
+/// The support-desk workflow this binary runs.
+mod support_desk;
+
+use std::time::Duration;
+
+use wyrd_sdk::WyrdClient;
+
+/// Deploys the support desk, serves its requests, waits for the Verifier
+/// verdicts, and prints one passing and one failing explanation.
+///
+/// # Errors
+///
+/// Returns [`support_desk::Error`] when the ambient client configuration is
+/// missing or invalid, the temporary bundle directory cannot be created, or
+/// any deploy, serve, verdict-wait, or explain call to the server fails.
+#[tokio::main]
+async fn main() -> Result<(), support_desk::Error> {
+    let client = WyrdClient::from_global()?;
+    let bundle = tempfile::tempdir()?;
+    let desk = support_desk::deploy(&client, &bundle.path().join("bundle")).await?;
+    let served = support_desk::serve(&desk).await?;
+    let verdicts = support_desk::wait_for_verdicts(&client, &desk, Duration::from_mins(5)).await?;
+    println!("{verdicts:?}");
+    for verdict in [true, false] {
+        if let Some(request) = served.iter().find(|request| request.passed == verdict) {
+            println!(
+                "{:#?}",
+                support_desk::explain(&client, &request.run_id).await?
+            );
+        }
+    }
+    Ok(())
+}

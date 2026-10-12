@@ -8,6 +8,8 @@
 //! journey observes exactly what the edge bound.
 
 use http::{HeaderName, HeaderValue};
+use rmcp::ServiceError;
+use rmcp::model::CallToolResult;
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use wyrd_client::WyrdClient;
@@ -80,6 +82,9 @@ pub(crate) fn client(
         .to_owned();
     let mut config = ClientConfig::default();
     config.http.base_url = base_url;
+    if let Some(endpoint) = server.grpc_url() {
+        config.grpc.endpoint = endpoint;
+    }
     config.token_cache = TokenCacheMode::InMemory;
     let auth = AuthMiddleware::new(&config, credential)?;
     let http = wyrd_client::transport::http::HttpTransport::new(
@@ -235,6 +240,8 @@ mod pg_tests {
                 "bifrost.query",
                 "principals.list_credentials",
                 "cards.get",
+                "cards.list",
+                "cards.get_by_ref",
                 "verification.get_binding",
                 "verification.get_run",
                 "operator_connections.list",
@@ -256,6 +263,7 @@ mod pg_tests {
                 "gateway.delete_provider_deployment",
                 "gateway.delete_fallback_policy",
                 "gateway.delete_governance_policy",
+                "wyrd.guide",
                 "principals.revoke_credential",
                 "verification.start_run",
                 "verification.execute",
@@ -534,4 +542,19 @@ mod pg_tests {
         drain.await?;
         Ok(())
     }
+}
+
+/// Render a refused tool call as text, whether the refusal arrived as a
+/// protocol error or as a structured Wyrd problem.
+///
+/// # Errors
+///
+/// Returns an error when the call succeeded.
+pub(crate) fn refusal(
+    result: Result<CallToolResult, ServiceError>,
+) -> Result<String, McpJourneyError> {
+    Ok(match result {
+        Err(error) => error.to_string(),
+        Ok(result) => problem(result)?.to_string(),
+    })
 }

@@ -82,6 +82,7 @@ pub struct ListCardsRequest {
         serialize_with = "metadata_query_option::serialize",
         deserialize_with = "metadata_query_option::deserialize"
     )]
+    #[schemars(with = "Option<String>")]
     pub filter: Option<MetadataQuery>,
     /// Include prerelease versions.
     #[serde(default)]

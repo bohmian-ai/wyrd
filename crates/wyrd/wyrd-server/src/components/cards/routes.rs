@@ -148,7 +148,7 @@ async fn get_card_by_ref_http(
 
 /// Authorize, audit, and read one Card by its exact identity.
 ///
-/// Shared by HTTP and the Workflow `cards.get` tool so both audit `cards:read`
+/// Shared by HTTP, MCP, and the Workflow `cards.get` tool so all audit `cards:read`
 /// under the same exact-reference resource. A reference that also names a
 /// UID must name the UID of the Card at that identity.
 ///
@@ -310,11 +310,20 @@ async fn list_cards_http(
     caller: Caller,
     Query(query): Query<ListCardsRequest>,
 ) -> Result<Json<ListCardsResponse>, WyrdErrorResponse> {
-    authorize_card_read(&state, &caller, "card.read.list", "cards")?;
-    service::list_cards(&state, &caller, query)
-        .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
+    Ok(Json(list_cards_for(&state, &caller, query).await?))
+}
+
+/// Authorize, audit, and list Cards for HTTP and MCP through the same operation.
+///
+/// # Errors
+/// Returns a permission denial or the registry's filter, cursor, and storage errors.
+pub(crate) async fn list_cards_for(
+    state: &AppState,
+    caller: &Caller,
+    request: ListCardsRequest,
+) -> Result<ListCardsResponse, WyrdError> {
+    authorize_card_read(state, caller, "card.read.list", "cards")?;
+    service::list_cards(state, caller, request).await
 }
 
 /// List server-authoritative stored artifacts for one Card.

@@ -10,6 +10,12 @@
 //! Scribe journeys in `wyrd-testing`; lifecycle and describe audit evidence is
 //! asserted by the `wyrd-testing` server journeys.
 
+mod every_iceberg_column_type;
+mod register_a_table_from_a_model;
+mod table_time_column;
+mod three_timestamp_types;
+mod variant_tables;
+
 mod pg_tests {
     use std::sync::Arc;
 
@@ -50,7 +56,11 @@ mod pg_tests {
     /// # Panics
     ///
     /// Panics when the service cannot be bootstrapped or the client assembled.
-    async fn service_client(srv: &WyrdTestServer, service: &str, roles: &[&str]) -> WyrdClient {
+    pub(super) async fn service_client(
+        srv: &WyrdTestServer,
+        service: &str,
+        roles: &[&str],
+    ) -> WyrdClient {
         let bootstrap = srv
             .bootstrap_service(service, roles)
             .await

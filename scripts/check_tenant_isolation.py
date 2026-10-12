@@ -25,13 +25,12 @@ SQL_CRATES = [
 ]
 
 # Vala query modules that perform narrow cross-tenant maintenance work through
-# the OperatorPool (`wyrd_platform_admin` BYPASSRLS). Maintenance leases use
-# global keys without a tenant column; the Forge active-table roster deliberately
-# inventories active tenant registrations. Both are operator-only surfaces, so
-# their isolation boundary is the DB role rather than tenant-scoped RLS. Must
-# take OperatorPool.
+# the OperatorPool (the operator session). The Forge active-table roster
+# deliberately inventories active tenant registrations, and the Forge leader
+# term has no tenant column. Both are operator-only surfaces, so their
+# isolation boundary is the operator_access policy rather than tenant-scoped
+# RLS. Must take OperatorPool.
 VALA_OPERATOR_ALLOWLIST = {
-    "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
     # Cross-tenant active Bifrost roster used only by the Forge scheduler.
     "crates/vala/vala-sql/src/queries/forge_catalog_operator.rs",
     # Singleton Forge leader term in `vala.forge_scheduler_state` (no tenant column).
@@ -60,6 +59,17 @@ VALA_MIXED_EXECUTOR_ALLOWLIST = {
 # recovery enumeration. Every other tenant-query rule still runs unchanged.
 VALA_TENANT_CONN_OWNER_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/oracle_reader_authority.rs",
+}
+
+# Owners whose one statement binds its own tenant for RLS inside the SQL
+# function it calls, so it runs as a single autocommit round trip on a plain
+# request-role connection with no transaction around it. A bound transaction
+# would add `BEGIN`/`SET LOCAL`/`COMMIT` round trips to the Oracle cut, the
+# hottest per-query read. Each entry names the file and the exact struct; the
+# struct must own a `PgConnection` and a `DataTenantId`, and only its own
+# methods are exempt.
+VALA_STATEMENT_TENANT_OWNERS = {
+    "crates/vala/vala-sql/src/queries/oracle_reader_authority.rs": "OracleTableCuts",
 }
 
 
@@ -184,7 +194,9 @@ def check_vala_query_modules(failures: list[str]) -> None:
             continue
 
         if relative in VALA_TENANT_CONN_OWNER_ALLOWLIST:
-            for fn_name in tenant_conn_owner_violations(code):
+            for fn_name in tenant_conn_owner_violations(
+                code, VALA_STATEMENT_TENANT_OWNERS.get(relative)
+            ):
                 failures.append(
                     f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>, "
                     "take an OperatorPool, or be a method of the struct owning a TenantConn"
@@ -455,7 +467,7 @@ def structs_owning_tenant_conn(code: str) -> set[str]:
     return owners
 
 
-def tenant_conn_owner_violations(code: str) -> list[str]:
+def tenant_conn_owner_violations(code: str, statement_owner: str | None = None) -> list[str]:
     """Return public async fns in `code` that prove no tenant-scoped authority.
 
     A function passes on one of three exact grounds: it takes a
@@ -463,8 +475,13 @@ def tenant_conn_owner_violations(code: str) -> list[str]:
     cross-tenant work, or it is a method of the very struct that owns the
     connection. The last ground is receiver-exact on purpose — an unrelated
     struct's `&self` in the same module is not evidence of anything.
+    `statement_owner` names the one struct in `VALA_STATEMENT_TENANT_OWNERS`
+    whose methods also pass, and only while it owns a `PgConnection` and the
+    `DataTenantId` its statement binds.
     """
     owners = structs_owning_tenant_conn(code)
+    if statement_owner is not None and owns_statement_tenant(code, statement_owner):
+        owners.add(statement_owner)
     blocks = _impl_blocks(code)
     violations: list[str] = []
     for name, params, offset in _public_async_fn_sites(code):
@@ -474,6 +491,19 @@ def tenant_conn_owner_violations(code: str) -> list[str]:
             continue
         violations.append(name)
     return violations
+
+
+def owns_statement_tenant(code: str, struct_name: str) -> bool:
+    """Return whether `struct_name` owns a `PgConnection` and a `DataTenantId`."""
+    match = re.search(rf"\bstruct\s+{re.escape(struct_name)}\b[^{{;]*\{{", code)
+    if match is None:
+        return False
+    closing = _matching_brace(code, match.end() - 1)
+    body = code[match.end() : closing if closing is not None else len(code)]
+    return (
+        re.search(r"&\s*'\w+\s+mut\s+sqlx::PgConnection\b", body) is not None
+        and re.search(r":\s*DataTenantId\b", body) is not None
+    )
 
 
 def has_platform_executor(code: str) -> bool:

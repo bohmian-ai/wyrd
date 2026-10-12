@@ -7,6 +7,7 @@ import { expect, vi } from "vitest";
 import { Bifrost, Cards, WyrdClient, WyrdState } from "@wyrd/sdk";
 import { cli } from "@wyrd/testing";
 
+import { configureGateway } from "../support/local-development.js";
 import { type RegisteredRef, fixture, registered, serverTest } from "../support/server.js";
 
 vi.setConfig({ testTimeout: 120_000 });
@@ -16,7 +17,7 @@ const JUDGE_PASSES = {
   id: "chatcmpl-judge",
   object: "chat.completion",
   created: 1,
-  model: "gpt-test",
+  model: "gpt-4o",
   choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: '{"passed":true}' } }],
   usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
 };
@@ -43,7 +44,8 @@ async function serviceKey(name: string): Promise<string> {
 
 /**
  * The assistant Service, registered after its latency baseline and Model,
- * and the unfitted assistant whose `tier-drift` baseline never fits. Each test
+ * and the unfitted assistant whose `tier-drift` baseline never fits, after the
+ * judge model is deployed on the gateway its LLM judges call. Each test
  * gets a fresh offline state that verifies as its Service's own principal,
  * through a key `issueKey` minted with no Role grant.
  */
@@ -61,6 +63,7 @@ const test = serverTest({ provider: () => ({ status: 200, body: JUDGE_PASSES }),
 }>({
   assistant: [
     async ({ server: _ }, use) => {
+      await configureGateway(WyrdClient.connect());
       const cards = Cards.connect();
       await cards.registerFromPath(fixture("cards/latency_baseline/latency-baseline.yaml"));
       await cards.registerFromPath(fixture("cards/verify_in_real_time/latency-model.yaml"));

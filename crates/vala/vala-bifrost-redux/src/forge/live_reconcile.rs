@@ -423,7 +423,7 @@ impl Forge {
             let manifest_list_path = catalog_path_to_object_key(
                 table_location,
                 binding,
-                &self.core.staging,
+                &self.core.warehouse,
                 snapshot.manifest_list(),
             )?;
             let operation = snapshot
@@ -461,7 +461,7 @@ impl Forge {
                     let path = catalog_path_to_object_key(
                         table_location,
                         binding,
-                        &self.core.staging,
+                        &self.core.warehouse,
                         entry.file_path(),
                     )?;
                     live_data_paths.insert(path);
@@ -509,7 +509,7 @@ impl Forge {
         table_location: &str,
         path: &StoragePath,
     ) -> Result<String, ForgeError> {
-        catalog_path_to_object_key(table_location, binding, &self.core.staging, path.as_str())
+        catalog_path_to_object_key(table_location, binding, &self.core.warehouse, path.as_str())
     }
 
     /// Return shutdown consistently at every reconciliation cancellation point.
@@ -570,17 +570,12 @@ impl Forge {
                     .get(&snapshot_id)
                     .and_then(|snapshot| snapshot.rewrite_volume);
                 Self::require_running(context.stop)?;
-                context
-                    .lease
-                    .require_fence(&self.core.operator_pool)
-                    .await?;
+                context.lease.require_fence().await?;
                 if !context
                     .lease
                     .commit_window_fits(self.core.config.commit_window())
                 {
-                    return Err(ForgeError::FenceLost {
-                        lease_key: context.lease.lease_key.clone(),
-                    });
+                    return Err(context.lease.fence_lost());
                 }
                 self.append_live_transition(
                     context.lease,
@@ -634,17 +629,12 @@ impl Forge {
         outcome: &mut IcebergReconciliationOutcome,
     ) -> Result<(), ForgeError> {
         Self::require_running(context.stop)?;
-        context
-            .lease
-            .require_fence(&self.core.operator_pool)
-            .await?;
+        context.lease.require_fence().await?;
         if !context
             .lease
             .commit_window_fits(self.core.config.commit_window())
         {
-            return Err(ForgeError::FenceLost {
-                lease_key: context.lease.lease_key.clone(),
-            });
+            return Err(context.lease.fence_lost());
         }
         self.append_live_transition(
             context.lease,

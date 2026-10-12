@@ -1,11 +1,14 @@
 //! Postgres DSN resolution for the one-off migration and the serving process.
 //!
-//! Serving Wyrd receives exactly two logins: the RLS-bound `wyrd_app` role
-//! through [`APP_DSN_ENV`] and the explicitly privileged `wyrd_platform_admin`
-//! role through [`PLATFORM_DSN_ENV`]. The one-off `wyrd-server migrate`
-//! process instead reads the existing database-owner login from
-//! [`APP_DSN_ENV`]; the owner credential is never part of a serving
-//! environment.
+//! [`APP_DSN_ENV`] is the one required database URL for every server mode.
+//! [`PLATFORM_DSN_ENV`] optionally names a separate platform login; when it is
+//! unset, platform work uses the [`APP_DSN_ENV`] login. Operators create both
+//! logins; Wyrd names no role. Scope comes from the pool: tenant pools connect
+//! with [`APP_DSN_ENV`] as supplied and bind a tenant per transaction, while
+//! platform and catalog pools connect with [`OPERATOR_SETTING`] on, which the
+//! `operator_access` row-level-security policies admit only for the login that
+//! owns Wyrd's objects. The one-off `wyrd-server migrate` process runs as the
+//! platform login.
 
 use std::env;
 use std::fmt;
@@ -13,29 +16,32 @@ use std::fmt;
 use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
-/// Serving `wyrd_app` DSN; in the one-off migration process, the owner DSN.
+/// Required database DSN: the tenant login, and also the platform login when
+/// [`PLATFORM_DSN_ENV`] is unset.
 pub const APP_DSN_ENV: &str = "WYRD_DATABASE_URL";
-/// Serving `wyrd_platform_admin` DSN for platform and Iceberg catalog work.
+/// Optional platform DSN for migration, platform, and Iceberg catalog work;
+/// when unset, that work uses [`APP_DSN_ENV`].
 pub const PLATFORM_DSN_ENV: &str = "WYRD_PLATFORM_DATABASE_URL";
+/// Session setting that marks an operator session for `operator_access`
+/// policies; platform, catalog, and migration sessions set it to `on`.
+pub const OPERATOR_SETTING: &str = "app.operator";
 
-/// Runtime role for RLS-enforced application traffic.
-pub const WYRD_APP_ROLE: &str = "wyrd_app";
-/// Audited cross-tenant platform-admin role; also owns the Iceberg catalog.
-pub const WYRD_PLATFORM_ADMIN_ROLE: &str = "wyrd_platform_admin";
-
-/// Session options that point a platform-admin connection at the catalog schema.
-const CATALOG_OPTIONS: &str = "options=-c%20search_path%3Diceberg_catalog";
+/// Session options that mark a platform connection as an operator session.
+const OPERATOR_OPTIONS: &str = "options=-c%20app.operator%3Don";
+/// Session options for an operator session pinned to the catalog schema.
+const CATALOG_OPTIONS: &str = "options=-c%20app.operator%3Don%20-c%20search_path%3Diceberg_catalog";
 
 /// Resolved serving DSNs.
 ///
 /// DSNs are secret-bearing because they normally include role passwords.
 #[derive(Clone)]
 pub struct ResolvedDsns {
-    /// Runtime `wyrd_app` DSN. RLS applies to connections built from this DSN.
+    /// [`APP_DSN_ENV`] as supplied: the tenant login, and also the platform
+    /// login when [`Self::platform_admin`] is `None`.
     pub app: SecretString,
-    /// Audited cross-tenant `wyrd_platform_admin` DSN, also used (with
-    /// [`with_catalog_options`]) by the Bifrost Iceberg catalog.
-    pub platform_admin: SecretString,
+    /// Explicit separate platform login. `None` means platform and catalog
+    /// work share [`Self::app`]; see [`Self::platform`].
+    pub platform_admin: Option<SecretString>,
 }
 
 impl fmt::Debug for ResolvedDsns {
@@ -51,16 +57,20 @@ impl fmt::Debug for ResolvedDsns {
 impl ResolvedDsns {
     /// Build the serving DSN set from explicit values.
     ///
-    /// Both values are required and must parse as URLs, so a serving process
-    /// fails at boot rather than at its first platform or catalog operation.
+    /// `app` is required; an absent `platform_admin` makes both pools share
+    /// the `app` login. Every present value must parse as a URL, so a serving
+    /// process fails at boot rather than at its first platform or catalog
+    /// operation.
     ///
     /// # Errors
-    /// Returns [`DsnError::Missing`] naming the absent variable, or
-    /// [`DsnError::InvalidUrl`] when a value does not parse.
+    /// Returns [`DsnError::Missing`] when `app` is absent, or
+    /// [`DsnError::InvalidUrl`] naming the variable whose value does not parse.
     pub fn resolve(app: Option<String>, platform_admin: Option<String>) -> Result<Self, DsnError> {
         Ok(Self {
             app: parsed(APP_DSN_ENV, app)?,
-            platform_admin: parsed(PLATFORM_DSN_ENV, platform_admin)?,
+            platform_admin: platform_admin
+                .map(|value| parsed(PLATFORM_DSN_ENV, Some(value)))
+                .transpose()?,
         })
     }
 
@@ -72,21 +82,33 @@ impl ResolvedDsns {
         Self::resolve(env::var(APP_DSN_ENV).ok(), env::var(PLATFORM_DSN_ENV).ok())
     }
 
-    /// Return the Bifrost Iceberg catalog DSN: the platform-admin login with
-    /// its search path pinned to the catalog schema.
+    /// Return the platform login: the explicit platform DSN, or [`Self::app`]
+    /// when none was configured. Migration connects with this login.
+    #[must_use]
+    pub fn platform_login(&self) -> &SecretString {
+        self.platform_admin.as_ref().unwrap_or(&self.app)
+    }
+
+    /// Return the platform pool DSN: [`Self::platform_login`] as an operator
+    /// session ([`OPERATOR_SETTING`] on).
+    #[must_use]
+    pub fn platform(&self) -> SecretString {
+        with_options(self.platform_login(), OPERATOR_OPTIONS)
+    }
+
+    /// Whether the tenant and platform pools share one login, which selects
+    /// the tenant-login readiness checks.
+    #[must_use]
+    pub fn shares_login(&self) -> bool {
+        self.platform_admin.is_none()
+    }
+
+    /// Return the Bifrost Iceberg catalog DSN: the platform operator session
+    /// with its search path pinned to the catalog schema.
     #[must_use]
     pub fn catalog(&self) -> SecretString {
-        with_catalog_options(&self.platform_admin)
+        with_options(self.platform_login(), CATALOG_OPTIONS)
     }
-}
-
-/// Read the one-off migration owner DSN from [`APP_DSN_ENV`].
-///
-/// # Errors
-/// Returns [`DsnError::Missing`] when the variable is unset, or
-/// [`DsnError::InvalidUrl`] when it does not parse.
-pub fn owner_dsn_from_env() -> Result<SecretString, DsnError> {
-    parsed(APP_DSN_ENV, env::var(APP_DSN_ENV).ok())
 }
 
 /// DSN resolution errors.
@@ -116,12 +138,11 @@ fn parsed(name: &'static str, value: Option<String>) -> Result<SecretString, Dsn
     Ok(SecretString::from(value))
 }
 
-/// Append the catalog search-path option to a DSN.
-#[must_use]
-pub fn with_catalog_options(dsn: &SecretString) -> SecretString {
+/// Append one encoded `options` query parameter to a DSN.
+fn with_options(dsn: &SecretString, options: &str) -> SecretString {
     let dsn = dsn.expose_secret();
     let separator = if dsn.contains('?') { '&' } else { '?' };
-    SecretString::from(format!("{dsn}{separator}{CATALOG_OPTIONS}"))
+    SecretString::from(format!("{dsn}{separator}{options}"))
 }
 
 #[cfg(test)]
@@ -130,14 +151,19 @@ mod tests {
 
     use super::{DsnError, ResolvedDsns};
 
-    /// Both serving DSNs are required, and the catalog DSN is the platform
-    /// login with only the catalog search path added.
+    /// Explicit serving DSNs are validated and kept separate; the platform and
+    /// catalog DSNs are the platform login as an operator session.
     #[test]
-    fn serving_dsns_require_both_logins_and_derive_the_catalog() {
-        let missing = ResolvedDsns::resolve(Some("postgres://a@h/wyrd".to_owned()), None);
+    fn explicit_serving_dsns_stay_separate_and_derive_the_catalog() {
         assert!(matches!(
-            missing,
-            Err(DsnError::Missing("WYRD_PLATFORM_DATABASE_URL"))
+            ResolvedDsns::resolve(
+                Some("postgres://a@h/w".to_owned()),
+                Some("not a url".to_owned())
+            ),
+            Err(DsnError::InvalidUrl {
+                name: "WYRD_PLATFORM_DATABASE_URL",
+                ..
+            })
         ));
         assert!(matches!(
             ResolvedDsns::resolve(
@@ -151,13 +177,44 @@ mod tests {
         ));
 
         let dsns = ResolvedDsns::resolve(
-            Some("postgres://wyrd_app:a@h/wyrd".to_owned()),
-            Some("postgres://wyrd_platform_admin:p@h/wyrd?sslmode=require".to_owned()),
+            Some("postgres://tenant:a@h/wyrd".to_owned()),
+            Some("postgres://platform:p@h/wyrd?sslmode=require".to_owned()),
         )
         .expect("both DSNs resolve");
+        assert!(!dsns.shares_login());
+        assert_eq!(dsns.app.expose_secret(), "postgres://tenant:a@h/wyrd");
+        assert_eq!(
+            dsns.platform().expose_secret(),
+            "postgres://platform:p@h/wyrd?sslmode=require&options=-c%20app.operator%3Don"
+        );
         assert_eq!(
             dsns.catalog().expose_secret(),
-            "postgres://wyrd_platform_admin:p@h/wyrd?sslmode=require&options=-c%20search_path%3Diceberg_catalog"
+            "postgres://platform:p@h/wyrd?sslmode=require&options=-c%20app.operator%3Don%20-c%20search_path%3Diceberg_catalog"
         );
+    }
+
+    /// An unset platform URL resolves to the database URL for platform and
+    /// catalog work, while the database URL is still required and validated.
+    #[test]
+    fn platform_url_falls_back_to_database_url() {
+        let dsns = ResolvedDsns::resolve(Some("postgres://wyrd:a@h/wyrd".to_owned()), None)
+            .expect("the database URL alone resolves");
+        assert!(dsns.shares_login());
+        assert_eq!(
+            dsns.platform_login().expose_secret(),
+            "postgres://wyrd:a@h/wyrd"
+        );
+        assert_eq!(
+            dsns.platform().expose_secret(),
+            "postgres://wyrd:a@h/wyrd?options=-c%20app.operator%3Don"
+        );
+        assert_eq!(
+            dsns.catalog().expose_secret(),
+            "postgres://wyrd:a@h/wyrd?options=-c%20app.operator%3Don%20-c%20search_path%3Diceberg_catalog"
+        );
+        assert!(matches!(
+            ResolvedDsns::resolve(None, None),
+            Err(DsnError::Missing("WYRD_DATABASE_URL"))
+        ));
     }
 }

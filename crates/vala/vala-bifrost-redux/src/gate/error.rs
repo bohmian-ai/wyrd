@@ -2,13 +2,16 @@
 //!
 //! Each variant carries a stable Wyrd error code and a gRPC status code. The
 //! stable code is attached to the `tonic::Status` details via
-//! `google.rpc.ErrorInfo` (`tonic-types`), so the Wyrd client maps a gRPC
-//! `Status` and an HTTP `problem+json` to the same taxonomy.
+//! `google.rpc.ErrorInfo` (`tonic-types`), and the full `problem+json` rides
+//! in the `wyrd-error-bin` header, so the Wyrd client maps a gRPC `Status`
+//! and an HTTP `problem+json` to the same taxonomy and details.
 
 use wyrd_runtime::PermissionDenyReason;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_tonic::tonic::{Code, Status, metadata::MetadataValue};
+use wyrd_tonic::error::wyrd_error_to_status;
+use wyrd_tonic::tonic::metadata::MetadataValue;
+use wyrd_tonic::tonic::{Code, Status};
 use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
 
 /// Error domain used in the attached `google.rpc.ErrorInfo`.
@@ -40,12 +43,9 @@ pub enum IngestError {
         /// Fully-qualified table name the caller attempted to write.
         table: String,
     },
-    /// A per-row `card_ref` outside the principal's card scope (or null/absent).
-    #[error("card_ref {card_ref} outside principal card scope")]
-    CardScopeDenied {
-        /// Canonical string form of the refused card reference.
-        card_ref: String,
-    },
+    /// A per-row `card_uid` outside the principal's card scope.
+    #[error("Card outside principal card scope")]
+    CardScopeDenied,
     /// A per-row `card_ref` was present but could not be resolved to a `card_uid`
     /// by the server (unknown card, cross-tenant, or uid not available). Fail-closed
     /// (M-11): an authenticated write with an unresolvable `card_ref` is always rejected.
@@ -103,23 +103,10 @@ pub enum IngestError {
     /// Arrow IPC decode failed.
     #[error("ingest arrow decode failed: {0}")]
     Decode(String),
-    /// A caller-supplied `wyrd_event_time` value falls outside the server
-    /// acceptance window evaluated against per-batch receipt time.
-    ///
-    /// The whole batch is rejected; no rows are written. The caller must
-    /// either supply an in-window event time or omit the column.
-    #[error(
-        "wyrd_event_time {value_micros} µs outside acceptance window \
-         [{past_bound_micros}, {future_bound_micros}] µs"
-    )]
-    EventTimeOutOfRange {
-        /// The offending `wyrd_event_time` in epoch-microseconds.
-        value_micros: i64,
-        /// Inclusive past bound (receipt − past window) in epoch-microseconds.
-        past_bound_micros: i64,
-        /// Inclusive future bound (receipt + future window) in epoch-microseconds.
-        future_bound_micros: i64,
-    },
+    /// A schema-valid batch broke a catalogued rule of the table's declared
+    /// contract; the catalogued error is the public identity.
+    #[error("ingest contract violation: {0}")]
+    ContractViolation(BifrostError),
     /// An internal failure with no stable client remediation.
     #[error("internal ingest error: {0}")]
     Internal(String),
@@ -175,10 +162,10 @@ impl IngestError {
         Some(match self {
             Self::RbacDenied { .. }
             | Self::ReservedBuiltinWriteDenied { .. }
-            | Self::CardScopeDenied { .. }
+            | Self::CardScopeDenied
             | Self::CardUnresolved { .. } => "permission",
             Self::PayloadTooLarge { .. } => "payload_limit",
-            Self::RequestValidation(_) | Self::Decode(_) | Self::EventTimeOutOfRange { .. } => {
+            Self::RequestValidation(_) | Self::Decode(_) | Self::ContractViolation(_) => {
                 "validation"
             }
             Self::TableNotFound { .. } | Self::SchemaMismatch { .. } => "catalog",
@@ -211,6 +198,7 @@ impl IngestError {
             }
             .into(),
             Self::PrincipalUnresolved => BifrostError::PrincipalUnresolved.into(),
+            Self::ContractViolation(error) => error.clone().into(),
             Self::RequestValidation(detail) | Self::Decode(detail) => {
                 BifrostError::OtlpRequestMalformed {
                     table: fallback_table(),
@@ -228,10 +216,7 @@ impl IngestError {
                 }
                 .into()
             }
-            Self::CardScopeDenied { card_ref } => BifrostError::CardScopeDenied {
-                card_ref: card_ref.clone(),
-            }
-            .into(),
+            Self::CardScopeDenied => BifrostError::CardScopeDenied.into(),
             Self::CardUnresolved { card_ref } => BifrostError::CardUnresolved {
                 card_ref: card_ref.clone(),
             }
@@ -258,16 +243,6 @@ impl IngestError {
             }
             .into(),
             Self::WalDiskFull => BifrostError::WalDiskFull.into(),
-            Self::EventTimeOutOfRange {
-                value_micros,
-                past_bound_micros,
-                future_bound_micros,
-            } => BifrostError::EventTimeOutOfRange {
-                value: value_micros.to_string(),
-                past_bound: past_bound_micros.to_string(),
-                future_bound: future_bound_micros.to_string(),
-            }
-            .into(),
             Self::Internal(detail) => BifrostError::Internal {
                 detail: detail.clone(),
             }
@@ -302,21 +277,10 @@ impl IngestError {
             crate::contracts::ScribeError::InvalidFrame => {
                 Self::Decode("ingest frame validation failed".to_owned())
             }
-            crate::contracts::ScribeError::EventTimeOutOfRange {
-                value_micros,
-                past_bound_micros,
-                future_bound_micros,
-            } => Self::EventTimeOutOfRange {
-                value_micros,
-                past_bound_micros,
-                future_bound_micros,
-            },
-            crate::contracts::ScribeError::CardScopeDenied => Self::CardScopeDenied {
-                card_ref: "<server-validation>".to_owned(),
-            },
-            crate::contracts::ScribeError::CardUnresolved => Self::CardUnresolved {
-                card_ref: "<server-validation>".to_owned(),
-            },
+            crate::contracts::ScribeError::ContractViolation(error) => {
+                Self::ContractViolation(error)
+            }
+            crate::contracts::ScribeError::CardScopeDenied => Self::CardScopeDenied,
             crate::contracts::ScribeError::IngressClosed => Self::IngressClosed,
             crate::contracts::ScribeError::WalDiskFull => Self::WalDiskFull,
             other => {
@@ -339,6 +303,11 @@ impl IngestError {
 
     /// Render as a `tonic::Status` with the canonical code in `ErrorInfo`.
     ///
+    /// The public error's `problem+json` header comes from the shared
+    /// `wyrd_error_to_status` producer every Wyrd gRPC surface uses, so a typed
+    /// refusal such as a Variant violation reaches the client with its exact
+    /// details rather than only its code.
+    ///
     /// The Gate's native gRPC adapter has no endpoint table argument, so only
     /// errors carrying their own table retain one here; OTLP/HTTP supplies its
     /// endpoint table to [`Self::to_wyrd_error`] before response rendering.
@@ -351,8 +320,10 @@ impl IngestError {
             WYRD_ERROR_DOMAIN,
             [] as [(String, String); 0],
         );
-        let mut status =
-            Status::with_error_details(grpc_code_for_wyrd(&public), public.to_string(), details);
+        let code = grpc_code_for_wyrd(&public);
+        let message = public.to_string();
+        let metadata = wyrd_error_to_status(public, None).metadata().clone();
+        let mut status = Status::with_error_details_and_metadata(code, message, details, metadata);
         if retryable_busy {
             status
                 .metadata_mut()
@@ -413,6 +384,8 @@ impl From<IngestError> for Status {
 mod tests {
     use super::IngestError;
     use crate::contracts::ScribeError;
+    use wyrd_spec::vala::error::BifrostError;
+    use wyrd_tonic::error::wyrd_error_to_status;
     use wyrd_tonic::tonic::Code;
     use wyrd_tonic::tonic_types::StatusExt;
 
@@ -477,9 +450,7 @@ mod tests {
                 Code::PermissionDenied,
             ),
             (
-                IngestError::CardScopeDenied {
-                    card_ref: "c".to_owned(),
-                },
+                IngestError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
                 403,
                 Code::PermissionDenied,
@@ -527,6 +498,16 @@ mod tests {
                 "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
                 409,
                 Code::FailedPrecondition,
+            ),
+            (
+                IngestError::ContractViolation(BifrostError::VariantInvalidJson {
+                    field: "messages".to_owned(),
+                    row: 0,
+                    path: String::new(),
+                }),
+                "WYRD_VALA_400_VARIANT_INVALID_JSON",
+                400,
+                Code::InvalidArgument,
             ),
         ]
     }
@@ -581,45 +562,17 @@ mod tests {
         ]
     }
 
-    /// `from_scribe` maps `EventTimeOutOfRange` to the distinct `IngestError` variant,
-    /// and `to_wyrd_error` maps it to `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE` — not
-    /// to `OtlpRequestMalformed`.
-    #[test]
-    fn event_time_out_of_range_maps_through_gate_without_identity_collapse() {
-        let scribe_err = ScribeError::EventTimeOutOfRange {
-            value_micros: -1_000_000_i64,
-            past_bound_micros: 0_i64,
-            future_bound_micros: 1_000_000_i64,
-        };
-        let ingest_err = IngestError::from_scribe(scribe_err);
-        assert!(
-            matches!(
-                ingest_err,
-                IngestError::EventTimeOutOfRange {
-                    value_micros: -1_000_000,
-                    ..
-                }
-            ),
-            "from_scribe must produce IngestError::EventTimeOutOfRange, got {ingest_err}"
-        );
-
-        let public = ingest_err.to_wyrd_error("vala.traces.spans");
-        assert_eq!(
-            public.code(),
-            "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE",
-            "to_wyrd_error must produce the stable EventTimeOutOfRange code"
-        );
-        assert_eq!(public.status(), 400, "status must be 400");
-        // Must NOT collapse to OtlpRequestMalformed.
-        assert_ne!(public.code(), "WYRD_VALA_400_OTLP_REQUEST_MALFORMED");
-    }
-
     /// Assert that every ingest condition has one Wyrd identity and matching
-    /// gRPC status/ErrorInfo projection.
+    /// gRPC status, `ErrorInfo`, and shared `problem+json` header projection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a code, status, `ErrorInfo` reason, or header body drifts
+    /// from the public error.
     #[test]
     fn every_ingest_error_has_one_transport_projection() {
         for (error, expected_code, expected_status, expected_grpc) in ingest_cases() {
-            let public = error.to_wyrd_error("vala.traces.spans");
+            let public = error.to_wyrd_error("unknown");
             assert_eq!(public.code(), expected_code, "identity drift for {error}");
             assert_eq!(public.status(), expected_status, "status drift for {error}");
 
@@ -629,6 +582,15 @@ mod tests {
                 .get_details_error_info()
                 .expect("canonical ingest status carries ErrorInfo");
             assert_eq!(info.reason, expected_code, "ErrorInfo drift for {public}");
+            let headers = grpc.metadata().clone().into_headers();
+            let shared = wyrd_error_to_status(public.clone(), None)
+                .metadata()
+                .clone()
+                .into_headers();
+            assert!(!shared.is_empty(), "shared producer attaches the problem");
+            for (name, value) in &shared {
+                assert_eq!(headers.get(name), Some(value), "problem drift for {public}");
+            }
         }
     }
 
@@ -697,11 +659,6 @@ mod tests {
             (
                 ScribeError::CardScopeDenied,
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
-                "vala.traces.spans",
-            ),
-            (
-                ScribeError::CardUnresolved,
-                "WYRD_VALA_403_CARD_UNRESOLVED",
                 "vala.traces.spans",
             ),
             (

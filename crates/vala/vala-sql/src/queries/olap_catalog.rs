@@ -1,7 +1,7 @@
 //! Tenant-scoped reads + writes for the Vala OLAP catalog control table
 //! `vala.bifrost_tables`.
 //! All callers must pass a [`TenantConn`] — the wyrd-sql RLS bind enforces
-//! tenant scope for wyrd_app-role paths.
+//! tenant scope.
 // raw-query grep allowlist: olap control tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use serde_json::Value;
@@ -21,8 +21,8 @@ use crate::row_types::oracle_reader_authority::TableAuthorityIdentity;
 ///
 /// Registration also writes the table's
 /// `vala.bifrost_table_maintenance_authority` row in the same transaction, so
-/// the one serialization boundary reader protection and snapshot expiration
-/// both lock exists from the moment the table does. That is what lets every
+/// the one serialization boundary Forge's destructive protocols lock exists
+/// from the moment the table does. That is what lets every
 /// later consumer treat a missing authority row as an identity failure rather
 /// than falling back to an advisory lock.
 ///

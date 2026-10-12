@@ -5,10 +5,10 @@ pub mod assembly;
 pub mod claim_assembly;
 pub mod claim_merge;
 pub mod claim_publication;
+pub mod claim_sample;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
-mod fixed_ipc;
 pub mod geometry;
 pub mod hot_source;
 pub mod hot_stage;
@@ -21,6 +21,7 @@ pub mod memtable;
 pub mod parquet_writer;
 pub mod persistence;
 pub mod preprocess;
+pub(crate) mod profile;
 pub mod promotion;
 pub mod registry;
 pub mod replay;
@@ -79,7 +80,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
-use vala_sql::ValaPostgres;
 
 /// Awaits one already-signalled Scribe cleanup phase within the caller deadline.
 ///
@@ -227,8 +227,8 @@ impl ScribeLaneConfig {
 /// Exists so the persistence context can be assembled in one named place
 /// instead of inline in the middle of the build; it holds no state of its own.
 struct PersistenceDependencies {
-    /// Object-store operator shared by persistence workers.
-    operator: Arc<opendal::Operator>,
+    /// Bifrost object store shared by persistence workers.
+    operator: Arc<dyn object_store::ObjectStore>,
     /// WAL writer used for manifest location and recovery identity.
     wal: Arc<wal::WalWriter>,
     /// Bounded CPU lane used to encode and merge.
@@ -267,6 +267,10 @@ pub struct ScribeImpl {
     writer_epoch: i64,
     /// Pod-global request and shard admission counters.
     admission: AdmissionController,
+    /// Operator session holding the batch fences WAL recovery consults
+    /// before ending a shard chain at a bad record; `None` without a
+    /// persistence operator pool, where every bad record fails closed.
+    fence_operator: Option<vala_sql::OperatorPool>,
     /// Scribe-only child capability over the pod-global Bifrost governor.
     memory: crate::resources::ScribeResources,
     /// Immutable boot-selected ingest ceilings shared with Gate.
@@ -316,11 +320,9 @@ pub struct ScribeImpl {
     recovery_cancelled: Arc<AtomicBool>,
     /// Optional server-provisioned immutable persistence runtime.
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
-    /// Control-plane `PostgreSQL`, the clock of record for `wyrd_ingested_at`.
-    ///
-    /// `None` only for an engine built without persistence, which has no
-    /// durable control state and stamps admission from the system clock.
-    control_postgres: Option<Arc<ValaPostgres>>,
+    /// The `PostgreSQL`-anchored clock every admitted batch is stamped from
+    /// as `wyrd_ingested_at`.
+    admission_clock: ingress::AdmissionClock,
     /// Test-tier barrier installed at the public ingest seam, if any.
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
@@ -526,8 +528,8 @@ impl Default for ScribePressureConfig {
 pub struct ScribeBuildConfig {
     /// Catalog owner used by Scribe before physical binding or projection.
     pub catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
-    /// Object-store operator used by the persistence runtime.
-    pub operator: Arc<opendal::Operator>,
+    /// Bifrost object store used by the persistence runtime.
+    pub operator: Arc<dyn object_store::ObjectStore>,
     /// WAL writer used by every fixed shard and persistence worker.
     pub wal: Arc<wal::WalWriter>,
     /// Validated node/epoch identity shared by all child owners.
@@ -631,7 +633,7 @@ impl ScribeEmbeddedConfig {
 ///
 /// Panics when the embedded admission configuration cannot form a shared cap
 /// above the default server headroom, which is a construction invariant.
-fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::ScribeResources {
+fn embedded_scribe_resources(config: AdmissionConfig) -> crate::resources::ScribeResources {
     let cap = config.memory_limit_bytes.max(1);
     let memory_limit_bytes = cap.saturating_add(crate::resources::DEFAULT_SERVER_MEMORY_MIN_BYTES);
     let runtime =
@@ -653,6 +655,7 @@ fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::Scri
                 scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                oracle_partition_scan_bytes: None,
                 scratch_root: None,
                 volume_roots: None,
             },
@@ -675,7 +678,7 @@ fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::Scri
 /// Scribe root can own.
 #[cfg(test)]
 pub(crate) fn otlp_decode_owner_for_test(bytes: usize) -> crate::contracts::OtlpDecodeOwner {
-    let resources = embedded_scribe_resources(&AdmissionConfig::default());
+    let resources = embedded_scribe_resources(AdmissionConfig::default());
     let memory = resources
         .try_reserve_ingress(memory::MemoryCategory::Decode, bytes)
         .expect("test OTLP decode owner must fit the embedded Scribe root");
@@ -690,7 +693,7 @@ pub(crate) fn otlp_decode_owner_for_test(bytes: usize) -> crate::contracts::Otlp
 #[cfg(feature = "test-support")]
 #[must_use]
 pub fn tail_resources_for_test() -> crate::resources::ScribeResources {
-    embedded_scribe_resources(&AdmissionConfig::default())
+    embedded_scribe_resources(AdmissionConfig::default())
 }
 
 impl ScribeImpl {
@@ -743,7 +746,7 @@ impl ScribeImpl {
     }
     /// Construct a new `ScribeImpl` with empty memtable and provided dependencies.
     pub fn new_for_embedded_with_deps(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -761,14 +764,14 @@ impl ScribeImpl {
     /// Panics when the node identifier is not a UUID or the embedded resource
     /// policy cannot satisfy Scribe's fixed ownership floors.
     pub fn new_for_embedded_with_deps_and_catalog(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
         catalog: Arc<BifrostCatalog>,
     ) -> Self {
         let admission = AdmissionConfig::default();
-        let resources = embedded_scribe_resources(&admission);
+        let resources = embedded_scribe_resources(admission);
         Self::new_for_embedded_with_runtime_config_and_admission_and_memory(
             operator,
             wal,
@@ -799,7 +802,7 @@ impl ScribeImpl {
     /// Returns an error when a configured execution lane cannot be created or
     /// `node_id` is not a UUID accepted by the WAL stream identity.
     pub fn try_new_for_embedded_with_wal_sync_delay(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -823,14 +826,14 @@ impl ScribeImpl {
     /// Returns an error when a configured execution lane cannot be created or
     /// `node_id` is not a UUID accepted by the WAL stream identity.
     pub fn try_new_for_embedded_with_wal_sync_delay_and_admission(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
         sync_delay: std::time::Duration,
         admission: AdmissionConfig,
     ) -> Result<Self, String> {
-        let resources = embedded_scribe_resources(&admission);
+        let resources = embedded_scribe_resources(admission);
         Self::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
             operator,
             wal,
@@ -859,7 +862,7 @@ impl ScribeImpl {
     /// Returns an error when a configured execution lane cannot be created or
     /// `node_id` is not a UUID accepted by the WAL stream identity.
     pub fn try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -919,7 +922,7 @@ impl ScribeImpl {
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
     /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -942,7 +945,7 @@ impl ScribeImpl {
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
     /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -967,7 +970,7 @@ impl ScribeImpl {
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
     /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config_and_admission(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -975,7 +978,7 @@ impl ScribeImpl {
         admission: AdmissionConfig,
         coordination_runtime: Handle,
     ) -> Self {
-        let resources = embedded_scribe_resources(&admission);
+        let resources = embedded_scribe_resources(admission);
         Self::new_for_embedded_with_runtime_config_and_admission_and_memory(
             operator,
             wal,
@@ -1003,7 +1006,7 @@ impl ScribeImpl {
     /// Panics when `node_id` is not a UUID accepted by the WAL stream identity,
     /// or when the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config_and_admission_and_memory(
-        operator: Arc<opendal::Operator>,
+        operator: Arc<dyn object_store::ObjectStore>,
         wal: Arc<wal::WalWriter>,
         node_id: &str,
         writer_epoch: i64,
@@ -1155,6 +1158,9 @@ impl ScribeImpl {
         let control_postgres = persistence_config
             .as_ref()
             .map(|config| Arc::clone(&config.postgres));
+        let fence_operator = persistence_config
+            .as_ref()
+            .and_then(|config| config.operator_pool.clone());
         let hot_sources = Arc::new(hot_source::ScribeHotSourceRegistry::new());
         let persistence = persistence_config.map(|config| {
             Self::start_persistence(
@@ -1214,7 +1220,8 @@ impl ScribeImpl {
             recovery_ready: AtomicBool::new(true),
             recovery_cancelled: Arc::new(AtomicBool::new(false)),
             persistence,
-            control_postgres,
+            admission_clock: ingress::AdmissionClock::new(control_postgres),
+            fence_operator,
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
@@ -1261,11 +1268,7 @@ impl ScribeImpl {
         wal_io: ScribeWalIoPool,
         admission_config: AdmissionConfig,
     ) -> Self {
-        let operator = Arc::new(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .expect("memory backend init")
-                .finish(),
-        );
+        let operator = Arc::new(object_store::memory::InMemory::new());
 
         let temp_dir = tempfile::tempdir().expect("temp WAL dir");
         let node_id_bytes = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000000")
@@ -1280,7 +1283,7 @@ impl ScribeImpl {
         // Leak temp_dir to keep WAL files for the test lifetime
         std::mem::forget(temp_dir);
 
-        let resources = embedded_scribe_resources(&admission_config);
+        let resources = embedded_scribe_resources(admission_config);
         let geometry = geometry::ScribeGeometry::for_uniform_shard_rotation(
             wal.segment_bytes(),
             memtable::MEMTABLE_ROTATION_BYTES,
@@ -1852,15 +1855,13 @@ impl Scribe for ScribeImpl {
                     ScribeError::PayloadTooLarge { .. }
                     | ScribeError::DecodedPayloadTooLarge { .. }
                     | ScribeError::InvalidFrame
-                    | ScribeError::EventTimeOutOfRange { .. }
+                    | ScribeError::ContractViolation(_)
                     | ScribeError::FingerprintMismatch { .. }
                     | ScribeError::TableNotFound { .. }
                     | ScribeError::CardScopeDenied
-                    | ScribeError::CardUnresolved
                     | ScribeError::StreamMismatch { .. } => Some("invalid"),
                     ScribeError::IngressClosed
                     | ScribeError::IngestBusy { .. }
-                    | ScribeError::ObjectStorePutFailed(_)
                     | ScribeError::Internal { .. } => None,
                 };
                 if let Some(reason) = reason {
@@ -1965,11 +1966,7 @@ mod constructor_rotation_tests {
             )
             .expect("nondefault WAL writer"),
         );
-        let operator = Arc::new(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .expect("memory backend")
-                .finish(),
-        );
+        let operator = Arc::new(object_store::memory::InMemory::new());
         let scribe = ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission(
             operator,
             Arc::clone(&wal),
@@ -2011,11 +2008,7 @@ mod constructor_rotation_tests {
             )
             .expect("nondefault WAL writer"),
         );
-        let operator = Arc::new(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .expect("memory backend")
-                .finish(),
-        );
+        let operator = Arc::new(object_store::memory::InMemory::new());
         let admission = AdmissionConfig::default();
         let configured_request_bytes = 201 * 1024 * 1024;
         let defaults = crate::gate::limits::IngestLimits::default();
@@ -2038,7 +2031,7 @@ mod constructor_rotation_tests {
                 admission,
                 coordination_runtime: Handle::current(),
                 persistence: None,
-                resources: embedded_scribe_resources(&admission),
+                resources: embedded_scribe_resources(admission),
                 staging_file_publisher: None,
                 geometry_for_test: Some(
                     geometry::ScribeGeometry::for_uniform_shard_rotation(
@@ -2229,7 +2222,8 @@ mod telemetry_tests {
 }
 
 impl ScribeImpl {
-    /// Reports the pod's staged backlog from the staging owner.
+    /// Reports the staged backlog of one logical table, or of the whole pod
+    /// when `table_name` is `None`, from the staging owner.
     ///
     /// Live members are every durable staged member not yet retired, ready
     /// or claimed; outstanding claims are taken and not yet settled. A pod
@@ -2240,11 +2234,14 @@ impl ScribeImpl {
     /// Returns [`ScribeError::Internal`] when the staging assembler lock is
     /// poisoned.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn staging_backlog_for_test(&self) -> Result<StagingBacklog, ScribeError> {
+    pub fn staging_backlog_for_test(
+        &self,
+        table_name: Option<&str>,
+    ) -> Result<StagingBacklog, ScribeError> {
         self.persistence
             .as_ref()
             .map_or(Ok(StagingBacklog::default()), |persistence| {
-                persistence.staging_backlog_for_test()
+                persistence.staging_backlog_for_test(table_name)
             })
     }
 
@@ -2527,6 +2524,12 @@ impl ScribeImpl {
                     shard_senders: self.shards.replay_senders(),
                     memory: self.memory.clone(),
                     cancelled: Arc::clone(&self.recovery_cancelled),
+                    fences: self.fence_operator.as_ref().map(|operator| {
+                        crate::scribe::replay::ReplayFences::new(
+                            operator.clone(),
+                            tokio::runtime::Handle::current(),
+                        )
+                    }),
                 },
             )
             .await;

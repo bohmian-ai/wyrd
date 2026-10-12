@@ -1,4 +1,4 @@
-import { Table, tableFromIPC, tableToIPC, type RecordBatch, type Schema } from "apache-arrow";
+import { DataType, Table, tableFromIPC, tableToIPC, type Field, type RecordBatch, type Schema } from "apache-arrow";
 import { createRequire } from "node:module";
 
 import type { WyrdErrorCode } from "./error-codes.js";
@@ -22,8 +22,14 @@ const {
   connectWyrdClient,
   loadWorkflowFromPath,
   openWyrdState,
+  storedTimestampText,
   tableConfigFromArrowIpc,
   tableConfigFromJsonSchema,
+  telemetryProviderExists,
+  timestampFormat,
+  timestampKinds,
+  timestampText,
+  variantToValue,
   workflowFromYaml,
 } = nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
@@ -48,8 +54,9 @@ export type QueryParam = null | boolean | number | string;
 
 /**
  * One column's logical type: a scalar variant name, or a single-key object for
- * a parameterized form. `List` and `Struct` carry full field declarations,
- * which is what makes the contract recursive.
+ * a parameterized form. `List`, `Struct`, and `Map` carry full field
+ * declarations, which is what makes the contract recursive. `Map` carries its
+ * non-nullable `key` and its `value` declarations.
  */
 export type DataTypeSpec =
   | string
@@ -59,7 +66,8 @@ export type DataTypeSpec =
   | { readonly Time64: Readonly<Record<string, string>> }
   | { readonly Decimal128: Readonly<Record<string, number>> }
   | { readonly List: FieldDescription }
-  | { readonly Struct: readonly FieldDescription[] };
+  | { readonly Struct: readonly FieldDescription[] }
+  | { readonly Map: { readonly key: FieldDescription; readonly value: FieldDescription } };
 
 /**
  * One column declaration in a table description, exactly as stored.
@@ -92,9 +100,15 @@ export interface SortKey {
   readonly null_order: string;
 }
 
-/** A table's server-resolved partitioning, sort order, and Bloom columns. */
+/**
+ * A table's server-resolved partitioning, sort order, and Bloom columns.
+ *
+ * `partition_granularity` applies to `time_column`, which is `wyrd_ingested_at`
+ * unless the table declared its own.
+ */
 export interface PhysicalLayout {
   readonly partition_granularity: string;
+  readonly time_column: string;
   readonly sort_keys: readonly SortKey[];
   readonly bloom_columns: readonly string[];
 }
@@ -102,8 +116,8 @@ export interface PhysicalLayout {
 /**
  * The server's projection of one registered table's stored physical schema.
  *
- * A writer declares `user_fields`, supplies `correlation_fields`, and may
- * supply `managed_candidates`. `canonical_physical_fingerprint` is present only
+ * A writer declares `user_fields` and supplies `correlation_fields`.
+ * `canonical_physical_fingerprint` is present only
  * for a canonical signal table; `compaction_target_file_size_bytes` only when
  * the table declared an explicit Forge compaction file target, and
  * `compaction_type` only when it declared an explicit compaction type.
@@ -112,7 +126,6 @@ export interface TableDescription {
   readonly entry: TableEntry;
   readonly user_fields: readonly FieldDescription[];
   readonly correlation_fields: readonly FieldDescription[];
-  readonly managed_candidates: readonly FieldDescription[];
   readonly canonical_physical_fingerprint?: string;
   readonly physical_layout: PhysicalLayout;
   readonly compaction_target_file_size_bytes?: number;
@@ -408,6 +421,15 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
   }
 
   /**
+   * @internal Each top-level timestamp column's Bifrost timestamp type,
+   * decided in Rust from the retained schema; empty until the stream completes.
+   */
+  get timestampKinds(): Readonly<Record<string, string>> {
+    const ipc = this.#native.schemaIpc;
+    return ipc === null || ipc === undefined ? {} : timestampKinds(ipc);
+  }
+
+  /**
    * Iterate this stream with `for await`.
    *
    * @returns This stream.
@@ -499,16 +521,20 @@ export class BifrostQueryStream implements AsyncIterableIterator<RecordBatch> {
  *
  * Sort keys reuse {@link SortKey} — the same shape the describe route returns —
  * so a layout read back from the server can be declared again unchanged.
+ * `timeColumn` names the non-null timestamp column that partitions the table
+ * and leads its default sort order; omitted, it is `wyrd_ingested_at`. Any
+ * instant is accepted.
  */
 export interface TableLayout {
   partitionGranularity?: "hour" | "day";
+  timeColumn?: string;
   sortKeys?: readonly SortKey[];
   bloomColumns?: readonly string[];
 }
 
 /** Optional per-row correlation; an omitted field is a null on the wire. */
 export interface Correlation {
-  cardRef?: string;
+  cardUid?: string;
   runId?: string;
 }
 
@@ -521,7 +547,9 @@ export interface ResolvedTable {
 /** A JSON Schema document, or a schema that emits one, as JSON text. */
 function jsonSchemaText(schema: Readonly<Record<string, unknown>> | JsonSchemaSource): string {
   const source = schema as JsonSchemaSource;
-  return JSON.stringify(typeof source.toJSONSchema === "function" ? source.toJSONSchema() : schema);
+  return JSON.stringify(
+    typeof source.toJSONSchema === "function" ? source.toJSONSchema({ override: zodTimestampFormat }) : schema,
+  );
 }
 
 function layoutJson(layout?: TableLayout): string | undefined {
@@ -530,6 +558,7 @@ function layoutJson(layout?: TableLayout): string | undefined {
   }
   return JSON.stringify({
     partition_granularity: layout.partitionGranularity ?? "hour",
+    time_column: layout.timeColumn,
     sort_keys: layout.sortKeys ?? [],
     bloom_columns: layout.bloomColumns ?? [],
   });
@@ -553,7 +582,28 @@ export interface TableConfigOptions {
  * on Zod, or on any other schema library.
  */
 export interface JsonSchemaSource {
-  toJSONSchema(): Readonly<Record<string, unknown>>;
+  toJSONSchema(params?: {
+    override?(context: { zodSchema: unknown; jsonSchema: Record<string, unknown> }): void;
+  }): Readonly<Record<string, unknown>>;
+}
+
+/**
+ * Mark a Zod local date-time with the `TIMESTAMP_NTZ` format.
+ *
+ * Zod's `toJSONSchema` hook, read structurally so Zod stays out of this SDK's
+ * dependencies. `z.iso.datetime()` already declares `date-time`, which is
+ * `TIMESTAMP_LTZ`; a local-only one declares no format, so without this it
+ * would register as text. Other schema libraries never call the hook.
+ */
+function zodTimestampFormat(context: { zodSchema: unknown; jsonSchema: Record<string, unknown> }): void {
+  const def = (
+    context.zodSchema as {
+      _zod?: { def?: { format?: string; local?: boolean; offset?: boolean } };
+    }
+  )._zod?.def;
+  if (def?.format === "datetime" && def.local === true && def.offset !== true) {
+    context.jsonSchema.format = TimestampNTZ.format;
+  }
 }
 
 /**
@@ -591,6 +641,12 @@ export class TableConfig {
    * dependency of this SDK and any peer offering the same method works
    * unchanged.
    *
+   * Time fields declare Wyrd timestamp columns: `TimestampNTZ.schema(z)`,
+   * `TimestampLTZ.schema(z)`, and `TimestampTZ.schema(z)` declare their own
+   * type, `z.iso.datetime()` declares `TIMESTAMP_LTZ`, and
+   * `z.iso.datetime({ local: true })` declares `TIMESTAMP_NTZ`. Zod refuses to
+   * describe `z.date()` in JSON Schema, so it is refused here too.
+   *
    * `options.layout` requests the table's physical layout.
    * `options.compactionTargetFileSizeBytes` pins the table's Forge compaction
    * file target; omitted, the table follows the server's deployment default.
@@ -607,7 +663,8 @@ export class TableConfig {
    * @param options - Optional layout and Forge compaction declarations.
    * @returns The declared, still unregistered, table config.
    * @throws {@link WyrdError} when the resulting document does not map to an
-   * Arrow schema, declares a column the write path already owns, the
+   * Arrow schema (`WYRD_VALA_400_SCHEMA_PARSE`, including a model that allows
+   * extra keys), declares a column the write path already owns, the
    * compaction target is not a non-negative integer, or the compaction type
    * is not a known spelling (`WYRD_SPEC_400_VALIDATION`).
    */
@@ -726,6 +783,156 @@ export class TableConfig {
  */
 export interface RowSchema<T> {
   parse(value: unknown): T;
+}
+
+/** Brands a timestamp text with the Bifrost timestamp type it was checked as. */
+declare const timestampBrand: unique symbol;
+
+/** `TIMESTAMP_NTZ` text: an RFC 3339 wall-clock reading with no offset. */
+export type TimestampNTZ = string & { readonly [timestampBrand]: "TIMESTAMP_NTZ" };
+/** `TIMESTAMP_LTZ` text: one RFC 3339 instant, rendered in UTC. */
+export type TimestampLTZ = string & { readonly [timestampBrand]: "TIMESTAMP_LTZ" };
+/** `TIMESTAMP_TZ` text: one RFC 3339 instant in the writer's offset. */
+export type TimestampTZ = string & { readonly [timestampBrand]: "TIMESTAMP_TZ" };
+
+/**
+ * A Zod-style namespace, named structurally so this SDK never depends on Zod.
+ *
+ * Zod's `meta` and `refine` both return the string schema they are called on,
+ * so a field built from it has the type `meta` returns.
+ */
+export interface StringSchemaFactory {
+  string(): { meta(meta: Record<string, unknown>): unknown };
+}
+
+/** The string schema type a {@link StringSchemaFactory} builds. */
+export type StringSchemaOf<Z extends StringSchemaFactory> = ReturnType<ReturnType<Z["string"]>["meta"]>;
+
+/**
+ * One Wyrd timestamp type: its name, its JSON Schema format, and the checks
+ * that make a text a value of it.
+ */
+export interface WyrdTimestampType<T extends string> {
+  /** `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ`. */
+  readonly name: string;
+  /** The JSON Schema `format` that declares a column of this type. */
+  readonly format: string;
+  /**
+   * Check `text` and return its canonical text.
+   *
+   * The text is parsed by the same Rust parser an insert uses, so a value this
+   * accepts is one Bifrost accepts.
+   *
+   * @throws TypeError when the text is not this type: an offset for
+   * `TIMESTAMP_NTZ`, no offset for the others, or not RFC 3339.
+   */
+  parse(text: string): T;
+  /**
+   * A string schema for a field of this type, built with the caller's Zod.
+   *
+   * It carries this type's format, so a table declared from it registers this
+   * column type, and it accepts only text {@link WyrdTimestampType.parse}
+   * accepts.
+   */
+  schema<Z extends StringSchemaFactory>(z: Z): StringSchemaOf<Z>;
+}
+
+/**
+ * Build one Wyrd timestamp type from its name.
+ *
+ * The format, the check, and the canonical text all come from the Rust owner,
+ * so the three types restate nothing.
+ */
+function wyrdTimestamp<T extends string>(name: string): WyrdTimestampType<T> {
+  const format = timestampFormat(name) as string;
+  const accepts = (text: string): boolean => timestampText(name, text) != null;
+  return {
+    name,
+    format,
+    parse(text: string): T {
+      const canonical = timestampText(name, text);
+      if (canonical == null) {
+        throw new TypeError(`${name} does not accept ${JSON.stringify(text)}`);
+      }
+      return canonical as T;
+    },
+    schema<Z extends StringSchemaFactory>(z: Z): StringSchemaOf<Z> {
+      const field = z.string().meta({ format }) as {
+        refine(check: (value: string) => boolean, message: string): StringSchemaOf<Z>;
+      };
+      return field.refine(accepts, `not a ${name}`);
+    },
+  };
+}
+
+/** `TIMESTAMP_NTZ`: a wall-clock reading with no instant. */
+export const TimestampNTZ = wyrdTimestamp<TimestampNTZ>("TIMESTAMP_NTZ");
+/** `TIMESTAMP_LTZ`: one instant. */
+export const TimestampLTZ = wyrdTimestamp<TimestampLTZ>("TIMESTAMP_LTZ");
+/** `TIMESTAMP_TZ`: one instant plus the writer's wall-clock reading. */
+export const TimestampTZ = wyrdTimestamp<TimestampTZ>("TIMESTAMP_TZ");
+
+/**
+ * One stored timestamp cell as its Wyrd timestamp type's text.
+ *
+ * Apache Arrow hands a microsecond timestamp over as fractional milliseconds,
+ * which round back to the exact microseconds; a `TIMESTAMP_TZ` cell is its
+ * `{utc, local}` struct. Rust renders the text.
+ */
+function timestampValue(kind: string, value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  const micros = (millis: unknown): number => Math.round((millis as number) * 1000);
+  const stored = value as { utc: unknown; local: unknown };
+  const text =
+    typeof value === "number"
+      ? storedTimestampText(kind, micros(value))
+      : storedTimestampText(kind, micros(stored.utc), micros(stored.local));
+  if (text == null) {
+    throw new TypeError(`stored ${kind} value is out of range`);
+  }
+  return text;
+}
+
+/** The Arrow extension name every Variant column carries. */
+const VARIANT_EXTENSION = "arrow.parquet.variant";
+
+/**
+ * Project one row value onto its native JavaScript value.
+ *
+ * A Variant cell decodes through the shared Rust owner (objects become plain
+ * objects, arrays arrays, and an integer outside the safe range a `bigint`),
+ * a Struct becomes a plain object, a List an array, and a Map an object keyed
+ * by its entry keys, recursively. Every scalar stays as Apache Arrow produced
+ * it, so 64-bit integers are `bigint`.
+ */
+function nativeValue(field: Field, value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (field.metadata.get("ARROW:extension:name") === VARIANT_EXTENSION) {
+    const cell = value as { metadata: Uint8Array; value: Uint8Array };
+    return variantToValue(cell.metadata, cell.value);
+  }
+  const children = field.type.children as Field[] | null;
+  if (DataType.isStruct(field.type)) {
+    const struct = value as Record<string, unknown>;
+    return Object.fromEntries((children ?? []).map((child) => [child.name, nativeValue(child, struct[child.name])]));
+  }
+  if (DataType.isList(field.type)) {
+    return Array.from(value as Iterable<unknown>, (item) => nativeValue(children?.[0] as Field, item));
+  }
+  if (DataType.isMap(field.type)) {
+    const entry = children?.[0]?.type.children as Field[];
+    return Object.fromEntries(
+      Array.from(value as Iterable<[unknown, unknown]>, ([key, item]) => [
+        String(key),
+        nativeValue(entry[1] as Field, item),
+      ]),
+    );
+  }
+  return value;
 }
 
 /**
@@ -900,12 +1107,12 @@ export class Bifrost {
    * saturated queue throws the stable refusal rather than dropping the row.
    *
    * @param row - One row object matching the active table's columns.
-   * @param correlation - Optional `cardRef` and `runId` stamped on the row.
+   * @param correlation - Optional `cardUid` and `runId` stamped on the row.
    * @throws {@link WyrdError} with no active table, for a malformed
-   * `cardRef`, or when the queue is full.
+   * `cardUid`, or when the queue is full.
    */
   insert(row: Readonly<Record<string, unknown>>, correlation: Correlation = {}): void {
-    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardRef, correlation.runId));
+    lifecycleValue<null>(this.#native.insert(JSON.stringify(row), correlation.cardUid, correlation.runId));
   }
 
   /**
@@ -915,8 +1122,9 @@ export class Bifrost {
    * destination instead of using the active binding, carries correlation as
    * ordinary columns, and is durable when it resolves, so no flush follows it.
    * Build the batch against {@link TableConfig.schema} from
-   * `describeTableConfig` - a canonical table compares an incoming block
-   * against its declared fields exactly, metadata included.
+   * `describeTableConfig`. Columns match the table's declared columns by name,
+   * in any order; the server judges every column's type and refuses a stale
+   * declaration.
    *
    * @param table - The destination's `namespace.name`.
    * @param batch - One Arrow batch matching the table's declared fields.
@@ -967,7 +1175,12 @@ export class Bifrost {
    * A purely local projection over the completed result: the query, its
    * authorization, its limits, and its terminal are the same ones raw
    * {@link Bifrost.sql} runs. The schema never reaches the server and says
-   * nothing about the table's stored layout.
+   * nothing about the table's stored layout. Every cell reaches `rows` as its
+   * native value: a Struct is a plain object, a List an array, a Map an
+   * object, a Variant its decoded JSON value, and a 64-bit integer a
+   * `bigint`. A top-level timestamp column's cell is its Wyrd timestamp
+   * type's text: `TIMESTAMP_NTZ` with no offset, `TIMESTAMP_LTZ` in UTC, and
+   * `TIMESTAMP_TZ` in the writer's offset.
    *
    * @param query - One SELECT statement.
    * @param params - Values bound to `$1..$n`, in order.
@@ -997,10 +1210,19 @@ export class Bifrost {
     if (rows === undefined) {
       return result;
     }
+    const kinds = stream.timestampKinds;
     return result
       .toArrow()
       .toArray()
-      .map((row: { toJSON(): Record<string, unknown> }) => rows.parse(row.toJSON()));
+      .map((row: { toJSON(): Record<string, unknown> }) => {
+        const values = row.toJSON();
+        for (const field of schema.fields) {
+          const kind = kinds[field.name];
+          values[field.name] =
+            kind === undefined ? nativeValue(field, values[field.name]) : timestampValue(kind, values[field.name]);
+        }
+        return rows.parse(values);
+      });
   }
 
   /**
@@ -1205,11 +1427,11 @@ export type TokenAudience = "wyrd" | "bifrost";
  * @param schema - The table's JSON Schema, or a schema that emits one, mapped
  * to the Arrow schema of the row.
  * @param row - One row object matching `schema`.
- * @param correlation - Optional `cardRef` and `runId` stamped on the row;
+ * @param correlation - Optional `cardUid` and `runId` stamped on the row;
  * omitted, the row is uncorrelated.
  * @throws {@link WyrdError} `WYRD_VALA_400_SCHEMA_PARSE` for a schema that
  * does not map to Arrow, or `WYRD_SPEC_400_VALIDATION` for unparsable schema
- * text or a malformed `cardRef`.
+ * text or a malformed `cardUid`.
  */
 export function record(
   bifrost: Bifrost,
@@ -1223,7 +1445,7 @@ export function record(
       table,
       jsonSchemaText(schema),
       JSON.stringify(row),
-      correlation.cardRef,
+      correlation.cardUid,
       correlation.runId,
     ),
   );
@@ -1266,6 +1488,11 @@ export class WyrdClient {
 
   private constructor(native: NativeWyrdClient) {
     this.#native = native;
+  }
+
+  /** @internal Wrap a native client another handle resolved, such as a state's. */
+  static fromNative(native: NativeWyrdClient): WyrdClient {
+    return new WyrdClient(native);
   }
 
   /**
@@ -2246,6 +2473,16 @@ let otelApi: typeof import("@opentelemetry/api") | null | undefined;
  * no installed API, no active span, or an invalid context supplies nothing.
  */
 function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string } {
+  const api = otel();
+  const spanContext = api?.trace.getActiveSpan()?.spanContext();
+  if (spanContext === undefined || !api?.isSpanContextValid(spanContext)) {
+    return {};
+  }
+  return { traceId: spanContext.traceId, spanId: spanContext.spanId };
+}
+
+/** The application's `@opentelemetry/api`, or `null` when it is not installed. */
+function otel(): typeof import("@opentelemetry/api") | null {
   if (otelApi === undefined) {
     try {
       otelApi = require("@opentelemetry/api") as typeof import("@opentelemetry/api");
@@ -2253,11 +2490,7 @@ function activeSpanIds(): { readonly traceId?: string; readonly spanId?: string 
       otelApi = null;
     }
   }
-  const spanContext = otelApi?.trace.getActiveSpan()?.spanContext();
-  if (spanContext === undefined || !otelApi?.isSpanContextValid(spanContext)) {
-    return {};
-  }
-  return { traceId: spanContext.traceId, spanId: spanContext.spanId };
+  return otelApi;
 }
 
 /** The closed own-key set of one {@link EvalMediaRef}. */
@@ -2463,6 +2696,25 @@ export class Run {
   async invoke(variables: Readonly<Record<string, string>> = {}): Promise<string> {
     return lifecycleValue<string>(await this.#native.invoke(strictJson("variables", variables)));
   }
+
+  /**
+   * Run `fn` inside this view's scope: spans started in it, across awaits,
+   * carry this run and Card once {@link WyrdState.startTelemetry} installed
+   * telemetry. Without `@opentelemetry/api` it only calls `fn`.
+   *
+   * @param fn - The work to scope.
+   * @returns What `fn` returns.
+   */
+  scope<T>(fn: () => T): T {
+    const api = otel();
+    if (api === null) {
+      return fn();
+    }
+    const scoped = api.context
+      .active()
+      .setValue(api.createContextKey("wyrd.run_scope"), [this.#native.subjectUid, this.#native.runId]);
+    return api.context.with(scoped, fn);
+  }
 }
 
 /**
@@ -2474,6 +2726,8 @@ export class Run {
  */
 export class WyrdState {
   readonly #native: NativeWyrdState;
+  /** The tracer provider {@link WyrdState.startTelemetry} installed. */
+  #telemetry: { forceFlush(): Promise<void> } | undefined;
 
   private constructor(native: NativeWyrdState) {
     this.#native = native;
@@ -2636,6 +2890,37 @@ export class WyrdState {
   }
 
   /**
+   * Install the global OpenTelemetry tracer provider exporting spans to this
+   * state's server as the state's client.
+   *
+   * Spans export through the stock OTLP/HTTP exporter `spanExporter` builds, which
+   * asks the client for a fresh access token on every export; spans started
+   * inside {@link Run.scope} carry that run and Card. Node's `AsyncLocalStorage`
+   * context manager is registered unless the application registered one. A
+   * second call is idempotent, and {@link WyrdState.shutdown} flushes only
+   * this provider. Needs the optional `@opentelemetry/api`,
+   * `@opentelemetry/context-async-hooks`, `@opentelemetry/sdk-trace-base`, and
+   * `@opentelemetry/exporter-trace-otlp-proto` peers.
+   *
+   * @throws a {@link WyrdError}: `WYRD_SDK_409_TELEMETRY_PROVIDER_EXISTS` when
+   * a global tracer provider is already registered (add `spanExporter` to it
+   * instead), or the credential error when the state's client cannot resolve.
+   */
+  async startTelemetry(): Promise<void> {
+    if (this.#telemetry !== undefined) {
+      return;
+    }
+    const native = this.#native.client();
+    const client = WyrdClient.fromNative(nativeHandle(native.client, native.error));
+    const { startTelemetry } = await import("./otel.js");
+    const provider = startTelemetry(client);
+    if (provider === undefined) {
+      throw projectedError(telemetryProviderExists());
+    }
+    this.#telemetry = provider;
+  }
+
+  /**
    * Open one invocation over this state, targeting `alias` or the root Service.
    *
    * Local only: no network IO and no server-side Run resource. `alias`
@@ -2669,11 +2954,13 @@ export class WyrdState {
    * admission is not a durable acknowledgement, so an abrupt exit before it
    * resolves can lose pending rows. After an ambiguous failure, retry
    * `shutdown()` on the same state rather than replacing the writer; a
-   * successfully closed state stays closed.
+   * successfully closed state stays closed. A tracer provider
+   * {@link WyrdState.startTelemetry} installed is flushed first.
    *
    * @throws a {@link WyrdError} for the first producer or sink failure.
    */
   async shutdown(): Promise<void> {
+    await this.#telemetry?.forceFlush();
     lifecycleValue<null>(await this.#native.shutdown());
   }
 }

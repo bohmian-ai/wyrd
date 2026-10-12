@@ -96,8 +96,8 @@ struct Waiter {
     id: u64,
     /// Fixed deadline computed at enqueue time.
     deadline: Instant,
-    /// Fraction of pinned sealed bytes available from the local hot tier.
-    local_ratio: f64,
+    /// Target partitions the query's retained plan was built with.
+    target_partitions: usize,
     /// One-shot notification carrying the granted query resources.
     tx: tokio::sync::oneshot::Sender<crate::resources::OracleQueryResources>,
 }
@@ -400,8 +400,9 @@ pub(crate) struct PreparedAdmission {
     pub(crate) tenant: DataTenantId,
     /// Closed query class selected by the planner.
     pub(crate) query_class: QueryClass,
-    /// Fraction of pinned sealed bytes available from the local hot tier.
-    pub(crate) local_ratio: f64,
+    /// Target partitions the query's retained plan was built with; the grant
+    /// shapes every session of the query with exactly this count.
+    pub(crate) target_partitions: usize,
     /// Absolute query deadline.
     pub(crate) deadline: Instant,
     /// Caller/request cancellation authority.
@@ -679,20 +680,28 @@ impl OracleAdmission {
         Ok((task, startup_rx))
     }
 
-    /// Returns the target partitions a query with `local_ratio` plans with.
+    /// Returns the most target partitions a query with `local_ratio` plans
+    /// with.
     ///
     /// Derived from this pod's effective CPU and the pinned locality before
-    /// admission, so the retained physical root is planned exactly once.
+    /// admission; planning narrows it to what the query scans and admits the
+    /// narrowed count, so the retained physical root is planned exactly once.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryAdmissionRejected`] when the locality is
     /// outside `[0, 1]` or the pod's CPU count cannot be represented.
     pub(super) fn session_partitions(&self, local_ratio: f64) -> Result<usize, BifrostError> {
-        self.shared
-            .resources
+        self.partitioning()
             .target_partitions(local_ratio)
             .map_err(|_| BifrostError::QueryAdmissionRejected)
+    }
+
+    /// Returns this pod's Oracle partition sizing, which caps a query by
+    /// [`Self::session_partitions`] and narrows it to the bytes it scans.
+    #[must_use]
+    pub(super) fn partitioning(&self) -> crate::scan_sizing::OraclePartitioning {
+        self.shared.resources.oracle_partitioning()
     }
 
     /// Reports whether a live Oracle role and local class capacity are available.
@@ -817,14 +826,14 @@ impl OracleAdmission {
         let PreparedAdmission {
             tenant,
             query_class,
-            local_ratio,
+            target_partitions,
             deadline,
             cancellation,
         } = request;
         let enqueue = Instant::now();
         let wait_deadline = deadline.min(enqueue + self.max_queue_wait());
         let waiter_telemetry = OracleTelemetry::start_admission_waiter(query_class);
-        let waiter = self.enqueue_waiter(tenant, query_class, local_ratio, wait_deadline)?;
+        let waiter = self.enqueue_waiter(tenant, query_class, target_partitions, wait_deadline)?;
         let resources = self
             .wait_for_grant(waiter, cancellation.clone(), query_class)
             .await?;
@@ -854,7 +863,7 @@ impl OracleAdmission {
         &self,
         tenant: DataTenantId,
         query_class: QueryClass,
-        local_ratio: f64,
+        target_partitions: usize,
         wait_deadline: Instant,
     ) -> Result<PreparedWaiter, BifrostError> {
         let (tx, receiver) = tokio::sync::oneshot::channel();
@@ -920,7 +929,7 @@ impl OracleAdmission {
             class.tenants[index].1.waiters.push_back(Waiter {
                 id: waiter_id,
                 deadline: wait_deadline,
-                local_ratio,
+                target_partitions,
                 tx,
             });
             state.queued += 1;
@@ -1037,6 +1046,7 @@ impl OracleAdmission {
             ))),
             resources: Some(resources),
             live_reservations: Vec::new(),
+            executed: None,
             cancellation: self.shared.root_cancel.child_token(),
             request_cancellation: cancellation,
             distributed_settlement: Arc::new(DistributedQuerySettlement::default()),
@@ -1143,13 +1153,13 @@ fn grant_waiters_with_clock(
             (None, Some(index)) => (QueryClass::Analytical, index),
             (None, None) => break,
         };
-        let local_ratio = state.class_mut(kind).tenants[index]
+        let target_partitions = state.class_mut(kind).tenants[index]
             .1
             .waiters
             .front()
             .expect("an eligible tenant has a FIFO head")
-            .local_ratio;
-        let Ok(resources) = acquire_waiter_resources(shared, kind, local_ratio) else {
+            .target_partitions;
+        let Ok(resources) = acquire_waiter_resources(shared, kind, target_partitions) else {
             refused[usize::from(kind == QueryClass::Analytical)] = true;
             continue;
         };
@@ -1203,13 +1213,13 @@ fn charge_tenant(
 fn acquire_waiter_resources(
     shared: &AdmissionShared,
     kind: QueryClass,
-    local_ratio: f64,
+    target_partitions: usize,
 ) -> Result<crate::resources::OracleQueryResources, crate::resources::BifrostResourceError> {
     shared
         .resources
         .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
             kind,
-            local_ratio,
+            target_partitions,
         ))
 }
 
@@ -1242,6 +1252,15 @@ pub(super) struct AdmittedQueryGuard {
     resources: Option<crate::resources::OracleQueryResources>,
     /// Parent reservations retaining drained live batches through stream cleanup.
     pub(super) live_reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
+    /// The executed physical root and the profile its metrics fold into.
+    ///
+    /// A plan node may hold memory charged to this query's envelope after its
+    /// streams end, as a `CollectLeft` hash join holds its build side, so the
+    /// root is released here, before `resources`, and never outlives them.
+    executed: Option<(
+        Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        Arc<super::profile::QueryProfile>,
+    )>,
     /// Analytical graph and attempt ownership retained until cleanup.
     ///
     /// Present only on an attempt that the distributed Analytical path leased
@@ -1307,6 +1326,7 @@ impl Drop for AdmittedQueryGuard {
         self.live_reservations.clear();
         self.physical_projections.clear();
         self.analytical.take();
+        self.release_root();
         drop(self.resources.take());
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
@@ -1316,6 +1336,32 @@ impl Drop for AdmittedQueryGuard {
 }
 
 impl AdmittedQueryGuard {
+    /// Retains the Interactive physical root this query executes until the
+    /// guard releases, with the profile its operator metrics fold into.
+    ///
+    /// An Analytical root is owned by its graph's metric fold instead, which
+    /// drops it before the graph waits for the envelope's children. An
+    /// attempt executes one root; the first retained root is kept.
+    pub(super) fn retain_root(
+        &mut self,
+        root: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        profile: &Arc<super::profile::QueryProfile>,
+    ) {
+        self.executed
+            .get_or_insert_with(|| (Arc::clone(root), Arc::clone(profile)));
+    }
+
+    /// Folds the executed root's final metrics into its profile and drops
+    /// the root, returning every plan-node reservation to the envelope.
+    ///
+    /// Runs after the query is cancelled, so the metrics are final, and
+    /// before the envelope releases, which refuses surviving children.
+    fn release_root(&mut self) {
+        if let Some((root, profile)) = self.executed.take() {
+            profile.fold_root(root.as_ref());
+        }
+    }
+
     /// Takes the Analytical ownership so the stream can settle it.
     ///
     /// Taking rather than borrowing is deliberate: settlement consumes the two
@@ -1471,16 +1517,14 @@ impl AdmittedQueryGuard {
     ///
     /// Returns [`BifrostError::QueryAdmissionRejected`] when the admitted
     /// envelope has already moved to an Analytical graph.
-    pub(super) fn execution_session(
+    pub(super) fn execution_task(
         &self,
         config: datafusion::prelude::SessionConfig,
-    ) -> Result<datafusion::prelude::SessionContext, BifrostError> {
+    ) -> Result<Arc<datafusion::execution::TaskContext>, BifrostError> {
         let execution = self
             .execution()
             .ok_or(BifrostError::QueryAdmissionRejected)?;
-        Ok(SessionContext::new_with_state(
-            execution.session_state(config),
-        ))
+        Ok(execution.session(config).1)
     }
 
     /// Returns the query-keyed ownership probe after live-tail drain completes.
@@ -1511,6 +1555,7 @@ impl AdmittedQueryGuard {
         self.analytical.take();
         self.live_reservations.clear();
         self.physical_projections.clear();
+        self.release_root();
         drop(self.resources.take());
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
@@ -1555,7 +1600,7 @@ pub(super) fn admitted_guard_for_test()
         .expect("composition must enable the Oracle capability"),
     });
     let tenant = DataTenantId::new_v7();
-    let granted = acquire_waiter_resources(&shared, QueryClass::Interactive, 1.0)
+    let granted = acquire_waiter_resources(&shared, QueryClass::Interactive, 8)
         .expect("the fixture governor grants one Interactive slot");
     let mut state = shared.state.lock().expect("state");
     let index = state.interactive.tenant_index(tenant);
@@ -1581,6 +1626,7 @@ pub(super) fn admitted_guard_for_test()
             ))),
             resources: Some(resources),
             live_reservations: Vec::new(),
+            executed: None,
             cancellation: cancellation.clone(),
             request_cancellation: request_cancellation.clone(),
             distributed_settlement: Arc::new(DistributedQuerySettlement::default()),
@@ -1757,7 +1803,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant,
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -1800,7 +1846,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant,
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -1852,7 +1898,7 @@ pub(in crate::oracle) mod tests {
             .push_back(Waiter {
                 id: 1,
                 deadline: Instant::now() + Duration::from_secs(1),
-                local_ratio: 0.0,
+                target_partitions: 8,
                 tx,
             });
         state.queued = 1;
@@ -1885,7 +1931,7 @@ pub(in crate::oracle) mod tests {
                 .push_back(Waiter {
                     id: number,
                     deadline: Instant::now() + Duration::from_secs(1),
-                    local_ratio: 0.0,
+                    target_partitions: 8,
                     tx,
                 });
             state.queued += 1;
@@ -1917,7 +1963,7 @@ pub(in crate::oracle) mod tests {
         let request = || PreparedAdmission {
             tenant: DataTenantId::new_v7(),
             query_class: QueryClass::Interactive,
-            local_ratio: 0.0,
+            target_partitions: 8,
             deadline: Instant::now() + Duration::from_secs(1),
             cancellation: CancellationToken::new(),
         };
@@ -1958,7 +2004,7 @@ pub(in crate::oracle) mod tests {
                 .push_back(Waiter {
                     id: number,
                     deadline: Instant::now() + Duration::from_secs(1),
-                    local_ratio: 0.0,
+                    target_partitions: 8,
                     tx,
                 });
             state.queued += 1;
@@ -1972,7 +2018,7 @@ pub(in crate::oracle) mod tests {
             .push_back(Waiter {
                 id: 3,
                 deadline: Instant::now() + Duration::from_secs(1),
-                local_ratio: 0.0,
+                target_partitions: 8,
                 tx,
             });
         state.queued += 1;
@@ -2012,7 +2058,7 @@ pub(in crate::oracle) mod tests {
                 .push_back(Waiter {
                     id,
                     deadline: Instant::now() + Duration::from_secs(1),
-                    local_ratio: 0.0,
+                    target_partitions: 8,
                     tx,
                 });
             state.queued += 1;
@@ -2040,7 +2086,7 @@ pub(in crate::oracle) mod tests {
         let request = || PreparedAdmission {
             tenant: DataTenantId::new_v7(),
             query_class: QueryClass::Interactive,
-            local_ratio: 0.0,
+            target_partitions: 8,
             deadline: Instant::now() + Duration::from_secs(2),
             cancellation: CancellationToken::new(),
         };
@@ -2073,7 +2119,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -2084,7 +2130,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: started + Duration::from_millis(20),
                 cancellation: CancellationToken::new(),
             })
@@ -2107,7 +2153,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: caller_one.clone(),
             })
@@ -2120,7 +2166,7 @@ pub(in crate::oracle) mod tests {
                 .admit(PreparedAdmission {
                     tenant: DataTenantId::new_v7(),
                     query_class: QueryClass::Interactive,
-                    local_ratio: 0.0,
+                    target_partitions: 8,
                     deadline: Instant::now() + Duration::from_secs(1),
                     cancellation: caller_two.clone(),
                 })
@@ -2157,7 +2203,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 1.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -2169,7 +2215,7 @@ pub(in crate::oracle) mod tests {
                 .admit(PreparedAdmission {
                     tenant: DataTenantId::new_v7(),
                     query_class: QueryClass::Analytical,
-                    local_ratio: 0.0,
+                    target_partitions: 8,
                     deadline: Instant::now() + Duration::from_secs(1),
                     cancellation: CancellationToken::new(),
                 })
@@ -2212,7 +2258,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -2224,7 +2270,7 @@ pub(in crate::oracle) mod tests {
                 .admit(PreparedAdmission {
                     tenant: DataTenantId::new_v7(),
                     query_class: QueryClass::Interactive,
-                    local_ratio: 0.0,
+                    target_partitions: 8,
                     deadline: Instant::now() + Duration::from_secs(1),
                     cancellation: CancellationToken::new(),
                 })
@@ -2247,7 +2293,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -2270,7 +2316,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -2297,7 +2343,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -2307,7 +2353,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_millis(10),
                 cancellation: CancellationToken::new(),
             })
@@ -2331,7 +2377,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -2345,7 +2391,7 @@ pub(in crate::oracle) mod tests {
                 .admit(PreparedAdmission {
                     tenant: DataTenantId::new_v7(),
                     query_class: QueryClass::Interactive,
-                    local_ratio: 0.0,
+                    target_partitions: 8,
                     deadline: Instant::now() + Duration::from_secs(1),
                     cancellation: request_cancel_for_task,
                 })
@@ -2364,7 +2410,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Interactive,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -2385,7 +2431,7 @@ pub(in crate::oracle) mod tests {
     fn tenant_charge_returns_with_its_resources() {
         let shared = shared(OracleAdmissionConfig::default());
         let tenant = DataTenantId::new_v7();
-        let resources = acquire_waiter_resources(&shared, QueryClass::Interactive, 0.0)
+        let resources = acquire_waiter_resources(&shared, QueryClass::Interactive, 8)
             .expect("the governor seats one Interactive query");
         let resources = {
             let mut state = shared.state.lock().expect("state");
@@ -2423,7 +2469,7 @@ pub(in crate::oracle) mod tests {
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),
                 query_class: QueryClass::Analytical,
-                local_ratio: 0.0,
+                target_partitions: 8,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
             })
@@ -2461,7 +2507,7 @@ pub(in crate::oracle) mod tests {
         let request = PreparedAdmission {
             tenant: DataTenantId::new_v7(),
             query_class: QueryClass::Interactive,
-            local_ratio: 0.0,
+            target_partitions: 8,
             deadline: Instant::now() + Duration::from_secs(1),
             cancellation: CancellationToken::new(),
         };
@@ -2611,13 +2657,13 @@ pub(in crate::oracle) mod tests {
             .resources
             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                 QueryClass::Interactive,
-                0.0,
+                8,
             ))
             .expect("a follower graph envelope charges the one local slot unit");
         let request = || PreparedAdmission {
             tenant: DataTenantId::new_v7(),
             query_class: QueryClass::Interactive,
-            local_ratio: 0.0,
+            target_partitions: 8,
             deadline: Instant::now() + Duration::from_secs(30),
             cancellation: CancellationToken::new(),
         };
@@ -2690,7 +2736,7 @@ pub(in crate::oracle) mod tests {
         class.tenants[index].1.waiters.push_back(Waiter {
             id,
             deadline,
-            local_ratio: 0.0,
+            target_partitions: 8,
             tx,
         });
         state.queued += 1;
@@ -3024,13 +3070,13 @@ pub(in crate::oracle) mod tests {
             resources.clone(),
         );
         let mut held = rejecting
-            .enqueue_waiter(tenant, QueryClass::Interactive, 0.0, deadline)
+            .enqueue_waiter(tenant, QueryClass::Interactive, 8, deadline)
             .expect("first interactive request is admitted");
         let mut waiting = rejecting
-            .enqueue_waiter(tenant, QueryClass::Interactive, 0.0, deadline)
+            .enqueue_waiter(tenant, QueryClass::Interactive, 8, deadline)
             .expect("second interactive request occupies the finite queue");
         let before_rejection = resources.snapshot().expect("pre-rejection root");
-        let rejected = rejecting.enqueue_waiter(tenant, QueryClass::Interactive, 0.0, deadline);
+        let rejected = rejecting.enqueue_waiter(tenant, QueryClass::Interactive, 8, deadline);
         assert!(matches!(rejected, Err(BifrostError::QueryQueueFull)));
         assert_eq!(charged_units(&rejecting.shared).0, 1);
         {
@@ -3061,7 +3107,7 @@ pub(in crate::oracle) mod tests {
         PreparedAdmission {
             tenant: DataTenantId::new_v7(),
             query_class: class,
-            local_ratio: 1.0,
+            target_partitions: 8,
             deadline: Instant::now() + total,
             cancellation,
         }
@@ -3277,7 +3323,7 @@ pub(in crate::oracle) mod tests {
         let request = |query_class: QueryClass, wait: Duration| PreparedAdmission {
             tenant: DataTenantId::new_v7(),
             query_class,
-            local_ratio: 0.0,
+            target_partitions: 8,
             deadline: Instant::now() + wait,
             cancellation: CancellationToken::new(),
         };

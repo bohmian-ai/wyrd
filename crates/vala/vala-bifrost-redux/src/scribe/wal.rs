@@ -1721,6 +1721,33 @@ impl WalSegment {
 
 /// Identifies the only decode failures eligible for tail truncation.
 ///
+/// The newest acknowledgement fence of one WAL shard stream: the segment
+/// and COMMIT LSN of the last batch whose ACK may have been sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NewestFence {
+    /// Sequence of the segment holding the fenced COMMIT.
+    pub(crate) segment_sequence: u64,
+    /// The fenced COMMIT's LSN.
+    pub(crate) lsn: WalLsn,
+}
+
+/// Recovery's view of the acknowledgement fences: the newest fence of one
+/// `(stream, shard)`, or `None` when that stream acknowledged nothing.
+///
+/// Replay consults it only when a shard chain ends in a bad record, to prove
+/// no acknowledged batch lies in the region it discards.
+pub(crate) type FenceLookup<'a> =
+    &'a dyn Fn(StreamIdentity, u8) -> Result<Option<NewestFence>, ScribeError>;
+
+/// Whether `error` is a complete but invalid record: a bad header or a CRC
+/// mismatch. Such a record ends a shard chain when it lies in the
+/// unacknowledged tail one group fsync left incomplete; anywhere else it is
+/// corruption.
+fn is_bad_record_error(error: &ScribeError) -> bool {
+    matches!(error, ScribeError::Internal { detail }
+        if detail.starts_with("invalid WAL v6 record") || detail.starts_with("WAL record CRC mismatch"))
+}
+
 /// A partially written final header, payload, or CRC is a recoverable torn
 /// tail. Structural violations and CRC mismatches in a complete frame are
 /// durable corruption and must fail-stop rather than silently discard data.
@@ -2024,16 +2051,32 @@ impl WalWriter {
         Ok(writer)
     }
 
+    /// The one directory holding this `(node_id, writer_epoch)` stream's
+    /// shard segments; every segment this writer creates lives beneath it.
+    fn stream_dir(&self) -> PathBuf {
+        self.base_dir
+            .join(Uuid::from_bytes(self.node_id).simple().to_string())
+            .join(self.writer_epoch.to_string())
+    }
+
     /// Recover the next segment and LSN counters for the current stream.
     ///
     /// A restarted writer must never recreate an existing decimal segment
     /// filename or reuse an LSN in the same `(node_id, writer_epoch)` stream.
-    /// Older epochs remain replayable but are deliberately excluded from the
-    /// live writer counters.
+    /// Only that stream's own directory is read: older epochs remain
+    /// replayable but are excluded from the live writer counters, so their
+    /// integrity is judged by replay, whose failure is role-local, and never
+    /// by writer construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the stream directory cannot be listed or
+    /// one of its segments cannot be opened or read.
     fn initialize_existing_stream(&self) -> Result<(), ScribeError> {
         let mut paths = Vec::new();
-        if self.base_dir.exists() {
-            collect_segment_paths(&self.base_dir, &mut paths)?;
+        let stream_dir = self.stream_dir();
+        if stream_dir.exists() {
+            collect_segment_paths(&stream_dir, &mut paths)?;
         }
         let mut next_lsn = 0_u64;
         for path in paths {
@@ -2725,11 +2768,7 @@ impl WalWriter {
 
         let seq = state.seg_seq;
         state.seg_seq = state.seg_seq.saturating_add(1);
-        let stream_dir = self
-            .base_dir
-            .join(Uuid::from_bytes(self.node_id).simple().to_string())
-            .join(self.writer_epoch.to_string());
-        let shard_dir = stream_dir.join(format!("shard-{shard_id:02}"));
+        let shard_dir = self.stream_dir().join(format!("shard-{shard_id:02}"));
         std::fs::create_dir_all(&shard_dir).map_err(|error| ScribeError::Internal {
             detail: format!("failed to create WAL shard directory: {error}"),
         })?;
@@ -2868,8 +2907,8 @@ impl ShardRecordCursor {
     ///
     /// Returns [`ScribeError`] when a segment cannot be opened or positioned,
     /// a complete header is invalid, or torn-tail repair cannot be persisted.
-    fn peek_lsn(&mut self) -> Result<Option<WalLsn>, ScribeError> {
-        self.ensure_header()?;
+    fn peek_lsn(&mut self, fences: Option<FenceLookup<'_>>) -> Result<Option<WalLsn>, ScribeError> {
+        self.ensure_header(fences)?;
         Ok(self.header.as_ref().map(|header| header.lsn))
     }
 
@@ -2885,8 +2924,9 @@ impl ShardRecordCursor {
     fn take_record(
         &mut self,
         governor: Option<&ScribeResources>,
+        fences: Option<FenceLookup<'_>>,
     ) -> Result<Option<(PathBuf, WalRecord, Option<ScribeMemoryLease>)>, ScribeError> {
-        self.ensure_header()?;
+        self.ensure_header(fences)?;
         let Some(header) = self.header.take() else {
             return Ok(None);
         };
@@ -2917,6 +2957,10 @@ impl ShardRecordCursor {
                 self.repair_torn_tail()?;
                 return Ok(None);
             }
+            Err(error) if is_bad_record_error(&error) => {
+                self.end_at_bad_record(error, fences)?;
+                return Ok(None);
+            }
             Err(error) => return Err(error),
         };
         if self
@@ -2941,7 +2985,7 @@ impl ShardRecordCursor {
     ///
     /// Returns [`ScribeError`] for open, seek, header validation, or torn-tail
     /// repair failures.
-    fn ensure_header(&mut self) -> Result<(), ScribeError> {
+    fn ensure_header(&mut self, fences: Option<FenceLookup<'_>>) -> Result<(), ScribeError> {
         while self.header.is_none() {
             if self.file.is_none() && !self.open_next_segment()? {
                 return Ok(());
@@ -2965,10 +3009,71 @@ impl ShardRecordCursor {
                     self.segment_retirement_safe = false;
                 }
                 Err(error) if is_torn_tail_error(&error) => self.repair_torn_tail()?,
+                Err(error) if is_bad_record_error(&error) => {
+                    self.end_at_bad_record(error, fences)?;
+                }
                 Err(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    /// Ends this shard chain at the complete but invalid record at
+    /// `record_offset` when it lies in the unacknowledged tail.
+    ///
+    /// One fsync makes a group's SLICE and COMMIT records durable together,
+    /// so a crash during it can leave any of the group's blocks unwritten. No
+    /// batch of that group was acknowledged: its fence commits only after the
+    /// fsync. The record is in that tail when it is in the chain's last
+    /// segment and the stream's newest fence lies before it; the chain is then
+    /// truncated there exactly like a torn tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns `error` when no fence authority is supplied or a later segment
+    /// follows, an error naming the fence when an acknowledged COMMIT lies at
+    /// or beyond the record, or the fence lookup or truncation failure.
+    fn end_at_bad_record(
+        &mut self,
+        error: ScribeError,
+        fences: Option<FenceLookup<'_>>,
+    ) -> Result<(), ScribeError> {
+        let Some(fences) = fences else {
+            return Err(error);
+        };
+        let Some(segment) = self
+            .segments
+            .last()
+            .filter(|_| self.next_segment == self.segments.len())
+        else {
+            return Err(error);
+        };
+        let header = segment.header();
+        let (seg_seq, shard_id) = (header.seg_seq, header.shard_id);
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(Uuid::from_bytes(header.node_id)),
+            crate::scribe::stream_identity::WriterEpoch::new(header.writer_epoch),
+        );
+        let acknowledged = fences(stream, shard_id)?.filter(|fence| {
+            fence.segment_sequence >= seg_seq
+                && self.previous_lsn.is_none_or(|last| fence.lsn > last)
+        });
+        if let Some(fence) = acknowledged {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "WAL v6 bad record precedes acknowledged COMMIT LSN {} in segment {}: {error}",
+                    fence.lsn, fence.segment_sequence
+                ),
+            });
+        }
+        tracing::warn!(
+            segment = ?self.path,
+            offset = self.record_offset,
+            last_lsn = ?self.previous_lsn,
+            %error,
+            "WAL recovery ended a shard chain at its first bad record, in the unacknowledged tail"
+        );
+        self.repair_torn_tail()
     }
 
     /// Opens and positions the next segment in this shard chain.
@@ -3251,7 +3356,7 @@ impl WalReader {
         F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,
     {
         let mut visit = visit;
-        self.for_each_stream_record_accounted(None, None, |stream, shard, accounted| {
+        self.for_each_stream_record_accounted(None, None, None, |stream, shard, accounted| {
             let (path, record, memory) = accounted.into_parts();
             drop(memory);
             visit(stream, shard, path, record).map(|()| false)
@@ -3275,6 +3380,7 @@ impl WalReader {
         &self,
         governor: Option<&ScribeResources>,
         pin_writer: Option<&WalWriter>,
+        fences: Option<FenceLookup<'_>>,
         mut visit: F,
     ) -> Result<(), ScribeError>
     where
@@ -3309,7 +3415,7 @@ impl WalReader {
             loop {
                 let mut selected: Option<(usize, WalLsn)> = None;
                 for (index, (_shard_id, cursor)) in cursors.iter_mut().enumerate() {
-                    let Some(lsn) = cursor.peek_lsn()? else {
+                    let Some(lsn) = cursor.peek_lsn(fences)? else {
                         continue;
                     };
                     if selected.is_none_or(|(_, selected_lsn)| lsn < selected_lsn) {
@@ -3320,7 +3426,8 @@ impl WalReader {
                     break;
                 };
                 let (shard_id, cursor) = &mut cursors[index];
-                let Some((path, record, payload_memory)) = cursor.take_record(governor)? else {
+                let Some((path, record, payload_memory)) = cursor.take_record(governor, fences)?
+                else {
                     continue;
                 };
                 if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
@@ -3523,12 +3630,12 @@ mod tests {
             )
             .expect("complete replay batch");
         let resources =
-            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+            crate::scribe::embedded_scribe_resources(crate::scribe::AdmissionConfig::default());
         let baseline = resources.snapshot().expect("baseline snapshot");
         let reader = WalReader::open_directory_unfiltered(directory.path()).expect("reader");
 
         reader
-            .for_each_stream_record_accounted(Some(&resources), None, |_, _, accounted| {
+            .for_each_stream_record_accounted(Some(&resources), None, None, |_, _, accounted| {
                 let (_, _, payload) = accounted.into_parts();
                 assert!(payload.is_some());
                 Ok(false)
@@ -3543,7 +3650,7 @@ mod tests {
         );
 
         let error = reader
-            .for_each_stream_record_accounted(Some(&resources), None, |_, _, accounted| {
+            .for_each_stream_record_accounted(Some(&resources), None, None, |_, _, accounted| {
                 let (_, _, payload) = accounted.into_parts();
                 assert!(payload.is_some());
                 Err(ScribeError::Internal {
@@ -3566,7 +3673,7 @@ mod tests {
 
         let cancelled = std::sync::atomic::AtomicBool::new(true);
         let _ = reader
-            .for_each_stream_record_accounted(Some(&resources), None, |_, _, accounted| {
+            .for_each_stream_record_accounted(Some(&resources), None, None, |_, _, accounted| {
                 let (_, _, payload) = accounted.into_parts();
                 assert!(payload.is_some());
                 if cancelled.load(std::sync::atomic::Ordering::Acquire) {
@@ -4269,18 +4376,23 @@ mod tests {
         let writer = Arc::new(writer);
         let mut commits = 0_usize;
         let cancelled = reader
-            .for_each_stream_record_accounted(None, Some(writer.as_ref()), |_, _, accounted| {
-                let (_, record, memory) = accounted.into_parts();
-                drop(memory);
-                if record.is_commit() {
-                    commits = commits.saturating_add(1);
-                    writer.retire_segments(std::slice::from_ref(&segment))?;
-                    return Err(ScribeError::Internal {
-                        detail: "injected replay cancellation".to_owned(),
-                    });
-                }
-                Ok(false)
-            })
+            .for_each_stream_record_accounted(
+                None,
+                Some(writer.as_ref()),
+                None,
+                |_, _, accounted| {
+                    let (_, record, memory) = accounted.into_parts();
+                    drop(memory);
+                    if record.is_commit() {
+                        commits = commits.saturating_add(1);
+                        writer.retire_segments(std::slice::from_ref(&segment))?;
+                        return Err(ScribeError::Internal {
+                            detail: "injected replay cancellation".to_owned(),
+                        });
+                    }
+                    Ok(false)
+                },
+            )
             .expect_err("first group cancellation");
         assert!(cancelled.to_string().contains("cancellation"));
         assert_eq!(commits, 1);
@@ -4305,25 +4417,27 @@ mod tests {
             .expect("restart reader");
         let mut restart_commits = 0_usize;
         replay
-            .for_each_stream_record_accounted(None, Some(restarted.as_ref()), |_, _, accounted| {
-                let (_, record, memory) = accounted.into_parts();
-                drop(memory);
-                if record.is_commit() {
-                    restart_commits = restart_commits.saturating_add(1);
-                    if restart_commits == 2 {
-                        let wal = restarted.handle_for_shard(shard)?;
-                        wal.retain_segments(std::slice::from_ref(&segment))?;
-                        wal.retire_segments(std::slice::from_ref(&segment))?;
-                        assert!(segment.path.exists(), "reader pin precedes final unlink");
+            .for_each_stream_record_accounted(
+                None,
+                Some(restarted.as_ref()),
+                None,
+                |_, _, accounted| {
+                    let (_, record, memory) = accounted.into_parts();
+                    drop(memory);
+                    if record.is_commit() {
+                        restart_commits = restart_commits.saturating_add(1);
+                        if restart_commits == 2 {
+                            let wal = restarted.handle_for_shard(shard)?;
+                            wal.retain_segments(std::slice::from_ref(&segment))?;
+                            wal.retire_segments(std::slice::from_ref(&segment))?;
+                            assert!(segment.path.exists(), "reader pin precedes final unlink");
+                        }
                     }
-                }
-                Ok(restart_commits == 2)
-            })
+                    Ok(restart_commits == 2)
+                },
+            )
             .expect("restart replay");
-        assert_eq!(
-            restart_commits, 2,
-            "restart recovers the unread second group"
-        );
+        assert_eq!(restart_commits, 2, "restart recovers the unread group");
         assert!(!segment.path.exists(), "final EOF releases the segment pin");
         restarted
             .handle_for_shard(shard)
@@ -4417,6 +4531,7 @@ mod tests {
             Some(current),
             None,
             Some(&restarted),
+            None,
             None,
             |_| panic!("fully watermarked groups must not be republished"),
         )

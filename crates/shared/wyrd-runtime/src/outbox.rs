@@ -97,6 +97,8 @@ pub struct Outbox<S: OutboxSink> {
     abandon: CancellationToken,
     /// Tracks the writer so shutdown can wait for it.
     writer: TaskTracker,
+    /// The sink the writer submits through, shared for inspection.
+    sink: Arc<S>,
 }
 
 impl<S: OutboxSink> Outbox<S> {
@@ -116,9 +118,10 @@ impl<S: OutboxSink> Outbox<S> {
         let idle = Arc::new(Notify::new());
         let abandon = CancellationToken::new();
         let writer = TaskTracker::new();
+        let sink = Arc::new(sink);
         writer.spawn(
             OutboxWriter {
-                sink: Arc::new(sink),
+                sink: Arc::clone(&sink),
                 requests,
                 waiting: HashMap::new(),
                 failed: HashMap::new(),
@@ -139,7 +142,14 @@ impl<S: OutboxSink> Outbox<S> {
             idle,
             abandon,
             writer,
+            sink,
         })
+    }
+
+    /// Borrows the sink this outbox writes through.
+    #[must_use]
+    pub fn sink(&self) -> &S {
+        &self.sink
     }
 
     /// Queues one item for `tenant` without waiting and never fails.

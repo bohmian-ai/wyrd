@@ -794,8 +794,8 @@ impl OraclePeerWorker {
     ///
     /// A graph runs a whole distributed plan on this node — several stages,
     /// their exchanges, and their spill — so it charges a full query envelope.
-    /// The local ratio is zero because none of the leader's own scan work runs
-    /// here.
+    /// Its sessions run the partitions of a fully remote scan (local ratio
+    /// zero), because none of the leader's own scan work runs here.
     ///
     /// # Errors
     ///
@@ -804,10 +804,15 @@ impl OraclePeerWorker {
     fn acquire_graph_envelope(
         &self,
     ) -> Result<Box<crate::resources::OracleQueryResources>, DispatchError> {
+        let target_partitions = self
+            .oracle_resources
+            .oracle_partitioning()
+            .target_partitions(0.0)
+            .map_err(|_| DispatchError::Capacity)?;
         self.oracle_resources
             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                 QueryClass::Analytical,
-                0.0,
+                target_partitions,
             ))
             .map(Box::new)
             .map_err(|_| DispatchError::Capacity)
@@ -1407,7 +1412,6 @@ impl TonicOraclePeerTransport {
         let channel = if let Some(channel) = cached {
             channel
         } else {
-            let started = std::time::Instant::now();
             let channel = self
                 .tls
                 .endpoint(address.clone())
@@ -1415,7 +1419,6 @@ impl TonicOraclePeerTransport {
                 .connect()
                 .await
                 .map_err(|_| DispatchError::Unavailable)?;
-            super::QueryPhase::PeerConnect.record(started);
             self.channels
                 .lock()
                 .map_err(|_| DispatchError::Terminal)?
@@ -1539,28 +1542,18 @@ impl TonicOraclePeerTransport {
         );
         let mut client = self.client(candidate).await?;
         let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
-        let opened = std::time::Instant::now();
-        let response = client
-            .execute_fragment(wire)
-            .await
-            .inspect(|_| super::QueryPhase::PeerOpen.record(opened))
-            .map_err(|status| {
-                span.record("outcome", "failed");
-                tracing::warn!(parent: &span, code = ?status.code(), "Oracle peer execute rejected");
-                if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
-                    live_execution_status_error(&status)
-                } else {
-                    execution_status_error(&status)
-                }
-            })?;
+        let response = client.execute_fragment(wire).await.map_err(|status| {
+            span.record("outcome", "failed");
+            tracing::warn!(parent: &span, code = ?status.code(), "Oracle peer execute rejected");
+            if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
+                live_execution_status_error(&status)
+            } else {
+                execution_status_error(&status)
+            }
+        })?;
         let mut stream = response.into_inner();
         let output = async_stream::stream! {
-            let streaming = std::time::Instant::now();
-            let mut first = true;
             while let Some(frame) = stream.next().await {
-                if std::mem::take(&mut first) {
-                    super::QueryPhase::PeerFirstFrame.record(streaming);
-                }
                 let frame = frame.map_err(|status| {
                     tracing::warn!(parent: &span, code = ?status.code(), message = status.message(), "Oracle peer worker stream failed");
                     stream_status_error(&status)
@@ -1574,7 +1567,6 @@ impl TonicOraclePeerTransport {
                 yield frame;
             }
             span.record("outcome", "success");
-            super::QueryPhase::PeerTerminal.record(streaming);
         };
         Ok(Box::pin(output))
     }
@@ -2008,7 +2000,7 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::vala::api::{
         AnalyticalGraphRef, ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease,
-        FollowerScanAssignment, OracleCapabilitiesV1, PersistedFileAssignment, TenantTableBinding,
+        FollowerScanAssignment, OracleCapabilitiesV1, TenantTableBinding,
     };
     use wyrd_tonic::tonic::Request;
 
@@ -2057,14 +2049,12 @@ mod tests {
             assignments: vec![FollowerScanAssignment {
                 scan_id: format!("{id}-scan"),
                 binding: binding.clone(),
-                persisted: PersistedFileAssignment { files: Vec::new() },
                 scribe_provider_cut: None,
                 // Canonical 64-lowercase-hex placeholder: the assignment-
                 // authority digest requires this shape even in fixtures that
                 // never exercise object storage.
                 schema_fingerprint: "0".repeat(64),
                 required_columns: vec!["value".to_owned()],
-                predicates: Vec::new(),
             }],
             binding,
             target_role: ClusterRole::Oracle,
@@ -2299,6 +2289,7 @@ mod tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: Some(units),
+                oracle_partition_scan_bytes: None,
                 scratch_root: None,
                 volume_roots: None,
             },
@@ -2322,7 +2313,7 @@ mod tests {
         oracle
             .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
                 QueryClass::Interactive,
-                0.0,
+                8,
             ))
             .map(Box::new)
     }

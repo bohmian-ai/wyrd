@@ -349,7 +349,9 @@ impl ForgeTablePolicy {
     /// Builds the complete core configuration one plan executes under.
     ///
     /// `data_file_prefix` is the attempt identity, which is what makes every
-    /// object an attempt produced attributable to it by path alone. `tenant`
+    /// object an attempt produced attributable to it by path alone.
+    /// `time_column` is the table's time column, which the shared writer recipe
+    /// encodes without a dictionary. `tenant`
     /// is the table binding's tenant, stamped into every output footer.
     /// `planning` is carried only because the core's configuration requires
     /// one; a rewrite reads the execution terms alone.
@@ -363,6 +365,7 @@ impl ForgeTablePolicy {
         &self,
         planning: CompactionPlanningConfig,
         data_file_prefix: String,
+        time_column: &str,
         bloom_columns: &[String],
         max_concurrent_closes: usize,
         tenant: DataTenantId,
@@ -373,9 +376,11 @@ impl ForgeTablePolicy {
             .max_concurrent_closes(max_concurrent_closes)
             .write_parquet_properties(crate::parquet::bifrost_rewrite_writer_properties(
                 self.row_group_target_bytes,
+                time_column,
                 bloom_columns,
                 tenant,
             ))
+            .variant_shredding(crate::parquet::BIFROST_VARIANT_SHREDDING)
             // One runner executes exactly one plan, so the core's own
             // multi-plan concurrency is never used. Memory and spill are left
             // unset here because they come from the attempt's governed
@@ -619,7 +624,7 @@ mod tests {
             iceberg::spec::PartitionSpec::unpartition_spec(),
             iceberg::spec::SortOrder::unsorted_order(),
             location.to_owned(),
-            iceberg::spec::FormatVersion::V2,
+            iceberg::spec::FormatVersion::V3,
             declared,
         )
         .expect("fixture metadata builder")
@@ -674,6 +679,7 @@ mod tests {
             .to_core_config(
                 CompactionPlanningConfig::default(),
                 "attempt".to_owned(),
+                "event_time",
                 &["value".to_owned()],
                 2,
                 wyrd_spec::DataTenantId::new_v7(),

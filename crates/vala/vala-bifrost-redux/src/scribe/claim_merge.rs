@@ -424,7 +424,7 @@ mod tests {
     fn merge_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
             Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
@@ -432,23 +432,10 @@ mod tests {
         ]))
     }
 
-    /// Resolves the hourly layout the fixtures are sorted and merged under.
-    fn merge_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::resolve(
-            "vala.bifrost.test",
-            schema,
-            Some(&crate::tables::hourly_layout(
-                vec![crate::tables::sort_asc("wyrd_event_time")],
-                &["wyrd_event_time"],
-            )),
-        )
-        .expect("fixture schema carries the built-in hourly layout")
-    }
-
     /// Writes one already sorted run and returns its path.
     ///
     /// Rows are given as `(event_time, value)` so a test can place an exact
-    /// tie on `wyrd_event_time` and name each row in the merged output by its
+    /// tie on `event_time` and name each row in the merged output by its
     /// `value`.
     ///
     /// # Panics
@@ -522,7 +509,7 @@ mod tests {
             &[(15, 100), (20, 101), (25, 20), (50, 102)],
         );
         let schema = merge_schema();
-        let layout = merge_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let runs = vec![second, first];
 
         let mut merge =
@@ -567,7 +554,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("merge fixture root");
         let run = write_run(directory.path(), "run-0.parquet", &[(10, 0)]);
         let schema = merge_schema();
-        let layout = merge_layout(schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
         let mut foreign_fields = merge_schema().fields().to_vec();
         foreign_fields.push(Arc::new(Field::new("later_column", DataType::Int32, true)));
         let foreign = Arc::new(Schema::new(foreign_fields));

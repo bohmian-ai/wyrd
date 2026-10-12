@@ -8,7 +8,7 @@ repository = { workspace = true }
 authors = { workspace = true }
 
 [features]
-cloud = ["wyrd-storage/cloud"]
+cloud = ["wyrd-storage/cloud", "vala-bifrost-redux/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
 test-support = [
     "dep:iceberg",
@@ -85,6 +85,7 @@ reqwest = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
 vala-bifrost-redux = { workspace = true }
 wyrd-queue = { workspace = true }
+wyrd-types = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
@@ -108,6 +109,7 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
 [dev-dependencies]
+opendal = { workspace = true }
 workspace-hack.workspace = true
 tracing-subscriber = { workspace = true }
 insta = { workspace = true }

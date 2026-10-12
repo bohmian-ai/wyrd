@@ -1,8 +1,9 @@
 //! Durable `PostgreSQL` coordination for Forge maintenance work.
 //!
 //! [`ForgeTasks`] owns bounded enqueue, fair claim, attempt, watermark,
-//! lifecycle, status, and retention workflows. Claims assign compute only;
-//! they never replace the separate Forge publication lease.
+//! lifecycle, status, and retention workflows. The one active task row of a
+//! table is that table's exclusive Forge authority: claiming it acquires the
+//! table, its heartbeat renews it, and its terminal transition releases it.
 
 // raw-query grep allowlist: Forge task tables post-date the sqlx offline cache and remain confined to OperatorPool/TenantConn.
 
@@ -11,7 +12,7 @@ use sqlx::{AssertSqlSafe, types::Uuid};
 use wyrd_spec::DataTenantId;
 
 use crate::queries::forge_operations::{
-    assert_lease_fence, bind_tenant, lock_table_authority, require_exclusive_authority,
+    bind_tenant, lock_table_authority, require_exclusive_authority,
 };
 use crate::queries::oracle_reader_authority::ExclusiveTableAuthority;
 use crate::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
@@ -591,6 +592,37 @@ impl ForgeTasks {
         exact_one(changed, "heartbeat")
     }
 
+    /// Locks one live claim inside the caller's tenant transaction.
+    ///
+    /// The active task row is its table's exclusive Forge authority, so a
+    /// durable transition fenced by this lock commits only while the exact
+    /// attempt and owner still hold an unexpired claim; the row lock keeps
+    /// reclaim and takeover out until the transaction ends.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Conflict`] when the claim is no longer this live
+    /// attempt's, and [`SqlError::Query`] when the statement fails.
+    ///
+    /// # Cancellation
+    /// Caller-owned transaction rollback releases the row lock.
+    pub async fn lock_live_claim(
+        conn: &mut TenantConn<'_>,
+        task_id: Uuid,
+        attempt: Uuid,
+        owner: Uuid,
+    ) -> Result<(), SqlError> {
+        let live: Option<Uuid> = sqlx::query_scalar("SELECT task_id FROM vala.forge_tasks WHERE task_id=$1 AND data_tenant_id=wyrd.current_tenant() AND state IN ('claimed','running','prepared') AND attempt_id=$2 AND claimed_by=$3 AND claim_expires_at>statement_timestamp() FOR UPDATE")
+            .bind(task_id)
+            .bind(attempt)
+            .bind(owner)
+            .fetch_optional(&mut **conn.transaction())
+            .await
+            .map_err(SqlError::from)?;
+        live.map(|_| ()).ok_or_else(|| SqlError::Conflict {
+            detail: "Forge claim is no longer held by this live attempt".to_owned(),
+        })
+    }
+
     /// Returns an exact Claimed or Running attempt to Retryable, eligible immediately.
     ///
     /// Eligibility is stamped from PostgreSQL's `statement_timestamp()`, the
@@ -715,7 +747,7 @@ impl ForgeTasks {
         evidence: &ForgeTaskEvidence,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
         evidence.validate(false)?;
-        let identity=sqlx::query_as::<_,(String,String,String)>("SELECT catalog_name,namespace_name,table_name FROM vala.forge_tasks WHERE task_id=$1 AND state IN ('running','prepared') AND attempt_id=$2 AND claimed_by=$3 FOR UPDATE").bind(task_id).bind(attempt).bind(owner).fetch_optional(&mut **conn.transaction()).await.map_err(SqlError::from)?.ok_or_else(||SqlError::Conflict{detail:"Forge Prepared transition did not match exact state, attempt, and owner".to_owned()})?;
+        let identity=sqlx::query_as::<_,(String,String,String)>("SELECT catalog_name,namespace_name,table_name FROM vala.forge_tasks WHERE task_id=$1 AND state IN ('running','prepared') AND attempt_id=$2 AND claimed_by=$3 AND claim_expires_at>statement_timestamp() FOR UPDATE").bind(task_id).bind(attempt).bind(owner).fetch_optional(&mut **conn.transaction()).await.map_err(SqlError::from)?.ok_or_else(||SqlError::Conflict{detail:"Forge Prepared transition did not match exact state, attempt, and owner".to_owned()})?;
         let identity =
             ForgeTaskTableIdentity::new(identity.0, identity.1, identity.2).map_err(|_| {
                 SqlError::InvariantViolation {
@@ -769,8 +801,10 @@ impl ForgeTasks {
     ///
     /// Returns conflict unless the transition is an exact Prepared-to-Succeeded
     /// transition for the supplied tenant/table, or Running-to-Succeeded for a
-    /// [`TaskProgressEffect::NoOpAcknowledged`] attempt that planned nothing,
-    /// or returns SQL errors.
+    /// [`TaskProgressEffect::NoOpAcknowledged`] attempt that planned nothing or
+    /// for a `manifest_rewrite` task, or returns SQL errors. A manifest rewrite
+    /// settles from Running because its commit reorganizes metadata only and
+    /// leaves no outputs for Prepared reconciliation to prove.
     ///
     /// # Cancellation
     ///
@@ -782,32 +816,33 @@ impl ForgeTasks {
         table: &ForgeTaskTableIdentity,
         progress_effect: TaskProgressEffect,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
-        // A no-op acknowledgement may have planned nothing, in which case it
-        // never prepared a publication and settles straight from Running.
-        let settles_from_running = transition.expected == ForgeTaskState::Running
-            && matches!(progress_effect, TaskProgressEffect::NoOpAcknowledged { .. });
-        if !(transition.expected == ForgeTaskState::Prepared || settles_from_running)
-            || transition.next != ForgeTaskState::Succeeded
-        {
-            return Err(SqlError::Conflict {
-                detail: "Forge successful continuation requires Prepared-to-Succeeded, or Running-to-Succeeded for a no-op acknowledgement".to_owned(),
-            });
-        }
-        let bound: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM vala.forge_tasks WHERE task_id=$1 AND data_tenant_id=$2 AND catalog_name=$3 AND namespace_name=$4 AND table_name=$5)",
+        let strategy: Option<String> = sqlx::query_scalar(
+            "SELECT strategy FROM vala.forge_tasks WHERE task_id=$1 AND data_tenant_id=$2 AND catalog_name=$3 AND namespace_name=$4 AND table_name=$5",
         )
         .bind(transition.task_id)
         .bind(conn.data_tenant_id().as_uuid())
         .bind(&table.catalog)
         .bind(&table.namespace)
         .bind(&table.table)
-        .fetch_one(&mut **conn.transaction())
+        .fetch_optional(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
-        if !bound {
+        let Some(strategy) = strategy else {
             return Err(SqlError::Conflict {
                 detail: "Forge successful continuation does not match tenant/table binding"
                     .to_owned(),
+            });
+        };
+        // A no-op acknowledgement never prepared a publication, and a manifest
+        // rewrite changes no data, so both settle straight from Running.
+        let settles_from_running = transition.expected == ForgeTaskState::Running
+            && (matches!(progress_effect, TaskProgressEffect::NoOpAcknowledged { .. })
+                || strategy == ForgeTaskStrategy::ManifestRewrite.as_str());
+        if !(transition.expected == ForgeTaskState::Prepared || settles_from_running)
+            || transition.next != ForgeTaskState::Succeeded
+        {
+            return Err(SqlError::Conflict {
+                detail: "Forge successful continuation requires Prepared-to-Succeeded, or Running-to-Succeeded for a no-op acknowledgement or manifest rewrite".to_owned(),
             });
         }
         let outcome = self.terminal(conn, transition).await?;
@@ -857,27 +892,14 @@ impl ForgeTasks {
         self.apply_transition(conn, transition, None).await
     }
 
-    /// Reclaims expired Claimed or Running attempts into Retryable with no audit.
-    /// Prepared is intentionally excluded because it may represent an uncertain external effect.
-    /// A leader-dispatched attempt (its plan names a `dispatch`) closes as
-    /// `cancelled` instead, because the leader alone owns its retry.
-    ///
-    /// # Errors
-    /// Returns SQL errors from the bounded operator update.
-    ///
-    /// # Cancellation
-    /// Reclaim is one bounded statement and cannot commit partial progress.
-    pub async fn reclaim_expired(&self, cap: u32) -> Result<u64, SqlError> {
-        let changed=sqlx::query("WITH victims AS (SELECT task_id FROM vala.forge_tasks WHERE state IN ('claimed','running') AND claim_expires_at<statement_timestamp() ORDER BY claim_expires_at,task_id FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE vala.forge_tasks t SET state=CASE WHEN t.plan->'parameters'->>'dispatch' IS NULL THEN 'retryable' ELSE 'cancelled' END,attempt_count=attempt_count+1,next_eligible_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,ready_at=statement_timestamp()+LEAST(power(2,attempt_count+1)*interval '30 seconds',interval '15 minutes'),updated_at=statement_timestamp() FROM victims v WHERE t.task_id=v.task_id").bind(i64::from(cap)).execute(self.operator_pool.pool()).await.map_err(SqlError::from)?.rows_affected();
-        Ok(changed)
-    }
-
     /// Reclaims expired attempts and returns their exact scratch ownership identities.
     ///
     /// A leader-dispatched attempt closes as `cancelled` rather than
-    /// `retryable`, as in [`Self::reclaim_expired`]; read its dispatch with
-    /// [`Self::cancelled_dispatches`] to tell the leader. Prepared attempts
-    /// remain excluded. The returned identities were captured
+    /// `retryable`, because the leader alone owns its retry; read its dispatch
+    /// with [`Self::cancelled_dispatches`] to tell the leader. Prepared
+    /// attempts are excluded because they may represent an uncertain external
+    /// effect; they pass to a new owner through
+    /// [`Self::claim_prepared_for_reconciliation`]. The returned identities were captured
     /// under the same row locks that cleared durable ownership.
     ///
     /// # Errors
@@ -1161,8 +1183,8 @@ impl ForgeTasks {
     ///
     /// This is the durable half of the per-candidate protocol: it opens and
     /// commits its own short operator transaction. Locks are taken in the
-    /// canonical order — live table lease, exact cleanup task/attempt/current
-    /// owner, cleanup evidence, then the tenant audit chain.
+    /// canonical order — exact live cleanup task/attempt/current owner (the
+    /// table's claim), cleanup evidence, then the tenant audit chain.
     ///
     /// The first preparation of a task copies the immutable plan handoff into
     /// evidence and moves `Running -> Prepared`; every later preparation mutates
@@ -1204,7 +1226,6 @@ impl ForgeTasks {
             .await
             .map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
-        assert_lease_fence(&mut tx, request.authority).await?;
         let locked = lock_cleanup_task(&mut tx, request.authority, request.table).await?;
         let payload = locked.payload()?;
         require_named_candidate(&payload, request.index, request.candidate)?;
@@ -1298,7 +1319,6 @@ impl ForgeTasks {
             .await
             .map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
-        assert_lease_fence(&mut tx, request.authority).await?;
         let locked = lock_cleanup_task(&mut tx, request.authority, request.table).await?;
         lock_table_authority(&mut tx, tenant, request.table).await?;
         let payload = locked.payload()?;
@@ -1388,7 +1408,6 @@ impl ForgeTasks {
             .await
             .map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
-        assert_lease_fence(&mut tx, authority).await?;
         let locked = lock_orphan_task(&mut tx, authority, table).await?;
         let cursor = OrphanCleanupCursor::new(start_after.to_owned());
         OrphanCleanupCursor::from_value(&cursor.to_value(), &locked.prefix, false)?;
@@ -1439,7 +1458,6 @@ impl ForgeTasks {
             .await
             .map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
-        assert_lease_fence(&mut tx, authority).await?;
         lock_orphan_task(&mut tx, authority, table).await?;
         let changed = sqlx::query("UPDATE vala.forge_tasks SET state='succeeded',evidence=NULL,attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class=NULL,next_eligible_at=statement_timestamp(),updated_at=statement_timestamp() WHERE task_id=$1 AND data_tenant_id=wyrd.current_tenant() AND strategy='orphan_cleanup' AND state='running' AND attempt_id=$2 AND claimed_by=$3 AND table_name=$4")
             .bind(authority.task_id)
@@ -1468,7 +1486,7 @@ impl ForgeTasks {
         transition: ForgeTaskTransition,
         evidence: Option<serde_json::Value>,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
-        let changed=sqlx::query("UPDATE vala.forge_tasks SET state=$5,evidence=COALESCE($6,evidence),attempt_id=CASE WHEN $5='prepared' THEN attempt_id ELSE NULL END,claimed_by=CASE WHEN $5='prepared' THEN claimed_by ELSE NULL END,claim_expires_at=CASE WHEN $5='prepared' THEN claim_expires_at ELSE NULL END,watermark_snapshot_id=CASE WHEN $5='prepared' THEN watermark_snapshot_id ELSE NULL END,watermark_timestamp_ms=CASE WHEN $5='prepared' THEN watermark_timestamp_ms ELSE NULL END,updated_at=statement_timestamp() WHERE task_id=$1 AND state=$4 AND attempt_id=$2 AND claimed_by=$3").bind(transition.task_id).bind(transition.attempt_id).bind(transition.owner).bind(transition.expected.as_str()).bind(transition.next.as_str()).bind(&evidence).execute(&mut **conn.transaction()).await.map_err(SqlError::from)?.rows_affected();
+        let changed=sqlx::query("UPDATE vala.forge_tasks SET state=$5,evidence=COALESCE($6,evidence),attempt_id=CASE WHEN $5='prepared' THEN attempt_id ELSE NULL END,claimed_by=CASE WHEN $5='prepared' THEN claimed_by ELSE NULL END,claim_expires_at=CASE WHEN $5='prepared' THEN claim_expires_at ELSE NULL END,watermark_snapshot_id=CASE WHEN $5='prepared' THEN watermark_snapshot_id ELSE NULL END,watermark_timestamp_ms=CASE WHEN $5='prepared' THEN watermark_timestamp_ms ELSE NULL END,updated_at=statement_timestamp() WHERE task_id=$1 AND state=$4 AND attempt_id=$2 AND claimed_by=$3 AND claim_expires_at>statement_timestamp()").bind(transition.task_id).bind(transition.attempt_id).bind(transition.owner).bind(transition.expected.as_str()).bind(transition.next.as_str()).bind(&evidence).execute(&mut **conn.transaction()).await.map_err(SqlError::from)?.rows_affected();
         if changed == 0 && transition.next == ForgeTaskState::Prepared {
             let replay=sqlx::query_as::<_,(String,Option<Uuid>,Option<Uuid>,Option<serde_json::Value>)>("SELECT state,attempt_id,claimed_by,evidence FROM vala.forge_tasks WHERE task_id=$1 FOR UPDATE").bind(transition.task_id).fetch_optional(&mut **conn.transaction()).await.map_err(SqlError::from)?;
             if let Some((state, attempt_id, claimed_by, stored_evidence)) = replay

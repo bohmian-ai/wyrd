@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Verifier
+metadata:
+  name: investigation-drift
+  version: 1.0.0
+  space: default
+spec:
+  implementation:
+    kind: drift
+    spec:
+      method: Custom
+      signal:
+        kind: Metric
+        name: latency
+      condition:
+        kind: Statistical
+      profile:
+        kind: Custom
+        metric_name: latency
+        baseline_value: 1.0
+        alert_threshold: 1.0

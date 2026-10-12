@@ -7,7 +7,7 @@ so a long-lived exporter keeps working after any one token expires. They need
 the ``otel`` extra (``pip install 'wyrd[otel]'``).
 
 ``Run.__enter__``/``__exit__`` delegate here so spans created inside
-``with state.run(...)`` carry the record-level ``wyrd.card_ref`` and
+``with state.run(...)`` carry the record-level ``wyrd.card_uid`` and
 ``wyrd.run_id`` attributes Bifrost extracts. Everything in that path is
 optional and fail-open: without ``opentelemetry-api`` it is a no-op.
 
@@ -35,11 +35,11 @@ else:
     _OTEL_AVAILABLE = True
 
 
-_CARD_REF = "wyrd.card_ref"
+_CARD_UID = "wyrd.card_uid"
 _RUN_ID = "wyrd.run_id"
 
 # The Run scope stack lives entirely in this one context value: a tuple of
-# ``(card_ref, run_id)`` pairs, innermost last. Entry and exit each attach a new
+# ``(card_uid, run_id)`` pairs, innermost last. Entry and exit each attach a new
 # value and never detach, so no token or per-scope state exists outside it.
 _SCOPE_KEY: Any = _otel_context.create_key("wyrd.run_scope") if _OTEL_AVAILABLE else None
 
@@ -49,15 +49,11 @@ _SCOPE_KEY: Any = _otel_context.create_key("wyrd.run_scope") if _OTEL_AVAILABLE 
 # setting the same two attributes again is idempotent.
 _MARKER = "_wyrd_run_correlation"
 
-# Private marker on the provider ``_start_telemetry`` installed, so a repeated
-# start returns it instead of mistaking it for the application's own provider.
-_INSTALLED = "_wyrd_installed"
-
 
 def _scope_stack(parent_context: Any = None) -> tuple[tuple[str, str], ...]:
     """Return the Run scope stack stored in ``parent_context``, or ``()``.
 
-    Only this module writes ``_SCOPE_KEY``, always as ``(card_ref, run_id)`` pairs.
+    Only this module writes ``_SCOPE_KEY``, always as ``(card_uid, run_id)`` pairs.
     """
     stack = _otel_context.get_value(_SCOPE_KEY, parent_context)
     return cast("tuple[tuple[str, str], ...]", stack) if isinstance(stack, tuple) else ()
@@ -74,8 +70,8 @@ class _RunCorrelationProcessor:
         try:
             stack = _scope_stack(parent_context)
             if stack:
-                card_ref, run_id = stack[-1]
-                span.set_attribute(_CARD_REF, card_ref)
+                card_uid, run_id = stack[-1]
+                span.set_attribute(_CARD_UID, card_uid)
                 span.set_attribute(_RUN_ID, run_id)
         except Exception:  # telemetry must never fail the app
             pass
@@ -122,45 +118,45 @@ def install_run_correlation(provider: Any = None) -> bool:
         return False
 
 
-def _enter_run(card_ref: str, run_id: str) -> None:
+def _enter_run(card_uid: str, run_id: str) -> None:
     """Push one Run scope; called by ``Run.__enter__``. Never raises.
 
     Stamps the already-active recording span unless it already carries
-    ``wyrd.card_ref``, so a nested scope never overwrites an outer correlation.
+    ``wyrd.card_uid``, so a nested scope never overwrites an outer correlation.
     """
     if not _OTEL_AVAILABLE:
         return
     try:
         install_run_correlation()
         stack = _scope_stack()
-        _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, (*stack, (card_ref, run_id))))
+        _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, (*stack, (card_uid, run_id))))
         span = _otel_trace.get_current_span()
-        if span.is_recording() and not _carries_card_ref(span):
-            span.set_attribute(_CARD_REF, card_ref)
+        if span.is_recording() and not _carries_card_uid(span):
+            span.set_attribute(_CARD_UID, card_uid)
             span.set_attribute(_RUN_ID, run_id)
     except Exception:  # telemetry must never fail the app
         pass
 
 
-def _carries_card_ref(span: Any) -> bool:
-    """Whether ``span``'s readable attributes already hold ``wyrd.card_ref``."""
+def _carries_card_uid(span: Any) -> bool:
+    """Whether ``span``'s readable attributes already hold ``wyrd.card_uid``."""
     try:
-        return _CARD_REF in span.attributes
+        return _CARD_UID in span.attributes
     except Exception:  # unreadable attributes: stamp as usual
         return False
 
 
-def _exit_run(card_ref: str, run_id: str) -> None:
+def _exit_run(card_uid: str, run_id: str) -> None:
     """Pop this view's Run scope; called by ``Run.__exit__``. Never raises.
 
-    Pops only when the innermost scope is exactly ``(card_ref, run_id)``; a
+    Pops only when the innermost scope is exactly ``(card_uid, run_id)``; a
     mismatched top, empty stack, or failing context call changes nothing.
     """
     if not _OTEL_AVAILABLE:
         return
     try:
         stack = _scope_stack()
-        if stack and stack[-1] == (card_ref, run_id):
+        if stack and stack[-1] == (card_uid, run_id):
             _otel_context.attach(_otel_context.set_value(_SCOPE_KEY, stack[:-1]))
     except Exception:  # telemetry must never fail the app
         pass
@@ -196,9 +192,10 @@ def _endpoint(client: WyrdClient, signal: str) -> str:
 def _start_telemetry(client: WyrdClient) -> Any:
     """Install the global tracer provider exporting spans as ``client``.
 
-    Returns the installed provider, or the one an earlier call installed, so a
-    repeated call is idempotent. Returns ``None`` when the application already
-    installed its own provider; the caller refuses with the catalog error.
+    Returns the installed provider, which the calling state keeps so a repeated
+    start is idempotent and its shutdown flushes it. Returns ``None`` when a
+    global provider is already installed; the caller refuses with the catalog
+    error.
 
     Raises:
         ImportError: naming the ``otel`` extra when the SDK or exporter is absent.
@@ -208,15 +205,11 @@ def _start_telemetry(client: WyrdClient) -> Any:
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
     except ImportError as missing:
         raise ImportError(_EXPORTER_EXTRA) from missing
-    current = _otel_trace.get_tracer_provider()
-    if getattr(current, _INSTALLED, False):
-        return current
-    if not isinstance(current, _otel_trace.ProxyTracerProvider):
+    if not isinstance(_otel_trace.get_tracer_provider(), _otel_trace.ProxyTracerProvider):
         return None
     provider = TracerProvider()
     provider.add_span_processor(BatchSpanProcessor(span_exporter(client)))
     install_run_correlation(provider)
-    setattr(provider, _INSTALLED, True)
     _otel_trace.set_tracer_provider(provider)
     return provider
 

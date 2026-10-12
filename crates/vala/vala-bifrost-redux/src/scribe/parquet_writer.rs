@@ -15,6 +15,7 @@ use arrow::compute::lexsort_to_indices;
 use arrow::compute::take;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use iceberg::writer::file_writer::variant_shredding::VariantLayout;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::RowGroupMetaData;
 use sha2::{Digest, Sha256};
@@ -22,9 +23,10 @@ use wyrd_spec::DataTenantId;
 
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::PhysicalLayout;
-use crate::catalog::layout::TimePartition;
+use crate::catalog::layout::{TimePartition, TimePrecision};
 use crate::contracts::ScribeError;
 use crate::parquet::footer::BifrostFooterIdentity;
+use crate::parquet::variant_residual::{VariantWriter, variant_residual_share};
 use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use crate::resources::ScribeClaimScratch;
 use crate::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES;
@@ -222,9 +224,9 @@ pub struct BoundedParquetArtifact {
 pub struct RowGroupStats {
     /// Number of rows in this row group.
     pub row_count: usize,
-    /// Minimum `wyrd_event_time` timestamp (microseconds since epoch).
+    /// Time-column minimum, floored to epoch microseconds.
     pub min_event_time: Option<i64>,
-    /// Maximum `wyrd_event_time` timestamp (microseconds since epoch).
+    /// Time-column maximum, ceiled to epoch microseconds.
     pub max_event_time: Option<i64>,
 }
 
@@ -293,7 +295,8 @@ pub struct ArtifactPlan<'a> {
 ///
 /// Unlike a frozen generation, a claim has no candidate boundaries: sealing
 /// happens only at the target and at the end, which is what lets several
-/// members share one object.
+/// members share one object. Every object is shredded with `variant_layout`,
+/// the claim's sampled layout.
 ///
 /// # Errors
 ///
@@ -303,9 +306,10 @@ pub struct ArtifactPlan<'a> {
 pub fn encode_ordered_claim(
     plan: ArtifactPlan<'_>,
     memory: &crate::resources::ScribeResources,
+    variant_layout: VariantLayout,
     ordered: impl Iterator<Item = Result<RecordBatch, ScribeError>>,
 ) -> Result<(BoundedParquetArtifactSet, Vec<RowGroupStats>), ScribeError> {
-    let mut roller = RollingArtifactWriter::new(plan);
+    let mut roller = RollingArtifactWriter::new(plan, Some(variant_layout));
     for batch in ordered {
         roller.append_charged_batch(memory, &batch?)?;
     }
@@ -360,7 +364,7 @@ impl<'a> ParquetBatchEncoder<'a> {
     /// Returns [`ScribeError::Internal`] for an invalid binding, Arrow
     /// materialization failure, or an invalid encoded artifact.
     fn encode(self) -> Result<ParquetEncoded, ScribeError> {
-        let mut roller = RollingArtifactWriter::new(self.plan());
+        let mut roller = RollingArtifactWriter::new(self.plan(), None);
         for candidate in &self.candidates {
             let sorted_batch = self.prepare_sorted_candidate(*candidate)?;
             roller.append_charged_batch(&self.memory, &sorted_batch)?;
@@ -423,7 +427,10 @@ struct OpenArtifact {
     object_identity: String,
     /// Scratch file receiving the appended row groups.
     scratch_path: PathBuf,
-    /// Arrow schema every appended row group must carry.
+    /// Logical Arrow schema every appended row group must carry.
+    ///
+    /// The footer identity and fingerprint are taken from this schema, so a
+    /// shredded object keeps the identity of its logical table schema.
     schema: Arc<Schema>,
     /// Open Parquet encoder owning the buffered sink.
     writer: ArrowWriter<BufWriter<std::fs::File>>,
@@ -450,25 +457,36 @@ struct RollingArtifactWriter<'a> {
     artifacts: Vec<BoundedParquetArtifact>,
     /// Footer-derived statistics for every sealed row group in write order.
     row_group_stats: Vec<RowGroupStats>,
+    /// Variant layout every final object is opened and shredded with.
+    ///
+    /// Chosen before the writer opens. `None` writes recovery-stage runs:
+    /// unshredded, and not measured by the residual-share metric.
+    variant_layout: Option<VariantLayout>,
 }
 
 impl<'a> RollingArtifactWriter<'a> {
     /// Starts a rolling writer at the plan's first generation-global ordinal.
-    fn new(plan: ArtifactPlan<'a>) -> Self {
+    ///
+    /// Every artifact opens with `variant_layout` as soon as its first batch
+    /// arrives; no rows are retained to choose it. `None` writes recovery-stage
+    /// runs.
+    fn new(plan: ArtifactPlan<'a>, variant_layout: Option<VariantLayout>) -> Self {
         Self {
             plan,
             next_ordinal: plan.first_ordinal,
             open: None,
             artifacts: Vec::new(),
             row_group_stats: Vec::new(),
+            variant_layout,
         }
     }
 
-    /// Charges one materialized batch's retained bytes while the encoder writes it.
+    /// Charges one materialized batch's retained bytes while it is held.
     ///
     /// The batch is a Wyrd-owned copy (sorted candidate or merge output), so it
     /// holds a Scribe lease for exactly its distinct allocations and no more;
-    /// nothing is admitted for encoder or footer bytes it may later need.
+    /// nothing is admitted for encoder or footer bytes it may later need. The
+    /// lease lasts while the encoder writes the batch.
     ///
     /// # Errors
     ///
@@ -503,31 +521,63 @@ impl<'a> RollingArtifactWriter<'a> {
     /// cannot be opened, the batch cannot be written, or sealing a due
     /// artifact fails.
     fn append_ordered_batch(&mut self, ordered_batch: &RecordBatch) -> Result<(), ScribeError> {
+        if self.open.is_none() {
+            self.open = Some(self.open_artifact(ordered_batch)?);
+        }
+        self.write_open(ordered_batch)?;
+        self.roll_if_due()
+    }
+
+    /// Shreds one batch with the writer's Variant layout, if any, and hands it to the encoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the batch is empty, no artifact is
+    /// open, or the batch cannot be shredded or written.
+    fn write_open(&mut self, ordered_batch: &RecordBatch) -> Result<(), ScribeError> {
         if ordered_batch.num_rows() == 0 {
             return Err(ScribeError::Internal {
                 detail: "Scribe Parquet writer cannot publish an empty batch".to_owned(),
             });
-        }
-        if self.open.is_none() {
-            self.open = Some(self.open_artifact(ordered_batch)?);
         }
         let Some(open) = self.open.as_mut() else {
             return Err(ScribeError::Internal {
                 detail: "Scribe Parquet rolling writer lost its open artifact".to_owned(),
             });
         };
+        let shredded;
+        let batch = match &self.variant_layout {
+            Some(layout) => {
+                shredded = layout
+                    .shred(ordered_batch)
+                    .map_err(|error| variant_error(&error))?;
+                &shredded
+            }
+            None => ordered_batch,
+        };
         open.writer
-            .write(ordered_batch)
+            .write(batch)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("write Scribe Parquet batch: {error}"),
             })?;
         open.rows = open.rows.saturating_add(ordered_batch.num_rows());
+        Ok(())
+    }
+
+    /// Seals the open artifact once its flushed plus buffered bytes reach the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns any [`Self::seal_open_artifact`] error.
+    fn roll_if_due(&mut self) -> Result<(), ScribeError> {
+        let Some(open) = self.open.as_ref() else {
+            return Ok(());
+        };
         let written = open
             .writer
             .bytes_written()
             .saturating_add(open.writer.in_progress_size());
-        let written = u64::try_from(written).unwrap_or(u64::MAX);
-        if written >= self.plan.target_object_bytes {
+        if u64::try_from(written).unwrap_or(u64::MAX) >= self.plan.target_object_bytes {
             self.seal_open_artifact()?;
         }
         Ok(())
@@ -535,13 +585,15 @@ impl<'a> RollingArtifactWriter<'a> {
 
     /// Opens the next artifact for the batch that is about to be written.
     ///
-    /// Bloom sizing is a per-row-group hint, so it is derived from the batch
-    /// that opens the artifact.
+    /// The artifact keeps the batch's logical schema; its encoder is opened
+    /// on the writer's Variant layout's physical schema, or on the logical
+    /// schema for a recovery-stage run.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the ordinal exceeds `u16`, the
-    /// scratch file cannot be created, or the Parquet encoder cannot be built.
+    /// scratch file cannot be created, the layout cannot shred the schema, or
+    /// the Parquet encoder cannot be built.
     fn open_artifact(&mut self, group: &RecordBatch) -> Result<OpenArtifact, ScribeError> {
         let ordinal = u16::try_from(self.next_ordinal).map_err(|_| ScribeError::Internal {
             detail: "Scribe Parquet artifact ordinal exceeds u16".to_owned(),
@@ -556,12 +608,18 @@ impl<'a> RollingArtifactWriter<'a> {
             detail: format!("create Scribe Parquet scratch artifact: {error}"),
         })?;
         let schema = group.schema();
+        let physical = match &self.variant_layout {
+            Some(layout) => layout
+                .physical_schema(&schema)
+                .map_err(|error| variant_error(&error))?,
+            None => Arc::clone(&schema),
+        };
         let writer = ArrowWriter::try_new(
             BufWriter::new(file),
-            Arc::clone(&schema),
+            physical,
             Some(bifrost_writer_properties_with_metadata(
-                group.num_rows(),
                 Vec::new(),
+                self.plan.layout.time_column(),
                 self.plan.layout.bloom_columns(),
             )),
         )
@@ -623,6 +681,7 @@ impl<'a> RollingArtifactWriter<'a> {
             &scratch_path,
             schema.as_ref(),
             &object_identity,
+            self.plan.layout.time_column(),
             self.plan.tenant,
             file_size,
         )?;
@@ -630,7 +689,11 @@ impl<'a> RollingArtifactWriter<'a> {
             row_group_stats,
             data_file_metrics,
             schema_fingerprint,
+            variant_residual_share,
         } = evidence;
+        if self.variant_layout.is_some() {
+            VariantWriter::Scribe.record(variant_residual_share);
+        }
         self.row_group_stats.extend(row_group_stats.iter().cloned());
         self.artifacts.push(BoundedParquetArtifact {
             ordinal,
@@ -646,7 +709,7 @@ impl<'a> RollingArtifactWriter<'a> {
         Ok(())
     }
 
-    /// Seals any residue and returns the ordered artifacts and their statistics.
+    /// Seals any residue and returns the ordered artifacts.
     ///
     /// # Errors
     ///
@@ -655,6 +718,13 @@ impl<'a> RollingArtifactWriter<'a> {
     fn finish(mut self) -> Result<(Vec<BoundedParquetArtifact>, Vec<RowGroupStats>), ScribeError> {
         self.seal_open_artifact()?;
         Ok((self.artifacts, self.row_group_stats))
+    }
+}
+
+/// Maps an Iceberg Variant shredding failure to a Scribe internal error.
+fn variant_error(error: &iceberg::Error) -> ScribeError {
+    ScribeError::Internal {
+        detail: format!("Scribe Variant shredding: {error}"),
     }
 }
 
@@ -716,18 +786,20 @@ fn sort_batch(batch: &RecordBatch, layout: &PhysicalLayout) -> Result<RecordBatc
 /// metrics are taken from that single read rather than from two passes that
 /// could disagree.
 struct SealedArtifactEvidence {
-    /// Per-row-group event-time statistics in write order.
+    /// Per-row-group time-column statistics in write order.
     row_group_stats: Vec<RowGroupStats>,
     /// Iceberg-ready metrics for the whole object.
     data_file_metrics: crate::scribe::promotion::ScribeDataFileV1,
     /// Lowercase hex Wyrd schema fingerprint the footer carries.
     schema_fingerprint: String,
+    /// Share of the object's Variant bytes left in residual `value` leaves.
+    variant_residual_share: Option<f64>,
 }
 
 /// Validates one sealed artifact and returns everything its footer proves.
 ///
 /// The footer must parse, carry this artifact's schema fingerprint and object
-/// identity, and give every row group event-time statistics. Row-group and
+/// identity, and give every row group time-column statistics. Row-group and
 /// footer sizes are not checked: they follow from soft writer targets, and a
 /// large accepted row is valid data rather than a defect.
 ///
@@ -740,6 +812,7 @@ fn inspect_sealed_artifact(
     path: &Path,
     expected_schema: &Schema,
     expected_object_identity: &str,
+    time_column: &str,
     tenant: DataTenantId,
     file_size: u64,
 ) -> Result<SealedArtifactEvidence, ScribeError> {
@@ -756,10 +829,17 @@ fn inspect_sealed_artifact(
     BifrostFooterIdentity::new(expected_schema, expected_object_identity, tenant)
         .and_then(|identity| identity.verify(metadata.file_metadata()))
         .map_err(|detail| ScribeError::Internal { detail })?;
+    let precision = expected_schema
+        .field_with_name(time_column)
+        .ok()
+        .and_then(|field| TimePrecision::of(field.data_type()))
+        .ok_or_else(|| ScribeError::Internal {
+            detail: format!("artifact schema has no time column {time_column}"),
+        })?;
     let mut row_group_stats = Vec::new();
 
     for rg in metadata.row_groups() {
-        row_group_stats.push(extract_row_group_time_range(rg)?);
+        row_group_stats.push(extract_row_group_time_range(rg, time_column, precision)?);
     }
 
     let data_file_metrics = derive_data_file_metrics(
@@ -774,6 +854,7 @@ fn inspect_sealed_artifact(
         schema_fingerprint: hex::encode(
             crate::schema::SchemaFingerprint::from_arrow_schema_exact(expected_schema).0,
         ),
+        variant_residual_share: variant_residual_share(metadata, expected_schema),
     })
 }
 
@@ -841,53 +922,40 @@ fn checksum_file(path: &Path) -> Result<String, ScribeError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Extract min/max event time from a single row group.
+/// Extracts one row group's row count and inclusive time-column interval.
+///
+/// The interval is read from the footer's typed `INT64` statistics of the
+/// top-level `time_column` leaf and narrowed to epoch microseconds through
+/// `precision`, so a nanosecond column yields the same conservative interval
+/// every other reader derives.
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] if column stats are missing.
-fn extract_row_group_time_range(rg: &RowGroupMetaData) -> Result<RowGroupStats, ScribeError> {
-    // Parquet row-group `num_rows()` is i64; RowGroupStats.row_count is usize.
-    // A negative row count would be a Parquet-writer invariant violation.
+/// Returns [`ScribeError::Internal`] when the row count is negative or the
+/// time column is absent from the row group or carries no `INT64` statistics.
+fn extract_row_group_time_range(
+    rg: &RowGroupMetaData,
+    time_column: &str,
+    precision: TimePrecision,
+) -> Result<RowGroupStats, ScribeError> {
     let row_count = usize::try_from(rg.num_rows()).map_err(|_| ScribeError::Internal {
         detail: format!("row group has invalid num_rows: {}", rg.num_rows()),
     })?;
-
-    // Find wyrd_event_time column index (column order matches Arrow schema order)
     let time_col = rg
         .columns()
         .iter()
-        .find(|col| col.column_descr().name() == "wyrd_event_time")
+        .find(|col| col.column_descr().path().parts() == [time_column])
         .ok_or_else(|| ScribeError::Internal {
-            detail: "wyrd_event_time column not found in row group".to_string(),
+            detail: format!("time column {time_column} not found in row group"),
         })?;
-
-    let stats = time_col.statistics().ok_or_else(|| ScribeError::Internal {
-        detail: "wyrd_event_time column has no statistics".to_string(),
-    })?;
-
-    // Extract min/max as i64 (TimestampMicrosecondType)
-    let min = if let Some(min_val) = stats.min_bytes_opt() {
-        min_val.get(0..8).and_then(|b| {
-            let arr: [u8; 8] = b.try_into().ok()?;
-            Some(i64::from_le_bytes(arr))
-        })
-    } else {
-        None
+    let Some(parquet::file::statistics::Statistics::Int64(stats)) = time_col.statistics() else {
+        return Err(ScribeError::Internal {
+            detail: format!("time column {time_column} has no INT64 statistics"),
+        });
     };
-
-    let max = if let Some(max_val) = stats.max_bytes_opt() {
-        max_val.get(0..8).and_then(|b| {
-            let arr: [u8; 8] = b.try_into().ok()?;
-            Some(i64::from_le_bytes(arr))
-        })
-    } else {
-        None
-    };
-
     Ok(RowGroupStats {
         row_count,
-        min_event_time: min,
-        max_event_time: max,
+        min_event_time: stats.min_opt().map(|min| precision.floor_micros(*min)),
+        max_event_time: stats.max_opt().map(|max| precision.ceil_micros(*max)),
     })
 }
 
@@ -1028,30 +1096,6 @@ mod tests {
         assert_candidates_cover_batches_within_bounds(&second.1, &second_candidates);
     }
 
-    /// Builds the canonical hourly write recipe for a test schema.
-    ///
-    /// Tests exercise the same resolution path production uses: declare the
-    /// built-in hourly layout, then let `PhysicalLayout::resolve` union the
-    /// managed Bloom floor.
-    ///
-    /// The fixture schema carries none of the floor columns, so the Bloom
-    /// intent is declared explicitly. `wyrd_event_time` is a legal declared
-    /// Bloom column and is not constant within a file.
-    ///
-    /// # Panics
-    /// Panics when the schema cannot carry the built-in declaration.
-    fn test_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::resolve(
-            "vala.bifrost.test",
-            schema,
-            Some(&crate::tables::hourly_layout(
-                vec![crate::tables::sort_asc("wyrd_event_time")],
-                &["wyrd_event_time"],
-            )),
-        )
-        .expect("test schema carries the built-in hourly layout")
-    }
-
     fn build_test_frozen(
         seal_partition: TimePartition,
         seal_tenant: DataTenantId,
@@ -1061,7 +1105,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("service", DataType::Utf8, false),
             Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
@@ -1088,6 +1132,7 @@ mod tests {
             shard_id: 0,
             schema: Arc::clone(&schema),
             batches: vec![batch],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1102,7 +1147,7 @@ mod tests {
         tenant: DataTenantId,
     ) -> (tempfile::TempDir, ParquetEncoded) {
         let scratch = tempfile::tempdir().expect("test scratch");
-        let layout = test_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let encoded = encode_batch(
             frozen,
             binding,
@@ -1121,7 +1166,7 @@ mod tests {
         let row_count = i64::try_from(rows).expect("test row count fits i64");
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             )])),
@@ -1139,7 +1184,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let day = crate::test_support::day_partition(2026, 7, 14);
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]));
@@ -1156,6 +1201,7 @@ mod tests {
                 whole_member_batch(0, 60 * 1024),
                 whole_member_batch(60 * 1024, 50 * 1024),
             ],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1184,7 +1230,7 @@ mod tests {
     /// either, so the encoded size tracks the row count.
     fn incompressible_frozen(tenant: DataTenantId, rows: usize) -> FrozenMemtable {
         let mut fields = vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )];
@@ -1223,6 +1269,7 @@ mod tests {
             shard_id: 1,
             schema,
             batches: vec![batch],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1238,7 +1285,7 @@ mod tests {
         scratch_dir: &Path,
         target_object_bytes: u64,
     ) -> Result<ParquetEncoded, ScribeError> {
-        let layout = test_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         ParquetBatchEncoder {
             frozen,
             binding,
@@ -1672,7 +1719,7 @@ mod tests {
             .expect("encoded row group")
             .expect("encoded batch");
         let times = batch
-            .column_by_name("wyrd_event_time")
+            .column_by_name("event_time")
             .expect("event time")
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -1705,7 +1752,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("service", DataType::Utf8, false),
             Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
                 false,
             ),
@@ -1728,6 +1775,7 @@ mod tests {
             shard_id: 0,
             schema: Arc::clone(&schema),
             batches: vec![batch],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1809,7 +1857,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let day = crate::test_support::day_partition(2026, 7, 14);
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
+            "event_time",
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         )]));
@@ -1830,6 +1878,7 @@ mod tests {
             shard_id: 4,
             schema: Arc::clone(&schema),
             batches: vec![stored_batch(vec![40, 10]), stored_batch(vec![30, 20])],
+            statistics: Vec::new(),
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1849,7 +1898,7 @@ mod tests {
         assert_encoded_rows(&encoded, tenant, &[10, 20, 30, 40]);
 
         let mismatch_scratch = tempfile::tempdir().expect("mismatch scratch");
-        let layout = test_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let error = encode_batch(
             &frozen,
             &binding,
@@ -1915,7 +1964,7 @@ mod tests {
             .unwrap();
 
         let time_col = batch
-            .column_by_name("wyrd_event_time")
+            .column_by_name("event_time")
             .unwrap()
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -1964,7 +2013,7 @@ mod tests {
         let col = rg
             .columns()
             .iter()
-            .find(|column| column.column_descr().name() == "wyrd_event_time")
+            .find(|column| column.column_descr().name() == "event_time")
             .unwrap();
         assert!(
             col.bloom_filter_offset().is_some(),
@@ -2027,7 +2076,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("service", DataType::Utf8, false),
             arrow::datatypes::Field::new(
-                "wyrd_event_time",
+                "event_time",
                 DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
                 false,
             ),
@@ -2041,7 +2090,7 @@ mod tests {
         )
         .unwrap();
 
-        let layout = test_layout(batch.schema().as_ref());
+        let layout = crate::tables::hourly_test_layout(batch.schema().as_ref());
         let sorted = sort_batch(&batch, &layout).unwrap();
         let services = sorted
             .column_by_name("service")
@@ -2050,7 +2099,7 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         let times = sorted
-            .column_by_name("wyrd_event_time")
+            .column_by_name("event_time")
             .unwrap()
             .as_any()
             .downcast_ref::<TimestampMicrosecondArray>()
@@ -2062,7 +2111,7 @@ mod tests {
 
     /// A real sealed file proves the writer recipe on its own footer rather
     /// than on the builder that produced it: the low-cardinality
-    /// `service` column encodes through a dictionary, `wyrd_event_time`
+    /// `service` column encodes through a dictionary, `event_time`
     /// encodes as `DELTA_BINARY_PACKED` with no dictionary page, and every row
     /// decodes back exactly as written.
     #[test]
@@ -2103,16 +2152,16 @@ mod tests {
                         "low-cardinality {name} must be dictionary-encoded, saw {encodings:?}"
                     );
                 }
-                if name == "wyrd_event_time" {
+                if name == "event_time" {
                     saw_event_time = true;
                     assert!(
                         encodings.contains(&parquet::basic::Encoding::DELTA_BINARY_PACKED),
-                        "wyrd_event_time must be DELTA_BINARY_PACKED, saw {encodings:?}"
+                        "event_time must be DELTA_BINARY_PACKED, saw {encodings:?}"
                     );
                     assert!(
                         !encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
                             && !encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
-                        "wyrd_event_time must not carry a dictionary page, saw {encodings:?}"
+                        "event_time must not carry a dictionary page, saw {encodings:?}"
                     );
                 }
             }
@@ -2134,7 +2183,7 @@ mod tests {
         let mut decoded_times = Vec::with_capacity(decoded_rows);
         for batch in &batches {
             let column = batch
-                .column_by_name("wyrd_event_time")
+                .column_by_name("event_time")
                 .expect("decoded event-time column")
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
@@ -2158,7 +2207,7 @@ mod tests {
             TenantTableBinding::resolve((binding_tenant, frozen.seal_key.table.clone())).unwrap();
 
         let scratch = tempfile::tempdir().unwrap();
-        let layout = test_layout(frozen.schema.as_ref());
+        let layout = crate::tables::hourly_test_layout(frozen.schema.as_ref());
         let error = encode_batch(
             &frozen,
             &binding,
@@ -2172,5 +2221,283 @@ mod tests {
         assert!(
             matches!(error, ScribeError::Internal { detail } if detail.contains("binding mismatch"))
         );
+    }
+
+    /// One staged run of `rows` Variant values parsed from `json`, one per row.
+    ///
+    /// Event times start at `first_timestamp`, so runs merge in order.
+    fn variant_run(first_timestamp: i64, json: &[&str]) -> RecordBatch {
+        let json: arrow::array::ArrayRef = Arc::new(StringArray::from(json.to_vec()));
+        let variant: arrow::array::ArrayRef = parquet_variant_compute::json_to_variant(&json)
+            .expect("valid JSON")
+            .into();
+        let variant = arrow::compute::cast(&variant, &wyrd_types::variant::variant_storage_type())
+            .expect("Variant storage casts to the stored shape");
+        let rows = i64::try_from(json.len()).expect("test row count fits i64");
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(
+                    "event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+                wyrd_types::variant::variant_field("v", true),
+            ])),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from_iter_values(
+                    first_timestamp..first_timestamp + rows,
+                )),
+                variant,
+            ],
+        )
+        .expect("variant run")
+    }
+
+    /// The `typed_value` field names of column `v` in one sealed artifact, and its JSON values.
+    fn read_variant_artifact(path: &Path) -> (Vec<String>, Vec<String>) {
+        let file = std::fs::File::open(path).expect("sealed artifact");
+        let batches = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("artifact reader")
+            .build()
+            .expect("artifact batches")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("artifact rows");
+        let batch = concat_batches(&batches[0].schema(), &batches).expect("artifact batch");
+        let column = batch.column_by_name("v").expect("variant column");
+        let variant = parquet_variant_compute::VariantArray::try_new(column.as_ref())
+            .expect("variant storage");
+        let shredded = match variant.typed_value_column().map(|typed| typed.data_type()) {
+            Some(DataType::Struct(fields)) => fields.iter().map(|f| f.name().clone()).collect(),
+            _ => Vec::new(),
+        };
+        let logical: arrow::array::ArrayRef = parquet_variant_compute::unshred_variant(&variant)
+            .expect("unshred")
+            .into();
+        let json = parquet_variant_compute::variant_to_json(&logical).expect("variant JSON");
+        (
+            shredded,
+            json.iter()
+                .map(|value| value.expect("non-null").to_owned())
+                .collect(),
+        )
+    }
+
+    /// The claim plan these tests seal under for `tenant`, with a target no test reaches.
+    fn claim_plan<'a>(
+        scratch: &'a Path,
+        layout: &'a PhysicalLayout,
+        tenant: DataTenantId,
+    ) -> ArtifactPlan<'a> {
+        ArtifactPlan {
+            scratch_dir: scratch,
+            object_base: "s3://bucket/table/day=2026-07-14/scribe-claim-0",
+            layout,
+            first_ordinal: 0,
+            target_object_bytes: u64::MAX,
+            tenant,
+        }
+    }
+
+    /// Encodes `batch` as one recovery-stage run and returns its scratch and artifact paths.
+    fn recovery_run(
+        batch: &RecordBatch,
+        tenant: DataTenantId,
+    ) -> (tempfile::TempDir, Vec<PathBuf>) {
+        let binding = TenantTableBinding::resolve((
+            tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "events"),
+        ))
+        .expect("tenant binding");
+        let frozen = FrozenMemtable {
+            seal_id: 0,
+            seal_key: SealKey::new(
+                tenant,
+                TableRef::new(BifrostNamespace::Bifrost, "events"),
+                crate::test_support::day_partition(2026, 7, 14),
+            ),
+            shard_id: 0,
+            schema: batch.schema(),
+            batches: vec![batch.clone()],
+            statistics: Vec::new(),
+            metas: vec![],
+            opened_at: std::time::Instant::now(),
+            closed_at: std::time::Instant::now(),
+            arrow_bytes: 0,
+        };
+        let (scratch, encoded) = encode_for_test(&frozen, &binding, tenant);
+        let paths = encoded
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.scratch_path.clone())
+            .collect();
+        (scratch, paths)
+    }
+
+    /// Samples the claim over `runs` and encodes their rows into final objects.
+    fn encode_sampled_claim(
+        runs: &[PathBuf],
+        batches: &[RecordBatch],
+        scratch: &Path,
+        tenant: DataTenantId,
+    ) -> BoundedParquetArtifactSet {
+        let schema = batches[0].schema();
+        let claim =
+            crate::scribe::assembly::StagingClaimId::from_hex(&"07".repeat(32)).expect("claim id");
+        let variant_layout =
+            crate::scribe::claim_sample::ClaimVariantSample::new(claim, runs, &schema)
+                .layout()
+                .expect("claim sample");
+        let layout = crate::tables::hourly_test_layout(schema.as_ref());
+        encode_ordered_claim(
+            claim_plan(scratch, &layout, tenant),
+            &crate::resources::ScribeResources::for_test(),
+            variant_layout,
+            batches.iter().cloned().map(Ok),
+        )
+        .expect("claim encodes")
+        .0
+    }
+
+    /// Recovery-stage runs stay unshredded; the final object takes the claim's sampled layout.
+    ///
+    /// The two runs hold values that alone would shred different fields (`a`
+    /// only, `b` only). Each run's `encode_batch` artifact has no
+    /// `typed_value`, so the runs merge under one exact schema; the claim
+    /// sample over both runs shreds `a` and `b`, and the final object reads
+    /// back every value unchanged.
+    #[test]
+    fn recovery_runs_are_unshredded_and_the_claim_sample_shreds() {
+        let tenant = DataTenantId::new_v7();
+        let first = variant_run(1, &[r#"{"a":1}"#, r#"{"a":2}"#]);
+        let second = variant_run(3, &[r#"{"b":"x"}"#, r#"{"b":"y"}"#]);
+        let (_first_scratch, mut runs) = recovery_run(&first, tenant);
+        let (_second_scratch, second_runs) = recovery_run(&second, tenant);
+        runs.extend(second_runs);
+        for run in &runs {
+            let (shredded, _) = read_variant_artifact(run);
+            assert!(shredded.is_empty(), "a recovery run is never shredded");
+        }
+
+        let scratch = tempfile::tempdir().expect("claim scratch");
+        let artifacts = encode_sampled_claim(&runs, &[first, second], scratch.path(), tenant);
+        assert_eq!(artifacts.len(), 1, "one final hot object");
+        let (shredded, values) = read_variant_artifact(&artifacts[0].scratch_path);
+        assert_eq!(shredded, ["a", "b"]);
+        assert_eq!(
+            values,
+            [r#"{"a":1}"#, r#"{"a":2}"#, r#"{"b":"x"}"#, r#"{"b":"y"}"#]
+        );
+    }
+
+    /// Re-running the same claim picks the same sample and writes byte-identical objects.
+    #[test]
+    fn rerun_claim_writes_byte_identical_objects() {
+        let tenant = DataTenantId::new_v7();
+        let json: Vec<String> = (0..5_000)
+            .map(|row| match row % 3 {
+                0 => format!(r#"{{"a":{row}}}"#),
+                1 => format!(r#"{{"b":"{row}","c":{row}}}"#),
+                _ => format!(r#"{{"a":"{row}"}}"#),
+            })
+            .collect();
+        let json: Vec<&str> = json.iter().map(String::as_str).collect();
+        let batch = variant_run(1, &json);
+        let (_run_scratch, runs) = recovery_run(&batch, tenant);
+
+        let checksums = || {
+            let scratch = tempfile::tempdir().expect("claim scratch");
+            encode_sampled_claim(&runs, std::slice::from_ref(&batch), scratch.path(), tenant)
+                .iter()
+                .map(|artifact| artifact.checksum.clone())
+                .collect::<Vec<_>>()
+        };
+        let first = checksums();
+        assert!(!first.is_empty());
+        assert_eq!(first, checksums(), "a re-run claim writes the same bytes");
+    }
+
+    /// Final objects record the residual-share metric; recovery runs do not.
+    #[test]
+    fn final_objects_record_residual_share_and_recovery_runs_do_not() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let tenant = DataTenantId::new_v7();
+        let batch = variant_run(1, &[r#"{"a":1}"#, r#"{"a":2}"#]);
+        metrics::with_local_recorder(&recorder, || {
+            let (_run_scratch, runs) = recovery_run(&batch, tenant);
+            assert!(
+                !recorder
+                    .snapshot()
+                    .contains_family("bifrost_variant_residual_share"),
+                "a recovery run is not measured"
+            );
+            let scratch = tempfile::tempdir().expect("claim scratch");
+            encode_sampled_claim(&runs, std::slice::from_ref(&batch), scratch.path(), tenant);
+        });
+        let snapshot = recorder.snapshot();
+        let samples: Vec<_> = snapshot
+            .histograms
+            .iter()
+            .filter(|(series, _)| series.contains("bifrost_variant_residual_share"))
+            .collect();
+        assert_eq!(samples.len(), 1, "one writer series: {samples:?}");
+        assert!(samples[0].0.contains("scribe"), "{samples:?}");
+        assert_eq!(samples[0].1.count, 1, "one final object");
+    }
+
+    /// Row-group bounds are read from the table's own time column, and a
+    /// nanosecond column narrows to the microsecond interval containing it.
+    ///
+    /// The fixture also carries an unrelated earlier timestamp, so a reader
+    /// keyed on any other column would report the wrong interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot be encoded or the bounds are not the
+    /// floored minimum and ceiled maximum of `start_time_unix_nano`.
+    #[test]
+    fn row_group_bounds_read_the_time_column() {
+        let time_column = "start_time_unix_nano";
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                time_column,
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                false,
+            ),
+            Field::new(
+                "wyrd_ingested_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(
+                    arrow::array::TimestampNanosecondArray::from(vec![1_500_i64, 7_001])
+                        .with_timezone("+00:00"),
+                ),
+                Arc::new(TimestampMicrosecondArray::from(vec![0_i64, 0]).with_timezone("+00:00")),
+            ],
+        )
+        .expect("time-column fixture");
+        let mut bytes = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            &mut bytes,
+            Arc::clone(&schema),
+            Some(crate::parquet::writer_properties::bifrost_writer_properties(time_column, &[])),
+        )
+        .expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let reader = SerializedFileReader::new(bytes::Bytes::from(bytes)).expect("footer");
+        let stats = extract_row_group_time_range(
+            reader.metadata().row_group(0),
+            time_column,
+            TimePrecision::Nanos,
+        )
+        .expect("the time column carries INT64 statistics");
+        assert_eq!(stats.row_count, 2);
+        assert_eq!(stats.min_event_time, Some(1));
+        assert_eq!(stats.max_event_time, Some(8));
     }
 }

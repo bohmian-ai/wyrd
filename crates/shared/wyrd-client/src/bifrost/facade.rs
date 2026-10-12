@@ -17,10 +17,13 @@ use crate::environment::Environment;
 use crate::error::WyrdClientError;
 use crate::global_config::GlobalConfig;
 use arrow::datatypes::SchemaRef;
+use arrow::json::WriterBuilder;
+use arrow::json::writer::JsonArray;
 use arrow::record_batch::RecordBatch;
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 use wyrd_queue::QueueConfig;
+use wyrd_queue::variant::WyrdJsonEncoderFactory;
 #[cfg(feature = "internal")]
 use wyrd_queue::{BatchSink, ClientByteGuard, DurableBatchAck, SealedBatch, SinkError};
 use wyrd_spec::request_id::RequestId;
@@ -477,7 +480,7 @@ impl Bifrost {
                 table.fqn(),
                 table.user_schema(),
                 row,
-                correlation.card_ref,
+                correlation.card_uid,
                 correlation.run_id,
             )
             .map_err(Into::into)
@@ -511,30 +514,23 @@ impl Bifrost {
         rows: Vec<Vec<u8>>,
         correlation: Correlation,
     ) -> Result<(), BifrostClientError> {
-        self.writer
-            .insert_rows(
-                table.fqn(),
-                table.user_schema(),
-                rows,
-                correlation.card_ref,
-                correlation.run_id,
-                None,
-            )
-            .map_err(Into::into)
+        self.insert_observation(table, rows, correlation)
     }
 
     /// Enqueue every JSON row of one observation into a described table, or
-    /// none of them, stamped with this client's clock at emit.
+    /// none of them.
     ///
-    /// The observation counterpart to [`Self::insert_rows_into`]: every row
-    /// gets one `wyrd_event_time` read now, so batching, linger, retry, and
-    /// flush never move it. A row whose own JSON carries `wyrd_event_time`
-    /// keeps that value. Plain writes stay unstamped and take the server's
-    /// receipt instant.
+    /// The crate-owned path behind [`Self::insert_rows_into`] that `observe`
+    /// emits through without the `internal` feature. Each row carries its own
+    /// time column, such as `created_at`, which the observation projection
+    /// mints at emit, so batching, linger, retry, and flush never move it.
     ///
     /// # Errors
     ///
-    /// As [`Self::insert_rows_into`].
+    /// Returns [`BifrostClientError::Queue`] with `WYRD_CLIENT_429_QUEUE_FULL`
+    /// when the producer cannot admit every row now, and with
+    /// `WYRD_CLIENT_413_PAYLOAD_TOO_LARGE` when the record has more rows than
+    /// one producer can ever admit at once.
     pub(crate) fn insert_observation(
         &self,
         table: &WriterTable,
@@ -546,9 +542,8 @@ impl Bifrost {
                 table.fqn(),
                 table.user_schema(),
                 rows,
-                correlation.card_ref,
+                correlation.card_uid,
                 correlation.run_id,
-                Some(chrono::Utc::now().timestamp_micros()),
             )
             .map_err(Into::into)
     }
@@ -598,7 +593,7 @@ impl Bifrost {
                 &table,
                 &schema,
                 row,
-                correlation.card_ref,
+                correlation.card_uid,
                 correlation.run_id,
             )
             .map_err(Into::into)
@@ -610,7 +605,7 @@ impl Bifrost {
     /// express — binary payloads, fixed-size identities, and nested list or
     /// struct columns — which is what the canonical signal tables are made of.
     /// Build the batch from the table's own published contract
-    /// ([`Self::describe_table`] plus `wyrd_queue::schema::writable_schema`) rather
+    /// ([`Self::describe_table`] plus `wyrd_types::schema::writable_schema`) rather
     /// than from a restated schema.
     ///
     /// The table is named explicitly instead of taken from the bound active
@@ -618,10 +613,10 @@ impl Bifrost {
     /// binding one would invite a registration this caller does not want.
     ///
     /// The batch is sent verbatim. Whether its columns satisfy the destination
-    /// table's canonical contract is the server's judgement, and it answers
-    /// with its own stable whole-batch refusal; this client does not pre-check
-    /// it, because a second implementation of that contract is exactly what
-    /// would drift.
+    /// table's contract is the server's judgement: it matches columns to the
+    /// table by name, in any order, and answers any mismatch with its own
+    /// stable whole-batch refusal. This client does not pre-check it, because
+    /// a second implementation of that contract is exactly what would drift.
     ///
     /// Unlike [`Self::insert`], durability is complete when this resolves — the
     /// batch is not buffered and needs no [`Self::flush`].
@@ -826,7 +821,7 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`Self::sql`], plus `WYRD_VALA_400_QUERY_INVALID_DEADLINE` for a
+    /// As [`Self::sql`], plus `WYRD_VALA_400_QUERY_INVALID_SQL` for a
     /// deadline outside the accepted range and a decode error on a malformed
     /// Arrow IPC frame.
     ///
@@ -1097,7 +1092,10 @@ impl QueryResult {
     /// Arrow's own writer produces one JSON array over the retained batches, so
     /// the column names and types `T` sees are exactly the schema the server
     /// sent — there is no second, hand-written type mapping to disagree with
-    /// it. An empty result writes no array at all, which is the zero-row case.
+    /// it. A Variant column renders as its JSON value through the shared
+    /// [`WyrdJsonEncoderFactory`],
+    /// so `T` reads it as a `serde_json::Value` or any type that value fits.
+    /// An empty result writes no array at all, which is the zero-row case.
     ///
     /// # Errors
     ///
@@ -1106,7 +1104,9 @@ impl QueryResult {
     fn deserialize<T: DeserializeOwned>(&self) -> Result<Vec<T>, BifrostClientError> {
         let mut bytes = Vec::new();
         {
-            let mut writer = arrow::json::ArrayWriter::new(&mut bytes);
+            let mut writer = WriterBuilder::new()
+                .with_encoder_factory(Arc::new(WyrdJsonEncoderFactory))
+                .build::<_, JsonArray>(&mut bytes);
             for batch in &self.batches {
                 writer
                     .write(batch)

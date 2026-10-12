@@ -77,6 +77,14 @@ pub use wyrd_spec::vala::api::CompactionTypeWire;
 /// One typed positional bind value for [`Bifrost::sql`] and its siblings.
 pub use wyrd_spec::vala::api::QueryParam;
 
+// C4a forward schema helpers, re-exported so SDK users build the user Arrow
+// schema from a `FieldSpec` set or a JSON-Schema value without reaching into
+// `wyrd-types` directly.
+/// The three timestamp types a model field declares a column with:
+/// `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, and `TIMESTAMP_TZ`.
+pub use wyrd_types::{TimestampLtz, TimestampNtz, TimestampTz};
+pub use wyrd_types::{fieldspec_to_arrow, json_schema_to_arrow};
+
 /// Server-free unit lane for the Bifrost client: scope identity, producer pooling, and
 /// the asymmetric backpressure contract — all driven through mock/stall sinks.
 #[cfg(test)]
@@ -95,7 +103,7 @@ mod sdk {
         QueueConfig, SealedBatch, SinkError,
     };
     use wyrd_spec::error::WyrdError;
-    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::ids::CardUid;
 
     use crate::bifrost::handle::WriterPool;
     use crate::bifrost::{
@@ -140,7 +148,7 @@ mod sdk {
     /// One row correlated to the harness card.
     fn correlated() -> Correlation {
         Correlation {
-            card_ref: Some(card()),
+            card_uid: Some(card()),
             run_id: None,
         }
     }
@@ -149,8 +157,12 @@ mod sdk {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
-    fn card() -> CardRef {
-        "prod/Service/alpha@1.0.0".parse().expect("valid card ref")
+    /// The fixed Card UID every correlated harness row asserts, so tests can
+    /// compare the correlation a facade call carries against one known value.
+    fn card() -> CardUid {
+        "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22"
+            .parse()
+            .expect("valid card uid")
     }
 
     fn row() -> Vec<u8> {
@@ -276,13 +288,13 @@ mod sdk {
         assert_eq!(bifrost.producer_count(), 2, "a new table is a new producer");
     }
 
-    /// An omitted `card_ref` is a valid write, not a client-side refusal.
+    /// An omitted `card_uid` is a valid write, not a client-side refusal.
     ///
     /// The server stores an uncorrelated row against the authenticated
     /// principal with a null `card_uid`; the pool must reach it, so this proves
     /// the client no longer forces a correlation the wire never required.
     #[test]
-    fn omitted_card_ref_is_accepted() {
+    fn omitted_card_uid_is_accepted() {
         let bifrost = pool(Arc::new(MockSink::new()), QueueConfig::default());
         bifrost
             .insert("ns.tbl", &test_schema(), row(), None, None)
@@ -697,7 +709,7 @@ mod sdk {
     #[test]
     fn table_config_rejects_a_reserved_column() {
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            "card_ref",
+            "card_uid",
             DataType::Utf8,
             true,
         )]));

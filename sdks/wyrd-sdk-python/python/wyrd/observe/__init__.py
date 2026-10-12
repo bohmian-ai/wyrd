@@ -39,13 +39,13 @@ def record(
         schema: the table's JSON Schema mapping, or a Pydantic model class
             whose ``model_json_schema()`` is used.
         row: the row as a mapping or a Pydantic model instance.
-        correlation: optional ``card_ref`` (``space/Kind/name@version``) and
+        correlation: optional ``card_uid`` (the correlated Card's UID) and
             ``run_id`` stamped on the row. Omitted, the row is uncorrelated.
 
     Raises:
         WyrdError: ``WYRD_VALA_400_SCHEMA_PARSE`` for a schema with no
             mappable columns, as ``TableConfig.from_json_schema`` raises;
-            ``WYRD_SPEC_400_VALIDATION`` for an invalid ``card_ref``.
+            ``WYRD_SPEC_400_VALIDATION`` for an invalid ``card_uid``.
     """
 
     if isinstance(schema, type):
@@ -57,7 +57,7 @@ def record(
         table,
         json.dumps(dict(schema)),
         str(dump()) if callable(dump) else json.dumps(dict(row)),
-        correlation.get("card_ref"),
+        correlation.get("card_uid"),
         correlation.get("run_id"),
     )
 

@@ -52,11 +52,10 @@ ALTER TABLE wyrd.drift_baselines FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.drift_baselines
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON wyrd.drift_baselines TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
-REVOKE ALL ON TABLE wyrd.drift_baselines FROM wyrd_app, wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON wyrd.drift_baselines TO wyrd_app;
 -- Cross-tenant fitter work discovery only reads.
-GRANT SELECT ON wyrd.drift_baselines TO wyrd_platform_admin;
 
 -- A PSI or SPC Drift Verifier is ready only once its exact fitted baseline is.
 CREATE OR REPLACE FUNCTION wyrd.verifier_readiness(p_verifier_uid UUID) RETURNS TEXT

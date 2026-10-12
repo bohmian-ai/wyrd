@@ -14,6 +14,7 @@ pub mod operators;
 pub mod principals;
 pub mod workflow;
 
+use std::collections::HashMap;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +22,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use napi::Error;
 use napi::Result;
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{Buffer, Uint8Array};
 use napi_derive::napi;
 use serde::Serialize;
 use serde_json::Value;
@@ -34,10 +35,11 @@ use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, QueryContractError, QueryParam};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryParam};
 use wyrd_spec::vala::api::{CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
+use wyrd_types::TimestampKind;
 
 /// JavaScript query request projected onto the pure Wyrd contract.
 #[napi(object)]
@@ -271,12 +273,13 @@ impl NativeBifrostConnection {
     }
 }
 
-/// Closed result of describing one table: its config or a catalog error.
+/// Closed result of declaring or describing one table: its config or a
+/// catalog error.
 #[napi(object, object_from_js = false)]
 pub struct NativeTableConfigResult {
-    /// Described table config when the server answered.
+    /// The table config when it was declared or described.
     pub config: Option<NativeTableConfig>,
-    /// Catalog failure when description failed.
+    /// Catalog failure when declaration or description failed.
     pub error: Option<NativeWyrdError>,
 }
 
@@ -459,6 +462,12 @@ fn decode_batch_ipc(bytes: &[u8]) -> Result<RecordBatch> {
 /// `wyrd-queue` owner every language uses, so one model declares the same
 /// columns from any SDK.
 ///
+/// A catalogued refusal of the declaration itself — a table name that is not
+/// `namespace.name`, a document that does not map to columns, an open-extras
+/// object, or a server-owned column — returns in the result's structured
+/// `error`, which the TypeScript wrapper raises as a `WyrdError` carrying its
+/// code, status, details, and remediation.
+///
 /// # Errors
 ///
 /// Returns a napi error only when the declared config cannot be encoded. A
@@ -522,6 +531,83 @@ pub fn table_config_from_arrow_ipc(
                 )
             });
     NativeTableConfigResult::declared(declared)
+}
+
+/// Decodes one Variant cell's `metadata`/`value` bytes into its native
+/// JavaScript value.
+///
+/// The typed row terminal calls this for every Variant cell it finds while
+/// walking the result schema, so decoding stays in the shared `wyrd-queue`
+/// owner. napi's JSON projection makes objects plain objects, arrays arrays,
+/// and an integer outside the IEEE-754 safe range a `bigint`.
+///
+/// # Errors
+///
+/// Returns a napi error when the bytes are not a valid Variant, which only a
+/// faulty server result can produce.
+#[napi]
+pub fn variant_to_value(metadata: Uint8Array, value: Uint8Array) -> Result<Value> {
+    wyrd_queue::variant::variant_bytes_to_json(&metadata, &value).map_err(|violation| {
+        napi_error(format!(
+            "query result Variant does not decode: {violation:?}"
+        ))
+    })
+}
+
+/// The JSON Schema `format` a Bifrost timestamp type declares itself with.
+///
+/// `kind` is a [`TimestampKind::name`]; returns `None` for an unknown type. The
+/// TypeScript Wyrd timestamp types read their format here rather than restating
+/// the format table.
+#[napi]
+pub fn timestamp_format(kind: String) -> Option<&'static str> {
+    TimestampKind::from_name(&kind).map(TimestampKind::json_format)
+}
+
+/// Checks one timestamp text against a Bifrost timestamp type and returns its
+/// canonical text.
+///
+/// `kind` is a [`TimestampKind::name`]. The text is parsed exactly as the write
+/// path parses it, so a value the TypeScript Wyrd types accept is one an
+/// insert accepts. Returns `None` for an unknown type or refused text.
+#[napi]
+pub fn timestamp_text(kind: String, text: String) -> Option<String> {
+    TimestampKind::from_name(&kind)?.canonical(&text)
+}
+
+/// Renders one stored timestamp cell as its Bifrost timestamp type's text.
+///
+/// `kind` is a [`TimestampKind::name`] and `stored` the column's microseconds;
+/// a `TIMESTAMP_TZ` cell also passes its `local` writer reading. The typed row
+/// terminal calls this for every timestamp cell, so reads render in Rust.
+/// Returns `None` for an unknown type or a value out of range.
+#[napi]
+pub fn stored_timestamp_text(kind: String, stored: i64, local: Option<i64>) -> Option<String> {
+    TimestampKind::from_name(&kind)?.render(stored, local)
+}
+
+/// The Bifrost timestamp type of every top-level timestamp column in a
+/// schema-only Arrow IPC stream.
+///
+/// Maps each column to `TIMESTAMP_NTZ`, `TIMESTAMP_LTZ`, or `TIMESTAMP_TZ` as
+/// [`TimestampKind::of`] decides it, so the typed row terminal renders each
+/// column's cells without restating that decision.
+///
+/// # Errors
+///
+/// Returns a napi error when the bytes are not an Arrow IPC stream.
+#[napi]
+pub fn timestamp_kinds(schema_ipc: Buffer) -> Result<HashMap<String, &'static str>> {
+    let schema = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(schema_ipc), None)
+        .map_err(napi_error)?
+        .schema();
+    Ok(schema
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            TimestampKind::of(field.data_type()).map(|kind| (field.name().clone(), kind.name()))
+        })
+        .collect())
 }
 
 impl NativeTableConfigResult {
@@ -745,16 +831,16 @@ impl NativeBifrost {
     /// # Errors
     ///
     /// Returns a napi error only when the outcome cannot be encoded; an invalid
-    /// card reference, no-active-table, and queue-full refusals are returned in
+    /// Card UID, no-active-table, and queue-full refusals are returned in
     /// [`NativeLifecycleResult`].
     #[napi]
     pub fn insert(
         &self,
         row: String,
-        card_ref: Option<String>,
+        card_uid: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
-        let inserted = correlation(card_ref.as_deref(), run_id)
+        let inserted = correlation(card_uid.as_deref(), run_id)
             .and_then(|correlation| self.client.insert(row.into_bytes(), correlation));
         match inserted {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
@@ -841,7 +927,7 @@ impl NativeBifrost {
     /// # Errors
     ///
     /// Returns a napi error only when the outcome cannot be encoded; an
-    /// unparsable or unmappable schema and an invalid card reference are
+    /// unparsable or unmappable schema and an invalid Card UID are
     /// returned in [`NativeLifecycleResult`].
     #[napi]
     pub fn record(
@@ -849,11 +935,11 @@ impl NativeBifrost {
         table: String,
         schema_json: String,
         row: String,
-        card_ref: Option<String>,
+        card_uid: Option<String>,
         run_id: Option<String>,
     ) -> Result<NativeLifecycleResult> {
         let recorded = telemetry_schema(&schema_json).and_then(|schema| {
-            let correlation = correlation(card_ref.as_deref(), run_id)?;
+            let correlation = correlation(card_uid.as_deref(), run_id)?;
             wyrd_client::bifrost::observe::record(
                 &self.client,
                 &table,
@@ -1185,24 +1271,24 @@ impl NativeBifrostQueryStream {
 fn telemetry_schema(schema_json: &str) -> StdResult<SchemaRef, BifrostClientError> {
     let schema: Value = serde_json::from_str(schema_json)
         .map_err(|error| validation_error(format!("invalid JSON schema: {error}"), "schema"))?;
-    Ok(Arc::new(wyrd_queue::json_schema_to_arrow(&schema)?))
+    Ok(Arc::new(wyrd_types::json_schema_to_arrow(&schema)?))
 }
 
 /// Parses the optional per-row correlation at the Node boundary.
 ///
 /// # Errors
 ///
-/// Returns the shared validation refusal when `card_ref` is not one parsable
-/// Card reference.
+/// Returns the shared validation refusal when `card_uid` is not one parsable
+/// Card UID.
 fn correlation(
-    card_ref: Option<&str>,
+    card_uid: Option<&str>,
     run_id: Option<String>,
 ) -> StdResult<Correlation, BifrostClientError> {
     Ok(Correlation {
-        card_ref: card_ref
+        card_uid: card_uid
             .map(str::parse)
             .transpose()
-            .map_err(|error| validation_error(format!("invalid cardRef: {error}"), "cardRef"))?,
+            .map_err(|error| validation_error(format!("invalid cardUid: {error}"), "cardUid"))?,
         run_id: run_id.map(RunId::from_string),
     })
 }
@@ -1215,13 +1301,16 @@ fn correlation(
 ///
 /// # Errors
 ///
-/// Returns the shared deadline refusal, `WYRD_VALA_400_QUERY_INVALID_DEADLINE`, for a
-/// non-finite, fractional, or beyond-`i64` number.
+/// Returns the shared query-contract validation error for a non-finite,
+/// fractional, or beyond-`i64` number.
 fn parse_deadline_ms(value: f64) -> StdResult<i64, BifrostClientError> {
-    value
-        .to_string()
-        .parse()
-        .map_err(|_| BifrostClientError::Transport(QueryContractError::InvalidDeadline.into()))
+    value.to_string().parse().map_err(|_| {
+        BifrostClientError::Transport(WyrdError::Vala {
+            error: BifrostError::QueryInvalidSql {
+                detail: "deadline_ms must be an integer between 1 and 4294967295".to_owned(),
+            },
+        })
+    })
 }
 
 /// Parses one canonical request ID at the Node boundary.

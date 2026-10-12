@@ -54,13 +54,13 @@ pub const BUILTIN_PROVIDER_IDS: [&str; 4] = ["openai", "anthropic", "gemini", "v
 
 /// Request header naming the application Run a gateway call belongs to.
 ///
-/// It appears together with [`CARD_HEADER`] or not at all, and its value is
+/// It appears together with [`CARD_UID_HEADER`] or not at all, and its value is
 /// at most [`MAX_RUN_HEADER_BYTES`] of visible ASCII.
 pub const RUN_HEADER: &str = "wyrd-run-id";
 
-/// Request header naming, in `CardRef` text form, the Card a gateway call is
-/// attributed to; it appears together with [`RUN_HEADER`] or not at all.
-pub const CARD_HEADER: &str = "wyrd-card-ref";
+/// Request header naming, by Card UID, the Card a gateway call is attributed
+/// to; it appears together with [`RUN_HEADER`] or not at all.
+pub const CARD_UID_HEADER: &str = "wyrd-card-uid";
 
 /// Longest accepted [`RUN_HEADER`] value, in bytes.
 pub const MAX_RUN_HEADER_BYTES: usize = 128;

@@ -68,3 +68,20 @@ Offline inputs that only Python unit tests load live with them in
 bundles that `WyrdState` hydrates without a server (`builtin-model/` holds only
 the files that differ from `complete/`), `authoring/` holds Cards loaded
 through `from_path`, and `invalid/` holds one broken input per local refusal.
+
+## MCP investigation
+
+The MCP evidence journey reuses `register_and_hydrate` Model, Agent, Prompt,
+and Eval Verifier Cards. Its additional fixtures live in `cards/mcp_investigation`:
+
+| File | Purpose |
+| --- | --- |
+| `service.yaml` | Exact shared component references and the declared `investigation_events` dataset |
+| `drift-verifier.yaml` | Agent-readable Custom Drift Verifier matching the seeded feature report |
+| `drift-report.json` | Native retained Drift report with a failed latency feature |
+| `eval-assertion.json` | Native failed refund-promise assertion item |
+
+The journey registers Cards through the shared client, writes custom rows
+through Bifrost, and publishes fixture reports through the existing native
+result mapper and Scribe outbox. It reads the evidence through the real MCP
+endpoint; it does not execute a live model.

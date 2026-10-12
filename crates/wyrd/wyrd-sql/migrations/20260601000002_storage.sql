@@ -56,13 +56,8 @@ ALTER TABLE wyrd.storage_multipart_uploads FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.storage_multipart_uploads
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
--- wyrd_platform_admin requires cross-tenant access for sweeper reclamation.
--- Named permissive policy avoids cluster-level BYPASSRLS on this role.
-CREATE POLICY admin_cross_tenant ON wyrd.storage_multipart_uploads
-    TO wyrd_platform_admin
-    USING (true)
-    WITH CHECK (true);
+CREATE POLICY operator_access ON wyrd.storage_multipart_uploads TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 CREATE TABLE wyrd.storage_artifact_metadata (
     data_tenant_id UUID        NOT NULL REFERENCES platform.tenants(data_tenant_id),
@@ -87,18 +82,5 @@ ALTER TABLE wyrd.storage_artifact_metadata FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON wyrd.storage_artifact_metadata
     USING (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-CREATE POLICY admin_cross_tenant ON wyrd.storage_artifact_metadata
-    TO wyrd_platform_admin
-    USING (true)
-    WITH CHECK (true);
-
-REVOKE ALL ON TABLE wyrd.storage_multipart_uploads FROM wyrd_app;
-REVOKE ALL ON TABLE wyrd.storage_multipart_uploads FROM wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON wyrd.storage_multipart_uploads TO wyrd_app;
-GRANT SELECT, UPDATE ON wyrd.storage_multipart_uploads TO wyrd_platform_admin;
-
-REVOKE ALL ON TABLE wyrd.storage_artifact_metadata FROM wyrd_app;
-REVOKE ALL ON TABLE wyrd.storage_artifact_metadata FROM wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_artifact_metadata TO wyrd_app;
-GRANT SELECT ON wyrd.storage_artifact_metadata TO wyrd_platform_admin;
+CREATE POLICY operator_access ON wyrd.storage_artifact_metadata TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());

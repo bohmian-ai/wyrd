@@ -2,7 +2,7 @@
 //!
 //! The view's Agent Card and Prompt come from the hydrated graph; the model
 //! call goes through the public gateway as the state's client, carrying the
-//! Run and Agent Card as gateway correlation, so gateway authorization,
+//! Run and Agent Card UID as gateway correlation, so gateway authorization,
 //! accounting, capture, and audit apply. No provider credential is held here.
 
 use std::sync::Arc;
@@ -23,7 +23,7 @@ impl Run {
     /// return its final text.
     ///
     /// The Agent's Prompt is rendered with `variables` and sent through the
-    /// gateway with this Run's `run_id` and the Agent Card as correlation.
+    /// gateway with this Run's `run_id` and the Agent Card UID as correlation.
     /// Every refusal below except a gateway one happens before any IO.
     ///
     /// # Arguments
@@ -47,7 +47,7 @@ impl Run {
         }
         let prompt = self.state.resolve_agent_prompt(&self.alias)?;
         let caller = PublicWyrdGatewayCaller::new(self.state.client()?.clone())
-            .with_subject(&self.run_id, &self.subject);
+            .with_subject(&self.run_id, self.subject_uid());
         let registry = wyrd_gateway_registry(Arc::new(caller), prompt).ok_or_else(|| {
             invalid_agent(
                 &self.alias,

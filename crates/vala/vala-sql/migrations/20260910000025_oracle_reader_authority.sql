@@ -49,10 +49,8 @@ ALTER TABLE vala.bifrost_table_maintenance_authority FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.bifrost_table_maintenance_authority
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-REVOKE ALL ON vala.bifrost_table_maintenance_authority FROM PUBLIC;
-GRANT SELECT, INSERT, UPDATE, DELETE
-    ON vala.bifrost_table_maintenance_authority TO wyrd_app;
+CREATE POLICY operator_access ON vala.bifrost_table_maintenance_authority TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Active Oracle table reads
@@ -99,27 +97,14 @@ ALTER TABLE vala.oracle_active_table_reads FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.oracle_active_table_reads
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
-
-REVOKE ALL ON vala.oracle_active_table_reads FROM PUBLIC;
-GRANT SELECT, INSERT, UPDATE, DELETE ON vala.oracle_active_table_reads TO wyrd_app;
--- Forge's fenced maintenance transactions run on the operator pool: they read
--- the table's active reads and discard only provably abandoned ones.
-GRANT SELECT, DELETE ON vala.oracle_active_table_reads TO wyrd_platform_admin;
--- The fenced Forge expiration lifecycle runs on the operator pool and takes the
--- maintenance-authority row as its serialization lock against cut acquisition.
--- PostgreSQL requires UPDATE privilege to take a `FOR UPDATE` row lock, so the
--- grant is wider than the behavior: Forge only ever reads and locks this row,
--- and registration remains the sole writer.
-GRANT SELECT, UPDATE ON vala.bifrost_table_maintenance_authority TO wyrd_platform_admin;
--- Expired-object cleanup retires a promoted object's terminal file_list row in
--- the same operator transaction that records the object's proven deletion.
-GRANT DELETE ON vala.file_list TO wyrd_platform_admin;
+CREATE POLICY operator_access ON vala.oracle_active_table_reads TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
 -- ---------------------------------------------------------------------------
 -- Tenant-derived catalog pointer
 -- ---------------------------------------------------------------------------
 
--- The request role has no access to iceberg_catalog. This definer is its only
+-- Tenant sessions have no access to iceberg_catalog. This definer is their only
 -- route to a pointer: it takes a canonical logical namespace (`vala.<segment>`)
 -- and table name, derives the physical namespace from wyrd.current_tenant()
 -- alone, and returns one metadata_location or NULL. No tenant, catalog, or
@@ -169,10 +154,6 @@ EXCEPTION
 END
 $$;
 
-ALTER FUNCTION vala.oracle_catalog_metadata_location(text, text) OWNER TO wyrd_platform_admin;
-REVOKE ALL ON FUNCTION vala.oracle_catalog_metadata_location(text, text) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION vala.oracle_catalog_metadata_location(text, text) TO wyrd_app;
-
 -- ---------------------------------------------------------------------------
 -- One-statement cut acquisition
 -- ---------------------------------------------------------------------------
@@ -186,17 +167,9 @@ GRANT EXECUTE ON FUNCTION vala.oracle_catalog_metadata_location(text, text) TO w
 -- repeated table keeps its first position and yields one row and one claim.
 -- The durable order is: resolve every authority row, share-lock them in
 -- primary-key order (Forge's destructive preparation takes the same rows FOR
--- UPDATE), refuse a table whose snapshot expiration is still unresolved, read
--- each pointer, record every active read, then return the tables with their
--- unresolved file_list candidates. A missing registration or pointer raises
--- no_data_found, so no partial set of reads can commit.
---
--- Forge resolves an expiration's claims before it surrenders the authority
--- row, except when the catalog commit's acceptance is still unknown at the
--- Forge lease bound. Claims seen under the share lock therefore name an
--- expiration whose pointer may still change, and the acquisition raises
--- object_not_in_prerequisite_state (55000) until reconciliation establishes
--- the stable pointer and deletes them. It never waits or polls. Each
+-- UPDATE), read each pointer, record every active read, then return the
+-- tables with their unresolved file_list candidates. A missing registration or
+-- pointer raises no_data_found, so no partial set of reads can commit. Each
 -- statement in this VOLATILE function takes a fresh snapshot, so the pointer
 -- and hot rows are read after the share lock is granted.
 --
@@ -287,16 +260,6 @@ BEGIN
       ORDER BY a.data_tenant_id, a.catalog_name, a.namespace_name, a.table_name
         FOR SHARE OF a;
 
-    IF EXISTS (
-        SELECT 1
-          FROM vala.forge_snapshot_expiration_claims c
-         WHERE c.data_tenant_id = wyrd.current_tenant()
-           AND c.table_uid = ANY (v_uids)
-    ) THEN
-        RAISE EXCEPTION 'a Bifrost table has an unresolved snapshot expiration'
-            USING ERRCODE = 'object_not_in_prerequisite_state';
-    END IF;
-
     SELECT pg_catalog.array_agg(
                vala.oracle_catalog_metadata_location(u.namespace_name, u.table_name)
                ORDER BY u.ordinal)
@@ -340,9 +303,6 @@ BEGIN
 END
 $$;
 
-REVOKE ALL ON FUNCTION vala.oracle_acquire_table_cut(uuid, uuid, bigint, bigint, jsonb) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION vala.oracle_acquire_table_cut(uuid, uuid, bigint, bigint, jsonb) TO wyrd_app;
-
 -- ---------------------------------------------------------------------------
 -- Forge snapshot-expiration claims
 -- ---------------------------------------------------------------------------
@@ -359,12 +319,11 @@ GRANT EXECUTE ON FUNCTION vala.oracle_acquire_table_cut(uuid, uuid, bigint, bigi
 -- other direction either.
 --
 -- Claim rows are immutable. They preserve the identity the selection was
--- prepared under — task, attempt, preparing worker, and that worker's table
--- lease key and fencing token — as historical evidence. Correcting a
--- preparation means deleting these rows and preparing a new operation, never
--- updating one, which is why wyrd_platform_admin holds INSERT and DELETE but
--- no UPDATE. A successor that takes the task over settles under its own current
--- ownership and its own newly acquired fence; it does not rewrite these rows.
+-- prepared under — task, attempt, and preparing worker — as historical
+-- evidence. Correcting a preparation means deleting these rows and preparing a
+-- new operation, never updating one. A successor that takes the task over
+-- settles under its own current claim on the task row; it does not rewrite
+-- these rows.
 CREATE TABLE vala.forge_snapshot_expiration_claims (
     data_tenant_id      uuid   NOT NULL REFERENCES platform.tenants(data_tenant_id),
     resource            text   NOT NULL,
@@ -374,8 +333,6 @@ CREATE TABLE vala.forge_snapshot_expiration_claims (
     task_id             uuid   NOT NULL REFERENCES vala.forge_tasks(task_id),
     attempt_id          uuid   NOT NULL,
     worker_id           uuid   NOT NULL,
-    lease_key           text   NOT NULL CHECK (btrim(lease_key) <> ''),
-    lease_fencing_token bigint NOT NULL CHECK (lease_fencing_token > 0),
     table_uid           bytea  NOT NULL CHECK (octet_length(table_uid) = 16),
     catalog_name        text   NOT NULL CHECK (catalog_name = 'wyrd-redux'),
     namespace_name      text   NOT NULL CHECK (btrim(namespace_name) <> ''),
@@ -403,13 +360,11 @@ ALTER TABLE vala.forge_snapshot_expiration_claims FORCE  ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON vala.forge_snapshot_expiration_claims
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
+CREATE POLICY operator_access ON vala.forge_snapshot_expiration_claims TO CURRENT_USER
+    USING (wyrd.operator_session()) WITH CHECK (wyrd.operator_session());
 
-REVOKE ALL ON vala.forge_snapshot_expiration_claims FROM PUBLIC;
 -- Oracle admission reads the claim index from a tenant connection; only the
 -- fenced Forge lifecycle owner, which runs on the operator pool, may write one.
-GRANT SELECT ON vala.forge_snapshot_expiration_claims TO wyrd_app;
-GRANT SELECT, INSERT, DELETE
-    ON vala.forge_snapshot_expiration_claims TO wyrd_platform_admin;
 
 -- ---------------------------------------------------------------------------
 -- Expired-cleanup handoff identity

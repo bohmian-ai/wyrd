@@ -10,7 +10,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
-use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
+use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterTask, RegisteredRole};
 use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::gate::Gate;
@@ -25,7 +25,7 @@ use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, Scrib
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
 
-use crate::scribe_outbox::{ScribeOutbox, ScribeRouteBinding, ScribeSink};
+use crate::scribe_outbox::{ScribeOutbox, ScribeSink};
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_gateway::{GatewayEngine, ManagedSecretKeys};
 use wyrd_storage::StorageHandle;
@@ -68,13 +68,11 @@ pub struct BifrostBuildInputs {
     pub deployment_profile: DeploymentProfile,
     /// Shared production PostgreSQL handles.
     pub postgres: ServerPostgres,
-    /// Shared object-storage handle used by Scribe and Forge construction.
-    pub storage: Arc<StorageHandle>,
     /// This node's one Bifrost storage owner.
     ///
-    /// Retained so every co-located role shares one pointer-identical owner,
-    /// one request ceiling, and one shutdown, rather than each role composing
-    /// its own view of the same backend.
+    /// Retained so every co-located role shares one pointer-identical object
+    /// store and one request ceiling, rather than each role composing its own
+    /// view of the same backend.
     pub bifrost_storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
     /// Shared tenant-qualified Bifrost catalog.
     pub catalog: Arc<BifrostCatalog>,
@@ -126,8 +124,8 @@ pub struct OracleBuildInputs {
     pub resources: OracleResources,
     /// Peer runtime owning outbound fragment dispatch.
     pub peer: Arc<crate::oracle::OraclePeerRuntime>,
-    /// Role-scoped cancellation signal.
-    pub role_shutdown: CancellationToken,
+    /// Process drain signal, cancelled when the supervised drain begins.
+    pub process_drain: CancellationToken,
     /// Whether boot already activated the fence; `false` keeps heartbeats
     /// unready until [`Oracle::activate`] runs once the peer listener serves.
     pub activated: bool,
@@ -152,8 +150,8 @@ pub struct ScribeBuildInputs {
     pub fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Audit sink for refused inbound fragment requests.
     pub fragment_security_audit: Arc<dyn PeerSecurityAudit>,
-    /// Role-scoped cancellation signal.
-    pub role_shutdown: CancellationToken,
+    /// Process drain signal, cancelled when the supervised drain begins.
+    pub process_drain: CancellationToken,
     /// Whether boot already activated the fence; `false` keeps heartbeats
     /// unready until [`Scribe::activate`] runs once the peer listener serves.
     pub activated: bool,
@@ -419,19 +417,14 @@ pub struct Scribe {
     fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Durable security audit for rejected Scribe fragment authority.
     fragment_security_audit: Arc<dyn PeerSecurityAudit>,
-    /// Cancels the recurring heartbeat and snapshot tasks before role removal.
-    role_shutdown: CancellationToken,
-    /// Retains the heartbeat task so teardown can prove it stopped before unregister.
-    heartbeat: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Synchronously aborts the heartbeat without acquiring its async owner lock.
-    heartbeat_abort: AbortHandle,
-    /// Retains the snapshot poller so role-owned background work is drained.
-    snapshot_poller: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Synchronously aborts the snapshot poller without acquiring its async owner lock.
-    snapshot_poller_abort: AbortHandle,
+    /// Process drain signal; cancelled when the supervised drain begins.
+    process_drain: CancellationToken,
+    /// This role's fenced heartbeat, stopped only at final role shutdown or
+    /// abort so the role stays fenced, though unready, while the process drains.
+    heartbeat: Arc<ClusterTask>,
     /// Readiness value preserved by heartbeats during transport drain.
     advertise_ready: Arc<AtomicBool>,
-    /// Withdraws this role when its WAL faults; ends with `role_shutdown`.
+    /// Withdraws this role when its WAL faults; ends with `process_drain`.
     wal_fault_monitor: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Synchronously aborts the WAL fault monitor.
     wal_fault_monitor_abort: AbortHandle,
@@ -458,16 +451,11 @@ pub struct Oracle {
     lifecycle: RoleLifecycle,
     /// Shared tenant-qualified catalog retained by the selected data subsystem.
     catalog: Arc<BifrostCatalog>,
-    /// Cancels the Oracle heartbeat and membership snapshot tasks.
-    role_shutdown: CancellationToken,
-    /// Retains the heartbeat task until ordered shutdown stops it.
-    heartbeat: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Synchronously aborts the heartbeat without acquiring its async owner lock.
-    heartbeat_abort: AbortHandle,
-    /// Retains the membership poller until ordered shutdown stops it.
-    snapshot_poller: Arc<Mutex<Option<JoinHandle<()>>>>,
-    /// Synchronously aborts the snapshot poller without acquiring its async owner lock.
-    snapshot_poller_abort: AbortHandle,
+    /// Process drain signal; cancelled when the supervised drain begins.
+    process_drain: CancellationToken,
+    /// This role's fenced heartbeat, stopped only at final role shutdown or
+    /// abort so the role stays fenced, though unready, while the process drains.
+    heartbeat: Arc<ClusterTask>,
     /// Readiness value preserved by heartbeats during transport drain.
     advertise_ready: Arc<AtomicBool>,
     /// Canonical authenticated transport for owner-local lifecycle fanout.
@@ -479,7 +467,7 @@ impl Oracle {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn process_shutdown_observed_for_test(&self) -> bool {
-        self.role_shutdown.is_cancelled() && self.engine.process_shutdown_observed_for_test()
+        self.process_drain.is_cancelled() && self.engine.process_shutdown_observed_for_test()
     }
 
     /// Returns the exact registered Oracle role identity and fence.
@@ -491,14 +479,12 @@ impl Oracle {
     /// Cancels Oracle work and explicitly aborts retained role tasks without awaiting.
     ///
     /// Used only after the process deadline is exhausted. It closes role
-    /// activity synchronously, aborts the heartbeat and snapshot poller
-    /// through handles that do not require their async owner locks, starts no registry operation, and leaves incomplete durable cleanup
-    /// to existing recovery.
+    /// activity synchronously, aborts the heartbeat, starts no registry
+    /// operation, and leaves incomplete durable cleanup to existing recovery.
     pub(crate) fn abort_shutdown(&self) {
         self.lifecycle.begin_stopping();
-        self.role_shutdown.cancel();
-        self.heartbeat_abort.abort();
-        self.snapshot_poller_abort.abort();
+        self.process_drain.cancel();
+        self.heartbeat.abort();
         self.engine.begin_shutdown();
     }
     /// Creates the retained query lifecycle.
@@ -521,19 +507,15 @@ impl Oracle {
             lifecycle_transport,
             resources,
             peer,
-            role_shutdown,
+            process_drain,
             activated,
         } = inputs;
         let advertise_ready = Arc::new(AtomicBool::new(activated));
         let lifecycle = RoleLifecycle::serving();
-        let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
-            registered_role.clone(),
-            Arc::clone(&advertise_ready),
-            role_shutdown.clone(),
+        let heartbeat = Arc::new(
+            Arc::clone(&cluster)
+                .start_readiness_heartbeat(registered_role.clone(), Arc::clone(&advertise_ready)),
         );
-        let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(role_shutdown.clone());
-        let heartbeat_abort = heartbeat.abort_handle();
-        let snapshot_poller_abort = snapshot_poller.abort_handle();
         let running_queries = Arc::clone(engine.running_queries());
         // The engine already owns the distributed dispatcher, so assert the
         // composition invariant here rather than retaining a second handle that
@@ -549,21 +531,18 @@ impl Oracle {
         );
         Ok(Self {
             engine,
-            catalog,
-            registered_role,
-            cluster,
-            role_shutdown,
-            heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
-            heartbeat_abort,
-            snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
-            snapshot_poller_abort,
-            lifecycle,
-            advertise_ready,
-            running_queries,
-            lifecycle_transport,
-            query_controls,
             peer,
+            running_queries,
+            query_controls,
             resources,
+            cluster,
+            registered_role,
+            lifecycle,
+            catalog,
+            process_drain,
+            heartbeat,
+            advertise_ready,
+            lifecycle_transport,
         })
     }
 
@@ -705,10 +684,9 @@ impl Oracle {
         deadline: Instant,
     ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         self.lifecycle.begin_stopping();
-        self.role_shutdown.cancel();
+        self.process_drain.cancel();
         let report = self.engine.shutdown(deadline).await;
-        await_role_task(&self.heartbeat, deadline, "oracle heartbeat").await?;
-        await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await?;
+        stop_role_task(&self.heartbeat, deadline, "oracle heartbeat").await?;
         if report.active_queries != 0
             || report.queued_queries != 0
             || report.peer_running != 0
@@ -811,19 +789,18 @@ impl Scribe {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn process_shutdown_observed_for_test(&self) -> bool {
-        self.role_shutdown.is_cancelled()
+        self.process_drain.is_cancelled()
     }
 
     /// Explicitly aborts all retained Scribe role work without awaiting.
     ///
-    /// This deadline-expiry path signals role cancellation, explicitly aborts
-    /// heartbeat and snapshot tasks without acquiring their async owner locks,
-    /// and aborts retained Scribe workers. It performs no flush or external await.
+    /// This deadline-expiry path signals role cancellation, aborts the
+    /// heartbeat and the WAL fault monitor, and aborts retained Scribe
+    /// workers. It performs no flush or external await.
     pub(crate) fn abort_shutdown(&self) {
         self.lifecycle.begin_stopping();
-        self.role_shutdown.cancel();
-        self.heartbeat_abort.abort();
-        self.snapshot_poller_abort.abort();
+        self.process_drain.cancel();
+        self.heartbeat.abort();
         self.wal_fault_monitor_abort.abort();
         self.ingest.abort_shutdown();
     }
@@ -845,7 +822,7 @@ impl Scribe {
             registered_role,
             fragment_verifier,
             fragment_security_audit,
-            role_shutdown,
+            process_drain,
             activated,
         } = inputs;
         let tail_service = Arc::new(
@@ -856,19 +833,16 @@ impl Scribe {
         let fragment_follower = Arc::new(PhysicalPlanFollower::new(ScribeTailResolver::new(
             Arc::clone(&tail_service),
             Arc::clone(&catalog),
+            resources.oracle_partitioning(),
         )));
         // A WAL that faulted during boot replay never advertises ready.
         let advertise_ready = Arc::new(AtomicBool::new(
             activated && !ingest.wal_fault().is_cancelled(),
         ));
-        let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
-            registered_role.clone(),
-            Arc::clone(&advertise_ready),
-            role_shutdown.clone(),
+        let heartbeat = Arc::new(
+            Arc::clone(&cluster)
+                .start_readiness_heartbeat(registered_role.clone(), Arc::clone(&advertise_ready)),
         );
-        let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(role_shutdown.clone());
-        let heartbeat_abort = heartbeat.abort_handle();
-        let snapshot_poller_abort = snapshot_poller.abort_handle();
         let lifecycle = RoleLifecycle::serving();
         let wal_fault_monitor = tokio::spawn(
             ScribeWalFaultMonitor {
@@ -877,7 +851,7 @@ impl Scribe {
                 registered_role: registered_role.clone(),
                 lifecycle: lifecycle.clone(),
                 advertise_ready: Arc::clone(&advertise_ready),
-                shutdown: role_shutdown.clone(),
+                shutdown: process_drain.clone(),
             }
             .run(),
         );
@@ -895,11 +869,8 @@ impl Scribe {
             catalog,
             fragment_verifier,
             fragment_security_audit,
-            role_shutdown,
-            heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
-            heartbeat_abort,
-            snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
-            snapshot_poller_abort,
+            process_drain,
+            heartbeat,
             advertise_ready,
             wal_fault_monitor: Arc::new(Mutex::new(Some(wal_fault_monitor))),
             wal_fault_monitor_abort,
@@ -1064,14 +1035,13 @@ impl Scribe {
         deadline: Instant,
     ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         self.lifecycle.begin_stopping();
-        self.role_shutdown.cancel();
+        self.process_drain.cancel();
         if !self.ingest.shutdown(deadline).await {
             return Err(wyrd_spec::vala::error::BifrostError::Internal {
                 detail: "Scribe shutdown did not flush every retained owner".to_owned(),
             });
         }
-        await_role_task(&self.heartbeat, deadline, "scribe heartbeat").await?;
-        await_role_task(&self.snapshot_poller, deadline, "scribe snapshot poller").await?;
+        stop_role_task(&self.heartbeat, deadline, "scribe heartbeat").await?;
         await_role_task(
             &self.wal_fault_monitor,
             deadline,
@@ -1111,6 +1081,26 @@ impl Scribe {
             })
         }
     }
+}
+
+/// Stops one owned membership task, waiting until the process shutdown deadline.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::Internal`](wyrd_spec::vala::error::BifrostError::Internal)
+/// naming `task_name` when the task had to be aborted at `deadline`.
+async fn stop_role_task(
+    task: &ClusterTask,
+    deadline: Instant,
+    task_name: &'static str,
+) -> Result<(), wyrd_spec::vala::error::BifrostError> {
+    if task.stop(tokio::time::Instant::from_std(deadline)).await {
+        return Ok(());
+    }
+    tracing::warn!(task = task_name, "role task exceeded shutdown deadline");
+    Err(wyrd_spec::vala::error::BifrostError::Internal {
+        detail: format!("{task_name} exceeded shutdown deadline"),
+    })
 }
 
 /// Wait for one role-owned task until the process shutdown deadline.
@@ -1512,6 +1502,11 @@ pub struct Bifrost {
     /// `None` only for the ownerless unit-test shell, whose `AppState` starts
     /// its own outbox.
     scribe_outbox: Option<Arc<ScribeOutbox>>,
+    /// The process membership poller every role, forwarder, and the Scribe
+    /// outbox read through; stopped only after every role has drained.
+    ///
+    /// `None` only for the ownerless unit-test shell, which has no membership.
+    membership_poller: Option<Arc<ClusterTask>>,
 }
 
 /// Complete immutable composition retained by one published [`Bifrost`].
@@ -1540,10 +1535,10 @@ pub(crate) struct BifrostComposition {
     pub(crate) query_controls: Option<crate::oracle::RunningQueryControls>,
     /// Run-request outbox the Gate's observation acknowledgement stages on.
     pub(crate) observation_runs: Arc<crate::verification::observations::ObservationRunOutbox>,
-    /// The process Scribe outbox, started before its route is known.
+    /// The process Scribe outbox, routed to the local or a peer Scribe.
     pub(crate) scribe_outbox: Arc<ScribeOutbox>,
-    /// Binds `scribe_outbox`'s route once the roles above exist.
-    pub(crate) scribe_route: ScribeRouteBinding,
+    /// The one process membership poller for the shared cluster registry.
+    pub(crate) membership_poller: ClusterTask,
     /// Already-composed production resources exposed only to the test tier.
     #[cfg(feature = "test-support")]
     pub(crate) resources: Option<BifrostRoleResources>,
@@ -1564,11 +1559,10 @@ impl Bifrost {
             query_controls,
             observation_runs,
             scribe_outbox,
-            scribe_route,
+            membership_poller,
             #[cfg(feature = "test-support")]
             resources,
         } = composition;
-        scribe_route.bind(scribe.as_ref(), oracle.as_ref());
         Arc::new(Self {
             gate,
             scribe,
@@ -1585,6 +1579,7 @@ impl Bifrost {
             #[cfg(feature = "test-support")]
             test_catalog: None,
             scribe_outbox: Some(scribe_outbox),
+            membership_poller: Some(Arc::new(membership_poller)),
         })
     }
 
@@ -1611,6 +1606,7 @@ impl Bifrost {
             test_resources: None,
             test_catalog: None,
             scribe_outbox: None,
+            membership_poller: None,
         })
     }
 
@@ -1646,6 +1642,7 @@ impl Bifrost {
             test_resources: None,
             test_catalog: Some(catalog),
             scribe_outbox: None,
+            membership_poller: None,
         })
     }
 
@@ -1673,6 +1670,23 @@ impl Bifrost {
     #[must_use]
     pub const fn scribe(&self) -> Option<&Arc<Scribe>> {
         self.scribe.as_ref()
+    }
+
+    /// Reports whether the membership poller and every role heartbeat ended.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn membership_tasks_finished_for_test(&self) -> bool {
+        self.membership_poller
+            .as_ref()
+            .is_none_or(|poller| poller.is_finished())
+            && self
+                .scribe
+                .as_ref()
+                .is_none_or(|scribe| scribe.heartbeat.is_finished())
+            && self
+                .oracle
+                .as_ref()
+                .is_none_or(|oracle| oracle.heartbeat.is_finished())
     }
 
     /// Borrows the process Scribe outbox, absent only for the unit-test shell.
@@ -1804,9 +1818,9 @@ impl Bifrost {
     /// Borrows this node's one Bifrost storage owner.
     ///
     /// `None` only for the ownerless unit-test shell. Every co-located role in a
-    /// composed process observes the identical pointer, which is what makes the
-    /// node-wide request ceiling and the single shutdown real rather than
-    /// per-role.
+    /// composed process observes the identical pointer, so the node-wide
+    /// request ceiling is shared rather than per-role. Storage has no shutdown
+    /// step of its own: the shared owner drops with its last role.
     #[must_use]
     pub fn bifrost_storage(&self) -> Option<&Arc<vala_bifrost_redux::storage::BifrostStorage>> {
         self.storage.as_ref()
@@ -1905,29 +1919,24 @@ impl Bifrost {
         }
     }
 
-    /// Drains every selected subsystem and this node's storage owner against
-    /// one absolute deadline.
+    /// Drains every selected subsystem against one absolute deadline.
     ///
     /// The order is fixed and load-bearing: readiness and public admission
-    /// close first, Forge supervision must already be quiesced, the Oracle and
-    /// then the Scribe owner and registry drain, and only then is the storage
-    /// owner closed. Storage is last because work a role already admitted may
-    /// still need object I/O to finish; closing it first would fail that work
-    /// rather than let it complete.
+    /// close first, Forge supervision must already be quiesced, then the
+    /// Oracle and then the Scribe owner and registry drain, and the membership
+    /// poller stops last because draining roles and the earlier Scribe outbox
+    /// drain read membership. Storage has no drain step: the shared storage
+    /// owner simply drops once its last role does, so work a role already
+    /// admitted keeps its object I/O until it finishes.
     ///
-    /// Any failure along the way — unquiesced Forge supervision, a role drain
-    /// error, or a storage owner that does not settle by the deadline — runs
-    /// the abort path for both roles *and* storage before returning, so a
-    /// failed shutdown never leaves the metadata cache open, decoded entries
-    /// retained, or object I/O admissible. A successful report is therefore
-    /// only ever produced when storage is closed and settled.
+    /// Any failure along the way — unquiesced Forge supervision or a role
+    /// drain error — runs the abort path for every selected role before
+    /// returning, so a failed shutdown never leaves admission open.
     ///
     /// # Errors
     /// Returns a stable lifecycle failure when a selected role cannot remove
-    /// readiness, when Forge supervision has not joined, or
-    /// [`BifrostError::Internal`](wyrd_spec::vala::error::BifrostError::Internal)
-    /// with detail `"Bifrost storage did not settle before shutdown deadline"`
-    /// when the storage owner does not settle.
+    /// readiness or drain by the deadline, or when Forge supervision has not
+    /// joined, or when the membership poller does not stop by the deadline.
     pub async fn shutdown(
         &self,
         deadline: Instant,
@@ -1936,7 +1945,7 @@ impl Bifrost {
         match self.drain_selected_owners(deadline).await {
             Ok(report) => Ok(report),
             Err(error) => {
-                self.abort_selected_owners().await;
+                self.abort_selected_owners();
                 Err(error)
             }
         }
@@ -1986,12 +1995,8 @@ impl Bifrost {
         } else {
             false
         };
-        if let Some(storage) = &self.storage
-            && !storage.close(deadline).await
-        {
-            return Err(wyrd_spec::vala::error::BifrostError::Internal {
-                detail: "Bifrost storage did not settle before shutdown deadline".to_owned(),
-            });
+        if let Some(poller) = &self.membership_poller {
+            stop_role_task(poller, deadline, "membership poller").await?;
         }
         Ok(BifrostShutdownReport {
             scribe_drained,
@@ -2002,19 +2007,17 @@ impl Bifrost {
 
     /// Closes public admission and aborts selected role owners without claiming a flush.
     ///
-    /// Awaits the storage owner's abort, so once this returns no retained
-    /// loader and no governed operation is still running against the node's
-    /// backend. Repeated calls remain safe.
-    pub async fn abort(&self) {
-        self.abort_selected_owners().await;
+    /// Signals cancellation and returns without waiting for any owner to
+    /// settle. Repeated calls remain safe.
+    pub fn abort(&self) {
+        self.abort_selected_owners();
     }
 
-    /// Cancels every selected owner and settles the storage owner.
+    /// Closes the gate and cancels every selected owner.
     ///
     /// The one abort path, shared by the public seam and by every failed
-    /// shutdown, so a failure can never take a cleanup route that skips
-    /// storage.
-    async fn abort_selected_owners(&self) {
+    /// shutdown, so both cancel the same set of owners.
+    fn abort_selected_owners(&self) {
         self.gate.close();
         if let Some(query) = &self.oracle {
             query.abort_shutdown();
@@ -2025,8 +2028,8 @@ impl Bifrost {
         if let Some(forge) = &self.forge {
             forge.begin_shutdown();
         }
-        if let Some(storage) = &self.storage {
-            storage.abort().await;
+        if let Some(poller) = &self.membership_poller {
+            poller.abort();
         }
     }
 }
@@ -2171,9 +2174,10 @@ impl AppState {
         let (reporter, _service) = wyrd_tonic::tonic_health::server::health_reporter();
         let scribe_outbox = bifrost.scribe_outbox().map_or_else(
             || {
-                let (outbox, route) = ScribeSink::outbox();
-                route.bind(None, None);
-                outbox
+                ScribeSink::outbox(
+                    None,
+                    vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+                )
             },
             Arc::clone,
         );

@@ -13,6 +13,7 @@ use vala_bifrost_redux::forge::{ForgeClock, ForgeObjectStore};
 
 use super::support::{
     CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
+    manual_clock,
 };
 
 /// Promotion appends the writer's own objects and never writes a data object.
@@ -42,7 +43,7 @@ async fn scribe_promotion_integration_appends_existing_datafile_without_put() {
         "the fixture sealed real data objects"
     );
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let mut forge = SupervisedPromotion::start(
         &fixture,
         fixture.catalog.iceberg_catalog(),
@@ -69,11 +70,6 @@ async fn scribe_promotion_integration_appends_existing_datafile_without_put() {
             .filter(|(path, _)| data_object(path))
             .collect::<BTreeMap<_, _>>(),
         "promotion left every data object byte-identical"
-    );
-    assert_eq!(
-        object_store.output_writers(),
-        0,
-        "promotion opened no rewrite output"
     );
     assert_eq!(object_store.deletes(), 0, "promotion deleted no object");
     assert!(
@@ -111,7 +107,7 @@ async fn scribe_promotion_integration_appends_existing_datafile_without_put() {
 #[tokio::test]
 async fn scribe_promotion_integration_conflict_revalidates_before_retry() {
     let fixture = PromotionIntegrationFixture::start("promotion_conflict").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -170,7 +166,7 @@ async fn scribe_promotion_integration_conflict_revalidates_before_retry() {
 #[tokio::test]
 async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operation() {
     let fixture = PromotionIntegrationFixture::start("promotion_reset_retry").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -225,6 +221,64 @@ async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operat
     );
 }
 
+/// The operation deadline bounds the conflict retry to zero second attempts.
+///
+/// The commit is parked at the real catalog seam, the Forge clock is moved past
+/// the operation's own retry budget, and only then is the parked commit
+/// refused. The deadline captured before the first attempt is therefore already
+/// spent, so the definite conflict closes the operation instead of buying a
+/// second catalog call. One delegated update — against two in the retry
+/// scenario — is what proves the barrier held.
+#[tokio::test]
+async fn scribe_promotion_integration_deadline_expires_before_conflict_retry() {
+    let fixture = PromotionIntegrationFixture::start("promotion_deadline").await;
+    let object_store = CountingObjectStore::new(&fixture.storage);
+    let catalog = PromotionCatalogSeam::new(
+        fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    catalog.park_next_commit();
+    let (clock, control) = manual_clock();
+
+    let forge = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    let forge = forge
+        .run_one_failure_while(async {
+            catalog.wait_for_parked_commit().await;
+            let expired = control.now().expect("manual Forge clock")
+                + chrono::Duration::from_std(fixture.config.iceberg_total_retry_timeout)
+                    .expect("retry budget is representable")
+                + chrono::Duration::seconds(1);
+            control.set(expired).expect("manual Forge clock advances");
+            catalog.reject_parked_commit();
+        })
+        .await;
+
+    assert_eq!(
+        catalog.attempts(),
+        1,
+        "the expired deadline permitted no second catalog call: {:?}",
+        forge.returned_errors()
+    );
+    assert_eq!(
+        fixture.promotion_phases().await,
+        vec!["reset".to_owned()],
+        "a conflict past the deadline closes the operation"
+    );
+    let unsettled = fixture.file_rows().await;
+    assert!(
+        unsettled
+            .iter()
+            .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
+        "nothing was settled by a refused promotion: {unsettled:?}"
+    );
+    forge.shutdown().await;
+}
+
 /// Cancellation drains a parked promotion without settling anything.
 ///
 /// The coordinator is cancelled while its inline promotion commit is parked, so
@@ -240,7 +294,7 @@ async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operat
 #[tokio::test]
 async fn scribe_promotion_integration_cancellation_drains_without_settlement() {
     let fixture = PromotionIntegrationFixture::start("promotion_drain").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -276,9 +330,9 @@ async fn scribe_promotion_integration_cancellation_drains_without_settlement() {
         "a drained promotion settled nothing: {unsettled:?}"
     );
     assert_eq!(
-        fixture.live_leases().await,
+        fixture.live_claims().await,
         0,
-        "the drained attempt released its lease"
+        "the drained attempt released its claim"
     );
     forge.shutdown().await;
 }
@@ -451,7 +505,7 @@ async fn assert_mutation_is_refused_before_catalog_io(
     assert_ne!(altered, original, "{name} must change the evidence");
     fixture.set_promotion_record(row_id, &altered).await;
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let object_store = CountingObjectStore::new(&fixture.storage);
     let catalog = PromotionCatalogSeam::new(
         fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
@@ -470,11 +524,6 @@ async fn assert_mutation_is_refused_before_catalog_io(
         catalog.attempts(),
         0,
         "{name} must be refused before any catalog commit"
-    );
-    assert_eq!(
-        object_store.output_writers(),
-        0,
-        "{name} must not open a rewrite output"
     );
     assert_eq!(object_store.deletes(), 0, "{name} must delete no object");
     assert!(
@@ -508,22 +557,13 @@ async fn scribe_promotion_integration_rejects_corrupted_object_before_catalog_io
         .as_str()
         .expect("the record names its object")
         .to_owned();
-    let intact = fixture
-        .staging
-        .read(&object_key)
-        .await
-        .expect("the sealed object is readable")
-        .to_bytes();
+    let intact = fixture.read_object(&object_key).await;
     let mut corrupted = intact.to_vec();
     let last = corrupted.len() - 5;
     corrupted[last] ^= 0xFF;
-    fixture
-        .staging
-        .write(&object_key, corrupted)
-        .await
-        .expect("fixture object corruption");
+    fixture.write_object(&object_key, corrupted).await;
     {
-        let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+        let object_store = CountingObjectStore::new(&fixture.storage);
         let catalog = PromotionCatalogSeam::new(
             fixture.catalog.iceberg_catalog(),
             object_store.read_counter(),
@@ -543,11 +583,7 @@ async fn scribe_promotion_integration_rejects_corrupted_object_before_catalog_io
         );
         assert!(fixture.live_data_paths().await.is_empty());
     }
-    fixture
-        .staging
-        .write(&object_key, intact.to_vec())
-        .await
-        .expect("fixture object restoration");
+    fixture.write_object(&object_key, intact).await;
 }
 
 /// Forge operation family and phase vocabulary shared by the barrier proof.
@@ -678,10 +714,10 @@ mod promotion_barrier {
         Ok(())
     }
 
-    /// Seeds one live Forge lease and one running snapshot-expiry task.
+    /// Seeds one running snapshot-expiry task holding a live claim.
     ///
     /// # Panics
-    /// Panics when either seeding statement fails.
+    /// Panics when the seeding statement fails.
     async fn seed_running_expiry_task(
         fixture: &PromotionIntegrationFixture,
         identity: &TableAuthorityIdentity,
@@ -690,17 +726,8 @@ mod promotion_barrier {
             task_id: Uuid::now_v7(),
             attempt_id: Uuid::now_v7(),
             worker_id: Uuid::now_v7(),
-            lease_key: format!("forge:{}:barrier", identity.table_name),
-            lease_fencing_token: 20,
         };
         let pool = fixture.database.operator_pool().pool();
-        sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
-            .bind(&authority.lease_key)
-            .bind(authority.worker_id)
-            .bind(authority.lease_fencing_token)
-            .execute(pool)
-            .await
-            .expect("lease seeds");
         sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',20,'{}'::jsonb,decode(repeat('00',32),'hex'),1,1,'running',$6,$7,now()+interval '10 minutes',20,1,now())")
             .bind(authority.task_id)
             .bind(identity.tenant.as_uuid())
@@ -764,10 +791,7 @@ mod promotion_barrier {
                 &mut conn,
             )
             .exclusive(identity.clone())
-            .await?
-            .ok_or_else(|| SqlError::Conflict {
-                detail: "an Oracle query is still reading this table".to_owned(),
-            })?;
+            .await?;
         let prepared = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
             .expect("valid Forge resource")
             .prepare_snapshot_expiration(

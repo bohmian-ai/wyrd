@@ -76,7 +76,7 @@ impl ForgeLeaderElection {
     ) -> Result<Option<i64>, SqlError> {
         let ttl = Self::ttl_millis(ttl)?;
         // Dynamic query is intentional: the leader term is a singleton
-        // cross-tenant control row accessed via the operator pool (BYPASSRLS).
+        // cross-tenant control row accessed via the operator pool.
         sqlx::query_scalar(
             "UPDATE vala.forge_scheduler_state SET owner=$1,peer_uri=$2,\
              fencing_token=fencing_token+1,\
@@ -110,7 +110,7 @@ impl ForgeLeaderElection {
     ) -> Result<bool, SqlError> {
         let ttl = Self::ttl_millis(ttl)?;
         // Dynamic query is intentional: the leader term is a singleton
-        // cross-tenant control row accessed via the operator pool (BYPASSRLS).
+        // cross-tenant control row accessed via the operator pool.
         let changed = sqlx::query(
             "UPDATE vala.forge_scheduler_state \
              SET expires_at=statement_timestamp()+($3*interval '1 millisecond'),\
@@ -138,7 +138,7 @@ impl ForgeLeaderElection {
     /// Returns SQL errors from the single update.
     pub async fn resign(&self, owner: Uuid, fencing_token: i64) -> Result<(), SqlError> {
         // Dynamic query is intentional: the leader term is a singleton
-        // cross-tenant control row accessed via the operator pool (BYPASSRLS).
+        // cross-tenant control row accessed via the operator pool.
         sqlx::query(
             "UPDATE vala.forge_scheduler_state SET owner=NULL,peer_uri=NULL,expires_at=NULL,\
              updated_at=statement_timestamp() \
@@ -162,7 +162,7 @@ impl ForgeLeaderElection {
     /// Returns SQL errors from the read.
     pub async fn current(&self) -> Result<Option<ForgeLeaderTerm>, SqlError> {
         // Dynamic query is intentional: the leader term is a singleton
-        // cross-tenant control row accessed via the operator pool (BYPASSRLS).
+        // cross-tenant control row accessed via the operator pool.
         sqlx::query_as(
             "SELECT owner,fencing_token,peer_uri FROM vala.forge_scheduler_state \
              WHERE singleton AND owner IS NOT NULL AND expires_at>statement_timestamp()",

@@ -15,8 +15,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse,
-    ListRunningQueriesResponse, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
-    QueryTerminalOutcome, RunningQuerySummary,
+    ListRunningQueriesResponse, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
+    RunningQuerySummary,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::frame_codec::FrameDecoder;
@@ -81,6 +81,13 @@ pub enum BifrostClientError {
     #[error("{0}")]
     Client(#[from] WyrdClientError),
 }
+impl From<wyrd_spec::vala::BifrostError> for BifrostClientError {
+    /// Carry a refusal from the shared column-type mappings as the queue
+    /// error it has always surfaced as, so its stable code is unchanged.
+    fn from(error: wyrd_spec::vala::BifrostError) -> Self {
+        Self::Queue(error.into())
+    }
+}
 
 impl BifrostClientError {
     /// Returns terminal metadata when a validated failed terminal caused this error.
@@ -128,9 +135,12 @@ impl From<&BifrostClientError> for WyrdError {
             BifrostClientError::IncompleteQueryStream => Self::Vala {
                 error: BifrostError::QueryStreamIncomplete,
             },
-            BifrostClientError::FailedTerminal { terminal } => Self::Vala {
-                error: terminal_bifrost_error(terminal),
-            },
+            BifrostClientError::FailedTerminal { terminal } => terminal.error.as_deref().map_or(
+                Self::Vala {
+                    error: BifrostError::QueryExecutionFailed,
+                },
+                crate::error::from_problem,
+            ),
             BifrostClientError::ResultTooLarge => Self::Vala {
                 error: BifrostError::QueryResultTooLarge,
             },
@@ -141,75 +151,8 @@ impl From<&BifrostClientError> for WyrdError {
                 message: detail.clone(),
                 details: serde_json::json!({}),
             },
-            BifrostClientError::Queue(inner) => queue_catalog_error(inner),
+            BifrostClientError::Queue(inner) => inner.into(),
             BifrostClientError::Client(inner) => inner.into(),
-        }
-    }
-}
-
-/// Projects one client-tier queue refusal onto its catalog variant.
-///
-/// Saturation, drain, payload, and configuration refusals keep their own `WYRD_CLIENT_*`
-/// codes so a caller can retry a full queue without parsing error text; a sink
-/// failure is already a catalog error and passes through unchanged.
-fn queue_catalog_error(error: &WyrdQueueError) -> WyrdError {
-    let message = error.to_string();
-    let details = serde_json::json!({});
-    match error {
-        WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => {
-            WyrdError::ClientQueueFull { message, details }
-        }
-        WyrdQueueError::FlushTimeout => WyrdError::ClientFlushTimeout { message, details },
-        WyrdQueueError::PayloadTooLarge => WyrdError::ClientPayloadTooLarge { message, details },
-        WyrdQueueError::ConfigInvalid { field, reason } => WyrdError::ClientConfigInvalid {
-            message,
-            details: serde_json::json!({ "field": field, "reason": reason }),
-        },
-        WyrdQueueError::SchemaParse(detail) => WyrdError::Vala {
-            error: BifrostError::SchemaParse {
-                detail: detail.clone(),
-            },
-        },
-        WyrdQueueError::ReservedColumn(column) => WyrdError::Vala {
-            error: BifrostError::ReservedColumn {
-                column: column.clone(),
-            },
-        },
-        WyrdQueueError::Sink(inner) => inner.clone(),
-    }
-}
-
-/// Projects one validated closed terminal code through the canonical catalog.
-fn terminal_bifrost_error(terminal: &QueryTerminalFrame) -> BifrostError {
-    let detail = terminal
-        .error
-        .as_ref()
-        .and_then(|error| error.detail.as_ref())
-        .map_or_else(
-            || "query terminal reported failure".to_owned(),
-            |detail| detail.as_str().to_owned(),
-        );
-    match terminal.error.as_ref().map(|error| error.code) {
-        Some(QueryTerminalErrorCode::QueryTimeout) => BifrostError::QueryTimeout,
-        Some(QueryTerminalErrorCode::QueryVisibilityUnavailable) => {
-            BifrostError::QueryVisibilityUnavailable
-        }
-        Some(QueryTerminalErrorCode::QueryTenantInvariant) => BifrostError::QueryTenantInvariant,
-        Some(QueryTerminalErrorCode::QueryReconciliationInvariant) => {
-            BifrostError::QueryReconciliationInvariant
-        }
-        Some(QueryTerminalErrorCode::QueryPeerSecurity) => BifrostError::QueryPeerSecurity,
-        Some(QueryTerminalErrorCode::CatalogUnreachable) => {
-            BifrostError::CatalogUnreachable { detail }
-        }
-        Some(QueryTerminalErrorCode::StorageUnreachable) => {
-            BifrostError::StorageUnreachable { detail }
-        }
-        Some(QueryTerminalErrorCode::QueryResourcesExhausted) => {
-            BifrostError::QueryResourcesExhausted
-        }
-        Some(QueryTerminalErrorCode::QueryExecutionFailed) | None => {
-            BifrostError::QueryExecutionFailed
         }
     }
 }
@@ -251,10 +194,9 @@ impl QueryClient {
     /// # Errors
     ///
     /// Returns a contract error before IO when the request is invalid —
-    /// `WYRD_VALA_400_QUERY_INVALID_DEADLINE` for an out-of-range deadline and
-    /// `WYRD_VALA_400_QUERY_INVALID_SQL` for empty SQL or a non-finite bind
-    /// value — or a transport error when authentication or the HTTP request
-    /// fails.
+    /// `WYRD_VALA_400_QUERY_INVALID_SQL` for empty SQL, a non-finite bind
+    /// value, or an out-of-range deadline — or a transport error when
+    /// authentication or the HTTP request fails.
     ///
     /// # Cancellation
     ///
@@ -1335,8 +1277,8 @@ mod tests {
     use tokio::net::TcpListener;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::vala::api::{
-        QueryBatchFrame, QueryErrorDetail, QuerySchemaFrame, QuerySource, QueryTerminalError,
-        QueryTerminalErrorCode, QueryWarning, SourceCompletion, SourceCompletionOutcome,
+        QueryBatchFrame, QuerySchemaFrame, QuerySource, QueryWarning, SourceCompletion,
+        SourceCompletionOutcome,
     };
     use wyrd_tonic::frame_codec::FrameEncoder;
     use wyrd_tonic::wyrd::v1 as proto;
@@ -1396,7 +1338,9 @@ mod tests {
                         )
                     } else {
                         counts.statuses.fetch_add(1, Ordering::AcqRel);
-                        let body = "{\"code\":\"WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND\",\"detail\":\"gone\"}";
+                        let body = WyrdError::from(BifrostError::RunningQueryNotFound)
+                            .as_problem_json()
+                            .to_string();
                         format!(
                             "HTTP/1.1 404 Not Found\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                             body.len()
@@ -1948,7 +1892,7 @@ mod tests {
     /// the user fields, supplies the correlation inputs, and may supply the
     /// managed candidate. Building a schema from that description must append
     /// each correlation column exactly once — a writer that also re-declared
-    /// `card_ref` would collide with the one the write path resolves.
+    /// `card_uid` would collide with the one the write path resolves.
     ///
     /// # Panics
     ///
@@ -1972,15 +1916,10 @@ mod tests {
                   "metadata": { "PARQUET:field_id": "1" } }
             ],
             "correlation_fields": [
-                { "name": "card_ref", "data_type": "Utf8", "nullable": true,
-                  "metadata": { "wyrd:input_class": "gate_correlation" } },
+                { "name": "card_uid", "data_type": "Utf8", "nullable": true,
+                  "metadata": { "PARQUET:field_id": "1001" } },
                 { "name": "run_id", "data_type": "Utf8", "nullable": true,
                   "metadata": { "PARQUET:field_id": "1000" } }
-            ],
-            "managed_candidates": [
-                { "name": "wyrd_event_time",
-                  "data_type": { "Timestamp": { "unit": "Microsecond", "tz": "UTC" } },
-                  "nullable": false, "metadata": { "PARQUET:field_id": "1004" } }
             ],
             "canonical_physical_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "physical_layout": { "partition_granularity": "hour" }
@@ -2002,7 +1941,7 @@ mod tests {
             "a canonical table publishes its exact physical fingerprint"
         );
 
-        let writable = wyrd_queue::schema::writable_schema(&described, true)
+        let writable = wyrd_types::schema::writable_schema(&described)
             .expect("the description projects an Arrow schema");
         assert_eq!(
             writable
@@ -2010,8 +1949,8 @@ mod tests {
                 .iter()
                 .map(|field| field.name().as_str())
                 .collect::<Vec<_>>(),
-            ["trace_id", "card_ref", "run_id", "wyrd_event_time"],
-            "user fields precede correlation inputs, then the managed candidate"
+            ["trace_id", "card_uid", "run_id"],
+            "user fields precede correlation inputs and no managed column is writable"
         );
         assert!(
             writable
@@ -2020,30 +1959,22 @@ mod tests {
                 .all(|field| field.metadata().is_empty()),
             "no writable column repeats the server-owned field id back on the wire"
         );
-        assert_eq!(
-            wyrd_queue::schema::writable_schema(&described, false)
-                .expect("event time is optional")
-                .fields()
-                .len(),
-            3,
-            "a writer that supplies no event time declares no event-time column"
-        );
 
-        let builder = wyrd_queue::batch_builder::BatchBuilder::from_description(&described)
-            .expect("the description builds a JSON row builder");
+        let builder = wyrd_queue::RowPreflight::from_description(&described)
+            .expect("the description builds a JSON row preflight");
         assert_eq!(
             builder
                 .output_schema()
                 .fields()
                 .iter()
-                .filter(|field| field.name() == "card_ref")
+                .filter(|field| field.name() == "card_uid")
                 .count(),
             1,
             "the write path appends each correlation column exactly once"
         );
         assert!(
             writable.field(1).is_nullable(),
-            "card_ref is nullable: a writer may submit a row with no Card correlation"
+            "card_uid is nullable: a writer may submit a row with no Card correlation"
         );
         assert!(
             builder.output_schema().field(1).is_nullable(),
@@ -2200,15 +2131,8 @@ mod tests {
         );
 
         let mut terminal = failed_terminal(0);
-        terminal
-            .error
-            .as_mut()
-            .expect("failed terminal has error")
-            .detail =
-            Some(QueryErrorDetail::new("source failed").expect("fixed detail is scrubbed"));
-        let failed = BifrostClientError::FailedTerminal {
-            terminal: terminal.clone(),
-        };
+        terminal.error = None;
+        let failed = BifrostClientError::FailedTerminal { terminal };
         assert_eq!(
             WyrdError::from(&failed).code(),
             BifrostError::QueryExecutionFailed.code()
@@ -2266,69 +2190,42 @@ mod tests {
         }
     }
 
-    /// Every closed failed-terminal code projects through its catalog entry.
+    /// A failed terminal's catalog problem rebuilds the exact typed error.
     ///
     /// # Panics
     ///
-    /// Panics when any code is flattened to generic query execution metadata.
+    /// Panics when any error loses its code, details, status, title, or
+    /// remediation on the way back from the terminal.
     #[test]
-    fn failed_terminal_metadata_projection_is_exhaustive() {
+    fn failed_terminal_problem_rebuilds_its_catalog_error() {
         let cases = [
-            (
-                QueryTerminalErrorCode::QueryTimeout,
-                BifrostError::QueryTimeout,
-            ),
-            (
-                QueryTerminalErrorCode::QueryVisibilityUnavailable,
-                BifrostError::QueryVisibilityUnavailable,
-            ),
-            (
-                QueryTerminalErrorCode::QueryTenantInvariant,
-                BifrostError::QueryTenantInvariant,
-            ),
-            (
-                QueryTerminalErrorCode::QueryReconciliationInvariant,
-                BifrostError::QueryReconciliationInvariant,
-            ),
-            (
-                QueryTerminalErrorCode::QueryPeerSecurity,
-                BifrostError::QueryPeerSecurity,
-            ),
-            (
-                QueryTerminalErrorCode::CatalogUnreachable,
-                BifrostError::CatalogUnreachable {
-                    detail: "source failed".to_owned(),
-                },
-            ),
-            (
-                QueryTerminalErrorCode::StorageUnreachable,
-                BifrostError::StorageUnreachable {
-                    detail: "source failed".to_owned(),
-                },
-            ),
-            (
-                QueryTerminalErrorCode::QueryExecutionFailed,
-                BifrostError::QueryExecutionFailed,
-            ),
-            (
-                QueryTerminalErrorCode::QueryResourcesExhausted,
-                BifrostError::QueryResourcesExhausted,
-            ),
+            BifrostError::QueryTimeout,
+            BifrostError::QueryVisibilityUnavailable,
+            BifrostError::QueryTenantInvariant,
+            BifrostError::CatalogUnreachable {
+                detail: "source failed".to_owned(),
+            },
+            BifrostError::QueryResourcesExhausted,
+            BifrostError::QueryExecutionFailed,
+            BifrostError::VariantInvalidJson {
+                field: "parse_json".to_owned(),
+                row: 1,
+                path: String::new(),
+            },
+            BifrostError::VariantNumericOutOfRange {
+                field: "parse_json".to_owned(),
+                row: 0,
+                path: "/n".to_owned(),
+                numeric_kind: "integer".to_owned(),
+            },
         ];
-        for (code, expected) in cases {
-            let mut terminal = failed_terminal(0);
-            let error = terminal.error.as_mut().expect("failed terminal has error");
-            error.code = code;
-            error.detail =
-                Some(QueryErrorDetail::new("source failed").expect("detail is scrubbed"));
+        for expected in cases {
+            let terminal = failed_terminal_with(expected.clone(), 0);
             let projected = WyrdError::from(&BifrostClientError::FailedTerminal { terminal });
-            assert_eq!(projected.code(), expected.code(), "code for {code:?}");
-            assert_eq!(projected.status(), expected.status(), "status for {code:?}");
-            assert_eq!(projected.title(), expected.title(), "title for {code:?}");
             assert_eq!(
-                projected.remediation(),
-                expected.remediation(),
-                "remediation for {code:?}"
+                projected.problem(),
+                WyrdError::from(expected).problem(),
+                "terminal problem rebuilds its catalog error"
             );
         }
     }
@@ -2452,18 +2349,20 @@ mod tests {
         }
     }
 
-    /// Builds a failed terminal that still retains the immutable cut metadata.
+    /// Builds a generic failed terminal that retains the immutable cut metadata.
     fn failed_terminal(rows: u64) -> QueryTerminalFrame {
+        failed_terminal_with(BifrostError::QueryExecutionFailed, rows)
+    }
+
+    /// Builds a failed terminal carrying `error`'s catalog problem.
+    fn failed_terminal_with(error: BifrostError, rows: u64) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
             query_class: wyrd_spec::vala::api::QueryClass::Interactive,
             row_count: rows,
             warnings: Vec::new(),
             source_completion: sources(),
-            error: Some(QueryTerminalError {
-                code: QueryTerminalErrorCode::QueryExecutionFailed,
-                detail: None,
-            }),
+            error: Some(Box::new(WyrdError::from(error).problem())),
             // A failed stream never calls `finish`, so it has no end-of-stream.
             arrow_ipc_eos: Vec::new(),
         }
@@ -2815,12 +2714,7 @@ mod tests {
     async fn resource_terminal_rejects_partial_rows() {
         let schema = test_schema();
         let (mut ipc, prefix) = TestQueryIpc::open(&schema);
-        let mut terminal = failed_terminal(1);
-        terminal
-            .error
-            .as_mut()
-            .expect("failed terminal has error")
-            .code = QueryTerminalErrorCode::QueryResourcesExhausted;
+        let terminal = failed_terminal_with(BifrostError::QueryResourcesExhausted, 1);
         let chunks = vec![
             encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
                 schema_fingerprint: "fingerprint".to_owned(),

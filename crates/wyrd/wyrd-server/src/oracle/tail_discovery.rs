@@ -15,8 +15,9 @@ use vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls;
 use vala_bifrost_redux::oracle::{
     DiscoveredTailRoute, OracleQueryParticipant, TailStreamDiscovery,
 };
+use vala_bifrost_redux::scan_sizing::ScanScope;
 use vala_bifrost_redux::scribe::tail_rpc::{
-    FetchLiveTailService, TailReadError, TonicTailReadTransport,
+    ActiveTailStream, FetchLiveTailService, TailReadError, TonicTailReadTransport,
 };
 use wyrd_spec::vala::api::{NodeId, TenantTableBinding};
 use wyrd_tonic::tonic::transport::Channel;
@@ -129,7 +130,8 @@ impl RegistryTailStreamDiscovery {
             .collect()
     }
 
-    /// Lists one frozen Scribe and checks every stream against its fence.
+    /// Lists one frozen Scribe under `scope` and checks every stream against
+    /// its fence.
     ///
     /// # Errors
     /// Returns the listing's [`TailReadError`] class, or
@@ -139,10 +141,11 @@ impl RegistryTailStreamDiscovery {
         scribe: &OracleQueryParticipant,
         channel: Channel,
         binding: &TenantTableBinding,
+        scope: &ScanScope,
     ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
         let transport = TonicTailReadTransport::new(ScribeTailServiceClient::new(channel));
         let streams = transport
-            .list_active_streams(binding.clone())
+            .list_active_streams(binding.clone(), scope)
             .await
             .inspect_err(|error| {
                 tracing::warn!(
@@ -153,11 +156,12 @@ impl RegistryTailStreamDiscovery {
             })?;
         streams
             .into_iter()
-            .map(|stream| Self::route(scribe, stream.time_partition, stream.stream))
+            .map(|stream| Self::route(scribe, stream))
             .collect()
     }
 
-    /// Lists the frozen roster in-process on a node with no peer channel.
+    /// Lists the frozen roster in-process under `scope` on a node with no
+    /// peer channel.
     ///
     /// # Errors
     /// Returns [`TailReadError::State`] when the roster names a Scribe other
@@ -167,6 +171,7 @@ impl RegistryTailStreamDiscovery {
         local: &FetchLiveTailService,
         scribes: &[OracleQueryParticipant],
         binding: &TenantTableBinding,
+        scope: &ScanScope,
     ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
         let mut routes = Vec::new();
         for scribe in scribes {
@@ -175,8 +180,8 @@ impl RegistryTailStreamDiscovery {
                     detail: "tail transport requires the Bifrost peer identity".to_owned(),
                 });
             }
-            for (time_partition, stream) in local.list_active_streams(binding)? {
-                routes.push(Self::route(scribe, time_partition, stream)?);
+            for stream in local.list_active_streams(binding, scope)? {
+                routes.push(Self::route(scribe, stream)?);
             }
         }
         Ok(routes)
@@ -189,15 +194,20 @@ impl RegistryTailStreamDiscovery {
     /// node or writer epoch than the frozen participant.
     fn route(
         scribe: &OracleQueryParticipant,
-        time_partition: wyrd_spec::vala::api::TimePartitionWire,
-        stream: wyrd_spec::vala::api::TailStreamIdentity,
+        listed: ActiveTailStream,
     ) -> Result<DiscoveredTailRoute, TailReadError> {
+        let ActiveTailStream {
+            time_partition,
+            stream,
+            bytes,
+        } = listed;
         if stream.node_id != scribe.node_id || stream.writer_epoch != scribe.fencing_token {
             return Err(TailReadError::StaleIdentity);
         }
         Ok(DiscoveredTailRoute {
             time_partition,
             stream,
+            bytes,
         })
     }
 }
@@ -220,6 +230,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
     async fn discover(
         &self,
         binding: &TenantTableBinding,
+        scope: &ScanScope,
         scribes: &[OracleQueryParticipant],
         deadline: Instant,
     ) -> Result<Vec<DiscoveredTailRoute>, TailReadError> {
@@ -244,7 +255,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
         if self.tls.is_none()
             && let Some(local) = &self.local
         {
-            return Self::list_local(local, scribes, binding);
+            return Self::list_local(local, scribes, binding, scope);
         }
         let channels = self.channels_for(scribes)?;
         let remaining = deadline
@@ -254,7 +265,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
             scribes
                 .iter()
                 .zip(channels)
-                .map(|(scribe, channel)| Self::list_one(scribe, channel, binding)),
+                .map(|(scribe, channel)| Self::list_one(scribe, channel, binding, scope)),
         );
         #[cfg(feature = "test-support")]
         let listings = async {

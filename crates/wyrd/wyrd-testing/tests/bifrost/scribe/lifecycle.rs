@@ -38,9 +38,7 @@ const IDLE_PUBLICATION_DEADLINE: Duration = Duration::from_secs(30);
 /// lifecycle tick expiring the generation's age and then the staged member's
 /// dwell. No flush, snapshot refresh, drain, or further write is issued; the
 /// case only waits and observes, exactly as an application that wrote once and
-/// went quiet would. The audit publisher is kept off because it is the one
-/// other writer in the pod, and its generations would publish the table
-/// without the tick.
+/// went quiet would.
 ///
 /// # Panics
 ///
@@ -307,6 +305,7 @@ async fn scribe_tick_retries_a_failed_due_claim() {
         .expect("the Scribe production harness starts");
     let tenant = server.data_tenant_id();
     let name = unique_table("tick_retry");
+    faults.target_table_for_test(&name);
     let table = register_table(&server, tenant, BifrostNamespace::Datasets, &name).await;
     let client = tenant_client(&server, tenant).await;
     let expected: Vec<i64> = (0..32).collect();
@@ -371,6 +370,7 @@ async fn scribe_tick_finishes_a_claim_that_failed_after_its_commit() {
     let expected: Vec<i64> = (0..32).collect();
 
     let first_name = unique_table("post_commit_failure");
+    faults.target_table_for_test(&first_name);
     let first = register_table(&server, tenant, BifrostNamespace::Datasets, &first_name).await;
     append_values(&client, &first, Uuid::now_v7(), &expected)
         .await
@@ -392,7 +392,7 @@ async fn scribe_tick_finishes_a_claim_that_failed_after_its_commit() {
     );
     assert_eq!(sorted_values(&client, &first).await, expected);
     let settled = server
-        .scribe_staging_backlog_for_test()
+        .scribe_staging_backlog_for_test(Some(&first_name))
         .expect("the staging owner is inspectable");
     assert_eq!(
         (settled.outstanding_claims, settled.live_members),
@@ -401,6 +401,7 @@ async fn scribe_tick_finishes_a_claim_that_failed_after_its_commit() {
     );
 
     let second_name = unique_table("after_post_commit_failure");
+    faults.target_table_for_test(&second_name);
     let second = register_table(&server, tenant, BifrostNamespace::Datasets, &second_name).await;
     append_values(&client, &second, Uuid::now_v7(), &expected)
         .await

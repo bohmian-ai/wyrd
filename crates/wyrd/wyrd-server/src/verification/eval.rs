@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{Array, ArrayRef, AsArray as _};
-use arrow::datatypes::{DataType, Int32Type, Int64Type, TimestampMicrosecondType};
+use arrow::datatypes::{
+    DataType, Int32Type, Int64Type, TimestampMicrosecondType, TimestampNanosecondType,
+};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -32,10 +34,10 @@ use vala_eval::sampling::RecordSample;
 use vala_eval::{
     EvalExecError, EvalReport, InMemoryTraceSource, JudgeError, JudgeInvoker, MediaBindings,
 };
+use wyrd_queue::variant::variant_cell_to_json;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::card::agent::AgentSpec;
-
 use wyrd_spec::card::eval::EvalSpec;
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
@@ -57,8 +59,6 @@ use wyrd_sql::queries::cards::{get_card_by_ref, get_card_by_uid};
 use wyrd_sql::queries::verifier_runs::{ClaimedRun, RunInput, TerminalStatus};
 use wyrd_storage::tenant_path;
 use wyrd_storage::{StorageError, StorageHandle};
-use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValueList, any_value};
-use wyrd_tonic::prost::Message as _;
 
 use super::authority::{SystemReadAuthority, SystemReadAuthorityError, writer_caller};
 use super::engines::{EngineOutcome, VerifierReport};
@@ -156,13 +156,10 @@ impl EvalEngine {
                 )
                 .await
                 .map_err(ReadStart::Authority)?;
-                let record = Box::pin(reader.record(
-                    &run.subject_card_uid.to_string(),
-                    record_id,
-                    *event_time,
-                ))
-                .await
-                .map_err(ReadStart::Record)?;
+                let record = reader
+                    .record(&run.subject_card_uid.to_string(), record_id, *event_time)
+                    .await
+                    .map_err(ReadStart::Record)?;
                 Ok::<_, ReadStart>((reader, record))
             })
             .await;
@@ -222,11 +219,12 @@ impl EvalEngine {
         };
         let traces = InMemoryTraceSource::new();
         if let Some(trace_id) = record.trace_id.filter(|_| needs_trace(spec)) {
-            match Box::pin(telemetry.phase(
-                Phase::InputRead,
-                reader.spans(trace_id, *event_time, self.trace_window),
-            ))
-            .await
+            match telemetry
+                .phase(
+                    Phase::InputRead,
+                    reader.spans(trace_id, *event_time, self.trace_window),
+                )
+                .await
             {
                 Ok(spans) if spans.is_empty() => {
                     return EngineOutcome::AwaitingTrace(failure(
@@ -596,25 +594,27 @@ impl BifrostReader {
     #[tracing::instrument(name = "verification.evidence_read", skip_all)]
     async fn query(&self, sql: String) -> Result<Vec<RecordBatch>, WyrdError> {
         let mut batches = Vec::new();
-        Box::pin(self.waits.wait(self.caller.run_with(
-            BifrostQueryRequest {
-                params: Vec::new(),
-                sql,
-                deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
-            },
-            |batch| {
-                batches.push(batch);
-                Ok(())
-            },
-        )))
-        .await?;
+        self.waits
+            .wait(self.caller.run_with(
+                BifrostQueryRequest {
+                    params: Vec::new(),
+                    sql,
+                    deadline_ms: i64::try_from(READ_DEADLINE_MS).ok(),
+                },
+                |batch| {
+                    batches.push(batch);
+                    Ok(())
+                },
+            ))
+            .await?;
         Ok(batches)
     }
 
     /// Read one committed observation of `subject` by its record ID, pruned
-    /// to the UTC day of its frozen server `event_time`, with the managed
-    /// application `run_id` that wrote it (`None` when the row names none)
-    /// and its managed writer `principal_id`.
+    /// to the UTC day of its `created_at`, the table's time column, which the
+    /// run froze as `event_time`, with the managed application `run_id` that
+    /// wrote it (`None` when the row names none) and its managed writer
+    /// `principal_id`.
     ///
     /// # Errors
     /// Returns [`ReadError::Admission`] when Bifrost refuses the read at
@@ -627,16 +627,16 @@ impl BifrostReader {
         event_time: DateTime<Utc>,
     ) -> Result<(EvalRecordObservation, Option<RunId>, Option<String>), ReadError> {
         let (start, end) = utc_day(event_time);
-        let batches = Box::pin(self.query(format!(
+        let batches = self.query(format!(
             "SELECT record_id, session_id, context, trace_id, span_id, created_at, media, run_id, principal_id \
                  FROM vala.eval.observations \
                  WHERE card_uid = '{}' AND record_id = '{}' \
-                   AND wyrd_event_time >= TIMESTAMP '{start}' \
-                   AND wyrd_event_time < TIMESTAMP '{end}' \
+                   AND created_at >= TIMESTAMP '{start}' \
+                   AND created_at < TIMESTAMP '{end}' \
                  LIMIT 1",
             quoted(subject),
             quoted(record_id),
-        )))
+        ))
         .await?;
         let batch = batches
             .iter()
@@ -666,29 +666,32 @@ impl BifrostReader {
             .map(|at| at.is_valid(0).then(|| at.value(0)))?
             .and_then(DateTime::<Utc>::from_timestamp_micros)
             .ok_or("created_at is missing")?;
-        let json_text = |name| -> Result<Value, String> {
-            text(batch, name, 0)?
-                .map(|raw| serde_json::from_str(&raw).map_err(|error| error.to_string()))
-                .transpose()
-                .map(Option::unwrap_or_default)
+        let variant = |name: &str| -> Result<Value, String> {
+            let column = batch
+                .column_by_name(name)
+                .ok_or_else(|| format!("{name} is missing"))?;
+            variant_cell_to_json(column.as_ref(), 0).map_err(|_| format!("{name} does not decode"))
         };
         let run_id = text(batch, "run_id", 0)?.map(RunId::from_string);
         let record = serde_json::from_value(json!({
             "record_id": text(batch, "record_id", 0)?,
             "session_id": text(batch, "session_id", 0)?,
-            "context": json_text("context")?,
+            "context": variant("context")?,
             "trace_id": trace_id.map(|id| id.to_hex()),
             "span_id": span_id.map(|id| id.to_hex()),
             "created_at": created_at,
-            "media": json_text("media")?,
+            "media": variant("media")?,
         }))
         .map_err(|error| format!("record {record_id} does not decode: {error}"))?;
         Ok((record, run_id, text(batch, "principal_id", 0)?))
     }
 
-    /// Read the visible spans of `trace_id` received from the start of the
-    /// day before the record's day to the end of the day containing
+    /// Read the visible spans of `trace_id` that started from the start of
+    /// the day before the record's day to the end of the day containing
     /// `event_time + window`, in start-time then span-ID order.
+    ///
+    /// The range is on `start_time_unix_nano`, the span table's time column,
+    /// so it prunes to the partitions and files the range covers.
     ///
     /// The one total order makes positional selectors such as `$.spans[0]`
     /// reproducible across retries and restarts. At most
@@ -712,21 +715,22 @@ impl BifrostReader {
                 .checked_add_signed(window)
                 .ok_or("the trace window is out of range")?,
         );
-        let batches = match Box::pin(self.query(format!(
-            "SELECT span_id, parent_span_id, trace_state, flags, name, kind, \
+        let batches = match self
+            .query(format!(
+                "SELECT span_id, parent_span_id, trace_state, flags, name, kind, \
                         start_time_unix_nano, end_time_unix_nano, status_code, status_message, \
                         attributes, dropped_attributes_count, events, dropped_events_count, \
                         links, dropped_links_count, scope_name, service_name \
                  FROM vala.traces.spans \
                  WHERE trace_id = X'{}' \
-                   AND wyrd_event_time >= TIMESTAMP '{start}' \
-                   AND wyrd_event_time < TIMESTAMP '{end}' \
+                   AND start_time_unix_nano >= TIMESTAMP '{start}' \
+                   AND start_time_unix_nano < TIMESTAMP '{end}' \
                  ORDER BY start_time_unix_nano, span_id \
                  LIMIT {}",
-            trace_id.to_hex(),
-            TRACE_SPAN_LIMIT + 1,
-        )))
-        .await
+                trace_id.to_hex(),
+                TRACE_SPAN_LIMIT + 1,
+            ))
+            .await
         {
             Ok(batches) => batches,
             // A tenant's span table is created by its first export, so its
@@ -766,8 +770,7 @@ fn span(batch: &RecordBatch, row: usize, trace_id: TraceId) -> Result<SpanRecord
             .transpose()
     };
     let nanos = |name| -> Result<DateTime<Utc>, String> {
-        let value = int64(batch, name, row)?.ok_or_else(|| format!("{name} is missing"))?;
-        Ok(DateTime::<Utc>::from_timestamp_nanos(value))
+        instant(batch, name, row)?.ok_or_else(|| format!("{name} is missing"))
     };
     let (start_time, end_time) = (nanos("start_time_unix_nano")?, nanos("end_time_unix_nano")?);
     let status = match int32(batch, "status_code", row)? {
@@ -823,9 +826,8 @@ fn span(batch: &RecordBatch, row: usize, trace_id: TraceId) -> Result<SpanRecord
 /// Returns a description of a missing or malformed field.
 fn event(items: &RecordBatch, row: usize) -> Result<SpanEvent, String> {
     Ok(SpanEvent {
-        timestamp: DateTime::<Utc>::from_timestamp_nanos(
-            int64(items, "time_unix_nano", row)?.ok_or("event time_unix_nano is missing")?,
-        ),
+        timestamp: instant(items, "time_unix_nano", row)?
+            .ok_or("event time_unix_nano is missing")?,
         name: text(items, "name", row)?.unwrap_or_default(),
         attributes: attribute_column(items, "attributes", row)?,
         dropped_attributes_count: count(items, "dropped_attributes_count", row)?,
@@ -887,17 +889,30 @@ fn nested<T>(
         .collect()
 }
 
-/// The canonical attribute payload in column `name` at `row` as JSON; a null
-/// payload is empty.
+/// The Variant attribute object in column `name` at `row` as JSON; a null
+/// value is empty.
+///
+/// Bytes values render as base64 text and integers keep their exact value.
 ///
 /// # Errors
-/// Returns the column or protobuf decode failure.
+/// Returns a description when the column is absent, is not Variant storage,
+/// the value does not decode, or the value is not an object.
 fn attribute_column(
     batch: &RecordBatch,
     name: &str,
     row: usize,
 ) -> Result<Map<String, Value>, String> {
-    bytes(batch, name, row)?.map_or_else(|| Ok(Map::new()), |raw| attributes(&raw))
+    let column = batch
+        .column_by_name(name)
+        .ok_or_else(|| format!("column {name} is missing"))?;
+    let ordinal = u64::try_from(row).unwrap_or(u64::MAX);
+    match variant_cell_to_json(column.as_ref(), row)
+        .map_err(|violation| violation.into_error(name, ordinal).to_string())?
+    {
+        Value::Null => Ok(Map::new()),
+        Value::Object(attributes) => Ok(attributes),
+        _ => Err(format!("column {name} does not hold an attribute object")),
+    }
 }
 
 /// Non-negative 32-bit count in 64-bit column `name` at `row`; null is zero.
@@ -907,46 +922,6 @@ fn attribute_column(
 fn count(batch: &RecordBatch, name: &str, row: usize) -> Result<u32, String> {
     u32::try_from(int64(batch, name, row)?.unwrap_or_default())
         .map_err(|_| format!("column {name} is not a 32-bit count"))
-}
-
-/// Decode a canonical `KeyValueList` attribute payload into JSON.
-///
-/// # Errors
-/// Returns the protobuf decode failure.
-fn attributes(raw: &[u8]) -> Result<Map<String, Value>, String> {
-    Ok(KeyValueList::decode(raw)
-        .map_err(|error| error.to_string())?
-        .values
-        .into_iter()
-        .map(|entry| (entry.key, any_json(entry.value)))
-        .collect())
-}
-
-/// One OTLP `AnyValue` as JSON; bytes become base64 text.
-fn any_json(value: Option<AnyValue>) -> Value {
-    match value.and_then(|value| value.value) {
-        None => Value::Null,
-        Some(any_value::Value::StringValue(text)) => Value::String(text),
-        Some(any_value::Value::BoolValue(flag)) => Value::Bool(flag),
-        Some(any_value::Value::IntValue(number)) => Value::from(number),
-        Some(any_value::Value::DoubleValue(number)) => Value::from(number),
-        Some(any_value::Value::BytesValue(raw)) => {
-            Value::String(base64::engine::general_purpose::STANDARD.encode(raw))
-        }
-        Some(any_value::Value::ArrayValue(array)) => Value::Array(
-            array
-                .values
-                .into_iter()
-                .map(|item| any_json(Some(item)))
-                .collect(),
-        ),
-        Some(any_value::Value::KvlistValue(list)) => Value::Object(
-            list.values
-                .into_iter()
-                .map(|entry| (entry.key, any_json(entry.value)))
-                .collect(),
-        ),
-    }
 }
 
 /// The UTC day containing `at`, as `[start, end)` SQL timestamp literals.
@@ -1024,6 +999,23 @@ fn int64(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<i64>, Str
         .as_primitive_opt::<Int64Type>()
         .ok_or_else(|| format!("column {name} is not a 64-bit integer"))?;
     Ok(column.is_valid(row).then(|| column.value(row)))
+}
+
+/// UTC instant of the nanosecond timestamp column `name` at `row`, `None`
+/// when null.
+///
+/// Span start, end and event times are stored as OTLP instants
+/// (`Timestamp(Nanosecond, "UTC")`), not as raw integers.
+///
+/// # Errors
+/// Returns the column failure or a column that is not a nanosecond timestamp.
+fn instant(batch: &RecordBatch, name: &str, row: usize) -> Result<Option<DateTime<Utc>>, String> {
+    let column = column(batch, name)?
+        .as_primitive_opt::<TimestampNanosecondType>()
+        .ok_or_else(|| format!("column {name} is not a nanosecond timestamp"))?;
+    Ok(column
+        .is_valid(row)
+        .then(|| DateTime::<Utc>::from_timestamp_nanos(column.value(row))))
 }
 
 /// 32-bit integer value of column `name` at `row`, `None` when null.

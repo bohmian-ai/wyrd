@@ -467,7 +467,7 @@ async fn run_invokes_its_agent_through_the_gateway() {
     assert_eq!(requests.len(), 1);
     assert!(
         requests[0].headers.get("wyrd-run-id").is_none()
-            && requests[0].headers.get("wyrd-card-ref").is_none(),
+            && requests[0].headers.get("wyrd-card-uid").is_none(),
         "correlation never reaches the provider"
     );
     assert_eq!(

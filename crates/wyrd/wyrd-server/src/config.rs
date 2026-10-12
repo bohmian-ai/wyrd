@@ -243,6 +243,12 @@ pub struct ForgeRuntimeConfig {
     /// orphan GC. Must be positive when set. Default 86400 (24 hours).
     #[serde(default)]
     pub orphan_gc_ttl_secs: Option<u64>,
+    /// Time (seconds) Forge keeps a replaced snapshot after first observing it
+    /// replaced. Oracle queries record no reads, so this window is what keeps
+    /// a running query's files: it must be at least
+    /// `bifrost.oracle.max_query_deadline_ms`. Default 21600 (6 hours).
+    #[serde(default)]
+    pub snapshot_retention_secs: Option<u64>,
     /// Maximum object-store listing pages one orphan-GC candidate scan walks
     /// before yielding cleanly to a successor run. Must be at least 1 when set.
     /// Default 1024.
@@ -266,6 +272,19 @@ pub struct ForgeRuntimeConfig {
 }
 
 impl ForgeRuntimeConfig {
+    /// Resolves the snapshot retention window, defaulting to the compiled
+    /// Forge default.
+    ///
+    /// Boot hands this to Forge and validation compares it with the Oracle
+    /// maximum query deadline, so both read the one resolved value.
+    #[must_use]
+    pub fn snapshot_retention(&self) -> Duration {
+        self.snapshot_retention_secs.map_or_else(
+            || vala_bifrost_redux::forge::ForgeConfig::default().snapshot_retention,
+            Duration::from_secs,
+        )
+    }
+
     /// Resolve the per-tenant active cap, defaulting directly to one.
     ///
     /// This is the single place the D78 per-tenant fairness bound is derived
@@ -307,20 +326,6 @@ pub struct ScribeRuntimeConfig {
     /// WAL IO worker count.
     #[serde(default = "default_scribe_wal_io_threads")]
     pub wal_io_threads: usize,
-    /// Optional past-window bound (seconds) for caller-supplied `wyrd_event_time` validation.
-    ///
-    /// A caller-supplied `wyrd_event_time` older than this many seconds before server receipt
-    /// time is rejected with `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`. When absent the D85
-    /// default of 30 days applies. Per-tenant overrides are not supported.
-    #[serde(default)]
-    pub event_time_past_window_secs: Option<u64>,
-    /// Optional future-window bound (seconds) for caller-supplied `wyrd_event_time` validation.
-    ///
-    /// A caller-supplied `wyrd_event_time` more than this many seconds ahead of server receipt
-    /// time is rejected with `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE`. When absent the D85
-    /// default of 24 hours applies. Per-tenant overrides are not supported.
-    #[serde(default)]
-    pub event_time_future_window_secs: Option<u64>,
     /// Maximum encoded bytes accepted for one native or OTLP request.
     ///
     /// Scribe reserves a replayable envelope for one request of this size at
@@ -473,6 +478,14 @@ pub struct OracleRuntimeConfig {
     /// overrides it.
     #[serde(default = "default_oracle_default_query_deadline_ms")]
     pub default_query_deadline_ms: u64,
+    /// Longest total deadline any query may run under; a caller's larger
+    /// `deadline_ms` is capped to it.
+    ///
+    /// Forge's snapshot retention must be at least this long, since it is the
+    /// only thing keeping a running query's files.
+    /// `WYRD_BIFROST_ORACLE_MAX_QUERY_DEADLINE_MS` overrides it.
+    #[serde(default = "default_oracle_max_query_deadline_ms")]
+    pub max_query_deadline_ms: u64,
     /// Maximum remote workers, excluding the leader.
     #[serde(default = "default_oracle_max_workers_per_query")]
     pub max_workers_per_query: usize,
@@ -488,6 +501,12 @@ pub struct OracleRuntimeConfig {
     /// to be approved.
     #[serde(default)]
     pub allow_unapproved_profile: bool,
+    /// Parquet bytes each distributed Analytical scan task reads.
+    ///
+    /// `datafusion-distributed` asks for one scan task per this many bytes,
+    /// capped by the workers the query holds. Unset keeps its own default.
+    #[serde(default)]
+    pub file_scan_bytes_per_task: Option<usize>,
 }
 
 /// Default waiting places per Oracle node across both query classes.
@@ -501,6 +520,10 @@ fn default_oracle_max_queue_wait_ms() -> u64 {
 /// Default total Oracle query deadline in milliseconds: two hours.
 fn default_oracle_default_query_deadline_ms() -> u64 {
     7_200_000
+}
+/// Default maximum Oracle query deadline in milliseconds: six hours.
+fn default_oracle_max_query_deadline_ms() -> u64 {
+    21_600_000
 }
 fn default_oracle_max_workers_per_query() -> usize {
     2
@@ -519,6 +542,15 @@ impl OracleRuntimeConfig {
     pub const fn default_query_deadline(&self) -> Duration {
         Duration::from_millis(self.default_query_deadline_ms)
     }
+
+    /// Returns the longest total deadline any query may run under.
+    ///
+    /// Boot resolves it beside [`Self::default_query_deadline`] for both the
+    /// local Oracle engine and the public forwarder.
+    #[must_use]
+    pub const fn max_query_deadline(&self) -> Duration {
+        Duration::from_millis(self.max_query_deadline_ms)
+    }
 }
 
 impl Default for OracleRuntimeConfig {
@@ -527,10 +559,12 @@ impl Default for OracleRuntimeConfig {
             admission_waiters: default_oracle_admission_waiters(),
             max_queue_wait_ms: default_oracle_max_queue_wait_ms(),
             default_query_deadline_ms: default_oracle_default_query_deadline_ms(),
+            max_query_deadline_ms: default_oracle_max_query_deadline_ms(),
             max_workers_per_query: default_oracle_max_workers_per_query(),
             max_frame_bytes: default_oracle_max_frame_bytes(),
             calibration_profile: PathBuf::new(),
             allow_unapproved_profile: false,
+            file_scan_bytes_per_task: None,
         }
     }
 }
@@ -1343,6 +1377,14 @@ pub struct BifrostResourceConfig {
     /// derives twice effective CPU, never below the portable slot-unit floor.
     #[serde(default)]
     pub oracle_query_slot_limit: Option<usize>,
+    /// Optional scanned bytes that earn one Oracle execution partition.
+    ///
+    /// Oracle sizes each query's partitions from the bytes it scans, and the
+    /// Scribe follower deals live batches by the same value. Unset keeps
+    /// 24 MiB; zero is refused.
+    /// `WYRD_BIFROST_ORACLE_PARTITION_SCAN_BYTES` overrides it.
+    #[serde(default)]
+    pub oracle_partition_scan_bytes: Option<u64>,
 }
 
 impl BifrostResourceConfig {
@@ -1366,6 +1408,7 @@ impl BifrostResourceConfig {
             scratch_limit_bytes: self.scratch_limit_bytes,
             effective_cpu: self.effective_cpu,
             oracle_query_slot_limit: self.oracle_query_slot_limit,
+            oracle_partition_scan_bytes: self.oracle_partition_scan_bytes,
             scratch_root,
             volume_roots,
         }
@@ -1453,8 +1496,6 @@ impl Default for ScribeRuntimeConfig {
             ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
             persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
             wal_io_threads: default_scribe_wal_io_threads(),
-            event_time_past_window_secs: None,
-            event_time_future_window_secs: None,
             ingest_request_bytes: default_ingest_request_bytes(),
             mem_table_bucket_num: default_scribe_mem_table_bucket_num(),
             max_file_size_on_disk: default_scribe_max_file_size_on_disk(),
@@ -2976,6 +3017,10 @@ impl WyrdServerConfig {
             "WYRD_BIFROST_ORACLE_QUERY_SLOT_LIMIT",
             self.bifrost.resources.oracle_query_slot_limit,
         )?;
+        self.bifrost.resources.oracle_partition_scan_bytes = parse_optional_env(
+            "WYRD_BIFROST_ORACLE_PARTITION_SCAN_BYTES",
+            self.bifrost.resources.oracle_partition_scan_bytes,
+        )?;
         self.forge.target_file_size_bytes = parse_optional_env(
             "WYRD_BIFROST_FORGE_TARGET_FILE_SIZE_BYTES",
             self.forge.target_file_size_bytes,
@@ -2990,6 +3035,11 @@ impl WyrdServerConfig {
             Some(self.bifrost.oracle.default_query_deadline_ms),
         )?
         .unwrap_or(self.bifrost.oracle.default_query_deadline_ms);
+        self.bifrost.oracle.max_query_deadline_ms = parse_optional_env(
+            "WYRD_BIFROST_ORACLE_MAX_QUERY_DEADLINE_MS",
+            Some(self.bifrost.oracle.max_query_deadline_ms),
+        )?
+        .unwrap_or(self.bifrost.oracle.max_query_deadline_ms);
         let scribe = &mut self.bifrost.scribe;
         scribe.mem_table_bucket_num = parse_optional_env(
             "WYRD_MEM_TABLE_BUCKET_NUM",
@@ -3292,10 +3342,25 @@ impl WyrdServerConfig {
                 message: "forge.target_file_size_bytes must be positive".to_owned(),
             });
         }
+        // Queries record no reads; retention alone keeps a running query's
+        // files, so no query may outlive it. Checked on every target because
+        // Forge and Oracle may run on different ones from one configuration.
+        if self.forge.snapshot_retention() < self.bifrost.oracle.max_query_deadline() {
+            return Err(ConfigError::Invalid {
+                message: "forge.snapshot_retention_secs must be at least \
+                          bifrost.oracle.max_query_deadline_ms"
+                    .to_owned(),
+            });
+        }
         if serves_api {
             if self.bifrost.oracle.max_workers_per_query > 63 {
                 return Err(ConfigError::Invalid {
                     message: "bifrost.oracle.max_workers_per_query must be at most 63".to_owned(),
+                });
+            }
+            if self.bifrost.oracle.file_scan_bytes_per_task == Some(0) {
+                return Err(ConfigError::Invalid {
+                    message: "bifrost.oracle.file_scan_bytes_per_task must be positive".to_owned(),
                 });
             }
             // Both time limits share the caller `deadline_ms` range, so every
@@ -3304,6 +3369,9 @@ impl WyrdServerConfig {
             if self.bifrost.oracle.admission_waiters == 0
                 || !representable_ms.contains(&self.bifrost.oracle.max_queue_wait_ms)
                 || !representable_ms.contains(&self.bifrost.oracle.default_query_deadline_ms)
+                || !representable_ms.contains(&self.bifrost.oracle.max_query_deadline_ms)
+                || self.bifrost.oracle.default_query_deadline_ms
+                    > self.bifrost.oracle.max_query_deadline_ms
                 || self.bifrost.oracle.max_frame_bytes == 0
             {
                 return Err(ConfigError::Invalid {
@@ -4377,6 +4445,48 @@ maintenance_interval_secs = 45
             assert!(
                 config.validate().is_err(),
                 "queue {queue_ms} ms and total {total_ms} ms must be refused"
+            );
+        }
+    }
+
+    /// Proves the maximum query deadline defaults to six hours, has an
+    /// environment override, and must sit between the default deadline and
+    /// Forge's snapshot retention.
+    #[test]
+    fn max_query_deadline_sits_between_default_deadline_and_retention() {
+        let defaults = WyrdServerConfig::default();
+        assert_eq!(defaults.bifrost.oracle.max_query_deadline_ms, 21_600_000);
+        assert_eq!(
+            defaults.forge.snapshot_retention(),
+            defaults.bifrost.oracle.max_query_deadline()
+        );
+
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars(
+            [("WYRD_BIFROST_ORACLE_MAX_QUERY_DEADLINE_MS", Some("3500"))],
+            || {
+                let mut config = WyrdServerConfig::default();
+                config.apply_env_overrides().expect("valid override");
+                assert_eq!(config.bifrost.oracle.max_query_deadline_ms, 3_500);
+            },
+        );
+
+        for (default_ms, max_ms, retention_secs, valid) in [
+            (7_200_000, 21_600_000, None, true),
+            (7_200_000, 7_200_000, Some(7_200), true),
+            (7_200_001, 7_200_000, Some(21_600), false),
+            (7_200_000, 21_600_000, Some(21_599), false),
+            (7_200_000, 0, None, false),
+        ] {
+            let mut config = WyrdServerConfig::default();
+            config.bifrost.oracle.allow_unapproved_profile = true;
+            config.bifrost.oracle.default_query_deadline_ms = default_ms;
+            config.bifrost.oracle.max_query_deadline_ms = max_ms;
+            config.forge.snapshot_retention_secs = retention_secs;
+            assert_eq!(
+                config.validate().is_ok(),
+                valid,
+                "default {default_ms} ms, max {max_ms} ms, retention {retention_secs:?} s"
             );
         }
     }
@@ -5724,6 +5834,8 @@ minimum_slots = 2
             memory_limit_bytes: oracle_bytes * 2,
             effective_cpu,
             oracle_query_slot_limit: limit,
+            oracle_partition_scan_bytes:
+                vala_bifrost_redux::scan_sizing::ORACLE_PARTITION_SCAN_BYTES,
             server_memory_min_bytes: oracle_bytes,
             managed_memory_bytes: oracle_bytes,
             scribe_enabled: false,

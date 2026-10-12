@@ -1,8 +1,9 @@
 //! Generic, reusable write-buffering substrate for Wyrd observation surfaces.
 //!
 //! `wyrd-queue` owns the DX write-buffering layer and nothing else: a byte-budgeted,
-//! two-stage in-process queue; a background flush task; the [`BatchBuilder`]
-//! that turns buffered JSON rows into one user-only Arrow IPC batch; the
+//! two-stage in-process queue; a background flush task; the [`RowPreflight`]
+//! that converts complete JSON row inputs into user-only Arrow rows before
+//! admission; the
 //! [`BatchSink`] trait the sealed batch is drained into; the pure
 //! `schema_to_fieldspec` mapping core; backpressure, drain-on-shutdown, and
 //! metrics.
@@ -12,7 +13,7 @@
 //! observation kind. A new observation kind is a new [`BatchSink`] impl in its
 //! own surface crate, with zero change here.
 //!
-//! [`BatchBuilder`]: batch_builder::BatchBuilder
+//! [`RowPreflight`]: batch_builder::RowPreflight
 //! [`BatchSink`]: sink::BatchSink
 //! [`SealedBatch`]: sink::SealedBatch
 
@@ -24,11 +25,11 @@ pub mod config;
 pub mod error;
 pub mod producer;
 pub mod queue;
-pub mod schema;
 pub mod sealed_sender;
 pub mod sink;
+pub mod variant;
 
-pub use batch_builder::{BatchBuilder, is_reserved_column};
+pub use batch_builder::{PreparedRows, RowPreflight, is_reserved_column};
 pub use bounded_arrow::{
     ArrowIpcMaterialError, ArrowIpcMaterialFacts, ArrowIpcMaterialPlan,
     ArrowIpcMaterializedCapacity, BoundedArrowIpc,
@@ -39,9 +40,6 @@ pub use producer::{
     ClientByteBudget, ClientByteGuard, ClientByteMetrics, Producer, ProducerMetrics,
 };
 pub use queue::{Flushable, RecordQueue, Row};
-pub use schema::{
-    arrow_schema_to_fieldspec, fieldspec_to_arrow, json_schema_to_arrow, json_schema_to_fieldspec,
-};
 pub use sealed_sender::SealedBatchSender;
 pub use sink::{
     BatchSink, DurableBatchAck, MockSink, OwnedIpcBytes, SealedBatch, SharedIpcBytes, SinkError,

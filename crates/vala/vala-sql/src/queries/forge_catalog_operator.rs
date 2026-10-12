@@ -1,8 +1,7 @@
 //! Operator-only active-table roster for cross-tenant Forge maintenance.
 //!
 //! The roster intentionally reads every active Bifrost registration through
-//! [`OperatorPool`], which is backed by the `wyrd_platform_admin` BYPASSRLS
-//! role. It remains separate from tenant-scoped OLAP catalog queries so the
+//! [`OperatorPool`], the platform operator session. It remains separate from tenant-scoped OLAP catalog queries so the
 //! query-module boundary makes that elevated access explicit.
 // raw-query grep allowlist: the cross-tenant Forge roster is intentionally operator-owned.
 

@@ -1,4 +1,48 @@
 import { env } from '$env/dynamic/private';
+import type { paths } from './generated/wyrd-http';
+
+/** Generated `/v1` operations, keyed by their path below the `/v1` prefix the BFF adds. */
+export type V1 = { [P in keyof paths as P extends `/v1/${infer R}` ? `/${R}` : never]: paths[P] };
+type Method = 'get' | 'put' | 'post' | 'delete' | 'patch';
+/** The methods the server serves at `P`. */
+export type V1Method<P extends keyof V1> = {
+  [M in Method]: [NonNullable<V1[P][M]>] extends [never] ? never : M;
+}[Method];
+type Operation<P extends keyof V1, M extends V1Method<P>> = NonNullable<V1[P][M]>;
+/** Path parameters and JSON body of one operation, each required exactly when the contract requires it. */
+export type V1Request<P extends keyof V1, M extends V1Method<P>> =
+  (Operation<P, M> extends { parameters: { path: infer A } } ? { path: A } : { path?: never }) &
+    (Operation<P, M> extends { requestBody: { content: { 'application/json': infer B } } }
+      ? { body: B }
+      : Operation<P, M> extends { requestBody?: { content: { 'application/json': infer B } } }
+        ? { body?: B }
+        : { body?: never });
+/** The request argument, optional when the operation declares nothing required. */
+export type V1Args<P extends keyof V1, M extends V1Method<P>> =
+  {} extends V1Request<P, M> ? [request?: V1Request<P, M>] : [request: V1Request<P, M>];
+type Json<R> = R extends { content: { 'application/json': infer J } } ? J : undefined;
+/** JSON body of the operation's success response. */
+export type V1Ok<P extends keyof V1, M extends V1Method<P>> =
+  Operation<P, M> extends { responses: infer R }
+    ? R extends { 200: infer S } ? Json<S> : R extends { 201: infer S } ? Json<S> : undefined
+    : never;
+/**
+ * A response whose `json()` is typed as the operation's success body. Compile-time
+ * contract only: callers check `ok` first, and the served-contract suite proves the
+ * server's actual serialization.
+ */
+export type V1Response<P extends keyof V1, M extends V1Method<P>> = {
+  json(): Promise<V1Ok<P, M>>;
+} & Response;
+
+/** Fill the `{name}` segments of a generated path template; a missing parameter throws. */
+export function v1Path(template: string, params: unknown = {}): string {
+  const values = (params ?? {}) as Record<string, unknown>;
+  return template.replace(/\{(\w+)\}/g, (_, name: string) => {
+    if (values[name] === undefined) throw new Error(`missing path parameter ${name}`);
+    return encodeURIComponent(String(values[name]));
+  });
+}
 
 /** `localhost` or a literal loopback address, as normalized by the URL parser. */
 export const loopback = (hostname: string) =>

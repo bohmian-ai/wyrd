@@ -4,7 +4,15 @@ import type { Cookies } from '@sveltejs/kit';
 import * as client from 'openid-client';
 import { EncryptJWT, decodeJwt, jwtDecrypt } from 'jose';
 import type { SessionMetadata } from '$lib/views';
-import { loopback, serverUrl } from '../upstream';
+import {
+  loopback,
+  serverUrl,
+  v1Path,
+  type V1,
+  type V1Args,
+  type V1Method,
+  type V1Response
+} from '../upstream';
 import { reject, type TenantContext } from './session';
 
 const sessionPrefix = 'wyrd_session_';
@@ -77,11 +85,16 @@ export class BrowserSession {
     };
   }
 
-  /** Call a Wyrd `/v1` API as this session's principal. */
-  async api(method: string, path: string, body?: unknown): Promise<Response> {
+  /** Call a generated Wyrd `/v1` operation as this session's principal. */
+  async api<P extends keyof V1, M extends V1Method<P>>(
+    method: M,
+    path: P,
+    ...[request]: V1Args<P, M>
+  ): Promise<V1Response<P, M>> {
+    const { body, path: params }: { body?: unknown; path?: unknown } = request ?? {};
     try {
-      return await fetch(new URL(`/v1${path}`, serverUrl()), {
-        method,
+      return await fetch(new URL(`/v1${v1Path(path, params)}`, serverUrl()), {
+        method: method.toUpperCase(),
         headers: {
           'x-wyrd-access-token': `Bearer ${this.#token}`,
           ...(body === undefined ? {} : { 'content-type': 'application/json' })

@@ -51,32 +51,10 @@ mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=sc
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::pg_scribe_crash_injection::bad_record_without_a_fence_authority_fails_closed)'
 ```
 
-#### P05 — Main flush snapshot and concurrent ownership
+#### P06 — S snapshot retention and native rewrites (S selectors only)
 
 ```bash
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=scribe::staging_runtime::tests::owns_any_tracks_only_snapshot_members)'
-
-mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support -E 'test(=scribe::persistence::tests::flush_waits_for_an_outside_claim_over_members_durable_at_drain)'
-
-mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support -E 'test(=scribe::persistence::tests::flush_ignores_an_outside_claim_taken_after_its_snapshot)'
-```
-
-#### P06 — Forge term/quiescence, uncertainty and source non-blocking retention
-
-```bash
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=forge::leadership::tests::schedule_use_is_linearized_with_term_replacement)'
-
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=forge::leadership::tests::relinquished_term_refuses_every_handler)'
-
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=forge::worker::tests::only_a_joined_loop_enables_same_owner_reclaim)'
-
-mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --features test-support --test integration -P journey --run-ignored=all -E 'test(=forge::production_routes::failed_scheduler_ends_its_term_before_restart)'
-
-mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --features test-support --test integration -P journey --run-ignored=all -E 'test(=forge::production_routes::interrupted_startup_waits_for_its_prepared_lease)'
-
 mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --features test-support --test integration -P journey --run-ignored=all -E 'test(=forge::snapshot_expiration::retryable_catalog_failure_retains_prepared_authority)'
-
-mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-sql --test integration -P journey --run-ignored=all -E 'test(=pg_forge_tasks::pg_tests::previous_owner_reclaims_its_unexpired_attempt)'
 
 mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --features test-support --test integration -P journey --run-ignored=all -E 'test(=forge::reader_expiry_ordering::replaced_snapshots_expire_only_after_the_retention_window)'
 
@@ -85,14 +63,6 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locke
 mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --features test-support --test integration -P journey --run-ignored=all -E 'test(=forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite)'
 
 mise exec -- scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --features test-support --test integration -P journey --run-ignored=all -E 'test(=forge::managed_rewrite::standard_variant_layouts_round_trip_per_file)'
-```
-
-#### P07 — Main owner-specific Oracle memory settlement
-
-```bash
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::admission::tests::oracle_shutdown_drains_only_oracle_memory)'
-
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=oracle::admission::tests::oracle_shutdown_drains_oracle_infallible_headroom)'
 ```
 
 #### P08 — Role task stop/abort/drop
@@ -124,7 +94,7 @@ mise exec -- cargo nextest run --locked -p wyrd-server --lib --features test-sup
 #### P12 — Native UID/ACK/audit projection and actual Gate adapter
 
 ```bash
-WYRD_LOG=info mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=tables::audit::projection::tests::projects_canonical_content_with_the_decision_time) | test(=tables::eval::observations::tests::acknowledged_keys_mirror_scribe_stamping) | test(=scribe::execution_lanes::tests::card_scope_rejects_before_writer_admission) | test(=scribe::execution_lanes::tests::optional_and_scoped_card_correlations_stamp_signed_uids)'
+WYRD_LOG=info mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=tables::audit::projection::tests::projects_canonical_content_with_the_decision_time) | test(=tables::eval::observations::tests::acknowledged_keys_carry_subject_and_created_at) | test(=scribe::execution_lanes::tests::card_scope_rejects_before_writer_admission) | test(=scribe::execution_lanes::tests::optional_and_scoped_card_correlations_stamp_signed_uids)'
 
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::tests::gate_enforces_bifrost_record_write)'
 ```
@@ -264,12 +234,10 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_pac
 mise exec -- scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration 'tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]' 'tests/integration/test_local_development.py::test_installed_cli_bootstrap[exit]'
 ```
 
-#### P27 — Historical migration immutability
+#### P27 — S forward-owner uniqueness (no migration-history test; REQ-024 struck)
 
 ```bash
 mise exec -- cargo nextest run --locked -p vala-sql --lib -E 'test(=tests::forge_and_oracle_migrations_have_unique_forward_owners)'
-
-mise exec -- cargo nextest run --locked -p vala-sql --test integration -E 'test(=pg_migration::pg_tests::shipped_audit_staging_migration_is_immutable)'
 ```
 
 #### P28 — Actual SQL replay/readiness/RLS/main upgrade owners
@@ -331,22 +299,11 @@ mise exec -- cargo nextest list --locked -p wyrd-testing --bin capacity
 | `scribe::pg_scribe_crash_injection::zeroed_block_after_the_newest_fence_ends_the_chain` | `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/src/scribe/tests/pg_scribe_crash_injection.rs:363:fn zeroed_block_after_the_newest_fence_ends_the_chain() {` |
 | `scribe::pg_scribe_crash_injection::bad_record_before_an_acknowledged_commit_fails_closed` | `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/src/scribe/tests/pg_scribe_crash_injection.rs:403:fn bad_record_before_an_acknowledged_commit_fails_closed() {` |
 | `scribe::pg_scribe_crash_injection::bad_record_without_a_fence_authority_fails_closed` | `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/src/scribe/tests/pg_scribe_crash_injection.rs:422:fn bad_record_without_a_fence_authority_fails_closed() {` |
-| `scribe::staging_runtime::tests::owns_any_tracks_only_snapshot_members` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/scribe/staging_runtime.rs:1640:    async fn owns_any_tracks_only_snapshot_members() {` |
-| `scribe::persistence::tests::flush_waits_for_an_outside_claim_over_members_durable_at_drain` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/scribe/persistence.rs:3367:    async fn flush_waits_for_an_outside_claim_over_members_durable_at_drain() {` |
-| `scribe::persistence::tests::flush_ignores_an_outside_claim_taken_after_its_snapshot` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/scribe/persistence.rs:3436:    async fn flush_ignores_an_outside_claim_taken_after_its_snapshot() {` |
-| `forge::leadership::tests::schedule_use_is_linearized_with_term_replacement` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/forge/leadership.rs:732:    async fn schedule_use_is_linearized_with_term_replacement() {` |
-| `forge::leadership::tests::relinquished_term_refuses_every_handler` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/forge/leadership.rs:783:    async fn relinquished_term_refuses_every_handler() {` |
-| `forge::worker::tests::only_a_joined_loop_enables_same_owner_reclaim` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/forge/worker.rs:9190:    async fn only_a_joined_loop_enables_same_owner_reclaim() {` |
-| `forge::production_routes::failed_scheduler_ends_its_term_before_restart` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/tests/integration/forge/production_routes.rs:2645:async fn failed_scheduler_ends_its_term_before_restart() {` |
-| `forge::production_routes::interrupted_startup_waits_for_its_prepared_lease` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/tests/integration/forge/production_routes.rs:1112:async fn interrupted_startup_waits_for_its_prepared_lease() {` |
 | `forge::snapshot_expiration::retryable_catalog_failure_retains_prepared_authority` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/tests/integration/forge/snapshot_expiration.rs:500:async fn retryable_catalog_failure_retains_prepared_authority() {`; `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/tests/integration/forge/snapshot_expiration.rs:497:async fn retryable_catalog_failure_retains_prepared_authority() {` |
-| `pg_forge_tasks::pg_tests::previous_owner_reclaims_its_unexpired_attempt` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-sql/tests/integration/pg_forge_tasks.rs:336:    async fn previous_owner_reclaims_its_unexpired_attempt() {` |
 | `forge::reader_expiry_ordering::replaced_snapshots_expire_only_after_the_retention_window` | `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/tests/integration/forge/reader_expiry_ordering.rs:44:async fn replaced_snapshots_expire_only_after_the_retention_window() {` |
 | `forge::reader_expiry_ordering::cut_read_completes_while_snapshot_expiry_holds_the_authority` | `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/tests/integration/forge/reader_expiry_ordering.rs:128:async fn cut_read_completes_while_snapshot_expiry_holds_the_authority() {` |
 | `forge::managed_rewrite::v3_row_lineage_survives_repeated_rewrite` | `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/tests/integration/forge/managed_rewrite.rs:1473:async fn v3_row_lineage_survives_repeated_rewrite() {` |
 | `forge::managed_rewrite::standard_variant_layouts_round_trip_per_file` | `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/tests/integration/forge/managed_rewrite.rs:1950:async fn standard_variant_layouts_round_trip_per_file() {` |
-| `oracle::admission::tests::oracle_shutdown_drains_only_oracle_memory` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/oracle/admission.rs:2531:    async fn oracle_shutdown_drains_only_oracle_memory() {` |
-| `oracle::admission::tests::oracle_shutdown_drains_oracle_infallible_headroom` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/oracle/admission.rs:2605:    async fn oracle_shutdown_drains_oracle_infallible_headroom() {` |
 | `cluster::tests::stop_joins_the_task_once` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/cluster/mod.rs:833:    async fn stop_joins_the_task_once() {` |
 | `cluster::tests::stop_aborts_a_task_past_its_deadline` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/cluster/mod.rs:859:    async fn stop_aborts_a_task_past_its_deadline() {` |
 | `cluster::tests::abort_and_drop_end_the_task` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/cluster/mod.rs:871:    async fn abort_and_drop_end_the_task() {` |
@@ -365,7 +322,6 @@ mise exec -- cargo nextest list --locked -p wyrd-testing --bin capacity
 | `scribe_outbox::tests::an_unsplittable_row_is_submitted_whole_and_terminal_refusal_consumes_it` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/wyrd/wyrd-server/src/scribe_outbox.rs:1486:    async fn an_unsplittable_row_is_submitted_whole_and_terminal_refusal_consumes_it() {` |
 | `scribe_outbox::tests::a_silent_peer_times_out_and_the_slice_retries_on_the_next_scribe` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/wyrd/wyrd-server/src/scribe_outbox.rs:1610:    async fn a_silent_peer_times_out_and_the_slice_retries_on_the_next_scribe() {` |
 | `tables::audit::projection::tests::projects_canonical_content_with_the_decision_time` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/tables/audit/projection.rs:85:    fn projects_canonical_content_with_the_decision_time() {` |
-| `tables::eval::observations::tests::acknowledged_keys_mirror_scribe_stamping` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/tables/eval/observations.rs:174:    fn acknowledged_keys_mirror_scribe_stamping() {` |
 | `scribe::execution_lanes::tests::card_scope_rejects_before_writer_admission` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/scribe/execution_lanes.rs:2760:    fn card_scope_rejects_before_writer_admission() {`; `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/src/scribe/execution_lanes.rs:3277:    fn card_scope_rejects_before_writer_admission() {` |
 | `scribe::execution_lanes::tests::optional_and_scoped_card_correlations_stamp_signed_uids` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/scribe/execution_lanes.rs:4076:    fn optional_and_scoped_card_correlations_stamp_signed_uids() {` |
 | `gate::tests::gate_enforces_bifrost_record_write` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-bifrost-redux/src/gate/mod.rs:1882:    async fn gate_enforces_bifrost_record_write() {`; `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-bifrost-redux/src/gate/mod.rs:1848:    async fn gate_enforces_bifrost_record_write() {` |
@@ -430,7 +386,6 @@ mise exec -- cargo nextest list --locked -p wyrd-testing --bin capacity
 | `pg_tests::server_dev_repeat_and_partial_failure_preserve_state` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/wyrd/wyrd-cli/tests/pg_tests.rs:407:async fn server_dev_repeat_and_partial_failure_preserve_state() {` |
 | `pg_tests::server_dev_selected_mcp_host_reads` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/wyrd/wyrd-cli/tests/pg_tests.rs:582:async fn server_dev_selected_mcp_host_reads() {` |
 | `tests::forge_and_oracle_migrations_have_unique_forward_owners` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-sql/src/lib.rs:191:    fn forge_and_oracle_migrations_have_unique_forward_owners() {`; `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-sql/src/lib.rs:201:    fn forge_and_oracle_migrations_have_unique_forward_owners() {` |
-| `pg_migration::pg_tests::shipped_audit_staging_migration_is_immutable` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-sql/tests/integration/pg_migration.rs:167:    fn shipped_audit_staging_migration_is_immutable() {`; `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-sql/tests/pg_migration.rs:149:    fn shipped_audit_staging_migration_is_immutable() {` |
 | `pg_migration::pg_tests::vala_migrations_apply_and_are_idempotent` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/vala/vala-sql/tests/integration/pg_migration.rs:22:    async fn vala_migrations_apply_and_are_idempotent() {`; `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/vala/vala-sql/tests/pg_migration.rs:19:    async fn vala_migrations_apply_and_are_idempotent() {` |
 | `pg_migration::pg_tests::migrations_apply_and_are_idempotent` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/wyrd/wyrd-sql/tests/integration/pg_migration.rs:816:    async fn migrations_apply_and_are_idempotent() {`; `cfe21dc9007d5d22d9ae4411be07fb5504b0cc05:crates/wyrd/wyrd-sql/tests/pg_migration.rs:290:    async fn migrations_apply_and_are_idempotent() {` |
 | `pg_migration::pg_tests::single_url_boot_and_separate_url_regression` | `8a8813a7458b7c98707c7b4f9b9d403f604ee0e6:crates/wyrd/wyrd-sql/tests/integration/pg_migration.rs:184:    async fn single_url_boot_and_separate_url_regression() {` |

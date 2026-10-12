@@ -304,26 +304,6 @@ binding rather than restating them.
 
 ## Durability and visibility
 
-### Consistency principle
-
-Wyrd's high-throughput paths are eventually consistent within a few seconds,
-and their tradeoffs are known and accepted:
-
-- An acknowledgement on a high-throughput path means the server has received
-  the work. It does not guarantee the work is durable, and the caller never
-  waits for derived work. Examples of derived work are Eval run creation,
-  audit decisions, result publication, and Forge planning.
-- Derived work is batched through server-owned outboxes and becomes visible
-  within seconds. An outbox retries rather than dropping work because a
-  dependency is slow or unavailable, and graceful shutdown flushes it.
-- A hard process kill may lose work that was received but not yet flushed.
-  This loss is accepted, and every loss the process can observe is counted and
-  logged.
-- Reviews and designs MUST NOT treat these windows as defects, and MUST NOT
-  close them by making callers wait. A path that needs a stronger guarantee
-  states it explicitly in its own contract. Scribe's append acknowledgement,
-  described below, is one such path.
-
 Bifrost uses explicit authority transitions:
 
 ```text
@@ -880,10 +860,10 @@ class with no executable capacity on the pod is refused immediately. Public
 HTTP queries bypass the server's global load-shed and request-concurrency
 layers so they reach this queue; gRPC reaches it directly.
 
-Snapshot preparation has no admission gate of its own. One read-only
-statement inside a `TenantConn` transaction on the bounded runtime
-PostgreSQL pool, re-asserting that transaction's tenant, resolves every
-referenced table and returns each catalog metadata pointer with its hot rows. The statement is read-only: it takes no lock,
+Snapshot preparation has no admission gate of its own. One tenant-scoped
+autocommit statement on the bounded runtime PostgreSQL pool, binding its own
+tenant, resolves every referenced table and returns each catalog metadata
+pointer with its hot rows. The statement is read-only: it takes no lock,
 writes no row, and nothing is released at the query's terminal. Each Oracle
 node caches the returned cuts per table and serves them only while it is
 listening on the `bifrost_cut` channel, which a `vala.file_list` trigger
@@ -1059,11 +1039,12 @@ branch. It then performs one fenced duplicate-checking fast-append
 On a definite compare-and-swap conflict, Forge refreshes the branch head and
 revalidates the exact `file_list` rows, object/footer evidence, absence of an
 equivalent promoted entry, branch, lease, and fence. When all assumptions hold,
-the same attempt and operation ID may make at most one additional `commit_once`.
-Another conflict or changed assumption settles the attempt as definitely
-uncommitted and leaves the rows as `file_list` promotion debt that a later
-leader sweep retries under a new attempt. No retry rewrites or reuploads the
-Scribe object.
+the same attempt and operation ID may make at most one additional `commit_once`
+within the original deadline. Another conflict, changed assumption, or expired
+deadline settles the attempt as definitely uncommitted and leaves the rows as
+`file_list` promotion debt that a later leader sweep retries under a new
+attempt. No retry rewrites or reuploads
+the Scribe object.
 
 An ambiguous catalog result keeps the same attempt and operation ID. Forge
 refreshes metadata and reconciles exact snapshot properties and manifest
@@ -1171,11 +1152,11 @@ conflict, Forge refreshes the branch head and revalidates the retained planning
 snapshot, current schema identity, selected-input existence, lease, and fence.
 When those assumptions remain true, the same plan operation, output generation,
 and objects may make at most three further `commit_once` calls after fixed
-1s/2s/4s delays. Each call is bounded by the catalog request timeout; a call it
-ends is ambiguous, never a refusal. Exhausted retries or a changed assumption
-settles only that plan as definitely uncommitted. Successful sibling snapshots
-remain visible; the task succeeds when any admitted plan publishes, and later
-discovery replans remaining debt from the current head. No conflict retry creates new output objects.
+1s/2s/4s delays within the original deadline. Exhausted retries, an expired
+deadline, or a changed assumption settles only that plan as definitely
+uncommitted. Successful sibling snapshots remain visible; the task succeeds
+when any admitted plan publishes, and later discovery replans remaining debt
+from the current head. No conflict retry creates new output objects.
 
 An uncertain attempt protects its outputs and reconciles under the same
 identity; it never retries the catalog call, starts a fresh attempt, or reports
@@ -1399,9 +1380,10 @@ attribution (run, exact Verifier Card, tenant `System` principal) that Scribe
 stamps as `principal_id` and `card_uid`. A pod without Scribe submits through
 `ScribeCapturePeerService.IngestCapture` on the peer listener, which the same
 `wyrd-peer` mTLS admits; the request names its tenant and one of those five
-tables explicitly, carries no token, carries an attribution exactly when the
-table is a result table, and is refused for the reserved system tenant or any
-other table. Sensitive-column metadata remains descriptive; table query
+tables or `vala.system.audit_log` explicitly, carries no token, and carries an
+attribution exactly when the table is a result table. It is refused for any
+other table, and for the reserved system tenant unless the table is
+`vala.system.audit_log`. Sensitive-column metadata remains descriptive; table query
 permission governs every column, including GenAI fields stored on trace spans,
 except that a projection reaching the `vala.gateway.calls` request or response
 payload columns also requires the tenant-wide gateway payload-read permission.

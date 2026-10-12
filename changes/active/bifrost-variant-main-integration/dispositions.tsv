@@ -329,14 +329,14 @@ crates/vala/vala-sql/migrations/20261010000000_bifrost_cut_notify.sql	A		adapted
 crates/vala/vala-sql/migrations/20261011000000_scribe_wal_fenced_lsn.sql	A		adapted	TASK-001	
 crates/vala/vala-sql/src/lib.rs	M	C	main-retained	TASK-001	REQ-024: olap_minimal checksum stays main since bytes stay main.
 crates/vala/vala-sql/src/postgres.rs	M	A	main-retained	TASK-001	REQ-022: source bare conn() removed; cut on TenantConn, fence on OperatorPool.
-crates/vala/vala-sql/src/queries/audit_staging.rs	M	C	retired	TASK-003	Main retired audit staging (shared ScribeOutbox); audit owned by TASK-003.
+crates/vala/vala-sql/src/queries/audit_staging.rs	M	C	retired	TASK-002	Main retired audit staging (shared ScribeOutbox); audit owned by TASK-002 Part B.
 crates/vala/vala-sql/src/queries/forge_operations.rs	M	A	adapted	TASK-001	
 crates/vala/vala-sql/src/queries/olap_catalog.rs	M	A	adapted	TASK-001	
 crates/vala/vala-sql/src/queries/oracle_reader_authority.rs	M	C	adapted	TASK-001	
 crates/vala/vala-sql/src/queries/scribe_batch_commits.rs	M		adapted	TASK-001	
 crates/vala/vala-sql/src/row_types/file_list.rs	M		preserved	TASK-001	
 crates/vala/vala-sql/src/row_types/oracle_reader_authority.rs	M		preserved	TASK-001	
-crates/vala/vala-sql/tests/pg_audit_staging.rs	M	C	retired	TASK-003	Main retired audit staging. Source assertion newest_wal_fence_spans_tenants_on_one_stream rehomed to vala-sql tests/integration/pg_stream_identity.rs.
+crates/vala/vala-sql/tests/pg_audit_staging.rs	M	C	retired	TASK-002	Main retired audit staging. Source assertion newest_wal_fence_spans_tenants_on_one_stream rehomed to vala-sql tests/integration/pg_stream_identity.rs.
 crates/vala/vala-sql/tests/pg_forge_operations.rs	M	A	retired	TASK-001	Rehomed to the single tests/integration binary (L03/S3).
 crates/vala/vala-sql/tests/pg_forge_tasks.rs	M	A	retired	TASK-001	Rehomed to the single tests/integration binary (L03/S3).
 crates/vala/vala-sql/tests/pg_olap_catalog.rs	M	A	retired	TASK-001	Rehomed to the single tests/integration binary (L03/S3).
@@ -373,9 +373,9 @@ crates/wyrd/wyrd-server/Cargo.toml	M	C	adapted	TASK-001
 crates/wyrd/wyrd-server/src/app/metrics.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-server/src/app/serve.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-server/src/app/server.rs	M	C	adapted	TASK-001	
-crates/wyrd/wyrd-server/src/audit/mod.rs	M	C	main-retained	TASK-003	Main audit owner kept; audit owned by TASK-003.
+crates/wyrd/wyrd-server/src/audit/mod.rs	M	C	main-retained	TASK-002	Main audit owner kept; audit owned by TASK-002 Part B.
 crates/wyrd/wyrd-server/src/bifrost/convert.rs	M		preserved	TASK-001	
-crates/wyrd/wyrd-server/src/bifrost/gate_audit.rs	M	C	retired	TASK-003	Main retired gate audit path for staged AuditEvent; audit owned by TASK-003.
+crates/wyrd/wyrd-server/src/bifrost/gate_audit.rs	M	C	retired	TASK-002	Main retired gate audit path for staged AuditEvent; audit owned by TASK-002 Part B.
 crates/wyrd/wyrd-server/src/bifrost/routes.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/bifrost/service.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/boot/mod.rs	M	C	adapted	TASK-001	
@@ -398,7 +398,7 @@ crates/wyrd/wyrd-server/src/test_support.rs	M	A	adapted	TASK-001
 crates/wyrd/wyrd-server/src/verification/drift.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/verification/eval.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/verification/observations.rs	M	C	adapted	TASK-001	
-crates/wyrd/wyrd-server/src/verification/publisher.rs	M	C	retired	TASK-004	Main retired the result publisher; results staged on ScribeOutbox (verification_runtime adapted); TASK-004 owns results.
+crates/wyrd/wyrd-server/src/verification/publisher.rs	M	C	retired	TASK-002	Main retired the result publisher; results staged on ScribeOutbox (verification_runtime adapted); TASK-002 Part C owns results.
 crates/wyrd/wyrd-server/src/verification/results.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/verification/runner.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/tests/pg_grpc_ingest_smoke.rs	M	A	retired	TASK-001	Rehomed to wyrd-server tests/integration/ (S3).
@@ -495,30 +495,30 @@ sdks/wyrd-sdk-python/python/wyrd/bifrost/_pydantic.py	A		preserved	TASK-001
 sdks/wyrd-sdk-python/python/wyrd/stubs/bifrost.pyi	M	C	adapted	TASK-001	
 sdks/wyrd-sdk-python/python/wyrd/types.py	A		preserved	TASK-001	
 sdks/wyrd-sdk-python/src/bifrost/mod.rs	M	C	adapted	TASK-001	
-sdks/wyrd-sdk-python/tests/bifrost/test_public_typing.py	M	A	retired	TASK-005	Main deleted/rewrote this story; source assertions assigned to TASK-005 public journeys.
-sdks/wyrd-sdk-python/tests/integration/bifrost/test_bifrost_e2e.py	M	C	main-retained	TASK-005	Main OTel story kept; source Variant attribute assertions not ported, assigned to TASK-005.
+sdks/wyrd-sdk-python/tests/bifrost/test_public_typing.py	M	A	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
+sdks/wyrd-sdk-python/tests/integration/bifrost/test_bifrost_e2e.py	M	C	main-retained	TASK-002	Main OTel story kept; source Variant attribute assertions not ported, assigned to TASK-002 Part D.
 sdks/wyrd-sdk-python/tests/integration/bifrost/test_every_iceberg_column_type.py	A		preserved	TASK-001	
 sdks/wyrd-sdk-python/tests/integration/bifrost/test_register_a_table_from_a_model.py	A		preserved	TASK-001	
 sdks/wyrd-sdk-python/tests/integration/bifrost/test_table_time_column.py	A		preserved	TASK-001	
 sdks/wyrd-sdk-python/tests/integration/bifrost/test_three_timestamp_types.py	A		preserved	TASK-001	
 sdks/wyrd-sdk-python/tests/integration/bifrost/test_variant_tables.py	A		preserved	TASK-001	
-sdks/wyrd-sdk-python/tests/integration/state/test_observe_journey.py	M	C	retired	TASK-005	Main deleted/rewrote this story; source assertions assigned to TASK-005 public journeys.
-sdks/wyrd-sdk-python/tests/integration/test_bifrost_query.py	M	C	retired	TASK-005	Main deleted/rewrote this story; source assertions assigned to TASK-005 public journeys.
-sdks/wyrd-sdk-python/tests/integration/test_drift_journey.py	M	C	retired	TASK-004	Main deleted; drift assertions assigned to TASK-004.
+sdks/wyrd-sdk-python/tests/integration/state/test_observe_journey.py	M	C	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
+sdks/wyrd-sdk-python/tests/integration/test_bifrost_query.py	M	C	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
+sdks/wyrd-sdk-python/tests/integration/test_drift_journey.py	M	C	retired	TASK-002	Main deleted; drift assertions assigned to TASK-002 Part C.
 sdks/wyrd-sdk-python/tests/unit/bifrost/test_timestamp_types.py	A		preserved	TASK-001	
-sdks/wyrd-sdk-rust/tests/drift_verification.rs	M	C	retired	TASK-004	Main deleted; drift assertions assigned to TASK-004.
-sdks/wyrd-sdk-rust/tests/observe_run.rs	M	C	retired	TASK-005	Main deleted/rewrote this story; source assertions assigned to TASK-005 public journeys.
+sdks/wyrd-sdk-rust/tests/drift_verification.rs	M	C	retired	TASK-002	Main deleted; drift assertions assigned to TASK-002 Part C.
+sdks/wyrd-sdk-rust/tests/observe_run.rs	M	C	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
 sdks/wyrd-sdk-ts/native/Cargo.toml	M	A	adapted	TASK-001	
 sdks/wyrd-sdk-ts/native/src/lib.rs	M	C	adapted	TASK-001	
 sdks/wyrd-sdk-ts/wyrd/index.d.cts	M	C	adapted	TASK-001	
 sdks/wyrd-sdk-ts/wyrd/index.d.ts	M	C	adapted	TASK-001	
 sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts	M	A	adapted	TASK-001	
 sdks/wyrd-sdk-ts/wyrd/src/index.ts	M	C	adapted	TASK-001	
-sdks/wyrd-sdk-ts/wyrd/tests/integration/drift-verification.test.ts	M	C	retired	TASK-004	Main deleted; drift assertions assigned to TASK-004.
+sdks/wyrd-sdk-ts/wyrd/tests/integration/drift-verification.test.ts	M	C	retired	TASK-002	Main deleted; drift assertions assigned to TASK-002 Part C.
 sdks/wyrd-sdk-ts/wyrd/tests/integration/every-iceberg-column-type.test.ts	A		adapted	TASK-001	
-sdks/wyrd-sdk-ts/wyrd/tests/integration/observe-run.test.ts	M	C	retired	TASK-005	Main deleted/rewrote this story; source assertions assigned to TASK-005 public journeys.
-sdks/wyrd-sdk-ts/wyrd/tests/integration/oracle-query.test.ts	M	C	retired	TASK-005	Main deleted/rewrote this story; source assertions assigned to TASK-005 public journeys.
-sdks/wyrd-sdk-ts/wyrd/tests/integration/otel-export.test.ts	M	C	main-retained	TASK-005	Main OTel story kept; source attribute assertions not ported, assigned to TASK-005.
+sdks/wyrd-sdk-ts/wyrd/tests/integration/observe-run.test.ts	M	C	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
+sdks/wyrd-sdk-ts/wyrd/tests/integration/oracle-query.test.ts	M	C	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
+sdks/wyrd-sdk-ts/wyrd/tests/integration/otel-export.test.ts	M	C	main-retained	TASK-002	Main OTel story kept; source attribute assertions not ported, assigned to TASK-002 Part D.
 sdks/wyrd-sdk-ts/wyrd/tests/integration/register-a-table-from-a-model.test.ts	A		adapted	TASK-001	
 sdks/wyrd-sdk-ts/wyrd/tests/integration/table-time-column.test.ts	A		adapted	TASK-001	
 sdks/wyrd-sdk-ts/wyrd/tests/integration/three-timestamp-types.test.ts	A		adapted	TASK-001	

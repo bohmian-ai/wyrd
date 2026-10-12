@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant-main-integration
-revision: 3
+revision: 4
 status: approved
 task_count: 6
 ---
@@ -65,6 +65,9 @@ mechanism over or beside an S one, never two implementations.
 | X5 | Ten built-ins, eager provisioning, no `vala.dev.agent_traces` | REQ-018 | user-approved |
 | X6 | Ordered typed query bind parameters | REQ-019 | user-approved |
 | X7 | Main identity at the Bifrost entrance: verified-principal Gate, API-key OTLP authentication before decode, `TenantConn`/`OperatorPool` SQL capability types | REQ-022 | user-approved |
+| X8 | No-wait Oracle graph release (main c63e2ff46): a settled or dropped graph releases inline without waiting on nested children; a late child returns its bytes through the shared memory root and the query memory view's drop is the leak check; one cancellation token ends the leader's first-batch wait and an open stream alike, and a cancel observed before the first batch is recorded as `cancelled` | REQ-007 | user-approved |
+| X9 | Task Verifier results: `vala.verification.results` carries main's nullable `assertion_result` Variant column | REQ-016 | user-approved |
+| X10 | One Forge table authority (Q16, an S defect exposed by X2): the active `forge_tasks` row is the table's exclusive claim — claiming it acquires the table, its terminal transition releases it, its heartbeat renews it, and every durable transition and pre-commit check fences on it. Every Forge table operation, manifest rewrite included, runs as a task, so contention is only a refused claim. `vala.maintenance_leases`, `ForgeLease` and `vala.assert_maintenance_lease_fence` are deleted | — (S defect) | user-approved 2026-10-12 |
 
 **Struck (reverted to S):** REQ-005 flush ownership repair; all of REQ-006;
 REQ-007's settlement model; main deadline refusal codes; main Forge SQL,
@@ -89,11 +92,12 @@ every S command remains callable by name, unchanged:
 `mise run bench:bifrost:client-queue`. Main's `bench:capacity` stays beside
 them. `changes/active/bifrost-variant/BENCHMARK-HANDOFF.md` runs as written.
 
-**Acceptance (AC-028).** Bifrost scope contains no trace of main except X1–X7,
+**Acceptance (AC-028).** Bifrost scope contains no trace of main except X1–X9,
+and no S mechanism except as X10 corrects it,
 each adapted to S's owners. Evidence: a per-file diff of Bifrost scope against
 S where every hunk maps to one exception (or to a non-Bifrost rename that the
 exception forces); the struck mechanisms absent by symbol and SQL object; the
-net Bifrost schema equal to S's; and the handoff benchmark commands running
+net Bifrost schema equal to S's apart from X1, X2, X5, X9 and X10; and the handoff benchmark commands running
 unchanged with S's report shape.
 
 ## Immutable inputs and integration authority
@@ -189,7 +193,7 @@ reupload objects. Wire, WAL, ingress, SQL, and crash proof must agree.
 
 ### REQ-007 — Oracle-owned memory settles correctly
 
-**Struck in revision 3.** Oracle governed memory, executor ownership and shutdown drain are S's, unchanged.
+**Struck in revision 3; X8 in revision 4.** Oracle governed memory and executor ownership are S's. X8 is the remainder: a settled or dropped graph releases inline with no wait on nested children and no spawned release work; a late child returns its bytes through the shared memory root; the query memory view's drop poisons the governor on bytes that never return; one cancellation token ends the first-batch wait and an open stream, and a cancel observed before the first batch is recorded as `cancelled`.
 
 ### REQ-008 — Role heartbeat and one membership poller
 
@@ -526,7 +530,8 @@ or proposed scope/contract change routes through a new spec revision.
 |---|---|---|---|
 | 1 | 2026-10-11 | superseded | Initial transcription; incomplete task recipes and conflicting earlier research choices replaced by revision 2. |
 | 2 | 2026-10-11 | superseded | Explicit approval of all seven batches (1–27), unified Task/registration/error/SQL resolutions, and source workload retention with main target consolidation. |
-| 3 | 2026-10-11 | approved | User ruling that S is the sole Bifrost implementation: exceptions X1–X7 approved, REQ-005/006/007/024 struck, Bifrost migrations edited in place (nothing shipped), benches restored by name in one build, AC-028. |
+| 3 | 2026-10-11 | superseded | User ruling that S is the sole Bifrost implementation: exceptions X1–X7 approved, REQ-005/006/007/024 struck, Bifrost migrations edited in place (nothing shipped), benches restored by name in one build, AC-028. |
+| 4 | 2026-10-11 | approved | User approval of X8, the no-wait graph release with one cancellation signal and no spawned release work, and X9, main's Task Verifier `assertion_result` Variant column. |
 
 ## Authority links
 

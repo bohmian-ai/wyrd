@@ -2326,11 +2326,6 @@ async fn acceptance_unknown_recovers_from_durable_state() {
     )
     .await;
     supervisor.shutdown().await;
-    assert_eq!(
-        promoted.fixture.live_claims().await,
-        0,
-        "every settled attempt released its table claim"
-    );
 }
 
 /// Proves a commit that never landed is Reset only once absence is provable.

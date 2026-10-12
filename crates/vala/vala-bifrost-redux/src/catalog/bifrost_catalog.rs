@@ -352,9 +352,9 @@ pub fn inject_metadata_not_found_for_test(count: usize) {
 impl BifrostCatalog {
     /// Reads one query's complete cut in one read-only tenant statement.
     ///
-    /// Runs [`OracleTableCuts::read`] as one statement inside a `TenantConn`
-    /// transaction for `tenant`, then commits the read-only transaction.
-    /// Nothing is recorded: the returned pointers stay readable for the
+    /// Runs [`OracleTableCuts::read`] as one autocommit statement on a pooled
+    /// connection: the statement binds the tenant itself, so the cut costs one
+    /// round trip with no transaction. Nothing is recorded: the returned pointers stay readable for the
     /// query's deadline because Forge retains a replaced snapshot for at least
     /// the maximum query deadline.
     ///
@@ -384,15 +384,14 @@ impl BifrostCatalog {
                 table_name: &binding.table_name,
             })
             .collect::<Vec<_>>();
-        let mut conn = self.postgres.tenant_conn(tenant).await?;
-        let cut = match OracleTableCuts::new(&mut conn).read(&refs).await {
+        let mut conn = self.postgres.conn().await?;
+        let cut = match OracleTableCuts::new(&mut conn, tenant).read(&refs).await {
             Err(vala_sql::SqlError::NoRows) => {
                 let names = tables.iter().map(TableRef::fqn).collect::<Vec<_>>();
                 return Err(BifrostCatalogError::TableNotFound(names.join(", ")));
             }
             other => other?,
         };
-        conn.commit().await?;
         Ok(cut)
     }
 
@@ -888,10 +887,10 @@ impl BifrostCatalog {
     /// treat a missing built-in as an unregistered table.
     /// Repeating it for an existing built-in returns the same [`TableUid`].
     ///
-    /// Ingest calls this on every frame, so a built-in this node has already
-    /// resolved answers from the immutable registration cache; only the first
-    /// frame per tenant and table takes the advisory lock and loads Iceberg
-    /// metadata, then reads the control row once into the cache.
+    /// A built-in this node has already resolved answers from the immutable
+    /// registration cache; only the first ensure per tenant and table takes the
+    /// advisory lock and loads Iceberg metadata, then reads the control row
+    /// once into the cache.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::MetadataMismatch`] when the definition
@@ -2388,6 +2387,46 @@ mod production_pin_tests {
                     registered.table_uid
                 );
             }
+        });
+    }
+
+    /// A built-in this node has ensured is ensured again without Postgres.
+    ///
+    /// Only the first ensure per tenant and table may take the advisory lock
+    /// and load Iceberg metadata. Closing the pool
+    /// after the first ensure makes any later round trip fail.
+    ///
+    /// # Panics
+    /// Panics when the fixture or the first ensure fails, or when the second
+    /// ensure fails or returns another UID.
+    #[test]
+    fn ensured_builtin_answers_from_the_registration_cache() {
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                local_storage_owner(warehouse.path()),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+            let tenant = fixture.data_tenant_id();
+            let spans = crate::tables::builtin_table("traces", "spans").expect("spans is built in");
+            let first = catalog
+                .ensure_builtin(tenant, spans)
+                .await
+                .expect("the first ensure registers");
+            fixture.vala_postgres().pool().close().await;
+
+            let again = catalog
+                .ensure_builtin(tenant, spans)
+                .await
+                .expect("the second ensure answers from the cache");
+
+            assert_eq!(again, first);
         });
     }
 

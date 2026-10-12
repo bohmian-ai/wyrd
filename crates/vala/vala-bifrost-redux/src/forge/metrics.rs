@@ -21,12 +21,13 @@ use super::error::ForgeError;
 ///
 /// The gauges are the only handles registered eagerly, so this is the exact
 /// set of per-task-type series that always exports an explicit zero.
-pub(super) const TASK_TYPES: [ForgeTaskStrategy; 5] = [
+pub(super) const TASK_TYPES: [ForgeTaskStrategy; 6] = [
     ForgeTaskStrategy::ScribePromotion,
     ForgeTaskStrategy::SmallFiles,
     ForgeTaskStrategy::SnapshotExpiry,
     ForgeTaskStrategy::ExpiredCleanup,
     ForgeTaskStrategy::OrphanCleanup,
+    ForgeTaskStrategy::ManifestRewrite,
 ];
 
 /// Unlabelled gauges [`ForgeTelemetry::new`] publishes as an explicit zero.
@@ -123,9 +124,6 @@ pub(super) enum ForgeLeaderRevocation {
     Replaced,
     /// The coordinator stopped and resigned it.
     Shutdown,
-    /// The scheduler exited, failed or was dropped before shutdown; the
-    /// election row is left to lapse.
-    SchedulerStopped,
 }
 
 impl ForgeLeaderRevocation {
@@ -137,7 +135,6 @@ impl ForgeLeaderRevocation {
             Self::RenewalTimeout => "renewal_timeout",
             Self::Replaced => "replaced",
             Self::Shutdown => "shutdown",
-            Self::SchedulerStopped => "scheduler_stopped",
         }
     }
 }

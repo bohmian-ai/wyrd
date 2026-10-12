@@ -816,8 +816,8 @@ impl AnalyticalSupervisor {
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when an attempt of the graph is
-    /// still live or when a lock is poisoned. Returns
-    /// [`BifrostError::QueryExecutionFailed`] when the graph is not registered.
+    /// still live or when a lock is poisoned. Returns [`BifrostError::QueryExecutionFailed`] when the graph
+    /// is not registered.
     pub(super) fn release_graph(
         &self,
         graph: AnalyticalGraphKey,
@@ -1838,8 +1838,8 @@ mod tests {
     /// resolves to the query's own `RuntimeEnv` and pool rather than a process
     /// default, that the exchange child is charged against that pool, and that a
     /// second settlement of the same key is refused without returning any byte
-    /// twice — proven by the query owner releasing cleanly at the end, which it
-    /// refuses to do while a nested child survives.
+    /// twice — proven by the query owner returning its whole envelope at the
+    /// end.
     ///
     /// Required mutation RED: substitute a process runtime in
     /// [`AnalyticalSupervisor::spawn_attempt`] and the pool-identity assertion
@@ -1950,8 +1950,7 @@ mod tests {
                 .expect("a released query owner leaves an unpoisoned root")
                 .oracle_query_memory_used_bytes,
             0,
-            "the query owner returns its whole envelope, which it refuses to do \
-             while a nested exchange child survives"
+            "the query owner returns its whole envelope"
         );
         drop(metrics_guard);
 

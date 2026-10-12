@@ -1,5 +1,7 @@
 //! Server-owned scheduled query caller.
 
+use std::pin::pin;
+
 use arrow::record_batch::RecordBatch;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryIpcDecoder};
@@ -142,15 +144,18 @@ impl ScheduledQueryCaller {
             .query_controls()
             .ok_or(BifrostError::RunningQueryControlUnavailable)?;
         let requested_deadline_ms = request.deadline_ms;
-        let mut stream = controls
-            .open_cancellable(
-                self.dispatch(request),
-                self.context.data_tenant_id,
-                &self.context.request_id,
-                requested_deadline_ms,
-                &self.cancellation,
-            )
-            .await?;
+        let mut stream = {
+            let open = pin!(self.dispatch(request));
+            controls
+                .open_cancellable(
+                    open,
+                    self.context.data_tenant_id,
+                    &self.context.request_id,
+                    requested_deadline_ms,
+                    &self.cancellation,
+                )
+                .await?
+        };
         // The stream's absolute deadline becomes one fixed instant before any
         // frame is taken, so no leg of consumption — least of all the wait for
         // clean EOF after a terminal — can start a fresh budget.

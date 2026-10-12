@@ -1059,111 +1059,6 @@ async fn worker_prepared_recovery_observes_one_ownership_episode() {
     );
 }
 
-/// A worker aborted during startup recovery cannot let its same-owner restart
-/// take the Prepared claim it left unexpired; the claim is recovered once its
-/// lease lapses.
-///
-/// The abort lands while startup holds a fresh durable Prepared claim, before
-/// that invocation could mark itself joined. The restart shares the worker's
-/// quiescence, so the old lease must be honored for several recovery passes
-/// and then taken through ordinary expiry recovery.
-///
-/// # Panics
-/// Panics when the restart renews the unexpired claim, becomes ready while it
-/// is unresolved, or fails to reconcile it after the lease lapses.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn interrupted_startup_waits_for_its_prepared_lease() {
-    let fixture = PromotionIntegrationFixture::start("interrupted_startup").await;
-    let observer = ForgeWorkerCompletionObserver::default();
-    let store = CountingObjectStore::new(&fixture.storage);
-    let forge = fixture.build_forge_for_test(
-        fixture.catalog.iceberg_catalog(),
-        store,
-        ForgeClock::system(),
-        observer.clone(),
-        ForgeSchedulerTrigger::default(),
-    );
-    let stop = CancellationToken::new();
-    let promotion = owed_promotion(&fixture, &forge).await;
-    enqueue(&fixture, &promotion).await;
-    fixture.prepare_recovery_episode(&forge, &stop).await;
-    observer.hold_after_claims_for_test(1);
-    let worker = ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7())
-        .expect("recovering worker");
-    let owner = worker.owner_for_test();
-    let restarted = worker.clone();
-    let mut interrupted = AbortOnDropHandle::new(tokio::spawn(
-        worker.run(stop.clone(), ForgeRoleReadiness::default()),
-    ));
-    timeout(OWNERSHIP_BOUND, observer.wait_for_claims_for_test())
-        .await
-        .expect("startup claims the Prepared attempt");
-    interrupted.abort();
-    assert!(
-        (&mut interrupted)
-            .await
-            .expect_err("aborted startup")
-            .is_cancelled()
-    );
-    observer.release_claims_for_test();
-    let held: (String, Uuid, bool, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
-        "SELECT state,claimed_by,claim_expires_at>now(),claim_expires_at FROM vala.forge_tasks",
-    )
-    .fetch_one(fixture.operator_pool.pool())
-    .await
-    .expect("interrupted claim");
-    assert_eq!(
-        (held.0.as_str(), held.1, held.2),
-        ("prepared", owner, true),
-        "the aborted startup leaves its own unexpired Prepared claim"
-    );
-
-    let readiness = ForgeRoleReadiness::default();
-    let mut work =
-        AbortOnDropHandle::new(tokio::spawn(restarted.run(stop.clone(), readiness.clone())));
-    // Startup paces recovery passes 250ms apart; eight passes would each have
-    // renewed the claim if the interrupted invocation still authorized it.
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let honored: (String, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as("SELECT state,claim_expires_at FROM vala.forge_tasks")
-            .fetch_one(fixture.operator_pool.pool())
-            .await
-            .expect("honored claim");
-    assert_eq!(
-        honored,
-        ("prepared".to_owned(), held.3),
-        "the restart must not renew a claim its interrupted predecessor holds"
-    );
-    assert!(
-        !readiness.is_ready(),
-        "unresolved recovery keeps readiness down"
-    );
-
-    let admin = fixture
-        .database
-        .superuser_pool()
-        .expect("fixture administrator");
-    sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=now()-interval '1 hour'")
-        .execute(&admin)
-        .await
-        .expect("lapse the interrupted lease");
-    timeout(OWNERSHIP_BOUND, observer.wait_for_at_least(1))
-        .await
-        .expect("the lapsed Prepared attempt is reconciled");
-    let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
-        .fetch_one(fixture.operator_pool.pool())
-        .await
-        .expect("recovered state");
-    assert_eq!(state, "succeeded");
-    stop.cancel();
-    timeout(OWNERSHIP_BOUND, &mut work)
-        .await
-        .expect("restart drains")
-        .expect("restart join")
-        .expect("restart stops cleanly");
-}
-
 /// Shutdown before execution balances ownership and reports the durable Retryable
 /// release, even though that transition clears the attempt identity.
 ///
@@ -1247,118 +1142,6 @@ async fn worker_pre_execution_cancellation_reports_durable_retry() {
     );
 }
 
-/// Ordinary ownership timing includes held claim and settled-but-unreleased lease
-/// intervals; a release failure preserves the known successful durable result.
-///
-/// # Panics
-/// Panics when duration omits either boundary, ownership leaks, or emission duplicates.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn worker_duration_includes_claim_and_failed_release() {
-    let telemetry = ForgeTelemetryCheckpoint::install();
-    let fixture = PromotionIntegrationFixture::start("duration_episode").await;
-    let observer = ForgeWorkerCompletionObserver::default();
-    observer.hold_after_claims_for_test(1);
-    observer.hold_before_next_lease_release_for_test();
-    observer.hold_after_next_attempt_for_test();
-    observer.fail_next_lease_release();
-    let stop = CancellationToken::new();
-    let worker = fixture.plan_worker_for_test(observer.clone()).await;
-    let mut work = AbortOnDropHandle::new(tokio::spawn(
-        worker.run(stop.clone(), ForgeRoleReadiness::default()),
-    ));
-    if timeout(OWNERSHIP_BOUND, observer.wait_for_claims_for_test())
-        .await
-        .is_err()
-    {
-        stop.cancel();
-        work.abort();
-        panic!(
-            "claim gate missed; last task state=ready, attempts={}",
-            observer.attempts()
-        );
-    }
-    let claim_at = Instant::now();
-    let active_claim = active_tasks(&telemetry.snapshot());
-    let claimed: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
-        .fetch_one(fixture.operator_pool.pool())
-        .await
-        .expect("claimed state");
-    let claim_held = claim_at.elapsed();
-    observer.release_claims_for_test();
-    if timeout(
-        OWNERSHIP_BOUND,
-        observer.wait_for_held_lease_release_for_test(),
-    )
-    .await
-    .is_err()
-    {
-        stop.cancel();
-        work.abort();
-        panic!("release gate missed; last state={claimed}");
-    }
-    let release_at = Instant::now();
-    let execution_bound = claim_at.elapsed();
-    let active_release = active_tasks(&telemetry.snapshot());
-    let mut settled = String::new();
-    // Hold release longer than the observed claim-to-release work, using real
-    // state reads and elapsed comparison rather than a fixed sleep duration.
-    if timeout(OWNERSHIP_BOUND, async {
-        loop {
-            settled = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
-                .fetch_one(fixture.operator_pool.pool())
-                .await
-                .expect("settled state");
-            if release_at.elapsed() > execution_bound {
-                break;
-            }
-        }
-    })
-    .await
-    .is_err()
-    {
-        stop.cancel();
-        work.abort();
-        panic!("release observation timed out; last state={settled}");
-    }
-    let release_held = release_at.elapsed();
-    let observed_ownership = claim_at.elapsed();
-    observer.release_held_lease_release_for_test();
-    if timeout(OWNERSHIP_BOUND, observer.wait_for_held_attempt_for_test())
-        .await
-        .is_err()
-    {
-        stop.cancel();
-        work.abort();
-        panic!("completion gate missed; last state={settled}");
-    }
-    let after = telemetry.snapshot();
-    observer.release_held_attempt_for_test();
-    let error = if let Ok(result) = timeout(OWNERSHIP_BOUND, &mut work).await {
-        result
-            .expect("worker join")
-            .expect_err("release failure must remain fatal")
-    } else {
-        stop.cancel();
-        work.abort();
-        panic!("release failure did not drain; last state={settled}");
-    };
-    assert!(
-        error.to_string().contains("lease release failure"),
-        "{error}"
-    );
-    assert_eq!(claimed, "claimed");
-    assert_eq!(settled, "succeeded");
-    assert_eq!((active_claim, active_release), (1.0, 1.0));
-    let duration = assert_completed_episode(&after, 0, "succeeded", observed_ownership);
-    eprintln!(
-        "duration={}ns, claim gate={}ns, release gate={}ns; attempts=1 succeeded; active=1/1/0",
-        duration,
-        claim_held.as_nanos(),
-        release_held.as_nanos()
-    );
-}
-
 /// A worker whose operator database stops answering backs off and recovers.
 ///
 /// The worker's operator pool is narrowed to one connection, which the test
@@ -1429,13 +1212,14 @@ async fn worker_backs_off_while_the_operator_database_is_unreachable() {
 }
 
 /// A running slot discovering invalid Prepared evidence closes readiness before
-/// held lease cleanup, preserves reconciliation over release, and observes uncertainty.
+/// its fatal outcome is observed, keeps the reconciliation error, and observes
+/// uncertainty.
 ///
 /// # Panics
 /// Panics on late readiness loss, error replacement, or missing ownership observation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn worker_prepared_fatal_closes_before_release_and_observation() {
+async fn worker_prepared_fatal_closes_before_observation() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("prepared_fatal").await;
     let observer = ForgeWorkerCompletionObserver::default();
@@ -1453,9 +1237,7 @@ async fn worker_prepared_fatal_closes_before_release_and_observation() {
     sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=now()+interval '1 hour', evidence=jsonb_set(evidence,'{committed_snapshot_id}','999999')")
         .execute(fixture.operator_pool.pool()).await.expect("live foreign Prepared claim");
     let before = telemetry.snapshot();
-    observer.hold_before_next_lease_release_for_test();
     observer.hold_before_fatal_observation_for_test();
-    observer.fail_next_lease_release();
     let worker =
         ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7()).expect("worker");
     let readiness = ForgeRoleReadiness::default();
@@ -1469,15 +1251,11 @@ async fn worker_prepared_fatal_closes_before_release_and_observation() {
             .execute(fixture.operator_pool.pool())
             .await
             .expect("recovery becomes eligible after startup");
-        observer.wait_for_held_lease_release_for_test().await;
+        observer.wait_for_fatal_observation_for_test().await;
         assert!(
             !readiness.is_ready(),
-            "known reconciliation failure closes before release"
+            "known reconciliation failure closes before it is observed"
         );
-        assert!((active_tasks(&telemetry.snapshot()) - 1.0).abs() < f64::EPSILON);
-        observer.release_held_lease_release_for_test();
-        observer.wait_for_fatal_observation_for_test().await;
-        assert!(!readiness.is_ready());
         assert!(!work.is_finished());
         observer.release_fatal_observation_for_test();
     })
@@ -1528,7 +1306,7 @@ async fn worker_prepared_fatal_closes_before_release_and_observation() {
     );
     assert_eq!(duration_count(&after) - duration_count(&before), 1);
     eprintln!(
-        "Prepared fatal: ready=false while release held; reconciliation error preserved; uncertain attempt/duration delta=1; active=0"
+        "Prepared fatal: ready=false before observation; reconciliation error preserved; uncertain attempt/duration delta=1; active=0"
     );
 }
 
@@ -2513,174 +2291,4 @@ async fn property_less_table_is_compacted_after_the_default_interval() {
     let due = forge.pull_compaction(4).await.expect("leader pull");
     assert_eq!(due.len(), 1, "the interval boundary dispatches: {due:?}");
     assert_eq!(due[0].compaction_type, ForgeCompactionType::SmallFiles);
-}
-
-/// Builds one coordinator over `fixture` whose scheduler passes a test requests.
-///
-/// # Panics
-///
-/// Panics when the fixture cannot produce a validated Forge graph.
-fn coordinator(fixture: &PromotionIntegrationFixture) -> (Arc<Forge>, ForgeSchedulerTrigger) {
-    let trigger = ForgeSchedulerTrigger::with_owner_for_test(Uuid::now_v7());
-    let forge = fixture.build_forge_for_test(
-        fixture.catalog.iceberg_catalog(),
-        CountingObjectStore::new(&fixture.storage),
-        ForgeClock::system(),
-        ForgeWorkerCompletionObserver::new(),
-        trigger.clone(),
-    );
-    (forge, trigger)
-}
-
-/// Requests one scheduler pass and waits until `expected` passes completed.
-///
-/// A requested pass renews or contends for the term before it records
-/// completion, so on return the coordinator's term state is settled.
-///
-/// # Panics
-///
-/// Panics when the pass misses its diagnostic bound.
-async fn contend(trigger: &ForgeSchedulerTrigger, expected: usize) {
-    trigger.request_pass();
-    timeout(OWNERSHIP_BOUND, trigger.wait_for_passes_at_least(expected))
-        .await
-        .expect("the requested scheduler pass completes");
-}
-
-/// Asserts that notify, pull and report all refuse `fencing_token` on `forge`.
-///
-/// # Panics
-///
-/// Panics when any leader handler still serves the term.
-fn assert_handlers_refuse(
-    forge: &Forge,
-    fixture: &PromotionIntegrationFixture,
-    fencing_token: i64,
-) {
-    let key = ForgeTableKey {
-        tenant: fixture.tenant,
-        table: identity(fixture),
-    };
-    let notify = forge.accept_commit_notice(
-        fencing_token,
-        ForgeCommitNotice {
-            key: key.clone(),
-            snapshot_id: 1,
-            settings: ForgeTableSettings::default(),
-        },
-    );
-    let pull = forge.serve_compaction_pull(fencing_token, 4).map(|_| ());
-    let report = forge
-        .serve_compaction_report(
-            fencing_token,
-            &key,
-            Uuid::now_v7(),
-            ForgeCompactionOutcome::Failed,
-        )
-        .map(|_| ());
-    for (handler, result) in [("notify", notify), ("pull", pull), ("report", report)] {
-        assert!(
-            matches!(
-                result,
-                Err(vala_bifrost_redux::forge::ForgeError::FenceLost { .. })
-            ),
-            "{handler} under an ended scheduler's term: {result:?}"
-        );
-    }
-}
-
-/// A failed scheduler ends its term before the same-pod restart backoff.
-///
-/// The scheduler panics after acquiring the term. While nothing runs on that
-/// pod, its term is revoked and gone, so notify, pull and report all refuse
-/// it. Once the abandoned row lapses a standby acquires, and the rebuilt
-/// scheduler contends like any other replica and stays a standby. A rebuilt
-/// scheduler that later holds the term and is dropped ends it the same way.
-///
-/// # Panics
-///
-/// Panics when an ended scheduler's term stays held or serves a handler, when
-/// the standby cannot take over, or when the rebuilt scheduler takes the live
-/// term from the standby.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn failed_scheduler_ends_its_term_before_restart() {
-    let fixture = PromotionIntegrationFixture::start("scheduler_unwind").await;
-    let (old, old_trigger) = coordinator(&fixture);
-    let fail = CancellationToken::new();
-    let first = tokio::spawn({
-        let old = Arc::clone(&old);
-        let fail = fail.clone();
-        async move {
-            tokio::select! {
-                result = old.run(CancellationToken::new(), ForgeRoleReadiness::detached()) => {
-                    panic!("the scheduler stopped on its own: {result:?}")
-                }
-                () = fail.cancelled() => panic!("forced scheduler failure after acquisition"),
-            }
-        }
-    });
-    contend(&old_trigger, 1).await;
-    let term = old
-        .held_leader_term()
-        .expect("the first scheduler holds the term");
-    fail.cancel();
-    let failed = first.await.expect_err("the scheduler task fails");
-    assert!(failed.is_panic(), "the scheduler unwound: {failed}");
-
-    // Restart backoff: no scheduler runs on this pod, and its term is over.
-    assert!(term.is_revoked());
-    assert!(old.held_leader_term().is_none());
-    assert_handlers_refuse(&old, &fixture, term.fencing_token());
-
-    // The abandoned row lapses at its own expiry; a standby then acquires.
-    sqlx::query(
-        "UPDATE vala.forge_scheduler_state SET expires_at = statement_timestamp() WHERE singleton",
-    )
-    .execute(fixture.operator_pool.pool())
-    .await
-    .expect("the abandoned term lapses");
-    let (standby, standby_trigger) = coordinator(&fixture);
-    let standby_stop = CancellationToken::new();
-    let standby_run = tokio::spawn({
-        let standby = Arc::clone(&standby);
-        let stop = standby_stop.clone();
-        async move { standby.run(stop, ForgeRoleReadiness::detached()).await }
-    });
-    contend(&standby_trigger, 1).await;
-    let successor = standby.held_leader_term().expect("the standby takes over");
-    assert!(successor.fencing_token() > term.fencing_token());
-
-    // The rebuilt scheduler contends for the live term and stays a standby.
-    let rebuilt = AbortOnDropHandle::new(tokio::spawn({
-        let old = Arc::clone(&old);
-        async move {
-            old.run(CancellationToken::new(), ForgeRoleReadiness::detached())
-                .await
-        }
-    }));
-    contend(&old_trigger, 2).await;
-    assert!(
-        old.held_leader_term().is_none(),
-        "the live term is not taken"
-    );
-    assert!(!successor.is_revoked());
-
-    // After the standby resigns, the rebuilt scheduler acquires; dropping it
-    // then ends that term at once.
-    standby_stop.cancel();
-    standby_run
-        .await
-        .expect("standby scheduler task")
-        .expect("standby scheduler stops cleanly");
-    contend(&old_trigger, 3).await;
-    let rebuilt_term = old
-        .held_leader_term()
-        .expect("the rebuilt scheduler acquires the resigned term");
-    rebuilt.abort();
-    let dropped = rebuilt.await.expect_err("the rebuilt scheduler is dropped");
-    assert!(dropped.is_cancelled());
-    assert!(rebuilt_term.is_revoked());
-    assert!(old.held_leader_term().is_none());
-    assert_handlers_refuse(&old, &fixture, rebuilt_term.fencing_token());
 }

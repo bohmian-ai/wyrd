@@ -75,7 +75,7 @@ pub use expiry_gates::ExpiryTestControls;
 #[cfg(feature = "test-support")]
 pub use gc::cleanup_projection;
 #[cfg(feature = "test-support")]
-pub use lease::{ForgeLease, forge_lease_key};
+pub use lease::ForgeLease;
 #[cfg(feature = "test-support")]
 pub use live_reconcile::LiveReconciliationTestOutcome;
 #[cfg(feature = "test-support")]
@@ -166,7 +166,7 @@ pub struct ForgeBuildConfig {
     pub spill_root: std::path::PathBuf,
     /// SQL handle used by tenant-scoped durable Forge transitions.
     pub vala: vala_sql::ValaPostgres,
-    /// Cross-tenant operator pool used by discovery and table leases.
+    /// Cross-tenant operator pool used by discovery and Forge task claims.
     pub operator_pool: vala_sql::OperatorPool,
     /// Iceberg catalog used by maintenance operations.
     pub catalog: Arc<dyn Catalog>,

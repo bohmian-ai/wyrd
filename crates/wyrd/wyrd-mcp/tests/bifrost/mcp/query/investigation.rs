@@ -358,8 +358,7 @@ impl EvidenceInvestigation {
                 discover(),
             )
             .await?;
-        let arguments =
-            json!({ "sql": "SELECT request_payload_json FROM vala.gateway.calls LIMIT 20" });
+        let arguments = json!({ "sql": "SELECT request_payload FROM vala.gateway.calls LIMIT 20" });
         let failure = problem(
             restricted
                 .call_tool(Self::request("bifrost.query", &arguments)?)

@@ -679,7 +679,7 @@ impl DriftEngine {
         spec: &DriftSpec,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
-        match Box::pin(self.try_verify(tenant, run, spec, telemetry)).await {
+        match self.try_verify(tenant, run, spec, telemetry).await {
             Ok(report) => EngineOutcome::Completed(VerifierReport::Drift(report)),
             Err(outcome) => outcome,
         }
@@ -719,7 +719,9 @@ impl DriftEngine {
                     .prepare(async { window.custom(&profile.metric_name) })
                     .await;
                 let mut row = None;
-                Box::pin(reader.fold(sql, |batch| fold_custom(batch, &mut row))).await?;
+                reader
+                    .fold(sql, |batch| fold_custom(batch, &mut row))
+                    .await?;
                 let _score = tracing::info_span!("verification.score").entered();
                 match row.flatten() {
                     Some(mean) => scored(score_custom_mean(mean, profile)),
@@ -741,7 +743,7 @@ impl DriftEngine {
                     })
                     .await?;
                 let mut fold = DistributionFold::psi(&baseline, profile);
-                Box::pin(reader.fold(sql, |batch| fold.fold(batch))).await?;
+                reader.fold(sql, |batch| fold.fold(batch)).await?;
                 let _score = tracing::info_span!("verification.score").entered();
                 fold.finish().map_err(|error| invalid(error.to_string()))
             }
@@ -760,7 +762,7 @@ impl DriftEngine {
                     })
                     .await?;
                 let mut fold = DistributionFold::spc(&baseline);
-                Box::pin(reader.fold(sql, |batch| fold.fold(batch))).await?;
+                reader.fold(sql, |batch| fold.fold(batch)).await?;
                 let _score = tracing::info_span!("verification.score").entered();
                 fold.finish().map_err(|error| invalid(error.to_string()))
             }

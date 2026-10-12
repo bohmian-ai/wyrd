@@ -179,18 +179,6 @@ async fn release_cleanup_claim(fixture: &PromotionIntegrationFixture, task_id: U
         .expect("the cleanup claim releases");
 }
 
-/// Counts every live maintenance lease, which a refused claim must not change.
-///
-/// # Panics
-///
-/// Panics when the diagnostic read fails.
-async fn live_leases(fixture: &PromotionIntegrationFixture) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM vala.maintenance_leases")
-        .fetch_one(fixture.operator_pool.pool())
-        .await
-        .expect("lease count")
-}
-
 /// Builds a path beside one candidate, sharing its table-bound directory.
 ///
 /// Staying in the candidate's own directory keeps the derived path inside the
@@ -262,19 +250,16 @@ async fn assert_preparation_committed_under_held_authority(
     lock.rollback().await.expect("end the probe transaction");
 }
 
-/// Asserts an unresolved preparation excludes every competing Forge authority.
+/// Asserts an unresolved preparation excludes every competing Forge task.
 ///
-/// A second Forge claim and a competing destructive effect are each refused by
-/// their own production mechanism while the prepared row stands.
+/// Every Forge effect on a table, destructive ones included, runs as that
+/// table's one active task, so refusing a second claim while the prepared row
+/// stands refuses every competitor.
 ///
 /// # Panics
 ///
-/// Panics when any competitor is admitted.
-async fn assert_prepared_candidate_excludes_competitors(
-    worker: &ForgeWorker,
-    forge: &Arc<Forge>,
-    binding: &TenantTableBinding,
-) {
+/// Panics when a competitor is admitted.
+async fn assert_prepared_candidate_excludes_competitors(worker: &ForgeWorker) {
     assert!(
         worker
             .claim_for_test()
@@ -282,13 +267,6 @@ async fn assert_prepared_candidate_excludes_competitors(
             .expect("claim transaction runs")
             .is_none(),
         "the prepared cleanup task excludes every competing Forge claim"
-    );
-    assert!(
-        matches!(
-            forge.run_orphan_gc_report_for_test(binding).await,
-            Err(ForgeError::FenceLost { .. })
-        ),
-        "the live table lease denies a competing destructive effect"
     );
 }
 
@@ -413,7 +391,7 @@ async fn assert_paused_candidate_gates(
     payload: &ExpiredCleanupPayload,
 ) {
     assert_preparation_committed_under_held_authority(table, identity, cleanup_id).await;
-    assert_prepared_candidate_excludes_competitors(worker, forge, binding).await;
+    assert_prepared_candidate_excludes_competitors(worker).await;
     assert_self_exemption_is_exact(
         forge,
         binding,
@@ -458,7 +436,6 @@ async fn assert_cross_table_plan_is_refused(
         ..payload.clone()
     };
     persist_cleanup_plan(&table.fixture, cleanup_id, &sibling).await;
-    let leases_before = live_leases(&table.fixture).await;
     let stats_before = table.store.stats();
     let Some(stray) = worker
         .claim_for_test()
@@ -488,11 +465,6 @@ async fn assert_cross_table_plan_is_refused(
         table.store.deletes(),
         deletes_before,
         "a refused cross-table plan deletes no object"
-    );
-    assert_eq!(
-        live_leases(&table.fixture).await,
-        leases_before,
-        "a refused cross-table plan acquires no table lease"
     );
     assert_eq!(
         cursor(&table.fixture, cleanup_id).await,

@@ -15,13 +15,13 @@ use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
+use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, OracleRoleFence, ReservationId,
     TenantTableBinding,
 };
-use wyrd_tonic::prost::Message;
 
 use super::codec::{OraclePhysicalExtensionCodec, physical_plan_fingerprint};
 use crate::catalog::layout::TimePartition;

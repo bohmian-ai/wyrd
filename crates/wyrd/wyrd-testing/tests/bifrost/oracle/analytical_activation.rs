@@ -16,9 +16,7 @@ use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
 use vala_bifrost_redux::oracle::Oracle;
 use vala_bifrost_redux::oracle::QueryIpcDecoder;
-use vala_bifrost_redux::oracle::analytical::{
-    AnalyticalCleanupPause, AnalyticalLiveInspection, analytical_cleanup_pause_for_test,
-};
+use vala_bifrost_redux::oracle::analytical::AnalyticalLiveInspection;
 use wyrd_client::Bifrost;
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
@@ -213,12 +211,12 @@ fn nodes_clean(cluster: &WyrdTestCluster) -> Result<bool, JourneyError> {
         .all(AnalyticalLiveInspection::is_clean))
 }
 
-/// Interactive streams are graphless and settle on their own; only a selected
-/// Analytical query keeps its running entry and graph ownership until the
-/// leader lifecycle's cleanup join completes.
+/// Interactive streams are graphless and settle on their own; a selected
+/// Analytical query whose consumer drops mid-stream retires its running entry
+/// and releases its graph ownership on every node without a terminal.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn transport_drop_retains_running_status_until_cleanup_joins() {
+async fn transport_drop_retires_and_releases_the_graph() {
     prove_cleanup_ownership()
         .await
         .expect("production analytical cleanup ownership journey");
@@ -273,8 +271,8 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
         return Err(format!("{case}: Interactive retirement left graph ownership").into());
     }
 
-    prove_paused_cleanup(&cluster, &engine, tenant, query_server, &public, &grouped).await?;
-    prove_paused_cleanup_over_grpc(&cluster, &engine, tenant, query_server, &public, &grouped)
+    prove_dropped_cleanup(&cluster, &engine, tenant, &public, &grouped).await?;
+    prove_dropped_cleanup_over_grpc(&cluster, &engine, tenant, query_server, &public, &grouped)
         .await?;
 
     cluster.shutdown().await?;
@@ -305,28 +303,23 @@ async fn dispatch(
     }
 }
 
-/// Drops one selected Analytical HTTP consumer mid-stream and holds its release.
+/// Drops one selected Analytical HTTP consumer mid-stream.
 ///
 /// The consumer takes the schema and exactly one batch and then vanishes
 /// without `settle` and without reaching a terminal, which is what a real
-/// caller that closes its connection does. Every later observation is made on a
-/// freshly authenticated client, so the abandoned connection the dropped stream
-/// left in the pool cannot serve it.
+/// caller that closes its connection does.
 ///
 /// # Errors
 ///
-/// Returns a transport, pause, ownership, or assertion error.
-async fn prove_paused_cleanup(
+/// Returns a transport, ownership, or assertion error.
+async fn prove_dropped_cleanup(
     cluster: &WyrdTestCluster,
     engine: &Arc<Oracle>,
     tenant: DataTenantId,
-    server: &WyrdTestServer,
     public: &WyrdClient,
     sql: &str,
 ) -> Result<(), JourneyError> {
     let case = "http selected analytical";
-    let pause = analytical_cleanup_pause_for_test();
-    pause.arm();
     let mut stream = dispatch(&wyrd_client::Bifrost::query_only(public), sql, case).await?;
     let request_id = stream.request_id().clone();
     stream
@@ -337,15 +330,6 @@ async fn prove_paused_cleanup(
         return Err(format!("{case}: the abandoned consumer reached its terminal").into());
     }
     drop(stream);
-    let observer = client(server, "analytical-cleanup-http-observer").await?;
-    hold_and_release(
-        cluster,
-        &wyrd_client::Bifrost::query_only(&observer),
-        &request_id,
-        &pause,
-        case,
-    )
-    .await?;
     await_retired(engine, tenant, &request_id, case).await?;
     await_clean_nodes(cluster).await?;
     Ok(())
@@ -354,14 +338,12 @@ async fn prove_paused_cleanup(
 /// Drops one selected Analytical gRPC consumer and its channel mid-stream.
 ///
 /// Both the response stream and the channel that carried it are dropped after a
-/// single message, so nothing this consumer owns can drain to a terminal. The
-/// running-status observation opens its own channel for the same reason the
-/// HTTP case opens its own client.
+/// single message, so nothing this consumer owns can drain to a terminal.
 ///
 /// # Errors
 ///
-/// Returns a transport, pause, ownership, or assertion error.
-async fn prove_paused_cleanup_over_grpc(
+/// Returns a transport, ownership, or assertion error.
+async fn prove_dropped_cleanup_over_grpc(
     cluster: &WyrdTestCluster,
     engine: &Arc<Oracle>,
     tenant: DataTenantId,
@@ -384,8 +366,6 @@ async fn prove_paused_cleanup_over_grpc(
         format!("Bearer {}", bearer.expose()).parse()?,
     );
 
-    let pause = analytical_cleanup_pause_for_test();
-    pause.arm();
     let response = grpc.query(grpc_request).await?;
     let deadline_ms: i64 = response
         .metadata()
@@ -417,44 +397,8 @@ async fn prove_paused_cleanup_over_grpc(
     drop(frames);
     drop(grpc);
     drop(channel);
-
-    let observer = client(server, "analytical-cleanup-grpc-observer").await?;
-    hold_and_release(
-        cluster,
-        &wyrd_client::Bifrost::query_only(&observer),
-        &request_id,
-        &pause,
-        case,
-    )
-    .await?;
     await_retired(engine, tenant, &request_id, case).await?;
     await_clean_nodes(cluster).await?;
-    Ok(())
-}
-
-/// Asserts running status and graph ownership survive the paused release.
-///
-/// # Errors
-///
-/// Returns a timeout, transport, ownership, or assertion error naming the case.
-async fn hold_and_release(
-    cluster: &WyrdTestCluster,
-    query: &Bifrost,
-    request_id: &RequestId,
-    pause: &AnalyticalCleanupPause,
-    case: &str,
-) -> Result<(), JourneyError> {
-    tokio::time::timeout(std::time::Duration::from_mins(2), pause.wait_entered())
-        .await
-        .map_err(|_| format!("{case}: cleanup never reached the graph release pause"))?;
-    query
-        .status(request_id)
-        .await
-        .map_err(|error| format!("{case}: running entry retired before cleanup joined: {error}"))?;
-    if nodes_clean(cluster)? {
-        return Err(format!("{case}: graph ownership was released before cleanup joined").into());
-    }
-    pause.release();
     Ok(())
 }
 

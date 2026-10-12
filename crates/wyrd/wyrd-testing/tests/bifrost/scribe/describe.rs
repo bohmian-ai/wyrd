@@ -102,8 +102,11 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
             "`{name}` keeps its stored nullability"
         );
         assert!(
-            described.metadata().is_empty(),
-            "`{name}` sends no field identity; ingress compares by shape"
+            described
+                .metadata()
+                .keys()
+                .all(|key| wyrd_types::is_extension_key(key)),
+            "`{name}` sends no field identity beyond its extension type; ingress compares by shape"
         );
     }
     let card_uid = canonical

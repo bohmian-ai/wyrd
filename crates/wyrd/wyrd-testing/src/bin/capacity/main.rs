@@ -31,12 +31,20 @@
 //! Run through `mise run bench:capacity`; `-- --profile` adds per-step,
 //! per-replica `perf` captures of a frame-pointer build, as diagnostic
 //! evidence. Exits nonzero when the verdict fails.
+//!
+//! The same binary carries the named Bifrost workloads, selected by the first
+//! argument: `query-capacity` ([`query`], `mise run
+//! bench:bifrost:query-capacity` and `bench:bifrost:write-capacity`) and
+//! `client-queue` ([`client_queue`], `mise run bench:bifrost:client-queue`).
+//! Each keeps its own flags, report, and output directory.
 
+mod client_queue;
 mod evidence;
 mod fixture;
 mod judge;
 mod load;
 mod profile;
+mod query;
 mod report;
 mod step;
 
@@ -703,9 +711,29 @@ fn install_tracing() {
     );
 }
 
-/// Runs the benchmark and exits nonzero on a failed verdict or error.
+/// Runs the Bifrost workload the first argument names, or the capacity mix
+/// when it names none, and exits nonzero on a failed verdict or error.
+///
+/// A named workload receives the command line without its name, so its flags
+/// parse exactly as they did on its standalone binary.
 #[tokio::main]
 async fn main() -> ExitCode {
+    let mut arguments: Vec<String> = std::env::args().collect();
+    match arguments.get(1).map(String::as_str) {
+        Some("query-capacity") => {
+            arguments.remove(1);
+            Box::pin(query::main(arguments)).await
+        }
+        Some("client-queue") => {
+            arguments.remove(1);
+            Box::pin(client_queue::main(arguments)).await
+        }
+        _ => Box::pin(capacity()).await,
+    }
+}
+
+/// Runs the capacity mix and exits nonzero on a failed verdict or error.
+async fn capacity() -> ExitCode {
     install_tracing();
     let cli = Cli::parse();
     let result = match Lifetime::from_command() {

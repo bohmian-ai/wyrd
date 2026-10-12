@@ -100,17 +100,20 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
+    ///
+    /// The plan is ready immediately; the future keeps signature parity with
+    /// the cloud backends, whose dispatch awaits every variant uniformly.
     pub fn presign_single_put(
         &self,
         path: &ValidatedPath,
         _size_bytes: u64,
         ttl: Duration,
-    ) -> Result<UploadPlan, StorageError> {
-        Ok(UploadPlan::SinglePut {
-            put_url: self.file_url(path)?,
+    ) -> std::future::Ready<Result<UploadPlan, StorageError>> {
+        std::future::ready(self.file_url(path).map(|put_url| UploadPlan::SinglePut {
+            put_url,
             ttl_secs: ttl_secs(ttl),
             required_headers: Vec::<HeaderPair>::new(),
-        })
+        }))
     }
 
     /// Return the local single PUT plan for multipart init.
@@ -118,7 +121,11 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
-    pub fn init_multipart(
+    #[allow(
+        clippy::unused_async,
+        reason = "signature parity with sibling cloud backends (S3/GCS/Azure); BackendSigner dispatch awaits the returned future uniformly across variants"
+    )]
+    pub async fn init_multipart(
         &self,
         path: &ValidatedPath,
         _part_count: u32,
@@ -126,7 +133,7 @@ impl LocalSigner {
         ttl: Duration,
     ) -> Result<MultipartInit, StorageError> {
         Ok(MultipartInit {
-            plan: self.presign_single_put(path, 0, ttl)?,
+            plan: self.presign_single_put(path, 0, ttl).await?,
             backend_upload_id: String::new(),
         })
     }
@@ -152,12 +159,15 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
+    ///
+    /// The URL is ready immediately; the future keeps signature parity with
+    /// the cloud backends, whose dispatch awaits every variant uniformly.
     pub fn presign_get(
         &self,
         path: &ValidatedPath,
         _ttl: Duration,
-    ) -> Result<String, StorageError> {
-        self.file_url(path)
+    ) -> std::future::Ready<Result<String, StorageError>> {
+        std::future::ready(self.file_url(path))
     }
 
     /// Read local object metadata.
@@ -179,7 +189,7 @@ impl LocalSigner {
     ///
     /// # Errors
     /// Returns a capability mismatch if the replay protocol is not local.
-    pub fn remint_plan(
+    pub async fn remint_plan(
         &self,
         path: &ValidatedPath,
         input: &UploadPlanReplayInput,
@@ -192,6 +202,7 @@ impl LocalSigner {
             });
         }
         self.presign_single_put(path, input.part_size_bytes, ttl)
+            .await
     }
 
     fn object_path(&self, path: &ValidatedPath) -> PathBuf {
@@ -232,6 +243,7 @@ mod integration_tests {
 
         let plan = signer
             .presign_single_put(&path, head.size_bytes, Duration::from_mins(1))
+            .await
             .expect("local upload plan");
         let UploadPlan::SinglePut {
             put_url,
@@ -305,10 +317,8 @@ mod integration_tests {
         }
     }
 
-    /// Replaying a non-local upload protocol through the local signer is a
-    /// typed capability mismatch naming the local backend and `remint_plan`.
-    #[test]
-    fn local_capability_mismatch_is_typed_for_non_local_protocols() {
+    #[tokio::test]
+    async fn local_capability_mismatch_is_typed_for_non_local_protocols() {
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let tenant = DataTenantId::new_v7();
@@ -321,7 +331,9 @@ mod integration_tests {
             part_size_bytes: 10,
             block_count_planned: None,
         };
-        let result = signer.remint_plan(&path, &input, Duration::from_mins(1));
+        let result = signer
+            .remint_plan(&path, &input, Duration::from_mins(1))
+            .await;
         match result {
             Err(StorageError::BackendCapabilityMismatch { signer, op }) => {
                 assert_eq!(signer, StorageBackendKind::Local);

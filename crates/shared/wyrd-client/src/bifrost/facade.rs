@@ -821,7 +821,7 @@ impl Bifrost {
     ///
     /// # Errors
     ///
-    /// As [`Self::sql`], plus `WYRD_VALA_400_QUERY_INVALID_DEADLINE` for a
+    /// As [`Self::sql`], plus `WYRD_VALA_400_QUERY_INVALID_SQL` for a
     /// deadline outside the accepted range and a decode error on a malformed
     /// Arrow IPC frame.
     ///

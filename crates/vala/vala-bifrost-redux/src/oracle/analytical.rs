@@ -1071,11 +1071,9 @@ impl GraphLease {
     ///
     /// The order is the invariant: stop admitting, cancel unless the graph
     /// succeeded, join every attempt and the descendants they own, drop the
-    /// graph's worker cache, and only then release the supervisor guard that
-    /// returns the envelope, the egress record, and, when the last holder of
-    /// this lease goes away, the reservation's running permit. A nested child
-    /// still finishing is not waited on: it returns its bytes through the
-    /// shared root, and the memory view's own drop is the leak check.
+    /// graph's worker cache and exchanges, and only then release the supervisor
+    /// guard that returns the envelope, the egress record, and, when the last
+    /// holder of this lease goes away, the reservation's running permit.
     ///
     /// A cleanup failure is never a successful release: the graph keeps every
     /// owner it still holds, so the residue stays attributable to this node.
@@ -2225,8 +2223,7 @@ impl fmt::Debug for AnalyticalParticipantGrants {
 /// `Drop` returns, everything this node can revoke: the graph moves to
 /// `Draining`, its cancellation fires, every participant grant is dropped — each follower observes its admit stream end and cancels
 /// what it built on the grant — and the attempt's local drivers are aborted.
-/// Only the query envelope is returned afterwards, by an
-/// [`AnalyticalGraphRelease`] that owns no follower, grant, driver, or claim.
+/// The graph, and with it the query envelope, is then released in place.
 /// Remote IO already in flight when the grants drop has no consumer left and
 /// may complete after that.
 pub(super) struct AnalyticalGraphLifecycle {
@@ -2299,13 +2296,6 @@ const METRIC_FOLD_EXPIRED: &str =
 /// says the dependency could not build the metric-carrying plan at all. Both
 /// retain the graph; only this one names an error the dependency reported.
 const METRIC_FOLD_REFUSED: &str = "Oracle analytical distributed metric rewrite failed";
-
-/// Detail one graph records when its owner was dropped outside any runtime.
-///
-/// Nothing can poll the envelope's children there, so the graph is retained
-/// as attributable residue rather than released unconfirmed.
-const RECLAIM_WITHOUT_RUNTIME: &str =
-    "Oracle analytical graph owner was dropped outside a Tokio runtime";
 
 impl AnalyticalGraphLifecycle {
     /// Composes one graph's stream-owned lifecycle over its registered entry.
@@ -2470,9 +2460,7 @@ impl AnalyticalGraphLifecycle {
     /// the graph out of `Active` so nothing new is admitted, cancel unless the
     /// graph succeeded, join the attempt and every driver it retained, drop its
     /// unfolded plan and every participant grant, release the graph, and only
-    /// then release the admission owner. A nested child still finishing is not
-    /// waited on; it returns its bytes through the shared root, and the memory
-    /// view's own drop is the leak check. The pinned distributed executor releases every
+    /// then release the admission owner. The pinned distributed executor releases every
     /// partition stream it opened when the root stream ends or is dropped. Cleanup that cannot be confirmed
     /// leaves every unresolved owner in the `Draining` entry and returns the
     /// failure, so a success terminal is unreachable and readiness stays false.
@@ -2527,7 +2515,10 @@ impl AnalyticalGraphLifecycle {
         if failure.is_none() {
             #[cfg(feature = "test-support")]
             analytical_cleanup_pause_for_test().hold().await;
-            match self.release().release() {
+            // Removing the entry drops the envelope and only then the
+            // admission permit it retained, so the counters that wake the next
+            // query are returned last.
+            match self.supervisor.release_graph(self.graph) {
                 Ok(owner) => running_query = owner,
                 Err(error) => failure = Some(error.to_string()),
             }
@@ -2560,14 +2551,6 @@ impl AnalyticalGraphLifecycle {
                     .retain_graph_cleanup(self.graph, detail.clone());
                 Err(BifrostError::Internal { detail })
             }
-        }
-    }
-
-    /// Names the envelope release this graph ends with.
-    fn release(&self) -> AnalyticalGraphRelease {
-        AnalyticalGraphRelease {
-            supervisor: Arc::clone(&self.supervisor),
-            graph: self.graph,
         }
     }
 
@@ -2736,8 +2719,9 @@ impl Drop for AnalyticalGraphLifecycle {
     /// without awaiting: the graph stops admitting work, its cancellation
     /// fires, every participant grant is dropped (which
     /// revokes each follower), the attempt is abandoned (which aborts every
-    /// local driver), and the retained metric fold is discarded. Only the
-    /// query envelope is left, handed to a bounded capacity release.
+    /// local driver), the retained metric fold is discarded, and the graph is
+    /// released. A child still being torn down returns its bytes through the
+    /// shared memory root as it frees them.
     fn drop(&mut self) {
         if self.settled {
             return;
@@ -2753,73 +2737,22 @@ impl Drop for AnalyticalGraphLifecycle {
         drop(self.grants.take());
         drop(self.attempt.take());
         drop(self.supervisor.take_metric_fold(self.graph));
-        self.release().reclaim();
-    }
-}
-
-/// The return of one leader graph's query envelope.
-///
-/// Owns only the identity needed to remove the graph entry. It holds no
-/// follower grant, local driver, active-read claim, or consumer-facing stream:
-/// by the time it exists, the lifecycle that built it has already revoked all
-/// of those.
-struct AnalyticalGraphRelease {
-    /// Supervisor that owns the graph entry being released.
-    supervisor: Arc<AnalyticalSupervisor>,
-    /// The graph whose envelope is returned.
-    graph: AnalyticalGraphKey,
-}
-
-impl AnalyticalGraphRelease {
-    /// Removes the graph entry, returning its envelope and admission permit.
-    ///
-    /// Removing the entry drops the envelope and only then the admission permit
-    /// it retained, so the counters that wake the next query are returned last.
-    /// A nested child still finishing is not waited on: it keeps the memory
-    /// view alive and returns its bytes through the shared root, and the view's
-    /// own drop remains the leak check.
-    ///
-    /// # Errors
-    ///
-    /// Returns the supervisor's refusal when the graph cannot be released.
-    fn release(&self) -> Result<Option<RunningQueryTerminalOwner>, BifrostError> {
-        self.supervisor.release_graph(self.graph)
-    }
-
-    /// Returns a dropped graph's envelope and admission on the current runtime.
-    ///
-    /// `Drop` has already revoked every other owner; this is the one step that
-    /// runs afterwards. Aborted drivers drop their memory reservations on a
-    /// later runtime poll; they keep the memory view alive and return their
-    /// bytes through the shared root, so nothing here waits for them. A graph
-    /// dropped outside any runtime, or one the supervisor refuses to release,
-    /// is retained as draining residue, which fails readiness.
-    fn reclaim(self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            self.supervisor
-                .retain_graph_cleanup(self.graph, RECLAIM_WITHOUT_RUNTIME.to_owned());
-            return;
-        };
-        runtime.spawn(async move {
-            #[cfg(feature = "test-support")]
-            analytical_cleanup_pause_for_test().hold().await;
-            match self.release() {
-                Ok(owner) => {
-                    if let Some(mut owner) = owner {
-                        owner.finish(wyrd_spec::vala::api::QueryTerminalOutcome::Failed);
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        public_query_id = %self.graph.public_query_id,
-                        "Oracle analytical dropped graph could not return its envelope"
-                    );
-                    self.supervisor
-                        .retain_graph_cleanup(self.graph, error.to_string());
+        match self.supervisor.release_graph(self.graph) {
+            Ok(owner) => {
+                if let Some(mut owner) = owner {
+                    owner.finish(wyrd_spec::vala::api::QueryTerminalOutcome::Failed);
                 }
             }
-        });
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    public_query_id = %self.graph.public_query_id,
+                    "Oracle analytical dropped graph could not return its envelope"
+                );
+                self.supervisor
+                    .retain_graph_cleanup(self.graph, error.to_string());
+            }
+        }
     }
 }
 
@@ -2986,7 +2919,7 @@ impl AnalyticalCleanupPause {
     ///
     /// Unarmed graphs pass straight through, so production release behavior is
     /// unchanged when nothing is testing it.
-    async fn hold(&self) {
+    pub(super) async fn hold(&self) {
         if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
             return;
         }
@@ -3520,11 +3453,10 @@ mod tests {
             body: &[u8],
             _now: DateTime<Utc>,
         ) -> Result<AuthorizedStage, super::super::peer::PeerSecurityError> {
-            let claims =
-                <super::super::peer::StageTicketClaims as wyrd_tonic::prost::Message>::decode(
-                    context.claims_bytes.as_slice(),
-                )
-                .map_err(|_| super::super::peer::PeerSecurityError::Claims)?;
+            let claims = <super::super::peer::StageTicketClaims as prost::Message>::decode(
+                context.claims_bytes.as_slice(),
+            )
+            .map_err(|_| super::super::peer::PeerSecurityError::Claims)?;
             let digest = super::super::peer::stage_body_digest(body)?;
             claims.verify_binding(binding, &digest)?;
             Ok(AuthorizedStage {
@@ -4342,13 +4274,14 @@ mod tests {
             .expect("the aborted driver ends promptly")
             .expect_err("the driver was aborted, never completed");
 
-        await_until(|| {
+        assert_eq!(
             fixture
                 .supervisor
                 .live_graphs()
-                .is_ok_and(|graphs| graphs == 0)
-        })
-        .await;
+                .expect("the supervisor reports live graphs"),
+            0,
+            "the dropped graph is released before the drop returns"
+        );
         assert_eq!(
             fixture
                 .supervisor
@@ -4448,8 +4381,8 @@ mod tests {
     /// An idle graph whose query ended by its deadline releases cleanly.
     ///
     /// A query that ends by its deadline begins cleanup at or after that
-    /// instant. Its children being idle is what makes the release safe, so the
-    /// deadline having passed cannot turn a clean cleanup into retained residue.
+    /// instant. Nothing is left to wait for at release, so the deadline having
+    /// passed cannot turn a clean cleanup into retained residue.
     ///
     /// # Panics
     ///
@@ -4459,7 +4392,7 @@ mod tests {
         let oracle = fixture_oracle_role();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
         // Nothing is ever reserved: the only owner this settlement has left to
-        // release is the envelope itself, and it is already idle.
+        // release is the envelope itself.
         let leased = lease_over_lossy_peers_until(&fixture, &oracle, 0, deadline);
         let (admitted, ownership, _transport) = *leased;
         tokio::time::sleep_until(deadline + Duration::from_millis(30)).await;
@@ -4612,8 +4545,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a graph is released beneath a live holder or when a settled
-    /// graph is retained.
+    /// Panics when a graph is released beneath a live holder, when a settled
+    /// graph is retained, or when a failed cleanup is reported as clean.
     #[tokio::test]
     async fn follower_graph_release_waits_for_every_holder() {
         let now = Utc::now();
@@ -4689,6 +4622,7 @@ mod tests {
             "closing the leader's stream ends the grant"
         );
 
+        follower_retains_a_graph_it_cannot_release().await;
         follower_scopes_one_upstream_worker_to_each_graph().await;
     }
 
@@ -4933,6 +4867,105 @@ mod tests {
             "a retained follower cleanup failure fails production readiness"
         );
         drop(stray);
+    }
+
+    /// Proves a graph a settlement cannot release is retained until shutdown.
+    ///
+    /// Split from the release test only to keep each phase readable; it is the
+    /// second half of the same scenario. A live stray attempt is the only owner
+    /// that can block a release, so shutdown, which cancels every attempt
+    /// before it sweeps graphs, is what finally returns the envelope.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a failed cleanup releases a graph or is reported as clean,
+    /// when a lease resolved before settlement admits an attempt after it, or
+    /// when shutdown leaves the graph retained once its stray is cancelled.
+    async fn follower_retains_a_graph_it_cannot_release() {
+        // A graph with a stage its settlement never joins cannot be released.
+        // The follower must report that as a failure and keep everything it
+        // owns.
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let attempt = fixture
+            .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
+            .await
+            .expect("the reserving leader activates the graph");
+        let stray = fixture
+            .supervisor
+            .spawn_attempt(stray_attempt_key(fixture.graph))
+            .expect("an active graph admits one more stage");
+        // A request that resolved the lease before settlement began, as an
+        // in-flight SetPlan does, still holds it once the graph is draining.
+        let in_flight = fixture
+            .ingress
+            .published(fixture.graph)
+            .expect("the live graph is published");
+        fixture
+            .ingress
+            .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
+            .await
+            .expect_err("a graph with a live stray attempt cannot be settled");
+        assert!(
+            matches!(
+                in_flight.admit_attempt(stray_attempt_key(fixture.graph)),
+                Err(BifrostError::QueryExecutionFailed)
+            ),
+            "a lease whose graph began settling admits no attempt"
+        );
+        assert_eq!(
+            in_flight.live_attempts().expect("attempts are readable"),
+            0,
+            "the refused admission left no attempt behind"
+        );
+        drop(in_flight);
+        let retained = fixture.ingress.live().expect("ownership is readable");
+        assert_eq!(retained.graphs, 1, "the unreleased graph is still owned");
+        assert_eq!(
+            retained.cleanup_failures, 1,
+            "the follower recorded exactly why the graph could not be released"
+        );
+        assert!(
+            !retained.is_clean(),
+            "a retained cleanup failure fails follower readiness"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("graphs are readable"),
+            1,
+            "a failed settlement released no supervisor guard"
+        );
+
+        // Shutdown closes admission first, then reports what stayed retained.
+        let refused = fixture
+            .send(&fixture.leader_message(StageOperationV1::ExecuteTask), now)
+            .await;
+        let inspection = fixture
+            .ingress
+            .shutdown()
+            .await
+            .expect("the follower shuts down without a poisoned lock");
+        assert!(
+            matches!(refused, Err(BifrostError::QueryExecutionFailed)),
+            "a draining graph admits nothing new"
+        );
+        assert_eq!(
+            (inspection.attempts_settled, inspection.graphs_retained),
+            (1, 0),
+            "shutdown cancels the stray attempt, and with nothing left holding the graph it returns the envelope"
+        );
+        drop(stray);
+        assert!(
+            matches!(
+                fixture
+                    .send(&fixture.leader_message(StageOperationV1::SetPlan), now)
+                    .await,
+                Err(BifrostError::QueryAdmissionRejected)
+            ),
+            "a shut-down follower admits no further stage work"
+        );
     }
 
     /// A failed activation publishes nothing and hands the reservation back.
@@ -5406,96 +5439,6 @@ mod tests {
             0,
             "every admission this query held returns exactly once"
         );
-    }
-
-    /// A dropped owner releases its graph without waiting on a live child.
-    ///
-    /// Dropping the owner revokes every follower at once and returns the graph,
-    /// its envelope, and the query's admission permit immediately. A nested
-    /// child that is still alive keeps only the memory view, and returns its
-    /// bytes through the shared root when it drops; it never holds the graph
-    /// as residue or fails readiness.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the drop leaves a follower grant open, retains the graph or
-    /// its admission, or leaves the node advertising no readiness.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_dropped_owner_releases_its_graph_without_waiting_on_children() {
-        let fixture = GraphFixture::new(Utc::now());
-        let oracle = fixture_oracle_role();
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
-        let leased = lease_over_lossy_peers_until(&fixture, &oracle, 2, deadline);
-        let (admitted, mut ownership, transport) = *leased;
-        ownership
-            .publish_participants()
-            .await
-            .expect("every addressed follower accepted its reservation");
-        let graph = ownership.key().graph();
-        assert!(
-            ownership.retain_admission(admitted).is_ok(),
-            "the live graph takes this query's admission permit"
-        );
-        let runtime = fixture
-            .supervisor
-            .graph_runtime(graph)
-            .expect("the leased graph installed a query-owned runtime");
-        let stray = datafusion::execution::memory_pool::MemoryConsumer::new("stray-child")
-            .register(&runtime.runtime().memory_pool);
-        stray
-            .try_grow(4_096)
-            .expect("the admitted envelope funds one nested child");
-
-        drop(ownership);
-        assert_eq!(
-            transport.releases().len(),
-            2,
-            "every follower grant is closed before the drop returns"
-        );
-        await_until(|| fixture.supervisor.live_graphs().is_ok_and(|live| live == 0)).await;
-        assert_eq!(
-            (
-                fixture
-                    .supervisor
-                    .live_graphs()
-                    .expect("the supervisor reports live graphs"),
-                fixture
-                    .supervisor
-                    .draining_graphs()
-                    .expect("the supervisor reports retained cleanup"),
-            ),
-            (0, 0),
-            "a live child does not keep the dropped graph registered"
-        );
-        assert!(
-            !fixture.supervisor.retains_admission_for_test(graph),
-            "the dropped graph returns the query's admission permit"
-        );
-        assert!(
-            fixture.execution_handle().is_healthy(),
-            "a released graph leaves the node ready"
-        );
-        drop(stray);
-        drop(runtime);
-    }
-
-    /// Polls `ready` until it holds, bounded so a regression fails rather than hangs.
-    ///
-    /// The one step a dropped owner leaves behind — returning its envelope —
-    /// runs after the drop on the current runtime, so it is observed by its
-    /// effect rather than by a fixed sleep.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `ready` does not hold within ten seconds.
-    async fn await_until(ready: impl Fn() -> bool) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !ready() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the awaited ownership state is reached in time");
     }
 
     /// Every peer call this graph makes ends by the envelope's own deadline.

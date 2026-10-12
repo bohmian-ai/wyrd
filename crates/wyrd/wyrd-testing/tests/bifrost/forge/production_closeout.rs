@@ -1304,8 +1304,9 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .restart_node(journey.coordinator_node)
         .await
         .expect("coordinator starts after complete ingestion");
-    // The new leader promotes all owed debt inside its boot pass, so the
-    // promoted cut is read before any driven pass can rewrite it.
+    // The new leader promotes all owed debt inside its boot pass. A promotion
+    // that makes a table due is dispatched at once, so the promoted cut is read
+    // before the rewrites it starts are drained below.
     journey.await_boot_pass().await;
     let (promoted_snapshot, inputs) = journey.live_files(&table.binding).await;
     assert_eq!(
@@ -1315,6 +1316,9 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     );
     let (neighbour_promoted, _) = journey.live_files(&neighbour_table.binding).await;
     let published_before = journey.snapshot_count(&table.binding).await;
+    // A rewrite's publication deadline is an instant on the Forge clock, so the
+    // clock moves only once no rewrite started before the jump is in flight.
+    journey.drain_tasks().await;
     for server in journey.cluster.servers().iter() {
         server
             .forge_clock()
@@ -1471,10 +1475,13 @@ impl ReaderCleanupJourney {
             .await
             .expect("coordinator starts");
         // The boot pass promotes the owed debt, so the promoted inputs are
-        // read before any driven pass can rewrite them.
+        // read before the rewrites it dispatches are drained; the Forge clock
+        // moves only once none is in flight, since a rewrite's publication
+        // deadline is an instant on that clock.
         roles.await_boot_pass().await;
         let (_, earlier_files) = roles.live_files(&table.binding).await;
         assert!(earlier_files.len() >= 2, "two real promoted inputs");
+        roles.drain_tasks().await;
         roles.advance_maintenance(chrono::Duration::hours(2));
         let earlier_object = earlier_files.keys().next().expect("earlier object").clone();
         let (old_snapshot, old_files) = roles.compact_small_table(&table.binding).await;

@@ -753,6 +753,9 @@ mod pg_tests {
             "a direct run never dispatches: {run}"
         );
         let result_id = text(&run, "/result_id")?.to_owned();
+        // The judgment is staged on the Scribe outbox when the run completes;
+        // settle it into Bifrost before reading it back.
+        server.flush_bifrost().await?;
 
         let summary = rows(
             &agent_client,

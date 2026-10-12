@@ -2051,16 +2051,32 @@ impl WalWriter {
         Ok(writer)
     }
 
+    /// The one directory holding this `(node_id, writer_epoch)` stream's
+    /// shard segments; every segment this writer creates lives beneath it.
+    fn stream_dir(&self) -> PathBuf {
+        self.base_dir
+            .join(Uuid::from_bytes(self.node_id).simple().to_string())
+            .join(self.writer_epoch.to_string())
+    }
+
     /// Recover the next segment and LSN counters for the current stream.
     ///
     /// A restarted writer must never recreate an existing decimal segment
     /// filename or reuse an LSN in the same `(node_id, writer_epoch)` stream.
-    /// Older epochs remain replayable but are deliberately excluded from the
-    /// live writer counters.
+    /// Only that stream's own directory is read: older epochs remain
+    /// replayable but are excluded from the live writer counters, so their
+    /// integrity is judged by replay, whose failure is role-local, and never
+    /// by writer construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the stream directory cannot be listed or
+    /// one of its segments cannot be opened or read.
     fn initialize_existing_stream(&self) -> Result<(), ScribeError> {
         let mut paths = Vec::new();
-        if self.base_dir.exists() {
-            collect_segment_paths(&self.base_dir, &mut paths)?;
+        let stream_dir = self.stream_dir();
+        if stream_dir.exists() {
+            collect_segment_paths(&stream_dir, &mut paths)?;
         }
         let mut next_lsn = 0_u64;
         for path in paths {
@@ -2752,11 +2768,7 @@ impl WalWriter {
 
         let seq = state.seg_seq;
         state.seg_seq = state.seg_seq.saturating_add(1);
-        let stream_dir = self
-            .base_dir
-            .join(Uuid::from_bytes(self.node_id).simple().to_string())
-            .join(self.writer_epoch.to_string());
-        let shard_dir = stream_dir.join(format!("shard-{shard_id:02}"));
+        let shard_dir = self.stream_dir().join(format!("shard-{shard_id:02}"));
         std::fs::create_dir_all(&shard_dir).map_err(|error| ScribeError::Internal {
             detail: format!("failed to create WAL shard directory: {error}"),
         })?;

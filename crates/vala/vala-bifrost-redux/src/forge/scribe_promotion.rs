@@ -1001,12 +1001,10 @@ impl Forge {
             "scribe_promotion",
             Some((task_id, attempt_id)),
         );
-        if !lease.renew(&self.core.operator_pool).await?
+        if !lease.renew().await?
             || !lease.commit_window_fits(self.core.config.commit_window())
         {
-            return Err(ForgeError::FenceLost {
-                lease_key: lease.lease_key.clone(),
-            });
+            return Err(lease.fence_lost());
         }
         let transaction = iceberg::transaction::Transaction::new(table);
         let action = transaction
@@ -1020,11 +1018,9 @@ impl Forge {
             ]));
         let transaction = iceberg::transaction::ApplyTransactionAction::apply(action, transaction)
             .map_err(ForgeError::Catalog)?;
-        lease.require_fence(&self.core.operator_pool).await?;
+        lease.require_fence().await?;
         if !lease.commit_window_fits(self.core.config.commit_window()) {
-            return Err(ForgeError::FenceLost {
-                lease_key: lease.lease_key.clone(),
-            });
+            return Err(lease.fence_lost());
         }
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
@@ -1152,10 +1148,8 @@ impl Forge {
             base_snapshot_id,
             committed_snapshot_id,
         } = settlement;
-        if !lease.renew(&self.core.operator_pool).await? {
-            return Err(ForgeError::FenceLost {
-                lease_key: lease.lease_key.clone(),
-            });
+        if !lease.renew().await? {
+            return Err(lease.fence_lost());
         }
         let resource = ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref);
         let detail = AuditDetail::ForgeScribePromotion {
@@ -1179,7 +1173,7 @@ impl Forge {
             .tenant_conn(binding.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        lease.require_fence(&self.core.operator_pool).await?;
+        lease.require_fence().await?;
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::ScribePromotion)
             .map_err(ForgeError::Sql)?;
         let transition = if phase == ForgeScribePromotionPhase::Prepared {

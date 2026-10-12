@@ -305,7 +305,7 @@ mod pg_tests {
             .expect("expire attempt");
         assert_eq!(
             tasks
-                .reclaim_expired_attempts(1, None)
+                .reclaim_expired_attempts(1)
                 .await
                 .expect("bounded reclaim"),
             vec![(capacity_id, reclaimed_attempt)]
@@ -320,54 +320,6 @@ mod pg_tests {
         assert_eq!(reclaimed.0, "retryable");
         assert_eq!(reclaimed.1, 1);
         assert!(reclaimed.2);
-    }
-
-    /// A starting worker reclaims its previous incarnation's unexpired claim.
-    ///
-    /// Steady-state reclaim and another owner's identity leave the live lease
-    /// alone; only the holder's own identity takes it, so a supervised restart
-    /// does not stay unready until its own lease lapses.
-    #[tokio::test]
-    async fn previous_owner_reclaims_its_unexpired_attempt() {
-        let (fixture, _admin) = setup().await;
-        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
-        let owner = Uuid::now_v7();
-        let task_id = tasks
-            .enqueue(&task(fixture.data_tenant_id(), "owned-restart", 205))
-            .await
-            .expect("enqueue owned task");
-        let attempt = tasks
-            .claim_fair(owner, limits(1), None)
-            .await
-            .expect("owned claim")
-            .expect("owned task")
-            .attempt_id
-            .expect("owned attempt");
-
-        assert!(
-            tasks
-                .reclaim_expired_attempts(1, None)
-                .await
-                .expect("steady-state reclaim")
-                .is_empty(),
-            "steady-state reclaim leaves an unexpired lease"
-        );
-        assert!(
-            tasks
-                .reclaim_expired_attempts(1, Some(Uuid::now_v7()))
-                .await
-                .expect("foreign-owner reclaim")
-                .is_empty(),
-            "another owner cannot take an unexpired lease"
-        );
-        assert_eq!(
-            tasks
-                .reclaim_expired_attempts(1, Some(owner))
-                .await
-                .expect("previous-owner reclaim"),
-            vec![(task_id, attempt)],
-            "the holder's own identity reclaims its unexpired attempt"
-        );
     }
 
     /// Proves worker admission is independent of scheduler leadership and only
@@ -499,7 +451,7 @@ mod pg_tests {
         .await
         .expect("committed cancellation state");
         assert_eq!(terminal, ("cancelled".to_owned(), None, None));
-        assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 0);
+        assert_eq!(tasks.reclaim_expired_attempts(10).await.expect("reclaim").len(), 0);
     }
 
     /// Claims and starts one task with a caller-selected watermark.
@@ -643,7 +595,7 @@ mod pg_tests {
                 .is_err(),
             "expired claim cannot be revived by heartbeat"
         );
-        assert_eq!(tasks.reclaim_expired(10).await.expect("reclaim"), 1);
+        assert_eq!(tasks.reclaim_expired_attempts(10).await.expect("reclaim").len(), 1);
         let successor = Uuid::now_v7();
         let second = tasks
             .claim_fair(successor, claim_limits, None)
@@ -971,8 +923,8 @@ mod pg_tests {
         let successor_a = Uuid::now_v7();
         let successor_b = Uuid::now_v7();
         let (takeover_a, takeover_b) = tokio::join!(
-            tasks.claim_prepared_for_reconciliation(successor_a, 30, None),
-            tasks.claim_prepared_for_reconciliation(successor_b, 30, None),
+            tasks.claim_prepared_for_reconciliation(successor_a, 30),
+            tasks.claim_prepared_for_reconciliation(successor_b, 30),
         );
         let taken = [
             takeover_a.expect("takeover A"),
@@ -1059,7 +1011,7 @@ mod pg_tests {
 
         let successor = Uuid::now_v7();
         let taken = tasks
-            .claim_prepared_for_reconciliation(successor, 30, None)
+            .claim_prepared_for_reconciliation(successor, 30)
             .await
             .expect("takeover")
             .expect("large Prepared task recovered");
@@ -1686,17 +1638,12 @@ mod pg_tests {
         }
     }
 
-    /// Seeds the registered table, its maintenance-authority row, and one live
-    /// lease so fenced cleanup transitions have every durable root they check.
+    /// Seeds the registered table and its maintenance-authority row so fenced
+    /// cleanup transitions have every durable root they check.
     ///
     /// # Panics
     /// Panics when any seeding statement fails.
-    async fn seed_cleanup_roots(
-        superuser: &PgPool,
-        tenant: DataTenantId,
-        authority: &ForgeExpirationAuthority,
-        table: &ForgeClaimTable,
-    ) {
+    async fn seed_cleanup_roots(superuser: &PgPool, tenant: DataTenantId, table: &ForgeClaimTable) {
         sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout) VALUES ($1,$2,'vala.bifrost.cleanup',decode(repeat('00',32),'hex'),'{}'::jsonb)")
             .bind(tenant.as_uuid())
             .bind(table.table_uid.as_slice())
@@ -1712,13 +1659,6 @@ mod pg_tests {
             .execute(superuser)
             .await
             .expect("seed maintenance authority");
-        sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
-            .bind(&authority.lease_key)
-            .bind(authority.worker_id)
-            .bind(authority.lease_fencing_token)
-            .execute(superuser)
-            .await
-            .expect("seed lease");
     }
 
     /// Inserts one old succeeded snapshot-expiration source carrying candidates.
@@ -2036,10 +1976,8 @@ mod pg_tests {
             task_id: cleanup_id,
             attempt_id: Uuid::now_v7(),
             worker_id: Uuid::now_v7(),
-            lease_key: "forge:table:cleanup".to_owned(),
-            lease_fencing_token: 7,
         };
-        seed_cleanup_roots(&admin, tenant, &authority, &table).await;
+        seed_cleanup_roots(&admin, tenant, &table).await;
         sqlx::query("UPDATE vala.forge_tasks SET state='running',attempt_id=$2,claimed_by=$3,claim_expires_at=now()+interval '10 minutes',watermark_snapshot_id=4242,watermark_timestamp_ms=1 WHERE task_id=$1")
             .bind(cleanup_id)
             .bind(authority.attempt_id)
@@ -2513,7 +2451,6 @@ mod pg_tests {
             .await
             .expect("orphan cleanup enqueue");
         let owner = Uuid::now_v7();
-        let fence = 1_i64;
         let table = ForgeClaimTable {
             table_uid: [7_u8; 16],
             catalog_name: "wyrd-redux".to_owned(),
@@ -2570,16 +2507,7 @@ mod pg_tests {
             task_id: id,
             attempt_id: attempt,
             worker_id: owner,
-            lease_key: format!("forge:table:{tenant}:vala.bifrost.orphan"),
-            lease_fencing_token: fence,
         };
-        sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
-            .bind(&authority.lease_key)
-            .bind(authority.worker_id)
-            .bind(authority.lease_fencing_token)
-            .execute(&admin)
-            .await
-            .expect("seed lease");
 
         // The cursor records traversal only, and only inside this task's own
         // prefix. A sibling table's key, a traversal segment, and the prefix
@@ -2644,13 +2572,6 @@ mod pg_tests {
                 },
                 "a foreign owner never held this claim",
             ),
-            (
-                ForgeExpirationAuthority {
-                    lease_fencing_token: fence + 1,
-                    ..authority.clone()
-                },
-                "a stale fence has lost table authority",
-            ),
         ] {
             assert!(
                 tasks
@@ -2680,6 +2601,28 @@ mod pg_tests {
                 .is_err(),
             "a cross-table checkpoint cannot reach this task"
         );
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
+            .bind(id)
+            .execute(&admin)
+            .await
+            .expect("lapse orphan claim");
+        assert!(
+            tasks
+                .checkpoint_orphan_cleanup_cursor(
+                    tenant,
+                    &authority,
+                    &table,
+                    &format!("{prefix}/zzz/object.parquet")
+                )
+                .await
+                .is_err(),
+            "a lapsed claim has lost table authority"
+        );
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()+interval '10 minutes' WHERE task_id=$1")
+            .bind(id)
+            .execute(&admin)
+            .await
+            .expect("restore orphan claim");
         assert_eq!(
             raw_evidence(&admin, id).await.expect("cursor evidence"),
             serde_json::json!({"version": 1, "start_after": first_key}),

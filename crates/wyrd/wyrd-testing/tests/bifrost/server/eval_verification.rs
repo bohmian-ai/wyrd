@@ -1262,8 +1262,9 @@ async fn enqueue_attempts(superuser: &sqlx::PgPool, count: i64) -> Result<i64, S
 /// PostgreSQL accepts the writes every acknowledged record has exactly one run
 /// per binding, a same-batch-ID replay adding none.
 ///
-/// A trigger refuses every observation run insert after counting the attempt
-/// in a sequence, so refused writes, and the retries that follow, are observed
+/// A superuser-owned `SECURITY DEFINER` trigger refuses every observation run
+/// insert after counting the attempt in a sequence the application role cannot
+/// use directly, so refused writes, and the retries that follow, are observed
 /// before the trigger is dropped.
 ///
 /// # Errors
@@ -1300,7 +1301,8 @@ async fn integrated_enqueue_outage_preserves_ack_and_recovers() -> Result<(), Se
         .execute(&superuser)
         .await?;
     sqlx::query(
-        "CREATE FUNCTION wyrd.eval_journey_refuse() RETURNS trigger LANGUAGE plpgsql AS \
+        "CREATE FUNCTION wyrd.eval_journey_refuse() RETURNS trigger LANGUAGE plpgsql \
+         SECURITY DEFINER SET search_path = pg_catalog AS \
          $$BEGIN PERFORM nextval('wyrd.eval_journey_attempts'); \
          RAISE EXCEPTION 'eval journey refuses this enqueue'; END$$",
     )
@@ -2523,7 +2525,7 @@ async fn eval_runs_follow_the_writing_owner() -> Result<(), ServerJourneyError> 
 /// The row carries `result_id = execution_id`, the task verdict, the exact
 /// Verifier version and subject, null binding facts and window, the Run as
 /// both `run_id` and `source_record_id`, the execution interval, and the
-/// canonical `AssertionResult` as `details`.
+/// canonical `AssertionResult` as the `assertion_result` Variant.
 ///
 /// # Errors
 /// Returns server, registration, query, or fixture errors, or a description of
@@ -2587,13 +2589,21 @@ async fn direct_task_judgment_records_one_correlated_result() -> Result<(), Serv
             return Err(format!("{column}: expected [{expected:?}], read {read:?}").into());
         }
     }
-    let details = cell("details", "vala.verification.results").await?;
-    let [Some(details)] = details.as_slice() else {
-        return Err(format!("expected one details payload, read {details:?}").into());
-    };
-    let details: Value = serde_json::from_str(details)?;
-    if details["task_id"] != "x_is_one" || details["passed"] != false || details["actual"] != 2 {
-        return Err(format!("details are not the AssertionResult: {details}").into());
+    for (field, expected) in [
+        ("task_id", "x_is_one"),
+        ("passed", "false"),
+        ("actual", "2"),
+    ] {
+        let read = cell(
+            &format!("assertion_result ->> '{field}'"),
+            "vala.verification.results",
+        )
+        .await?;
+        if read != [Some(expected.to_owned())] {
+            return Err(
+                format!("assertion_result.{field}: expected {expected}, read {read:?}").into(),
+            );
+        }
     }
     let intervals = cell(
         "CAST(started_at <= ended_at AS VARCHAR)",

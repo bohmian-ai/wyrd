@@ -58,10 +58,8 @@ impl Forge {
         operation: &str,
         detail: AuditDetail,
     ) -> Result<(), ForgeError> {
-        if !lease.renew(&self.core.operator_pool).await? {
-            return Err(ForgeError::FenceLost {
-                lease_key: lease.lease_key.clone(),
-            });
+        if !lease.renew().await? {
+            return Err(lease.fence_lost());
         }
         let mut conn = self
             .core
@@ -69,7 +67,7 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        lease.require_fence(&self.core.operator_pool).await?;
+        lease.require_fence().await?;
         #[cfg(feature = "test-support")]
         if operation == "forge.iceberg_rewrite.prepared"
             && FAIL_NEXT_PREPARED_LIVE_TRANSITION.swap(false, Ordering::AcqRel)

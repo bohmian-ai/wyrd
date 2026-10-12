@@ -1488,7 +1488,8 @@ mod tests {
     }
 
     /// The approved contract for `verification.results`, whose typed
-    /// summaries are nullable Structs written exclusively per implementation.
+    /// summaries are nullable Structs written exclusively per implementation,
+    /// and whose task result is one nullable `AssertionResult` Variant.
     fn verification_results_contract() -> VerificationContract {
         VerificationContract {
             namespace: "verification",
@@ -1534,6 +1535,7 @@ mod tests {
                     ),
                     true,
                 ),
+                variant_field("assertion_result", true),
             ],
             blooms: &["result_id", "subject_card_uid", "binding_id"],
         }

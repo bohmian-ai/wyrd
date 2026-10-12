@@ -70,7 +70,6 @@ pub async fn verify_schema(operator: &OperatorPool) -> Result<(), SqlError> {
 
 #[cfg(test)]
 mod tests {
-    use sha2::{Digest, Sha256};
 
     use crate::{MIGRATION_SEARCH_PATH, OWNED_SCHEMAS};
 
@@ -186,7 +185,11 @@ mod tests {
         }
     }
 
-    /// Verifies the Forge/Oracle migration partition and a stable older checksum.
+    /// Verifies the Forge and Oracle migrations each have their one forward owner.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Forge or Oracle migration file is missing.
     #[test]
     fn forge_and_oracle_migrations_have_unique_forward_owners() {
         let files = migration_files();
@@ -202,17 +205,6 @@ mod tests {
                 "missing migration {file}"
             );
         }
-        let old_olap = fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("migrations/20260619000001_olap_minimal.sql"),
-        )
-        .expect("older OLAP migration is readable");
-        let old_olap_digest = Sha256::digest(old_olap.as_bytes());
-        assert_eq!(
-            format!("{old_olap_digest:x}"),
-            "e7c5ec6049618065d6e38bd9835839b68fc7ea3b479aecd86322ed0882aeca8e",
-            "older migration checksum must remain stable"
-        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt as _;
 use tracing::Instrument as _;
 
 use wyrd_spec::verification::VerifierKind;
@@ -113,11 +114,18 @@ pub struct WaitSink {
 
 impl WaitSink {
     /// Await `future` as one wait.
-    pub async fn wait<F: Future>(&self, future: F) -> F::Output {
+    ///
+    /// The wait starts when this is called and is recorded when `future`
+    /// completes; a future dropped before completion records nothing. This
+    /// is a combinator rather than an `async fn` so `future` is held once:
+    /// an `async fn` keeps its future argument and the awaited value as two
+    /// copies, and every engine wraps a whole Bifrost query in waits.
+    pub fn wait<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
         let start = Instant::now();
-        let output = future.await;
-        self.record(start, Instant::now());
-        output
+        future.map(move |output| {
+            self.record(start, Instant::now());
+            output
+        })
     }
 
     /// Record one `[start, end)` wait measured by the caller.
@@ -208,20 +216,24 @@ impl ExecutionTelemetry {
     }
 
     /// Await `future` as one interval of `phase`.
-    pub async fn phase<F: Future>(&self, phase: Phase, future: F) -> F::Output {
+    ///
+    /// The interval starts when this is called and is recorded when `future`
+    /// completes; a future dropped before completion records nothing. Like
+    /// [`WaitSink::wait`], it is a combinator so `future` is held once.
+    pub fn phase<F: Future>(&self, phase: Phase, future: F) -> impl Future<Output = F::Output> {
         let start = Instant::now();
-        let output = future.await;
-        self.record_phase(phase, start, Instant::now());
-        output
+        future.map(move |output| {
+            self.record_phase(phase, start, Instant::now());
+            output
+        })
     }
 
     /// Await `future` as one `prepare` interval inside a `verification.prepare` span.
-    pub async fn prepare<F: Future>(&self, future: F) -> F::Output {
+    pub fn prepare<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
         self.phase(
             Phase::Prepare,
             future.instrument(tracing::info_span!("verification.prepare")),
         )
-        .await
     }
 
     /// Record one `[start, end)` interval of `phase`.
@@ -234,8 +246,8 @@ impl ExecutionTelemetry {
     }
 
     /// Await `future` as one dependency, evidence, or provider wait.
-    pub async fn wait<F: Future>(&self, future: F) -> F::Output {
-        self.waits.wait(future).await
+    pub fn wait<F: Future>(&self, future: F) -> impl Future<Output = F::Output> {
+        self.waits.wait(future)
     }
 
     /// The shareable sink recording this execution's waits.

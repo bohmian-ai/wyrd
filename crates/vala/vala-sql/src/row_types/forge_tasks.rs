@@ -1194,12 +1194,14 @@ pub enum ForgeTaskStrategy {
     ExpiredCleanup,
     /// Delete never-published outputs.
     OrphanCleanup,
+    /// Merge fragmented data manifests without changing table data.
+    ManifestRewrite,
 }
 
 /// The maintenance-family strategies a reserved worker slot claims first.
 ///
-/// These lifecycle and garbage-collection strategies reclaim durable storage
-/// but produce no compaction throughput, so they are exactly the strategies a
+/// These metadata, lifecycle, and garbage-collection strategies keep a table
+/// bounded but produce no compaction throughput, so they are exactly the strategies a
 /// sustained compaction backlog would otherwise starve. Compaction and rewrite
 /// strategies are deliberately excluded. Passed to
 /// [`super::super::queries::forge_tasks::ForgeTasks::claim_fair`] as the
@@ -1208,21 +1210,25 @@ pub const MAINTENANCE_STRATEGIES: &[ForgeTaskStrategy] = &[
     ForgeTaskStrategy::SnapshotExpiry,
     ForgeTaskStrategy::ExpiredCleanup,
     ForgeTaskStrategy::OrphanCleanup,
+    ForgeTaskStrategy::ManifestRewrite,
 ];
 
 impl ForgeTaskStrategy {
     /// Returns whether this strategy is maintenance-family lifecycle work.
     ///
-    /// Maintenance-family strategies reclaim durable storage (snapshot expiry
-    /// and orphan or expired cleanup) rather than producing compaction
-    /// throughput. The reserved worker slot uses this classification so a ready
+    /// Maintenance-family strategies keep table metadata and durable storage
+    /// bounded (manifest rewrite, snapshot expiry, and orphan or expired
+    /// cleanup) rather than producing compaction throughput. The reserved worker slot uses this classification so a ready
     /// maintenance task stays claimable regardless of compaction backlog. The
     /// set is kept in sync with [`MAINTENANCE_STRATEGIES`].
     #[must_use]
     pub fn is_maintenance(self) -> bool {
         matches!(
             self,
-            Self::SnapshotExpiry | Self::ExpiredCleanup | Self::OrphanCleanup
+            Self::SnapshotExpiry
+                | Self::ExpiredCleanup
+                | Self::OrphanCleanup
+                | Self::ManifestRewrite
         )
     }
 
@@ -1235,6 +1241,7 @@ impl ForgeTaskStrategy {
             Self::SnapshotExpiry => "snapshot_expiry",
             Self::ExpiredCleanup => "expired_cleanup",
             Self::OrphanCleanup => "orphan_cleanup",
+            Self::ManifestRewrite => "manifest_rewrite",
         }
     }
 }
@@ -1250,6 +1257,7 @@ impl FromStr for ForgeTaskStrategy {
             "snapshot_expiry" => Ok(Self::SnapshotExpiry),
             "expired_cleanup" => Ok(Self::ExpiredCleanup),
             "orphan_cleanup" => Ok(Self::OrphanCleanup),
+            "manifest_rewrite" => Ok(Self::ManifestRewrite),
             _ => Err(SqlError::InvariantViolation {
                 detail: format!("unknown Forge task strategy {value}"),
             }),
@@ -1595,11 +1603,11 @@ impl ExpiredCleanupOutcome {
 /// The exact identity one per-candidate cleanup transition is applied under.
 ///
 /// Every field is revalidated inside the workflow's own short operator
-/// transaction: a stale owner, a lost table fence, a different attempt, or a
+/// transaction: a stale owner, a lapsed claim, a different attempt, or a
 /// cursor that has already moved all refuse rather than mutate.
 #[derive(Debug, Clone, Copy)]
 pub struct ExpiredCleanupCandidateRequest<'request> {
-    /// Fenced task, attempt, current owner, and live table lease.
+    /// Fenced task, attempt, and current owner of the live claim.
     pub authority: &'request ForgeExpirationAuthority,
     /// Registered table whose maintenance-authority row is taken FOR UPDATE.
     pub table: &'request ForgeClaimTable,

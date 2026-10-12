@@ -152,11 +152,6 @@ impl VerifierEngines {
     /// records its input-read, preparation, and wait intervals on
     /// `telemetry`. Every failure is carried in the returned
     /// [`EngineOutcome`], not raised.
-    ///
-    /// Each arm's future is boxed. The arms embed the Bifrost query stream
-    /// futures, and every wrapper above this call (phase timing, timeout,
-    /// lease select, claim task) holds its child inline, so an unboxed arm
-    /// multiplies into a claim task that overflows a worker thread's stack.
     async fn execute(
         &self,
         tenant: DataTenantId,
@@ -164,14 +159,12 @@ impl VerifierEngines {
         implementation: &VerifierImplementation,
         telemetry: &ExecutionTelemetry,
     ) -> EngineOutcome {
-        // Boxed: each engine's query chain is large, and inlining it into
-        // every runner frame overflows a worker stack in unoptimized builds.
         match implementation {
             VerifierImplementation::Drift(spec) => {
-                Box::pin(self.drift.verify(tenant, run, spec, telemetry)).await
+                self.drift.verify(tenant, run, spec, telemetry).await
             }
             VerifierImplementation::Eval(spec) => {
-                Box::pin(self.eval.execute(tenant, run, spec, telemetry)).await
+                self.eval.execute(tenant, run, spec, telemetry).await
             }
             // A task Verifier is invoked directly, never through a queued run.
             VerifierImplementation::Task(_) => EngineOutcome::implementation_unavailable("task"),

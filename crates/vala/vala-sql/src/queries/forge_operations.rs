@@ -847,12 +847,12 @@ fn extract_detail_phase(detail: &AuditDetail) -> Result<ForgeOperationPhase, Sql
 
 /// Lock order every snapshot-expiration transaction below takes, in order:
 ///
-/// 1. the current live Forge table lease row (fence assertion),
-/// 2. the exact task/attempt/current-owner row,
-/// 3. the table maintenance-authority row that serializes Forge's destructive
+/// 1. the exact task/attempt/current-owner row with its unexpired claim, the
+///    table's one exclusive Forge authority (the fence),
+/// 2. the table maintenance-authority row that serializes Forge's destructive
 ///    protocols on one tenant-qualified table,
-/// 4. the operation state row (advisory lock, then `FOR UPDATE`),
-/// 5. the claim rows for that operation.
+/// 3. the operation state row (advisory lock, then `FOR UPDATE`),
+/// 4. the claim rows for that operation.
 ///
 /// Every method here runs on the operator pool because claims are operator
 /// work across tenants; the transaction binds
@@ -868,8 +868,8 @@ impl ForgeOperations<'_> {
     /// would wait on the caller's own lock — and only verifies the capability
     /// covers the request's exact tenant and table.
     ///
-    /// In one operator transaction this asserts the caller's live lease fence,
-    /// pins the exact running attempt, inserts the Prepared operation state,
+    /// In one operator transaction this pins the exact running attempt and its
+    /// live claim (the fence), inserts the Prepared operation state,
     /// claims every selected snapshot, and moves the task to Prepared with its
     /// evidence.
     ///
@@ -881,8 +881,7 @@ impl ForgeOperations<'_> {
     ///
     /// Returns [`SqlError::Conflict`] when the family is not
     /// `snapshot_expire`, the transition does not name this operation, the
-    /// lease fence is lost, the task/attempt/owner/table identity does not
-    /// match, `exclusive` does not cover the request's table, a Scribe
+    /// task/attempt/owner/live-claim/table identity does not match, `exclusive` does not cover the request's table, a Scribe
     /// promotion on the table is unsettled, or the operation is already
     /// resolved.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
@@ -914,7 +913,6 @@ impl ForgeOperations<'_> {
 
         let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
-        assert_lease_fence(&mut tx, request.authority).await?;
         lock_expiration_task(
             &mut tx,
             request.authority,
@@ -974,17 +972,10 @@ impl ForgeOperations<'_> {
     /// moves the task to Succeeded with its final cleanup evidence, and
     /// advances the table's planning demand — all in one transaction.
     ///
-    /// `exclusive` is the caller's live table authority when it still holds
-    /// the row from the commit it settles; this transaction then only verifies
-    /// coverage, because locking the row would wait on the caller's own lock.
-    /// Settling before that authority is surrendered means no Oracle cut ever
-    /// observes the claims of an expiration whose outcome is known. `None`
-    /// takes the row here.
-    ///
     /// # Errors
     ///
     /// Returns [`SqlError::Conflict`] when the family, transition identity,
-    /// lease fence, task identity, table identity, operation phase, or the
+    /// live claim, task identity, table identity, operation phase, or the
     /// claim set does not exactly match the prepared selection.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
     /// Returns [`SqlError::Query`] for statement failures.
@@ -997,7 +988,6 @@ impl ForgeOperations<'_> {
         &self,
         operator: &OperatorPool,
         tenant: DataTenantId,
-        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         request: &ForgeExpirationSettlementRequest<'_>,
     ) -> Result<ForgeOperationTransition, SqlError> {
         self.require_snapshot_expire()?;
@@ -1013,9 +1003,8 @@ impl ForgeOperations<'_> {
 
         let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
-        assert_lease_fence(&mut tx, request.authority).await?;
         let task_state = task_state(&mut tx, request.authority.task_id).await?;
-        hold_table_authority(&mut tx, tenant, exclusive, request.table).await?;
+        lock_table_authority(&mut tx, tenant, request.table).await?;
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         let state_row: ForgeOperationStateRow = self
             .select_state_for_update(&mut tx, operation_id)
@@ -1070,14 +1059,10 @@ impl ForgeOperations<'_> {
     /// advances the table's planning demand so the selection can be recomputed
     /// against fresh table state.
     ///
-    /// `exclusive` follows the same rule as in
-    /// [`Self::settle_snapshot_expiration`]: `Some` when the caller still holds
-    /// the table's authority row, `None` to take it here.
-    ///
     /// # Errors
     ///
     /// Returns [`SqlError::Conflict`] when the family, transition identity,
-    /// lease fence, task identity, table identity, operation phase, or claim
+    /// live claim, task identity, table identity, operation phase, or claim
     /// set does not exactly match the prepared selection.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
     /// Returns [`SqlError::Query`] for statement failures.
@@ -1090,7 +1075,6 @@ impl ForgeOperations<'_> {
         &self,
         operator: &OperatorPool,
         tenant: DataTenantId,
-        exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
         request: &ForgeExpirationResetRequest<'_>,
     ) -> Result<ForgeExpirationResetOutcome, SqlError> {
         self.require_snapshot_expire()?;
@@ -1098,9 +1082,8 @@ impl ForgeOperations<'_> {
 
         let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
-        assert_lease_fence(&mut tx, request.authority).await?;
         let task_state = task_state(&mut tx, request.authority.task_id).await?;
-        hold_table_authority(&mut tx, tenant, exclusive, request.table).await?;
+        lock_table_authority(&mut tx, tenant, request.table).await?;
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         let state_row: ForgeOperationStateRow = self
             .select_state_for_update(&mut tx, operation_id)
@@ -1171,7 +1154,7 @@ impl ForgeOperations<'_> {
         let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
         let rows: Vec<ForgeSnapshotExpirationClaimSqlRow> = sqlx::query_as(
-            "SELECT resource,operation_id,snapshot_id,task_id,attempt_id,worker_id,lease_key,lease_fencing_token,table_uid,catalog_name,namespace_name,table_name,table_uuid FROM vala.forge_snapshot_expiration_claims WHERE data_tenant_id=wyrd.current_tenant() AND task_id=$1 ORDER BY operation_id,snapshot_id",
+            "SELECT resource,operation_id,snapshot_id,task_id,attempt_id,worker_id,table_uid,catalog_name,namespace_name,table_name,table_uuid FROM vala.forge_snapshot_expiration_claims WHERE data_tenant_id=wyrd.current_tenant() AND task_id=$1 ORDER BY operation_id,snapshot_id",
         )
         .bind(task_id)
         .fetch_all(&mut *tx)
@@ -1208,8 +1191,7 @@ impl ForgeOperations<'_> {
     ///
     /// Claim rows are historical evidence written once, at preparation. A
     /// takeover changes *current* execution authority, never that evidence, so
-    /// the historical worker, lease key, and lease fence are required only to
-    /// agree across rows and are deliberately never compared with the caller's
+    /// the historical worker is required only to agree across rows and are deliberately never compared with the caller's
     /// live authority. Everything that identifies *which* operation the rows
     /// belong to — resource, operation, table, originating task and attempt,
     /// and the exact selected snapshot set — must match both the current
@@ -1318,7 +1300,7 @@ impl ForgeOperations<'_> {
         request: &ForgeExpirationPreparation<'_>,
     ) -> Result<(), SqlError> {
         sqlx::query(
-            "INSERT INTO vala.forge_snapshot_expiration_claims (data_tenant_id,resource,family,operation_id,snapshot_id,task_id,attempt_id,worker_id,lease_key,lease_fencing_token,table_uid,catalog_name,namespace_name,table_name,table_uuid) SELECT wyrd.current_tenant(),$1,$2,$3,s,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14 FROM unnest($4::bigint[]) AS s",
+            "INSERT INTO vala.forge_snapshot_expiration_claims (data_tenant_id,resource,family,operation_id,snapshot_id,task_id,attempt_id,worker_id,table_uid,catalog_name,namespace_name,table_name,table_uuid) SELECT wyrd.current_tenant(),$1,$2,$3,s,$5,$6,$7,$8,$9,$10,$11,$12 FROM unnest($4::bigint[]) AS s",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -1327,8 +1309,6 @@ impl ForgeOperations<'_> {
         .bind(request.authority.task_id)
         .bind(request.authority.attempt_id)
         .bind(request.authority.worker_id)
-        .bind(&request.authority.lease_key)
-        .bind(request.authority.lease_fencing_token)
         .bind(request.table.table_uid.as_slice())
         .bind(&request.table.catalog_name)
         .bind(&request.table.namespace_name)
@@ -1359,7 +1339,7 @@ impl ForgeOperations<'_> {
         operation_id: Uuid,
     ) -> Result<Vec<ForgeSnapshotExpirationClaim>, SqlError> {
         let rows: Vec<ForgeSnapshotExpirationClaimSqlRow> = sqlx::query_as(
-            "SELECT resource,operation_id,snapshot_id,task_id,attempt_id,worker_id,lease_key,lease_fencing_token,table_uid,catalog_name,namespace_name,table_name,table_uuid FROM vala.forge_snapshot_expiration_claims WHERE data_tenant_id=wyrd.current_tenant() AND resource=$1 AND family=$2 AND operation_id=$3 ORDER BY snapshot_id",
+            "SELECT resource,operation_id,snapshot_id,task_id,attempt_id,worker_id,table_uid,catalog_name,namespace_name,table_name,table_uuid FROM vala.forge_snapshot_expiration_claims WHERE data_tenant_id=wyrd.current_tenant() AND resource=$1 AND family=$2 AND operation_id=$3 ORDER BY snapshot_id",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -1437,37 +1417,6 @@ pub(crate) async fn bind_tenant(
         .await
         .map_err(SqlError::from)?;
     Ok(())
-}
-
-/// Locks the caller's maintenance lease row and proves it still owns the fence.
-///
-/// `vala.maintenance_leases` is a cross-tenant control-plane table that admits
-/// only operator sessions, so the operator path takes the same `FOR UPDATE`
-/// lock the SECURITY DEFINER assertion function takes for tenant sessions.
-///
-/// # Errors
-/// Returns [`SqlError::InvariantViolation`] when the fence is lost and
-/// [`SqlError::Query`] when the statement fails.
-pub(crate) async fn assert_lease_fence(
-    tx: &mut Transaction<'_, Postgres>,
-    authority: &ForgeExpirationAuthority,
-) -> Result<(), SqlError> {
-    let owned: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM vala.maintenance_leases WHERE lease_key=$1 AND owner=$2 AND fencing_token=$3 AND expires_at>clock_timestamp() FOR UPDATE)",
-    )
-    .bind(&authority.lease_key)
-    .bind(authority.worker_id)
-    .bind(authority.lease_fencing_token)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(SqlError::from)?;
-    if owned {
-        Ok(())
-    } else {
-        Err(SqlError::InvariantViolation {
-            detail: format!("maintenance lease fence lost for `{}`", authority.lease_key),
-        })
-    }
 }
 
 /// Reads one Forge task's current state under a row lock.
@@ -1565,29 +1514,6 @@ pub(crate) async fn lock_table_authority(
     };
     identity.validate(BIFROST_CATALOG_NAME)?;
     Ok(identity)
-}
-
-/// Holds the table's maintenance authority for one expiration transaction.
-///
-/// With the caller's live `exclusive` capability the row is already held on
-/// the caller's connection, so this only verifies the capability covers the
-/// table; locking it here would wait on that lock. Without one it takes the
-/// row through [`lock_table_authority`].
-///
-/// # Errors
-///
-/// Returns what [`require_exclusive_authority`] or [`lock_table_authority`]
-/// returns.
-async fn hold_table_authority(
-    tx: &mut Transaction<'_, Postgres>,
-    tenant: DataTenantId,
-    exclusive: Option<&ExclusiveTableAuthority<'_, '_>>,
-    table: &ForgeClaimTable,
-) -> Result<(), SqlError> {
-    match exclusive {
-        Some(exclusive) => require_exclusive_authority(exclusive, tenant, table),
-        None => lock_table_authority(tx, tenant, table).await.map(|_| ()),
-    }
 }
 
 /// Fails closed unless the caller's exclusive authority covers exactly the

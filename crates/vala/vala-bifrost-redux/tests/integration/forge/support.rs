@@ -526,11 +526,26 @@ impl PromotionCatalogSeam {
         }
     }
 
-    /// Wait until cancellation or the request timeout dropped the parked commit.
+    /// Wait until cancellation dropped the parked commit.
     pub(crate) async fn wait_for_parked_commit_drop(&self) {
         while !self.parked_dropped.load(Ordering::Acquire) {
             self.parked_drop_ready.notified().await;
         }
+    }
+
+    /// Release the parked commit as a definite conflict and park the next one.
+    ///
+    /// Arming the follow-up park before the release is what makes the retry
+    /// observable: the conflicted call returns, production re-derives and
+    /// submits once more, and that second call stops here instead of racing the
+    /// test to the real catalog. The parked second call is never released, so
+    /// only the production budget can end it.
+    pub(crate) fn reject_parked_commit_and_park_next(&self) {
+        self.parked.store(false, Ordering::Release);
+        self.parked_dropped.store(false, Ordering::Release);
+        self.park_next.store(true, Ordering::Release);
+        self.reject_parked.store(true, Ordering::Release);
+        self.parked_release.notify_waiters();
     }
 
     /// Arm or disarm losing every accepted commit's response.
@@ -552,7 +567,7 @@ impl PromotionCatalogSeam {
     /// call is refused by the real catalog because the first one landed, so the
     /// caller ends up with a *definite* conflict rather than an unknown
     /// acceptance. Withholding the answer instead leaves the call in flight
-    /// until the catalog request timeout ends it, which is the one shape that
+    /// until the publication budget ends it, which is the one shape that
     /// delivers a landed replacement and an unknowable outcome together.
     pub(crate) fn stall_next_commit_responses(&self, count: usize) {
         self.stall_response_budget.store(count, Ordering::Release);
@@ -707,7 +722,7 @@ impl Catalog for PromotionCatalogSeam {
             // The call is handed to a task the caller cannot cancel, so the
             // replacement lands exactly as it would have while this call never
             // answers. Awaiting the commit here instead would let the caller's
-            // catalog request timeout cancel the commit itself, which is a different
+            // publication budget cancel the commit itself, which is a different
             // fault entirely: nothing landed.
             let inner = Arc::clone(&self.inner);
             tokio::spawn(async move {
@@ -1601,35 +1616,34 @@ impl PromotionIntegrationFixture {
         .expect("fixture claim aging");
     }
 
-    /// Expires the durable table lease this fixture's Forge owner holds.
+    /// Lapses the claim of the fixture table's one active Forge task.
     ///
-    /// The lease row is the real fence owner, and every renewal is conditional
-    /// on it still being unexpired, so aging it here is exactly what a lost
-    /// fence looks like to production code: the next `renew` matches no row and
-    /// reports the lease as lost. Nothing about the claim, the attempt, or the
-    /// table is touched.
+    /// The active task's claim is the table's only exclusive authority, and
+    /// every renewal and fenced commit requires it unexpired, so aging it here
+    /// is exactly what a lost fence looks like to production code: the next
+    /// renewal matches no row and reports the fence as lost. The task's state,
+    /// attempt, and owner are untouched.
     ///
     /// # Panics
     ///
-    /// Panics when the update fails.
-    pub(crate) async fn expire_table_lease(&self) {
-        let lease_key = vala_bifrost_redux::forge::forge_lease_key(
-            self.tenant,
-            &self.binding.logical_namespace,
-            &self.binding.table_name,
-        );
-        let expired = sqlx::query(
-            "UPDATE vala.maintenance_leases \
-             SET expires_at = statement_timestamp() - interval '1 minute' WHERE lease_key = $1",
+    /// Panics when the update fails or the table has no single active task.
+    pub(crate) async fn lapse_table_claim(&self) {
+        let lapsed = sqlx::query(
+            "UPDATE vala.forge_tasks \
+             SET claim_expires_at = statement_timestamp() - interval '1 minute' \
+             WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
+             AND state IN ('claimed', 'running', 'prepared')",
         )
-        .bind(&lease_key)
+        .bind(self.tenant.as_uuid())
+        .bind(self.binding.table_ref.namespace.as_str())
+        .bind(&self.binding.table_ref.name)
         .execute(self.operator_pool.pool())
         .await
-        .expect("fixture lease aging");
+        .expect("fixture claim lapse");
         assert_eq!(
-            expired.rows_affected(),
+            lapsed.rows_affected(),
             1,
-            "the publication under test holds exactly one table lease"
+            "the publication under test holds exactly one table claim"
         );
     }
 
@@ -1735,28 +1749,28 @@ impl PromotionIntegrationFixture {
         .expect("fixture operation-state inspection")
     }
 
-    /// Counts unexpired Forge leases still held over the fixture table.
+    /// Counts live Forge claims still held over the fixture table.
     ///
-    /// The key is derived through the production builder, so a re-scoped lease
-    /// identity fails this read rather than silently counting zero.
+    /// A claim is live while its task is active and its deadline has not
+    /// passed; the terminal transition clears it, so zero proves the table is
+    /// released.
     ///
     /// # Panics
     ///
     /// Panics when the read-only diagnostic query fails.
-    pub(crate) async fn live_leases(&self) -> i64 {
-        let lease_key = vala_bifrost_redux::forge::forge_lease_key(
-            self.tenant,
-            &self.binding.logical_namespace,
-            &self.binding.table_name,
-        );
+    pub(crate) async fn live_claims(&self) -> i64 {
         sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.maintenance_leases \
-             WHERE lease_key = $1 AND expires_at > statement_timestamp()",
+            "SELECT count(*) FROM vala.forge_tasks \
+             WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
+             AND state IN ('claimed', 'running', 'prepared') \
+             AND claim_expires_at > statement_timestamp()",
         )
-        .bind(&lease_key)
+        .bind(self.tenant.as_uuid())
+        .bind(self.binding.table_ref.namespace.as_str())
+        .bind(&self.binding.table_ref.name)
         .fetch_one(self.operator_pool.pool())
         .await
-        .expect("fixture lease inspection")
+        .expect("fixture claim inspection")
     }
 
     /// Collects the live data-file paths of the table's current snapshot.

@@ -194,10 +194,9 @@ impl QueryClient {
     /// # Errors
     ///
     /// Returns a contract error before IO when the request is invalid —
-    /// `WYRD_VALA_400_QUERY_INVALID_DEADLINE` for an out-of-range deadline and
-    /// `WYRD_VALA_400_QUERY_INVALID_SQL` for empty SQL or a non-finite bind
-    /// value — or a transport error when authentication or the HTTP request
-    /// fails.
+    /// `WYRD_VALA_400_QUERY_INVALID_SQL` for empty SQL, a non-finite bind
+    /// value, or an out-of-range deadline — or a transport error when
+    /// authentication or the HTTP request fails.
     ///
     /// # Cancellation
     ///

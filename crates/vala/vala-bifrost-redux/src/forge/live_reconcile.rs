@@ -572,15 +572,13 @@ impl Forge {
                 Self::require_running(context.stop)?;
                 context
                     .lease
-                    .require_fence(&self.core.operator_pool)
+                    .require_fence()
                     .await?;
                 if !context
                     .lease
                     .commit_window_fits(self.core.config.commit_window())
                 {
-                    return Err(ForgeError::FenceLost {
-                        lease_key: context.lease.lease_key.clone(),
-                    });
+                    return Err(context.lease.fence_lost());
                 }
                 self.append_live_transition(
                     context.lease,
@@ -636,15 +634,13 @@ impl Forge {
         Self::require_running(context.stop)?;
         context
             .lease
-            .require_fence(&self.core.operator_pool)
+            .require_fence()
             .await?;
         if !context
             .lease
             .commit_window_fits(self.core.config.commit_window())
         {
-            return Err(ForgeError::FenceLost {
-                lease_key: context.lease.lease_key.clone(),
-            });
+            return Err(context.lease.fence_lost());
         }
         self.append_live_transition(
             context.lease,

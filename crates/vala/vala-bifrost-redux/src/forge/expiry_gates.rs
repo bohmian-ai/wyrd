@@ -15,12 +15,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Default)]
 pub struct ExpiryTestControls {
     /// Expiry-lifecycle boundary before its first catalog submission.
-    submit: Arc<ExpiryTestGate>,
-    /// Expiry boundary after preparation commits and before the commit is
-    /// submitted, where the lease bound proves an unsubmitted cut-off.
-    prepared: Arc<ExpiryTestGate>,
+    expiry_submit: Arc<ExpiryTestGate>,
     /// Expiry accepted-response boundary.
-    accepted: Arc<ExpiryTestGate>,
+    expiry_accepted: Arc<ExpiryTestGate>,
 }
 
 /// One armed boundary with lossless arrival and release notifications.
@@ -99,45 +96,36 @@ impl ExpiryTestGate {
 impl ExpiryTestControls {
     /// Pauses the expiry lifecycle before its first catalog submission when armed.
     pub(super) async fn pause_expiry_submission(&self, stop: &CancellationToken) -> bool {
-        self.submit.pause(stop).await
-    }
-
-    /// Pauses after preparation commits and before submission when armed.
-    pub(super) async fn pause_expiry_prepared(&self, stop: &CancellationToken) -> bool {
-        self.prepared.pause(stop).await
+        self.expiry_submit.pause(stop).await
     }
 
     /// Pauses after an accepted expiry response when armed.
     pub(super) async fn pause_expiry_accepted(&self, stop: &CancellationToken) -> bool {
-        self.accepted.pause(stop).await
+        self.expiry_accepted.pause(stop).await
     }
 
     /// Arms the next expiry lifecycle before its first catalog submission.
     pub fn arm_expiry_submission(&self) {
-        self.submit.arm();
+        self.expiry_submit.arm();
     }
     /// Waits for the armed expiry lifecycle boundary.
     pub async fn wait_expiry_submission(&self) {
-        self.submit.wait().await;
+        self.expiry_submit.wait().await;
     }
     /// Releases the armed expiry lifecycle boundary.
     pub fn release_expiry_submission(&self) {
-        self.submit.release();
-    }
-    /// Arms the boundary after preparation commits and before submission.
-    pub fn arm_expiry_prepared(&self) {
-        self.prepared.arm();
+        self.expiry_submit.release();
     }
     /// Arms the boundary after the catalog accepts an expiry commit.
     pub fn arm_expiry_accepted(&self) {
-        self.accepted.arm();
+        self.expiry_accepted.arm();
     }
     /// Waits for the accepted expiry response.
     pub async fn wait_expiry_accepted(&self) {
-        self.accepted.wait().await;
+        self.expiry_accepted.wait().await;
     }
     /// Releases the accepted expiry response boundary.
     pub fn release_expiry_accepted(&self) {
-        self.accepted.release();
+        self.expiry_accepted.release();
     }
 }

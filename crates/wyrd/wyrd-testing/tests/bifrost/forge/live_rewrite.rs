@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use vala_bifrost_redux::catalog::TenantTableBinding;
+use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
 use wyrd_client::WyrdClient;
 use wyrd_client::bifrost::CompactionTypeWire;
@@ -2454,7 +2455,9 @@ async fn write_two_commits(
 
 /// A failed Forge worker is rebuilt on the same pod while the API keeps serving.
 ///
-/// A one-shot lease-release fault makes the worker's first rewrite fatal. While
+/// A one-shot lease-release fault makes the worker's first rewrite fatal; the
+/// tenant's `audit_log` is opted out of compaction so no sibling attempt is
+/// left unsettled by that fatal exit for the rebuilt worker to wait out. While
 /// the failing worker is held at that fatal point the pod reports Forge not
 /// ready and the public read still serves. Once released, the supervisor
 /// rebuilds the worker after its backoff, readiness returns, and a second
@@ -2492,6 +2495,20 @@ async fn failed_worker_restarts_while_the_api_serves() {
     let client = tenant_client(server, tenant).await;
     await_worker_readiness(&cluster, true, "first worker").await;
 
+    // Every audited request writes the tenant's `audit_log`, which Forge would
+    // compact beside the journey's table in the faulted pass. A fatal exit
+    // leaves that sibling attempt to the next owner once its lease lapses, so
+    // the journey opts the audit table out and the fault meets only its own
+    // rewrite.
+    let audit_log =
+        TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Audit, "audit_log")))
+            .expect("the tenant audit table resolves to its physical binding");
+    set_table_properties(
+        server,
+        &audit_log,
+        &[("wyrd.forge.enable-compaction", "false")],
+    )
+    .await;
     let failing = register_table(server, tenant, &unique_table("restart_failing")).await;
     let failing_rows = write_two_commits(&cluster, &client, &failing).await;
     server

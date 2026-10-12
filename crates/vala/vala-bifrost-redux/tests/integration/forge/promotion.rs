@@ -13,6 +13,7 @@ use vala_bifrost_redux::forge::{ForgeClock, ForgeObjectStore};
 
 use super::support::{
     CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
+    manual_clock,
 };
 
 /// Promotion appends the writer's own objects and never writes a data object.
@@ -220,6 +221,64 @@ async fn scribe_promotion_integration_reset_operation_retries_under_fresh_operat
     );
 }
 
+/// The operation deadline bounds the conflict retry to zero second attempts.
+///
+/// The commit is parked at the real catalog seam, the Forge clock is moved past
+/// the operation's own retry budget, and only then is the parked commit
+/// refused. The deadline captured before the first attempt is therefore already
+/// spent, so the definite conflict closes the operation instead of buying a
+/// second catalog call. One delegated update — against two in the retry
+/// scenario — is what proves the barrier held.
+#[tokio::test]
+async fn scribe_promotion_integration_deadline_expires_before_conflict_retry() {
+    let fixture = PromotionIntegrationFixture::start("promotion_deadline").await;
+    let object_store = CountingObjectStore::new(&fixture.storage);
+    let catalog = PromotionCatalogSeam::new(
+        fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    catalog.park_next_commit();
+    let (clock, control) = manual_clock();
+
+    let forge = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    let forge = forge
+        .run_one_failure_while(async {
+            catalog.wait_for_parked_commit().await;
+            let expired = control.now().expect("manual Forge clock")
+                + chrono::Duration::from_std(fixture.config.iceberg_total_retry_timeout)
+                    .expect("retry budget is representable")
+                + chrono::Duration::seconds(1);
+            control.set(expired).expect("manual Forge clock advances");
+            catalog.reject_parked_commit();
+        })
+        .await;
+
+    assert_eq!(
+        catalog.attempts(),
+        1,
+        "the expired deadline permitted no second catalog call: {:?}",
+        forge.returned_errors()
+    );
+    assert_eq!(
+        fixture.promotion_phases().await,
+        vec!["reset".to_owned()],
+        "a conflict past the deadline closes the operation"
+    );
+    let unsettled = fixture.file_rows().await;
+    assert!(
+        unsettled
+            .iter()
+            .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
+        "nothing was settled by a refused promotion: {unsettled:?}"
+    );
+    forge.shutdown().await;
+}
+
 /// Cancellation drains a parked promotion without settling anything.
 ///
 /// The coordinator is cancelled while its inline promotion commit is parked, so
@@ -271,9 +330,9 @@ async fn scribe_promotion_integration_cancellation_drains_without_settlement() {
         "a drained promotion settled nothing: {unsettled:?}"
     );
     assert_eq!(
-        fixture.live_leases().await,
+        fixture.live_claims().await,
         0,
-        "the drained attempt released its lease"
+        "the drained attempt released its claim"
     );
     forge.shutdown().await;
 }
@@ -655,10 +714,10 @@ mod promotion_barrier {
         Ok(())
     }
 
-    /// Seeds one live Forge lease and one running snapshot-expiry task.
+    /// Seeds one running snapshot-expiry task holding a live claim.
     ///
     /// # Panics
-    /// Panics when either seeding statement fails.
+    /// Panics when the seeding statement fails.
     async fn seed_running_expiry_task(
         fixture: &PromotionIntegrationFixture,
         identity: &TableAuthorityIdentity,
@@ -667,17 +726,8 @@ mod promotion_barrier {
             task_id: Uuid::now_v7(),
             attempt_id: Uuid::now_v7(),
             worker_id: Uuid::now_v7(),
-            lease_key: format!("forge:{}:barrier", identity.table_name),
-            lease_fencing_token: 20,
         };
         let pool = fixture.database.operator_pool().pool();
-        sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
-            .bind(&authority.lease_key)
-            .bind(authority.worker_id)
-            .bind(authority.lease_fencing_token)
-            .execute(pool)
-            .await
-            .expect("lease seeds");
         sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',20,'{}'::jsonb,decode(repeat('00',32),'hex'),1,1,'running',$6,$7,now()+interval '10 minutes',20,1,now())")
             .bind(authority.task_id)
             .bind(identity.tenant.as_uuid())

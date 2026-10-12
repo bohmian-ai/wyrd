@@ -873,8 +873,9 @@ mod pg_tests {
         let (_telemetry_guard, telemetry) = shared_process_telemetry_for_test()?;
         let gateway = GatewayCapture::start().await?;
         gateway.capture_call().await?;
-        // Capture is delivered to Scribe asynchronously; seal only once both
-        // calls (the answered one and the refused one) have arrived, so the
+        // Capture is staged on the Scribe outbox after each call returns;
+        // flush only once both calls (the answered one and the refused one)
+        // are staged, so the flush settles them into storage and the
         // permitted reads below come from storage rather than the live tail.
         // Each test is its own process, so the absolute count is this test's.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -883,7 +884,7 @@ mod pg_tests {
             .iter()
             .filter(|sample| {
                 sample.family == "wyrd_gateway_capture_total"
-                    && sample.labels.get("outcome").map(String::as_str) == Some("delivered")
+                    && sample.labels.get("outcome").map(String::as_str) == Some("staged")
             })
             .map(|sample| sample.value)
             .sum::<f64>()
@@ -891,7 +892,7 @@ mod pg_tests {
         {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "both gateway calls are captured within 30 s"
+                "both gateway calls are staged within 30 s"
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

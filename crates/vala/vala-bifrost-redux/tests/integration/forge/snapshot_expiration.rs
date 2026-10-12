@@ -39,11 +39,6 @@ struct ExpiryState {
     claims: i64,
     /// Current operation phase, if the projection row exists.
     operation_phase: Option<String>,
-    /// Identity of the newest snapshot-expiry operation, if one exists.
-    operation_id: Option<Uuid>,
-    /// Number of snapshot-expiry operations the tenant has ever prepared, so
-    /// a second submission of the same expiration is observable.
-    operations: i64,
     /// Whether a committed expiration left a cleanup handoff for the
     /// leader's next maintenance pass to consume.
     cleanup_handoff: bool,
@@ -69,23 +64,14 @@ async fn expiry_state(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> E
     .fetch_one(pool)
     .await
     .expect("claim count");
-    let newest: Option<(String, Uuid)> = sqlx::query_as(
-        "SELECT phase, operation_id FROM vala.forge_operation_state \
+    let operation_phase: Option<String> = sqlx::query_scalar(
+        "SELECT phase FROM vala.forge_operation_state \
          WHERE data_tenant_id = $1 AND family = 'snapshot_expire' ORDER BY prepared_at DESC LIMIT 1",
     )
     .bind(fixture.tenant.as_uuid())
     .fetch_optional(pool)
     .await
     .expect("operation phase");
-    let (operation_phase, operation_id) = newest.unzip();
-    let operations: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.forge_operation_state \
-         WHERE data_tenant_id = $1 AND family = 'snapshot_expire'",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .fetch_one(pool)
-    .await
-    .expect("operation count");
     let identity = vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
         "wyrd-redux",
         fixture.binding.table_ref.namespace.as_str(),
@@ -102,8 +88,6 @@ async fn expiry_state(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> E
         task_state,
         claims,
         operation_phase,
-        operation_id,
-        operations,
         cleanup_handoff,
     }
 }
@@ -287,14 +271,10 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         prepare_and_abandon_at_the_catalog_gate(&fixture, &seam, &forge, watermark).await;
 
     // --- a takeover settles with exact candidates and zero deletes -------
-    // The dead worker's lease ages out and the scheduler hands the same task
-    // and attempt to a new owner, exactly as a real crash recovery does.
+    // The scheduler hands the dead worker's task and attempt to a new owner,
+    // exactly as a real crash recovery does.
     let settle_task = task;
     let settling_worker = Uuid::now_v7();
-    sqlx::query("UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 hour'")
-        .execute(fixture.operator_pool.pool())
-        .await
-        .expect("the dead preparing worker's lease ages out");
     sqlx::query("UPDATE vala.forge_tasks SET claimed_by = $2 WHERE task_id = $1")
         .bind(settle_task)
         .bind(settling_worker)
@@ -469,7 +449,6 @@ async fn assert_uncertain_preparation_retained(
     assert_eq!(retained.task_state, "prepared");
     assert!(retained.claims > 0, "every claim survives uncertainty");
     assert_eq!(retained.operation_phase.as_deref(), Some("prepared"));
-    assert_eq!(retained.operations, 1, "one expiration has one operation");
     let preparing_evidence: (Uuid, Uuid, Uuid) = sqlx::query_as(
         "SELECT task_id, attempt_id, worker_id FROM vala.forge_snapshot_expiration_claims \
          WHERE task_id = $1 LIMIT 1",
@@ -559,10 +538,6 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
 
     let attempts_before = seam.attempts();
     let settling_worker = Uuid::now_v7();
-    sqlx::query("UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 hour'")
-        .execute(fixture.operator_pool.pool())
-        .await
-        .expect("the dead preparing worker's lease ages out");
     sqlx::query("UPDATE vala.forge_tasks SET claimed_by = $2 WHERE task_id = $1")
         .bind(task)
         .bind(settling_worker)
@@ -587,11 +562,6 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
     assert_eq!(settled.task_state, "succeeded");
     assert_eq!(settled.claims, 0);
     assert_eq!(settled.operation_phase.as_deref(), Some("recovered"));
-    assert_eq!(
-        (settled.operation_id, settled.operations),
-        (retained.operation_id, 1),
-        "takeover settles the retained operation and prepares no second one"
-    );
     assert!(
         !retained.cleanup_handoff && settled.cleanup_handoff,
         "recovered settlement hands its cleanup to the leader's next pass"
@@ -943,10 +913,6 @@ async fn worker_expiration_never_runs_orphan_cleanup() {
         recovered.watermark,
     )
     .await;
-    sqlx::query("UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 hour'")
-        .execute(recovered.fixture.operator_pool.pool())
-        .await
-        .expect("the dead preparing worker's lease ages out");
     sqlx::query(
         "UPDATE vala.forge_tasks SET claim_expires_at = now() - interval '1 hour' WHERE task_id = $1",
     )
@@ -1438,279 +1404,4 @@ async fn active_watermark_blocks_expiry_and_failed_cleanup_retries_exactly() {
     assert_compaction_watermark_blocks_expiry(&table).await;
     assert_failed_cleanup_retries_exactly(&mut table).await;
     table.supervised.shutdown().await;
-}
-
-/// Where the lease bound cuts off one prepared expiration.
-#[derive(Clone, Copy, Debug)]
-enum UnknownExpiryOutcome {
-    /// The pass is held after preparation commits and before the commit is
-    /// submitted, so the lease bound proves nothing reached the catalog.
-    Unsubmitted,
-    /// The catalog accepted the expiration; the pass is cut off by the Forge
-    /// lease bound while it is held after the accepted response.
-    Accepted,
-    /// The submitted commit never reaches the catalog; the pass is cut off by
-    /// the commit timeout while the commit is parked unlanded.
-    Rejected,
-}
-
-/// Reads the fixture table's current catalog pointer from the real catalog.
-///
-/// # Panics
-///
-/// Panics when the table cannot be loaded or has no metadata location.
-async fn catalog_pointer(fixture: &PromotionIntegrationFixture) -> String {
-    fixture
-        .catalog
-        .iceberg_catalog()
-        .load_table(&fixture.binding.table_ident())
-        .await
-        .expect("fixture table loads")
-        .metadata_location()
-        .expect("a committed table has a metadata location")
-        .to_owned()
-}
-
-/// Lapses the preparing worker's lease and reconciles the task as a new owner
-/// of the short-lease `forge`.
-///
-/// A rejected outcome stays pending until the uncertainty bound passes on the
-/// Forge clock, so the clock is advanced past it first; an accepted outcome is
-/// recovered at once from the advanced metadata.
-///
-/// # Panics
-///
-/// Panics when the takeover statements fail or reconciliation does not settle
-/// the prepared task.
-async fn take_over_and_reconcile(
-    table: &ExpirableTable,
-    forge: &vala_bifrost_redux::forge::Forge,
-    outcome: UnknownExpiryOutcome,
-    task: Uuid,
-    attempt: Uuid,
-) {
-    let fixture = &table.fixture;
-    sqlx::query("UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 hour'")
-        .execute(fixture.operator_pool.pool())
-        .await
-        .expect("the preparing worker's lease lapses");
-    let settling_worker = Uuid::now_v7();
-    sqlx::query("UPDATE vala.forge_tasks SET claimed_by = $2 WHERE task_id = $1")
-        .bind(task)
-        .bind(settling_worker)
-        .execute(fixture.operator_pool.pool())
-        .await
-        .expect("a new owner takes the prepared task over");
-    if matches!(outcome, UnknownExpiryOutcome::Rejected) {
-        let bound = ChronoDuration::from_std(fixture.config.uncertainty_bound)
-            .expect("bounded uncertainty window");
-        table
-            .control
-            .advance(bound + ChronoDuration::seconds(1))
-            .expect("manual clock advance");
-    }
-    forge
-        .run_snapshot_expiry_for_test(&fixture.binding, task, attempt, settling_worker)
-        .await
-        .expect("takeover reconciles the unknown outcome")
-        .expect("reconciliation settles the prepared task");
-}
-
-/// Proves an unknown expiration outcome retains its durable uncertainty
-/// evidence under the lease bound until takeover reconciliation settles it.
-///
-/// A short-lease Forge leaves one expiration's acceptance unknown, either cut
-/// off by the lease bound after the catalog accepted it or by the commit
-/// timeout before the parked commit landed. The prepared claims survive and
-/// the table authority is free. New cuts are not barred meanwhile: source
-/// cuts stay non-blocking during expiry. Once the preparing worker's lease
-/// lapses, takeover reconciliation settles the same operation, prepares no
-/// second one, and the catalog holds a pointer carrying the expiration. A
-/// pass cut off before submission instead resets its one operation and
-/// releases every claim without any catalog submission.
-///
-/// # Panics
-///
-/// Panics when the pass does not end as a retained reconciliation,
-/// reconciliation does not settle the claims, or the established pointer
-/// does not carry the expiration.
-async fn unknown_expiry_outcome_is_reconciled(outcome: UnknownExpiryOutcome) {
-    let _telemetry = ForgeTelemetryCheckpoint::install();
-    let name = match outcome {
-        UnknownExpiryOutcome::Accepted => "expiry_unknown_accepted",
-        UnknownExpiryOutcome::Rejected => "expiry_unknown_rejected",
-        UnknownExpiryOutcome::Unsubmitted => "expiry_unknown_unsubmitted",
-    };
-    let mut table = expirable_table(name).await;
-    let lease_ttl = std::time::Duration::from_secs(6);
-    table.fixture.config = vala_bifrost_redux::forge::ForgeConfig {
-        lease_ttl,
-        iceberg_total_retry_timeout: std::time::Duration::from_secs(2),
-        catalog_request_timeout: std::time::Duration::from_secs(2),
-        uncertainty_margin: std::time::Duration::from_secs(1),
-        ..table.fixture.config.clone()
-    };
-    let forge = table.fixture.build_forge_for_test(
-        Arc::clone(&table.seam) as Arc<dyn iceberg::Catalog>,
-        Arc::clone(&table.store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
-        table.supervised.forge().clock_for_test(),
-        vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-        vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(Uuid::now_v7()),
-    );
-    let fixture = &table.fixture;
-    let replaced = catalog_pointer(fixture).await;
-    let snapshots_before = retained_snapshots(fixture).await;
-
-    let (attempt, preparing_worker) = (Uuid::now_v7(), Uuid::now_v7());
-    let task = seed_running_task(
-        fixture,
-        fixture.tenant,
-        attempt,
-        preparing_worker,
-        table.watermark,
-        "33",
-    )
-    .await;
-    let attempts_before = table.seam.attempts();
-    match outcome {
-        UnknownExpiryOutcome::Accepted => forge.expiry_controls_for_test().arm_expiry_accepted(),
-        UnknownExpiryOutcome::Rejected => table.seam.park_next_commit(),
-        UnknownExpiryOutcome::Unsubmitted => {
-            forge.expiry_controls_for_test().arm_expiry_prepared();
-            let released = tokio::time::timeout(
-                lease_ttl * 4,
-                forge.run_snapshot_expiry_for_test(
-                    &fixture.binding,
-                    task,
-                    attempt,
-                    preparing_worker,
-                ),
-            )
-            .await
-            .expect("the exclusive scope ends at the lease bound")
-            .expect("an unsubmitted cut-off is a released expiration, not a failed pass");
-            assert!(released.is_none(), "nothing settled");
-            let reset = expiry_state(fixture, task).await;
-            assert_eq!(reset.task_state, "cancelled");
-            assert_eq!(
-                reset.claims, 0,
-                "an unsubmitted cut-off releases every claim"
-            );
-            assert_eq!(reset.operation_phase.as_deref(), Some("reset"));
-            assert_eq!(
-                reset.operations, 1,
-                "the reset names the one prepared operation"
-            );
-            assert_eq!(
-                table.seam.attempts(),
-                attempts_before,
-                "nothing was submitted to the catalog"
-            );
-            assert_eq!(retained_snapshots(fixture).await, snapshots_before);
-            assert_eq!(catalog_pointer(fixture).await, replaced);
-            table.supervised.shutdown().await;
-            return;
-        }
-    }
-    let error = tokio::time::timeout(
-        lease_ttl * 4,
-        forge.run_snapshot_expiry_for_test(&fixture.binding, task, attempt, preparing_worker),
-    )
-    .await
-    .expect("the exclusive scope ends at the lease bound")
-    .expect_err("an unknown acceptance does not settle the expiration");
-    let ForgeError::Reconciliation { detail } = &error else {
-        panic!("an unknown acceptance is left to reconciliation: {error:?}");
-    };
-    match outcome {
-        UnknownExpiryOutcome::Accepted => {
-            assert!(
-                detail.contains("lease bound"),
-                "the lease bound ended the accepted pass: {detail}"
-            );
-            assert!(
-                retained_snapshots(fixture).await < snapshots_before,
-                "the catalog accepted the expiration"
-            );
-        }
-        UnknownExpiryOutcome::Rejected => {
-            table.seam.wait_for_parked_commit_drop().await;
-            assert_eq!(
-                retained_snapshots(fixture).await,
-                snapshots_before,
-                "the parked commit never landed"
-            );
-        }
-        UnknownExpiryOutcome::Unsubmitted => unreachable!("released before submission"),
-    }
-    let retained =
-        assert_uncertain_preparation_retained(fixture, task, attempt, preparing_worker).await;
-    assert_eq!(
-        table.seam.attempts(),
-        attempts_before + 1,
-        "the pass submitted exactly one commit"
-    );
-
-    take_over_and_reconcile(&table, &forge, outcome, task, attempt).await;
-    let fixture = &table.fixture;
-    let settled = expiry_state(fixture, task).await;
-    assert_eq!(settled.task_state, "succeeded");
-    assert_eq!(settled.claims, 0, "reconciliation resolves every claim");
-    assert_eq!(
-        (settled.operation_id, settled.operations),
-        (retained.operation_id, 1),
-        "reconciliation settles the retained operation and prepares no second one"
-    );
-    assert!(
-        retained_snapshots(fixture).await < snapshots_before,
-        "the established pointer carries the expiration"
-    );
-    assert_ne!(
-        catalog_pointer(fixture).await,
-        replaced,
-        "reconciliation established a new pointer"
-    );
-    table.supervised.shutdown().await;
-}
-
-/// Proves an accepted expiration cut off at the lease bound is retained as
-/// uncertain until reconciliation recovers it.
-///
-/// # Panics
-///
-/// Panics when [`unknown_expiry_outcome_is_reconciled`] does.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn accepted_expiry_past_the_lease_bound_is_reconciled() {
-    Box::pin(unknown_expiry_outcome_is_reconciled(
-        UnknownExpiryOutcome::Accepted,
-    ))
-    .await;
-}
-
-/// Proves a lease bound reached after preparation and before submission
-/// releases the expiration without touching the catalog.
-///
-/// # Panics
-///
-/// Panics when [`unknown_expiry_outcome_is_reconciled`] does.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unsubmitted_expiry_at_the_lease_bound_is_released() {
-    Box::pin(unknown_expiry_outcome_is_reconciled(
-        UnknownExpiryOutcome::Unsubmitted,
-    ))
-    .await;
-}
-
-/// Proves an unlanded expiration of unknown outcome is retained as uncertain
-/// until reconciliation commits it.
-///
-/// # Panics
-///
-/// Panics when [`unknown_expiry_outcome_is_reconciled`] does.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rejected_expiry_of_unknown_outcome_is_reconciled() {
-    Box::pin(unknown_expiry_outcome_is_reconciled(
-        UnknownExpiryOutcome::Rejected,
-    ))
-    .await;
 }

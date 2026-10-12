@@ -122,7 +122,7 @@ pub(crate) struct TelemetryBinding {
 
 /// Closed `task_type` label values every public Forge family carries.
 ///
-/// Mirrors the five durable Forge task strategies owned by the production
+/// Mirrors the six durable Forge task strategies owned by the production
 /// telemetry catalog, so a production label this projection cannot name fails
 /// as an unexpected value instead of silently vanishing from the report.
 const FORGE_TASK_TYPES: &[&str] = &[
@@ -131,6 +131,7 @@ const FORGE_TASK_TYPES: &[&str] = &[
     "snapshot_expiry",
     "expired_cleanup",
     "orphan_cleanup",
+    "manifest_rewrite",
 ];
 
 /// Closed label domain for the Forge families keyed only by task type.
@@ -2286,7 +2287,6 @@ fn validate_binding_unit(binding: &TelemetryBinding) -> Result<(), BifrostTeleme
     }
 }
 
-/// Construct one stable binding failure without exposing metric values.
 /// Converts one aggregated metric sample to the whole count a binding reports.
 ///
 /// Counters and gauges render as floats; the conversion truncates any fraction
@@ -2300,6 +2300,7 @@ fn whole_count(binding: &TelemetryBinding, value: f64) -> Result<u64, BifrostTel
         .ok_or_else(|| invalid_binding(binding, "metric value is not a representable count"))
 }
 
+/// Construct one stable binding failure without exposing metric values.
 fn invalid_binding(binding: &TelemetryBinding, detail: &str) -> BifrostTelemetryReportError {
     BifrostTelemetryReportError::InvalidBinding {
         id: binding.id.0.to_owned(),
@@ -3768,6 +3769,7 @@ mod tests {
                             "snapshot_expiry",
                             "expired_cleanup",
                             "orphan_cleanup",
+                            "manifest_rewrite",
                         ],
                     ),
                     (
@@ -3801,6 +3803,7 @@ mod tests {
                         "snapshot_expiry",
                         "expired_cleanup",
                         "orphan_cleanup",
+                        "manifest_rewrite",
                     ],
                 )],
                 unit: Count,
@@ -3822,6 +3825,7 @@ mod tests {
                         "snapshot_expiry",
                         "expired_cleanup",
                         "orphan_cleanup",
+                        "manifest_rewrite",
                     ],
                 )],
                 unit: Bytes,
@@ -3843,6 +3847,7 @@ mod tests {
                         "snapshot_expiry",
                         "expired_cleanup",
                         "orphan_cleanup",
+                        "manifest_rewrite",
                     ],
                 )],
                 unit: Count,
@@ -3864,6 +3869,7 @@ mod tests {
                         "snapshot_expiry",
                         "expired_cleanup",
                         "orphan_cleanup",
+                        "manifest_rewrite",
                     ],
                 )],
                 unit: Bytes,

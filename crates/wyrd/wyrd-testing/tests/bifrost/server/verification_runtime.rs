@@ -29,7 +29,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
 use arrow::json::writer::{JsonArray, WriterBuilder};
 use arrow::record_batch::RecordBatch;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike as _, Utc};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
@@ -304,17 +304,37 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
     Ok(())
 }
 
-/// A monthly schedule whose current window opens at the start of the month
-/// and closes at the PostgreSQL time the binding is made due.
+
+/// A monthly schedule whose current window opens at the start of the month.
+///
+/// The window closes at the Postgres instant the binding is made due, so an
+/// observation whose event time is the start of the month or a minute in the
+/// past falls inside the window the run analyzes; see
+/// [`observed_in_current_month`].
 const MONTHLY: &str = "0 0 1 * *";
 
-/// How far before the client's own clock the shared observation is stamped.
+/// The caller event time of the shared observation: one minute ago, or the
+/// start of the current UTC month when that is later.
 ///
-/// The client owns the observation's `created_at` time column; the window end
-/// is PostgreSQL's `statement_timestamp()`. The two clocks can differ (a
-/// VM-backed Postgres lags the host), so the observation is created this far
-/// in the past, which keeps it inside the window regardless of that skew.
-const EVENT_TIME_LEAD: chrono::Duration = chrono::Duration::minutes(1);
+/// The window end is Postgres' `statement_timestamp()`, while a
+/// server-stamped receipt reads the server's own clock. Whenever the database
+/// clock trails the server's, a receipt can land after a window that closed
+/// later in real time. Supplying the event time removes that cross-clock
+/// comparison: the observation is inside `[start of month, due)` by
+/// construction rather than by the race between the write's acknowledgement
+/// and the due update.
+///
+/// # Errors
+/// Returns a description when the month start cannot be represented.
+fn observed_in_current_month(now: DateTime<Utc>) -> Result<DateTime<Utc>, ServerJourneyError> {
+    let month_start = now
+        .date_naive()
+        .with_day(1)
+        .and_then(|day| day.and_hms_opt(0, 0, 0))
+        .ok_or("the current month has no first instant")?
+        .and_utc();
+    Ok(month_start.max(now - chrono::Duration::minutes(1)))
+}
 
 /// Two schedule bindings of one subject share one raw client observation and
 /// stay independently filterable through their runs and results.
@@ -390,7 +410,7 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
         .await?
         .write_batch(
             "vala.drift.observations",
-            &observation_batch(&record, &subject)?,
+            &observation_batch(&record, &subject, observed_in_current_month(Utc::now())?)?,
         )
         .await?;
     seed.activate(client).await?;
@@ -498,14 +518,20 @@ async fn two_bindings_share_one_client_observation() -> Result<(), ServerJourney
     Ok(())
 }
 
-/// One Drift observation `record` of the Card `card_uid`: a drifting `score` and a
-/// `latency` feature, as the SDK's tall projection writes them, with a
-/// client-owned `created_at` time column [`EVENT_TIME_LEAD`] before the
-/// client's clock, which Scribe keeps verbatim.
+/// One Drift observation `record` of the Card `card_uid` at `event_time`: a
+/// drifting `score` and a `latency` feature, as the SDK's tall projection
+/// writes them.
+///
+/// `event_time` is the rows' `created_at`, the observation table's time
+/// column, which Scribe keeps verbatim.
 ///
 /// # Errors
 /// Returns an Arrow error when the batch cannot be assembled.
-fn observation_batch(record: &str, card_uid: &CardUid) -> Result<RecordBatch, ServerJourneyError> {
+fn observation_batch(
+    record: &str,
+    card_uid: &CardUid,
+    event_time: DateTime<Utc>,
+) -> Result<RecordBatch, ServerJourneyError> {
     let utc = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
     let schema = Arc::new(Schema::new(vec![
         Field::new("record_id", DataType::Utf8, false),
@@ -516,7 +542,7 @@ fn observation_batch(record: &str, card_uid: &CardUid) -> Result<RecordBatch, Se
         Field::new("created_at", utc(), false),
         Field::new(CARD_UID, DataType::Utf8, true),
     ]));
-    let event_time = (Utc::now() - EVENT_TIME_LEAD).timestamp_micros();
+    let event_time = event_time.timestamp_micros();
     Ok(RecordBatch::try_new(
         schema,
         vec![

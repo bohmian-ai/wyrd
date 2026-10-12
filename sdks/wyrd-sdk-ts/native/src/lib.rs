@@ -35,7 +35,7 @@ use wyrd_client::bifrost::{BifrostClientError, QueryResultStream};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, QueryContractError, QueryParam};
+use wyrd_spec::vala::api::{BifrostQueryRequest, QueryParam};
 use wyrd_spec::vala::api::{CompactionTypeWire, PhysicalLayoutWire};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::vala::ids::RunId;
@@ -1301,13 +1301,16 @@ fn correlation(
 ///
 /// # Errors
 ///
-/// Returns the shared deadline refusal, `WYRD_VALA_400_QUERY_INVALID_DEADLINE`, for a
-/// non-finite, fractional, or beyond-`i64` number.
+/// Returns the shared query-contract validation error for a non-finite,
+/// fractional, or beyond-`i64` number.
 fn parse_deadline_ms(value: f64) -> StdResult<i64, BifrostClientError> {
-    value
-        .to_string()
-        .parse()
-        .map_err(|_| BifrostClientError::Transport(QueryContractError::InvalidDeadline.into()))
+    value.to_string().parse().map_err(|_| {
+        BifrostClientError::Transport(WyrdError::Vala {
+            error: BifrostError::QueryInvalidSql {
+                detail: "deadline_ms must be an integer between 1 and 4294967295".to_owned(),
+            },
+        })
+    })
 }
 
 /// Parses one canonical request ID at the Node boundary.

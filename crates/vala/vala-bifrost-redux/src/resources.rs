@@ -757,12 +757,6 @@ pub struct ResourceSnapshot {
     pub oracle_analytical_queries: u32,
     /// Aggregate memory retained specifically by Oracle query owners.
     pub oracle_query_memory_used_bytes: usize,
-    /// Share of [`Self::infallible_headroom_bytes`] Oracle pools hold.
-    ///
-    /// Oracle shutdown adds this to the governed Oracle query bytes so a
-    /// child holding only infallible overshoot still delays its drain, while
-    /// headroom other roles hold never does.
-    pub oracle_infallible_headroom_bytes: usize,
     /// Bytes `DataFusion`'s infallible growth path holds above the shared cap.
     ///
     /// These are real, retained bytes accounted as server headroom rather than
@@ -864,8 +858,6 @@ struct ResourceState {
     /// Live Analytical queries and follower graphs; each holds one slot unit.
     oracle_analytical_queries: u32,
     oracle_query_memory_used_bytes: usize,
-    /// Oracle-held share of `infallible_headroom_bytes`.
-    oracle_infallible_headroom_bytes: usize,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     scribe_shard_bytes: BTreeMap<usize, usize>,
     /// Advances only when Oracle slot units return to the ledger.
@@ -1792,14 +1784,6 @@ impl OracleResources {
         self.memory_root.reserved()
     }
 
-    /// Returns a future that resolves on the next byte return to the shared pool.
-    ///
-    /// Callers enable it before reading the Oracle memory attribution so a
-    /// release between the read and the await is not lost.
-    pub(crate) fn shared_memory_released(&self) -> tokio::sync::futures::Notified<'_> {
-        self.memory_root.released.notified()
-    }
-
     /// Returns the cooperative maximum the shared memory pool arbitrates.
     #[must_use]
     pub fn shared_memory_limit(&self) -> usize {
@@ -2264,7 +2248,6 @@ impl BifrostResourceGovernor {
             oracle_interactive_queries: state.oracle_interactive_queries,
             oracle_analytical_queries: state.oracle_analytical_queries,
             oracle_query_memory_used_bytes: state.oracle_query_memory_used_bytes,
-            oracle_infallible_headroom_bytes: state.oracle_infallible_headroom_bytes,
             infallible_headroom_bytes: state.infallible_headroom_bytes,
             oracle_query_active: state.oracle_active_queries() > 0,
         })
@@ -2801,10 +2784,6 @@ impl BifrostResourceGovernor {
                 .oracle_query_memory_used_bytes
                 .checked_add(governed)
                 .ok_or_else(accounting_overflow)?;
-            state.oracle_infallible_headroom_bytes = state
-                .oracle_infallible_headroom_bytes
-                .checked_add(headroom)
-                .ok_or_else(accounting_overflow)?;
             let used = state.oracle_memory_used();
             drop(state);
             record_oracle_memory_used(used);
@@ -2836,8 +2815,7 @@ impl BifrostResourceGovernor {
         }
         let mut state = self.lock_state()?;
         let query_underflow = holder == MemoryHolder::Oracle
-            && (state.oracle_query_memory_used_bytes < charge.governed_bytes
-                || state.oracle_infallible_headroom_bytes < charge.headroom_bytes);
+            && state.oracle_query_memory_used_bytes < charge.governed_bytes;
         if state.infallible_headroom_bytes < charge.headroom_bytes || query_underflow {
             return Err(self.poison_locked(&mut state, "pool memory release underflow"));
         }
@@ -2845,7 +2823,6 @@ impl BifrostResourceGovernor {
         state.infallible_headroom_bytes -= charge.headroom_bytes;
         let oracle_used = (holder == MemoryHolder::Oracle).then(|| {
             state.oracle_query_memory_used_bytes -= charge.governed_bytes;
-            state.oracle_infallible_headroom_bytes -= charge.headroom_bytes;
             state.oracle_memory_used()
         });
         drop(state);
@@ -3483,12 +3460,6 @@ pub(crate) struct GovernedMemoryRoot {
     /// is that a charge another query is about to roll back can refuse a
     /// concurrent growth near the cap, which `DataFusion` handles by spilling.
     limit_bytes: usize,
-    /// Wakes shutdown waiters after any consumer returns bytes to the pool.
-    ///
-    /// A query's slot can return before its child tasks finish dropping their
-    /// reservations, so draining owners wait on this rather than reading the
-    /// ledger once.
-    released: Notify,
 }
 
 impl GovernedMemoryRoot {
@@ -3499,7 +3470,6 @@ impl GovernedMemoryRoot {
             pool: tracked_pool(limit_bytes),
             governor,
             limit_bytes,
-            released: Notify::new(),
         }
     }
 
@@ -3626,8 +3596,6 @@ impl GovernedMemoryRoot {
             tracing::error!(%error, "Oracle memory release could not be reconciled");
         }
         ledger.total = ledger.total.saturating_sub(shrink);
-        drop(ledger);
-        self.released.notify_waiters();
     }
 }
 
@@ -3724,7 +3692,7 @@ impl MemoryPool for GovernedMemoryView {
         "oracle_shared_root"
     }
 
-    /// Registers this query's consumer with the shared root unchanged.
+    /// Registers this query's consumer with the shared root.
     fn register(&self, consumer: &MemoryConsumer) {
         self.root.pool.register(consumer);
     }
@@ -3916,7 +3884,6 @@ impl OracleQueryResources {
     /// A nested child that is still being torn down keeps its own reference to
     /// the query's memory view, so its bytes return through the shared root as
     /// it shrinks; the view's drop is what poisons on bytes that never return.
-    ///
     /// Slot units return under the governor lock; the attached admission
     /// charge is then dropped outside it, and only after both is the Oracle
     /// capacity wake sent, so queued admission is reconsidered once with the
@@ -4785,6 +4752,42 @@ mod tests {
         assert!(refusal.contains("ceiling-holder"), "{refusal}");
     }
 
+    /// Dropping a query's memory view while it still holds bytes poisons the
+    /// shared root as an accounting failure.
+    ///
+    /// Settled graphs release inline with no drain, so the view's drop is the
+    /// only leak check. Charging the view directly, behind its reservation's
+    /// back, leaves bytes no consumer will ever return; once the reservation,
+    /// the pool handle, and the query are gone the view drops holding them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the root is unhealthy before the drop or not poisoned for
+    /// accounting after it.
+    #[test]
+    fn oracle_view_dropped_holding_bytes_poisons_the_root() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            512 * MIB,
+            8 * 1024 * MIB as u64,
+            [BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let query = oracle
+            .try_acquire_query(interactive_query(8))
+            .expect("interactive leader");
+        let pool = Arc::clone(query.execution().memory_pool());
+        let reservation = MemoryConsumer::new("leaking-operator").register(&pool);
+        pool.grow(&reservation, MIB);
+        assert!(oracle.health().reason().is_none());
+        drop(reservation);
+        drop(pool);
+        drop(query);
+        assert_eq!(
+            oracle.health().reason(),
+            Some(BifrostResourcePoisonReason::Accounting)
+        );
+    }
+
     /// Concurrent Oracle queries compete beneath exactly one governed root.
     ///
     /// Independent per-query pools let three admitted ceilings sum above the
@@ -5636,7 +5639,6 @@ mod tests {
                 oracle_interactive_queries: 0,
                 oracle_analytical_queries: 0,
                 oracle_query_memory_used_bytes: 0,
-                oracle_infallible_headroom_bytes: 0,
                 infallible_headroom_bytes: 0,
                 oracle_query_active: false,
             }

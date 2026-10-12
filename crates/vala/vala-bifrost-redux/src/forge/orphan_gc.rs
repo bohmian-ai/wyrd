@@ -14,6 +14,8 @@ use uuid::Uuid;
 use vala_sql::TenantConn;
 use vala_sql::queries::file_list::list_nonterminal_file_paths;
 use vala_sql::queries::forge_operations::ForgeOperations;
+#[cfg(feature = "test-support")]
+use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::queries::forge_tasks::list_prepared_cleanup_candidates;
 use vala_sql::queries::oracle_reader_authority::ExclusiveTableAuthority;
 use vala_sql::row_types::forge_operations::{
@@ -35,7 +37,6 @@ use super::error::ForgeError;
 use super::expire::table_resource_for_key;
 use super::lease::ForgeLease;
 #[cfg(feature = "test-support")]
-use super::lease::forge_lease_key;
 use super::live_reconcile::DestructiveMaintenance;
 use super::managed::identity::ForgeOutputIdentity;
 use super::metrics::ForgeTelemetry;
@@ -755,10 +756,12 @@ impl Forge {
 
     /// Runs one table-scoped orphan collection pass for integration fixtures.
     ///
+    /// Behaves exactly like [`Self::run_orphan_gc_report_for_test`] and returns
+    /// only its deleted count.
+    ///
     /// # Errors
     ///
-    /// Returns lease, catalog, object-store, SQL, audit, or live-set failures
-    /// from the unchanged production GC owner.
+    /// Returns the errors of [`Self::run_orphan_gc_report_for_test`].
     #[cfg(feature = "test-support")]
     pub async fn run_orphan_gc_for_test(
         &self,
@@ -767,18 +770,23 @@ impl Forge {
         Ok(self.run_orphan_gc_report_for_test(binding).await?.deleted)
     }
 
-    /// Runs one bounded orphan collection pass and reports its full outcome.
+    /// Runs one bounded orphan collection pass as a recorded attempt and
+    /// reports its full outcome.
     ///
-    /// Mirrors [`Self::run_orphan_gc_for_test`] but surfaces the bounded-run
-    /// accounting an integration test asserts on — deleted, skipped, candidate,
-    /// and pending counts plus whether a per-run bound made the run Partial — so
-    /// tests can prove the page cap and run budget without reaching into the
+    /// The pass is admitted the way the leader admits one: an orphan-cleanup
+    /// task is recorded already claimed, so it becomes the table's one active
+    /// task, and the claim is the run's only table authority. The attempt then
+    /// settles as the production dispatch does — a Partial run returns to the
+    /// pool for retry and an exhausted run succeeds — so the table is free for
+    /// whatever the test runs next. The report surfaces the bounded-run
+    /// accounting an integration test asserts on without reaching into the
     /// crate-private [`OrphanGcOutcome`].
     ///
     /// # Errors
     ///
-    /// Returns lease, catalog, object-store, SQL, audit, or live-set failures
-    /// from the unchanged production GC owner.
+    /// Returns [`ForgeError::FenceLost`] when the table already has an active
+    /// Forge task, and the catalog, object-store, SQL, audit, or live-set
+    /// failures of the unchanged production GC owner.
     #[cfg(feature = "test-support")]
     pub async fn run_orphan_gc_report_for_test(
         &self,
@@ -788,21 +796,62 @@ impl Forge {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
         };
-        let lease_key = forge_lease_key(
-            binding.tenant,
-            &binding.logical_namespace,
-            &binding.table_name,
-        );
-        let mut lease = ForgeLease::acquire(
-            &self.core.operator_pool,
-            lease_key,
-            Uuid::now_v7(),
-            self.core.config.lease_ttl,
-        )
-        .await?
-        .ok_or_else(|| ForgeError::FenceLost {
-            lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
+        let table = self.load_table(&binding.table_ident()).await?;
+        let task_key = super::leader::ForgeTableKey {
+            tenant: binding.tenant,
+            table: vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity::new(
+                BIFROST_CATALOG_NAME,
+                binding.table_ref.namespace.as_str(),
+                binding.table_ref.name.as_str(),
+            )
+            .map_err(ForgeError::Sql)?,
+        };
+        let task = super::gc::orphan_cleanup_task(
+            &task_key,
+            table
+                .metadata()
+                .current_snapshot()
+                .map_or(0, |snapshot| snapshot.snapshot_id()),
+            forge_data_prefix(binding),
+            self.core.clock.now()?,
+            self.core.config.orphan_gc_ttl,
+        )?;
+        let tasks = ForgeTasks::new(self.core.operator_pool.clone());
+        let (task_id, worker_id) = (Uuid::now_v7(), Uuid::now_v7());
+        let lease_seconds =
+            u32::try_from(self.core.config.lease_ttl.as_secs()).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "Forge claim TTL exceeds u32 seconds".to_owned(),
+                }
+            })?;
+        let claim = tasks
+            .insert_claimed(task_id, &task, worker_id, lease_seconds)
+            .await
+            .map_err(ForgeError::Sql)?
+            .ok_or_else(|| ForgeError::FenceLost {
+                lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
+            })?;
+        let attempt = claim.attempt_id.ok_or_else(|| ForgeError::Invariant {
+            detail: "claimed Forge task has no attempt generation".to_owned(),
         })?;
+        tasks
+            .start(
+                task_id,
+                attempt,
+                worker_id,
+                vala_sql::row_types::forge_tasks::SnapshotWatermark {
+                    snapshot_id: task.base_snapshot_id,
+                    timestamp_ms: table
+                        .metadata()
+                        .current_snapshot()
+                        .map_or(0, |snapshot| snapshot.timestamp_ms()),
+                },
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
+        let mut lease =
+            ForgeLease::confirm(tasks.clone(), task_id, attempt, worker_id, self.core.config.lease_ttl)
+                .await?;
         let outcome = self
             .run_orphan_gc_for_table(
                 &mut lease,
@@ -812,12 +861,28 @@ impl Forge {
                     now: self.core.clock.now()?,
                     age_cutoff_ms: None,
                     start_after: None,
-                    task_id: None,
+                    task_id: Some(task_id),
                 },
                 &CancellationToken::new(),
             )
             .await?;
-        lease.release(&self.core.operator_pool).await?;
+        if outcome.partial {
+            tasks
+                .retry(task_id, attempt, worker_id, None)
+                .await
+                .map_err(ForgeError::Sql)?;
+        } else {
+            let authority = vala_sql::row_types::forge_operations::ForgeExpirationAuthority {
+                task_id,
+                attempt_id: attempt,
+                worker_id,
+            };
+            let claim_table = self.expiry_claim_table(&key, &table).await?;
+            tasks
+                .complete_orphan_cleanup(binding.tenant, &authority, &claim_table)
+                .await
+                .map_err(ForgeError::Sql)?;
+        }
         Ok(OrphanGcReport {
             candidates: outcome.candidates,
             deleted: outcome.deleted,
@@ -1408,7 +1473,7 @@ impl Forge {
                 continue;
             }
             require_running(table.stop)?;
-            lease.require_fence(&self.core.operator_pool).await?;
+            lease.require_fence().await?;
             let normalized = table
                 .binding
                 .validate_object_path(path.as_str())
@@ -1436,7 +1501,7 @@ impl Forge {
                 continue;
             }
             require_running(table.stop)?;
-            lease.require_fence(&self.core.operator_pool).await?;
+            lease.require_fence().await?;
             match self.core.object_store.delete(&normalized).await {
                 Ok(()) => {
                     // Counted here, not from the tally: the tally also records
@@ -1555,7 +1620,7 @@ impl Forge {
             deferred,
         } = tally?;
         require_running(table.stop)?;
-        lease.require_fence(&self.core.operator_pool).await?;
+        lease.require_fence().await?;
         let deleted_count = deleted.len();
         let skipped_count = skipped.len();
         let terminal = Self::terminal_gc_detail(
@@ -1735,7 +1800,7 @@ impl Forge {
                 });
             }
         };
-        lease.require_fence(&self.core.operator_pool).await?;
+        lease.require_fence().await?;
         let mut conn = self
             .core
             .vala

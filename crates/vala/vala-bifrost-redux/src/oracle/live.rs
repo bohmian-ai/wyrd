@@ -959,7 +959,7 @@ mod tests {
         use datafusion::physical_optimizer::PhysicalOptimizerRule as _;
         use datafusion::physical_optimizer::filter_pushdown::FilterPushdown;
         use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
-        use wyrd_tonic::prost::Message as _;
+        use prost::Message as _;
 
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let leaf = Arc::new(LiveScribeExec::new(

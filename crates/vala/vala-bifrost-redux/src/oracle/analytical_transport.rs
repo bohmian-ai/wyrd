@@ -1836,8 +1836,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
+    use prost::Message as _;
     use tower::Service as _;
-    use wyrd_tonic::prost::Message as _;
 
     use super::super::analytical::{
         AnalyticalStageIngressConfig, DataFusionQueryId, PublicQueryId,

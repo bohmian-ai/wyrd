@@ -1,8 +1,12 @@
-//! Fenced leases for one Forge tenant/table maintenance scope.
+//! The claim lease on one Forge task, the table's only exclusive authority.
 //!
-//! Lease ownership is coordinated through the operator pool. The fencing token
-//! is carried into tenant transactions so an expired or superseded owner cannot
-//! commit a durable state transition after another Forge process takes over.
+//! The partial unique index `forge_tasks_publication_active` admits one
+//! `claimed`, `running`, or `prepared` task per table, so the active task row is
+//! the table lease: claiming it acquires the table, its terminal transition
+//! releases it, and its heartbeat renews it. Contention is a refused claim at
+//! admission, never a failure after work was admitted. This type carries that
+//! claim's identity into every renewal, pre-commit window check, and tenant
+//! transaction fence of the attempt that owns it.
 
 use std::sync::{
     Arc,
@@ -10,116 +14,110 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use wyrd_spec::DataTenantId;
 
-use vala_sql::OperatorPool;
 use vala_sql::TenantConn;
+use vala_sql::queries::forge_tasks::ForgeTasks;
 
 use super::error::ForgeError;
 
-/// Build the shared lease namespace for all maintenance stages of a table.
-pub fn forge_lease_key(tenant: DataTenantId, logical_namespace: &str, table_name: &str) -> String {
-    format!("forge:table:{tenant}:{logical_namespace}:{table_name}")
-}
-
-#[derive(Debug, Clone)]
-/// A Forge table lease and its database fencing token.
+#[derive(Clone)]
+/// The live claim lease of one Forge task attempt.
+///
+/// Every clone shares one renewal clock, so the attempt's heartbeat loop keeps
+/// the remaining-time estimate current for each clone the attempt's stages
+/// hold.
 pub struct ForgeLease {
-    /// Stable tenant/table lease namespace.
-    pub lease_key: String,
-    /// UUID of the process that owns the lease.
+    /// Durable task owner the claim lives on.
+    tasks: ForgeTasks,
+    /// Claimed task row.
+    pub task_id: Uuid,
+    /// Attempt generation the claim was granted to.
+    pub attempt_id: Uuid,
+    /// UUID of the worker that owns the claim.
     pub owner: Uuid,
-    /// Monotonic token asserted by every durable transition.
-    pub fencing_token: i64,
-    /// Whether this acquisition replaced an expired different owner.
-    takeover: bool,
+    /// Claim lifetime each renewal extends from `PostgreSQL`'s clock.
     ttl: Duration,
-    /// Shared monotonic origin used by every clone of this lease generation.
+    /// Shared monotonic origin used by every clone of this claim.
     clock_started: Instant,
     /// Shared nanosecond offset of the most recent successful renewal.
     confirmed_at_nanos: Arc<AtomicU64>,
 }
 
+impl std::fmt::Debug for ForgeLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ForgeLease")
+            .field("task_id", &self.task_id)
+            .field("attempt_id", &self.attempt_id)
+            .field("owner", &self.owner)
+            .field("ttl", &self.ttl)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ForgeLease {
-    /// Try to acquire a lease, returning `None` when another owner holds it.
+    /// Confirms a claim this worker already holds and starts its renewal clock.
+    ///
+    /// The claim was granted by the task row; confirming it renews that row
+    /// once, so the local remaining-time estimate starts from a renewal the
+    /// database acknowledged rather than from the earlier claim instant.
     ///
     /// # Errors
     ///
-    /// Returns a lease error when the operator query fails or the TTL cannot
-    /// be represented by the database interval.
-    pub async fn acquire(
-        operator_pool: &OperatorPool,
-        lease_key: String,
+    /// Returns [`ForgeError::FenceLost`] when the claim lapsed or passed to
+    /// another attempt before confirmation, [`ForgeError::InvalidConfig`] when
+    /// the TTL does not fit whole seconds, and [`ForgeError::Sql`] for other
+    /// statement failures.
+    pub async fn confirm(
+        tasks: ForgeTasks,
+        task_id: Uuid,
+        attempt_id: Uuid,
         owner: Uuid,
         ttl: Duration,
-    ) -> Result<Option<Self>, ForgeError> {
-        let seconds = i64::try_from(ttl.as_secs()).map_err(|_| ForgeError::InvalidConfig {
-            detail: "lease TTL is too large".to_owned(),
-        })?;
-        let acquisition = vala_sql::queries::maintenance_leases::try_acquire_lease(
-            operator_pool,
-            &lease_key,
+    ) -> Result<Self, ForgeError> {
+        let mut lease = Self {
+            tasks,
+            task_id,
+            attempt_id,
             owner,
-            seconds,
-        )
-        .await
-        .map_err(ForgeError::Lease)?;
-        Ok(acquisition.map(|acquisition| {
-            let clock_started = Instant::now();
-            Self {
-                lease_key,
-                owner,
-                fencing_token: acquisition.fencing_token,
-                takeover: acquisition.takeover,
-                ttl,
-                clock_started,
-                confirmed_at_nanos: Arc::new(AtomicU64::new(0)),
-            }
-        }))
+            ttl,
+            clock_started: Instant::now(),
+            confirmed_at_nanos: Arc::new(AtomicU64::new(0)),
+        };
+        lease.require_renewal().await?;
+        Ok(lease)
     }
 
-    /// Reports whether acquisition replaced an expired row owned by another owner.
-    #[must_use]
-    pub const fn takeover(&self) -> bool {
-        self.takeover
-    }
-
-    /// Renew this lease and refresh its local confirmation time.
+    /// Renews this claim and refreshes its local confirmation time.
     ///
-    /// Returns `false` when the owner or fencing token no longer matches.
-    pub async fn renew(&mut self, operator_pool: &OperatorPool) -> Result<bool, ForgeError> {
-        let seconds = i64::try_from(self.ttl.as_secs()).map_err(|_| ForgeError::InvalidConfig {
-            detail: "lease TTL is too large".to_owned(),
+    /// Returns `false` when the claim no longer belongs to this attempt and
+    /// owner, or has lapsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::InvalidConfig`] when the TTL does not fit whole
+    /// seconds and [`ForgeError::Sql`] for statement failures other than a
+    /// stale claim.
+    pub async fn renew(&mut self) -> Result<bool, ForgeError> {
+        let seconds = u32::try_from(self.ttl.as_secs()).map_err(|_| ForgeError::InvalidConfig {
+            detail: "Forge claim TTL exceeds u32 seconds".to_owned(),
         })?;
-        let renewed = vala_sql::queries::maintenance_leases::renew_lease_fenced(
-            operator_pool,
-            &self.lease_key,
-            self.owner,
-            self.fencing_token,
-            seconds,
-        )
-        .await
-        .map_err(ForgeError::Lease)?;
-        if renewed {
-            self.confirmed_at_nanos
-                .store(self.elapsed_nanos(), Ordering::Release);
+        match self
+            .tasks
+            .heartbeat(self.task_id, self.attempt_id, self.owner, seconds)
+            .await
+        {
+            Ok(()) => {
+                self.confirmed_at_nanos
+                    .store(self.elapsed_nanos(), Ordering::Release);
+                Ok(true)
+            }
+            Err(vala_sql::SqlError::Conflict { .. }) => Ok(false),
+            Err(error) => Err(ForgeError::Sql(error)),
         }
-        Ok(renewed)
     }
 
-    /// Release this lease only if the owner and fencing token still match.
-    pub async fn release(&self, operator_pool: &OperatorPool) -> Result<bool, ForgeError> {
-        vala_sql::queries::maintenance_leases::release_lease_fenced(
-            operator_pool,
-            &self.lease_key,
-            self.owner,
-            self.fencing_token,
-        )
-        .await
-        .map_err(ForgeError::Lease)
-    }
-
-    /// Return the locally estimated time remaining before the lease expires.
+    /// Returns the locally estimated time remaining before the claim lapses.
     pub fn remaining(&self) -> Duration {
         let confirmed_at = self.confirmed_at_nanos.load(Ordering::Acquire);
         self.ttl.saturating_sub(Duration::from_nanos(
@@ -127,65 +125,69 @@ impl ForgeLease {
         ))
     }
 
-    /// Check whether the remaining lease covers a required commit window.
+    /// Checks whether the remaining claim covers a required commit window.
     pub fn commit_window_fits(&self, required: Duration) -> bool {
         self.remaining() > required
     }
 
-    /// Renew the lease and fail closed if its fence cannot be confirmed.
-    pub async fn require_fence(&mut self, operator_pool: &OperatorPool) -> Result<(), ForgeError> {
+    /// Renews the claim and fails closed if it cannot be confirmed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when the local estimate has already
+    /// lapsed or the renewal finds the claim gone, and the renewal's other
+    /// failures unchanged.
+    pub async fn require_fence(&mut self) -> Result<(), ForgeError> {
         if self.remaining().is_zero() {
-            return Err(ForgeError::FenceLost {
-                lease_key: self.lease_key.clone(),
-            });
+            return Err(self.fence_lost());
         }
-        if !self.renew(operator_pool).await? {
-            return Err(ForgeError::FenceLost {
-                lease_key: self.lease_key.clone(),
-            });
-        }
-        Ok(())
+        self.require_renewal().await
     }
 
-    /// Assert this lease inside a tenant transaction immediately before commit.
+    /// Asserts this claim inside a tenant transaction immediately before commit.
     ///
-    /// A lost lease is returned as [`ForgeError::FenceLost`], while other SQL
-    /// failures retain their original error classification.
+    /// The task row is locked for the rest of the transaction, so the claim
+    /// cannot be reclaimed or taken over between this check and the commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when the claim no longer belongs to
+    /// this live attempt, and [`ForgeError::Sql`] for other statement failures.
     pub async fn assert_transaction_fence(
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<(), ForgeError> {
-        match vala_sql::queries::maintenance_leases::assert_fence(
-            conn,
-            &self.lease_key,
-            self.owner,
-            self.fencing_token,
-        )
-        .await
-        {
+        match ForgeTasks::lock_live_claim(conn, self.task_id, self.attempt_id, self.owner).await {
             Ok(()) => Ok(()),
-            Err(vala_sql::SqlError::InvariantViolation { .. }) => Err(ForgeError::FenceLost {
-                lease_key: self.lease_key.clone(),
-            }),
+            Err(vala_sql::SqlError::Conflict { .. }) => Err(self.fence_lost()),
             Err(error) => Err(ForgeError::Sql(error)),
+        }
+    }
+
+    /// Renews the claim, reporting a stale claim as a lost fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] for a stale claim and the renewal's
+    /// other failures unchanged.
+    async fn require_renewal(&mut self) -> Result<(), ForgeError> {
+        if self.renew().await? {
+            Ok(())
+        } else {
+            Err(self.fence_lost())
+        }
+    }
+
+    /// Names this claim in a lost-fence error.
+    #[must_use]
+    pub fn fence_lost(&self) -> ForgeError {
+        ForgeError::FenceLost {
+            lease_key: format!("forge:task:{}:{}", self.task_id, self.attempt_id),
         }
     }
 
     /// Returns the saturated monotonic nanosecond offset for shared renewal state.
     fn elapsed_nanos(&self) -> u64 {
         u64::try_from(self.clock_started.elapsed().as_nanos()).unwrap_or(u64::MAX)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lease_key_is_shared_by_all_table_maintenance_concerns() {
-        let tenant = DataTenantId::new_v7();
-        let key = forge_lease_key(tenant, "vala.traces", "spans");
-        assert_eq!(key, format!("forge:table:{tenant}:vala.traces:spans"));
-        assert_eq!(key, forge_lease_key(tenant, "vala.traces", "spans"));
     }
 }

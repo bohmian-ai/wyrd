@@ -539,8 +539,8 @@ mod pg_tests {
                 .expect("tenant connection")
         }
 
-        /// Reads one tenant's cut over `tables` inside a tenant transaction,
-        /// as Oracle does; the transaction rolls back when it drops.
+        /// Reads one tenant's cut over `tables` as one autocommit statement on
+        /// a plain request-role connection, as Oracle does.
         ///
         /// # Errors
         ///
@@ -561,8 +561,8 @@ mod pg_tests {
                     table_name: table,
                 })
                 .collect();
-            let mut conn = self.conn(tenant).await;
-            OracleTableCuts::new(&mut conn).read(&refs).await
+            let mut conn = self.fixture.app_pool().acquire().await.expect("connection");
+            OracleTableCuts::new(&mut conn, tenant).read(&refs).await
         }
 
         /// Records `replaced` for one table under its exclusive authority, as
@@ -729,6 +729,45 @@ mod pg_tests {
         assert_eq!(cut_b[0].metadata_location, "s3://b/events/v1.metadata.json");
         assert_eq!(cut_b[0].hot_files.len(), 1);
         assert_eq!(cut_b[0].hot_files[0].file_path, "b/hot-1.parquet");
+
+        // The cut's tenant binding is statement-local: the next statement on
+        // the same connection sees no tenant. Inside a transaction already
+        // bound to another tenant the cut refuses instead of rebinding.
+        let mut plain = reads
+            .fixture
+            .app_pool()
+            .acquire()
+            .await
+            .expect("connection");
+        OracleTableCuts::new(&mut plain, tenant_b)
+            .read(&[CutTableRef {
+                namespace_name: NAMESPACE,
+                table_name: "events",
+            }])
+            .await
+            .expect("the cut reads");
+        let after: String =
+            sqlx::query_scalar("SELECT current_setting('app.current_tenant', true)")
+                .fetch_one(&mut *plain)
+                .await
+                .expect("setting reads");
+        assert_eq!(after, "", "the binding ends with the cut statement");
+        drop(plain);
+        let mut bound = reads.conn(tenant_a).await;
+        let refused = OracleTableCuts::new(bound.transaction(), tenant_b)
+            .read(&[CutTableRef {
+                namespace_name: NAMESPACE,
+                table_name: "events",
+            }])
+            .await
+            .expect_err("a cut never rebinds another tenant's transaction");
+        assert!(
+            refused
+                .to_string()
+                .contains("differs from the bound tenant"),
+            "{refused}"
+        );
+        drop(bound);
 
         // A missing registration or pointer fails the whole statement.
         assert!(matches!(

@@ -171,8 +171,7 @@ impl WriterPool {
     ///
     /// Both correlation fields are optional. An omitted `card_uid` becomes a
     /// null in the sealed batch, which the server stores against the
-    /// authenticated principal with a null `card_uid`. The row carries no
-    /// writer event time, as [`Self::insert_rows`] describes for `None`.
+    /// authenticated principal with a null `card_uid`.
     ///
     /// The queue-domain [`WyrdQueueError`] is propagated verbatim (rather than
     /// projected onto the shared catalog) so the client-tier code —
@@ -194,7 +193,8 @@ impl WriterPool {
         card_uid: Option<CardUid>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
-        self.insert_rows(table, schema, vec![json], card_uid, run_id)
+        self.producer_for(table, schema)?
+            .enqueue(json, card_uid, run_id)
     }
 
     /// Enqueue every row of one logical record, or none of them, propagating

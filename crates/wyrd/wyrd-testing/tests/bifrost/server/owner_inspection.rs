@@ -270,8 +270,11 @@ fn wal_segments(
 
 /// A WAL that fails restart replay leaves only Scribe unready.
 ///
-/// A WAL sync fault keeps the segments on disk; corrupting the final CRC byte
-/// of each segment that holds records makes the next boot's replay fail. The
+/// A WAL sync fault keeps the segments on disk. Corrupting the prologue CRC of
+/// each segment that holds records makes the next boot's replay fail: a bad
+/// prologue is corruption wherever the segment lies, whereas a bad final
+/// record is the unacknowledged tail replay truncates, and the segment holding
+/// the acknowledged seed rows may already be retired. The
 /// restarted combined target must still boot and report `/readyz` 200 with
 /// Scribe named unready, keep answering published Oracle reads, refuse writes
 /// without an ACK, and leave every WAL byte as it found it for operator
@@ -317,8 +320,7 @@ async fn failed_wal_replay_is_role_local() -> Result<(), super::query::ServerJou
     let mut corrupted = 0;
     for (path, mut bytes) in wal_segments(&wal_root)? {
         if bytes.len() > 64 {
-            let last = bytes.len() - 1;
-            bytes[last] ^= 0xff;
+            bytes[60] ^= 0xff;
             std::fs::write(&path, &bytes)?;
             corrupted += 1;
         }

@@ -520,24 +520,17 @@ pub enum QueryContractError {
         /// Zero-based position of the rejected bind value.
         index: usize,
     },
-    /// The caller deadline is not an integer in `1..=u32::MAX` milliseconds.
-    #[error("deadline_ms must be an integer between 1 and 4294967295")]
-    InvalidDeadline,
 }
 
 /// Projects a query request refusal onto the Bifrost error catalog.
 ///
-/// A deadline outside its range is `WYRD_VALA_400_QUERY_INVALID_DEADLINE`;
-/// every other contract refusal concerns the SQL text or its bind values and is
+/// Every contract refusal, the deadline range included, is
 /// `WYRD_VALA_400_QUERY_INVALID_SQL`. Client pre-IO validation and Oracle's
 /// server-side validation both route through this one projection.
 impl From<QueryContractError> for crate::vala::error::BifrostError {
     fn from(error: QueryContractError) -> Self {
-        match error {
-            QueryContractError::InvalidDeadline => Self::QueryInvalidDeadline,
-            other => Self::QueryInvalidSql {
-                detail: other.to_string(),
-            },
+        Self::QueryInvalidSql {
+            detail: error.to_string(),
         }
     }
 }
@@ -627,7 +620,9 @@ impl BifrostQueryRequest {
             .deadline_ms
             .is_some_and(|deadline| !(1..=i64::from(u32::MAX)).contains(&deadline))
         {
-            return Err(QueryContractError::InvalidDeadline);
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "deadline_ms must be between 1 and 4294967295",
+            });
         }
         Ok(())
     }
@@ -1233,8 +1228,8 @@ mod query_terminal_tests {
         );
     }
 
-    /// An out-of-range deadline projects onto the Bifrost deadline code, while
-    /// an empty statement stays the SQL refusal.
+    /// An out-of-range deadline and an empty statement both project onto the
+    /// SQL refusal.
     ///
     /// # Panics
     ///
@@ -1253,7 +1248,7 @@ mod query_terminal_tests {
 
         assert_eq!(
             refusal(request("SELECT 1", Some(0))),
-            "WYRD_VALA_400_QUERY_INVALID_DEADLINE"
+            "WYRD_VALA_400_QUERY_INVALID_SQL"
         );
         assert_eq!(
             refusal(request(" ", None)),

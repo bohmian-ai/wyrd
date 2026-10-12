@@ -3253,8 +3253,24 @@ mod tests {
             self.shut_down().await;
         }
 
-        /// Submits generation `generation` and waits until the worker reports
-        /// it durable as a staged member, acknowledging its visibility.
+        /// Returns the retained audit table competing audit traffic stages into.
+        fn audit_table() -> crate::catalog::TableRef {
+            crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Audit, "audit_log")
+        }
+
+        /// Stages generation `generation` of [`Self::fixture_table`].
+        ///
+        /// # Panics
+        ///
+        /// Panics when [`Self::stage_generation_on`] fails.
+        async fn stage_generation(&self, generation: u64) {
+            self.stage_generation_on(Self::fixture_table(), generation)
+                .await;
+        }
+
+        /// Submits generation `generation` of `table` and waits until the
+        /// worker reports it durable as a staged member, acknowledging its
+        /// visibility.
         ///
         /// The caller registers the table's control row first, once. The
         /// member stays ready: no claim is published here.
@@ -3263,8 +3279,7 @@ mod tests {
         ///
         /// Panics when the generation cannot register, submit, or stage, or
         /// when the worker reports a failed completion.
-        async fn stage_generation(&self, generation: u64) {
-            let table = Self::fixture_table();
+        async fn stage_generation_on(&self, table: crate::catalog::TableRef, generation: u64) {
             let seal_key = SealKey::new(
                 self.tenant,
                 table.clone(),
@@ -3400,34 +3415,49 @@ mod tests {
     }
 
     /// A flush returns only after a member durable at its drain publishes,
-    /// even when another publisher, not the flush, claimed that member.
+    /// even when another publisher, not the flush, claimed that member, and
+    /// competing audit traffic neither satisfies that wait nor consumes the
+    /// table's injected fault.
     ///
     /// The lifecycle tick's `publish_due` can claim members the flush's own
-    /// drain made durable; the flush then has nothing to take and nothing in
-    /// flight. Here the test holds that outside claim itself, so the flush must
-    /// wait for it rather than return while its rows are unpublished. The wait
-    /// is observed through the claim-slot probe, then the outside claim
+    /// drain made durable; the flush then has nothing of that table to take and
+    /// nothing of it in flight. Here the test holds that outside claim itself,
+    /// so the flush must wait for it rather than return while its rows are
+    /// unpublished. Raw staging rows of the retained audit table are durable at
+    /// the same drain, as every audited call makes them, so the flush publishes
+    /// that claim itself while a one-shot fault scoped to the test table stays
+    /// armed and the table-scoped backlog still shows the claimed member. The
+    /// wait is observed through the claim-slot probe, then the outside claim
     /// publishes and the flush ends with nothing left staged.
     ///
     /// # Panics
     ///
-    /// Panics when the fixture cannot stage or publish, or when the flush
-    /// returns before the outside claim over its durable member publishes.
+    /// Panics when the fixture cannot stage or publish, when the flush returns
+    /// before the outside claim over its durable member publishes, or when the
+    /// audit claim consumes the test table's fault or masks its backlog.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[cfg(feature = "test-support")]
     async fn flush_waits_for_an_outside_claim_over_members_durable_at_drain() {
         let faults = PersistenceFaults::default();
-        let fixture = IdlePersistenceFixture::start_with(faults.clone(), 1).await;
-        fixture
-            .register_control_row(&IdlePersistenceFixture::fixture_table())
-            .await;
+        // Two claim slots: the outside claim holds one, so the flush has the
+        // other for the audit claim and then waits only on its snapshot.
+        let fixture = IdlePersistenceFixture::start_with(faults.clone(), 2).await;
+        let table = IdlePersistenceFixture::fixture_table();
+        let audit = IdlePersistenceFixture::audit_table();
+        fixture.register_control_row(&table).await;
+        fixture.register_control_row(&audit).await;
         fixture.stage_generation(1).await;
+        // Generation ordinals are unique per shard across tables.
+        fixture.stage_generation_on(audit.clone(), 2).await;
+        faults.target_table_for_test(table.name.clone());
+        faults.fail_next_claim_retirement();
         let worker = fixture.runtime.worker.as_ref().expect("persistence worker");
         let staging = worker.staging().expect("staging runtime");
         let key = staging
             .ready_keys()
             .expect("ready keys")
-            .pop()
+            .into_iter()
+            .find(|key| key.table() == &table)
             .expect("the staged member's key is ready");
         let outside = staging
             .take_residue(&key, crate::scribe::assembly::ClaimCause::Drain)
@@ -3444,6 +3474,23 @@ mod tests {
             ),
             () = faults.wait_for_claim_contention_for_test(1) => {}
         }
+        assert!(
+            faults.claim_retirement_failure_armed_for_test(),
+            "the audit claim the flush published did not consume the test table's fault"
+        );
+        let backlog = |name: &str| {
+            fixture
+                .runtime
+                .staging_backlog_for_test(Some(name))
+                .expect("staging backlog")
+        };
+        assert_eq!(
+            (backlog(&audit.name).live_members, backlog(&table.name).live_members),
+            (0, 1),
+            "the table-scoped backlog keeps the claimed member while audit rows publish"
+        );
+        // Moving the scope off the test table lets the outside claim retire.
+        faults.target_table_for_test("unrelated_table");
         worker
             .publish_claim(&staging, &outside)
             .await
@@ -3453,8 +3500,8 @@ mod tests {
             flush
                 .await
                 .expect("the flush ends once the outside claim publishes"),
-            0,
-            "the flush published nothing itself"
+            1,
+            "the flush published only the audit claim itself"
         );
         assert_eq!(
             fixture

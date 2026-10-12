@@ -3656,7 +3656,7 @@ async fn settle_attempt_output(
     } = settle;
     // A cancel before the first batch ends the wait, exactly as a cancel of
     // an open stream ends its next read; the distributed children are then
-    // cancelled and joined like any other first-batch failure. It is marked
+    // cancelled like any other first-batch failure. It is marked
     // on the query's telemetry as `request_cancel` marks an open stream, so
     // an owner cancelled before its stream opens is recorded as cancelled.
     let cancellation = admitted.cancellation.clone();
@@ -3692,7 +3692,6 @@ async fn settle_attempt_output(
     {
         admitted.cancellation.cancel();
         drop(batches);
-        admitted.distributed_settlement.join().await;
         return release_error(
             deadline,
             admitted,
@@ -3919,12 +3918,12 @@ fn release_error<T>(
     Err(original)
 }
 
-/// Cancels and joins every distributed child before releasing query admission.
+/// Cancels every distributed child and releases query admission.
 ///
 /// Dropping the batches drops the graph's stream-owned lifecycle, which
-/// releases the graph inline; the error returns to the caller only after the
-/// children are joined and admission is released, so no caller observes a
-/// terminal while the query still owns anything.
+/// releases the graph inline without waiting for children still being torn
+/// down; their bytes return through the shared memory root as they free them.
+/// The error returns to the caller after admission is released.
 ///
 /// # Errors
 ///
@@ -3939,7 +3938,6 @@ async fn settle_distributed_failure<T>(
     admitted.cancellation.cancel();
     admitted.request_cancellation.cancel();
     drop(batches);
-    admitted.distributed_settlement.join().await;
     #[cfg(feature = "test-support")]
     analytical::analytical_cleanup_pause_for_test().hold().await;
     release_error(deadline, admitted, original, phase)

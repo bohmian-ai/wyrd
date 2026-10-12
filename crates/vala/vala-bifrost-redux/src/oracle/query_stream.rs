@@ -433,7 +433,6 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
         mut running_query,
         profile,
     } = input;
-    let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
     // Built before the generator, never inside it: a stream dropped before its
     // first poll drops only its captures, in an unspecified order, so the two
     // owners must already be one captured value whose `Drop` fixes the order.
@@ -510,7 +509,6 @@ fn build_frames(input: FrameBuildInput) -> Pin<Box<OracleFrameStream>> {
             stream_telemetry_cancelled: &stream_telemetry_cancelled,
             request_cancellation: &request_cancellation,
             stream_cancellation: &stream_cancellation,
-            distributed_settlement: &distributed_settlement,
             admitted: &mut owners.admitted,
             ipc: &mut ipc,
             query_telemetry: &mut query_telemetry,
@@ -607,7 +605,7 @@ fn collect_degraded_sources(
 /// Everything one drained query stream must settle before it reports a terminal.
 ///
 /// Grouped because settlement and terminal assembly are one ordered act: the
-/// cancellation signals, the distributed fan-out, the Analytical ownership, the
+/// cancellation signals, the Analytical ownership, the
 /// IPC writer, admission, telemetry, and the running-query registry are all
 /// closed in a fixed order, and none of them is meaningful apart from it.
 struct StreamSettlementInputs<'a> {
@@ -619,8 +617,6 @@ struct StreamSettlementInputs<'a> {
     request_cancellation: &'a CancellationToken,
     /// Stream-scoped cancellation, signalled on a failed terminal.
     stream_cancellation: &'a CancellationToken,
-    /// Distributed fan-out this query must join before it settles.
-    distributed_settlement: &'a Arc<super::admission::DistributedQuerySettlement>,
     /// Admission guard whose Analytical ownership settles with the stream.
     admitted: &'a mut Option<AdmittedQueryGuard>,
     /// Arrow IPC writer closed after the last batch frame.
@@ -645,20 +641,19 @@ struct StreamSettlementInputs<'a> {
 
 /// Settles every owner the drained stream holds and assembles its terminal.
 ///
-/// Cancellation is projected first so a failed terminal signals both tokens
-/// before anything waits on them; the distributed fan-out is joined next so no
-/// peer work outlives the stream; the Analytical attempt settles after that,
+/// Cancellation is projected first so a failed terminal signals both tokens,
+/// which stops the distributed fan-out; the Analytical attempt settles next,
 /// because its ownership is what releases the query envelope the fan-out
 /// charged against. Only then is the IPC stream closed, admission released,
-/// telemetry finished, and the registry entry retired — so a terminal frame is
-/// never emitted while any owner it accounts for is still live.
+/// telemetry finished, and the registry entry retired. Dependency-owned
+/// children still being torn down are not awaited; their bytes return through
+/// the shared memory root as they free them.
 async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTerminalFrame {
     let StreamSettlementInputs {
         candidate,
         stream_telemetry_cancelled,
         request_cancellation,
         stream_cancellation,
-        distributed_settlement,
         admitted,
         ipc,
         query_telemetry,
@@ -675,7 +670,6 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         request_cancellation,
         stream_cancellation,
     );
-    settle_distributed(distributed_settlement, outcome, stream_cancellation).await;
     // A cleanup that could not be confirmed cannot become a success terminal:
     // the graph is retained as draining, so rows this query produced are not
     // provably complete and its owners are not provably returned.
@@ -772,26 +766,6 @@ fn cancellation_requested(
     request_cancellation: &CancellationToken,
 ) -> bool {
     cancellation.is_cancelled() || request_cancellation.is_cancelled()
-}
-
-/// Settles every distributed child before the terminal frame is emitted.
-///
-/// A failed terminal cancels first, because the remaining children have no
-/// consumer and would otherwise keep RPCs and reservations alive past the
-/// query that owns them; any other terminal joins without cancelling so
-/// in-flight children finish their own release. Either way this awaits to
-/// completion, which is what guarantees no nested resource child outlives the
-/// query owner.
-async fn settle_distributed(
-    settlement: &Arc<super::admission::DistributedQuerySettlement>,
-    outcome: QueryTerminalOutcome,
-    stream_cancellation: &CancellationToken,
-) {
-    if outcome == QueryTerminalOutcome::Failed {
-        settlement.cancel_and_join(stream_cancellation).await;
-    } else {
-        settlement.join().await;
-    }
 }
 
 /// Settles an Analytical attempt before its admission is released.

@@ -497,11 +497,11 @@ sdks/wyrd-sdk-python/python/wyrd/types.py	A		preserved	TASK-001
 sdks/wyrd-sdk-python/src/bifrost/mod.rs	M	C	adapted	TASK-001	
 sdks/wyrd-sdk-python/tests/bifrost/test_public_typing.py	M	A	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
 sdks/wyrd-sdk-python/tests/integration/bifrost/test_bifrost_e2e.py	M	C	main-retained	TASK-002	Main OTel story kept; source Variant attribute assertions not ported, assigned to TASK-002 Part D.
-sdks/wyrd-sdk-python/tests/integration/bifrost/test_every_iceberg_column_type.py	A		preserved	TASK-001	
-sdks/wyrd-sdk-python/tests/integration/bifrost/test_register_a_table_from_a_model.py	A		preserved	TASK-001	
-sdks/wyrd-sdk-python/tests/integration/bifrost/test_table_time_column.py	A		preserved	TASK-001	
-sdks/wyrd-sdk-python/tests/integration/bifrost/test_three_timestamp_types.py	A		preserved	TASK-001	
-sdks/wyrd-sdk-python/tests/integration/bifrost/test_variant_tables.py	A		preserved	TASK-001	
+sdks/wyrd-sdk-python/tests/integration/bifrost/test_every_iceberg_column_type.py	A		adapted	TASK-001	S capability tests called to the integrated SDK surface (ambient client, from_arrow(table, schema), sql(..., model=)); assertions unchanged (TASK-002 Q21).
+sdks/wyrd-sdk-python/tests/integration/bifrost/test_register_a_table_from_a_model.py	A		adapted	TASK-001	S capability tests called to the integrated SDK surface (ambient client, from_arrow(table, schema), sql(..., model=)); assertions unchanged (TASK-002 Q21).
+sdks/wyrd-sdk-python/tests/integration/bifrost/test_table_time_column.py	A		adapted	TASK-001	S capability tests called to the integrated SDK surface (ambient client, from_arrow(table, schema), sql(..., model=)); assertions unchanged (TASK-002 Q21).
+sdks/wyrd-sdk-python/tests/integration/bifrost/test_three_timestamp_types.py	A		adapted	TASK-001	S capability tests called to the integrated SDK surface (ambient client, from_arrow(table, schema), sql(..., model=)); assertions unchanged (TASK-002 Q21).
+sdks/wyrd-sdk-python/tests/integration/bifrost/test_variant_tables.py	A		adapted	TASK-001	S capability tests called to the integrated SDK surface (ambient client, from_arrow(table, schema), sql(..., model=)); assertions unchanged (TASK-002 Q21).
 sdks/wyrd-sdk-python/tests/integration/state/test_observe_journey.py	M	C	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
 sdks/wyrd-sdk-python/tests/integration/test_bifrost_query.py	M	C	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
 sdks/wyrd-sdk-python/tests/integration/test_drift_journey.py	M	C	retired	TASK-002	Main deleted; drift assertions assigned to TASK-002 Part C.

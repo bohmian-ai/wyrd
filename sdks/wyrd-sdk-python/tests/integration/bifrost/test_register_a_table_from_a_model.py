@@ -87,7 +87,7 @@ def test_api_requests_read_back_as_the_same_models(api_requests: Bifrost) -> Non
     rows = api_requests.sql(
         "SELECT request_id, outcome, prediction, attributes "
         "FROM vala.datasets.api_requests ORDER BY request_id",
-        ApiRequest,
+        model=ApiRequest,
     )
 
     assert rows == REQUESTS
@@ -98,7 +98,7 @@ def test_a_nested_model_field_is_selected_by_its_path(api_requests: Bifrost) -> 
     rows = api_requests.sql(
         "SELECT request_id, prediction['feature_importance']['importance'] AS importance "
         "FROM vala.datasets.api_requests ORDER BY request_id",
-        Importance,
+        model=Importance,
     )
 
     assert rows == [
@@ -113,7 +113,7 @@ def test_a_nested_model_field_filters_rows(api_requests: Bifrost) -> None:
         "SELECT request_id, prediction['feature_importance']['importance'] AS importance "
         "FROM vala.datasets.api_requests "
         "WHERE prediction['feature_importance']['importance'] > 0.5",
-        Importance,
+        model=Importance,
     )
 
     assert rows == [Importance(request_id="req-1", importance=0.72)]
@@ -124,7 +124,7 @@ def test_an_open_dict_field_is_queried_by_key(api_requests: Bifrost) -> None:
     rows = api_requests.sql(
         "SELECT request_id, attributes -> 'client' ->> 'region' AS region "
         "FROM vala.datasets.api_requests ORDER BY request_id",
-        Region,
+        model=Region,
     )
 
     assert rows == [

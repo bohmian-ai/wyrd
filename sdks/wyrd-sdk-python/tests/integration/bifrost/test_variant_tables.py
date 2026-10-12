@@ -39,11 +39,7 @@ class Event(BaseModel):
 def bifrost(wyrd_server: WyrdTestServer) -> Bifrost:
     """A client writing to a freshly registered ``Event`` table."""
 
-    bifrost = Bifrost(
-        TableConfig(Event, f"vala.datasets.events_{uuid.uuid4().hex}"),
-        server_url=wyrd_server.base_url,
-        credential=wyrd_server.api_key,
-    )
+    bifrost = Bifrost(TableConfig(Event, f"vala.datasets.events_{uuid.uuid4().hex}"))
     bifrost.register()
     return bifrost
 
@@ -79,7 +75,9 @@ def test_rows_come_back_as_native_values(bifrost: Bifrost, wyrd_server: WyrdTest
     wyrd_server.flush_bifrost()
 
     table = bifrost.table.fqn
-    rows = bifrost.sql(f"SELECT id, payload, mixed, point, tags FROM {table} ORDER BY id", Event)
+    rows = bifrost.sql(
+        f"SELECT id, payload, mixed, point, tags FROM {table} ORDER BY id", model=Event
+    )
 
     assert rows == events
 
@@ -88,7 +86,7 @@ def test_query_results_copy_into_another_table(
     bifrost: Bifrost, wyrd_server: WyrdTestServer
 ) -> None:
     archive = TableConfig(Event, f"vala.datasets.archive_{uuid.uuid4().hex}")
-    Bifrost(archive, server_url=wyrd_server.base_url, credential=wyrd_server.api_key).register()
+    Bifrost(archive).register()
     event = Event(id=1, payload={"source": "row"}, mixed=8, point=Point(x=1), tags=["a"])
     bifrost.insert(event)
     bifrost.flush()
@@ -98,7 +96,7 @@ def test_query_results_copy_into_another_table(
     bifrost.write_batch(archive.fqn, copied.to_arrow().to_batches()[0])
     wyrd_server.flush_bifrost()
 
-    rows = bifrost.sql(f"SELECT id, payload, mixed, point, tags FROM {archive.fqn}", Event)
+    rows = bifrost.sql(f"SELECT id, payload, mixed, point, tags FROM {archive.fqn}", model=Event)
     assert rows == [event]
 
 
@@ -158,7 +156,7 @@ def test_unsupported_type_is_refused(arrow_type: pyarrow.DataType) -> None:
     schema = pyarrow.schema([pyarrow.field("moment", arrow_type)])
 
     with pytest.raises(WyrdError) as error:
-        TableConfig.from_arrow(schema, "vala.datasets.unsupported")
+        TableConfig.from_arrow("vala.datasets.unsupported", schema)
 
     assert error.value.code == "WYRD_VALA_400_BIFROST_UNSUPPORTED_TYPE"
     assert error.value.status == 400

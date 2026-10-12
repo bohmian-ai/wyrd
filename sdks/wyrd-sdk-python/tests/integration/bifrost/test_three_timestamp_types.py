@@ -105,7 +105,7 @@ def pydantic_orders(wyrd_server: WyrdTestServer) -> Bifrost:
 
 @pytest.mark.integration
 def test_wyrd_timestamps_read_back_as_wyrd_values(wyrd_orders: Bifrost) -> None:
-    orders = wyrd_orders.sql(f"SELECT * FROM {WYRD_ORDERS} ORDER BY order_id", WyrdOrder)
+    orders = wyrd_orders.sql(f"SELECT * FROM {WYRD_ORDERS} ORDER BY order_id", model=WyrdOrder)
 
     assert [order.order_id for order in orders] == ["chicago", "tokyo"]
     for order in orders:
@@ -143,7 +143,7 @@ def test_pydantic_timestamps_go_through_wyrd_types(pydantic_orders: Bifrost) -> 
         field.name: field.type for field in TableConfig.describe(PYDANTIC_ORDERS).arrow_schema
     }
     orders = pydantic_orders.sql(
-        f"SELECT * FROM {PYDANTIC_ORDERS} ORDER BY order_id", PydanticOrder
+        f"SELECT * FROM {PYDANTIC_ORDERS} ORDER BY order_id", model=PydanticOrder
     )
 
     assert columns["store_opens"] == pyarrow.timestamp("us")
@@ -191,7 +191,7 @@ def test_an_arrow_instant_in_any_zone_is_one_instant_and_a_naive_one_is_refused(
             {"received_at": pyarrow.array([RECEIVED], pyarrow.timestamp("us", tz=zone))}
         )
 
-    orders = Bifrost(TableConfig.from_arrow(received("America/New_York").schema, ARROW_ORDERS))
+    orders = Bifrost(TableConfig.from_arrow(ARROW_ORDERS, received("America/New_York").schema))
     orders.register()
     for zone in ["UTC", "America/Chicago", "Asia/Tokyo"]:
         orders.write_batch(ARROW_ORDERS, received(zone))

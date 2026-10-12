@@ -686,6 +686,9 @@ impl<T: AuditStage> OracleAudit for T {
 }
 
 /// Builds the scrubbed event shared by read decisions and security violations.
+///
+/// The event names the credential the principal authenticated with, when it
+/// has one, exactly as HTTP audit does.
 fn query_audit_event(
     context: &AuthorizedQueryContext,
     operation: &str,
@@ -703,6 +706,7 @@ fn query_audit_event(
         context.permission.to_string(),
         outcome,
     )
+    .with_credential_id(context.principal.credential_id)
     .with_detail(detail)
 }
 

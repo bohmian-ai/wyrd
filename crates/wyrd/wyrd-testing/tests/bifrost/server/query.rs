@@ -1495,13 +1495,23 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     let writes = server
         .retained_audit_records(
             tenant,
-            "outcome, audit_principal_id, detail",
+            "outcome, audit_principal_id, detail, credential_id",
             "operation = 'bifrost.record.write'",
         )
         .await?;
     let [
-        [Some(denied), Some(denied_principal), denied_detail],
-        [Some(allowed), Some(allowed_principal), allowed_detail],
+        [
+            Some(denied),
+            Some(denied_principal),
+            denied_detail,
+            denied_credential,
+        ],
+        [
+            Some(allowed),
+            Some(allowed_principal),
+            allowed_detail,
+            allowed_credential,
+        ],
     ] = writes
         .iter()
         .map(Vec::as_slice)
@@ -1526,6 +1536,15 @@ async fn prove_service_b_acts_for_service_a() -> Result<(), ServerJourneyError> 
     assert!(
         allowed_detail.is_none(),
         "B's direct write carries no delegation attribution: {allowed_detail:?}"
+    );
+    assert_eq!(
+        *denied_credential, None,
+        "the delegated refusal names no credential"
+    );
+    assert_eq!(
+        *allowed_credential,
+        Some(b_credential.to_string()),
+        "B's direct write names the API key B authenticated with"
     );
 
     server.shutdown().await?;

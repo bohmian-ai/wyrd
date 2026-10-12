@@ -224,7 +224,9 @@ impl Forge {
     /// held across that IO: it is taken before preparation and surrendered
     /// only once the commit's outcome is known and the claims are settled or
     /// reset, so no other destructive maintenance interleaves with it. The
-    /// Forge lease TTL bounds that hold. Claims that outlive the authority
+    /// renewed lease's remaining time, less the uncertainty margin, bounds
+    /// that hold, so a pass cut off before submission still resets its claims
+    /// under a live fence. Claims that outlive the authority
     /// therefore always name an expiration whose acceptance is unknown, which
     /// reconciliation resolves. Oracle cuts never wait on it: retention keeps
     /// every expired snapshot older than the maximum query deadline.
@@ -293,8 +295,9 @@ impl Forge {
         lease.require_fence(&self.core.operator_pool).await?;
         // The exclusive table authority is held through the Iceberg commit's
         // known outcome and the claims' resolution, so no other destructive
-        // maintenance interleaves with this expiry. The lease TTL bounds the
-        // hold.
+        // maintenance interleaves with this expiry. The renewed lease less
+        // the uncertainty margin bounds the hold, leaving a live fence for the
+        // reset of a pass cut off before submission.
         let mut authority_conn = self
             .core
             .vala
@@ -312,8 +315,11 @@ impl Forge {
             detail: &detail,
         };
         let progress = ExpiryProgress::default();
+        let hold = lease
+            .remaining()
+            .saturating_sub(self.core.config.uncertainty_margin);
         let bounded = tokio::time::timeout(
-            self.core.config.lease_ttl,
+            hold,
             // Boxed so the whole expiry state machine stays off every
             // caller's future.
             Box::pin(self.expire_under_authority(lease, expiry, &exclusive, &progress, stop)),
@@ -395,6 +401,12 @@ impl Forge {
     ) -> Result<ExpiryResolution, ForgeError> {
         self.prepare_expiration(lease, expiry, exclusive).await?;
         progress.prepared.store(true, Ordering::Release);
+        #[cfg(feature = "test-support")]
+        if self.core.expiry_controls.pause_expiry_prepared(stop).await {
+            return Err(self
+                .release_unsubmitted(lease, expiry, exclusive, ForgeError::Shutdown)
+                .await);
+        }
         let reloaded = match self.reload_running(expiry, stop).await {
             Ok(reloaded) => reloaded,
             Err(error) => {

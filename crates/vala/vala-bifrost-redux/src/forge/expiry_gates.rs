@@ -16,6 +16,9 @@ use tokio_util::sync::CancellationToken;
 pub struct ExpiryTestControls {
     /// Expiry-lifecycle boundary before its first catalog submission.
     expiry_submit: Arc<ExpiryTestGate>,
+    /// Expiry boundary after preparation commits and before the commit is
+    /// submitted, where the lease bound proves an unsubmitted cut-off.
+    expiry_prepared: Arc<ExpiryTestGate>,
     /// Expiry accepted-response boundary.
     expiry_accepted: Arc<ExpiryTestGate>,
 }
@@ -99,6 +102,11 @@ impl ExpiryTestControls {
         self.expiry_submit.pause(stop).await
     }
 
+    /// Pauses after preparation commits and before submission when armed.
+    pub(super) async fn pause_expiry_prepared(&self, stop: &CancellationToken) -> bool {
+        self.expiry_prepared.pause(stop).await
+    }
+
     /// Pauses after an accepted expiry response when armed.
     pub(super) async fn pause_expiry_accepted(&self, stop: &CancellationToken) -> bool {
         self.expiry_accepted.pause(stop).await
@@ -115,6 +123,10 @@ impl ExpiryTestControls {
     /// Releases the armed expiry lifecycle boundary.
     pub fn release_expiry_submission(&self) {
         self.expiry_submit.release();
+    }
+    /// Arms the boundary after preparation commits and before submission.
+    pub fn arm_expiry_prepared(&self) {
+        self.expiry_prepared.arm();
     }
     /// Arms the boundary after the catalog accepts an expiry commit.
     pub fn arm_expiry_accepted(&self) {

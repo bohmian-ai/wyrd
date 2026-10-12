@@ -11,7 +11,7 @@ use crate::public_support::{
 use arrow::array::{BinaryBuilder, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use futures_util::TryStreamExt as _;
-use iceberg::spec::DataFile;
+use iceberg::spec::{DataFile, Operation, SnapshotRef};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use object_store::ObjectStoreExt as _;
 use object_store::path::Path as ObjectPath;
@@ -293,24 +293,26 @@ impl CloseoutJourney {
         }
     }
 
-    /// Promotes owed debt, then waits for a pulled rewrite of this table's head.
+    /// Promotes owed debt, then waits until this table's head is all Forge output.
     ///
     /// One scheduler pass promotes owed Scribe debt; its commit makes the table
-    /// due on the leader, and a worker pulls it on its own interval. Progress
-    /// is observed through settled attempts, never sleeps, until a snapshot
-    /// newer than the one on entry names only Forge outputs.
+    /// due on the leader, and a worker pulls it on its own interval. That pull
+    /// may already have rewritten debt an earlier pass promoted, so completion
+    /// is judged on state, not against the head on entry: progress is observed
+    /// through settled attempts, never sleeps, until the live head names only
+    /// Forge outputs.
     ///
     /// # Panics
     /// Panics if no such rewrite publishes within the rewrite bound, or on any
     /// worker or SQL failure observed while draining.
     async fn compact(&self, binding: &TenantTableBinding) -> (i64, BTreeMap<String, DataFile>) {
-        let (entry, _) = self.live_files(binding).await;
         self.scheduler_pass().await;
         let current = tokio::time::timeout(REWRITE_BOUND, async {
             loop {
                 let next = self.observer.attempts() + 1;
                 let current = self.live_files(binding).await;
-                if current.0 != entry && current.1.keys().all(|path| path.contains("/data/forge/"))
+                if !current.1.is_empty()
+                    && current.1.keys().all(|path| path.contains("/data/forge/"))
                 {
                     return current;
                 }
@@ -907,17 +909,59 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics on missing catalog authority, unreadable manifests, or duplicate files.
     async fn live_files(&self, binding: &TenantTableBinding) -> (i64, BTreeMap<String, DataFile>) {
-        let table = self
-            .coordinator()
-            .bifrost_catalog()
-            .iceberg_catalog()
-            .load_table(&binding.table_ident())
-            .await
-            .expect("catalog table");
+        let table = self.load_table(binding).await;
         let snapshot = table
             .metadata()
             .current_snapshot()
             .expect("published snapshot");
+        Self::snapshot_files(binding, &table, snapshot).await
+    }
+
+    /// Reads the live files of the table's latest Scribe promotion.
+    ///
+    /// A worker may pull the table as soon as the promotion commits, so the
+    /// current head can already be a rewrite of it. The promotion is the
+    /// table's latest append, which no rewrite replaces in history.
+    ///
+    /// # Panics
+    /// Panics when the table has no append snapshot, or as [`Self::live_files`].
+    async fn promoted_files(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> (i64, BTreeMap<String, DataFile>) {
+        let table = self.load_table(binding).await;
+        let snapshot = table
+            .metadata()
+            .snapshots()
+            .filter(|snapshot| snapshot.summary().operation == Operation::Append)
+            .max_by_key(|snapshot| snapshot.sequence_number())
+            .expect("promotion snapshot");
+        Self::snapshot_files(binding, &table, snapshot).await
+    }
+
+    /// Loads the table from the coordinator's catalog.
+    ///
+    /// # Panics
+    /// Panics when the catalog cannot load the table.
+    async fn load_table(&self, binding: &TenantTableBinding) -> iceberg::table::Table {
+        self.coordinator()
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .expect("catalog table")
+    }
+
+    /// Reads exact live files from one snapshot's manifests, keyed by object path.
+    ///
+    /// # Panics
+    /// Panics on unreadable manifests, a file outside the table prefix, or
+    /// duplicate files.
+    async fn snapshot_files(
+        binding: &TenantTableBinding,
+        table: &iceberg::table::Table,
+        snapshot: &SnapshotRef,
+    ) -> (i64, BTreeMap<String, DataFile>) {
         let manifests = table
             .manifest_list_reader(snapshot)
             .load()
@@ -945,22 +989,20 @@ impl CloseoutJourney {
         (snapshot.snapshot_id(), files)
     }
 
-    /// Counts the snapshots the table currently retains.
+    /// Counts the rewrite snapshots the table currently retains.
     ///
-    /// Publication is per plan, so the retained snapshot count — not the task
-    /// count — is what an attempt's operations have to line up against.
+    /// Publication is per plan, so the retained rewrite snapshot count — not
+    /// the task count — is what an attempt's operations have to line up
+    /// against.
     ///
     /// # Panics
     /// Panics when the catalog cannot load the table.
-    async fn snapshot_count(&self, binding: &TenantTableBinding) -> usize {
-        self.coordinator()
-            .bifrost_catalog()
-            .iceberg_catalog()
-            .load_table(&binding.table_ident())
+    async fn rewrite_snapshot_count(&self, binding: &TenantTableBinding) -> usize {
+        self.load_table(binding)
             .await
-            .expect("catalog table")
             .metadata()
             .snapshots()
+            .filter(|snapshot| snapshot.summary().operation == Operation::Replace)
             .count()
     }
 
@@ -1305,17 +1347,16 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .await
         .expect("coordinator starts after complete ingestion");
     // The new leader promotes all owed debt inside its boot pass. A promotion
-    // that makes a table due is dispatched at once, so the promoted cut is read
-    // before the rewrites it starts are drained below.
+    // that makes a table due may be dispatched at once, so the promoted cut is
+    // read from the promotion snapshot, whatever a rewrite already did to it.
     journey.await_boot_pass().await;
-    let (promoted_snapshot, inputs) = journey.live_files(&table.binding).await;
+    let (promoted_snapshot, inputs) = journey.promoted_files(&table.binding).await;
     assert_eq!(
         inputs.len(),
         hot.len(),
         "promotion retains every physical Scribe object"
     );
-    let (neighbour_promoted, _) = journey.live_files(&neighbour_table.binding).await;
-    let published_before = journey.snapshot_count(&table.binding).await;
+    let (neighbour_promoted, _) = journey.promoted_files(&neighbour_table.binding).await;
     // A rewrite's publication deadline is an instant on the Forge clock, so the
     // clock moves only once no rewrite started before the jump is in flight.
     journey.drain_tasks().await;
@@ -1383,7 +1424,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let operations = journey.assert_rewrite_evidence(&table.binding).await;
     assert_eq!(
         operations,
-        journey.snapshot_count(&table.binding).await - published_before,
+        journey.rewrite_snapshot_count(&table.binding).await,
         "every snapshot the rewrite passes published carries its own operation"
     );
     // Ownership is judged once every role has drained, when every attempt
@@ -1474,12 +1515,12 @@ impl ReaderCleanupJourney {
             .restart_node(roles.coordinator_node)
             .await
             .expect("coordinator starts");
-        // The boot pass promotes the owed debt, so the promoted inputs are
-        // read before the rewrites it dispatches are drained; the Forge clock
-        // moves only once none is in flight, since a rewrite's publication
-        // deadline is an instant on that clock.
+        // The boot pass promotes the owed debt, and a rewrite it makes due may
+        // already be dispatched, so the inputs are read from the promotion
+        // snapshot; the Forge clock moves only once no rewrite is in flight,
+        // since a rewrite's publication deadline is an instant on that clock.
         roles.await_boot_pass().await;
-        let (_, earlier_files) = roles.live_files(&table.binding).await;
+        let (_, earlier_files) = roles.promoted_files(&table.binding).await;
         assert!(earlier_files.len() >= 2, "two real promoted inputs");
         roles.drain_tasks().await;
         roles.advance_maintenance(chrono::Duration::hours(2));

@@ -252,17 +252,30 @@ impl TelemetryGuard {
 ///
 /// Priority: `WYRD_LOG` env var → `RUST_LOG` env var → `config.filter` field → `"info"`.
 pub fn resolve_filter(config: &TelemetryConfig) -> EnvFilter {
-    if let Ok(val) = std::env::var("WYRD_LOG")
-        && !val.is_empty()
-    {
-        return EnvFilter::new(val);
+    EnvFilter::new(operator_directives().unwrap_or_else(|| config.filter.clone()))
+}
+
+/// Return the operator's filter directives: non-empty `WYRD_LOG`, else
+/// non-empty `RUST_LOG`.
+fn operator_directives() -> Option<String> {
+    ["WYRD_LOG", "RUST_LOG"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
+/// Build the span-capture filter: `config.filter` with the operator's
+/// directives appended.
+///
+/// A later directive for the same target replaces the earlier one, so the
+/// operator can widen or override individual targets, while every target the
+/// test's filter names stays captured when the operator's filter does not
+/// mention it.
+#[cfg(feature = "test-support")]
+fn capture_filter(config: &TelemetryConfig) -> EnvFilter {
+    match operator_directives() {
+        Some(operator) => EnvFilter::new(format!("{},{operator}", config.filter)),
+        None => EnvFilter::new(&config.filter),
     }
-    if let Ok(val) = std::env::var("RUST_LOG")
-        && !val.is_empty()
-    {
-        return EnvFilter::new(val);
-    }
-    EnvFilter::new(&config.filter)
 }
 
 /// Initialize a tracing subscriber without setting it as the global default.
@@ -336,10 +349,15 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
 /// filter, formatter, and global subscriber path as [`init`]. The exporter
 /// destination differs, allowing journeys to inspect completed spans without a
 /// second telemetry implementation, and every captured span also carries its
-/// `tracing` level as the `level` attribute. The ambient `WYRD_LOG` filter
-/// decides which spans are captured, so a test asserting that an operation is
-/// DEBUG detail reads that attribute instead of inferring the level from
-/// whether the span appeared.
+/// `tracing` level as the `level` attribute.
+///
+/// Log output and span capture are filtered per layer. Log output follows
+/// [`resolve_filter`], so `WYRD_LOG` decides what a person reads. Capture
+/// follows [`capture_filter`]: every span the test's `config.filter` enables
+/// is captured whatever `WYRD_LOG` says, and `WYRD_LOG` can only add spans or
+/// override targets the test does not name. A test asserting that an
+/// operation is DEBUG detail reads the `level` attribute instead of inferring
+/// the level from whether the span appeared.
 ///
 /// # Errors
 ///
@@ -349,7 +367,7 @@ pub fn init_test_capture(
     config: TelemetryConfig,
 ) -> Result<(TelemetryGuard, TestTraceCapture), WyrdError> {
     use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt, util::SubscriberInitExt};
 
     let capture = TestTraceCapture::default();
     let exporter = CaptureExporter {
@@ -362,12 +380,12 @@ pub fn init_test_capture(
         .build();
     let tracer = provider.tracer("wyrd");
     tracing_subscriber::registry()
-        .with(resolve_filter(&config))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_filter(resolve_filter(&config)))
         .with(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
-                .with_level(true),
+                .with_level(true)
+                .with_filter(capture_filter(&config)),
         )
         .try_init()
         .map_err(|_| WyrdError::Conflict {

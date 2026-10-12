@@ -44,12 +44,20 @@ def bifrost(wyrd_server: WyrdTestServer) -> Bifrost:
     return bifrost
 
 
+def table_of(bifrost: Bifrost) -> TableConfig:
+    """The table a fixture client writes to, which every fixture client has."""
+
+    table = bifrost.table
+    assert table is not None
+    return table
+
+
 def is_variant(field: pyarrow.Field) -> bool:
     return (field.metadata or {}).get(b"ARROW:extension:name") == b"arrow.parquet.variant"
 
 
 def test_model_fields_become_variant_struct_and_list_columns(bifrost: Bifrost) -> None:
-    schema = bifrost.table.arrow_schema
+    schema = table_of(bifrost).arrow_schema
 
     assert is_variant(schema.field("payload"))
     assert is_variant(schema.field("mixed"))
@@ -74,7 +82,7 @@ def test_rows_come_back_as_native_values(bifrost: Bifrost, wyrd_server: WyrdTest
     bifrost.flush()
     wyrd_server.flush_bifrost()
 
-    table = bifrost.table.fqn
+    table = table_of(bifrost).fqn
     rows = bifrost.sql(
         f"SELECT id, payload, mixed, point, tags FROM {table} ORDER BY id", model=Event
     )
@@ -92,7 +100,7 @@ def test_query_results_copy_into_another_table(
     bifrost.flush()
     wyrd_server.flush_bifrost()
 
-    copied = bifrost.sql(f"SELECT id, payload, mixed, point, tags FROM {bifrost.table.fqn}")
+    copied = bifrost.sql(f"SELECT id, payload, mixed, point, tags FROM {table_of(bifrost).fqn}")
     bifrost.write_batch(archive.fqn, copied.to_arrow().to_batches()[0])
     wyrd_server.flush_bifrost()
 
@@ -108,7 +116,7 @@ def test_struct_fields_stay_typed_and_variant_paths_stay_variant(
     wyrd_server.flush_bifrost()
 
     result = bifrost.sql(
-        f"SELECT point['x'] AS x, payload -> 'scores' AS scores FROM {bifrost.table.fqn}"
+        f"SELECT point['x'] AS x, payload -> 'scores' AS scores FROM {table_of(bifrost).fqn}"
     )
     schema = result.to_arrow().schema
 
@@ -124,7 +132,7 @@ def test_undeclared_field_is_refused(bifrost: Bifrost, wyrd_server: WyrdTestServ
     wyrd_server.flush_bifrost()
 
     assert error.value.code == "WYRD_VALA_400_BIFROST_UNDECLARED_FIELD"
-    assert len(bifrost.sql(f"SELECT id FROM {bifrost.table.fqn}")) == 0
+    assert len(bifrost.sql(f"SELECT id FROM {table_of(bifrost).fqn}")) == 0
 
 
 class Loose(BaseModel):

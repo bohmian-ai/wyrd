@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
-from ._wyrd import bifrost as _native_bifrost
+from ._wyrd import timestamp_format
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -87,7 +87,7 @@ class _Timestamp(datetime):
         The format table is owned by Rust; this reads it from the native module.
         """
 
-        return cast(str, _native_bifrost.timestamp_format(cls._NAME))
+        return cast(str, timestamp_format(cls._NAME))
 
 
 class TimestampNTZ(_Timestamp):

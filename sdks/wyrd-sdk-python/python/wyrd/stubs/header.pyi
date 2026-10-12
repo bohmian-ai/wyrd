@@ -22,6 +22,17 @@ def run_wyrd_cli() -> int:
     """
     ...
 
+def timestamp_format(kind: str) -> str | None:
+    """The JSON Schema ``format`` a Wyrd timestamp type declares itself with.
+
+    Args:
+        kind: a timestamp type name such as ``TIMESTAMP_NTZ``.
+
+    Returns:
+        The type's ``format``, or ``None`` for an unknown type name.
+    """
+    ...
+
 class CardRefLike(Protocol):
     """Object that can be represented as a Wyrd card reference.
 

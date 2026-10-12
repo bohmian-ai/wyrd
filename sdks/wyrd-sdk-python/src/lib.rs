@@ -49,6 +49,7 @@ use pyo3::types::PyModule;
 fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_utils::py::register_wyrd_error_exception(m)?;
     cli::register_entrypoint(m)?;
+    bifrost::register_timestamp_format(m)?;
 
     let agent = PyModule::new(py, "agent")?;
     skald_agent::python_register(&agent)?;

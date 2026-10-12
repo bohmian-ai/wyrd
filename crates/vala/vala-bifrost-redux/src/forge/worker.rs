@@ -909,6 +909,9 @@ pub struct ForgeWorkerCompletionObserver {
     /// One-shot injected failure of the next cancelled-claim release.
     #[cfg(feature = "test-support")]
     fail_next_cancelled_claim_release: Arc<AtomicBool>,
+    /// One-shot injected failure of the next execution-failure settlement.
+    #[cfg(feature = "test-support")]
+    fail_next_failure_settlement: Arc<AtomicBool>,
     /// One-shot passive barrier after a dispatch returns durable settlement.
     #[cfg(feature = "test-support")]
     pause_after_next_settlement: Arc<AtomicBool>,
@@ -1059,6 +1062,30 @@ impl ForgeWorkerCompletionObserver {
     #[must_use]
     fn take_cancelled_claim_release_failure(&self) -> bool {
         self.fail_next_cancelled_claim_release
+            .swap(false, Ordering::AcqRel)
+    }
+
+    /// Arm a one-shot failure of the next execution-failure settlement.
+    ///
+    /// A failed attempt whose durable settlement cannot commit leaves its claim
+    /// with an owner that cannot prove what it did, which is the worker's
+    /// runtime fatal path: it must close readiness, claim nothing more, and
+    /// leave the claim for expiry recovery by a successor.
+    pub fn fail_next_failure_settlement(&self) {
+        self.fail_next_failure_settlement
+            .store(true, Ordering::Release);
+    }
+
+    /// Returns whether the armed settlement failure has not been consumed yet.
+    #[must_use]
+    pub fn failure_settlement_failure_armed(&self) -> bool {
+        self.fail_next_failure_settlement.load(Ordering::Acquire)
+    }
+
+    /// Consume the armed one-shot settlement failure, if any.
+    #[must_use]
+    fn take_failure_settlement_failure(&self) -> bool {
+        self.fail_next_failure_settlement
             .swap(false, Ordering::AcqRel)
     }
 
@@ -8600,6 +8627,14 @@ impl ForgeWorker {
         attempt: Uuid,
         error: &ForgeError,
     ) -> Result<Option<ForgeTaskResult>, ForgeError> {
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer
+            && observer.take_failure_settlement_failure()
+        {
+            return Err(ForgeError::Sql(vala_sql::SqlError::Conflict {
+                detail: "injected Forge failure settlement failure".to_owned(),
+            }));
+        }
         if self.is_dispatched(claim.task_id)
             && !matches!(
                 error,

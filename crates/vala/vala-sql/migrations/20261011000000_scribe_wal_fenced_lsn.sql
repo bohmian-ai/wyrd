@@ -11,16 +11,22 @@ CREATE FUNCTION vala.scribe_wal_newest_fence(
     p_writer_epoch bigint,
     p_shard_id smallint
 ) RETURNS TABLE (wal_segment_sequence bigint, wal_lsn_max bigint)
-LANGUAGE sql
-STABLE
+LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, vala
 AS $$
-    SELECT wal_segment_sequence, wal_lsn_max
-      FROM vala.scribe_batch_commits
-     WHERE wal_node_id = p_node_id
-       AND wal_writer_epoch = p_writer_epoch
-       AND wal_shard_id = p_shard_id
-     ORDER BY wal_lsn_max DESC
-     LIMIT 1
+DECLARE
+    prior text := coalesce(current_setting('app.operator', true), '');
+BEGIN
+    PERFORM set_config('app.operator', 'on', true);
+    RETURN QUERY
+        SELECT c.wal_segment_sequence, c.wal_lsn_max
+          FROM vala.scribe_batch_commits c
+         WHERE c.wal_node_id = p_node_id
+           AND c.wal_writer_epoch = p_writer_epoch
+           AND c.wal_shard_id = p_shard_id
+         ORDER BY c.wal_lsn_max DESC
+         LIMIT 1;
+    PERFORM set_config('app.operator', prior, true);
+END;
 $$;

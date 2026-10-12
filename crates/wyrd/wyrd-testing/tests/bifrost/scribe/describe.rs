@@ -1,6 +1,7 @@
 //! Describe reaches the exact stored physical schema for both table kinds.
 
 use arrow::array::Array;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_client::Bifrost;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 
@@ -173,6 +174,21 @@ async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
             .expect("the described batch is accepted by the real wire");
     }
     server.flush_bifrost().await.expect("publish the append");
+    let durable_rows: u64 = server
+        .published_hot_files_for_test(
+            server.data_tenant_id(),
+            BifrostNamespace::Datasets.as_str(),
+            &table_name,
+        )
+        .await
+        .expect("published hot files are inspectable")
+        .iter()
+        .map(|file| file.row_count)
+        .sum();
+    assert_eq!(
+        durable_rows, 2,
+        "the description-built batch reached the durable read boundary"
+    );
 
     let mut stream = query
         .query(&BifrostQueryRequest {

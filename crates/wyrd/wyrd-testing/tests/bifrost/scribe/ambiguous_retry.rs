@@ -87,13 +87,8 @@ async fn ambiguous_deadline_retains_then_deduplicates_one_batch() {
         .await
         .expect("delayed-WAL server starts");
     let tenant = server.data_tenant_id();
-    let fqn = register_table(
-        &server,
-        tenant,
-        BifrostNamespace::Bifrost,
-        &unique_table("ambiguous_retry"),
-    )
-    .await;
+    let table_name = unique_table("ambiguous_retry");
+    let fqn = register_table(&server, tenant, BifrostNamespace::Bifrost, &table_name).await;
     let bootstrap = server
         .bootstrap_service_in_tenant(tenant, &unique_table("ambiguous_writer"), &["admin"])
         .await
@@ -205,6 +200,17 @@ async fn ambiguous_deadline_retains_then_deduplicates_one_batch() {
         sorted_values(&client, &fqn).await,
         vec![41],
         "the retry did not duplicate the durable row"
+    );
+    let durable_rows: u64 = server
+        .published_hot_files_for_test(tenant, BifrostNamespace::Bifrost.as_str(), &table_name)
+        .await
+        .expect("published hot files are inspectable")
+        .iter()
+        .map(|file| file.row_count)
+        .sum();
+    assert_eq!(
+        durable_rows, 1,
+        "the retry did not create a duplicate durable row"
     );
     server.shutdown().await.expect("server shutdown");
 }

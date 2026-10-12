@@ -1142,6 +1142,76 @@ async fn worker_pre_execution_cancellation_reports_durable_retry() {
     );
 }
 
+/// Ordinary ownership timing includes the held claim interval.
+///
+/// The worker is held after it claims a plan task, so the completed attempt's
+/// one duration sample must cover at least the interval the claim was owned
+/// before execution began, and ownership is balanced once the terminal commits.
+///
+/// # Panics
+/// Panics when duration omits the claim interval, ownership leaks, or emission duplicates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_duration_includes_the_held_claim() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("duration_episode").await;
+    let observer = ForgeWorkerCompletionObserver::default();
+    observer.hold_after_claims_for_test(1);
+    observer.hold_after_next_attempt_for_test();
+    let stop = CancellationToken::new();
+    let worker = fixture.plan_worker_for_test(observer.clone()).await;
+    let mut work = AbortOnDropHandle::new(tokio::spawn(
+        worker.run(stop.clone(), ForgeRoleReadiness::default()),
+    ));
+    if timeout(OWNERSHIP_BOUND, observer.wait_for_claims_for_test())
+        .await
+        .is_err()
+    {
+        stop.cancel();
+        work.abort();
+        panic!(
+            "claim gate missed; last task state=ready, attempts={}",
+            observer.attempts()
+        );
+    }
+    let claim_at = Instant::now();
+    let active = active_tasks(&telemetry.snapshot());
+    let claimed: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("claimed state");
+    let held = claim_at.elapsed();
+    observer.release_claims_for_test();
+    if timeout(OWNERSHIP_BOUND, observer.wait_for_held_attempt_for_test())
+        .await
+        .is_err()
+    {
+        stop.cancel();
+        work.abort();
+        panic!("completion gate missed; last state={claimed}");
+    }
+    let after = telemetry.snapshot();
+    stop.cancel();
+    observer.release_held_attempt_for_test();
+    if let Ok(result) = timeout(OWNERSHIP_BOUND, &mut work).await {
+        result.expect("worker join").expect("the worker drains");
+    } else {
+        work.abort();
+        panic!("the worker failed to drain; last state={claimed}");
+    }
+    let settled: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("settled state");
+    assert_eq!(claimed, "claimed");
+    assert_eq!(settled, "succeeded");
+    assert!(
+        (active - 1.0).abs() < f64::EPSILON,
+        "claimed ownership is active"
+    );
+    assert_completed_episode(&after, 0, "succeeded", held);
+}
+
 /// A worker whose operator database stops answering backs off and recovers.
 ///
 /// The worker's operator pool is narrowed to one connection, which the test
@@ -1255,6 +1325,10 @@ async fn worker_prepared_fatal_closes_before_observation() {
         assert!(
             !readiness.is_ready(),
             "known reconciliation failure closes before it is observed"
+        );
+        assert!(
+            (active_tasks(&telemetry.snapshot()) - 1.0).abs() < f64::EPSILON,
+            "the failing attempt still owns its task when the failure is observed"
         );
         assert!(!work.is_finished());
         observer.release_fatal_observation_for_test();

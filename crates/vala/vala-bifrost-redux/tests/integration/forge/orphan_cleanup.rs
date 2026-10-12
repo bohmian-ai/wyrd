@@ -675,23 +675,23 @@ async fn assert_recovered_pass_exhausts_the_prefix(
     );
 }
 
-/// A sibling table's Forge root is refused before any lease, catalog, or IO.
+/// A sibling table's Forge root is refused before any catalog load or IO.
 ///
 /// The plan input is a delete authority. A prefix that is well shaped — same
 /// tenant, same warehouse, same current Forge recipe root — but names a
 /// different table would still authorise deleting that table's objects, and the
 /// dispatch's catalog-derived comparison only catches it after the worker has
-/// already taken the table fence and loaded metadata. The binding derived from
-/// the task row already names the one table this task may touch, so the refusal
-/// belongs before all of that: no lease row, no catalog load, no listing, no
-/// stat, and no delete may exist when it returns.
+/// already loaded metadata. The binding derived from the task row already names
+/// the one table this task may touch, and the task's own claim is the only
+/// authority it holds, so the refusal belongs before all of that: no catalog
+/// load, no listing, no stat, and no delete may exist when it returns.
 ///
 /// # Panics
 ///
 /// Panics when the fixture cannot start, when the cross-table prefix is
 /// accepted, or when any effect was reached before the refusal.
 #[tokio::test]
-async fn cross_table_plan_refuses_before_lease_or_io() {
+async fn cross_table_plan_refuses_before_catalog_or_io() {
     let promoted = PromotedRewriteFixture::start_unpromoted("orphan_cross_table").await;
     let store = CountingObjectStore::new(&promoted.fixture.storage);
     let catalog = PromotionCatalogSeam::new(

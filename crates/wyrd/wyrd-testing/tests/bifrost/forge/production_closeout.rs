@@ -1257,10 +1257,6 @@ fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, tar
 /// Panics on any route, geometry, exactness, tenancy, or convergence violation.
 #[tokio::test]
 #[ignore = "requires Postgres and production-sized object storage"]
-#[expect(
-    clippy::float_cmp,
-    reason = "Prometheus renders this gauge as whole numbers, so f64 equality is exact"
-)]
 async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let mut journey = CloseoutJourney::start().await;
     let tenant = journey.cluster.data_tenant_id();
@@ -1437,7 +1433,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .iter()
         .filter(|sample| sample.family == "bifrost_forge_active_tasks")
     {
-        assert_eq!(sample.value, 0.0, "settled ownership: {sample:?}");
+        assert!(sample.value.abs() < f64::EPSILON, "settled ownership: {sample:?}");
     }
 }
 

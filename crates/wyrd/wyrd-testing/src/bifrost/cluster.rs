@@ -644,10 +644,6 @@ impl OracleTelemetryCapture {
     ///
     /// Returns [`ClusterError::Telemetry`] when a changed Prometheus line has
     /// invalid label or numeric syntax.
-    #[expect(
-        clippy::float_cmp,
-        reason = "Prometheus renders these metrics as whole numbers, so f64 equality is exact"
-    )]
     pub fn delta_since(
         &self,
         checkpoint: &OracleTelemetryCheckpoint,
@@ -657,7 +653,7 @@ impl OracleTelemetryCapture {
         let mut metrics = Vec::new();
         for (series, value) in current {
             let prior = checkpoint.metrics.get(&series).copied().unwrap_or_default();
-            if value != prior {
+            if value.to_bits() != prior.to_bits() {
                 let mut sample = parse_metric_sample(&series, value)?;
                 sample.value = value - prior;
                 metrics.push(sample);

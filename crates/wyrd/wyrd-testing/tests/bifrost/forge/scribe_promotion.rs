@@ -720,15 +720,14 @@ async fn scribe_promotion_deadline_expires_before_conflict_retry() {
 /// Cancellation drains a parked promotion without settling anything.
 ///
 /// The coordinator is cancelled while its inline promotion commit is parked
-/// before delegation, so acceptance is unknown by construction. Draining must therefore
-/// leave the operation Prepared, with its task claim left to lapse for a
-/// successor: settling it either way would claim knowledge the worker does
-/// not have.
+/// before delegation, so acceptance is unknown by construction. Draining must therefore release the
+/// attempt and its claim while leaving the operation Prepared: settling it
+/// either way would claim knowledge the worker does not have.
 ///
 /// # Panics
 ///
-/// Panics when the drained operation leaves `prepared` or any sealed row is
-/// settled.
+/// Panics when the drained operation leaves `prepared`, any sealed row is
+/// settled, or the drained attempt still holds its claim.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_cancellation_drains_without_settlement() {
@@ -765,7 +764,32 @@ async fn scribe_promotion_cancellation_drains_without_settlement() {
             .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
         "a drained promotion settled nothing: {unsettled:?}"
     );
+    assert_eq!(
+        live_forge_claims(&fixture).await,
+        0,
+        "the drained attempt released its claim"
+    );
     forge.shutdown().await;
+}
+
+/// Counts unexpired Forge task claims still held over the fixture's own table.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails.
+async fn live_forge_claims(fixture: &ForgeFixture) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM vala.forge_tasks \
+         WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
+         AND state IN ('claimed', 'running', 'prepared') \
+         AND claim_expires_at > statement_timestamp()",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("Forge claim inspection")
 }
 
 /// Brings a retryable task's production backoff forward to now.

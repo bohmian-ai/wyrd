@@ -11,6 +11,9 @@ import type { ChangeList, ChangeSummary } from '$lib/features/changes/types';
 import { mockHome } from './mock/home';
 import type { HomeView } from '$lib/views';
 import { reject, type TenantContext } from './auth/session';
+import type { BrowserSession } from './auth/browser-sessions';
+import { problemKind } from './problem';
+import type { components } from './generated/wyrd-http';
 import type {
   DashboardDetail,
   DashboardsView,
@@ -44,7 +47,9 @@ import {
 export class WyrdClient {
   constructor(
     private readonly context: TenantContext,
-    private readonly mockData: boolean
+    private readonly mockData: boolean,
+    /** The signed-in principal's server session; live reads go through it. */
+    private readonly session?: BrowserSession
   ) {}
 
   /** Whether the server-issued `resource:action` grants allow `permission`, honoring `wildcard`. */
@@ -358,15 +363,80 @@ export class WyrdClient {
     return detail;
   }
 
-  home(): HomeView {
-    if (
-      ['cards:read', 'bifrost_query:read', 'evals:read'].some(
-        (permission) => !this.can(permission)
+  async home(): Promise<HomeView> {
+    if (this.mockData) {
+      if (
+        ['cards:read', 'bifrost_query:read', 'evals:read'].some(
+          (permission) => !this.can(permission)
+        )
       )
-    )
-      reject('denied');
-    // No fallback to fixtures: the live transport must be connected here before server mode can serve data.
-    if (!this.mockData) reject('upstream');
-    return mockHome(this.context.tenant);
+        reject('denied');
+      return mockHome(this.context.tenant);
+    }
+    // No fallback to fixtures: without a server session there is no live data.
+    if (!this.session) reject('upstream');
+    // The server decides authority; its refusal is the page's refusal.
+    const response = await this.session.api('get', '/cards');
+    if (!response.ok) reject(await problemKind(response));
+    return liveHome(`/t/${encodeURIComponent(this.context.tenant.key)}`, await response.json());
   }
+}
+
+type Lifecycle = components['schemas']['CardLifecycleStatus'];
+const lifecycleTone: Record<Lifecycle, HomeView['cards'][number]['tone']> = {
+  active: 'ok',
+  pending: 'running',
+  deprecated: 'warn',
+  expired: 'warn',
+  failed: 'danger',
+  deleted: 'neutral'
+};
+
+/**
+ * Project the server's first Card page onto Home. Operational sections have no
+ * live source until their pages land, so they are `null` (unavailable), not empty.
+ */
+function liveHome(base: string, page: components['schemas']['ListCardsResponse']): HomeView {
+  // ponytail: one default-size page, so "newest" is within it; page the cursor when Home needs exact totals.
+  const more = Boolean(page.next_cursor);
+  const kinds = [...new Set(page.items.map((card) => card.kind))].sort();
+  return {
+    attention: null,
+    changes: null,
+    recent: null,
+    cards: page.items
+      .toSorted((a, b) => b.created_at.localeCompare(a.created_at))
+      .slice(0, 5)
+      .map((card) => ({
+        name: card.name,
+        kind: card.kind,
+        version: card.version,
+        space: card.space,
+        status: card.status,
+        tone: lifecycleTone[card.status],
+        registered: card.created_at.slice(0, 10),
+        href: `${base}/cards/${encodeURIComponent(card.card_uid)}`
+      })),
+    summaries: [
+      {
+        label: 'Cards',
+        value: page.items.length,
+        more,
+        unit: 'registered',
+        detail: more
+          ? 'More are registered than one page shows.'
+          : kinds.length
+            ? kinds.join(' · ')
+            : 'No Cards are registered in this tenant.',
+        href: `${base}/cards`
+      },
+      {
+        label: 'Observe',
+        value: null,
+        unit: '',
+        detail: 'Signal summaries are not available on Home yet.',
+        href: `${base}/observe`
+      }
+    ]
+  };
 }

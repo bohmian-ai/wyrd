@@ -26,7 +26,7 @@ export const handle: Handle = async ({ event, resolve }) => {
       event.locals.browserSession = session;
       event.locals.tenant = session.context();
       // Mock projections belong to the development identity only.
-      event.locals.wyrd = new WyrdClient(event.locals.tenant, false);
+      event.locals.wyrd = new WyrdClient(event.locals.tenant, false, session);
     }
     return resolve(event);
   }

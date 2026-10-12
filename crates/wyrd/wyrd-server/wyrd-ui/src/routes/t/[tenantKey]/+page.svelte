@@ -15,19 +15,21 @@
     <form role="search" method="GET" action={`${base}/cards`}>
       <input aria-label="Find a Card" name="q" type="search" placeholder="⌕ Find a Card by name, kind or uid…" />
     </form>
-    <a class="app-control primary" href={`${base}/changes/new`}>+ New Change Request</a>
+    {#if data.home?.changes}<a class="app-control primary" href={`${base}/changes/new`}>+ New Change Request</a>{/if}
   </div>
 </div>
 
 {#if data.problem}
-  <StateBlock state="error" title="Home is unavailable" detail={data.serverUnavailable ? "Mock data is disabled. The Wyrd server connection is not implemented yet." : data.problem.remediation} code={data.problem.code} actionHref={base} actionLabel="Retry" />
+  <StateBlock state="error" title="Home is unavailable" detail={data.problem.remediation} code={data.problem.code} actionHref={base} actionLabel="Retry" />
 {:else if data.home}
   <div class="home-grid">
     <div class="work">
       <div class="attention">
         <Panel variant="accent">
-          {#snippet head()}<h2>Requires your action</h2><span>{data.home.attention.length} items</span>{/snippet}
-          {#if data.home.attention.length}
+          {#snippet head()}<h2>Requires your action</h2>{#if data.home.attention}<span>{data.home.attention.length} items</span>{/if}{/snippet}
+          {#if !data.home.attention}
+            <StateBlock state="absent" title="Not available yet" detail="Action items are not read from the server on Home yet." />
+          {:else if data.home.attention.length}
             <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
             <div class="scroller" role="region" aria-label="Requires your action" tabindex="0">
               <table class="attention-table"><tbody>
@@ -41,6 +43,7 @@
           {/if}
         </Panel>
       </div>
+      {#if data.home.changes}
       <Panel>
         {#snippet head()}<h2>Recent changes</h2><a class="context-link" href={`${base}/changes`}>View all in Changes →</a>{/snippet}
         {#if data.home.changes.length}
@@ -55,19 +58,20 @@
           </div>
         {:else}<p class="empty">No recent changes in this tenant.</p>{/if}
       </Panel>
+      {/if}
       <Panel>
-        {#snippet head()}<h2>Recently viewed Cards</h2><span>last 7 days</span>{/snippet}
+        {#snippet head()}<h2>Registered Cards</h2><span>newest first</span>{/snippet}
         {#if data.home.cards.length}
           <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-          <div class="scroller" role="region" aria-label="Recently viewed Cards" tabindex="0">
+          <div class="scroller" role="region" aria-label="Registered Cards" tabindex="0">
             <table class="cards-table">
-              <thead><tr><th>Name</th><th>Kind</th><th>Version</th><th>Space</th><th>Status</th><th>Seen</th></tr></thead>
+              <thead><tr><th>Name</th><th>Kind</th><th>Version</th><th>Space</th><th>Status</th><th>Registered</th></tr></thead>
               <tbody>{#each data.home.cards as item (item.href)}
-                <tr><td><a href={item.href}>{item.name}</a></td><td class="muted">{item.kind}</td><td>{item.version}</td><td class="muted">{item.space}</td><td><Badge tone={item.tone}>{item.status}</Badge></td><td class="age">{item.seen}</td></tr>
+                <tr><td><a href={item.href}>{item.name}</a></td><td class="muted">{item.kind}</td><td>{item.version}</td><td class="muted">{item.space}</td><td><Badge tone={item.tone}>{item.status}</Badge></td><td class="age">{item.registered}</td></tr>
               {/each}</tbody>
             </table>
           </div>
-        {:else}<p class="empty">No recently viewed Cards in this tenant.</p>{/if}
+        {:else}<p class="empty">No Cards are registered in this tenant.</p>{/if}
       </Panel>
     </div>
     <aside aria-label="Workspace summaries and recent work">
@@ -75,12 +79,13 @@
         <Panel variant="flat">
           {#snippet head()}<h2>{item.label}</h2>{/snippet}
           <div class="summary" class:observe={item.label === 'Observe'}>
-            <strong>{item.signal ? '! ' : ''}{fmtCount(item.value)} {item.unit}</strong>
+            <strong>{#if item.value === null}Unavailable{:else}{item.signal ? '! ' : ''}{fmtCount(item.value)}{item.more ? '+' : ''} {item.unit}{/if}</strong>
             <p>{item.detail}</p>
             <a href={item.href}>Open {item.label} →</a>
           </div>
         </Panel>
       {/each}
+      {#if data.home.recent}
       <Panel variant="flat">
         {#snippet head()}<h2>Pick work back up</h2><span>recent</span>{/snippet}
         <div class="recent">
@@ -89,6 +94,7 @@
           {:else}<p>No recent work in this tenant.</p>{/each}
         </div>
       </Panel>
+      {/if}
     </aside>
   </div>
 {/if}

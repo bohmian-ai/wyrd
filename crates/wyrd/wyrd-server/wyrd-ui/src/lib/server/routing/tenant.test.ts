@@ -157,7 +157,7 @@ test('real root load and actions handle tenant counts, challenge, and least priv
     await expect(
       homeLoad({ locals: { wyrd: denied } } as Parameters<typeof homeLoad>[0])
     ).rejects.toMatchObject({ status: 403 });
-    expect(wyrd.home().attention.length).toBeGreaterThan(0);
+    expect((await wyrd.home()).attention?.length).toBeGreaterThan(0);
     session!.memberships.length = 0;
     expect(await rootLoad(loadEvent)).toMatchObject({ session: { tenants: [] } });
   } finally {
@@ -166,12 +166,12 @@ test('real root load and actions handle tenant counts, challenge, and least priv
   }
 });
 
-test('Home cannot reveal observation summaries with only Card read permission', () => {
+test('Home cannot reveal observation summaries with only Card read permission', async () => {
   const sessions = new LocalSessions();
   const { session } = sessions.read(sessions.create());
   session!.memberships[0].permissions = ['cards:read'];
   const wyrd = new WyrdClient(sessions.bind(session!, 'acme'), true);
-  expect(() => wyrd.home()).toThrow(expect.objectContaining({ status: 403 }));
+  await expect(wyrd.home()).rejects.toMatchObject({ status: 403 });
 });
 
 test('mock data must be explicitly enabled and never falls back when disabled', async () => {

@@ -92,7 +92,7 @@ export function mockHome(tenant: Tenant): HomeView {
         space: 'prod',
         status: 'Healthy',
         tone: 'ok',
-        seen: '3m',
+        registered: '3m',
         href: `${base}/cards/card_service_01`
       },
       {
@@ -102,7 +102,7 @@ export function mockHome(tenant: Tenant): HomeView {
         space: 'prod',
         status: 'Healthy',
         tone: 'ok',
-        seen: '18m',
+        registered: '18m',
         href: `${base}/cards/card_service_02`
       },
       {
@@ -112,7 +112,7 @@ export function mockHome(tenant: Tenant): HomeView {
         space: 'prod',
         status: 'Degraded',
         tone: 'warn',
-        seen: '26m',
+        registered: '26m',
         href: `${base}/cards/card_service_03`
       },
       {
@@ -122,7 +122,7 @@ export function mockHome(tenant: Tenant): HomeView {
         space: 'prod',
         status: 'Healthy',
         tone: 'ok',
-        seen: '1h',
+        registered: '1h',
         href: `${base}/cards/card_service_04`
       }
     ],

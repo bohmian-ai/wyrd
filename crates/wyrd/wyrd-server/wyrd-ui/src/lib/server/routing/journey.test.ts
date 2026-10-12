@@ -94,7 +94,7 @@ test('real browser-facing loads and actions contain credentials and isolate tena
   expect(otherTab.status).toBe(200);
   const home = await otherTab.text();
   expect(home).toContain('Recent changes');
-  expect(home).toContain('Recently viewed Cards');
+  expect(home).toContain('Registered Cards');
   expect(home).toContain('Raise checkout ranking cutoff');
   expect(home).toContain('checkout-api');
   expect(home).toContain('Pick work back up');
@@ -115,7 +115,7 @@ test('real browser-facing loads and actions contain credentials and isolate tena
   });
   const liveHtml = await liveHome.text();
   expect(liveHtml).toContain('Mock data: Off');
-  expect(liveHtml).toContain('server connection is not implemented yet');
+  expect(liveHtml).toContain('WYRD_SPEC_502_UPSTREAM_FAILURE');
   expect(liveHtml).not.toContain('Raise checkout ranking cutoff');
   expect((await toggle('true')).status).toBe(303);
   const logoSource = home.match(/<img src="([^"]+)"/)![1];

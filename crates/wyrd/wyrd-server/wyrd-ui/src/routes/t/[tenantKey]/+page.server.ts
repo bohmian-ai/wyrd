@@ -10,6 +10,6 @@ export const load: PageServerLoad = async ({ locals }) => {
   } catch (cause) {
     const value = safeProblem(cause);
     if (value.status < 500) error(value.status, { ...value, message: value.title });
-    return { home: null, problem: value, serverUnavailable: !locals.mockData };
+    return { home: null, problem: value };
   }
 };

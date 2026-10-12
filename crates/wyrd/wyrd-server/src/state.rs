@@ -596,9 +596,22 @@ impl Oracle {
     }
 
     /// Reports startup reconciliation and lifecycle readiness, excluding saturation.
+    ///
+    /// Ready also requires this role's own fenced lease in the live membership
+    /// snapshot, so a peer-mode Oracle restarted beside a live one is not ready
+    /// until its activation publishes the lease peers route by.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.lifecycle.is_serving() && self.engine.is_ready()
+        self.lifecycle.is_serving()
+            && self.engine.is_ready()
+            && self
+                .cluster
+                .snapshot()
+                .live_oracle_at_fence(
+                    self.registered_role.key.node_id,
+                    self.registered_role.fencing_token,
+                )
+                .is_some()
     }
 
     /// Synchronously closes local Oracle readiness before transport cancellation.
@@ -946,9 +959,22 @@ impl Scribe {
     }
 
     /// Reports whether the ingest writer has completed recovery and can accept work.
+    ///
+    /// Ready also requires this role's own fenced lease in the live membership
+    /// snapshot, so a peer-mode Scribe is not ready until its activation
+    /// publishes the lease peers dial its tail by.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.lifecycle.is_serving() && self.ingest.is_ready()
+        self.lifecycle.is_serving()
+            && self.ingest.is_ready()
+            && self
+                .cluster
+                .snapshot()
+                .live_scribe_at_fence(
+                    self.registered_role.key.node_id,
+                    self.registered_role.fencing_token,
+                )
+                .is_some()
     }
 
     /// Reports whether this role's WAL faulted and withdrew it until restart.

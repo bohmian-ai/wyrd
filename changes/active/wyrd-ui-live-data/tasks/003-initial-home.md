@@ -147,3 +147,52 @@ Report a concrete blocker if repository-managed setup cannot supply the required
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
 
+
+## Implementation Evidence
+
+**Reuse map (revalidated).** Owner `WyrdClient.home()` (`wyrd-ui/src/lib/server/wyrd.ts`) now has a live branch. It reads `GET /v1/cards` (`list_cards_http` → `ListCardsResponse`/`CardSummary`, generated `wyrd-http.d.ts`) through the existing `BrowserSession.api`, which `hooks.server.ts` now passes to the facade. Upstream refusals map through the existing `problemKind`. The Home `+page.server.ts` load, `HomeView`, the page layout and the mock projection are retained. Gap: Home had no live source. Extension: one private `liveHome` projection with a typed `CardLifecycleStatus → tone` map. There is no new route, transport, session or schema.
+
+**Decisions.**
+- Home reads only the server's default first page (50). A page with `next_cursor` shows `N+ registered` and a "more are registered" detail, never an inferred total; the `ponytail:` note marks the ceiling.
+- Registered Cards are shown newest first within that page, with links to `/t/{tenant}/cards/{card_uid}`.
+- Attention and the Observe summary render as explicitly unavailable (`null` section/value). Changes (out of scope) and "Pick work back up" (no evidence source) are omitted in live mode, along with the New Change Request action.
+- Live mode leaves authority to the server; the mock branch keeps its existing permission gate.
+- "Recently viewed Cards/Seen" was renamed "Registered Cards/Registered", because the UI has no view history.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Scenario 1: an empty-baseline tenant, then Cards registered via SDK, shows on Home with valid links | `wyrd.ts` `home()`/`liveHome`; `+page.svelte` | `live UI initial Home`: Home equals the authoritative `GET /v1/cards` before and after, and the `wyrd apply` Prompts appear with `card_uid` links; `live UI initial Home projection` | PASS |
+| Scenario 2: unavailable sections show no fixtures, and denied gets the safe state | `null` sections and `Unavailable` summary; server 403 → `reject('denied')` | Raw HTML has no fixture strings and shows the "Not available yet"/unavailable text. A no-Role principal gets 403 `WYRD_PERMISSION_403_DENIED_RBAC` with no Card names. Another tenant's reader sees only its own Cards. Unit test covers 403 and the no-session 502 | PASS |
+| BFF input reaches the upstream with the session scope; generated mapping; denied/error behavior | `session.api('get','/cards')`, `components['schemas']['ListCardsResponse']` | Projection test (call recorded as `get /cards`); `pnpm check` 0 errors; `mise run codegen:check` exit 0 | PASS |
+| Primary content in initial HTML; client navigation by server load; hydration does not refetch; no browser `/v1` calls | Existing `+page.server.ts` | Browser case: initial `GET` HTML contains Cards; nav-link click fetches `/t/{t}/__data.json` with zero browser `/v1/` requests; reload issues no `__data.json`; deep link then Back restores Home | PASS |
+| No fixture fallback when missing/denied/unavailable | Live branch has no mock path | Unit test (no session → 502, 403 → 403); `journey.test.ts` dev live-mode asserts 502 with no fixtures | PASS |
+| Usability pass | Screenshots `target/debug/wyrd-ui-live-login/home-{before,after,denied}.png` (local, not checked in) | Reviewed; issues below | PASS (issues recorded) |
+
+**Usability issues (not fixed; outside this page's minimal scope).**
+1. At 1280px the Cards table's fixed `min-width: 740px` pushes the Registered column behind a horizontal scroll. The same was true of the mock "Seen" column.
+2. A denied Home renders the root error page without the Shell; "Return to tenant entry" is the only recovery. This was already noted in TASK-002.
+3. The page subtitle ("what changed, and where to pick work back up") overstates content while those sections are unavailable.
+4. The header shows a raw principal UUID (known from TASK-002).
+
+**"Empty" baseline.** Every harness tenant is seeded with its bootstrap owner's Service Card, so the starting state is that one authoritative Card rather than zero. The zero-Card empty state is proven in the projection unit test.
+
+**Card links.** Links target the exact `card_uid`. The Card detail and inventory pages remain mock-backed until TASK-004/005.
+
+**Commands.**
+- `mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/server/wyrd.test.ts -t '^live UI initial Home projection$'`: RED (403 from the mock permission gate), then GREEN.
+- `vitest run src/lib src/routes`: 182 passed.
+- `WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='live UI initial Home' mise run test:identity:journey`: 1 passed, 5 skipped.
+- `pnpm run check`: 742 files, 0 errors.
+- `pnpm run build`: ok.
+- `mise run codegen:check`: ok.
+- `git diff --check`: clean.
+
+**Gate-run diagnoses.**
+- `wyrd apply <dir>` refused two independent Prompts: `WYRD_LOADER_400_INVALID_ENVELOPE`, multiple roots. A directory is one Card tree, so each file is now applied separately.
+- The CLI refused a world-readable `credentials.toml` (`unsafe_store`). It is now written with mode 0600.
+- `locator('aside')` matched the nav and the summaries. The summaries are now selected by accessible name.
+- `goBack()` resolved before the URL changed. The test now waits on `waitForURL(home)`, a condition wait.
+
+**Not run.** `fmt`/`lints` (the Rust change is a two-line test-host fixture) and `check:deps` were skipped at the user's direction ("dont do lints"). `$wyrd-task-review` was not run.
+
+**Non-goals.** No public/persisted contracts, migrations, compatibility routes, Changes, dashboards or Query work. No unrelated files were changed.

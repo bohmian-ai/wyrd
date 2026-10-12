@@ -12,7 +12,7 @@
  * that refresh token (RFC 7009).
  */
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -29,6 +29,8 @@ type Journey = {
   ssoAdminKey: string;
   offAdminKey: string;
   offReaderKey: string;
+  /** An OIDC-off service principal with no Role: every protected read is refused. */
+  offNoRoleKey: string;
   switchTenants: { keycloak: string; second: string; peer: string };
   replacementTenant: string;
   replacementOwnerKey: string;
@@ -929,3 +931,119 @@ test('live UI login and CLI', async () => {
     await rm(config, { recursive: true, force: true });
   }
 }, 180_000);
+
+/** The tenant's Card names, read with the tenant administrator's key. */
+async function registeredCards(apiKey: string): Promise<{ name: string; card_uid: string }[]> {
+  const listed = await asKey(apiKey, 'GET', '/cards');
+  expect(listed.status).toBe(200);
+  const page = (await listed.json()) as { items: { name: string; card_uid: string }[]; next_cursor?: string | null };
+  expect(page.next_cursor ?? null).toBeNull();
+  return page.items;
+}
+
+/** Sign in to an OIDC-off tenant through the rendered API-key recovery form. */
+async function apiKeyLogin(page: Page, tenant: string, apiKey: string) {
+  await page.goto(`${journey.origin}/t/${tenant}/login/api-key`);
+  await page.fill('#api-key', apiKey);
+  await page.getByRole('button', { name: 'Sign in with API key' }).click();
+  await page.waitForURL(`${journey.origin}/t/${tenant}`);
+}
+
+/** Home data that must never reach a live page: the development fixtures. */
+const homeFixtures = ['Raise checkout ranking cutoff', 'checkout-api', 'change_01', 'Recent changes', 'Pick work back up'];
+
+test('live UI initial Home', async () => {
+  const sso = journey.ssoTenant;
+  const home = `${journey.origin}/t/${sso}`;
+  await mkdir(journey.evidence, { recursive: true });
+  const cards = await mkdtemp(join(tmpdir(), 'wyrd-home-cards-'));
+  const browser = await chromium.launch();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await browserLogin(page, sso, journey.users.admin);
+
+    // Before registration Home shows exactly the tenant's authoritative Cards and no fixtures.
+    const before = await registeredCards(journey.ssoAdminKey);
+    const initial = await (await context.request.get(home)).text();
+    expect(initial).toContain(`${before.length} registered`);
+    for (const { name } of before.slice(-5)) expect(initial).toContain(name);
+    for (const fixture of homeFixtures) expect(initial).not.toContain(fixture);
+    // Operational sections without a live source say so instead of showing numbers.
+    expect(initial).toContain('Not available yet');
+    expect(initial).toContain('Signal summaries are not available on Home yet.');
+    await page.goto(home);
+    await page.screenshot({ path: join(journey.evidence, 'home-before.png'), fullPage: true });
+
+    // Register two real Prompt Cards through the public CLI with the administrator's key.
+    for (const name of ['home-triage', 'home-summarize'])
+      await writeFile(
+        join(cards, `${name}.yaml`),
+        `apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: ${name}\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [${name}]\n`
+      );
+    await writeFile(join(cards, 'credentials.toml'), `[default]\napi_key = "${journey.ssoAdminKey}"\n`, {
+      mode: 0o600
+    });
+    // A directory is one Card tree with one root, so each independent Prompt is applied alone.
+    for (const name of ['home-triage', 'home-summarize']) {
+      const applied = await wyrd(cards, ['apply', '--server', journey.origin, join(cards, `${name}.yaml`)]);
+      expect(applied.code, applied.output).toBe(0);
+    }
+    const after = await registeredCards(journey.ssoAdminKey);
+    expect(after).toHaveLength(before.length + 2);
+
+    // Returning Home by client navigation reads the change through a server load, not the browser.
+    await page.goto(`${home}/settings`);
+    const browserRequests: string[] = [];
+    page.on('request', (request) => browserRequests.push(new URL(request.url()).pathname));
+    await page.getByRole('navigation', { name: 'Primary' }).getByRole('link', { name: 'Home' }).click();
+    await page.waitForURL(home);
+    const triage = after.find(({ name }) => name === 'home-triage')!;
+    const link = page.getByRole('link', { name: 'home-triage' });
+    await expect.poll(() => link.getAttribute('href')).toBe(`/t/${sso}/cards/${triage.card_uid}`);
+    const summaries = page.getByRole('complementary', { name: 'Workspace summaries and recent work' });
+    await expect.poll(() => summaries.textContent()).toContain(`${after.length} registered`);
+    expect(browserRequests).toContain(`/t/${sso}/__data.json`);
+    expect(browserRequests.filter((path) => path.startsWith('/v1/'))).toEqual([]);
+    await page.screenshot({ path: join(journey.evidence, 'home-after.png'), fullPage: true });
+
+    // Refresh is server-rendered with the same content; hydration does not fetch it again.
+    browserRequests.length = 0;
+    const refreshed = await page.reload();
+    expect(await refreshed!.text()).toContain('home-summarize');
+    expect(browserRequests.filter((path) => path.endsWith('__data.json'))).toEqual([]);
+    // A deep link and Back keep the tenant context.
+    await page.goto(`${home}/settings`);
+    await page.goBack();
+    await page.waitForURL(home);
+    await expect.poll(() => page.getByRole('link', { name: 'home-triage' }).count()).toBe(1);
+    await link.click();
+    await page.waitForURL(`${home}/cards/${triage.card_uid}`);
+    await context.close();
+
+    // Another tenant's reader sees only that tenant's Cards.
+    const reader = await browser.newContext();
+    const readerPage = await reader.newPage();
+    await apiKeyLogin(readerPage, journey.apiKeyTenant, journey.offReaderKey);
+    const offCards = await registeredCards(journey.offAdminKey);
+    const readerHtml = await (await reader.request.get(`${journey.origin}/t/${journey.apiKeyTenant}`)).text();
+    expect(readerHtml).toContain(`${offCards.length} registered`);
+    for (const name of ['home-triage', 'home-summarize']) expect(readerHtml).not.toContain(name);
+    await reader.close();
+
+    // A principal the server refuses Card reads gets the denied state, never fixtures or Cards.
+    const denied = await browser.newContext();
+    const deniedPage = await denied.newPage();
+    await apiKeyLogin(deniedPage, journey.apiKeyTenant, journey.offNoRoleKey);
+    const refusal = await denied.request.get(`${journey.origin}/t/${journey.apiKeyTenant}`);
+    expect(refusal.status()).toBe(403);
+    const refusalHtml = await refusal.text();
+    expect(refusalHtml).toContain('WYRD_PERMISSION_403');
+    for (const { name } of offCards) expect(refusalHtml).not.toContain(name);
+    for (const fixture of homeFixtures) expect(refusalHtml).not.toContain(fixture);
+    await deniedPage.screenshot({ path: join(journey.evidence, 'home-denied.png'), fullPage: true });
+  } finally {
+    await browser.close();
+    await rm(cards, { recursive: true, force: true });
+  }
+}, 120_000);

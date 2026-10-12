@@ -501,6 +501,10 @@ async fn production_ui_bff_journey() {
         .bootstrap_service_in_tenant(off, "ui-off-reader", &["viewer"])
         .await
         .expect("oidc-off reader bootstraps");
+    let off_no_role = srv
+        .bootstrap_service_in_tenant(off, "ui-off-no-role", &[])
+        .await
+        .expect("oidc-off role-less principal bootstraps");
 
     sso_tenant(
         &srv,
@@ -561,6 +565,7 @@ async fn production_ui_bff_journey() {
         "ssoAdminKey": sso_admin_key,
         "offAdminKey": off_admin.api_key().expect("admin key").expose_secret(),
         "offReaderKey": off_reader.api_key().expect("reader key").expose_secret(),
+        "offNoRoleKey": off_no_role.api_key().expect("role-less key").expose_secret(),
         "switchTenants": {
             "keycloak": SWITCH_KEYCLOAK_TENANT,
             "second": SWITCH_SECOND_TENANT,

@@ -2166,6 +2166,16 @@ async fn settlement_failure_clears_readiness() {
         "newly eligible work must receive no claim from the stopping worker"
     );
     eprintln!("after worker join: new demand={after:?}; no later claim or attempt");
+    // The unsettled claim lapses on its production TTL before the respawned
+    // owner may reclaim it; the test proves the recovery, not the wait.
+    sqlx::query(
+        "UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 millisecond' \
+         WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .execute(&pool)
+    .await
+    .expect("the unsettled claim lapses");
     await_forge_role_while_running(&server, "worker after its settlement failure recovers").await;
     server.shutdown().await.expect("test server shuts down");
 }

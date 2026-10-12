@@ -2546,6 +2546,9 @@ async fn failed_worker_restarts_while_the_api_serves() {
     await_worker_readiness(&cluster, false, "failing worker").await;
     assert_public_rows(&client, &failing, &failing_rows, "while the worker fails").await;
 
+    // The unsettled claim is left to lapse on its production TTL before a
+    // successor can reclaim it; the journey proves the recovery, not the wait.
+    expire_running_claims(&cluster, tenant).await;
     observer.release_fatal_observation_for_test();
     await_worker_readiness(&cluster, true, "rebuilt worker").await;
     assert_public_rows(&client, &failing, &failing_rows, "after the restart").await;

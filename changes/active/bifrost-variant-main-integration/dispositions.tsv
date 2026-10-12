@@ -1,9 +1,9 @@
 path	B→S status	class (C conflict, A auto-merged overlap, I identical overlap)	disposition	owner	note
 .agents/skills/wyrd-task-review/SKILL.md	M	A	main-retained	TASK-001	Source review-skill change out of scope; main skill kept (commit b38f9be37).
 .claude/skills/wyrd-task-review/SKILL.md	M	C	retired	TASK-001	Source review-skill change out of scope; main skill kept (commit b38f9be37).
-Cargo.lock	M	C	adapted	TASK-001	
+Cargo.lock	M	C	adapted	TASK-002	
 Cargo.toml	M	C	adapted	TASK-001	
-architecture/bifrost-design.md	M	C	adapted	TASK-001	
+architecture/bifrost-design.md	M	C	adapted	TASK-002	
 architecture/references/domain/datafusion.md	M		preserved	TASK-001	
 architecture/wyrd-design.md	M	A	adapted	TASK-001	
 changes/active/bifrost-variant/architecture_ref.md	A		preserved	TASK-001	
@@ -157,11 +157,11 @@ changes/active/bifrost-variant/tasks/TASK-005-table-time-column.md	A		preserved	
 crates/shared/workspace-hack/Cargo.toml	M	C	adapted	TASK-001	
 crates/shared/wyrd-bench/src/lane.rs	M		preserved	TASK-001	
 crates/shared/wyrd-client/Cargo.toml	M	A	adapted	TASK-001	
-crates/shared/wyrd-client/src/bifrost/facade.rs	M	C	adapted	TASK-001	
+crates/shared/wyrd-client/src/bifrost/facade.rs	M	C	adapted	TASK-002	
 crates/shared/wyrd-client/src/bifrost/grpc.rs	M	C	adapted	TASK-001	
-crates/shared/wyrd-client/src/bifrost/handle.rs	M	A	adapted	TASK-001	
+crates/shared/wyrd-client/src/bifrost/handle.rs	M	A	adapted	TASK-002	
 crates/shared/wyrd-client/src/bifrost/mod.rs	M	C	adapted	TASK-001	
-crates/shared/wyrd-client/src/bifrost/query.rs	M	C	adapted	TASK-001	
+crates/shared/wyrd-client/src/bifrost/query.rs	M	C	adapted	TASK-002	
 crates/shared/wyrd-client/src/bifrost/table.rs	M	C	adapted	TASK-001	
 crates/shared/wyrd-client/src/error.rs	M	C	adapted	TASK-001	
 crates/shared/wyrd-client/src/observe/drift.rs	M	A	adapted	TASK-001	
@@ -175,7 +175,7 @@ crates/shared/wyrd-client/tests/pg_bifrost_e2e.rs	M	C	retired	TASK-001	Rehomed t
 crates/shared/wyrd-client/tests/pg_bifrost_e2e/variant_tables.rs	A		retired	TASK-001	Rehomed to tests/integration/pg_bifrost_e2e/ (S3).
 crates/shared/wyrd-queue/Cargo.toml	M	A	adapted	TASK-001	
 crates/shared/wyrd-queue/src/batch_builder.rs	M	C	adapted	TASK-001	
-crates/shared/wyrd-queue/src/config.rs	M	C	preserved	TASK-001	
+crates/shared/wyrd-queue/src/config.rs	M	C	preserved	TASK-002	
 crates/shared/wyrd-queue/src/error.rs	M	C	adapted	TASK-001	
 crates/shared/wyrd-queue/src/lib.rs	M		preserved	TASK-001	
 crates/shared/wyrd-queue/src/producer.rs	M	C	adapted	TASK-001	
@@ -187,8 +187,8 @@ crates/shared/wyrd-types/src/lib.rs	A		preserved	TASK-001
 crates/shared/wyrd-types/src/schema.rs	A		preserved	TASK-001	
 crates/shared/wyrd-types/src/timestamp.rs	A		preserved	TASK-001	
 crates/shared/wyrd-types/src/variant.rs	A		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/Cargo.toml	M	A	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/src/catalog/bifrost_catalog.rs	M	C	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/Cargo.toml	M	A	adapted	TASK-002	
+crates/vala/vala-bifrost-redux/src/catalog/bifrost_catalog.rs	M	C	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/catalog/cut_cache.rs	A		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/catalog/error.rs	M	A	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/catalog/event_time.rs	M		preserved	TASK-001	
@@ -199,42 +199,42 @@ crates/vala/vala-bifrost-redux/src/catalog/table_ref.rs	M		preserved	TASK-001
 crates/vala/vala-bifrost-redux/src/catalog/wire.rs	M	C	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/contracts.rs	M	A	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/forge/compact.rs	M	A	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/src/forge/error.rs	M		preserved	TASK-001	
+crates/vala/vala-bifrost-redux/src/forge/error.rs	M		preserved	TASK-002	
 crates/vala/vala-bifrost-redux/src/forge/expire.rs	M	C	adapted	TASK-002	S06: main lease-bounded expiry kept; hold bounded by remaining lease less uncertainty margin so pre-submission reset runs under a live fence (136e460d6); post-preparation test gate.
 crates/vala/vala-bifrost-redux/src/forge/expiry_policy.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/forge/gc.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/forge/live_reconcile.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/forge/live_replace.rs	M		preserved	TASK-001	
+crates/vala/vala-bifrost-redux/src/forge/gc.rs	M		preserved	TASK-002	
+crates/vala/vala-bifrost-redux/src/forge/live_reconcile.rs	M		preserved	TASK-002	
+crates/vala/vala-bifrost-redux/src/forge/live_replace.rs	M		preserved	TASK-002	
 crates/vala/vala-bifrost-redux/src/forge/managed/executor.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/forge/managed/identity.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/forge/managed/policy.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/forge/metrics.rs	M	A	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/src/forge/mod.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/forge/orphan_gc.rs	M		preserved	TASK-001	
+crates/vala/vala-bifrost-redux/src/forge/metrics.rs	M	A	adapted	TASK-002	
+crates/vala/vala-bifrost-redux/src/forge/mod.rs	M		preserved	TASK-002	
+crates/vala/vala-bifrost-redux/src/forge/orphan_gc.rs	M		preserved	TASK-002	
 crates/vala/vala-bifrost-redux/src/forge/path.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/forge/scribe_promotion.rs	M		preserved	TASK-001	
+crates/vala/vala-bifrost-redux/src/forge/scribe_promotion.rs	M		preserved	TASK-002	
 crates/vala/vala-bifrost-redux/src/forge/table_authority.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/forge/worker.rs	M	A	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/forge/worker.rs	M	A	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/gate/error.rs	M	C	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/gate/limits.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/gate/mod.rs	M	C	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/gate/mod.rs	M	C	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/lib.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/oracle/admission.rs	M	C	adapted	TASK-002	S07: main Oracle-only drain over governed bytes plus infallible headroom; source child-drain removed (ba86fe129).
 crates/vala/vala-bifrost-redux/src/oracle/analytical.rs	M	C	adapted	TASK-002	S07: main late-child settlement; source graph child drain and wall deadline removed; release sync with test pause in callers (ba86fe129, 985aa12f8).
 crates/vala/vala-bifrost-redux/src/oracle/analytical_scan.rs	D		S-delete kept	TASK-001	Source deletion kept: replaced owner (REQ-001).
 crates/vala/vala-bifrost-redux/src/oracle/analytical_supervisor.rs	M	C	adapted	TASK-002	S07: source graph child idle/debt refusal removed (ba86fe129).
-crates/vala/vala-bifrost-redux/src/oracle/analytical_transport.rs	M	C	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/oracle/analytical_transport.rs	M	C	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/oracle/bindings.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/oracle/codec.rs	M	A	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/oracle/codec.rs	M	A	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/oracle/dispatcher.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/oracle/exec.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/oracle/follower.rs	M	C	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/src/oracle/live.rs	M		adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/oracle/follower.rs	M	C	adapted	TASK-002	
+crates/vala/vala-bifrost-redux/src/oracle/live.rs	M		adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/oracle/memtable_source.rs	A		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/oracle/mod.rs	M	C	adapted	TASK-002	S07: drain_children calls removed (ba86fe129).
 crates/vala/vala-bifrost-redux/src/oracle/nested_pushdown.rs	A		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/oracle/peer.rs	M	A	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/src/oracle/planner.rs	M	A	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/oracle/peer.rs	M	A	adapted	TASK-002	
+crates/vala/vala-bifrost-redux/src/oracle/planner.rs	M	A	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/oracle/profile.rs	A		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/oracle/pruning.rs	D		S-delete kept	TASK-001	Source deletion kept: replaced owner (REQ-001).
 crates/vala/vala-bifrost-redux/src/oracle/query_stream.rs	M	C	adapted	TASK-002	S07: drain_children call removed (ba86fe129).
@@ -251,7 +251,7 @@ crates/vala/vala-bifrost-redux/src/resources.rs	M	C	adapted	TASK-002	S07: main s
 crates/vala/vala-bifrost-redux/src/scan_sizing.rs	A		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/schema/fingerprint.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/admission.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/scribe/assembly.rs	M	A	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/scribe/assembly.rs	M	A	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/scribe/claim_assembly.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/claim_merge.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/claim_sample.rs	A		preserved	TASK-001	
@@ -274,14 +274,14 @@ crates/vala/vala-bifrost-redux/src/scribe/replay.rs	M	A	adapted	TASK-001
 crates/vala/vala-bifrost-redux/src/scribe/seal_key.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/shards.rs	M	A	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/staging.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/src/scribe/staging_runtime.rs	M	A	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/scribe/staging_runtime.rs	M	A	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/scribe/tail_rpc.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/tests/pg_scribe_crash_injection.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/tests/pg_scribe_restart.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/tests/scribe_persistence_path.rs	M	C	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/tests/time_partition.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/scribe/tests/wal_closeout.rs	M	A	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/src/scribe/wal.rs	M		preserved	TASK-001	
+crates/vala/vala-bifrost-redux/src/scribe/wal.rs	M		preserved	TASK-002	
 crates/vala/vala-bifrost-redux/src/storage/cache.rs	D		S-delete kept	TASK-001	Source deletion kept: replaced owner (REQ-001).
 crates/vala/vala-bifrost-redux/src/storage/error.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/storage/mod.rs	M	C	preserved	TASK-001	
@@ -304,35 +304,35 @@ crates/vala/vala-bifrost-redux/src/tables/managed_columns.rs	M	C	adapted	TASK-00
 crates/vala/vala-bifrost-redux/src/tables/metrics/mod.rs	M	A	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/tables/metrics/points.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/tables/metrics/projection.rs	M	C	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/src/tables/mod.rs	M	C	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/tables/mod.rs	M	C	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/src/tables/signal.rs	M	C	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/tables/traces/mod.rs	M	A	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/tables/traces/projection.rs	M	C	adapted	TASK-001	
 crates/vala/vala-bifrost-redux/src/tables/traces/spans.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/src/tables/verification/mod.rs	M		adapted	TASK-001	
-crates/vala/vala-bifrost-redux/src/tables/verification/results.rs	M	C	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/src/tables/verification/results.rs	M	C	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/tests/integration/distributed_compat.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/tests/integration/forge/compaction_admission.rs	M	C	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/tests/integration/forge/expired_cleanup.rs	M		preserved	TASK-001	
+crates/vala/vala-bifrost-redux/tests/integration/forge/compaction_admission.rs	M	C	adapted	TASK-002	
+crates/vala/vala-bifrost-redux/tests/integration/forge/expired_cleanup.rs	M		preserved	TASK-002	
 crates/vala/vala-bifrost-redux/tests/integration/forge/managed_rewrite.rs	M		preserved	TASK-001	
-crates/vala/vala-bifrost-redux/tests/integration/forge/orphan_cleanup.rs	M	A	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/tests/integration/forge/production_routes.rs	M	A	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/tests/integration/forge/promotion.rs	M	C	adapted	TASK-001	
-crates/vala/vala-bifrost-redux/tests/integration/forge/publication.rs	M	C	adapted	TASK-001	
+crates/vala/vala-bifrost-redux/tests/integration/forge/orphan_cleanup.rs	M	A	adapted	TASK-002	
+crates/vala/vala-bifrost-redux/tests/integration/forge/production_routes.rs	M	A	adapted	TASK-002	
+crates/vala/vala-bifrost-redux/tests/integration/forge/promotion.rs	M	C	adapted	TASK-002	
+crates/vala/vala-bifrost-redux/tests/integration/forge/publication.rs	M	C	adapted	TASK-002	
 crates/vala/vala-bifrost-redux/tests/integration/forge/reader_expiry_ordering.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/tests/integration/forge/rewrite_support.rs	M		preserved	TASK-001	
 crates/vala/vala-bifrost-redux/tests/integration/forge/snapshot_expiration.rs	M	A	adapted	TASK-002	S06: uncertain-expiry proof extended with pre-submission lease bound and exact retained operation identity (136e460d6).
-crates/vala/vala-bifrost-redux/tests/integration/forge/support.rs	M	A	adapted	TASK-001	
-crates/vala/vala-sql/migrations/20260619000001_olap_minimal.sql	M	A	main-retained	TASK-001	REQ-024: main historical bytes; source comment edit dropped.
+crates/vala/vala-bifrost-redux/tests/integration/forge/support.rs	M	A	adapted	TASK-002	
+crates/vala/vala-sql/migrations/20260619000001_olap_minimal.sql	M	A	main-retained	TASK-002	REQ-024: main historical bytes; source comment edit dropped.
 crates/vala/vala-sql/migrations/20261009000000_bifrost_snapshot_retention.sql	A		adapted	TASK-001	
 crates/vala/vala-sql/migrations/20261010000000_bifrost_cut_notify.sql	A		adapted	TASK-001	
-crates/vala/vala-sql/migrations/20261011000000_scribe_wal_fenced_lsn.sql	A		adapted	TASK-001	
-crates/vala/vala-sql/src/lib.rs	M	C	main-retained	TASK-001	REQ-024: olap_minimal checksum stays main since bytes stay main.
-crates/vala/vala-sql/src/postgres.rs	M	A	main-retained	TASK-001	REQ-022: source bare conn() removed; cut on TenantConn, fence on OperatorPool.
+crates/vala/vala-sql/migrations/20261011000000_scribe_wal_fenced_lsn.sql	A		adapted	TASK-002	
+crates/vala/vala-sql/src/lib.rs	M	C	main-retained	TASK-002	REQ-024: olap_minimal checksum stays main since bytes stay main.
+crates/vala/vala-sql/src/postgres.rs	M	A	main-retained	TASK-002	REQ-022: source bare conn() removed; cut on TenantConn, fence on OperatorPool.
 crates/vala/vala-sql/src/queries/audit_staging.rs	M	C	retired	TASK-002	Main retired audit staging (shared ScribeOutbox); audit owned by TASK-002 Part B.
-crates/vala/vala-sql/src/queries/forge_operations.rs	M	A	adapted	TASK-001	
+crates/vala/vala-sql/src/queries/forge_operations.rs	M	A	adapted	TASK-002	
 crates/vala/vala-sql/src/queries/olap_catalog.rs	M	A	adapted	TASK-001	
-crates/vala/vala-sql/src/queries/oracle_reader_authority.rs	M	C	adapted	TASK-001	
+crates/vala/vala-sql/src/queries/oracle_reader_authority.rs	M	C	adapted	TASK-002	
 crates/vala/vala-sql/src/queries/scribe_batch_commits.rs	M		adapted	TASK-001	
 crates/vala/vala-sql/src/row_types/file_list.rs	M		preserved	TASK-001	
 crates/vala/vala-sql/src/row_types/oracle_reader_authority.rs	M		preserved	TASK-001	
@@ -350,9 +350,9 @@ crates/wyrd-spec/schemas/bifrost_register_table_request.json	M	A	adapted	TASK-00
 crates/wyrd-spec/schemas/bifrost_table_description.json	M	A	adapted	TASK-001	
 crates/wyrd-spec/schemas/bifrost_time_granularity.json	M		preserved	TASK-001	
 crates/wyrd-spec/src/error.rs	M	A	adapted	TASK-001	
-crates/wyrd-spec/src/vala/api.rs	M	C	adapted	TASK-001	
+crates/wyrd-spec/src/vala/api.rs	M	C	adapted	TASK-002	
 crates/wyrd-spec/src/vala/assignment_authority.rs	M	C	adapted	TASK-001	
-crates/wyrd-spec/src/vala/error.rs	M	A	adapted	TASK-001	
+crates/wyrd-spec/src/vala/error.rs	M	A	adapted	TASK-002	
 crates/wyrd-spec/src/vala/logs/record.rs	M		preserved	TASK-001	
 crates/wyrd-spec/src/vala/managed_columns.rs	M	A	adapted	TASK-001	
 crates/wyrd-spec/src/vala/mod.rs	M	C	adapted	TASK-001	
@@ -368,7 +368,7 @@ crates/wyrd-spec/tests/schemas/bifrost_time_granularity.json	M	C	retired	TASK-00
 crates/wyrd/wyrd-cli/Cargo.toml	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-cli/src/query/mod.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-cli/tests/query_server_journey.rs	M	A	adapted	TASK-001	
-crates/wyrd/wyrd-mcp/tests/bifrost/mcp/query.rs	M	C	adapted	TASK-001	
+crates/wyrd/wyrd-mcp/tests/bifrost/mcp/query.rs	M	C	adapted	TASK-002	
 crates/wyrd/wyrd-server/Cargo.toml	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/app/metrics.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-server/src/app/serve.rs	M		preserved	TASK-001	
@@ -378,7 +378,7 @@ crates/wyrd/wyrd-server/src/bifrost/convert.rs	M		preserved	TASK-001
 crates/wyrd/wyrd-server/src/bifrost/gate_audit.rs	M	C	retired	TASK-002	Main retired gate audit path for staged AuditEvent; audit owned by TASK-002 Part B.
 crates/wyrd/wyrd-server/src/bifrost/routes.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/bifrost/service.rs	M	C	adapted	TASK-001	
-crates/wyrd/wyrd-server/src/boot/mod.rs	M	C	adapted	TASK-001	
+crates/wyrd/wyrd-server/src/boot/mod.rs	M	C	adapted	TASK-002	
 crates/wyrd/wyrd-server/src/components/gateway/capture.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/components/gateway/pg_invocation_tests.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/config.rs	M	A	adapted	TASK-001	
@@ -391,24 +391,24 @@ crates/wyrd/wyrd-server/src/oracle/tail_discovery.rs	M		preserved	TASK-001
 crates/wyrd/wyrd-server/src/otlp_json.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/otlp_metrics_decode.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/query/routes.rs	M	A	adapted	TASK-001	
-crates/wyrd/wyrd-server/src/query/scheduled.rs	M	A	adapted	TASK-001	
+crates/wyrd/wyrd-server/src/query/scheduled.rs	M	A	adapted	TASK-002	
 crates/wyrd/wyrd-server/src/query/service.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/state.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/test_support.rs	M	A	adapted	TASK-001	
-crates/wyrd/wyrd-server/src/verification/drift.rs	M	C	adapted	TASK-001	
-crates/wyrd/wyrd-server/src/verification/eval.rs	M	C	adapted	TASK-001	
+crates/wyrd/wyrd-server/src/verification/drift.rs	M	C	adapted	TASK-002	
+crates/wyrd/wyrd-server/src/verification/eval.rs	M	C	adapted	TASK-002	
 crates/wyrd/wyrd-server/src/verification/observations.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-server/src/verification/publisher.rs	M	C	retired	TASK-002	Main retired the result publisher; results staged on ScribeOutbox (verification_runtime adapted); TASK-002 Part C owns results.
 crates/wyrd/wyrd-server/src/verification/results.rs	M	C	adapted	TASK-001	
-crates/wyrd/wyrd-server/src/verification/runner.rs	M	C	adapted	TASK-001	
+crates/wyrd/wyrd-server/src/verification/runner.rs	M	C	adapted	TASK-002	
 crates/wyrd/wyrd-server/tests/pg_grpc_ingest_smoke.rs	M	A	retired	TASK-001	Rehomed to wyrd-server tests/integration/ (S3).
 crates/wyrd/wyrd-server/tests/pg_verification_routes.rs	M	A	retired	TASK-001	Rehomed to wyrd-server tests/integration/ (S3).
 crates/wyrd/wyrd-server/tests/pg_verification_runtime.rs	M	A	retired	TASK-001	Rehomed to wyrd-server tests/integration/ (S3).
 crates/wyrd/wyrd-sql/src/queries/verifier_runs.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-storage/src/factory/gcs.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-storage/src/factory/mod.rs	M		preserved	TASK-001	
-crates/wyrd/wyrd-storage/src/local.rs	M	C	preserved	TASK-001	
-crates/wyrd/wyrd-storage/src/signer.rs	M	A	adapted	TASK-001	
+crates/wyrd/wyrd-storage/src/local.rs	M	C	preserved	TASK-002	
+crates/wyrd/wyrd-storage/src/signer.rs	M	A	adapted	TASK-002	
 crates/wyrd/wyrd-storage/src/telemetry.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-testing/Cargo.toml	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-testing/src/bifrost/canonical_signals.rs	M		preserved	TASK-001	
@@ -441,22 +441,22 @@ crates/wyrd/wyrd-testing/src/release_server/os.rs	A		preserved	TASK-001
 crates/wyrd/wyrd-testing/src/server.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-testing/src/verification.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-testing/tests/README.md	M	C	adapted	TASK-001	
-crates/wyrd/wyrd-testing/tests/bifrost/forge/live_rewrite.rs	M	A	adapted	TASK-001	
-crates/wyrd/wyrd-testing/tests/bifrost/forge/production_closeout.rs	M	C	adapted	TASK-001	
-crates/wyrd/wyrd-testing/tests/bifrost/forge/scribe_promotion.rs	M	A	adapted	TASK-001	
-crates/wyrd/wyrd-testing/tests/bifrost/oracle/analytical_activation.rs	M	A	adapted	TASK-001	
+crates/wyrd/wyrd-testing/tests/bifrost/forge/live_rewrite.rs	M	A	adapted	TASK-002	
+crates/wyrd/wyrd-testing/tests/bifrost/forge/production_closeout.rs	M	C	adapted	TASK-002	
+crates/wyrd/wyrd-testing/tests/bifrost/forge/scribe_promotion.rs	M	A	adapted	TASK-002	
+crates/wyrd/wyrd-testing/tests/bifrost/oracle/analytical_activation.rs	M	A	adapted	TASK-002	
 crates/wyrd/wyrd-testing/tests/bifrost/oracle/analytical_lifecycle.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/oracle/capacity.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/oracle/distributed.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/oracle/peer_cluster.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/oracle/peer_network/analytical.rs	M	A	adapted	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/oracle/peer_network/security.rs	M	A	adapted	TASK-001	
-crates/wyrd/wyrd-testing/tests/bifrost/oracle/published.rs	M	C	adapted	TASK-001	
+crates/wyrd/wyrd-testing/tests/bifrost/oracle/published.rs	M	C	adapted	TASK-002	
 crates/wyrd/wyrd-testing/tests/bifrost/oracle/support.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/otlp/logs_export.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/otlp/metrics_export.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/otlp/support.rs	M	A	adapted	TASK-001	
-crates/wyrd/wyrd-testing/tests/bifrost/otlp/trace_export.rs	M	C	adapted	TASK-001	
+crates/wyrd/wyrd-testing/tests/bifrost/otlp/trace_export.rs	M	C	adapted	TASK-002	
 crates/wyrd/wyrd-testing/tests/bifrost/otlp/trace_export_http.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/scribe/fencing.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/scribe/main.rs	M	A	adapted	TASK-001	
@@ -464,20 +464,20 @@ crates/wyrd/wyrd-testing/tests/bifrost/scribe/qualification.rs	M	C	adapted	TASK-
 crates/wyrd/wyrd-testing/tests/bifrost/scribe/recovery.rs	A		adapted	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/scribe/support.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-testing/tests/bifrost/scribe/sustained.rs	M	A	adapted	TASK-001	
-crates/wyrd/wyrd-testing/tests/bifrost/scribe/write_read.rs	M	C	adapted	TASK-001	
-crates/wyrd/wyrd-testing/tests/bifrost/server/eval_verification.rs	M	C	adapted	TASK-001	
+crates/wyrd/wyrd-testing/tests/bifrost/scribe/write_read.rs	M	C	adapted	TASK-002	
+crates/wyrd/wyrd-testing/tests/bifrost/server/eval_verification.rs	M	C	adapted	TASK-002	
 crates/wyrd/wyrd-testing/tests/bifrost/server/main.rs	M	C	adapted	TASK-001	
-crates/wyrd/wyrd-testing/tests/bifrost/server/owner_inspection.rs	M	A	adapted	TASK-001	
+crates/wyrd/wyrd-testing/tests/bifrost/server/owner_inspection.rs	M	A	adapted	TASK-002	
 crates/wyrd/wyrd-testing/tests/bifrost/server/query.rs	M	C	adapted	TASK-002	S08: audit drain journey forces late Scribe discovery inside the Oracle drain (3712b9ba3).
-crates/wyrd/wyrd-testing/tests/bifrost/server/verification_runtime.rs	M	C	adapted	TASK-001	
+crates/wyrd/wyrd-testing/tests/bifrost/server/verification_runtime.rs	M	C	adapted	TASK-002	
 crates/wyrd/wyrd-testing/tests/gateway/peer.rs	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-tonic/proto/wyrd.v1.bin	M	C	retired	TASK-001	L08: checked-in descriptor stays deleted.
 crates/wyrd/wyrd-tonic/proto/wyrd.v1.proto	M	C	adapted	TASK-001	
 crates/wyrd/wyrd-tonic/src/private_conversion.rs	M		preserved	TASK-001	
 crates/wyrd/wyrd-tonic/src/query_conversion.rs	M	C	adapted	TASK-001	
-docs/src/content/docs/bifrost/architecture.svx	M	C	adapted	TASK-001	
-docs/src/content/docs/bifrost/data-plane-internals.svx	M	A	adapted	TASK-001	
-docs/src/content/docs/bifrost/forge.svx	M	C	adapted	TASK-001	
+docs/src/content/docs/bifrost/architecture.svx	M	C	adapted	TASK-002	
+docs/src/content/docs/bifrost/data-plane-internals.svx	M	A	adapted	TASK-002	
+docs/src/content/docs/bifrost/forge.svx	M	C	adapted	TASK-002	
 docs/src/content/docs/bifrost/reading-data.svx	M	C	adapted	TASK-001	
 docs/src/content/docs/bifrost/schema.svx	M	C	adapted	TASK-001	
 docs/src/content/docs/bifrost/writing-data.svx	M		preserved	TASK-001	
@@ -485,7 +485,7 @@ fixtures/bifrost/every_iceberg_type.arrow	A		preserved	TASK-001
 fixtures/bifrost/every_iceberg_type.py	A		preserved	TASK-001	
 fixtures/bifrost/narrow_types.arrow	A		preserved	TASK-001	
 mise.lock	M		preserved	TASK-001	
-mise.toml	M	C	adapted	TASK-001	
+mise.toml	M	C	adapted	TASK-002	
 scripts/checks/object-store-pin.sh	M	C	retired	TASK-001	S2/L07: retired scripts stay deleted.
 scripts/test-families.sh	M	C	retired	TASK-001	S2/L07: retired scripts stay deleted.
 sdks/wyrd-sdk-python/Cargo.toml	M	A	adapted	TASK-001	
@@ -509,10 +509,10 @@ sdks/wyrd-sdk-python/tests/unit/bifrost/test_timestamp_types.py	A		preserved	TAS
 sdks/wyrd-sdk-rust/tests/drift_verification.rs	M	C	retired	TASK-002	Main deleted; drift assertions assigned to TASK-002 Part C.
 sdks/wyrd-sdk-rust/tests/observe_run.rs	M	C	retired	TASK-002	Main deleted/rewrote this story; source assertions assigned to TASK-002 Part D public journeys.
 sdks/wyrd-sdk-ts/native/Cargo.toml	M	A	adapted	TASK-001	
-sdks/wyrd-sdk-ts/native/src/lib.rs	M	C	adapted	TASK-001	
+sdks/wyrd-sdk-ts/native/src/lib.rs	M	C	adapted	TASK-002	
 sdks/wyrd-sdk-ts/wyrd/index.d.cts	M	C	adapted	TASK-001	
 sdks/wyrd-sdk-ts/wyrd/index.d.ts	M	C	adapted	TASK-001	
-sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts	M	A	adapted	TASK-001	
+sdks/wyrd-sdk-ts/wyrd/src/error-codes.ts	M	A	adapted	TASK-002	
 sdks/wyrd-sdk-ts/wyrd/src/index.ts	M	C	adapted	TASK-001	
 sdks/wyrd-sdk-ts/wyrd/tests/integration/drift-verification.test.ts	M	C	retired	TASK-002	Main deleted; drift assertions assigned to TASK-002 Part C.
 sdks/wyrd-sdk-ts/wyrd/tests/integration/every-iceberg-column-type.test.ts	A		adapted	TASK-001	

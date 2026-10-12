@@ -40,6 +40,13 @@ components perform bounded computation behind Vala-owned contracts; they do not
 authenticate callers, serve the network, own tenant authority, or commit
 durable Wyrd state independently.
 
+Each role on a pod renews its own `vala.cluster_nodes` heartbeat, and one
+process-wide membership poller reads the live set for every role. Internal
+Scribe writes route to a peer by its Scribe capability alone, so a pod without
+Oracle still reaches Scribe. At the entrance, Gate admits only a verified
+principal, OTLP authenticates its API key before decoding a body, and every
+Bifrost SQL path takes a `TenantConn` or an `OperatorPool`, never a bare pool.
+
 ## Table and row identity
 
 Every Bifrost table has one server-owned managed envelope with these required,
@@ -1362,7 +1369,8 @@ The surface includes:
 - `AppendReceipt { batch_id, accepted_rows, durability }`, where `durability`
   is the closed `AppendDurability::Acknowledged` value; the synchronous append
   response never reports staged, published, promoted, or rewritten state;
-- terminal-safe query streaming at `POST /v1/query`;
+- terminal-safe query streaming at `POST /v1/query`, with ordered typed bind
+  values (`params`) for the `$1..$n` placeholders in its SQL;
 - canonical SQL observation reads through the ordinary Bifrost query contract;
 - gRPC ingestion through `wyrd.v1.BifrostIngestService`;
 - gRPC query projection through `wyrd.v1.BifrostQueryService`;

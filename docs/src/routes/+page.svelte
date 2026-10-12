@@ -12,7 +12,7 @@
   const DOORS: Record<Section, { blurb: string; kicker: string }> = {
     'Get started': { blurb: 'Learn what Wyrd verifies and set up a local server.', kicker: 'Start' },
     'Build and verify': { blurb: 'Declare an AI system, observe its behavior, and verify it.', kicker: 'How-to' },
-    Connect: { blurb: 'Use the SDKs, CLI, MCP, and the AI gateway.', kicker: 'How-to' },
+    Connect: { blurb: 'Use the SDKs, CLI, MCP, and the AI Gateway.', kicker: 'How-to' },
     Operate: { blurb: 'Deploy Wyrd for a team and manage sign-in and access.', kicker: 'Operate' },
     Understand: { blurb: 'How Cards, verification, Bifrost, and identity fit together.', kicker: 'Explain' },
     Reference: { blurb: 'Card schemas, APIs, CLI commands, errors, and configuration.', kicker: 'Look up' }
@@ -26,14 +26,14 @@
   <title>Wyrd docs</title>
   <meta
     name="description"
-    content="Wyrd is open-source AI assurance and verification infrastructure. Verify AI systems before and after release, with verdicts you can trace, reproduce, and audit."
+    content="Wyrd is open-source verification and assurance infrastructure for AI systems. Verify AI systems before and after release, with verdicts you can trace, reproduce, and audit."
   />
 </svelte:head>
 
 <section class="cover dark-field" aria-label="Wyrd">
   <CoverScene />
   <div class="wrap hero">
-    <p class="eyebrow">Open-source AI assurance and verification</p>
+    <p class="eyebrow">Open-source verification and assurance for AI systems</p>
     <h1><span class="d">Declare.</span><br /><span class="o">Observe.</span><br />Verify.</h1>
     <p class="tagline">Declare what an AI system should do, record what it does, and get a verdict on whether they match.</p>
     <p class="lede">For an individual LLM, a deployed agent service, or a traditional HTTP service. Verify before release and keep verifying in production.</p>
@@ -51,20 +51,20 @@
 <div class="wrap">
   <section class="layers" aria-labelledby="layers-h">
     <p class="eyebrow">Core platform</p>
-    <h2 id="layers-h">Three layers, one loop.</h2>
+    <h2 id="layers-h">One loop, three steps.</h2>
     <ol class="strip">
-      <li><span class="n">01</span><b>Declaration</b><p>Describe the AI system as a set of versioned components.</p></li>
-      <li><span class="n">02</span><b class="o">Observation</b><p>Custom data, traces, logs, and metrics land in Bifrost, Wyrd's SQL-based data plane.</p></li>
-      <li><span class="n">03</span><b>Verification</b><p>Bind Verifiers to declared components and verify them before and after deployment. Each verdict is tied to the exact versions that ran.</p></li>
+      <li><span class="n">01</span><b>Declare</b><p>Describe the AI system as a set of versioned Cards, and bind the Verifiers that check them.</p></li>
+      <li><span class="n">02</span><b class="o">Observe</b><p>Record what the system does. Observations, traces, logs, metrics, and custom data land in Bifrost, Wyrd's SQL data plane.</p></li>
+      <li><span class="n">03</span><b>Verify</b><p>Verifiers judge that behavior in real time or on a schedule, before and after deployment. Each verdict names the exact versions that ran.</p></li>
     </ol>
   </section>
 
   {#if start}
     <section class="qs" aria-labelledby="qs-h">
       <div>
-        <p class="eyebrow">Quickstart</p>
+        <p class="eyebrow">Get started</p>
         <h2 id="qs-h">From intent to evidence.</h2>
-        <p class="sub">Declare an AI system, bind a Verifier, record behavior, and read the verdict.</p>
+        <p class="sub">Learn what Wyrd verifies, then run a local server and connect a client.</p>
         <nav class="links" aria-label="Get started">
           {#each startPages as item (item.path)}
             <a href={`${base}${item.path}`}>{item.label}</a>
@@ -76,12 +76,15 @@
         <pre><span class="ln">1</span><span class="k">apiVersion</span>: wyrd/v1
 <span class="ln">2</span><span class="k">kind</span>: Service
 <span class="ln">3</span><span class="k">metadata</span>:
-<span class="ln">4</span>  <span class="k">name</span>: support-agent
-<span class="ln">5</span>  <span class="k">version</span>: <span class="s">"1.0.0"</span>
+<span class="ln">4</span>  <span class="k">space</span>: retention
+<span class="ln">5</span>  <span class="k">name</span>: support-copilot
 <span class="ln">6</span><span class="k">spec</span>:
-<span class="ln">7</span>  <span class="k">verified_by</span>:
-<span class="ln">8</span>    - <span class="k">verifier</span>: {'{'} kind: Verifier, name: answer-quality, version: <span class="s">"1.0.0"</span> {'}'}
-<span class="ln">9</span>      <span class="k">runs_on</span>: {'{'} kind: observations_ready {'}'}</pre>
+<span class="ln">7</span>  <span class="k">components</span>:
+<span class="ln">8</span>    - <span class="k">alias</span>: triage
+<span class="ln">9</span>      <span class="k">ref</span>: ./agents/triage.yaml
+<span class="ln">10</span>      <span class="k">verified_by</span>:
+<span class="ln">11</span>        - <span class="k">verifier</span>: ./verifiers/triage-quality.yaml
+<span class="ln">12</span>          <span class="k">runs_on</span>: {'{'} kind: observations_ready {'}'}</pre>
       </figure>
     </section>
   {/if}
@@ -91,7 +94,7 @@
     <h2 id="platform-h">Evidence others can check.</h2>
     <div class="trio">
       <div><b>Identity and access</b><p>Role-based access, OIDC sign-in for people, and API keys for workloads. Delegated tokens (RFC 8693 token exchange) keep calls made on someone's behalf attributed to them. Every access decision is written to the audit log.</p></div>
-      <div><b>Gateway</b><p>Route LLM calls through the Wyrd AI gateway. Each call is authorized for the calling agent, attributed to it, and recorded for end-to-end verification.</p></div>
+      <div><b>Gateway</b><p>Route LLM calls through the Wyrd AI Gateway. Each call is authorized for the calling agent, attributed to it, and recorded for end-to-end verification.</p></div>
       <div><b>Interfaces</b><p>Python, TypeScript, and Rust SDKs, OpenTelemetry (OTLP) ingest, HTTP, CLI, and MCP. You run the server yourself, on Postgres and object storage.</p></div>
     </div>
   </section>
@@ -327,9 +330,6 @@
   }
   .k {
     color: var(--code-keyword);
-  }
-  .s {
-    color: var(--code-string);
   }
   .empty {
     max-width: 68ch;

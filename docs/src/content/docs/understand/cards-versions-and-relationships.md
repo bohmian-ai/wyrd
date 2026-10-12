@@ -7,7 +7,7 @@ order: 1
 draft: true
 ---
 
-You declare a whole service in YAML, independent of the language it is written in. The declaration is a set of Cards. A Card is one defined component of your system, and it is expected to behave in a certain way. A Service Card ties the set together by naming its components.
+A Card is a versioned declaration: one model, prompt, agent, or dataset in your system, or one rule for checking them. You declare a whole service as a folder of Card files in YAML, whatever language the service is written in, and a Service Card ties the set together by naming its components.
 
 Wyrd has 15 Card kinds. These are the ones a service declaration uses most:
 
@@ -25,25 +25,24 @@ Wyrd has 15 Card kinds. These are the ones a service declaration uses most:
 
 Not every Card starts in YAML. In a traditional ML workflow, you register `Data` and `Model` Cards from code as they are produced, with the Python SDK.
 
-The examples on this page build one service, `support-copilot`: a triage agent that answers support tickets and a churn model that scores the customer.
+The examples on this page use `support-desk`, the service in [`examples/support-desk/`](https://github.com/bohmian-ai/wyrd/tree/main/examples/support-desk): an agent that answers customer questions, the prompt it runs, and two Verifiers that check its answers. The quickstart and the SDK journey tests run the same Cards.
 
 ## Every Card has the same shape
 
 Each Card is a YAML document with six top-level fields. You write the first four; the server writes the rest.
 
-```yaml title="agents/triage.yaml"
+```yaml title="service/support-agent.yaml"
 apiVersion: wyrd/v1
 kind: Agent
 metadata:
-  space: retention
-  name: triage
+  name: support-agent
   version: 1.0.0
+  space: default
 spec:
-  prompt: ../prompts/triage.yaml  # a Prompt Card file with its own version
-  tool_names: [customer_lookup, refund_status]
+  prompt: ./support-prompt.yaml  # a Prompt Card file with its own version
+  tool_names: []
   run_config:
-    max_iterations: 4
-    timeout_ms: 30000
+    max_iterations: 1
 ```
 
 | Field | Who writes it | Holds |
@@ -61,35 +60,43 @@ A Card is identified by `space`, `kind`, `name`, and `version`. A `space` groups
 
 The Service Card is the root of the declaration. Each component gets an `alias`, the name your code uses to reach it at runtime.
 
-```yaml title="service.yaml"
+```yaml title="service/support-desk.yaml"
 apiVersion: wyrd/v1
 kind: Service
 metadata:
-  space: retention
-  name: support-copilot
+  name: support-desk
+  version: 1.0.0
+  space: default
 spec:
-  description: Answers support tickets and flags customers likely to churn.
+  service_type: agent
+  tables:
+    - name: tickets
+      schema:
+        type: object
+        properties:
+          ticket_id: {type: string}
+          question: {type: string}
+          answer: {type: string}
+          refund: {type: boolean}
+        required: [ticket_id, question, answer, refund]
   components:
-    - alias: triage
-      ref: ./agents/triage.yaml
-    - alias: churn_model
-      ref:
-        kind: Model
-        name: churn-classifier
-        version: 1.4.2
+    - alias: agent
+      ref: ./support-agent.yaml
+    - alias: prompt
+      ref: ./support-prompt.yaml
 ```
 
-`triage` points at a file in the declaration folder, so Wyrd registers that Card first. `churn_model` points at a Card that was already registered from code (see [Register Cards from code](#register-cards-from-code)).
+Both components point at files in the declaration folder, so Wyrd registers those Cards first. `tables` declares `vala.datasets.tickets`, which registration creates in Bifrost. The real file also attaches Verifiers to `agent`; [How verification works](/understand/how-verification-works/#bindings-attach-verifiers-to-what-they-check) covers that part.
 
 Register the whole folder with one command:
 
 ```bash
-wyrd apply services/support-copilot/
+wyrd apply examples/support-desk/service/
 ```
 
 `wyrd apply` reads every Card in the folder, registers them in dependency order, and makes the Service the root. The folder must have exactly one root. If any Card fails validation, nothing is registered.
 
-To validate the folder locally first, without contacting the server, run `wyrd plan services/support-copilot/`.
+To validate the folder locally first, without contacting the server, run `wyrd plan examples/support-desk/service/`.
 
 ## Three ways to reference another Card
 
@@ -98,7 +105,7 @@ Wherever one Card points at another, you can write the reference three ways.
 | Form | Example | Use it when |
 | --- | --- | --- |
 | Registered Card | `ref: { kind: Model, name: churn-classifier, version: 1.4.2 }` | The Card already exists in the registry |
-| File path | `ref: ./agents/triage.yaml` | The Card lives in the same folder; Wyrd registers it first |
+| File path | `ref: ./support-agent.yaml` | The Card lives in the same folder; Wyrd registers it first |
 | Inline | `prompt: { model: ..., request: ... }` | The body only makes sense inside its parent; it gets no identity of its own |
 
 A registered reference always names an exact `version`. A path is relative to the file that contains it, not to the folder you run `wyrd apply` from, and the Card in that file must set its own `metadata.version`. An inline body is written directly under the field, with no wrapper key. Inline bodies are allowed only where the field accepts them: an Agent's `prompt`, a Workflow step's agent, and a verification binding's Trigger and Operators.
@@ -115,19 +122,19 @@ Every reference names an exact version, so a registered Service records exactly 
 | `version: 1` or `version: 1.2` | The next version within that line, or `1.0.0` / `1.2.0` if the line is empty |
 | `version: 2.1.0` | Exactly `2.1.0`; re-registering it with different content fails with `WYRD_REGISTRY_409_SPEC_DRIFT` |
 
-So the `support-copilot` Service above is stored with `triage@1.0.0` and `churn-classifier@1.4.2`. Registering a new `churn-classifier@1.5.0` later does not change the Service. To pick up the new model, change the reference to `1.5.0` and re-apply; the Service content changed, so Wyrd records a new Service version.
+So `support-desk@1.0.0` is stored with `support-agent@1.0.0` and `support-prompt@1.0.0`. The same holds for a registered reference: if the desk referenced `churn-classifier@1.4.2`, registering `churn-classifier@1.5.0` later would not change the Service. To pick up the new model, change the reference to `1.5.0` and re-apply; the Service content changed, so Wyrd records a new Service version.
 
 This is what makes a verdict reproducible. A verdict always names the Service version it checked, and that version names exactly which model, prompt, and agent ran.
 
 To see what a name currently resolves to:
 
 ```bash
-wyrd latest --kind Model --space retention --name churn-classifier
+wyrd latest --kind Agent --space default --name support-agent
 ```
 
 ## Register Cards from code
 
-`Data` and `Model` Cards carry bytes, such as a training set or model weights, so you usually register them from the code that produces them. The Python SDK saves the artifact, uploads it, and registers the Card in one call.
+`Data` and `Model` Cards carry bytes, such as a training set or model weights, so you usually register them from the code that produces them. `support-desk` has no trained model, but say you add one that scores how likely a customer is to churn. The Python SDK saves the artifact, uploads it, and registers the Card in one call.
 
 ```python title="train.py"
 import pandas as pd
@@ -140,7 +147,7 @@ from wyrd.model import ModelCard, ModelCardMetadata, ModelSignature, SklearnInte
 cards = Cards()  # server URL and credential come from your Wyrd config
 
 train = pd.read_parquet("churn-training.parquet")
-data = DataCard(PandasInterface(data=train), space="retention", name="churn-training", version="1.4.2")
+data = DataCard(PandasInterface(data=train), space="default", name="churn-training", version="1.4.2")
 cards.data.register(data)
 
 features = train[["tenure_months", "monthly_spend"]]
@@ -148,7 +155,7 @@ model = LogisticRegression().fit(features, train["churned"])
 signature = ModelSignature.from_data(inputs=features, outputs=model.predict_proba(features)[:, 1])
 card = ModelCard(
     SklearnInterface(model=model),
-    space="retention",
+    space="default",
     name="churn-classifier",
     version="1.4.2",
     metadata=ModelCardMetadata(task_type="binary_classification", signature=signature),
@@ -156,25 +163,25 @@ card = ModelCard(
 cards.model.register(card)
 ```
 
-A `ModelCard` needs a signature, the names and types of the model's inputs and outputs; without one, construction fails with `WYRD_MODEL_400_MISSING_SIGNATURE`. Code-built Cards default to version `0.1.0`, so set `version` yourself. `register` updates the card object in place with its server-assigned `uid`. The YAML Service can now reference `churn-classifier@1.4.2`.
+A `ModelCard` needs a signature, the names and types of the model's inputs and outputs; without one, construction fails with `WYRD_MODEL_400_MISSING_SIGNATURE`. Code-built Cards default to version `0.1.0`, so set `version` yourself. `register` updates the card object in place with its server-assigned `uid`. The Service can now list it as a component with `ref: { kind: Model, name: churn-classifier, version: 1.4.2 }`.
 
 The Rust and TypeScript SDKs do not build `Data` or `Model` Cards in code. They register Card files, including any `artifacts:` the file lists, with `register_from_path` and `registerFromPath`.
 
 ## Relationships come from references
 
-You never write `relationships` yourself. When a Card is registered, the server reads every reference in its `spec` and records the edge in both directions. For `support-copilot` that graph is:
+You never write `relationships` yourself. When a Card is registered, the server reads every reference in its `spec` and records the edge in both directions. For the components of `support-desk` that graph is:
 
 ```text
-Service support-copilot
-├── Agent triage
-│   └── Prompt triage
-└── Model churn-classifier
+Service support-desk
+├── Agent support-agent
+│   └── Prompt support-prompt
+└── Prompt support-prompt
 ```
 
 Two things follow from that graph:
 
-- **Lineage.** From any Card you can walk to everything it depends on and everything that depends on it. Before changing the `triage` Prompt, you can see every Agent and Service that uses it.
-- **Observation scope.** A running service may only record observations about Cards in its own graph. `support-copilot` can record observations for `triage` or `churn-classifier`, but not for a Card it does not reference. See [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/).
+- **Lineage.** From any Card you can walk to everything it depends on and everything that depends on it. Before changing `support-prompt`, you can see every Agent and Service that uses it.
+- **Observation scope.** A running service may only record observations about Cards in its own graph. `support-desk` can record observations for `support-agent` or `support-prompt`, but not for a Card it does not reference. See [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/).
 
 ## What can go wrong
 

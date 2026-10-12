@@ -111,7 +111,7 @@ the visible sidebar is always the subset that has earned publication.
 | Introduction | What Wyrd does; the service-verification loop; where Wyrd stops and the user's runtime starts; the first action. |
 | Quickstart | Outcome and prerequisites; one complete copyable path; expected output and visible verdict; how to verify it; next task. |
 | Task guide | Outcome; prerequisites; code or commands; expected result; common failure and recovery; concise links to explanation and reference. |
-| Explanation | The mental model and rationale; one diagram or example where useful; consequences and boundaries; links to tasks and exact contracts. |
+| Explanation | The mental model and rationale; a diagram for each process or architecture the model depends on, or an example where that explains it better; consequences and boundaries; links to tasks and exact contracts. |
 | Reference | Source-backed definitions, fields, commands, parameters, errors, and limits with stable anchors; no narrative prerequisite chain. |
 
 The quickstart is one guided learning experience. The **Build and verify**,

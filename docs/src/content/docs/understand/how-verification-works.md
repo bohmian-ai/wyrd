@@ -1,203 +1,104 @@
 ---
 title: How verification works
-description: How bindings, Triggers, Verifiers, and Operators turn a Service declaration into verdicts.
+description: Verifiers, bindings, and Triggers; real-time checks versus the verifier runtime; verdicts, results, and Operators.
 pillar: wyrd
 section: Understand
 order: 2
 draft: true
 ---
 
-To check that a component behaves as expected, you bind a Verifier to it with `verified_by`. Each binding names three things:
+A Verifier judges behavior against a standard and returns a verdict: `passed`, `failed`, or `inconclusive`. Wyrd runs a Verifier in one of two ways. Your code can call it while a request is in flight and act on the answer, or the server's verifier runtime can run it for you, on a schedule or as observations arrive, and react to failure without your code. Both write the result to the same Bifrost table, tied to the exact Card versions that ran.
 
-- the **Verifier**, a registered Verifier Card that judges the behavior;
-- the **Trigger**, which decides when the Verifier runs: on a `schedule`, or with `observations_ready` as each observation is recorded. Leave the Trigger out and the Verifier runs only when your code calls it, which is how a Verifier gives real-time feedback while a request is in flight;
-- the **Operators**, which run when a triggered check fails.
+<WyrdSequence name="verification-paths" />
 
-Bindings live in the Service declaration. Changing what gets verified changes the declaration, so the verification setup is versioned along with the service it checks.
+The examples continue the `support-desk` service from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).
 
-The examples continue the `support-copilot` service from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).
+## Three kinds of Verifier
 
-## A binding in the Service declaration
+A Verifier is a Card. Its `implementation.kind` decides what it can judge and how it can run:
 
-Here the churn model is checked for input drift every hour, the triage agent is evaluated on every answer it records, and the agent's tool calls can be checked in real time before an answer goes out:
+| Kind | Judges | Real time | Verifier runtime |
+| --- | --- | --- | --- |
+| `eval` | One observed record against a set of tasks and a pass gate | Yes, pass the record | Yes, with an `observations_ready` Trigger: once per eval observation |
+| `drift` | A measured signal, such as a feature distribution, against a baseline | Yes, pass a batch of rows | Yes, with a `schedule` Trigger: once per time window |
+| `task` | One assertion or LLM judgment on the context you pass | Yes, only this way | No |
 
-```yaml title="service.yaml"
-apiVersion: wyrd/v1
-kind: Service
-metadata:
-  space: retention
-  name: support-copilot
+A Verifier never names what it checks. The binding supplies the subject, so one `answer-quality` Verifier can check any number of agents.
+
+Eval and task Verifiers share the same checks. A check is either an `assertion`, which compares a value in the context with an operator such as `equals`, `contains`, `is_subset`, or `matches_regex`, or an `llm_judge`, which asks an Agent for a structured judgment. Eval adds two checks that read recorded execution: `trace_assertion` (which spans ran) and `agent_assertion` (a field of the agent's workflow record). Those two need a recorded trace, so they run only in the verifier runtime.
+
+Prefer an assertion whenever the check is deterministic. It is faster, costs nothing, and gives the same answer every time. Use an LLM judge for what an assertion cannot express, such as whether an answer is grounded in what the tool returned.
+
+[Evaluate agent behavior](/build-and-verify/verify/evaluate-agent-behavior/) and [Monitor drift](/build-and-verify/verify/monitor-drift/) show complete Verifier Cards for each kind.
+
+## Bindings attach Verifiers to what they check
+
+A binding lives in the Service declaration under `verified_by`. It names the Verifier, optionally the Trigger that runs it, and the Operators that run when a triggered check fails:
+
+```yaml title="service/support-desk.yaml (excerpt)"
 spec:
   components:
+    - alias: agent
+      ref: ./support-agent.yaml
+      verified_by:
+        - verifier: ./answer-quality.yaml
+          runs_on: {kind: observations_ready}
+        - verifier: ./no-refund-promise.yaml
+```
+
+The desk binds two Verifiers to its agent. `answer-quality` is an LLM judge the server runs on every eval observation. `no-refund-promise` has no `runs_on`, so only your code calls it. A Verifier that should page someone adds `on_failure`; this is how [Monitor drift](/build-and-verify/verify/monitor-drift/) binds a drift Verifier to a model it adds to the desk:
+
+```yaml
     - alias: churn_model
       ref: { kind: Model, name: churn-classifier, version: 1.4.2 }
       verified_by:
-        - verifier: ./verifiers/churn-input-drift.yaml
+        - verifier: ./churn-input-drift.yaml
           runs_on: { kind: schedule, cron: "0 * * * *" }
           on_failure:
-            - kind: notify
-              channel:
-                kind: slack
-                connection: ops-slack
-                channel_id: C0123456789
-                text: "Churn model input drift on {{subject_ref}}"
-    - alias: triage
-      ref: ./agents/triage.yaml
-      verified_by:
-        - verifier: ./verifiers/triage-quality.yaml
-          runs_on: { kind: observations_ready }
-          on_failure:
-            - ./operators/page-support-oncall.yaml
-        - verifier: ./verifiers/allowed-tools.yaml
+            - ./page-support-oncall.yaml
 ```
 
-The subject of a binding is the component it sits under. The same Verifier, Trigger, and Operator Cards can be reused by any number of bindings, on any number of services. You can also put `verified_by` on the Service itself, or on a standalone Agent.
+The subject of a binding is the component it sits under. You can also put `verified_by` on the Service itself, or on a standalone Agent. Because bindings are part of the declaration, changing what gets verified creates a new Service version, and every verdict records the version it was checked under.
 
-Every binding resolves to exact versions when the Service is registered, like any other reference. Wyrd rejects a binding that points at the wrong kind of Card, pairs a Trigger with a Verifier it cannot run, or binds the same Verifier version twice to one subject.
+| Field | Holds | If you leave it out |
+| --- | --- | --- |
+| `verifier` | A Verifier Card, by path or exact reference | Required |
+| `runs_on` | A Trigger, inline or as a Trigger Card | The verifier runtime never runs this binding; only your code can call the Verifier |
+| `on_failure` | Operators, inline or as Operator Cards | A failed verdict is stored, and nobody is notified |
 
-## Verifiers
+Only two Trigger pairings are valid, and registration rejects anything else with `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH`:
 
-A Verifier judges behavior against a standard and records the verdict with what was checked and which standard applied. A Verifier has one of three implementations:
+| Trigger | Runs | Pairs with |
+| --- | --- | --- |
+| `schedule` (`cron`, optional `tz`, UTC by default) | One run per binding per due window | `drift` |
+| `observations_ready` | One run per committed eval observation for the subject | `eval` |
 
-| Implementation | Runs when | Checks | Built for |
-| --- | --- | --- | --- |
-| `drift` | On a `schedule` Trigger | A measured signal, such as a feature distribution, against a baseline | Models and data over time |
-| `eval` | With `observations_ready`, once for each eval observation | That observation against a set of tasks and a pass gate | Agent behavior |
-| `task` | Only when your code calls it, inside the request | One assertion or LLM judgment on the context you pass | Real-time checks before you act on a result |
+A `task` Verifier takes no Trigger at all. Any Verifier bound without `runs_on`, like `no-refund-promise`, is never run by the server; it is bound to `agent` so your code can call it by name.
 
-A Verifier never names its subject. That is why one Verifier can check many components: the binding supplies the subject, and the observations carry it.
+## Real time: your code asks, and gets the answer back
 
-### Drift: a signal against a standard
-
-A drift Verifier compares a measured signal against a standard. This one compares the churn model's live inputs against the training set, feature by feature, using the population stability index (PSI):
-
-```yaml title="verifiers/churn-input-drift.yaml"
-apiVersion: wyrd/v1
-kind: Verifier
-metadata:
-  space: retention
-  name: churn-input-drift
-  version: 1.0.0
-spec:
-  description: Churn model input distribution drift.
-  implementation:
-    kind: drift
-    spec:
-      method: Psi
-      signal:
-        kind: Distribution
-        baseline_ref: { kind: Data, name: churn-training, version: 1.4.2 }
-        features: [tenure_months, monthly_spend]
-      condition: { kind: Statistical }
-      profile:
-        kind: Psi
-        binning_strategy: { kind: Quantile, n_bins: 10 }
-        threshold: { kind: Fixed, value: 0.25 }
-```
-
-| Field | Options |
-| --- | --- |
-| `method` | `Psi`, `Spc` (statistical process control), or `Custom` |
-| `signal` | `Distribution` (features against a baseline `Data` Card) for `Psi` and `Spc`; `Metric` (one named number, such as `p99_latency_ms`) for `Custom` |
-| `condition` | `Statistical`: the method's profile decides what counts as drift |
-| `profile` | The settings for `method`, such as PSI bins and threshold |
-
-A metric signal uses the `Custom` method. This one fails when mean 99th-percentile latency moves more than 400 ms from its 800 ms baseline:
-
-```yaml
-method: Custom
-signal: { kind: Metric, name: p99_latency_ms }
-condition: { kind: Statistical }
-profile: { kind: Custom, metric_name: p99_latency_ms, baseline_value: 800, alert_threshold: 400 }
-```
-
-### Eval: each observation against tasks
-
-An eval Verifier is built mainly for agentic evaluation. It judges each eval observation as it arrives: tasks are checks on the observation's context, and the pass gate turns task results into one verdict.
-
-```yaml title="verifiers/triage-quality.yaml"
-apiVersion: wyrd/v1
-kind: Verifier
-metadata:
-  space: retention
-  name: triage-quality
-  version: 1.0.0
-spec:
-  implementation:
-    kind: eval
-    spec:
-      pass_gate: { kind: all_pass }
-      tasks:
-        lookup_called:
-          kind: assertion
-          id: lookup_called
-          context_path: $.tool_call_names
-          operator: contains
-          expected: customer_lookup
-        answer_is_grounded:
-          kind: llm_judge
-          id: answer_is_grounded
-          depends_on: [lookup_called]
-          judge_ref: { kind: Agent, name: groundedness-judge, version: 1.0.0 }
-          operator: equals
-          expected: true
-```
-
-| Task kind | Checks |
-| --- | --- |
-| `assertion` | A value in the observation, compared with an operator such as `contains`, `equals`, `is_subset`, or `is_json` |
-| `llm_judge` | A judgment from an Agent that answers in a structured format |
-| `trace_assertion` | The agent's recorded trace, such as which spans ran |
-| `agent_assertion` | A field of the agent's workflow record |
-
-Each task's key must match its `id`. Use `depends_on` to order tasks. Here the judge runs only after the cheaper assertion. Prefer an assertion whenever the check is deterministic, such as "the agent only used allowed tools"; it is faster, free, and gives the same answer every time.
-
-### Task: one check, in real time
-
-A task Verifier is one check that your code calls directly, while the request is still in flight. Use it when the answer should change what your service does next, such as blocking a response that called a tool it should not have. It holds a single `assertion` or `llm_judge`, with the same fields as an eval task:
-
-```yaml title="verifiers/allowed-tools.yaml"
-apiVersion: wyrd/v1
-kind: Verifier
-metadata:
-  space: retention
-  name: allowed-tools
-  version: 1.0.0
-spec:
-  implementation:
-    kind: task
-    spec:
-      kind: assertion
-      id: allowed_tools
-      context_path: $.tool_call_names
-      operator: is_subset
-      expected: [customer_lookup, refund_status]
-```
-
-A task Verifier takes no Trigger; a binding that gives it `runs_on` is rejected. Call it by name from the component's run view, and the server returns the judgment in the same request:
+Call a bound Verifier from a run view, and the server judges the input inside the same request:
 
 <LangTabs langs={['python', 'rust', 'typescript']}>
 <LangTab lang="python">
 
 ```python
-judgment = run.for_card("triage").observe.verify(
-    "allowed-tools", {"tool_call_names": tool_names}
-)
-if not judgment.passed:
-    answer = escalate(ticket)  # your fallback
+with state.run("agent") as run:
+    answer = run.invoke({"question": question})
+    judgment = run.observe.verify("no-refund-promise", {"answer": answer})
+    if not judgment.passed:
+        answer = hand_to_person(ticket_id)  # your fallback
 ```
 
 </LangTab>
 <LangTab lang="rust">
 
 ```rust
-let judgment = run
-    .for_card("triage")?
-    .observe()
-    .verify("allowed-tools", &json!({ "tool_call_names": tool_names }))
-    .await?;
+let run = state.run_for_card("agent")?;
+let mut answer = run.invoke(&[("question", question)]).await?;
+let judgment = run.observe().verify("no-refund-promise", &json!({ "answer": answer })).await?;
 if !judgment.passed() {
-    answer = escalate(&ticket); // your fallback
+    answer = hand_to_person(ticket_id); // your fallback
 }
 ```
 
@@ -205,104 +106,86 @@ if !judgment.passed() {
 <LangTab lang="typescript">
 
 ```typescript
-const judgment = await run
-  .forCard("triage")
-  .observe.verify("allowed-tools", { tool_call_names: toolNames });
+const run = state.run("agent");
+let answer = await run.invoke({ question });
+const judgment = await run.observe.verify("no-refund-promise", { answer });
 if (!judgment.passed) {
-  answer = escalate(ticket); // your fallback
+  answer = await handToPerson(ticketId); // your fallback
 }
 ```
 
 </LangTab>
 </LangTabs>
 
-A failed judgment is an ordinary return value, not an error. The caller needs permission to run that Verifier, and the server stops waiting after 60 seconds. You can call an `eval` or `drift` Verifier the same way, passing an eval context or drift samples.
+The call is synchronous from your code's point of view: it blocks until the verdict comes back, for up to 60 seconds. A `failed` verdict is an ordinary return value, not an exception. The server stores the result in `vala.verification.results`, tied to this run, but it never runs Operators for a real-time call. Your code already has the verdict and decides what to do.
+
+Use real time when the answer should change what your service does next: block a response, fall back to a human, retry with a different prompt. [Verify a request in real time](/build-and-verify/verify/verify-a-request-in-real-time/) has the code in all three SDKs.
+
+## Verifier runtime: the server runs it for you
+
+For a binding with a Trigger, the server does the work. When the Trigger fires, it creates a run, executes the Verifier against the stored observations, writes the result, and on a `failed` verdict starts every Operator in `on_failure`. Your service only records observations; it never waits on a check.
+
+A runtime run has an execution status separate from its verdict. The execution status says whether the check ran; the verdict says what it found.
+
+| Execution status | Means |
+| --- | --- |
+| `pending`, `running`, `retrying` | Not finished. A run gets 3 attempts, each with a 5-minute limit |
+| `completed` | The Verifier ran and produced a verdict, stored as a result |
+| `timed_out`, `errored`, `cancelled` | No verdict exists. The run records the error |
+
+Only a `completed` run has a verdict. A run that errored is not a failure of your service; it is a failure to check it, and it never starts Operators.
+
+<WyrdDiagram name="run-lifecycle" />
+
+You can also start a drift run by hand for a specific window, through MCP or HTTP. A manual run of a binding behaves like a scheduled one and runs its Operators on failure; a manual run that names a Verifier and subject directly only analyzes. [Monitor drift](/build-and-verify/verify/monitor-drift/#score-a-past-window-by-hand) shows how.
 
 ## Verdicts
-
-Every Verifier run ends in one of three verdicts:
 
 | Verdict | Means | Runs Operators |
 | --- | --- | --- |
 | `passed` | The behavior met the standard | No |
-| `failed` | The behavior violated the standard | Yes, every Operator in `on_failure`, when a Trigger started the run |
-| `inconclusive` | No judgment could be made, such as no observations in the window | No |
+| `failed` | The behavior violated the standard | Yes, for a run of a binding |
+| `inconclusive` | No judgment was possible | No |
 
-A run your code starts with `verify` never runs Operators; your code already has the verdict and decides what to do with it. An inconclusive verdict is never a pass. If a drift window keeps coming back inconclusive, the service is not recording what the Verifier needs.
+`inconclusive` is never a pass. The common causes are worth knowing because they look like silence:
 
-Verdicts are stored in Bifrost, in `vala.verification.results`, and you query them like any other table:
+- An eval Verifier with no `pass_gate`. Its tasks run, but nothing turns them into a verdict. Always set one.
+- Every eval task was skipped, or sampling dropped the record.
+- A drift window with too little data to score.
 
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
+## Results are evidence
 
-```python
-from wyrd.bifrost import Bifrost
+Every completed check, real time or runtime, writes one row to `vala.verification.results`. Drift writes one more row per feature to `vala.drift.result_features`; eval writes one row per task to `vala.eval.result_items`.
 
-bifrost = Bifrost()
-failed = bifrost.sql("""
-    SELECT verdict, implementation, subject_card_uid, verifier_version, started_at
-    FROM vala.verification.results
-    WHERE verdict = 'failed'
-    ORDER BY started_at DESC
-    LIMIT 20
-""")
-print(failed.to_pandas())
-```
+| Column | Identifies |
+| --- | --- |
+| `result_id` | This result |
+| `card_uid` | The Verifier that judged |
+| `verifier_version` | Its exact version |
+| `subject_card_uid` | The Card that was judged |
+| `owner_card_uid`, `binding_id` | The binding that ran it. Both are null for a real-time call |
+| `run_id` | Your application's run: the run that recorded the observation, or the run that called `verify`. Null for a scheduled drift window |
+| `source_record_id` | For eval, the `record_id` of the observation it judged |
+| `verdict` | `passed`, `failed`, or `inconclusive` |
 
-</LangTab>
-<LangTab lang="rust">
+<WyrdDiagram name="evidence-joins" />
 
-```rust
-use wyrd_sdk::{Bifrost, WyrdClient};
+Results are queryable SQL, so "which version was running when this failed, and what did it see?" is one join. [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/#query-the-evidence) shows the join from observations to verdicts.
 
-let bifrost = Bifrost::connect(&WyrdClient::from_global()?).await?;
-let failed = bifrost
-    .sql(
-        "SELECT verdict, implementation, subject_card_uid, verifier_version, started_at \
-         FROM vala.verification.results \
-         WHERE verdict = 'failed' \
-         ORDER BY started_at DESC \
-         LIMIT 20",
-        &[],
-    )
-    .await?;
-```
+## Operators react to failure
 
-</LangTab>
-<LangTab lang="typescript">
-
-```typescript
-import { Bifrost } from "@wyrd/sdk";
-
-const bifrost = await Bifrost.connect();
-const failed = await bifrost.sql(`
-  SELECT verdict, implementation, subject_card_uid, verifier_version, started_at
-  FROM vala.verification.results
-  WHERE verdict = 'failed'
-  ORDER BY started_at DESC
-  LIMIT 20
-`);
-```
-
-</LangTab>
-</LangTabs>
-
-## Operators
-
-A failed verdict from a triggered run runs the binding's Operators: a notification or an HTTP call. A passing verdict runs nothing.
+An Operator is what happens when a binding's check fails. Each binding's `on_failure` list can hold any number:
 
 | Operator `kind` | Does |
 | --- | --- |
 | `notify` | Sends a Slack message or a PagerDuty event |
-| `http` | Calls a URL you choose |
+| `http` | Calls a URL you choose: `get`, `post`, `put`, `patch`, or `delete`, with optional bearer, basic, or header auth |
 
-An Operator can be a registered Card or written inline in `on_failure`; both use the same fields. A reusable Operator Card:
-
-```yaml title="operators/page-support-oncall.yaml"
+```yaml title="service/page-support-oncall.yaml"
 apiVersion: wyrd/v1
 kind: Operator
 metadata:
-  space: retention
+  space: default
   name: page-support-oncall
   version: 1.0.0
 spec:
@@ -315,29 +198,21 @@ spec:
     summary: "{{verifier_ref}} failed for {{subject_ref}}"
 ```
 
-Text fields accept `{{...}}` placeholders that Wyrd fills from the failed verdict, such as `verifier_ref`, `subject_ref`, `verdict`, `result_id`, and `summary`. Any other placeholder is rejected when the Card is registered.
+Text fields accept `{{...}}` placeholders filled from the result: `verifier_ref`, `subject_ref`, `verdict`, `summary`, `result_id`, `run_id`, `binding_id`, `completed_at`, and `dispatch_id` for any Verifier; `drift.drifted_features` and `drift.total_features` on drift bindings; `eval.passed_tasks`, `eval.failed_tasks`, `eval.total_tasks`, and `eval.pass_rate_percent` on eval bindings. Any other placeholder is rejected at registration.
 
-Secrets never go on the Card. An Operator names an operator connection, which an administrator creates once for your tenant and which holds the Slack token, PagerDuty key, or HTTP credential. Registration fails if the named connection does not exist.
+Secrets never go on the Card. An Operator names an operator connection, which a tenant administrator creates once and which holds the Slack token, PagerDuty key, or HTTP credential. Registration fails if the connection does not exist or is disabled.
 
-```yaml
-kind: http
-method: post
-url: https://tickets.example.com/api/incidents
-auth: { scheme: bearer, connection: tickets-api }
-body:
-  title: "{{verifier_ref}} failed"
-  result_id: "{{result_id}}"
-```
+Each Operator is delivered on its own, at least once: up to 3 attempts within 5 minutes, retrying network errors, `408`, `429`, and `5xx`. One failing Operator does not stop the others or change the verdict.
 
-Each Operator runs on its own, with its own retries. One failing Operator does not stop the others or change the verdict.
-
-## What can go wrong
+## What can go wrong at registration
 
 | Error code | Cause |
 | --- | --- |
-| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | The Trigger cannot run that Verifier, such as `schedule` with an `eval` Verifier, or any Trigger on a `task` Verifier |
+| `WYRD_SPEC_400_TRIGGER_ACTIVATION_MISMATCH` | The Trigger cannot run that Verifier: `schedule` with `eval`, `observations_ready` with `drift`, or any Trigger on a `task` Verifier |
 | `WYRD_SPEC_400_INVALID_VERIFIER_REF_KIND` | `verifier:` points at a Card that is not a Verifier |
+| `WYRD_SPEC_400_INVALID_BINDING_REF_KIND` | `runs_on:` is not a Trigger, or an `on_failure` entry is not an Operator |
 | `WYRD_SPEC_400_DUPLICATE_VERIFICATION_BINDING` | The same Verifier version is bound twice to one subject |
-| `WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION` | An `on_failure` entry uses an action the server cannot run, such as a `workflow` Operator |
+| `WYRD_SPEC_400_UNSUPPORTED_OPERATOR_ACTION` | An `on_failure` entry is a `workflow` Operator, which the runtime does not run |
+| `WYRD_SPEC_400_OPERATOR_CONNECTION_UNAVAILABLE` | The named operator connection is missing or disabled |
 
 Verifiers judge observations, so the next page covers how they get recorded: [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/).

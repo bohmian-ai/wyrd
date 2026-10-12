@@ -8,7 +8,7 @@ draft: true
 status: runnable
 ---
 
-Wyrd serves its production MCP catalog at `/mcp`. The CLI stdio proxy projects that catalog into an agent host; it adds no durable behavior. [Connect an agent](/connect/connect-an-agent-through-mcp/) describes installation and credentials.
+The Wyrd server exposes its MCP tools over HTTP at `/mcp`. `wyrd mcp proxy` relays the same tools to an agent over stdio and adds none of its own. [Connect an agent through MCP](/connect/connect-an-agent-through-mcp/) covers installation and credentials.
 
 ## Discovery and authentication
 
@@ -16,7 +16,7 @@ Every request is authenticated in the caller's tenant. Use `tools/list` for the 
 
 Read tools and `wyrd.guide` are always advertised. Principal revocation, verification execution/run creation, and Operator connection writes are advertised only to callers with their required write permission. Gateway writes remain in the catalog and enforce their explicit scopes when invoked. Advertising a tool grants no permission; naming a hidden write tool does not bypass authorization.
 
-The tables below summarize wire shapes. Use the live descriptor for every nested field, enum, validation bound, and required property. A `{}` input means an empty argument object. Credentials and connection secrets are never returned.
+The tables below summarize wire shapes. Named shapes such as `ExecuteVerificationRequest` or `OperatorConnectionView` are the JSON Schemas `tools/list` returns for that tool; use them for every nested field, enum, and bound. A `{}` input means an empty argument object. Credentials and connection secrets are never returned.
 
 ## Investigation guide
 
@@ -32,13 +32,13 @@ The tables below summarize wire shapes. Use the live descriptor for every nested
 | --- | --- | --- | --- |
 | `cards.list` | Read; `cards:read` | List filters and optional cursor → `{items, next_cursor}` | Discover metadata summaries by kind, name, space, version range, lifecycle status, or metadata filter |
 | `cards.get_by_ref` | Read; `cards:read` | `{card_ref}` → `{card, created_at, updated_at}` | Resolve exact kind, name, version, and space |
-| `cards.get` | Read; `cards:read` | `{kind, card_uid}` → `{card, created_at, updated_at}` | Existing kind-qualified UID read |
+| `cards.get` | Read; `cards:read` | `{kind, card_uid}` → `{card, created_at, updated_at}` | Read one Card when you already have its kind and UID |
 | `verification.get_binding` | Read; `cards:read` | `{binding_id}` → binding status | Inspect owner, subject, Verifier, readiness, and last run |
 | `verification.get_run` | Read; `cards:read` | `{run_id}` → run status | Inspect execution, result ID, errors, and Operator dispatches |
 | `verification.start_run` | Write; `verifier:run` on selected Verifier | `{target, input, idempotency_key?}` → run creation response | Enqueue a bounded manual Drift window; retry key preserves run identity |
-| `verification.execute` | Execute; `verifier:run` on exact Verifier | ExecuteVerificationRequest → Judgment | Return one-off scoring/assertion judgment; no run, persistence, or dispatch |
+| `verification.execute` | Execute; `verifier:run` on exact Verifier | ExecuteVerificationRequest → Judgment | Return a judgment in the same call and store its result; creates no run or Operator dispatch |
 
-`cards.list.filter` is the existing serialized query string, not an arbitrary JSON object. Preserve `next_cursor` unchanged alongside the same filters. A missing version or malformed cursor is invalid; no implicit newest-version or fuzzy selection occurs. Missing and foreign-tenant Cards are indistinguishable. Relationship edges in `outbound_refs` and `inbound_refs` carry exact identities under `ref`.
+`cards.list.filter` is a metadata query string, not a JSON object: for example `labels.env = "prod"`, `labels.tier in ["gold","silver"]`, or `labels.deprecated not exists`, combined with `and`, `or`, and `not`. Fields are `labels.<key>`, `annotations.<key>`, and `attributes.<key>`; a query may hold up to 64 predicates. A syntax error returns `WYRD_QUERY_400_INVALID_SYNTAX`. Preserve `next_cursor` unchanged alongside the same filters. A missing version or malformed cursor is invalid; no implicit newest-version or fuzzy selection occurs. Missing and foreign-tenant Cards are indistinguishable. Relationship edges in `outbound_refs` and `inbound_refs` carry exact identities under `ref`.
 
 `verification.start_run.target` is tagged `binding` (with `binding_id`) or `verifier` (with `verifier_uid` and `subject_card_uid`). `input` is tagged `drift_window` with UTC `start` and `end`. Invalid windows, absent targets, or unavailable baselines are refused. `verification.execute` supports the current scoring and direct assertion forms; unsupported execution forms are refused. Follow the [verification procedure](/build-and-verify/verify/run-a-verification-and-inspect-its-evidence/) to read persisted results.
 

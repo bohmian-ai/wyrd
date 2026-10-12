@@ -1,112 +1,195 @@
 ---
 title: Run a verification and inspect its evidence
-description: Follow exact Cards to bindings and runs, then inspect persisted verification, Drift, and Eval rows through MCP.
+description: Find a binding, start or follow its run, tell a failed verdict from a check that never ran, and read the stored result.
 pillar: wyrd
 section: Build and verify
 topic: Verify
-order: 1
+order: 4
 draft: true
-status: runnable
+status: partial
 ---
 
-Use MCP to discover an exact Service and its components, read verification state, and inspect retained judgments through Bifrost SQL. A completed failed judgment differs from a run that could not execute.
+When a check fails, or seems to have never run, follow it from the binding to the run to the stored result. Each step answers a different question: is the binding able to run, did the run execute, what did it find, and were the Operators delivered.
+
+The SDKs can find a binding ID and read results. Reading bindings and runs, and starting a run, are MCP and HTTP only for now. This guide shows the MCP tool arguments; each matches the HTTP body for the route named beside it.
 
 ## Prerequisites
 
-Connect an [agent through MCP](/connect/connect-an-agent-through-mcp/). Your tenant must contain a registered Service and its component Cards. To run a managed Drift verification, the component needs an active binding with a ready baseline. Use `cards:read`, `bifrost_table:read` for discovery/description, table-scoped `bifrost_query:read`, and `verifier:run` when starting or directly executing verification. Existing retained results can be investigated without starting another run.
+- A Service with at least one binding, such as `support-desk` from [Monitor drift](/build-and-verify/verify/monitor-drift/) or [Evaluate agent behavior](/build-and-verify/verify/evaluate-agent-behavior/).
+- `cards:read` and `bifrost_query:read` to inspect. `verifier:run` to start a run. The `viewer` role covers inspecting.
+- An [MCP connection](/connect/connect-an-agent-through-mcp/), or `curl` with a bearer credential.
 
-## 1. Select an exact Service
+## 1. Find the binding
 
-Call `cards.list` with a registered name; `support-desk` is a repository fixture, not a built-in Service:
+The server assigns each `verified_by` entry a binding ID when the Service registers. Read them from the Service's Card status:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```python
+from wyrd.cards import CardRef, Cards
+
+service = Cards().get(CardRef(kind="Service", name="support-desk", version="1.0.0", space="default"))
+print(service.status.verification.binding_ids)
+```
+
+</LangTab>
+<LangTab lang="rust">
+
+```rust
+use wyrd_sdk::cards::{CardKind, CardSelector, Cards};
+
+let selector = CardSelector::named(CardKind::Service, "default".parse()?, "support-desk".parse()?)
+    .with_version("1.0.0".parse()?);
+let service = Cards::from_env()?.get(selector).await?;
+let binding_ids = service.status.and_then(|status| status.verification).map(|v| v.binding_ids);
+```
+
+</LangTab>
+<LangTab lang="typescript">
+
+```typescript
+import { Cards } from "@wyrd/sdk";
+
+const service = await Cards.connect().get({
+  kind: "Service",
+  name: "support-desk",
+  version: "1.0.0",
+  space: "default",
+});
+console.log(service.status?.verification?.binding_ids);
+```
+
+</LangTab>
+</LangTabs>
+
+Over MCP, `cards.get_by_ref` returns the same `status.verification.binding_ids`. A binding belongs to one exact Service version; a new version has new binding IDs.
+
+## 2. Check that the binding can run
+
+Call `verification.get_binding` (`GET /v1/verification/bindings/{binding_id}`):
 
 ```json
-{"kind":"Service","name":"support-desk","space":"default","limit":20}
+{ "binding_id": "<binding-id>" }
 ```
 
-Select a version from `items`. If `next_cursor` is present, repeat the same filters with that cursor unchanged. No fuzzy lookup or automatic newest-version selection occurs. Call `cards.get_by_ref` with the selected identity:
+| Field | Tells you |
+| --- | --- |
+| `subject_card_uid`, `verifier_uid` | Exactly what is checked, and by which Verifier version |
+| `readiness` | `ready`, `baseline_not_ready` (a drift baseline is still fitting or failed), or `verifier_unavailable` |
+| `active` | Whether the Service has authenticated in the last 24 hours. An inactive binding does not run on its Trigger |
+| `next_run_at` | The next scheduled window. Always null for an `observations_ready` binding |
+| `last_run_id` | The most recent run, for step 4 |
+
+If `active` is false, deploy the Service; nothing on the Verifier side is wrong. If `readiness` is `baseline_not_ready`, see [Monitor drift](/build-and-verify/verify/monitor-drift/#4-wait-for-the-baseline-to-fit).
+
+## 3. Start a run (drift only)
+
+To score a window now instead of waiting for the schedule, call `verification.start_run` (`POST /v1/verification/runs`):
 
 ```json
-{"card_ref":{"kind":"Service","name":"support-desk","version":"1.0.0","space":"default"}}
+{
+  "target": { "kind": "binding", "binding_id": "<binding-id>" },
+  "input": { "kind": "drift_window", "start": "2026-10-12T14:00:00Z", "end": "2026-10-12T15:00:00Z" }
+}
 ```
 
-Read `card.spec.components` and `card.relationships.outbound_refs`. Every relationship edge has an exact `ref`; pass it to another `cards.get_by_ref` call. `inbound_refs` identifies Cards that refer to the current Card. Record each component's UID, kind, version, and space. `cards.get` remains available with `kind` and `card_uid` when you already have the UID.
+It returns `run_id`. A binding run uses the binding's Operators, so a `failed` verdict pages whoever it would page on schedule. Manual runs are drift only; an eval binding runs once per eval observation.
 
-## 2. Read bindings and start a managed run
+## 4. Follow the run
 
-Read the owner Card's `status.verification.binding_ids`. For each relevant ID, call `verification.get_binding`:
+Call `verification.get_run` (`GET /v1/verification/runs/{run_id}`) until `status` is final:
 
-```json
-{"binding_id":"<binding_id>"}
+| `status` | Means | Next |
+| --- | --- | --- |
+| `pending`, `running`, `retrying` | Not finished. 3 attempts, 5 minutes each | Wait and read again |
+| `completed` | A verdict exists | Read `result_id` and go to step 5 |
+| `errored`, `timed_out`, `cancelled` | The check did not run to a verdict | Read `error.code` and `error.message`. No Operator runs |
+
+The run never carries the verdict itself. A `completed` run of a passing check and of a failing one look the same here; the verdict is in the result.
+
+`dispatches` lists each Operator a failed binding run started, with its own `status`: `pending`, `running`, `retrying`, `delivered`, or `failed`. A `failed` dispatch has an `error` saying why, such as an expired connection credential. Delivery failure never changes the verdict.
+
+## 5. Read the result
+
+Query by `result_id`. `vala.verification.results` holds the verdict; the per-feature or per-task rows explain it:
+
+<LangTabs langs={['python', 'rust', 'typescript']}>
+<LangTab lang="python">
+
+```python
+from wyrd.bifrost import Bifrost
+
+bifrost = Bifrost()
+result = bifrost.sql(
+    "SELECT verdict, implementation, verifier_version, window_start, window_end "
+    "FROM vala.verification.results WHERE result_id = $1",
+    [result_id],
+)
+features = bifrost.sql(
+    "SELECT feature, score, threshold, verdict FROM vala.drift.result_features "
+    "WHERE result_id = $1 ORDER BY feature",
+    [result_id],
+)
+print(result.to_pandas(), features.to_pandas())
 ```
 
-Use the returned owner, subject, Verifier, readiness, and last-run state. A binding ID belongs to a specific declared expectation, not to any component with the same name.
+</LangTab>
+<LangTab lang="rust">
 
-To enqueue a manual Drift run, call `verification.start_run`. Replace all placeholders with a discovered binding and an appropriate bounded window:
+```rust
+use wyrd_sdk::{Bifrost, bifrost::QueryParam};
 
-```json
-{"target":{"kind":"binding","binding_id":"<binding_id>"},"input":{"kind":"drift_window","start":"2026-10-10T00:00:00Z","end":"2026-10-10T01:00:00Z"}}
+let bifrost = Bifrost::from_env().await?;
+let id = [QueryParam::String(result_id.to_string())];
+let result = bifrost
+    .sql(
+        "SELECT verdict, implementation, verifier_version, window_start, window_end \
+         FROM vala.verification.results WHERE result_id = $1",
+        &id,
+    )
+    .await?;
+let features = bifrost
+    .sql(
+        "SELECT feature, score, threshold, verdict FROM vala.drift.result_features \
+         WHERE result_id = $1 ORDER BY feature",
+        &id,
+    )
+    .await?;
 ```
 
-The result contains the run ID. Poll `verification.get_run`:
+</LangTab>
+<LangTab lang="typescript">
 
-```json
-{"run_id":"<run_id>"}
+```typescript
+import { Bifrost } from "@wyrd/sdk";
+
+const bifrost = await Bifrost.connect();
+const result = await bifrost.sql(
+  `SELECT verdict, implementation, verifier_version, window_start, window_end
+     FROM vala.verification.results WHERE result_id = $1`,
+  [resultId],
+);
+const features = await bifrost.sql(
+  `SELECT feature, score, threshold, verdict FROM vala.drift.result_features
+    WHERE result_id = $1 ORDER BY feature`,
+  [resultId],
+);
 ```
 
-Read execution state and `result_id`. Pending, timed-out, and errored execution are not completed judgments. Operator dispatch state is separate from the judgment. Use the returned result ID for the next step.
+</LangTab>
+</LangTabs>
 
-## 3. Inspect retained judgments
+For an eval result, read `vala.eval.result_items` instead: one row per task, with `passed`, `actual`, `expected`, `message`, and `skip_reason`. Over MCP, pass the same SQL to `bifrost.query`.
 
-Call `bifrost.list_tables`, then `bifrost.describe_table` for `vala.verification.results`, `vala.drift.result_features`, and `vala.eval.result_items`. The [custom-data procedure](/build-and-verify/observe/write-and-query-custom-data-with-bifrost/#3-discover-and-describe) shows those calls and how to interpret positional rows.
+A run can report `result_id` a few seconds before the row is queryable. If the query comes back empty right after the run completed, retry before assuming the result is missing.
 
-Call `bifrost.query` with this argument template:
+## What can go wrong
 
-```json
-{"sql":"SELECT result_id, implementation, execution_status, verdict, subject_card_uid FROM vala.verification.results WHERE result_id = '<result_id>' LIMIT 20","deadline_ms":10000,"max_rows":100,"max_bytes":65536}
-```
-
-If you started with a component rather than a run, find its retained results by the exact subject UID and a suitable window:
-
-```sql
-SELECT result_id, implementation, verdict, subject_card_uid
-FROM vala.verification.results
-WHERE subject_card_uid = '<subject_card_uid>'
-  AND ended_at >= TIMESTAMP '2026-01-01 00:00:00'
-  AND ended_at < TIMESTAMP '2027-01-01 00:00:00'
-ORDER BY ended_at DESC
-LIMIT 20
-```
-
-Adjust the calendar-year window. Select the most recent completed result for each implementation you need; ordering recent rows alone does not prove a completed judgment. `card_uid` on a result identifies its Verifier; `subject_card_uid` identifies what was judged. `owner_card_uid` identifies the binding owner where present. Do not use a principal ID as a Card UID.
-
-For a Drift result:
-
-```sql
-SELECT result_id, feature, score, threshold, verdict
-FROM vala.drift.result_features
-WHERE result_id = '<result_id>'
-LIMIT 20
-```
-
-For an Eval result:
-
-```sql
-SELECT result_id, task_id, outcome_kind, passed, skip_reason
-FROM vala.eval.result_items
-WHERE result_id = '<result_id>'
-LIMIT 20
-```
-
-An Eval item that was skipped does not establish a passing assertion. Inspect `actual`, `expected`, and `message` when needed and authorized for that table. Those columns follow table query permission; sensitive-column metadata does not add a separate verification payload permission.
-
-## Direct execution
-
-`verification.execute` evaluates supplied input and returns a one-off judgment directly. It requires `verifier:run` on the exact Verifier. Use its advertised input schema: scoring supports current Drift implementations and direct assertion evaluation; unsupported execution forms are refused.
-
-Direct execution enqueues no run, persists no result, and dispatches no Operator. Its returned judgment cannot be retrieved later through the result-history queries above. Use managed bindings and runs for retained evidence.
-
-## Report the supported conclusion
-
-Cite exact Card versions, subject UIDs, result IDs, table names, and returned rows. Distinguish a failed expectation from failed execution. State when a component has no binding or matching retained result. A Service-level result alone does not prove every component passed.
-
-Missing and foreign-tenant Cards produce the same absence behavior. Permission refusals and oversized queries supply no complete evidence; do not infer a passing judgment from either. Require a successful terminal and preserve any returned warnings when explaining a query. See [MCP tools](/reference/mcp-tools/) for error handling and limits.
+| Code or symptom | Cause | Fix |
+| --- | --- | --- |
+| `WYRD_VERIFICATION_409_BASELINE_NOT_READY` on `start_run` | The drift baseline has not fitted | Check `readiness`; wait or fix the baseline |
+| `WYRD_VERIFICATION_400_INVALID_WINDOW` | Empty, inverted, or longer than 31 days | Send `start` before `end`, at most 31 days apart |
+| `WYRD_PERMISSION_403_DENIED_RBAC` on `start_run` | No `verifier:run` on the bound Verifier | Use a credential with `workload` or a role that includes it |
+| Run `completed` but no Operator fired | The verdict was `passed` or `inconclusive` | Read the verdict in step 5 |
+| Dispatch `failed` | The Operator's connection or target refused delivery | Read the dispatch `error`; fix the operator connection |

@@ -7,9 +7,9 @@ order: 1
 draft: true
 ---
 
-Wyrd is open-source AI assurance and verification infrastructure. You declare what an AI system should do, record what it actually does, and Wyrd returns a verdict on whether the two match. The system can be an individual LLM, a deployed agent service, or a traditional HTTP service, and the same declaration is checked before release and in production.
+Wyrd is open-source verification and assurance infrastructure for AI systems. You declare what an AI system should do, record what it actually does, and Wyrd returns a verdict on whether the two match. The system can be an individual LLM, a deployed agent service, or a traditional HTTP service, and the same declaration is checked before release and in production.
 
-This page explains that loop and where Wyrd stops. The setup and quickstart guides are still being prepared.
+This page explains that loop and where Wyrd stops. To run it yourself, start with [Set up Wyrd](/get-started/setup/).
 
 ## The verification loop
 
@@ -18,14 +18,14 @@ Wyrd works in three steps, and each one leaves a durable record the next step bu
 | Step | You provide | Wyrd records |
 | --- | --- | --- |
 | Declare | A Service declaration: its components and the Verifiers bound to check them | Versioned Cards in the registry |
-| Observe | Your service's behavior: custom data, drift, eval, telemetry  | Observations in Bifrost, the Wyrd data plane |
-| Verify | Nothing extra; the declaration already says what is checked, when, and what happens on failure | A verdict, plus the failure actions the declaration names |
+| Observe | Your service's behavior: eval and drift observations, telemetry, and custom data | Rows in Bifrost, the Wyrd data plane |
+| Verify | Nothing extra for triggered checks; the declaration says what is checked, when, and what happens on failure. Real-time checks are one call from your code | A verdict tied to the exact versions that ran, plus any failure actions the declaration names |
 
-**Declare.** You declare a whole service in YAML, independent of the language it is written in. The declaration is a set of Cards. A Card is one defined component of your system, and it is expected to behave in a certain way. See [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).
+**Declare.** You declare a whole service in YAML, independent of the language it is written in. The declaration is a set of Cards. A Card is a versioned declaration of one part of your system, or of how that part is checked. See [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).
 
 **Observe.** Observe is how you record what the declared system actually does. Observations go straight into Bifrost, the Wyrd data plane. See [Runs, observations, and retained evidence](/understand/runs-observations-and-evidence/).
 
-**Verify.** When a Trigger fires, Wyrd runs the bound Verifier against that service's observations and records the verdict with what was checked and which standard applied. A failed verdict runs the binding's Operators. See [How verification works](/understand/how-verification-works/).
+**Verify.** A Verifier judges observed behavior against a standard. Wyrd runs it for you when its Trigger fires, on a schedule or as observations arrive, and stores the verdict; a failed verdict runs the binding's Operators. Your code can also call a Verifier directly while a request is in flight and act on the answer. See [How verification works](/understand/how-verification-works/).
 
 ## Where Wyrd stops
 

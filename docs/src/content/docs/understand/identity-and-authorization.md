@@ -3,13 +3,13 @@ title: Identity and authorization
 description: Every call to Wyrd is made as a principal whose roles decide what it may do, and every decision is audited.
 pillar: wyrd
 section: Understand
-order: 4
+order: 5
 draft: true
 ---
 
 Every call to the Wyrd server is made as a principal: a person, an administrator, or a deployed Service or Agent. A principal belongs to exactly one tenant, holds roles, and those roles decide what it may read, write, and run. Wyrd checks the permission before the operation proceeds and records the decision in the audit log. Identity is not optional, and there is no anonymous access to tenant data.
 
-This page explains how those pieces fit together. The examples continue the `support-copilot` service from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).
+This page explains how those pieces fit together. The examples continue the `support-desk` service from [Cards, versions, and relationships](/understand/cards-versions-and-relationships/).
 
 ## Tenants and the platform
 
@@ -37,7 +37,7 @@ A principal is an identity Wyrd can authorize and attribute. Each has a kind:
 | `service` | A deployed Service, or an automation such as a CI job | Registering a Service Card, or creating an automation principal |
 | `agent` | A deployed Agent | Registering an Agent Card |
 
-Registering a Card is what gives a deployed workload its identity. When `wyrd apply` registers `support-copilot`, Wyrd creates a `service` principal bound to that Card and grants it the `workload` role. Re-registering the Card keeps the same principal and never grants the role again, so an administrator's later change stands.
+Registering a Card is what gives a deployed workload its identity. When `wyrd apply` registers `support-desk`, Wyrd creates a `service` principal bound to that Card and grants it the `workload` role. Re-registering the Card keeps the same principal and never grants the role again, so an administrator's later change stands.
 
 An automation principal, such as a CI runner that registers Cards, is a `service` principal with no Card. An administrator creates it directly.
 
@@ -61,7 +61,9 @@ Each SDK and the CLI look for a credential in the same order and use the first o
 3. `WYRD_WORKLOAD_TOKEN`, with `WYRD_TENANT`
 4. `WYRD_API_KEY`
 5. A saved `wyrd auth login` for that server
-6. `api_key` under `[default]` in `~/.config/wyrd/credentials.toml`
+6. `api_key` under `[default]` in `credentials.toml`, in your Wyrd config directory (`WYRD_CONFIG_HOME`, else `$XDG_CONFIG_HOME/wyrd`, else `~/.config/wyrd`)
+
+Pass a tenant only with a workload token; combining `WYRD_TENANT` with an API key or access token is an error.
 
 A permission snapshot is taken when the token is issued, so a role change reaches a running service within 5 minutes, when its token is next renewed.
 
@@ -73,10 +75,10 @@ Every tenant has four built-in roles. Each includes everything in the role above
 
 | Role | Adds | Typical holder |
 | --- | --- | --- |
-| `viewer` | Read Cards, artifacts, operators, the audit log, gateway usage, and Bifrost tables | A person who inspects results |
-| `workload` | Write observations and records, run Verifiers, evals, and Workflows, invoke Operators and the gateway | A deployed Service or Agent |
-| `editor` | Register and delete Cards, upload artifacts, install Services, lock Policies | A person or CI job that changes declarations |
-| `admin` | Every permission (`*:*`) | The tenant administrator |
+| `viewer` | `cards:read`, `artifacts:read`, `audit:read`, `operators:read`, `gateway:read`, `gateway_payload:read`, `bifrost_table:read`, `bifrost_query:read` | A person who inspects results |
+| `workload` | `bifrost_table:write`, `bifrost_record:write`, `evals:run`, `verifier:run`, `workflows:run`, `triggers:write`, `operators:invoke`, `gateway:invoke` | A deployed Service or Agent |
+| `editor` | `cards:write`, `cards:delete`, `artifacts:write`, `policy:lock`, `services:install` | A person or CI job that changes declarations |
+| `admin` | Every permission (`*:*`), including the administrative ones no other role holds: `service_accounts:write`, `operators:write`, `gateway:write`, and `gateway:delete` | The tenant administrator |
 
 Roles are granted per tenant, not per space. A space groups and names Cards; it is not an access boundary. A few permissions can be narrowed to one object, such as `verifier:run` on a single Verifier or `gateway:invoke` on one model.
 
@@ -86,7 +88,7 @@ The four built-in roles are the only roles today. There is no API to create a cu
 
 ## What a service may write about
 
-Roles decide what a principal may do; a Card binding also decides what it may write about. A principal bound to `support-copilot` may record observations only for that Service and the Cards it references, such as `triage` and `churn-classifier`. Anything else is refused with `WYRD_VALA_403_BIFROST_CARD_SCOPE`, even though the `workload` role allows writing observations in general. That is what stops one service from writing evidence about another.
+Roles decide what a principal may do; a Card binding also decides what it may write about. A principal bound to `support-desk` may record observations only for that Service and the Cards it references, such as `support-agent` and `support-prompt`. Anything else is refused with `WYRD_VALA_403_BIFROST_CARD_SCOPE`, even though the `workload` role allows writing observations in general. That is what stops one service from writing evidence about another.
 
 A principal with no Card, such as a person or an automation principal, may attribute observations to any registered Card in its tenant that its roles allow.
 
@@ -142,56 +144,7 @@ LIMIT 20
 
 ## Changing access
 
-Granting and revoking roles requires the `admin` role. Other principal management, such as issuing and revoking credentials, requires `service_accounts:write`.
-
-From the CLI, with the server URL in `--server` or `WYRD_SERVER_URL`:
-
-```bash
-wyrd principal list --kind service
-wyrd principal role list --principal <principal-id>
-wyrd principal role grant --principal <principal-id> --role editor
-wyrd principal role revoke --principal <principal-id> --role editor
-```
-
-From an SDK:
-
-<LangTabs langs={['python', 'rust', 'typescript']}>
-<LangTab lang="python">
-
-```python
-from wyrd.principals import Principals
-
-principals = Principals()
-result = principals.grant_role(principal_id, "editor")
-print(result["changed"], result["roles"])
-```
-
-</LangTab>
-<LangTab lang="rust">
-
-```rust
-use wyrd_sdk::{Principals, WyrdClient};
-
-let principals = Principals::with_client(WyrdClient::from_global()?);
-let result = principals.grant_role(&principal_id, "editor").await?;
-println!("{} {:?}", result.changed, result.roles);
-```
-
-</LangTab>
-<LangTab lang="typescript">
-
-```typescript
-import { Principals } from "@wyrd/sdk";
-
-const principals = Principals.connect();
-const result = await principals.grantRole(principalId, "editor");
-console.log(result.changed, result.roles);
-```
-
-</LangTab>
-</LangTabs>
-
-A grant is idempotent: granting a role the principal already holds returns `changed: false`. To cut a principal off entirely, `wyrd principal revoke <principal-id> --kind service --reason "..."` suspends it. New tokens are refused at once, and tokens already issued expire within 5 minutes.
+Only the `admin` role can grant and revoke roles or manage credentials. [Grant and inspect permissions](/operate/grant-and-inspect-permissions/) has the commands and SDK calls.
 
 ## What can go wrong
 

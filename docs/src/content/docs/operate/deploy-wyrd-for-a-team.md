@@ -1,6 +1,6 @@
 ---
 title: Deploy Wyrd for a team
-description: Prepare PostgreSQL with a platform login and a tenant login, migrate it, and confirm the server is ready.
+description: Prepare PostgreSQL with a platform login and a tenant login, migrate it, start the server, and create the first tenant.
 pillar: wyrd
 section: Operate
 order: 1
@@ -8,14 +8,17 @@ draft: true
 status: partial
 ---
 
-A shared Wyrd server runs with two PostgreSQL logins. The platform login owns Wyrd's tables and runs migrations. The tenant login serves requests and does not own any table, so PostgreSQL row-level security keeps it inside one tenant at a time, even if the server process is compromised.
+A shared Wyrd server runs with two PostgreSQL logins. The platform login owns Wyrd's tables, runs migrations, and handles platform operations such as creating tenants. The tenant login serves tenant requests and owns no table, so PostgreSQL row-level security confines every tenant query to one tenant, even one that forgets its tenant filter.
 
-This page covers the database. Set `WYRD_STORAGE_URL` to an object store every replica can reach; when it is unset, the server stores data in a local `.wyrd/storage` directory that only that process sees. The signing key and the container image are not documented here yet.
+The server keeps both logins connected while it runs. Treat both database URLs as secrets: anyone who can read the server's environment has platform access.
+
+This page covers the database, the server's persistent settings, and the first tenant. Sizing, TLS termination, and multi-replica topology are not documented yet.
 
 ## Prerequisites
 
 - PostgreSQL 16, and an administrator login that can create logins and databases.
-- The `wyrd-server` binary for the release you are deploying.
+- The `wyrd-server` binary for the release you are deploying, or the `wyrdai/wyrd` container image from Docker Hub.
+- An object store every server replica can reach: S3, Google Cloud Storage, or Azure Blob Storage.
 
 ## 1. Create the logins and the database
 
@@ -60,10 +63,37 @@ wyrd-server migrate
 
 ## 4. Start the server and check readiness
 
-Start `wyrd-server` with the same two URLs, then:
+Set the persistent settings, then start `wyrd-server` with the same two database URLs:
+
+| Variable | Value | If unset |
+| --- | --- | --- |
+| `WYRD_STORAGE_URL` | `s3://bucket`, `gs://bucket`, or `az://account/container`; bucket only, no path. S3 reads its region from `AWS_REGION` | Data goes to a local directory that only this process sees |
+| `WYRD_SIGNING_KEY_FILE` | Path to an Ed25519 private key in PEM form, the same file on every replica. `WYRD_SIGNING_KEY_PEM` takes the PEM inline instead; set one, not both | Startup fails when `APP_ENV=production`; otherwise each process signs with its own temporary key, and tokens do not survive a restart or work across replicas |
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://<server-host>:8080/readyz
 ```
 
-`200` means the server checked the schema and both logins and is serving. If the server exits instead, see [Troubleshoot a deployment](/operate/troubleshoot-a-deployment/).
+`200` means the server checked the schema and both logins and is serving. If the server exits instead, its last log line says why; see [Troubleshoot a deployment](/operate/troubleshoot-a-deployment/).
+
+## 5. Create the first tenant
+
+With the server running, from a machine that has the same two database URLs exported:
+
+```bash
+wyrd-server setup --tenant acme --server http://<server-host>:8080
+```
+
+On a fresh database this creates the platform root and prints its `wyrd_global_...` credential, then creates the tenant and prints:
+
+```text
+tenant_id: <uuid>
+slug: acme
+admin_principal_id: <uuid>
+admin_credential: <key>
+This is the only time the tenant credential is shown. Store it now.
+```
+
+Store both credentials in your secret manager. The platform credential creates and recovers tenants; the tenant `admin_credential` is the tenant's first administrator. Rerunning `setup` for an active tenant prints `is already set up; nothing to do.` To add another tenant later, set `WYRD_PLATFORM_CREDENTIAL` and rerun `setup` with the new slug.
+
+Give the administrator credential to the first person who will manage the tenant. They save it as `[default].api_key` in their `credentials.toml`, [connect an agent](/connect/connect-an-agent-through-mcp/), and grant roles to others; [Identity and authorization](/understand/identity-and-authorization/) explains the model.

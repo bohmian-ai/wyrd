@@ -10,6 +10,8 @@ status: runnable
 
 `wyrd mcp install` adds Wyrd to your coding agent's MCP servers. The agent then launches `wyrd mcp proxy`, which serves your Wyrd server's tools over stdio and signs each request with your ordinary Wyrd credential. The agent's configuration file never holds that credential.
 
+If you ran [`wyrd server dev`](/get-started/setup/) and accepted its offer to connect agents, those agents are already connected with a saved credential. Restart them and skip to [step 4](#4-check-the-connection).
+
 ## Prerequisites
 
 - The `wyrd` CLI on your `PATH` (`pip install wyrd` or `npm install @wyrd/sdk`).
@@ -33,16 +35,17 @@ Agents started from the Dock or a launcher do not see variables you exported in 
 For a deployed server with single sign-on, sign in. The saved login applies only to that server:
 
 ```bash
-wyrd auth login --server https://acme.wyrd.cloud --tenant acme
+wyrd auth login --server https://wyrd.example.com --tenant acme
 ```
 
-For the local server, or any server where you hold an API key (such as the `admin_credential` from [Set up Wyrd](/get-started/setup/#4-create-the-first-credential)), put the key in `~/.config/wyrd/credentials.toml`, readable only by you. It is used for every server you have no saved login for:
+For the local server, `wyrd server dev` already saved the tenant key in `credentials.toml`; skip to step 2. For any other server where you hold an API key, such as the `admin_credential` from [Deploy Wyrd for a team](/operate/deploy-wyrd-for-a-team/#5-create-the-first-tenant), put the key in `credentials.toml` in your Wyrd config directory, readable only by you. It is used for every server you have no saved login for. This overwrites the file, so check that it holds no key you still need:
 
 ```bash
 umask 077
-mkdir -p ~/.config/wyrd
-printf '[default]\napi_key = "%s"\n' "$WYRD_API_KEY" > ~/.config/wyrd/credentials.toml
-chmod 600 ~/.config/wyrd/credentials.toml
+WYRD_DIR="${WYRD_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/wyrd}"
+mkdir -p "$WYRD_DIR"
+printf '[default]\napi_key = "%s"\n' "$WYRD_API_KEY" > "$WYRD_DIR/credentials.toml"
+chmod 600 "$WYRD_DIR/credentials.toml"
 ```
 
 The proxy reads the same sources as every Wyrd client, in this order: `WYRD_ACCESS_TOKEN`, workload identity, `WYRD_API_KEY`, your saved login for that server, then `credentials.toml`. It resolves them each time the agent starts it, so a renewed login or a rotated key takes effect without reinstalling.
@@ -70,12 +73,12 @@ Only the agents you choose change, and only their `wyrd` entry. Running the comm
 
 ## 3. Choose the server
 
-Without `--server`, the agent follows your global client endpoint: `http_url` in `~/.config/wyrd/config.toml`, else `http://localhost:8080`, the local server from [Set up Wyrd](/get-started/setup/).
+Without `--server`, the agent follows your global client endpoint: `[client].http_url` in `config.toml`, which `wyrd server dev` sets to `http://127.0.0.1:8080`, else `WYRD_SERVER_URL`, else `http://localhost:8080`.
 
 To point an agent at a deployed server, pass it explicitly:
 
 ```bash
-wyrd mcp install --host claude-code --server https://acme.wyrd.cloud
+wyrd mcp install --host claude-code --server https://wyrd.example.com
 ```
 
 The URL is stored in that agent's entry; open the file from the table above to see which server an agent uses. Rerunning `install` with a different `--server`, or without one, reports `updated`. Your global `config.toml` is not changed, so other tools keep using the local server. Remote servers must use `https://`. Plain `http://` is accepted only for `localhost` and loopback addresses.
@@ -87,7 +90,7 @@ Ask the agent to list its MCP tools, then call `wyrd.guide` with `{"topic":"over
 Try a question about a Service you registered:
 
 ```text
-Analyze service support-desk. Discover its exact version, follow its component
+Analyze service support-desk in space default. Discover its exact version, follow its component
 references, and explain what the retained evidence supports. State missing
 evidence and permission refusals explicitly.
 ```

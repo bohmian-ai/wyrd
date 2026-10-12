@@ -534,6 +534,10 @@ svg {
   border-radius: var(--r);
   background: var(--surface);
 }
+.aside[data-type='tip'] {
+  border-left-color: var(--observe);
+  background: var(--observe-soft);
+}
 .aside[data-type='caution'] {
   border-left-color: var(--warn);
 }
@@ -769,43 +773,458 @@ table.ref .ty {
   color: var(--text);
 }
 
-/* ─── Diagrams (token-only SVG) ─────────────────────────────────────────── */
+/* ─── Diagrams ──────────────────────────────────────────────────────────── */
+/* One visual grammar for every WyrdDiagram, WyrdSequence, and WyrdTimeline:
+   cobalt for declared things and control, lime fill for retained data, a glyph
+   plus a word for every status. The SVG is drawn at a fixed viewBox and scrolls
+   sideways on narrow screens instead of shrinking text past legibility. */
 
-.wyrd-diagram {
+.wd {
+  margin: 24px 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  font-size: 15px;
+  line-height: 1.6;
+}
+.wd-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.wd-meta {
+  font-size: 13px;
+  color: var(--muted);
+  min-width: 0;
+}
+.wd-meta b {
+  color: var(--text);
+  font-weight: var(--weight-strong);
+}
+.wd-ctrl {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.wd button {
+  font: 12px var(--font-mono);
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.wd button:hover {
+  background: var(--surface-hover);
+}
+.wd button:focus-visible {
+  outline: 2px solid var(--declare);
+  outline-offset: 2px;
+}
+.wd button[aria-pressed='true'] {
+  background: var(--declare-soft);
+  border-color: var(--declare);
+}
+.wd button.wd-play {
+  background: var(--declare);
+  color: var(--declare-ink);
+  border-color: var(--declare);
+}
+.wd-canvas {
+  position: relative;
+  overflow-x: auto;
+  padding: 8px 6px;
+}
+.wd-canvas svg {
   display: block;
   width: 100%;
-  max-width: 680px;
+  min-width: 700px;
   height: auto;
-  margin: 24px auto;
 }
-.wyrd-diagram .node-fill {
+.wd-narr {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: start;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-soft);
+  min-height: 64px;
+}
+.wd-k {
+  font: 11px var(--font-mono);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding-top: 3px;
+}
+.prose .wd p {
+  margin: 0;
+  font-size: 14px;
+}
+.prose .wd :not(pre) > code {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: 0.86em var(--font-mono);
+}
+.wd-detail {
+  border-top: 1px solid var(--border-soft);
+  padding: 12px 14px;
+  display: grid;
+  gap: 8px;
+}
+.wd-row {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 10px;
+  font-size: 13.5px;
+}
+.wd-row > span:first-child {
+  color: var(--muted);
+  font: 12px var(--font-mono);
+  padding-top: 2px;
+}
+.wd pre.wd-sql {
+  margin: 0;
+  background: var(--code-bg);
+  color: var(--code-text);
+  font: 12.5px/1.55 var(--font-mono);
+  padding: 12px 14px;
+  border-radius: var(--r);
+  overflow-x: auto;
+}
+.wd-sql .kw {
+  color: var(--code-keyword);
+}
+.wd-note {
+  font-size: 13.5px;
+  color: var(--muted);
+}
+.wd-text {
+  border-top: 1px solid var(--border-soft);
+  padding: 10px 14px;
+  font-size: 13.5px;
+}
+.wd-text summary {
+  cursor: pointer;
+  font: 12px var(--font-mono);
+  color: var(--muted);
+}
+.prose .wd-text ol {
+  margin: 8px 0 4px;
+}
+.wd-tl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border-soft);
+}
+.wd-tl label {
+  font: 12px var(--font-mono);
+  color: var(--muted);
+}
+.wd-tl input[type='range'] {
+  flex: 1 1 260px;
+  accent-color: var(--declare);
+}
+.wd-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  border-top: 1px solid var(--border-soft);
+}
+.wd-fact {
+  padding: 12px 14px;
+  display: grid;
+  gap: 4px;
+  border-right: 1px solid var(--border-soft);
+}
+.wd-fact:last-child {
+  border-right: 0;
+}
+.wd-fact .v {
+  font-size: 15px;
+  font-weight: var(--weight-strong);
+}
+.wd-fact .s {
+  font-size: 13px;
+  color: var(--muted);
+}
+.wd-badge {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  font: 12.5px var(--font-mono);
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 1px 7px;
+  width: fit-content;
+}
+.wd-badge.ok {
+  border-color: var(--ok);
+}
+.wd-badge.warn {
+  border-color: var(--warn);
+}
+.wd-badge.danger {
+  border-color: var(--danger);
+}
+@media (max-width: 560px) {
+  .wd-row {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+  .wd-fact {
+    border-right: 0;
+    border-bottom: 1px solid var(--border-soft);
+  }
+}
+
+/* SVG grammar */
+.wd svg text {
+  font-family: var(--font-sans);
+}
+.wd-t-title {
+  fill: var(--text);
+  font-size: 13.5px;
+  font-weight: var(--weight-strong);
+}
+.wd-t-sub {
+  fill: var(--muted);
+  font: 10.5px var(--font-mono);
+}
+.wd-t-code {
+  fill: var(--text);
+  font: 12px var(--font-mono);
+  font-weight: var(--weight-strong);
+}
+.wd svg .wd-t-ink {
+  fill: var(--evidence-ink);
+}
+.wd-t-col,
+.wd-t-yes {
+  fill: var(--text);
+  font: 11px var(--font-mono);
+}
+.wd-t-colk,
+.wd-t-no {
+  fill: var(--muted);
+  font: 11px var(--font-mono);
+}
+.wd-t-group,
+.wd-t-lane {
+  fill: var(--muted);
+  font: 10.5px var(--font-mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.wd-t-target {
+  fill: var(--text);
+  font: 12.5px var(--font-mono);
+  font-weight: var(--weight-strong);
+}
+.wd-t-label {
+  fill: var(--muted);
+  font: 10.5px var(--font-mono);
+  paint-order: stroke;
+  stroke: var(--surface);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+}
+.wd-t-x {
+  fill: var(--danger);
+  font: 12px var(--font-mono);
+}
+.wd-t-stage {
+  fill: var(--text);
+  font: 11px var(--font-mono);
+}
+.wd-t-stagesub {
+  fill: var(--muted);
+  font: 10.5px var(--font-sans);
+}
+.wd-f-surface {
   fill: var(--surface);
 }
-.wyrd-diagram .node-fill-accent {
+.wd-f-surface2 {
+  fill: var(--surface-2);
+}
+.wd-f-declare {
   fill: var(--declare-soft);
 }
-.wyrd-diagram .node-stroke {
-  fill: none;
+.wd-f-evidence {
+  fill: var(--observe);
+}
+.wd-s-border {
   stroke: var(--border);
   stroke-width: 1;
 }
-.wyrd-diagram .node-text {
+.wd-s-declare {
+  stroke: var(--declare);
+  stroke-width: 1;
+}
+.wd-s-text {
+  stroke: var(--text);
+  stroke-width: 1;
+}
+.wd-s-dash {
+  stroke-dasharray: 4 3;
+}
+.wd-group {
+  fill: none;
+  stroke: var(--border);
+  stroke-dasharray: 2 4;
+}
+.wd-tone-progress {
+  stroke: var(--declare);
+  stroke-width: 2;
+}
+.wd-tone-ok {
+  stroke: var(--ok);
+  stroke-width: 2;
+}
+.wd-tone-warn {
+  stroke: var(--warn);
+  stroke-width: 2;
+}
+.wd-tone-danger {
+  stroke: var(--danger);
+  stroke-width: 2;
+}
+.wd-tone-muted {
+  stroke: var(--muted);
+  stroke-width: 2;
+}
+.wd-line {
+  fill: none;
+  stroke-width: 1;
+}
+.wd-k-data .wd-line {
+  stroke: var(--text);
+}
+.wd-k-control .wd-line {
+  stroke: var(--declare);
+}
+.wd-k-ref .wd-line {
+  stroke: var(--muted);
+  stroke-dasharray: 3 3;
+}
+.wd-k-best .wd-line {
+  stroke: var(--text);
+  stroke-dasharray: 5 4;
+}
+.wd-mk-data {
   fill: var(--text);
-  font-family: var(--font-sans);
-  font-size: 14px;
-  font-weight: var(--weight-strong);
-  text-anchor: middle;
 }
-.wyrd-diagram .node-sub {
-  fill: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  text-anchor: middle;
+.wd-mk-control {
+  fill: var(--declare);
 }
-.wyrd-diagram .arrow-label {
+.wd-mk-ref {
   fill: var(--muted);
-  font-family: var(--font-mono);
-  font-size: 10.5px;
+}
+.wd-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 14;
+  cursor: pointer;
+}
+.wd-n,
+.wd-e {
+  transition: opacity 220ms ease-out;
+}
+.wd-focus .wd-n:not(.on),
+.wd-focus .wd-e:not(.on) {
+  opacity: 0.22;
+}
+.wd-e.on .wd-line {
+  stroke-width: 2;
+}
+.wd-n.clickable {
+  cursor: pointer;
+}
+.wd-n:focus-visible {
+  outline: none;
+}
+.wd-n .wd-halo {
+  fill: none;
+}
+.wd-n.sel .wd-halo,
+.wd-n:focus-visible .wd-halo {
+  stroke: var(--declare);
+  stroke-width: 2;
+}
+.wd-pk-data {
+  fill: var(--observe);
+  stroke: var(--evidence-ink);
+  stroke-width: 1;
+}
+.wd-pk-control {
+  fill: var(--declare);
+}
+.wd-lifeline {
+  stroke: var(--border);
+  stroke-dasharray: 2 4;
+}
+.wd-lane {
+  fill: var(--surface-2);
+}
+.wd-axis {
+  stroke: var(--border);
+}
+.wd-tick {
+  stroke: var(--muted);
+}
+.wd-cursor {
+  stroke: var(--declare);
+  stroke-width: 1.5;
+}
+.wd-peer {
+  fill: none;
+  stroke: var(--declare);
+  stroke-dasharray: 2 3;
+}
+.wd-pod > .wd-box {
+  fill: var(--surface);
+  stroke: var(--border);
+}
+.wd-pod.hl > .wd-box {
+  stroke: var(--declare);
+  stroke-width: 2;
+}
+.wd-facet .wd-pod.dim,
+.wd-facet .wd-chip.dim {
+  opacity: 0.3;
+}
+.wd-chip rect {
+  fill: var(--surface-2);
+  stroke: var(--border);
+}
+.wd-chip.off rect {
+  fill: none;
+  stroke-dasharray: 3 3;
+}
+.wd-chip.hl rect {
+  fill: var(--declare-soft);
+  stroke: var(--declare);
+  stroke-width: 2;
+}
+.wd-pod,
+.wd-chip {
+  transition: opacity 220ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .wd-n,
+  .wd-e,
+  .wd-pod,
+  .wd-chip {
+    transition: none;
+  }
 }
 
 /* ─── Error ─────────────────────────────────────────────────────────────── */

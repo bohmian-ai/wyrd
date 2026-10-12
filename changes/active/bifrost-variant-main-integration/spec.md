@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-variant-main-integration
-revision: 2
+revision: 3
 status: approved
 task_count: 6
 ---
@@ -32,6 +32,69 @@ engine that compiles but loses its surrounding consumers is not deliverable.
 Task boundaries are reviewed internal checkpoints, never permission to omit a
 consumer or release a partial outcome. Every task closes its affected consumers,
 tests and artifacts; final integrated acceptance accounts for all contributions.
+
+## Revision 3 — Bifrost is the variant
+
+The user ruled on 2026-10-11: “the only source of truth for Bifrost architecture
+is variant (S)… I don't want main's outdated and stale architecture for Bifrost
+in this codebase”; “variant (S) is the owner of the bifrost logic”; “this is for
+bifrost only”. This section overrides every conflicting sentence elsewhere in
+this spec, its tasks, decomposition, contract, and dispositions.
+
+**Bifrost scope.** `crates/vala/vala-bifrost-redux`; the Bifrost tables, queries,
+row types, and tests in `crates/vala/vala-sql`; the Bifrost harness, journeys,
+and benchmark workloads in `crates/wyrd/wyrd-testing`; the Bifrost server seams
+(`otlp_decode.rs`, Bifrost gRPC/HTTP wiring); `wyrd_client::bifrost`; and
+`architecture/bifrost-design.md`. Non-Bifrost main code is unaffected.
+
+**Rule.** Inside Bifrost scope the implementation is S at
+`cfe21dc9007d5d22d9ae4411be07fb5504b0cc05`. There is no main Bifrost mechanism,
+state, SQL, test, or prose except the exceptions below. A conflicting “retain
+main's …” or “compose with main repair” obligation in REQ-001–REQ-027 is struck.
+Composition means adapting an exception to S's owners — never layering a main
+mechanism over or beside an S one, never two implementations.
+
+**Exceptions — main behavior kept, adapted to S's owners:**
+
+| ID | Exception | Governing REQ | Status |
+|---|---|---|---|
+| X1 | `card_uid` observation correlation and Gate attribution of unbound writers | REQ-013, REQ-014 | user-approved |
+| X2 | One shared non-blocking Scribe outbox for audit, gateway captures and Verifier results; no audit staging, publisher, or chain; audit content and six trusted destinations | REQ-010, REQ-011, REQ-012 | user-approved |
+| X3 | Oracle and Scribe peer routing: Scribe capability and internal-write routing independent of Oracle | REQ-009 | user-approved |
+| X4 | Role-owned heartbeat and one process membership poller | REQ-008 | user-approved |
+| X5 | Ten built-ins, eager provisioning, no `vala.dev.agent_traces` | REQ-018 | user-approved |
+| X6 | Ordered typed query bind parameters | REQ-019 | user-approved |
+| X7 | Main identity at the Bifrost entrance: verified-principal Gate, API-key OTLP authentication before decode, `TenantConn`/`OperatorPool` SQL capability types | REQ-022 | user-approved |
+
+**Struck (reverted to S):** REQ-005 flush ownership repair; all of REQ-006;
+REQ-007's settlement model; main deadline refusal codes; main Forge SQL,
+leadership, reclaim, expiry, publication-retry and operation-state designs and
+their tests. Commits 136e460d6, ba86fe129, f10f735dd, 53dfc2a1c and the Forge
+gate part of 985aa12f8 are reverted with them. S's tests for S's behavior return.
+
+**Migrations.** Nothing has shipped, so no migration history is preserved:
+the Bifrost migrations in `crates/vala/vala-sql/migrations` are S's files,
+edited in place. X2 and X5 are applied by editing those files (audit staging and
+`vala.dev.agent_traces` are never created), not by drop or forward migrations.
+Main-only Bifrost migrations and the integration's forward migrations are
+deleted, along with tests that pin shipped-migration bytes. REQ-024 is struck;
+non-Bifrost (`wyrd-sql`) migrations are unaffected.
+
+**Benchmarks.** S's query-capacity, write-capacity and client-queue workloads
+are restored with S's exact inputs, steps, assertions, metrics, report layout
+and output paths. They compile into main's one consolidated capacity build, and
+every S command remains callable by name, unchanged:
+`mise run bench:bifrost:query-capacity [-- --fixture telemetry | --heavy]`,
+`mise run bench:bifrost:write-capacity [-- --fixture logs|telemetry]`,
+`mise run bench:bifrost:client-queue`. Main's `bench:capacity` stays beside
+them. `changes/active/bifrost-variant/BENCHMARK-HANDOFF.md` runs as written.
+
+**Acceptance (AC-028).** Bifrost scope contains no trace of main except X1–X7,
+each adapted to S's owners. Evidence: a per-file diff of Bifrost scope against
+S where every hunk maps to one exception (or to a non-Bifrost rename that the
+exception forces); the struck mechanisms absent by symbol and SQL object; the
+net Bifrost schema equal to S's; and the handoff benchmark commands running
+unchanged with S's report shape.
 
 ## Immutable inputs and integration authority
 
@@ -118,32 +181,15 @@ reupload objects. Wire, WAL, ingress, SQL, and crash proof must agree.
 
 ### REQ-005 — Flush includes concurrently owned rows
 
-Port main's flush snapshot ownership repair into source staging/persistence.
-Flush cannot complete while another publisher owns a member in its promised
-snapshot. Preserve source publication/recovery behavior. Fault controls and
-backlog inspections remain table-scoped so audit traffic cannot consume another
-table's injected fault or invalidate its proof.
+**Struck in revision 3.** Scribe staging, persistence, flush and publication are S's, unchanged.
 
 ### REQ-006 — Compatible Forge durability and lifetime repairs
 
-Retain main's lease-bounded destructive-effect handling, prepared/submitted
-distinction, uncertain-outcome reconciliation, leader-term linearization,
-authority revocation on scheduler exit, and same-owner reclaim only after proven
-prior-loop quiescence. Retain main's bounded catalog calls and definite-conflict
-publication retry policy, including unchanged operation/output identity on
-retry. Compose these with source retention and native v3 rewrites; do not
-restore old active-reader SQL or publication wall deadlines.
-Source cuts remain non-blocking while expiry holds maintenance authority,
-including prepared expiry. Do not port main's barriers/refusals for new cuts;
-retain its durable uncertain-operation evidence and lease bounds instead.
+**Struck in revision 3.** Forge (expiry, publication, leadership, worker, scheduler, catalog operations) and its SQL are S's, unchanged.
 
 ### REQ-007 — Oracle-owned memory settles correctly
 
-Adapt main's shutdown fixes to source governor/executor ownership. Oracle drain
-waits for Oracle governed memory and infallible headroom, including late child
-ownership, without waiting for independent Forge reservations. A query slot
-can settle while a legitimate child view returns its bytes; successful release
-never masks poisoned or abandoned ownership. Keep the source resource model.
+**Struck in revision 3.** Oracle governed memory, executor ownership and shutdown drain are S's, unchanged.
 
 ### REQ-008 — Role heartbeat and one membership poller
 
@@ -308,14 +354,7 @@ than merely restoring a shutdown call.
 
 ### REQ-024 — Main migration history plus source forward DDL
 
-Preserve main applied historical migration bytes/checksums and retired audit
-tables' drop history. Import only source's three genuinely new retention,
-cut-notification, and WAL-fence migrations, adapting role/RLS/search_path/grants
-to main. Put genuinely required historical DDL differences in uniquely versioned
-forward migrations; comment changes do not justify checksum changes. Keep old
-workload/grant deletions: they are unchanged source/base, not new source changes.
-Fresh replay and forward migration from main with no old Bifrost objects must
-produce equivalent target SQL while preserving identities/Cards/credentials.
+**Struck in revision 3.** Bifrost migrations are S's files edited in place; see Revision 3, Migrations.
 
 ### REQ-025 — Fresh-only Bifrost, no implicit destructive transition
 
@@ -371,7 +410,7 @@ test binaries/harnesses.
 | INV-006 | Observation subject/writer/application Run and Verifier/result identity remain distinct and exact. |
 | INV-007 | Declared types/time axes and logical Variant values agree across writers/readers/schema/layout. |
 | INV-008 | Partial/failed/cancelled query streams are not successful complete results. |
-| INV-009 | Main migration history and control-plane state survive; old Bifrost format is not silently admitted. |
+| INV-009 | Main control-plane (`wyrd-sql`) migrations and state survive; Bifrost migrations are S's edited files; old Bifrost format is not silently admitted. |
 | INV-010 | No old dev table/CodeAxis, publisher, audit chain, deleted scripts, descriptor, or duplicate harness is restored. |
 | INV-011 | Main public integrations and all first-class clients consume the same source-authoritative contract. |
 | INV-012 | Checks are not bypassed, generated output is not hand-edited, and private mechanics remain implementer-owned. |
@@ -486,7 +525,8 @@ or proposed scope/contract change routes through a new spec revision.
 | Revision | Date | Status | Basis |
 |---|---|---|---|
 | 1 | 2026-10-11 | superseded | Initial transcription; incomplete task recipes and conflicting earlier research choices replaced by revision 2. |
-| 2 | 2026-10-11 | approved | Explicit approval of all seven batches (1–27), unified Task/registration/error/SQL resolutions, and source workload retention with main target consolidation. |
+| 2 | 2026-10-11 | superseded | Explicit approval of all seven batches (1–27), unified Task/registration/error/SQL resolutions, and source workload retention with main target consolidation. |
+| 3 | 2026-10-11 | approved | User ruling that S is the sole Bifrost implementation: exceptions X1–X7 approved, REQ-005/006/007/024 struck, Bifrost migrations edited in place (nothing shipped), benches restored by name in one build, AC-028. |
 
 ## Authority links
 

@@ -7546,19 +7546,14 @@ impl ForgeWorker {
 
         require_running(stop)?;
         lease.require_fence().await?;
-        let mut prepared = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(claim.data_tenant_id)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut prepared).await?;
+        let mut prepared = lease
+            .begin_fenced(&self.forge.core.vala, claim.data_tenant_id)
+            .await?;
         self.tasks
             .prepared(&mut prepared, claim.task_id, attempt, self.owner, &evidence)
             .await
             .map_err(ForgeError::Sql)?;
-        prepared.commit().await.map_err(ForgeError::Sql)?;
+        prepared.commit().await?;
         #[cfg(feature = "test-support")]
         if self
             .forge
@@ -8474,28 +8469,18 @@ impl ForgeWorker {
         lease: &ForgeLease,
         evidence: &ForgeTaskEvidence,
     ) -> Result<(), ForgeError> {
-        let mut prepared = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(claim.data_tenant_id)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut prepared).await?;
+        let mut prepared = lease
+            .begin_fenced(&self.forge.core.vala, claim.data_tenant_id)
+            .await?;
         self.tasks
             .prepared(&mut prepared, claim.task_id, attempt, self.owner, evidence)
             .await
             .map_err(ForgeError::Sql)?;
-        prepared.commit().await.map_err(ForgeError::Sql)?;
+        prepared.commit().await?;
 
-        let mut terminal = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(claim.data_tenant_id)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut terminal).await?;
+        let mut terminal = lease
+            .begin_fenced(&self.forge.core.vala, claim.data_tenant_id)
+            .await?;
         let progress_effect = task_progress_effect(
             &claim.strategy,
             claim.base_snapshot_id,
@@ -8518,7 +8503,7 @@ impl ForgeWorker {
             )
             .await
             .map_err(ForgeError::Sql)?;
-        terminal.commit().await.map_err(ForgeError::Sql)?;
+        terminal.commit().await?;
         tracing::debug!(
             progressed = matches!(progress_effect, TaskProgressEffect::Progressed),
             "Forge task settled its durable progress effect"
@@ -8539,19 +8524,12 @@ impl ForgeWorker {
         lease: &ForgeLease,
         progress_effect: TaskProgressEffect,
     ) -> Result<(), ForgeError> {
-        let mut terminal = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut terminal).await?;
+        let mut terminal = lease.begin_fenced(&self.forge.core.vala, tenant).await?;
         self.tasks
             .terminal_success(&mut terminal, transition, table_ref, progress_effect)
             .await
             .map_err(ForgeError::Sql)?;
-        terminal.commit().await.map_err(ForgeError::Sql)?;
+        terminal.commit().await?;
         tracing::debug!(
             progressed = matches!(progress_effect, TaskProgressEffect::Progressed),
             "Forge task settled its durable progress effect"

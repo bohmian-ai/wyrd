@@ -138,3 +138,54 @@ Report a concrete blocker if repository-managed setup cannot supply the required
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
 
+
+## Implementation Evidence
+
+**Reuse map.**
+- Owner: `identity_ui_e2e::production_ui_bff_journey`, which hosts the existing server replicas, BFFs and TLS hop.
+- Gap: no listener served the public origin, so the HTTP journey hand-routed `/auth/*` and no browser could reach the deployment.
+- Extension:
+  - A Node gateway on the origin port routes by the official nginx template's own `location ~` regex (`include_str!`).
+  - The case `live UI login and CLI` is added to the existing `production-auth.integration.test.ts`, which reuses its fixture, `asKey` and Vitest discovery.
+  - No second environment controller.
+- Additions:
+  - `playwright` 1.64.0 is a dev dependency; the lane installs `chromium-headless-shell`.
+  - The lane seeds Keycloak user `dana`, who has no Wyrd principal.
+  - nginx now forwards `/.well-known/oauth-authorization-server` (route-audit discovery gap).
+
+**Local decision: loopback HTTP origin.** The browser-facing origin stays `http://localhost:<port>`, not HTTPS:
+- Dex's public client accepts only loopback `http` callbacks, and the shared host's Dex tenant needs the same public origin.
+- Chromium treats `localhost` as a secure context, so production `Secure`/`HttpOnly`/`SameSite=Lax` cookies and CSRF behave as deployed.
+- The trusted, certificate-verified TLS hop remains BFF 1 → server replica B.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Focused case command: `WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='live UI login and CLI' mise run test:identity:journey` (1 passed, 4 skipped) | — | — | PASS |
+| Fresh Keycloak user signs in through the rendered UI and becomes exactly one principal | `browserLogin`, `usersWithEmail` (admin `GET /v1/principals?kind=user&email=`): `[]` before login, `[shown principal]` after | `live UI login and CLI` | PASS |
+| Repeat login creates no duplicate | Sign out, then sign in again (provider session, no form): same principal, list length 1 | same | PASS |
+| CLI device approval as the same person; only the configured Wyrd origin is used | Real `wyrd auth login --server <origin> --no-browser`; the verification URL origin is the configured origin; the browser approves; the saved `credentials.toml` access token's `principal.id` equals the UI principal; the output has no JWT | same | PASS |
+| Authenticated CLI read | `wyrd list --server <origin>` exits 0 with the saved login | same | PASS |
+| Discovery is reachable on the public origin, and the endpoints advertise that origin | `GET <origin>/.well-known/oauth-authorization-server` through the nginx-template routing | same | PASS |
+| Failed login exposes nothing | A wrong password stays at Keycloak (`#input-error`), with no session cookie and no principal; a forged callback goes to `/t/{tenant}/login?login=failed` and shows an alert | same | PASS |
+| Logout and nonrenewable session | Sign out clears the session; a protected URL goes to login. The signed-out cookie, replayed in a new context, is sent to login within 45 s and shows no principal | same | PASS |
+| Manipulated tenant URL | `/t/ui-oidc-off/settings` and `/t/ui-switch-peer/settings` go to that tenant's login with no principal in the HTML | same | PASS |
+| Second tenant / restricted identity runs independently | Reader `bob` signs into `ui-switch-peer` in a separate context: a different principal, only that tenant's cookie, and `/t/test-tenant-1` goes to login; dana is unaffected | same | PASS |
+| AC-018 loading gate | Settings' initial HTML contains the principal, and hydration makes no `__data.json` request. Client navigation to Home fetches `/t/{tenant}/__data.json`. The browser issues no `/v1/*` request | same | PASS |
+| Existing HTTP journey unaffected | The host now also starts the gateway | `WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='production SSO crosses replicas' mise run test:identity:journey`: 1 passed | PASS |
+| Types / build | — | `pnpm run check`: 741 files, 0 errors; `pnpm run build` succeeds | PASS |
+
+**Generated operation types consumed.** None new. The case reads `list_principals` and the authorization server metadata over raw HTTP as a privileged test assertion, not as a BFF consumer. `codegen:check` was not rerun because no HTTP contract changed.
+
+**Usability pass.** Reviewed scrubbed local screenshots in `target/debug/wyrd-ui-live-login/`: `settings.png`, `home.png`, `cli-approved.png` and `session-ended.png`. Issues for later page tasks:
+- The identity control shows the raw principal UUID. The session carries only the principal id, so a readable name needs a source the session does not have yet.
+- Tenant Home for a viewer renders the shell-less "Permission denied (RBAC)" page, because Home is still mock-backed. TASK-003 replaces it. Recovery is via "Return to tenant entry"; the session stays valid.
+- After a session ends, the login page gives no "your session ended" notice.
+- The server's CLI approval completion page is unstyled plain text ("Sign-in complete. You can return to your terminal."). It is clear but bare, and it is server-owned.
+
+**Not run, at the user's direction ("only run tests and verification related to the UI").**
+- `WYRD_IDENTITY_TARGET=cli WYRD_IDENTITY_FILTER=cli_device_login_journey`.
+- Rust fmt/lints and `check:deps`.
+
+The Rust change is test-host-only (`identity_ui_e2e.rs`). The CLI journey's own server and realm configuration are unchanged.
+
+**Non-goals.** No public or persisted contract, migration, BFF route or page behavior changed.

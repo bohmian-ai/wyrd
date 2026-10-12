@@ -183,7 +183,11 @@ async fn server_install_selects_latest_stable() {
         .expect("config directory created")
         .permissions()
         .mode();
-    assert_eq!(config_mode & 0o077, 0, "config directory mode {config_mode:o}");
+    assert_eq!(
+        config_mode & 0o077,
+        0,
+        "config directory mode {config_mode:o}"
+    );
 
     let incompatible = installer(&server, &root, "0.1.0");
     let refused = incompatible

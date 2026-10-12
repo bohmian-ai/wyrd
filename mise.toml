@@ -806,6 +806,8 @@ def create_user(username, email, password, group_path, realm=REALM):
 create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins")
 create_user("bob", "bob@wyrd.test", "wyrd-test", "wyrd-viewers")
 create_user("carol", "carol@wyrd.test", "carol-password", "wyrd-editors")
+# The browser journey's fresh person: no Wyrd principal exists until her first sign-in.
+create_user("dana", "dana@wyrd.test", "dana-password", "wyrd-viewers")
 # The second provider's alice shares the first's email: a provider switch must
 # still make her a separate Wyrd user.
 create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins", realm="wyrd-test-2")
@@ -908,7 +910,8 @@ ui_selected_count() {
 run_ui() {
   pnpm --dir "$ui_dir" install --frozen-lockfile
   pnpm --dir "$ui_dir" build
-  for required in "production SSO crosses replicas" "OIDC-off credential UI" "production multi-provider tenant switch" "production provider replacement settings"; do
+  pnpm --dir "$ui_dir" exec playwright install chromium-headless-shell
+  for required in "production SSO crosses replicas" "OIDC-off credential UI" "production multi-provider tenant switch" "production provider replacement settings" "live UI login and CLI"; do
     count="$(ui_selected_count "$required")"
     if [ "$count" != 1 ]; then
       echo "UI identity journey '$required' selects $count tests; expected exactly 1" >&2

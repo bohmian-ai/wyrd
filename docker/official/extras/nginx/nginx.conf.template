@@ -50,7 +50,7 @@ http {
         # Rust owns these paths verbatim; nothing is rewritten. Bodies stream
         # through unbuffered so artifact uploads and MCP streams are not held
         # or size-capped here; the server enforces its own limits.
-        location ~ ^/(v1|auth|platform|mcp)(/|$)|^/(openapi\.json|healthz|readyz)$ {
+        location ~ ^/(v1|auth|platform|mcp)(/|$)|^/(openapi\.json|healthz|readyz|\.well-known/oauth-authorization-server)$ {
             proxy_pass http://wyrd_http;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;

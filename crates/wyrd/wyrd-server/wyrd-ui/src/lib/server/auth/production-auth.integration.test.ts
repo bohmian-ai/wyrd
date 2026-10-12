@@ -11,6 +11,12 @@
  * session's access token renews it with the refresh token, and logout revokes
  * that refresh token (RFC 7009).
  */
+import { spawn } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+import { chromium, type BrowserContext, type Page } from 'playwright';
 import { expect, test } from 'vitest';
 
 type Journey = {
@@ -26,8 +32,15 @@ type Journey = {
   switchTenants: { keycloak: string; second: string; peer: string };
   replacementTenant: string;
   replacementOwnerKey: string;
-  /** Each provider's login form fields: Keycloak's admin and reader, and Dex's user. */
-  users: Record<'admin' | 'reader' | 'dex', Record<string, string>>;
+  /**
+   * Each provider's login form fields: Keycloak's admin and reader, Dex's user, and the
+   * fresh Keycloak person (with her `email`) who has no Wyrd principal until she signs in.
+   */
+  users: Record<'admin' | 'reader' | 'dex' | 'fresh', Record<string, string>>;
+  /** The built `wyrd` CLI. */
+  cli: string;
+  /** Local directory for the browser journey's screenshots; never checked in. */
+  evidence: string;
 };
 
 const journey = JSON.parse(process.env.WYRD_UI_JOURNEY ?? 'null') as Journey;
@@ -710,3 +723,209 @@ test('production provider replacement settings', async () => {
   expect((await replaced.go(0, settings)).status).toBe(200);
   expect((await replaced.go(1, settings)).status).toBe(200);
 }, journeyTimeout + 60_000);
+
+/** The `user` principals with `email`, read with the tenant administrator's key. */
+async function usersWithEmail(email: string): Promise<{ principal_id: string }[]> {
+  const listed = await asKey(
+    journey.ssoAdminKey,
+    'GET',
+    `/principals?kind=user&email=${encodeURIComponent(email)}`
+  );
+  expect(listed.status).toBe(200);
+  return ((await listed.json()) as { principals: { principal_id: string }[] }).principals;
+}
+
+/** Sign in at the rendered tenant login page and the provider's form; returns the shown principal. */
+async function browserLogin(page: Page, tenant: string, user: Record<string, string>) {
+  await page.goto(`${journey.origin}/t/${tenant}`);
+  expect(new URL(page.url()).pathname).toBe(`/t/${tenant}/login`);
+  await page.getByRole('button', { name: 'Sign in with SSO' }).click();
+  await page.waitForURL((url) => url.href.startsWith(keycloakIssuer));
+  await page.fill('#username', user.username);
+  await page.fill('#password', user.password);
+  await page.click('#kc-login');
+  await page.waitForURL(`${journey.origin}/t/${tenant}`);
+  return shownPrincipal(page, tenant);
+}
+
+/** The signed-in principal the tenant's Settings page shows. */
+async function shownPrincipal(page: Page, tenant: string): Promise<string> {
+  await page.goto(`${journey.origin}/t/${tenant}/settings`);
+  return (await page.locator('details.principal summary').textContent())!.trim();
+}
+
+/** The `wyrd_session_*` cookies the browser holds. */
+async function sessionCookies(context: BrowserContext): Promise<string[]> {
+  return (await context.cookies()).map(({ name }) => name).filter((name) => name.startsWith('wyrd_session_'));
+}
+
+/**
+ * Run the real `wyrd` CLI with only `config` as its configuration directory, so no
+ * credential of the developer's shell reaches it. `onLine` sees each stderr line.
+ */
+function wyrd(config: string, args: string[], onLine: (line: string) => void = () => {}) {
+  const child = spawn(journey.cli, args, {
+    env: { PATH: process.env.PATH, WYRD_CONFIG_HOME: config }
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => (output += chunk));
+  createInterface({ input: child.stderr }).on('line', (line) => {
+    output += `${line}\n`;
+    onLine(line);
+  });
+  return new Promise<{ code: number | null; output: string }>((resolve) =>
+    child.on('close', (code) => resolve({ code, output }))
+  );
+}
+
+/** The `principal.id` claim of a clear-text JWT. */
+const principalOf = (token: string) =>
+  (JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()) as {
+    principal: { id: string };
+  }).principal.id;
+
+test('live UI login and CLI', async () => {
+  const sso = journey.ssoTenant;
+  const fresh = journey.users.fresh;
+  await mkdir(journey.evidence, { recursive: true });
+  const config = await mkdtemp(join(tmpdir(), 'wyrd-live-cli-'));
+  const browser = await chromium.launch();
+  try {
+    // The deployment publishes its OAuth metadata on the public origin, through the gateway.
+    const metadata = await fetch(`${journey.origin}/.well-known/oauth-authorization-server`);
+    expect(metadata.status).toBe(200);
+    const advertised = (await metadata.json()) as Record<string, unknown>;
+    expect(advertised.issuer).toBe(journey.origin);
+    for (const endpoint of ['authorization_endpoint', 'token_endpoint', 'device_authorization_endpoint'])
+      expect(String(advertised[endpoint]).startsWith(`${journey.origin}/auth/`), endpoint).toBe(true);
+
+    // The fresh Keycloak person has no Wyrd principal before her first sign-in.
+    expect(await usersWithEmail(fresh.email)).toEqual([]);
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    const browserRequests: string[] = [];
+    page.on('request', (request) => browserRequests.push(request.url()));
+
+    // The signed-out page is server-rendered: its sign-in control is in the initial HTML.
+    const signedOut = await page.goto(`${journey.origin}/t/${sso}`);
+    expect(new URL(page.url()).pathname).toBe(`/t/${sso}/login`);
+    expect(await signedOut!.text()).toContain('Sign in with SSO');
+
+    // A wrong password stays at the provider and creates no session or principal.
+    await page.getByRole('button', { name: 'Sign in with SSO' }).click();
+    await page.waitForURL((url) => url.href.startsWith(keycloakIssuer));
+    await page.fill('#username', fresh.username);
+    await page.fill('#password', 'not-her-password');
+    await page.click('#kc-login');
+    await expect.poll(() => page.locator('#input-error').count()).toBe(1);
+    expect(await sessionCookies(context)).toEqual([]);
+    expect(await usersWithEmail(fresh.email)).toEqual([]);
+    // A provider return this login did not receive signs nobody in, and the tenant's
+    // sign-in page says so.
+    await page.goto(`${journey.origin}/login/callback?code=forged&state=forged`);
+    expect(page.url()).toBe(`${journey.origin}/t/${sso}/login?login=failed`);
+    await expect.poll(() => page.locator('[role="alert"]').count()).toBeGreaterThan(0);
+    expect(await sessionCookies(context)).toEqual([]);
+
+    // First sign-in creates exactly one Wyrd user, the principal the page shows.
+    const principal = await browserLogin(page, sso, fresh);
+    const created = await usersWithEmail(fresh.email);
+    expect(created.map(({ principal_id }) => principal_id)).toEqual([principal]);
+
+    // The signed-in page's content is in its initial HTML; hydration fetches no page data.
+    browserRequests.length = 0;
+    const settings = await page.goto(`${journey.origin}/t/${sso}/settings`);
+    expect(await settings!.text()).toContain(principal);
+    await page.waitForLoadState('networkidle');
+    expect(browserRequests.filter((url) => url.includes('__data.json'))).toEqual([]);
+    await page.screenshot({ path: join(journey.evidence, 'settings.png'), fullPage: true });
+    // Client navigation runs the server load through SvelteKit's data channel; the browser
+    // itself never calls a protected Wyrd API.
+    await page.locator('#primary-navigation a', { hasText: 'Home' }).click();
+    await page.waitForURL(`${journey.origin}/t/${sso}`);
+    expect(browserRequests.some((url) => url.startsWith(`${journey.origin}/t/${sso}/__data.json`))).toBe(true);
+    expect(browserRequests.filter((url) => new URL(url).pathname.startsWith('/v1/'))).toEqual([]);
+    await page.screenshot({ path: join(journey.evidence, 'home.png'), fullPage: true });
+
+    // The same person authorizes the CLI: it talks only to the configured Wyrd origin, and the
+    // browser approves the code there, signed in at the provider already.
+    let approved: Promise<void> | undefined;
+    const login = wyrd(config, ['auth', 'login', '--server', journey.origin, '--tenant', sso, '--no-browser'], (line) => {
+      const url = line.trim();
+      if (approved || !url.startsWith('http')) return;
+      expect(new URL(url).origin).toBe(journey.origin);
+      approved = (async () => {
+        await page.goto(url);
+        await page.getByRole('button', { name: 'Approve and sign in' }).click();
+        await page.waitForURL((current) => current.href.startsWith(`${journey.origin}/auth/callback`));
+        await page.screenshot({ path: join(journey.evidence, 'cli-approved.png'), fullPage: true });
+      })();
+    });
+    const loggedIn = await login;
+    await approved;
+    expect(loggedIn.code, loggedIn.output).toBe(0);
+    expect(loggedIn.output).toContain(`Logged in to ${journey.origin} tenant ${sso}.`);
+    expect(loggedIn.output).not.toMatch(jwt);
+    // The CLI's saved credential is the same Wyrd user, and it reads through the origin.
+    const saved = await readFile(join(config, 'credentials.toml'), 'utf8');
+    expect(principalOf(/access_token = "([^"]+)"/.exec(saved)![1])).toBe(principal);
+    const read = await wyrd(config, ['list', '--server', journey.origin]);
+    expect(read.code, read.output).toBe(0);
+    expect(read.output).not.toMatch(jwt);
+    expect((await usersWithEmail(fresh.email)).map(({ principal_id }) => principal_id)).toEqual([principal]);
+
+    // Changed tenant URLs never reuse this session: each sends to that tenant's sign-in.
+    for (const tenant of [journey.apiKeyTenant, journey.switchTenants.peer]) {
+      const other = await page.goto(`${journey.origin}/t/${tenant}/settings`);
+      expect(new URL(page.url()).pathname).toBe(`/t/${tenant}/login`);
+      expect(await other!.text()).not.toContain(principal);
+    }
+
+    // A restricted person in another tenant runs beside her without sharing anything.
+    const reader = await browser.newContext();
+    const readerPage = await reader.newPage();
+    const peer = journey.switchTenants.peer;
+    const readerPrincipal = await browserLogin(readerPage, peer, journey.users.reader);
+    expect(readerPrincipal).not.toBe(principal);
+    expect(await sessionCookies(reader)).toEqual([sessionCookie(peer)]);
+    await readerPage.goto(`${journey.origin}/t/${sso}`);
+    expect(new URL(readerPage.url()).pathname).toBe(`/t/${sso}/login`);
+    expect(await shownPrincipal(page, sso)).toBe(principal);
+    await reader.close();
+
+    // Signing out ends the session; signing in again is the same single principal.
+    const stale = (await context.cookies()).find(({ name }) => name === sessionCookie(sso))!;
+    await page.locator('details.principal summary').click();
+    await page.getByRole('button', { name: 'Sign out' }).click();
+    await page.waitForURL(`${journey.origin}/t/${sso}/login`);
+    expect(await sessionCookies(context)).toEqual([]);
+    await page.goto(`${journey.origin}/t/${sso}/settings`);
+    expect(new URL(page.url()).pathname).toBe(`/t/${sso}/login`);
+    await page.getByRole('button', { name: 'Sign in with SSO' }).click();
+    // The provider still knows her, so no form is shown.
+    await page.waitForURL(`${journey.origin}/t/${sso}`);
+    expect(await shownPrincipal(page, sso)).toBe(principal);
+    expect((await usersWithEmail(fresh.email)).map(({ principal_id }) => principal_id)).toEqual([principal]);
+
+    // The signed-out session's cookie, replayed, cannot renew: once its issued access
+    // token expires every navigation sends to sign-in and shows nothing protected.
+    const replay = await browser.newContext();
+    await replay.addCookies([stale]);
+    const replayPage = await replay.newPage();
+    const deadline = Date.now() + 45_000;
+    for (;;) {
+      const response = await replayPage.goto(`${journey.origin}/t/${sso}/settings`);
+      if (new URL(replayPage.url()).pathname === `/t/${sso}/login`) {
+        expect(await response!.text()).not.toContain(principal);
+        break;
+      }
+      expect(Date.now()).toBeLessThan(deadline);
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+    expect(await sessionCookies(replay)).toEqual([]);
+    await replayPage.screenshot({ path: join(journey.evidence, 'session-ended.png'), fullPage: true });
+  } finally {
+    await browser.close();
+    await rm(config, { recursive: true, force: true });
+  }
+}, 180_000);

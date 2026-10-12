@@ -15,6 +15,9 @@
 //! journey drives both BFFs over HTTP like a browser behind a load balancer,
 //! sending the public origin's `/auth/*` routes to either server replica as
 //! the gateway would; no Vitest mock stands in for the BFF or the server.
+//! The public origin itself is served by a gateway routing exactly as the
+//! official image's nginx template does, so the journey's real-browser case
+//! and the `wyrd` CLI it drives reach the deployment only through that origin.
 //!
 //! Ignored so the family lanes, which start no identity provider or BFF, skip
 //! it visibly; `mise run test:identity:journey` builds the UI and runs it.
@@ -211,6 +214,67 @@ async fn start_tls_terminator(server_url: &str, material: &std::path::Path) -> (
     panic!("TLS terminator on port {port} never accepted");
 }
 
+/// The official image's nginx template: its first regex `location` names the
+/// paths the public origin sends to the Rust server; every other path goes to
+/// the BFF.
+const NGINX_TEMPLATE: &str =
+    include_str!("../../../../../docker/official/extras/nginx/nginx.conf.template");
+
+/// Node gateway on `PORT` (dual-stack, so `localhost` resolves either way):
+/// paths matching `RUST_ROUTES` go to `SERVER`, every other path to `BFF`,
+/// with the browser's `Host` kept and the forwarding headers set as nginx
+/// sets them.
+const GATEWAY_JS: &str = "\
+const http = require('node:http'), env = process.env, rust = new RegExp(env.RUST_ROUTES);\
+http.createServer((req, res) => {\
+  const target = new URL(rust.test(req.url.split('?')[0]) ? env.SERVER : env.BFF);\
+  const headers = { ...req.headers, 'x-forwarded-proto': 'http', 'x-forwarded-for': req.socket.remoteAddress };\
+  const upstream = http.request({ host: target.hostname, port: target.port, method: req.method, path: req.url, headers }, (reply) => {\
+    res.writeHead(reply.statusCode, reply.headers);\
+    reply.pipe(res);\
+  });\
+  upstream.on('error', () => { res.writeHead(502); res.end(); });\
+  req.pipe(upstream);\
+}).listen(Number(env.PORT));";
+
+/// Serve the public origin on `port` as the official image's nginx routes it:
+/// the template's Rust paths to `server`, everything else to `bff`. A real
+/// browser and the CLI reach the deployment only through this origin.
+///
+/// # Panics
+/// Panics when the template names no Rust routes or the gateway never
+/// accepts connections.
+async fn start_gateway(port: u16, server: &str, bff: &str) -> Bff {
+    let routes = NGINX_TEMPLATE
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("location ~ ")?.strip_suffix(" {"))
+        .expect("the nginx template routes Rust paths by regex");
+    let child = Command::new("node")
+        .args(["-e", GATEWAY_JS])
+        .env("RUST_ROUTES", routes)
+        .env("SERVER", server)
+        .env("BFF", bff)
+        .env("PORT", port.to_string())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("node starts the gateway");
+    let gateway = Bff {
+        child,
+        url: format!("http://localhost:{port}"),
+    };
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return gateway;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("gateway on port {port} never accepted");
+}
+
 /// Call one authenticated JSON route on the bound server.
 ///
 /// # Panics
@@ -392,7 +456,8 @@ async fn sso_tenant(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Keycloak and a built UI; run via `mise run test:identity:journey`"]
 async fn production_ui_bff_journey() {
-    let origin = format!("http://localhost:{}", free_port());
+    let origin_port = free_port();
+    let origin = format!("http://localhost:{origin_port}");
     let client_secret = uuid::Uuid::new_v4().simple().to_string();
     let builder = || {
         WyrdTestServerBuilder::default()
@@ -477,6 +542,16 @@ async fn production_ui_bff_journey() {
     let (terminator, ca) = start_tls_terminator(&replica_url, &material).await;
     let first = start_bff(&origin, &server, &client_secret, None).await;
     let second = start_bff(&origin, &terminator.url, &client_secret, Some(&ca)).await;
+    let gateway = start_gateway(origin_port, &server, &first.url).await;
+    // The identity lane builds the `wyrd` CLI into the target directory that
+    // holds this test binary's `deps/` directory.
+    let target_dir = std::env::current_exe()
+        .expect("test binary path")
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("test binary lives in <target>/deps")
+        .to_owned();
+    let evidence = target_dir.join("wyrd-ui-live-login");
     let fixture = json!({
         "origin": origin,
         "servers": [server, replica_url],
@@ -497,7 +572,10 @@ async fn production_ui_bff_journey() {
             "admin": { "username": "alice", "password": "alice-password" },
             "reader": { "username": "bob", "password": "wyrd-test" },
             "dex": { "login": DEX_ALICE.0, "password": DEX_ALICE.1 },
+            "fresh": { "username": "dana", "password": "dana-password", "email": "dana@wyrd.test" },
         },
+        "cli": target_dir.join("wyrd"),
+        "evidence": evidence,
     });
 
     let mut vitest = Command::new("pnpm");
@@ -518,7 +596,7 @@ async fn production_ui_bff_journey() {
         .await
         .expect("vitest task joins")
         .expect("vitest runs");
-    drop((first, second, terminator));
+    drop((gateway, first, second, terminator));
     let _ = std::fs::remove_dir_all(&material);
     replica.shutdown().await.expect("server replica shuts down");
     srv.shutdown().await.expect("server shuts down");

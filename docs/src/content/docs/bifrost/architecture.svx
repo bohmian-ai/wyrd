@@ -12,7 +12,7 @@ Bifrost uses a four-component design: Gate (stateless routing), Scribe (durable 
 
 ## System diagram
 
-One binary runs Gate, Scribe, Oracle, and Forge on the same pod. Add pods to scale horizontally. Postgres holds `vala.maintenance_leases` so Forge can lease `(namespace, table)` pairs and run one tick per table at a time.
+One binary runs Gate, Scribe, Oracle, and Forge on the same pod. Add pods to scale horizontally. Postgres holds `vala.forge_tasks`, whose one active task per table is that table's Forge lease, so one Forge attempt runs per table at a time.
 
 <WyrdBifrostSystem />
 
@@ -27,7 +27,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
 | **Gate** | Auth, tenant/table resolution, dispatch | Stateless | Add pods, any pod handles any request |
 | **Scribe** | WAL append, memtable buffer, seal to Parquet, file_list registration | Per-pod stateful (WAL, memtables) | Add pods, symmetric (any Scribe handles any write) |
 | **Oracle** | One published-plus-live query flow; automatic Interactive or Analytical execution | Stateless (local caches only) | Add pods, any pod handles any query |
-| **Forge** | Bin-pack Parquet, Iceberg snapshot commits, GC | Stateless (Postgres-leased) | Multiple pods race for table leases |
+| **Forge** | Bin-pack Parquet, Iceberg snapshot commits, GC | Stateless (Postgres-leased) | Multiple pods claim table tasks |
 
 ## End-to-end write flow
 
@@ -59,7 +59,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
    - PUT to object store: `s3://tenants/{tenant_uuid}/{logical_namespace}/{table}/day={YYYY-MM-DD}/{pod_id}-{ulid}.parquet`.
    - Atomic Postgres transaction: INSERT the `vala.file_list` row. A batch commit evaluates no principal permission, so its durable record is that lineage row, never an audit event.
    - On commit, truncate WAL and retire manifest.
-7. **(Async) Forge** leases a tenant/table via `vala.maintenance_leases`, bin-packs small Parquet files into Iceberg data files, updates `vala.file_list`, and runs snapshot expiry plus orphan GC. See the [Forge system overview](/bifrost/forge) for the maintenance state machine.
+7. **(Async) Forge** claims a tenant/table task in `vala.forge_tasks`, bin-packs small Parquet files into Iceberg data files, updates `vala.file_list`, and runs snapshot expiry plus orphan GC. See the [Forge system overview](/bifrost/forge) for the maintenance state machine.
 
 **Critical:** Scribe never writes Iceberg snapshots on the ingest hot path. Forge is the only Iceberg snapshot writer.
 
@@ -158,7 +158,7 @@ Any Scribe accepts any write on any table. No coordination on write path. Multip
 
 ### Postgres-leased Forge
 
-Multiple Forge pods race for `(namespace, table)` leases via `vala.maintenance_leases`. One tick per table at a time. Scales linearly with table count (N pods × M tables, optimal when N ≤ M).
+Multiple Forge pods claim tasks from `vala.forge_tasks`; a table's one claimed, running, or prepared task is its lease. One attempt per table at a time. Scales linearly with table count (N pods × M tables, optimal when N ≤ M).
 
 ### Cluster heartbeats
 
@@ -196,7 +196,7 @@ Idempotent: if the pod crashed after PUT but before COMMIT, replay re-encodes Pa
 | Scribe crashes after WAL append but before seal | WAL replay rebuilds memtable, seal retries |
 | Scribe crashes after Parquet PUT but before Postgres COMMIT | Rollback atomically, no `file_list` row, Parquet becomes orphan (Forge GC reaps) |
 | Scribe crashes after Postgres COMMIT | WAL bytes retired, file visible to Oracle |
-| Forge crashes mid-tick | Lease expires, successor pod re-derives state from durable surface and re-runs (idempotent) |
+| Forge crashes mid-tick | Task claim expires, successor pod re-derives state from durable surface and re-runs (idempotent) |
 | Object storage temporarily unavailable | Seal retries with backoff; new appends return `429_INGEST_BUSY` until PUT succeeds |
 | Postgres temporarily unavailable | Seal retries; WAL replay reconstructs state on recovery |
 

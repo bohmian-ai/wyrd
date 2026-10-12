@@ -106,7 +106,7 @@ security; the pool decides which policy admits a row.
 | Pool | Connecting login | Admitting policy | Purpose |
 |---|---|---|---|
 | App pool | `WYRD_DATABASE_URL` (tenant login) | `tenant_isolation`, via `wyrd.current_tenant()` | Tenant-scoped reads and writes from the server; Scribe lineage inserts |
-| Operator pool | `WYRD_PLATFORM_DATABASE_URL`, else `WYRD_DATABASE_URL` | `operator_access`, via `wyrd.operator_session()` | Cross-tenant control-plane work (`vala.maintenance_leases`, Forge lease coordination) |
+| Operator pool | `WYRD_PLATFORM_DATABASE_URL`, else `WYRD_DATABASE_URL` | `operator_access`, via `wyrd.operator_session()` | Cross-tenant control-plane work (`vala.forge_tasks` claims, Forge lease coordination) |
 
 A few things worth being explicit about for audit purposes.
 
@@ -124,4 +124,4 @@ The app pool's `tenant_isolation` policy calls `wyrd.current_tenant()`, which re
 
 **Postgres unavailable during seal.** Same shape as above. Seal retries; the memtable stays in memory; the WAL keeps the acked data. New appends can proceed until the memtable fills.
 
-**Forge crash mid-tick.** Lease expires. Successor Forge pod picks up the same table, re-derives state from `vala.file_list` and Iceberg metadata, re-runs the tick. Idempotent by construction.
+**Forge crash mid-tick.** Task claim expires. Successor Forge pod picks up the same table, re-derives state from `vala.file_list` and Iceberg metadata, re-runs the tick. Idempotent by construction.

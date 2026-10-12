@@ -87,7 +87,7 @@
     {
       icon: 'PG',
       name: 'Postgres',
-      lines: ['vala.file_list · audit_outbox', 'vala.maintenance_leases (Forge)'],
+      lines: ['vala.file_list', 'vala.forge_tasks (Forge claims)'],
       accent: true
     },
     { icon: '◧', name: 'Object store', lines: ['Parquet · S3 · GCS · Azure'], accent: false },

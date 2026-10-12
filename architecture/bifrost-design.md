@@ -1014,7 +1014,13 @@ one table is logged and the pass continues. Durable task rows record attempt
 evidence and recovery; retryable rows are reclaimed with tenant-fair
 admission, but no durable queue decides what runs next.
 
-At most one durable task attempt owns the lease and fence for a
+A table's one `claimed`, `running`, or `prepared` task row is its exclusive
+lease: claiming the row acquires the table, contention is a refused claim at
+admission, the attempt's heartbeat renews the claim, and the attempt's single
+terminal transition, committed only after that heartbeat has stopped, releases
+it. A strategy that decides its own outcome returns that decision for the
+settlement seam to commit; it never releases the claim itself. At most one
+durable task attempt therefore owns the lease and fence for a
 tenant-qualified table. Within that attempt, admitted ordinary compaction plans are independent child
 operations: fitting siblings may rewrite and publish concurrently, while
 bounded per-tenant and per-worker admission also permits independent tables to

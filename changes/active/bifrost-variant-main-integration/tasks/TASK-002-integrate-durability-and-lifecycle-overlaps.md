@@ -395,3 +395,70 @@ An unexplained substantive S divergence outside approved M exceptions is a mater
 - [Spec-driven development](../../../../architecture/references/languages/spec-driven-development.md)
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
+
+## Implementation Evidence
+
+Commits: `ba86fe129` (S07), `f10f735dd` + `53dfc2a1c` (S05), `136e460d6` (S06),
+`3712b9ba3` (S08), `b7b2de753` (S09), `985aa12f8` (lint at release features).
+All tests ran through `mise` with
+`WYRD_LOG=info,vala_bifrost_redux=debug RUST_LOG=info,vala_bifrost_redux=debug RUST_BACKTRACE=1`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| TASK-002-C01 | `scribe/persistence.rs` flush proof: outside claim on the test table, audit staged at generation 2 under a 2-slot claim budget, fault scoped by `target_table_for_test` | P04 (6 lib selectors + Postgres crash replay) and P05 (3) pass; extended `flush_waits_for_an_outside_claim_over_members_durable_at_drain` asserts armed fault, scoped backlog `(audit 0, table 1)`, flush returns 1 | PASS |
+| TASK-002-C02 | `forge/expire.rs` hold = `lease.remaining() - uncertainty_margin`; `expiry_gates.rs` post-preparation gate; `snapshot_expiration.rs` `Unsubmitted` variant plus `operation_id`/`operations` identity on retained and settled state | P06 3 lib + 7 integration + 1 SQL pass; `forge::snapshot_expiration::*` (8) and `forge::reader_expiry_ordering::*` pass; term replacement, revoked handlers, joined-loop reclaim, non-blocking cuts, v3 lineage covered by the P06 selectors | PASS |
+| TASK-002-C03 | `resources.rs` shared-root `released` Notify and `oracle_infallible_headroom_bytes`; `oracle/admission.rs` drain over Oracle governed + headroom bytes, poisoned ledger reports `usize::MAX` | `oracle_release_paths_are_exact_and_idempotent`, `oracle_shutdown_drains_only_oracle_memory`, `oracle_shutdown_drains_oracle_infallible_headroom`; 119 owner tests and 187 `oracle::` lib tests pass | PASS |
+| TASK-002-C04 | Main ClusterTask/single poller retained (no source per-role poller); `WyrdTestCluster::stop_node_restarting_another_during_drain` boots the Scribe only after drained roles are unready and the drain is still running | P08 (3) pass; P09 `unready_roles_heartbeat_until_teardown_ends_membership_tasks` and extended `oracle_only_pod_retains_audit_staged_before_its_drain` pass | PASS |
+| TASK-002-C05 | Capture peer listener decodes at `transport.message_limit_bytes()` (`grpc/mod.rs`); listener journey submits a 6,295,638-byte audit frame as a member, requires ACK, reads back the exact row length through an Oracle | P10 SQL (3) and peer-network (3) pass; P11 outbox (6) pass, including silent-peer retry and terminal refusal | PASS |
+| TASK-002-EVIDENCE | This section; `dispositions.tsv` rows for the write set set to TASK-002 | — | PASS |
+| TASK-002-REVIEW | Independent review not run here; the user decides | — | OPEN |
+
+### Per-scenario RED/GREEN
+
+- **S05.** Production behaviour was already ported in TASK-001, so this scenario only verifies it. The extended test was proven by a mutation RED: unscoping `take_claim_retirement` fails it, and the source was restored.
+  - **Fixture diagnosis 1:** a backlog of `(1,1)` came from a one-slot claim budget held by the outside claim. Fixed with `start_with(faults, 2)`.
+  - **Fixture diagnosis 2:** a "writer-v2 replay identity" mismatch came from both members using shard 0, generation 1. Fixed by staging the audit rows at generation 2.
+  - **GREEN:** P04 and P05 commands as listed in the recipe.
+- **S06.**
+  - **RED:** `forge::snapshot_expiration::unsubmitted_expiry_at_the_lease_bound_is_released` failed with `Sql(InvariantViolation { "maintenance lease fence lost …" })`.
+  - **Cause:** the hold timeout equalled `lease_ttl`, so the pre-submission reset always ran after the fence had lapsed.
+  - **Fix site:** `run_snapshot_expiry_for_table_inner`. An independent read-only diagnostician confirmed this site.
+  - **Source check:** main carries the same bound and the variant has no lease-bounded expiry, so this is a correction inside main's REQ-006 code, not a merge from either branch. `architecture/bifrost-design.md:1216` still holds, because the lease still bounds the hold.
+  - **GREEN:** the same selector plus the accepted, rejected and retryable variants, then the full P06 set.
+- **S07.**
+  - **RED:** compile failure on the missing `oracle_infallible_headroom_bytes` field, then three behaviour failures:
+    - late child: `Some(Accounting)` vs `None`;
+    - headroom: 67112960 vs 4096;
+    - drain reporting Forge bytes: 1052672 vs 4096.
+  - **GREEN:** the same selectors plus the owner lanes.
+  - **Removed:** source `LiveConsumers`, the graph child drain and its wall deadline, the supervisor child idle/debt refusal, and `a_registered_zero_byte_child_keeps_its_query_busy`. That test's property is now unreachable under main's settlement model.
+  - **Replaced:** five source analytical tests, superseded by main's versions.
+- **S08.** The P08 and P09 baselines passed before and after the change.
+  - **Change:** the journey now boots the Scribe strictly after observing readiness withdrawn while the drain is still running. Before, the Scribe booted before the drain started.
+  - **Result:** GREEN on the first run. Main's poller already keeps discovery alive, so the preserved behaviour is now proven.
+- **S09.**
+  - **RED:** a mutation removing `.max_decoding_message_size(...)` from the capture peer service failed the listener journey with `decoded message length too large: found 6295638 bytes, the limit is: 4194304 bytes`. The source was restored.
+  - **GREEN:** the listener journey and P10/P11.
+
+### Static lanes
+
+`mise run fmt:check`, `mise run lints`, `mise run check:deps`,
+`mise run check:tenant-isolation` and `git diff --check` all pass.
+
+`lints` first failed twice, and both were fixed in `985aa12f8`:
+- **Gate fields:** clippy's `struct_field_names` lint fired on the expiry gate fields; they were renamed.
+- **Graph release:** `unused_async` fired on the analytical graph release in the release-feature binary pass. The release is now synchronous, and the test pause moved into its async callers, as on main.
+
+### Write set and exclusions
+
+The write set is listed in `dispositions.tsv`. Two of its files are main-only and therefore have no B→S row:
+- `forge/expiry_gates.rs` (test-support gate);
+- `tests/bifrost/oracle/peer_network/listener.rs`.
+
+Exclusions held:
+- No SQL schema, public contract, generated artifact, dependency or configuration change.
+- No compatibility shim.
+- No `#[allow]`.
+- No reader barrier restored.
+
+Deviation for user decision: the S06 production correction above.

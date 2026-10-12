@@ -82,6 +82,81 @@ Known open items on 2026-10-12. A new failure found while working joins this que
    ```
 5. **`agent_traces` wording.** Every hit of `rg -n 'agent_traces' crates architecture docs sdks` states that the table is removed.
 
+## Closeout evidence (TASK-002-CLOSE-01, CLOSE-02, EVIDENCE), 2026-10-12
+
+Candidate: `3def393ad` plus this record. Every command ran through `mise` with `WYRD_LOG=info,vala_bifrost_redux=debug RUST_LOG=info,vala_bifrost_redux=debug RUST_BACKTRACE=1`. Recipes are the Parts' "Exact Selected Recipes", run once each in order (58 commands; P-groups deduplicated across Parts). Each recipe's nextest or runner summary was read: every one selected and ran tests, none passed empty. A recipe that failed was diagnosed, fixed and rerun; its queue item names the fix.
+
+### Recipe results
+
+| Group | Recipe content | Result |
+| --- | --- | --- |
+| P09 | membership lifetime and audit drain journeys | 2/2 |
+| P10 | SQL role fences (3); peer listener, security, network journeys (3) | 3/3, 3/3 |
+| P11 | shared outbox routing, retry, refusal | 6/6 |
+| P12 | audit projection, observation keys, X9 results contract (4, then 5 with X9); Gate adapter | 4/4, 5/5, 1/1 |
+| P13 | retained audit journeys; six-destination capture validator | 2/2, 1/1 |
+| P14 | OTLP API key after token lifetime; UID entrances | 1/1, 2/2 |
+| P15 | Eval/Task/trace/result layout journeys | 8/8 |
+| P16 | verification queue/schedule/lease/judging (server); `wyrd-sql` verifier runs | 4/4, 5/5 |
+| P17 | result authoring and schema-by-name | 4/4 |
+| P18 | Rust SDK bind forwarding (4, 3, 3); `wyrd-client` bind values; Oracle payload authority; gateway payload objects | all pass; gateway 1/1 after Q19 |
+| P19 | Rust query/observation/verification stories | as P18 SDK runs |
+| P01 | declared schema and time conformance (5 lib selectors) | 5/5 |
+| P03 | deadline projection; max query deadline config | 1/1, 1/1 |
+| P20 | Workflow owner accounting | 2/2 |
+| P21 | Workflow shutdown and forwarded query settlement | 1/1 |
+| P22 | Oracle published Variant reads (3); Scribe recovery journey; recovery run shredding | 3/3, 1/1, 1/1 |
+| P23 | Python query (6); TS query (11); S Python capability files (60); TS capability files (64); `wyrd-client` integration list | all pass; Python capability 60/60 after Q21 |
+| P24 | boot auth handles (2); DSN (2); signing key file; platform initialization integration (3) | 2/2, 2/2, 1/1, 3/3 |
+| P25 | build; installed CLI `server_dev_*` (3) | 3/3 after Q20 |
+| P26 | installed CLI from Rust, Python, TS, interrupt, exit | 1, 1, 1, 2 pass after Q20 |
+| P29 | mounted MCP query (3); compiled CLI query (2); late HTTP terminal | 3/3, 2/2, 1/1 |
+| P30 | Service preflight and served OpenAPI journeys (1, 3) | 1/1, 3/3 |
+
+### Lanes on the final code
+
+After the last production change (`4066e46c3`, Q18) and the later fixes (Q19–Q21):
+
+- `mise run fmt:check`, `mise run lints`, `mise run check:deps`, `mise run check:tenant-isolation`, `mise run codegen:check`: pass.
+- `mise run py:format`, `mise run py:lints`: pass.
+- `mise run test:bifrost:integration:redux` 901/901; `test:bifrost:journey:forge` 23/23; `test:bifrost:journey:scribe` 29/29 (1 skipped); `test:bifrost:journey:otlp` 16/16; `test:bifrost:journey:oracle` 55/55; `test:bifrost:journey:server` 38/38; `test:bifrost:journey:mcp` 19/19.
+- `git diff --check` is clean except `dispositions.tsv`, whose rows with an empty `note` column end in the field-separating tab (445 of 528 rows, the file's format since TASK-001). That is an empty TSV field, not stray whitespace, so the file is left as it is.
+
+### Per-criterion results
+
+| Criterion | Evidence | Result |
+| --- | --- | --- |
+| TASK-002-C01 (S07, X8) | Addendum above; `resources::tests::oracle_view_dropped_holding_bytes_poisons_the_root` (Q2); Oracle unit run 242/242; `test:bifrost:journey:oracle` passes | PASS |
+| TASK-002-C02 (S08) | P09 2/2; P08 cluster drain journey (`server/query.rs`, `stop_node_restarting_another_during_drain`) in `test:bifrost:journey:server` | PASS |
+| TASK-002-C03 (S09) | P10 3/3 + 3/3 (listener journey at 6,295,638 bytes); P11 6/6 | PASS |
+| TASK-002-C04 (P-S) | `evidence.md` § P-028; struck symbols absent; redux integration 901/901, Forge 23/23, Scribe 29/29 | PASS |
+| Part A evidence rows C01–C03 of the original numbering (S05, S06, S07 main settlement) | Superseded by revisions 3 and 4 (Addendum) | STRUCK |
+| TASK-003-C01 | P11 6/6; P09 2/2 | PASS |
+| TASK-003-C02 | P12 projection; P13 retained audit 2/2; Gate and Oracle credential attribution (`f23eb1716`) | PASS |
+| TASK-003-C03 | P13 validator 1/1; P10; P18 gateway payload objects 1/1 (Q19) | PASS |
+| TASK-003-C04 | P12 observation keys; P14 UID entrances 2/2 | PASS |
+| TASK-003-C05 | P14 API key after token lifetime 1/1 | PASS |
+| TASK-003-C06 | `evidence.md` § P-028 | PASS |
+| TASK-004-C01 | P15 8/8; P16 `observation_outbox_retains_through_an_outage_and_flushes_at_shutdown`; server lane `integrated_enqueue_outage_preserves_ack_and_recovers` (Q7) | PASS |
+| TASK-004-C02 | P16 scheduler, renewal and cancellation selectors (4/4) and `wyrd-sql` verifier runs 5/5 | PASS |
+| TASK-004-C03 | P16 `pg_verification_routes::direct_execution_calls_the_judge_provider` | PASS |
+| TASK-004-C04 | P12 with X9 contract 5/5; P17 4/4; server lane Eval journeys (Q5, Q6) | PASS |
+| TASK-004-C05 | P15 8/8; P17 4/4 | PASS |
+| TASK-004-C06 | `evidence.md` § P-028 | PASS |
+| TASK-005-C01 | P01 5/5; P23 S capability files Python 60/60 (Q21), TS 64/64 | PASS |
+| TASK-005-C02 | P18 Oracle and gateway payload protections; server lane; `agent_traces` wording check (P-028 item 5) | PASS |
+| TASK-005-C03 | P18/P19 Rust SDK and `wyrd-client` bind values; P23 Python 6/6, TS 11/11; P03 deadlines | PASS |
+| TASK-005-C04 | P29 3/3, 2/2, 1/1 | PASS |
+| TASK-005-C05 | P20 2/2; P21 1/1; P30 1/1 + 3/3 | PASS |
+| TASK-005-C06 | P25 3/3 and P26 all pass after Q20 | PASS |
+| TASK-005-C07 | `codegen:check`; P30 served OpenAPI; P23 runtime surfaces; P24 | PASS |
+| TASK-005-C08 | `evidence.md` § P-028 | PASS |
+| TASK-002-CLOSE-01 | This table | PASS |
+| TASK-002-CLOSE-02 | Work Queue Q1–Q21 closed with diagnoses; server and MCP lanes pass in full (below) | PASS |
+| TASK-002-CLOSE-03 | `evidence.md` § P-028 (Q11) | PASS |
+| TASK-002-EVIDENCE | This section; `dispositions.tsv` names TASK-002 for this write set (`fcc3aceb1`, Q21 rows) | PASS |
+| TASK-002-REVIEW | Not run; the user decides | OPEN |
+
 ## Acceptance Criteria
 
 - **TASK-002-CLOSE-01.** Every criterion in Parts A–D passes under its original ID, with recorded evidence. A criterion superseded by spec revision 3 or 4 is recorded as struck, not passed.

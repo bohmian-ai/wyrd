@@ -2525,7 +2525,9 @@ impl AnalyticalGraphLifecycle {
         drop(self.grants.take());
         let mut running_query = None;
         if failure.is_none() {
-            match self.release().release().await {
+            #[cfg(feature = "test-support")]
+            analytical_cleanup_pause_for_test().hold().await;
+            match self.release().release() {
                 Ok(owner) => running_query = owner,
                 Err(error) => failure = Some(error.to_string()),
             }
@@ -2780,9 +2782,7 @@ impl AnalyticalGraphRelease {
     /// # Errors
     ///
     /// Returns the supervisor's refusal when the graph cannot be released.
-    async fn release(&self) -> Result<Option<RunningQueryTerminalOwner>, BifrostError> {
-        #[cfg(feature = "test-support")]
-        analytical_cleanup_pause_for_test().hold().await;
+    fn release(&self) -> Result<Option<RunningQueryTerminalOwner>, BifrostError> {
         self.supervisor.release_graph(self.graph)
     }
 
@@ -2801,7 +2801,9 @@ impl AnalyticalGraphRelease {
             return;
         };
         runtime.spawn(async move {
-            match self.release().await {
+            #[cfg(feature = "test-support")]
+            analytical_cleanup_pause_for_test().hold().await;
+            match self.release() {
                 Ok(owner) => {
                     if let Some(mut owner) = owner {
                         owner.finish(wyrd_spec::vala::api::QueryTerminalOutcome::Failed);

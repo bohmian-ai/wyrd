@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from typing import Any
 
 import pytest
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
@@ -31,10 +32,10 @@ EXPLICIT_TRACE = "0af7651916cd43dd8448eb211c80319c"
 EXPLICIT_SPAN = "b7ad6b7169203331"
 SESSION = "0190f5a4-8c3e-7b21-9d4f-3a6b2c1d0e9f"
 MEDIA = MediaRef(id="screenshot", kind="image", uri="s3://bucket/shot.png", media_type="image/png")
-MEDIA_TEXT = (
-    '[{"id":"screenshot","kind":"image","uri":"s3://bucket/shot.png","media_type":"image/png"}]'
-)
-"""``MEDIA`` as the ``media`` column stores it."""
+MEDIA_STORED = [
+    {"id": "screenshot", "kind": "image", "uri": "s3://bucket/shot.png", "media_type": "image/png"}
+]
+"""``MEDIA`` as the ``media`` Variant column decodes."""
 
 BURST_OBSERVATIONS = 1_000
 BURST_FEATURES = 9
@@ -58,11 +59,11 @@ class RecordRow(BaseModel):
 class EvalRow(BaseModel):
     """An Eval row's context, trace identity, session, and media."""
 
-    context: str
+    context: dict[str, Any]
     session_id: str | None
     trace_id: bytes | None
     span_id: bytes | None
-    media: str | None
+    media: list[dict[str, Any]] | None
 
 
 class SpanRow(BaseModel):
@@ -131,24 +132,24 @@ def test_eval_carries_trace_session_and_media(
         [agent.run_id],
         model=EvalRow,
     )
-    by_context = {row.context: row for row in rows}
+    by_context = {row.context["answer"]: row for row in rows}
     active = span.get_span_context()
-    assert by_context['{"answer":"untraced"}'] == EvalRow(
-        context='{"answer":"untraced"}', session_id=None, trace_id=None, span_id=None, media=None
+    assert by_context["untraced"] == EvalRow(
+        context={"answer": "untraced"}, session_id=None, trace_id=None, span_id=None, media=None
     )
-    assert by_context['{"answer":"traced"}'] == EvalRow(
-        context='{"answer":"traced"}',
+    assert by_context["traced"] == EvalRow(
+        context={"answer": "traced"},
         session_id=None,
         trace_id=active.trace_id.to_bytes(16, "big"),
         span_id=active.span_id.to_bytes(8, "big"),
         media=None,
     )
-    assert by_context['{"answer":"explicit"}'] == EvalRow(
-        context='{"answer":"explicit"}',
+    assert by_context["explicit"] == EvalRow(
+        context={"answer": "explicit"},
         session_id=SESSION,
         trace_id=bytes.fromhex(EXPLICIT_TRACE),
         span_id=bytes.fromhex(EXPLICIT_SPAN),
-        media=MEDIA_TEXT,
+        media=MEDIA_STORED,
     )
 
 

@@ -2,13 +2,17 @@
 //!
 //! Cloud backends (S3, GCS, Azure) live behind a single `Cloud` variant that is
 //! compiled only under the `cloud` feature; see [`crate::cloud`]. Builds without
-//! `cloud` carry only the local filesystem signer and drop the cloud SDKs.
+//! `cloud` carry only the local filesystem signer and the `object_store`
+//! filesystem backend.
 
 use crate::error::StorageError;
 use crate::local::LocalSigner;
 use crate::tenant_path::ValidatedPath;
+use object_store::ObjectStore;
+use object_store::local::LocalFileSystem;
+use std::sync::Arc;
 use std::time::Duration;
-use wyrd_spec::storage::{S3CompletedPart, StorageBackendKind, UploadPlan, WireProtocol};
+use wyrd_spec::storage::{CompletedPart, StorageBackendKind, UploadPlan, WireProtocol};
 
 /// Active signer for one configured backend.
 #[derive(Debug, Clone)]
@@ -31,6 +35,28 @@ impl BackendSigner {
         }
     }
 
+    /// Return the data-plane store bound to this signer's backend.
+    ///
+    /// A cloud signer hands out the store it signs with, so the handle's data
+    /// plane and the signer share one client; the local signer opens the
+    /// filesystem store at its root.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::Backend`] when the local root cannot be opened.
+    pub fn objects(&self) -> Result<Arc<dyn ObjectStore>, StorageError> {
+        match self {
+            Self::Local(signer) => LocalFileSystem::new_with_prefix(signer.root())
+                .map(|store| Arc::new(store) as Arc<dyn ObjectStore>)
+                .map_err(|error| StorageError::Backend {
+                    backend: StorageBackendKind::Local,
+                    op: "build_store",
+                    message: error.to_string(),
+                }),
+            #[cfg(feature = "cloud")]
+            Self::Cloud(cloud) => Ok(cloud.objects()),
+        }
+    }
+
     /// Presign or describe a single PUT upload.
     ///
     /// # Errors
@@ -45,7 +71,7 @@ impl BackendSigner {
         match self {
             Self::Local(signer) => signer.presign_single_put(path, size_bytes, ttl).await,
             #[cfg(feature = "cloud")]
-            Self::Cloud(cloud) => cloud.presign_single_put(path, size_bytes, ttl).await,
+            Self::Cloud(cloud) => cloud.presign_single_put(path, ttl).await,
         }
     }
 
@@ -172,9 +198,7 @@ impl BackendSigner {
     /// Abort a multipart upload in a cloud-enabled build.
     ///
     /// # Errors
-    /// Returns a backend error when abort fails. GCS returns a capability
-    /// mismatch because its resumable session URI is bearer-equivalent and is
-    /// not persisted server-side.
+    /// Returns a backend error when the backend abort fails.
     #[cfg(feature = "cloud")]
     pub async fn abort_multipart(
         &self,
@@ -270,12 +294,10 @@ pub struct MultipartInit {
 pub enum CompletePayload {
     /// Cloud single PUT, server-verified only.
     SinglePut,
-    /// S3 multipart completion payload.
-    S3 {
-        /// Completed S3 parts.
-        parts: Vec<S3CompletedPart>,
-        /// Client-declared base64 SHA-256 passed to S3 for server-side verification.
-        expected_sha256: String,
+    /// S3 or GCS multipart completion payload.
+    Multipart {
+        /// Completed parts, numbered 1..n in order.
+        parts: Vec<CompletedPart>,
     },
     /// Azure block blob completion payload.
     Azure {
@@ -290,7 +312,7 @@ impl CompletePayload {
     pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::SinglePut => "single_put",
-            Self::S3 { .. } => "s3",
+            Self::Multipart { .. } => "multipart",
             Self::Azure { .. } => "azure",
             Self::Local => "local",
         }

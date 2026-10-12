@@ -1041,7 +1041,7 @@ hide = true
 description = "Run wyrd-storage GCS emulator integration tests; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_URL = "gs://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:4443" }
-run = "cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(/^integration_gcs::/)'"
+run = "GOOGLE_APPLICATION_CREDENTIALS_JSON=\"$(scripts/storage/gcs-emulator-key.sh)\" cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=integration_gcs::gcs_head_on_missing_returns_not_found)'"
 
 [tasks."test:storage:azurite"]
 hide = true
@@ -1052,17 +1052,17 @@ run = "cargo nextest run -p wyrd-storage --all-features --test integration -E 't
 
 [tasks."test:storage:e2e"]
 hide = true
-description = "Run server-level storage HTTP e2e tests (local single-put + S3/GCS/Azure multipart) against the docker emulators + Postgres"
+description = "Run server-level storage HTTP e2e tests (local and GCS single-put, S3/Azure multipart; GCS multipart runs only against real GCS) against the docker emulators + Postgres"
 depends = ["storage:up"]
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:storage:e2e:inner'"
 [tasks."test:storage:e2e:inner"]
 hide = true
-description = "Run server-level storage HTTP e2e tests (local single-put + S3/GCS/Azure multipart) against the docker emulators + Postgres"
+description = "Run server-level storage HTTP e2e tests (local and GCS single-put, S3/Azure multipart; GCS multipart runs only against real GCS) against the docker emulators + Postgres"
 env = { WYRD_STORAGE_PART_SIZE_BYTES = "16777216", WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES = "8388608" }
 run = """
 cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::local_client_server_round_trip) | test(=storage_e2e::storage_routes_refuse_and_audit_an_unprivileged_caller) | test(=storage_e2e::local_upload_capability_rejects_raw_paths_and_bad_bytes)'
 WYRD_STORAGE_URL=s3://wyrd-storage-test WYRD_STORAGE_ENDPOINT_URL=http://localhost:9000 AWS_REGION=us-east-1 AWS_ACCESS_KEY_ID=wyrd-test-key AWS_SECRET_ACCESS_KEY=wyrd-test-secret cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::s3_multipart_e2e)'
-WYRD_STORAGE_URL=gs://wyrd-storage-test WYRD_STORAGE_ENDPOINT_URL=http://localhost:4443 cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::gcs_multipart_e2e)'
+WYRD_STORAGE_URL=gs://wyrd-storage-test WYRD_STORAGE_ENDPOINT_URL=http://localhost:4443 GOOGLE_APPLICATION_CREDENTIALS_JSON="$(scripts/storage/gcs-emulator-key.sh)" cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::gcs_single_put_e2e)'
 WYRD_STORAGE_URL=az://devstoreaccount1/wyrd-storage-test WYRD_STORAGE_ENDPOINT_URL=http://127.0.0.1:10000/devstoreaccount1 AZURE_STORAGE_ACCOUNT_KEY=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw== cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::azure_multipart_e2e)'
 """
 
@@ -1090,8 +1090,8 @@ hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real GCS (merge-to-main only; requires GCP credentials and WYRD_STORAGE_URL in env)"
 env = { WYRD_STORAGE_PART_SIZE_BYTES = "16777216", WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES = "8388608" }
 run = """
-cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=handle_crud::gcs_handle_crud)'
-cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::gcs_multipart_e2e)'
+cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=handle_crud::gcs_handle_crud) | test(/^integration_gcs::gcs_multipart_/)'
+cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::gcs_multipart_e2e) | test(=storage_e2e::gcs_single_put_e2e)'
 """
 
 [tasks."test:storage:azure:cloud"]
@@ -1115,7 +1115,7 @@ depends = ["test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azur
 
 [tasks."test:storage:matrix"]
 hide = true
-description = """Run all storage emulator integration tests (signer-tier + operator data-plane + server e2e); requires storage:up.
+description = """Run all storage emulator integration tests (signer-tier + handle data-plane + server e2e); requires storage:up.
 Offline integration_local runs in test:rust:workspace; handle_crud::local_handle_crud runs under test:storage:handle:emulators because its binary requires the emulator feature.
 """
 depends = ["test:storage:gcs-emu", "test:storage:rustfs", "test:storage:azurite", "test:storage:handle:emulators", "test:storage:e2e"]

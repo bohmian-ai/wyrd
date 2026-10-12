@@ -11,17 +11,10 @@
       ]
     },
     {
-      "description": "AWS S3 multipart upload.",
+      "description": "Multipart upload over the multipart protocol, served by AWS S3 and the GCS XML API.",
       "type": "string",
       "enum": [
-        "s3_multipart_v1"
-      ]
-    },
-    {
-      "description": "Google Cloud Storage resumable upload.",
-      "type": "string",
-      "enum": [
-        "gcs_resumable_v1"
+        "multipart_v1"
       ]
     },
     {

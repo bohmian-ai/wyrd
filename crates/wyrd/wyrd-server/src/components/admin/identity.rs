@@ -406,7 +406,7 @@ mod pg_tests {
     use wyrd_spec::auth::{LoginInitiation, PrincipalKindTag, Sha256Hex};
     use wyrd_spec::request_id::RequestId;
     use wyrd_sql::queries::auth::{consume_login_state, human_connection_in_state};
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use super::*;
     use crate::components::auth::{ServerAuth, ServerAuthz};
@@ -500,7 +500,7 @@ mod pg_tests {
         let origin = Url::parse(PUBLIC_ORIGIN).expect("origin parses");
         let state = scribe.record(test_app_state(
             postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
+            Arc::new(StorageHandle::new(signer)),
             test_catalog().await,
         ));
         let audit = Arc::clone(&state.scribe_outbox);

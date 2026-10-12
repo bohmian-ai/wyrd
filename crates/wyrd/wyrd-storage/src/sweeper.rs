@@ -317,10 +317,7 @@ impl Sweeper {
             Ok(())
         } else if matches!(
             wire_protocol,
-            WireProtocol::SinglePutV1
-                | WireProtocol::GcsResumableV1
-                | WireProtocol::AzureBlockBlobV1
-                | WireProtocol::LocalFsV1
+            WireProtocol::SinglePutV1 | WireProtocol::AzureBlockBlobV1 | WireProtocol::LocalFsV1
         ) && row.backend_upload_id.is_none()
         {
             tracing::info!(

@@ -179,7 +179,7 @@ pub enum StorageError {
     Reqwest(#[from] reqwest::Error),
 }
 
-/// AWS S3 backend errors.
+/// S3 backend errors.
 #[derive(Debug, thiserror::Error)]
 pub enum S3Error {
     /// Object was not found.
@@ -188,23 +188,11 @@ pub enum S3Error {
         /// Tenant-scoped object path.
         storage_path: String,
     },
-    /// Lifecycle preflight failed.
-    #[error("s3 lifecycle missing AbortIncompleteMultipartUpload")]
-    Lifecycle,
     /// Backend throttled the request.
     #[error("s3 throttled request")]
     Throttled,
-    /// Presigning failed.
-    #[error("s3 presign failed: {0}")]
-    Presign(String),
-    /// Create-multipart response did not include an upload id.
-    #[error("s3 create multipart response did not include upload_id")]
-    MissingUploadId,
-    /// A part-upload response did not include an `ETag`.
-    #[error("s3 part upload response did not include etag")]
-    MissingEtag,
-    /// SDK call failed.
-    #[error("s3 sdk error: {0}")]
+    /// Backend client call failed.
+    #[error("s3 client error: {0}")]
     Sdk(String),
 }
 
@@ -220,11 +208,8 @@ pub enum GcsError {
     /// Backend throttled the request.
     #[error("gcs throttled request")]
     Throttled,
-    /// Resumable upload init did not return a session URL.
-    #[error("gcs resumable upload did not return a session url")]
-    MissingSessionUrl,
-    /// SDK call failed.
-    #[error("gcs sdk error: {0}")]
+    /// Backend client call failed.
+    #[error("gcs client error: {0}")]
     Sdk(String),
 }
 
@@ -240,11 +225,8 @@ pub enum AzureError {
     /// Backend throttled the request.
     #[error("azure throttled request")]
     Throttled,
-    /// Storage account setting was missing.
-    #[error("azure storage account missing")]
-    MissingAccount,
-    /// SDK call failed.
-    #[error("azure sdk error: {0}")]
+    /// Backend client call failed.
+    #[error("azure client error: {0}")]
     Sdk(String),
 }
 
@@ -421,17 +403,7 @@ fn map_sql_error(error: wyrd_sql::SqlError) -> WyrdStorageError {
 fn map_s3_error(error: S3Error) -> WyrdStorageError {
     match error {
         S3Error::NoSuchKey { storage_path } => WyrdStorageError::ObjectNotFound { storage_path },
-        S3Error::Lifecycle => WyrdStorageError::LifecycleMissing,
         S3Error::Throttled => WyrdStorageError::BackendUnavailable { status: 503 },
-        S3Error::Presign(detail) => WyrdStorageError::Backend {
-            detail: format!("s3 presign: {detail}"),
-        },
-        S3Error::MissingUploadId => WyrdStorageError::Backend {
-            detail: "s3 create multipart response did not include upload_id".to_owned(),
-        },
-        S3Error::MissingEtag => WyrdStorageError::Backend {
-            detail: "s3 part upload response did not include etag".to_owned(),
-        },
         S3Error::Sdk(detail) => {
             tracing::error!(
                 detail,
@@ -450,9 +422,6 @@ fn map_gcs_error(error: GcsError) -> WyrdStorageError {
     match error {
         GcsError::NotFound { storage_path } => WyrdStorageError::ObjectNotFound { storage_path },
         GcsError::Throttled => WyrdStorageError::BackendUnavailable { status: 503 },
-        GcsError::MissingSessionUrl => WyrdStorageError::Backend {
-            detail: "gcs resumable upload did not return a session url".to_owned(),
-        },
         GcsError::Sdk(detail) => {
             tracing::error!(
                 detail,
@@ -473,9 +442,6 @@ fn map_azure_error(error: AzureError) -> WyrdStorageError {
             WyrdStorageError::ObjectNotFound { storage_path }
         }
         AzureError::Throttled => WyrdStorageError::BackendUnavailable { status: 503 },
-        AzureError::MissingAccount => WyrdStorageError::ConfigInvalid {
-            detail: "azure storage account missing".to_owned(),
-        },
         AzureError::Sdk(detail) => {
             tracing::error!(
                 detail,

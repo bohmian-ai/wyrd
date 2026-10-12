@@ -1,8 +1,8 @@
 ---
 id: SPEC-bifrost-variant-main-integration
-revision: 4
+revision: 5
 status: approved
-task_count: 6
+task_count: 7
 ---
 
 # Integrate the Bifrost variant with current main
@@ -376,7 +376,8 @@ immutable commit combining source compatibility with main's no-REST/Ring
 narrowing. The supplied commit is
 `22cd178d14009468bc951a14d7acf63237af808a` on the fork’s `wyrd/main`,
 already pinned by integration commit `914495674`; preserve it when importing
-source manifests. Neither old source 6965606 nor main 4e9f325 is sufficient. No
+source manifests (superseded by Revision 5's fork rule: `5f401029…` on
+`wyrd-production`, 22cd178 minus the unused Glue catalog). Neither old source 6965606 nor main 4e9f325 is sufficient. No
 Ring waiver is allowed. Preserve unrelated locked versions during directed graph
 resolution rather than performing a blanket dependency update; preserve main unrelated deps,
 features, profiles, pedantic rules, tier boundaries, and removed Ring/unearned
@@ -509,6 +510,65 @@ and tenancy, and Python/Node lifetime behavior runs in its owning runtime.
 Trace a failing Bifrost/server test before diagnosis. Exact named selectors,
 features, setup, expected RED and actual GREEN results belong in task evidence.
 
+## Revision 5 — One object store for all Wyrd storage
+
+The user ruled on 2026-10-12: “As long as GCS XML multipart supports what we
+require then we can swap it”; “Im fine with consolidation, but everything must
+be supported”; “this will ultimately be a win because we can simplify
+dependencies … and have 1 source of truth for storage”. Cause: S's Bifrost
+writes GCS through `object_store` (XML API) while main's `wyrd-storage` used
+OpenDAL and the gcloud SDK (JSON API), and no one GCS emulator serves both.
+
+**Rule.** `object_store` 0.14.2 is Wyrd's one storage client. `wyrd-storage`
+owns construction of the one backend store (S3, GCS, Azure, local) that both
+`StorageHandle` and `BifrostStorage` use; Bifrost passes only its client and
+retry policy. Presigned URLs come from `object_store`'s `Signer`, multipart
+control from `MultipartStore`. OpenDAL, `aws-sdk-s3`, `aws-config`,
+`gcloud-storage`, `gcloud-auth` and the `azure_*` crates leave the workspace.
+
+**Wire contract.** `GcsResumableV1`, `UploadPlan::GcsResumable` and
+`UploadCompleteRequest::GcsResumable` are deleted. GCS uploads above the
+multipart threshold use the GCS XML multipart API, the S3 multipart protocol
+GCS implements. Because the protocol now serves both backends it is renamed
+backend-neutral (user ruling 2026-10-12): `S3MultipartV1` → `MultipartV1`
+(`multipart_v1` on the wire and in SQL), `UploadPlan::S3Multipart` →
+`UploadPlan::Multipart`, `S3MultipartComplete` → `MultipartComplete`,
+`S3CompletedPart` → `CompletedPart` — server-created upload id, per-part
+presigned `PUT ?partNumber&uploadId`, server completion with the client's part
+ETags, server abort. GCS XML multipart limits (5 MiB–5 GiB parts, 10,000 parts, 5 TiB)
+equal the existing plan limits. GCS therefore gains server abort and sweeper
+cleanup. Nothing has shipped, so `wyrd-sql` migration
+`20260601000002_storage.sql` is edited in place to drop `gcs_resumable_v1`
+and rename `s3_multipart_v1`.
+
+**Preserved.** Single PUT and GET presigning on every backend; S3 per-part
+presigning, completion and abort; Azure block-blob SAS (account key or user
+delegation key from token credentials) and server block-list commit with the
+existing zero-based six-digit block ids; typed not-found and throttling;
+`HeadInfo` size, content type and SSE marker driving `require_encryption`;
+replay re-mint; sweeper aborts; boot credential probe; the S3
+`AbortIncompleteMultipartUpload` lifecycle warning; per-operation storage
+metrics; emulator-only endpoint overrides. Credentials resolve through
+`object_store`'s environment chains, the chain Bifrost already requires.
+
+**Emulators.** RustFS and Azurite are unchanged. GCS runs
+`tustvold/fake-gcs-server`, the emulator `object_store`'s CI uses; emulator
+lanes sign with a throwaway service-account key generated per run and send
+data-plane requests unauthenticated. No `fake-gcs-server` implements GCS XML
+multipart (fsouza/fake-gcs-server#852), so GCS multipart is proven only
+against real GCS in `test:storage:gcs:cloud` (user ruling 2026-10-12, “Do 1”);
+the emulator proves GCS single PUT, HEAD and handle CRUD.
+
+**Fork dependencies.** The user ruled on 2026-10-12 “remove all outdated
+storage dependencies” and “I want to standardize a common name across all used
+forks”. Every `bohmian-ai` fork Wyrd uses (iceberg-rust, iceberg-compaction,
+datafusion, datafusion-distributed, arrow-rs) publishes the revision Wyrd pins
+on one branch, `wyrd-production`; manifests still pin literal revisions.
+`iceberg-compaction-core` declared `iceberg-catalog-glue` without using it,
+which pulled OpenDAL, the AWS Glue SDK and `aws-config` into Wyrd; the pin
+moves to `5f4010291869ed4fb71357aa3dec96746010319a` on `wyrd-production`,
+which is 22cd178 with only that dependency removed.
+
 ## Open material decisions and revision history
 
 All product/architecture/security/format resolutions are approved in the seven
@@ -531,7 +591,8 @@ or proposed scope/contract change routes through a new spec revision.
 | 1 | 2026-10-11 | superseded | Initial transcription; incomplete task recipes and conflicting earlier research choices replaced by revision 2. |
 | 2 | 2026-10-11 | superseded | Explicit approval of all seven batches (1–27), unified Task/registration/error/SQL resolutions, and source workload retention with main target consolidation. |
 | 3 | 2026-10-11 | superseded | User ruling that S is the sole Bifrost implementation: exceptions X1–X7 approved, REQ-005/006/007/024 struck, Bifrost migrations edited in place (nothing shipped), benches restored by name in one build, AC-028. |
-| 4 | 2026-10-11 | approved | User approval of X8, the no-wait graph release with one cancellation signal and no spawned release work, and X9, main's Task Verifier `assertion_result` Variant column. |
+| 4 | 2026-10-11 | superseded | User approval of X8, the no-wait graph release with one cancellation signal and no spawned release work, and X9, main's Task Verifier `assertion_result` Variant column. |
+| 5 | 2026-10-12 | approved | User approval of one `object_store` storage client for `wyrd-storage` and Bifrost, GCS XML multipart replacing GCS resumable, and removal of OpenDAL and the cloud SDKs (TASK-007). |
 
 ## Authority links
 

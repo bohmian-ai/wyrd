@@ -17,11 +17,10 @@ pub use download::{DownloadInitRequest, DownloadInitResponse, DownloadPlan};
 pub use ids::{UploadId, UploadIdParseError};
 pub use protocol::{WireProtocol, WireProtocolParseError};
 pub use upload::{
-    AbortResponse, AzureBlockBlobComplete, GcsResumableComplete, HeaderPair,
-    IDEMPOTENCY_KEY_HEADER, LocalBlobUploadResponse, PartUrlResponse, S3CompletedPart,
-    S3MultipartComplete, SinglePutComplete, UploadCompleteRequest, UploadCompleteResponse,
-    UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee,
-    backend_verification_guarantee,
+    AbortResponse, AzureBlockBlobComplete, CompletedPart, HeaderPair, IDEMPOTENCY_KEY_HEADER,
+    LocalBlobUploadResponse, MultipartComplete, PartUrlResponse, SinglePutComplete,
+    UploadCompleteRequest, UploadCompleteResponse, UploadInitRequest, UploadInitResponse,
+    UploadPlan, VerificationGuarantee, backend_verification_guarantee,
 };
 
 #[cfg(test)]
@@ -51,8 +50,8 @@ mod storage_contracts_tests {
     fn storage_wire_protocol_sql_roundtrip_strings() {
         assert_eq!(WireProtocol::LocalFsV1.to_string(), "local_fs_v1");
         assert_eq!(
-            "gcs_resumable_v1".parse::<WireProtocol>().unwrap(),
-            WireProtocol::GcsResumableV1
+            "multipart_v1".parse::<WireProtocol>().unwrap(),
+            WireProtocol::MultipartV1
         );
     }
 

@@ -2483,7 +2483,7 @@ pub(crate) mod pg_tests {
         )
     }
 
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+    use wyrd_storage::{LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
 
@@ -2529,7 +2529,7 @@ pub(crate) mod pg_tests {
         let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        let storage = Arc::new(StorageHandle::new(signer));
         let state = crate::test_support::test_app_state(
             postgres,
             storage,

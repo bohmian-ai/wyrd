@@ -10,7 +10,7 @@ each reads back as Wyrd values, and the customer's local hour is queryable.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import pyarrow
@@ -27,7 +27,7 @@ WYRD_ORDERS = "vala.datasets.wyrd_orders"
 PYDANTIC_ORDERS = "vala.datasets.pydantic_orders"
 ARROW_ORDERS = "vala.datasets.arrow_orders"
 
-RECEIVED = datetime(2026, 10, 6, 17, 0, tzinfo=UTC)
+RECEIVED = datetime(2026, 10, 6, 17, 0, tzinfo=timezone.utc)
 STORE_OPENS = datetime(2026, 10, 6, 9, 0)
 CUSTOMERS = {
     "chicago": timezone(timedelta(hours=-5)),
@@ -75,11 +75,13 @@ def wyrd_orders(wyrd_server: WyrdTestServer) -> Bifrost:
         WyrdOrder,
         WYRD_ORDERS,
         [
-            WyrdOrder(
-                order_id=customer,
-                store_opens=STORE_OPENS,
-                received_at=RECEIVED,
-                submitted_at=RECEIVED.astimezone(zone),
+            WyrdOrder.model_validate(
+                {
+                    "order_id": customer,
+                    "store_opens": STORE_OPENS,
+                    "received_at": RECEIVED,
+                    "submitted_at": RECEIVED.astimezone(zone),
+                }
             )
             for customer, zone in CUSTOMERS.items()
         ],

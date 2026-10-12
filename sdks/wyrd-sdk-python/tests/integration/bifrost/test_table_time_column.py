@@ -9,7 +9,7 @@ a time column is refused naming the field.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
 import pyarrow
@@ -24,7 +24,7 @@ NAMESPACE = "vala.datasets"
 READINGS = "py_time_column_readings"
 DEFAULTS = "py_time_column_defaults"
 REFUSED = "py_time_column_refused"
-FIRST_HOUR = datetime(2026, 10, 6, tzinfo=UTC)
+FIRST_HOUR = datetime(2026, 10, 6, tzinfo=timezone.utc)
 SCHEMA = pyarrow.schema(
     [
         pyarrow.field("event_time", pyarrow.timestamp("us", tz="UTC"), nullable=False),

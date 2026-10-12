@@ -2075,9 +2075,9 @@ async fn baseline_artifact(server: &WyrdTestServer, seed: &VerificationFixture, 
     let sha256 = STANDARD.encode(Sha256::digest(&bytes));
     let path = wyrd_storage::tenant_path::build(seed.tenant(), data.as_str(), "data/data.parquet");
     let storage = &server.state().storage;
+    let object = wyrd_storage::tenant_path::validate(&path, seed.tenant()).expect("valid path");
     storage
-        .operator()
-        .write(&path, bytes.clone())
+        .put_object(&object, bytes.clone())
         .await
         .expect("artifact writes");
     let mut conn = server

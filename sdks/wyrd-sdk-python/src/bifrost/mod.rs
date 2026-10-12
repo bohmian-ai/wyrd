@@ -1270,8 +1270,18 @@ pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyQueryResult>()?;
     module.add_class::<PyQueryTerminal>()?;
     module.add_class::<PyBifrostQueryStream>()?;
-    module.add_function(wrap_pyfunction!(timestamp_format, module)?)?;
     Ok(())
+}
+
+/// Register [`timestamp_format`] on the root native module.
+///
+/// The Python timestamp types live outside the `bifrost` package and import
+/// from the root module, whose stub declares this function.
+///
+/// # Errors
+/// Returns `PyO3` registration errors.
+pub fn register_timestamp_format(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_function(wrap_pyfunction!(timestamp_format, module)?)
 }
 
 /// Register the `observe` fire-and-forget telemetry function on the module.

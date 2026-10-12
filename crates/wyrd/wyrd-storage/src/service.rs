@@ -15,9 +15,9 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
     AbortResponse, AzureBlockBlobComplete, DownloadInitRequest, DownloadInitResponse, DownloadPlan,
-    PartUrlResponse, S3MultipartComplete, StorageBackendKind, StoredObjectRef,
-    UploadCompleteRequest, UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest,
-    UploadInitResponse, UploadPlan, WireProtocol,
+    MultipartComplete, PartUrlResponse, StorageBackendKind, StoredObjectRef, UploadCompleteRequest,
+    UploadCompleteResponse, UploadId, UploadIdParseError, UploadInitRequest, UploadInitResponse,
+    UploadPlan, WireProtocol,
 };
 use wyrd_sql::queries::storage::artifact_metadata::ArtifactMetadataRow;
 use wyrd_sql::queries::storage::multipart_uploads::{self, MultipartUploadRow, UploadStatus};
@@ -203,10 +203,10 @@ async fn persist_upload_init(
         .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(|error| map_sql_error(&error))?;
-    persist_s3_upload_id(
+    persist_multipart_upload_id(
         &mut conn,
         input.upload_uuid,
-        input.backend,
+        input.wire_protocol,
         input.backend_upload_id,
     )
     .await?;
@@ -256,7 +256,7 @@ async fn claim_upload_init<'a>(
     Ok((conn, replay))
 }
 
-/// Return one S3 multipart part URL.
+/// Return one multipart part URL.
 #[instrument(skip(storage, postgres, caller), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
 pub async fn upload_part_url(
     storage: &StorageHandle,
@@ -276,9 +276,9 @@ pub async fn upload_part_url(
             serde_json::json!({ "upload_id": upload_id.to_string(), "status": row.status }),
         ));
     }
-    if row.wire_protocol != WireProtocol::S3MultipartV1 {
+    if row.wire_protocol != WireProtocol::MultipartV1 {
         return Err(validation_error(
-            "part-url is only valid for S3 multipart uploads",
+            "part-url is only valid for multipart uploads",
             serde_json::json!({
                 "upload_id": upload_id.to_string(),
                 "wire_protocol": row.wire_protocol,
@@ -296,7 +296,7 @@ pub async fn upload_part_url(
         tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
     let backend_upload_id = row.backend_upload_id.ok_or_else(|| {
         internal_error(
-            "pending S3 upload is missing backend_upload_id",
+            "pending multipart upload is missing backend_upload_id",
             serde_json::json!({ "upload_id": upload_id.to_string() }),
         )
     })?;
@@ -349,7 +349,6 @@ pub async fn upload_complete(
         row.wire_protocol,
         row.backend,
         row.block_count_planned,
-        &row.expected_sha256,
     )?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
@@ -795,8 +794,9 @@ fn derive_wire_protocol(backend: StorageBackendKind, planned: PlannedUpload) -> 
     match (backend, planned) {
         (StorageBackendKind::Local, _) => WireProtocol::LocalFsV1,
         (_, PlannedUpload::SinglePut) => WireProtocol::SinglePutV1,
-        (StorageBackendKind::S3, PlannedUpload::Multipart { .. }) => WireProtocol::S3MultipartV1,
-        (StorageBackendKind::Gcs, PlannedUpload::Multipart { .. }) => WireProtocol::GcsResumableV1,
+        (StorageBackendKind::S3 | StorageBackendKind::Gcs, PlannedUpload::Multipart { .. }) => {
+            WireProtocol::MultipartV1
+        }
         (StorageBackendKind::Azure, PlannedUpload::Multipart { .. }) => {
             WireProtocol::AzureBlockBlobV1
         }
@@ -965,20 +965,22 @@ fn local_single_put_plan(storage: &StorageHandle, upload_id: &UploadId) -> Uploa
 
 /// Move one freshly initialized upload into `pending`, keeping the backend id.
 ///
-/// Only S3 hands back a multipart id worth persisting; every other backend
-/// reaches completion from the stored path alone. The transition is upload
+/// Only the `MultipartV1` protocol (S3 and GCS) hands back an upload id its
+/// part signing, completion, and abort need; every other protocol reaches
+/// completion from the stored path alone. The transition is upload
 /// lifecycle state, not an authorization decision, so the row it writes is the
 /// only record it owes.
 ///
 /// # Errors
 /// Returns the mapped SQL failure when the transition cannot be written.
-async fn persist_s3_upload_id(
+async fn persist_multipart_upload_id(
     conn: &mut TenantConn<'_>,
     upload_uuid: Uuid,
-    backend: StorageBackendKind,
+    wire_protocol: WireProtocol,
     backend_upload_id: &str,
 ) -> Result<(), WyrdError> {
-    let persisted_backend_id = (backend == StorageBackendKind::S3).then_some(backend_upload_id);
+    let persisted_backend_id =
+        (wire_protocol == WireProtocol::MultipartV1).then_some(backend_upload_id);
     multipart_uploads::mark_pending(conn, upload_uuid, persisted_backend_id)
         .await
         .map_err(|error| map_sql_error(&error))
@@ -1037,7 +1039,6 @@ fn build_complete_payload(
     wire_protocol: WireProtocol,
     backend: StorageBackendKind,
     block_count_planned: Option<i32>,
-    expected_sha256: &str,
 ) -> Result<Option<CompletePayload>, WyrdError> {
     match (body, wire_protocol, backend) {
         (
@@ -1045,16 +1046,26 @@ fn build_complete_payload(
             WireProtocol::LocalFsV1,
             StorageBackendKind::Local,
         ) => Ok(Some(CompletePayload::Local)),
-        (UploadCompleteRequest::SinglePut(_), WireProtocol::SinglePutV1, _)
-        | (UploadCompleteRequest::GcsResumable(_), WireProtocol::GcsResumableV1, _) => Ok(None),
+        (UploadCompleteRequest::SinglePut(_), WireProtocol::SinglePutV1, _) => Ok(None),
         (
-            UploadCompleteRequest::S3Multipart(S3MultipartComplete { parts }),
-            WireProtocol::S3MultipartV1,
+            UploadCompleteRequest::Multipart(MultipartComplete { parts }),
+            WireProtocol::MultipartV1,
             _,
-        ) => Ok(Some(CompletePayload::S3 {
-            parts: parts.clone(),
-            expected_sha256: expected_sha256.to_owned(),
-        })),
+        ) => {
+            if !parts
+                .iter()
+                .zip(1_u32..)
+                .all(|(part, number)| part.part_number == number)
+            {
+                return Err(validation_error(
+                    "multipart parts must be numbered 1..n in order",
+                    serde_json::json!({ "part_count": parts.len() }),
+                ));
+            }
+            Ok(Some(CompletePayload::Multipart {
+                parts: parts.clone(),
+            }))
+        }
         (
             UploadCompleteRequest::AzureBlockBlob(AzureBlockBlobComplete { block_count }),
             WireProtocol::AzureBlockBlobV1,
@@ -1416,11 +1427,34 @@ mod tests {
             WireProtocol::AzureBlockBlobV1,
             StorageBackendKind::Azure,
             Some(3),
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         )
         .expect_err("block count mismatch should fail");
 
         assert_eq!(err.status(), 400);
+    }
+
+    /// Multipart completion refuses parts that are not numbered 1..n in
+    /// order, because the backend commits parts by position.
+    #[test]
+    fn multipart_complete_rejects_out_of_order_parts() {
+        let part = |part_number| wyrd_spec::storage::CompletedPart {
+            part_number,
+            e_tag: format!("etag-{part_number}"),
+        };
+        let complete = |parts| {
+            build_complete_payload(
+                &UploadCompleteRequest::Multipart(MultipartComplete { parts }),
+                WireProtocol::MultipartV1,
+                StorageBackendKind::Gcs,
+                None,
+            )
+        };
+
+        let err = complete(vec![part(2), part(1)]).expect_err("out-of-order parts fail");
+        let ordered = complete(vec![part(1), part(2)]).expect("ordered parts build");
+
+        assert_eq!(err.status(), 400);
+        assert!(matches!(ordered, Some(CompletePayload::Multipart { parts }) if parts.len() == 2));
     }
 
     #[test]
@@ -1431,7 +1465,6 @@ mod tests {
             WireProtocol::SinglePutV1,
             StorageBackendKind::S3,
             None,
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         )
         .expect("single put payload builds");
 
@@ -1450,7 +1483,7 @@ mod tests {
         assert_eq!(azure.part_size_bytes, 16);
         assert_eq!(azure.block_count_planned, Some(7));
 
-        let s3 = upload_row_counts(planned, 100, WireProtocol::S3MultipartV1);
+        let s3 = upload_row_counts(planned, 100, WireProtocol::MultipartV1);
         assert_eq!(s3.part_count, 7);
         assert_eq!(s3.part_size_bytes, 16);
         assert_eq!(s3.block_count_planned, None);
@@ -1590,10 +1623,9 @@ mod tests {
         let body = UploadCompleteRequest::SinglePut(SinglePutComplete {});
         let err = build_complete_payload(
             &body,
-            WireProtocol::S3MultipartV1,
+            WireProtocol::MultipartV1,
             StorageBackendKind::S3,
             None,
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         )
         .expect_err("protocol mismatch must fail");
 
@@ -1601,14 +1633,14 @@ mod tests {
     }
 
     #[test]
-    fn derive_wire_protocol_gcs_multipart_is_gcs_resumable() {
+    fn derive_wire_protocol_gcs_multipart_is_multipart() {
         let planned = PlannedUpload::Multipart {
             part_count: 4,
             part_size_bytes: 16 * 1024 * 1024,
         };
         assert_eq!(
             derive_wire_protocol(StorageBackendKind::Gcs, planned),
-            WireProtocol::GcsResumableV1,
+            WireProtocol::MultipartV1,
         );
     }
 

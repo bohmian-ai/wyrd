@@ -1266,17 +1266,17 @@ fn supported(kind: skald_spec::MediaKind, mime: &str) -> bool {
 mod tests {
     use std::sync::Arc;
 
-    use opendal::raw::{
-        Access, Layer, LayeredAccess, OpList, OpRead, OpStat, OpWrite, RpDelete, RpList, RpRead,
-        RpStat, RpWrite,
+    use futures_util::stream::BoxStream;
+    use object_store::path::Path as ObjectPath;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult,
     };
     use vala_eval::JudgeError;
     use vala_eval::orchestrator::MediaResolver;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::vala::eval::media::MediaRef as EvalMediaRef;
-    use wyrd_storage::{
-        BackendConfig, BackendSigner, LocalSigner, StorageHandle, StorageSettings, tenant_path,
-    };
+    use wyrd_storage::{BackendConfig, LocalSigner, StorageHandle, StorageSettings, tenant_path};
 
     use wyrd_spec::ids::VerificationRunId;
 
@@ -1341,9 +1341,9 @@ mod tests {
     #[tokio::test]
     async fn media_resolves_only_authorized_bounded_supported_objects() {
         let root = tempfile::tempdir().expect("temp dir");
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(
+        let storage = Arc::new(StorageHandle::new(
             LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
-        )));
+        ));
         let tenant = DataTenantId::new_v7();
         let card = uuid::Uuid::now_v7();
         let object = |name: &str| format!("{tenant}/cards/{card}/{name}");
@@ -1404,9 +1404,9 @@ mod tests {
         let logs = Logs::default();
         let _capture = logs.capture();
         let root = tempfile::tempdir().expect("temp dir");
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(
+        let storage = Arc::new(StorageHandle::new(
             LocalSigner::new(root.path().to_path_buf()).expect("local signer"),
-        )));
+        ));
         let tenant = DataTenantId::new_v7();
         let card = uuid::Uuid::now_v7();
         let directory = format!("{tenant}/cards/{card}/{LOCATOR_SENTINEL}-dir.png");
@@ -1476,66 +1476,106 @@ mod tests {
         );
     }
 
-    /// Test layer whose `stat` reports every object as one byte long while
+    /// Test store whose `HEAD` reports every object as one byte long while
     /// reads return the real body: the metadata a replaced or stale object
     /// presents between a size check and the read that follows it.
-    #[derive(Debug, Clone, Copy)]
-    struct UndersizedStat;
+    #[derive(Debug)]
+    struct UndersizedHead(Arc<dyn ObjectStore>);
 
-    impl<A: Access> Layer<A> for UndersizedStat {
-        type LayeredAccess = UndersizedStatAccess<A>;
-
-        /// Wrap `inner` so only its metadata lies.
-        fn layer(&self, inner: A) -> Self::LayeredAccess {
-            UndersizedStatAccess(inner)
+    impl std::fmt::Display for UndersizedHead {
+        /// Names the wrapper and the store it wraps.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "UndersizedHead({})", self.0)
         }
     }
 
-    /// Accessor of [`UndersizedStat`]: forwards everything except `stat`.
-    #[derive(Debug)]
-    struct UndersizedStatAccess<A>(A);
-
-    impl<A: Access> LayeredAccess for UndersizedStatAccess<A> {
-        type Inner = A;
-        type Reader = A::Reader;
-        type Writer = A::Writer;
-        type Lister = A::Lister;
-        type Deleter = A::Deleter;
-        type Copier = A::Copier;
-
-        /// The wrapped accessor.
-        fn inner(&self) -> &A {
-            &self.0
+    #[async_trait::async_trait]
+    impl ObjectStore for UndersizedHead {
+        /// Forward the put unchanged.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn put_opts(
+            &self,
+            location: &ObjectPath,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.0.put_opts(location, payload, opts).await
         }
 
-        /// Forward the read unchanged, so the real body is returned.
-        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, A::Reader)> {
-            self.0.read(path, args).await
+        /// Forward the multipart upload unchanged.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn put_multipart_opts(
+            &self,
+            location: &ObjectPath,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
         }
 
-        /// Forward the write unchanged.
-        async fn write(&self, path: &str, args: OpWrite) -> opendal::Result<(RpWrite, A::Writer)> {
-            self.0.write(path, args).await
+        /// Forward the get, reporting a one-byte size on a `HEAD` while a
+        /// body read returns the real bytes.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn get_opts(
+            &self,
+            location: &ObjectPath,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            let head = options.head;
+            let mut result = self.0.get_opts(location, options).await?;
+            if head {
+                result.meta.size = 1;
+            }
+            Ok(result)
         }
 
-        /// Forward the delete unchanged.
-        async fn delete(&self) -> opendal::Result<(RpDelete, A::Deleter)> {
-            self.0.delete().await
+        /// Forward deletes unchanged.
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+        ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+            self.0.delete_stream(locations)
         }
 
         /// Forward the listing unchanged.
-        async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, A::Lister)> {
-            self.0.list(path, args).await
+        fn list(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.0.list(prefix)
         }
 
-        /// Report the real metadata with a one-byte content length.
-        async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<RpStat> {
-            let metadata = self.0.stat(path, args).await?.into_metadata();
-            Ok(RpStat::new(metadata.with_content_length(1)))
+        /// Forward the delimited listing unchanged.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&ObjectPath>,
+        ) -> object_store::Result<ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+
+        /// Forward the copy unchanged.
+        ///
+        /// # Errors
+        /// Returns the wrapped store's error.
+        async fn copy_opts(
+            &self,
+            from: &ObjectPath,
+            to: &ObjectPath,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.0.copy_opts(from, to, options).await
         }
     }
 
-    /// Metadata is not the authority for media size: an object whose `stat`
+    /// Metadata is not the authority for media size: an object whose `HEAD`
     /// reports one byte while its body exceeds [`MEDIA_LIMIT_BYTES`] is
     /// refused as a terminal input error from a body read that stops at the
     /// limit plus one byte, so no provider call can receive it.
@@ -1545,10 +1585,9 @@ mod tests {
         let backend = BackendConfig::Local {
             root: root.path().to_path_buf(),
         };
-        let operator = wyrd_storage::factory::build_operator(&backend)
-            .expect("the local operator builds")
-            .layer(UndersizedStat);
-        let storage = StorageHandle::from_settings_with_operator(
+        let local = object_store::local::LocalFileSystem::new_with_prefix(root.path())
+            .expect("the local store builds");
+        let storage = StorageHandle::from_settings_with_store(
             StorageSettings {
                 backend,
                 require_encryption: false,
@@ -1556,7 +1595,7 @@ mod tests {
                 part_size_bytes: 16 * 1024 * 1024,
                 multipart_threshold_bytes: 100 * 1024 * 1024,
             },
-            operator,
+            Arc::new(UndersizedHead(Arc::new(local))),
         )
         .await
         .expect("the storage handle builds");

@@ -210,25 +210,7 @@ napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt
 napi-derive = "3"
 napi-build = "2"
 
-# Cloud SDKs are server-tier only.
-aws-sdk-s3 = { version = "=1.75.0", default-features = false, features = ["sigv4a", "rt-tokio", "behavior-version-latest"] }
-aws-config = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio", "credentials-process", "sso", "behavior-version-latest"] }
-aws-types = "1"
-gcloud-storage = { version = "1", features = ["auth"] }
-gcloud-auth = "1"
-azure_core = "0.21.0"
-azure_identity = "0.21.0"
-azure_storage = "0.21.0"
-azure_storage_blobs = "0.21.0"
-# opendal 0.57 is the wyrd-storage substrate for card and artifact storage;
-# Bifrost uses object_store. reqwest-rustls-tls is mandatory:
-# default-features=false drops it, leaving an HTTP-only client that fails all
-# cloud HTTPS requests.
 typetag = "0.2.23"
-opendal = { version = "0.57", default-features = false, features = [
-  "services-fs", "services-s3", "services-gcs", "services-azblob",
-  "reqwest-rustls-tls",
-] }
 
 # Bounded least-recently-used map behind the Bifrost decoded-metadata cache's
 # byte ceiling. Pinned: the cache manages its own byte accounting against this
@@ -240,7 +222,8 @@ libc = "0.2.186"
 # single native universe (no moving branch, no duplicate Arrow/Parquet package);
 # `[patch.crates-io]` below pins the DataFusion crates to the Wyrd fork.
 datafusion = "=55.1.0"
-# Bifrost's one object store; the same release DataFusion 55 uses.
+# Wyrd's one object store for artifact and Bifrost storage; the same release
+# DataFusion 55 uses.
 object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
 datafusion-proto = "=55.1.0"
 datafusion-datasource = "=55.1.0"
@@ -259,7 +242,7 @@ iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev =
 # universe. The revision is literal and must never be a branch: the branch it was
 # published on can move, and a moved core would silently change selection,
 # grouping, delete application, and output identity underneath Forge.
-iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "22cd178d14009468bc951a14d7acf63237af808a" }
+iceberg-compaction-core = { git = "https://github.com/bohmian-ai/iceberg-compaction", rev = "5f4010291869ed4fb71357aa3dec96746010319a" }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.

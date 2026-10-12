@@ -171,7 +171,7 @@
           }
         },
         {
-          "description": "AWS S3 multipart upload.",
+          "description": "Multipart upload over the multipart protocol, served by AWS S3 and the GCS XML API.",
           "type": "object",
           "required": [
             "data",
@@ -217,42 +217,7 @@
             "protocol": {
               "type": "string",
               "enum": [
-                "s3_multipart"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Google Cloud Storage resumable upload.",
-          "type": "object",
-          "required": [
-            "data",
-            "protocol"
-          ],
-          "properties": {
-            "data": {
-              "type": "object",
-              "required": [
-                "chunk_size_bytes",
-                "session_uri"
-              ],
-              "properties": {
-                "chunk_size_bytes": {
-                  "description": "Recommended chunk size in bytes.",
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0.0
-                },
-                "session_uri": {
-                  "description": "Resumable session URI returned once to the client.",
-                  "type": "string"
-                }
-              }
-            },
-            "protocol": {
-              "type": "string",
-              "enum": [
-                "gcs_resumable"
+                "multipart"
               ]
             }
           }

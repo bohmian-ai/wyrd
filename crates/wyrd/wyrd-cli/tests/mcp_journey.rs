@@ -8,7 +8,7 @@
 //! in-process fixture.
 
 use std::fs::{self, Permissions};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -658,7 +658,11 @@ pub(crate) async fn mcp_external_server_preserves_global_endpoint() {
 
     let home = tempfile::tempdir().expect("journey home");
     let config_dir = home.path().join("wyrd");
-    fs::create_dir_all(&config_dir).expect("config dir");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&config_dir)
+        .expect("config dir is private to the user");
     let global = "[client]\nhttp_url = \"http://127.0.0.1:9\"\n";
     fs::write(config_dir.join("config.toml"), global).expect("global config");
     let credentials = config_dir.join("credentials.toml");

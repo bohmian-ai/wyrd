@@ -1273,7 +1273,7 @@ mod pg_tests {
                     relative_path: "model.bin",
                     storage_path: &storage_path,
                     backend: StorageBackendKind::S3,
-                    wire_protocol: WireProtocol::S3MultipartV1,
+                    wire_protocol: WireProtocol::MultipartV1,
                     expected_sha256: &sha,
                     expected_size_bytes: 5_242_880,
                     content_type: Some("application/octet-stream"),
@@ -1304,7 +1304,7 @@ mod pg_tests {
             .expect("pending lookup succeeds")
             .expect("pending row found");
             assert_eq!(pending.backend, StorageBackendKind::S3);
-            assert_eq!(pending.wire_protocol, WireProtocol::S3MultipartV1);
+            assert_eq!(pending.wire_protocol, WireProtocol::MultipartV1);
 
             // Card activation may verify the object and complete the row
             // before the storage completion route persists its own result.
@@ -1346,7 +1346,7 @@ mod pg_tests {
                     upload_id: UploadId::new().to_string(),
                     storage_path: storage_path.clone(),
                     backend: StorageBackendKind::S3,
-                    wire_protocol: WireProtocol::S3MultipartV1,
+                    wire_protocol: WireProtocol::MultipartV1,
                 },
                 Duration::from_mins(1),
             )
@@ -1462,7 +1462,7 @@ mod pg_tests {
               part_count_planned, part_size_bytes, status, expires_at)
          VALUES
              ($1, $2, $3, 'expired.bin', $4,
-              's3', 's3_multipart_v1', $5, 1,
+              's3', 'multipart_v1', $5, 1,
               1, 1, 'pending', now() - interval '1 hour')",
         )
         .bind(upload_id)

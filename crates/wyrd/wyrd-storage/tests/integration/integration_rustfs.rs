@@ -2,36 +2,35 @@
 //!
 //! Run by `test:storage:rustfs` (part of `test:storage:matrix`), which selects
 //! the emulator through `WYRD_STORAGE_URL` and `WYRD_STORAGE_ENDPOINT_URL`.
-
-//! S3 (`RustFS`) signer-layer integration tests.
-//!
 //! Transfer round trips live in the server journey and use
-//! `WyrdStorageClient`. These tests retain only signer-specific planning,
-//! cleanup, head, and capability behavior.
+//! `WyrdStorageClient`; these tests retain signer planning, cleanup, head, and
+//! capability behavior.
 
 use std::time::Duration;
 
 use wyrd_spec::DataTenantId;
 use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
 use wyrd_storage::error::{S3Error, StorageError};
-use wyrd_storage::s3::S3Signer;
-use wyrd_storage::settings::{self, BackendConfig};
-use wyrd_storage::{UploadPlanReplayInput, ValidatedPath, factory};
+use wyrd_storage::settings;
+use wyrd_storage::{BackendSigner, UploadPlanReplayInput, ValidatedPath, factory};
 
 /// Smallest S3 multipart part size.
 const PART_SIZE: usize = 5 * 1024 * 1024;
 /// Planned part count for multipart init and replay.
 const PART_COUNT: u32 = 3;
 
-/// Build the S3 signer for the bucket and endpoint in `WYRD_STORAGE_URL`.
+/// Build the signer for the S3 location and endpoint in `WYRD_STORAGE_URL`.
 ///
 /// # Panics
-/// Panics when the environment does not select S3 or the bucket probe fails.
-async fn build_rustfs_signer() -> S3Signer {
-    let BackendConfig::S3(config) = settings::from_env().expect("storage settings").backend else {
-        panic!("WYRD_STORAGE_URL must select s3://");
-    };
-    factory::s3::build_signer(&config).await.expect("S3 signer")
+/// Panics when the environment does not select S3 or signer construction fails.
+async fn build_signer() -> BackendSigner {
+    let backend = settings::from_env().expect("storage settings").backend;
+    assert_eq!(
+        backend.kind(),
+        StorageBackendKind::S3,
+        "WYRD_STORAGE_URL must select s3://"
+    );
+    factory::build_signer(&backend).await.expect("S3 signer")
 }
 
 /// Tenant- and Card-unique validated path, so concurrent runs against a shared bucket never collide.
@@ -52,7 +51,7 @@ fn fresh_path(suffix: &str) -> ValidatedPath {
 /// object exists afterwards.
 #[tokio::test]
 async fn rustfs_abort_lifecycle() {
-    let signer = build_rustfs_signer().await;
+    let signer = build_signer().await;
     let path = fresh_path("abort/object.bin");
     let init = signer
         .init_multipart(&path, PART_COUNT, PART_SIZE as u64, Duration::from_mins(5))
@@ -62,7 +61,7 @@ async fn rustfs_abort_lifecycle() {
         .abort_multipart(&path, &init.backend_upload_id)
         .await
         .expect("abort multipart");
-    assert!(signer.head(&path).await.is_err());
+    assert!(signer.head_for_verification(&path).await.is_err());
 }
 
 /// Replaying a stored S3 multipart plan yields the same part geometry, then aborts the upload.
@@ -73,14 +72,14 @@ async fn rustfs_abort_lifecycle() {
 /// multipart upload for bucket lifecycle rules to expire.
 #[tokio::test]
 async fn rustfs_remint_plan_produces_valid_plan() {
-    let signer = build_rustfs_signer().await;
+    let signer = build_signer().await;
     let path = fresh_path("remint/object.bin");
     let init = signer
         .init_multipart(&path, PART_COUNT, PART_SIZE as u64, Duration::from_mins(5))
         .await
         .expect("init multipart");
     let input = UploadPlanReplayInput {
-        wire_protocol: WireProtocol::S3MultipartV1,
+        wire_protocol: WireProtocol::MultipartV1,
         backend_upload_id: Some(init.backend_upload_id.clone()),
         part_count_planned: PART_COUNT,
         part_size_bytes: PART_SIZE as u64,
@@ -91,7 +90,7 @@ async fn rustfs_remint_plan_produces_valid_plan() {
         .await
         .expect("remint S3 plan");
     assert!(
-        matches!(reminted, UploadPlan::S3Multipart { part_count, part_size_bytes, .. } if part_count == PART_COUNT && part_size_bytes == PART_SIZE as u64)
+        matches!(reminted, UploadPlan::Multipart { part_count, part_size_bytes, .. } if part_count == PART_COUNT && part_size_bytes == PART_SIZE as u64)
     );
     signer
         .abort_multipart(&path, &init.backend_upload_id)
@@ -99,17 +98,20 @@ async fn rustfs_remint_plan_produces_valid_plan() {
         .expect("cleanup abort");
 }
 
-/// `head` on a never-written key returns a typed S3 error.
+/// `head` on a never-written key returns typed S3 `NoSuchKey`.
 ///
 /// # Panics
-/// Panics when the environment does not select S3, `head` succeeds, or the error is untyped.
+/// Panics when the environment does not select S3, `head` succeeds, or the
+/// error is not `NoSuchKey`.
 #[tokio::test]
 async fn rustfs_head_on_missing_returns_error() {
-    let signer = build_rustfs_signer().await;
-    let result = signer.head(&fresh_path("never-written.bin")).await;
+    let signer = build_signer().await;
+    let result = signer
+        .head_for_verification(&fresh_path("never-written.bin"))
+        .await;
     match result {
         Err(StorageError::S3(boxed)) => match *boxed {
-            S3Error::NoSuchKey { .. } | S3Error::Sdk(_) => {}
+            S3Error::NoSuchKey { .. } => {}
             other => panic!("expected typed missing-key error, got: {other:?}"),
         },
         Err(other) => panic!("expected typed S3 error, got: {other:?}"),
@@ -117,37 +119,32 @@ async fn rustfs_head_on_missing_returns_error() {
     }
 }
 
-/// Replaying GCS or Azure plans through the S3 signer is a typed capability mismatch.
+/// Replaying an Azure plan through the S3 signer is a typed capability mismatch.
 ///
 /// # Panics
 /// Panics when the environment does not select S3 or any replay returns anything else.
 #[tokio::test]
-async fn rustfs_capability_mismatch_is_typed_for_non_s3_protocols() {
-    let signer = build_rustfs_signer().await;
+async fn rustfs_capability_mismatch_is_typed_for_azure_protocol() {
+    let signer = build_signer().await;
     let path = fresh_path("capability/object.bin");
-    for (wire_protocol, block_count_planned) in [
-        (WireProtocol::GcsResumableV1, None),
-        (WireProtocol::AzureBlockBlobV1, Some(PART_COUNT)),
-    ] {
-        let result = signer
-            .remint_plan(
-                &path,
-                &UploadPlanReplayInput {
-                    wire_protocol,
-                    backend_upload_id: None,
-                    part_count_planned: PART_COUNT,
-                    part_size_bytes: PART_SIZE as u64,
-                    block_count_planned,
-                },
-                Duration::from_mins(5),
-            )
-            .await;
-        assert!(matches!(
-            result,
-            Err(StorageError::BackendCapabilityMismatch {
-                signer: StorageBackendKind::S3,
-                op: "remint_plan"
-            })
-        ));
-    }
+    let result = signer
+        .remint_plan(
+            &path,
+            &UploadPlanReplayInput {
+                wire_protocol: WireProtocol::AzureBlockBlobV1,
+                backend_upload_id: None,
+                part_count_planned: PART_COUNT,
+                part_size_bytes: PART_SIZE as u64,
+                block_count_planned: Some(PART_COUNT),
+            },
+            Duration::from_mins(5),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(StorageError::BackendCapabilityMismatch {
+            signer: StorageBackendKind::S3,
+            op: "remint_plan"
+        })
+    ));
 }

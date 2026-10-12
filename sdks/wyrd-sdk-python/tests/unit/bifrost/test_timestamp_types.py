@@ -83,8 +83,11 @@ def test_wyrd_fields_validate_to_wyrd_values_and_write_their_offset() -> None:
         submitted_at: TimestampTZ
         store_opens: TimestampNTZ
 
-    row = Submission(
-        submitted_at=datetime(2026, 10, 6, 12, tzinfo=CHICAGO), store_opens=datetime(2026, 10, 6, 9)
+    row = Submission.model_validate(
+        {
+            "submitted_at": datetime(2026, 10, 6, 12, tzinfo=CHICAGO),
+            "store_opens": datetime(2026, 10, 6, 9),
+        }
     )
 
     assert type(row.submitted_at) is TimestampTZ
@@ -94,4 +97,6 @@ def test_wyrd_fields_validate_to_wyrd_values_and_write_their_offset() -> None:
         == '{"submitted_at":"2026-10-06T12:00:00-05:00","store_opens":"2026-10-06T09:00:00"}'
     )
     with pytest.raises(ValidationError):
-        Submission(submitted_at=datetime(2026, 10, 6, 12), store_opens=datetime(2026, 10, 6, 9))
+        Submission.model_validate(
+            {"submitted_at": datetime(2026, 10, 6, 12), "store_opens": datetime(2026, 10, 6, 9)}
+        )

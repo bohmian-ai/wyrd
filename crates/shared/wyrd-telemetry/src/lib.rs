@@ -336,10 +336,11 @@ pub fn init(config: TelemetryConfig) -> Result<TelemetryGuard, WyrdError> {
 /// filter, formatter, and global subscriber path as [`init`]. The exporter
 /// destination differs, allowing journeys to inspect completed spans without a
 /// second telemetry implementation, and every captured span also carries its
-/// `tracing` level as the `level` attribute. The ambient `WYRD_LOG` filter
-/// decides which spans are captured, so a test asserting that an operation is
-/// DEBUG detail reads that attribute instead of inferring the level from
-/// whether the span appeared.
+/// `tracing` level as the `level` attribute.
+///
+/// Capture is unfiltered: every span and event the code emits reaches the
+/// exporter, so what a test can assert on never depends on `WYRD_LOG`. Only
+/// the formatted log output is filtered, by [`resolve_filter`].
 ///
 /// # Errors
 ///
@@ -349,7 +350,7 @@ pub fn init_test_capture(
     config: TelemetryConfig,
 ) -> Result<(TelemetryGuard, TestTraceCapture), WyrdError> {
     use opentelemetry::trace::TracerProvider as _;
-    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    use tracing_subscriber::{Layer as _, layer::SubscriberExt, util::SubscriberInitExt};
 
     let capture = TestTraceCapture::default();
     let exporter = CaptureExporter {
@@ -362,8 +363,7 @@ pub fn init_test_capture(
         .build();
     let tracer = provider.tracer("wyrd");
     tracing_subscriber::registry()
-        .with(resolve_filter(&config))
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_filter(resolve_filter(&config)))
         .with(
             tracing_opentelemetry::layer()
                 .with_tracer(tracer)
@@ -381,18 +381,6 @@ pub fn init_test_capture(
         },
         capture,
     ))
-}
-
-/// Install the production-shaped telemetry pipeline with in-memory capture.
-///
-/// This name is retained for Forge/Scribe callers while the Oracle test
-/// harness uses [`init_test_capture`]. Both paths share one exporter and
-/// provider implementation.
-#[cfg(feature = "test-support")]
-pub fn init_capture(
-    config: TelemetryConfig,
-) -> Result<(TelemetryGuard, TestTraceCapture), WyrdError> {
-    init_test_capture(config)
 }
 
 /// Build the process resource shared by production and test exporters.

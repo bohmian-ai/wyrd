@@ -1239,6 +1239,7 @@ pub(crate) mod recording {
     use vala_bifrost_redux::contracts::{
         FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
     };
+    use wyrd_queue::variant::variant_cell_to_json;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::CardUid;
@@ -1436,7 +1437,8 @@ pub(crate) mod recording {
     ///
     /// # Panics
     ///
-    /// Panics when a content column is missing, not text, or not parseable.
+    /// Panics when a content column is missing, a text column is not text,
+    /// `detail` is not a Variant, or a value is not parseable.
     fn decode_audit(tenant: DataTenantId, batch: &RecordBatch) -> Vec<AuditDecision> {
         let text = |name: &str, row: usize| {
             let values = batch
@@ -1446,6 +1448,7 @@ pub(crate) mod recording {
             values.is_valid(row).then(|| values.value(row).to_owned())
         };
         let uuid = |value: String| uuid::Uuid::parse_str(&value).expect("audit id is a uuid");
+        let detail = batch.column_by_name("detail").expect("audit column detail");
         (0..batch.num_rows())
             .map(|row| {
                 let required = |name: &str| text(name, row).unwrap_or_else(|| panic!("{name}"));
@@ -1459,8 +1462,9 @@ pub(crate) mod recording {
                     permission: required("permission"),
                     outcome: required("outcome"),
                     credential_id: text("credential_id", row).map(uuid),
-                    detail: text("detail", row)
-                        .map(|detail| serde_json::from_str(&detail).expect("detail is json")),
+                    detail: detail.is_valid(row).then(|| {
+                        variant_cell_to_json(detail.as_ref(), row).expect("detail is a Variant")
+                    }),
                 }
             })
             .collect()

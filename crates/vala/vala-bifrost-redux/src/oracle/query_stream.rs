@@ -771,9 +771,9 @@ fn cancellation_requested(
 /// Settles an Analytical attempt before its admission is released.
 ///
 /// Dropping the admission guard would release the attempt too, but only an
-/// explicit settlement cancels the attempt's cancellation child and joins the
-/// driver futures started beneath it. Doing that here — after the distributed
-/// join and before admission release — is what makes a leader stream's end,
+/// explicit settlement cancels the attempt's cancellation child and records its
+/// outcome. Doing that here — after cancellation and before admission release —
+/// is what makes a leader stream's end,
 /// however it ended, the point at which follower work stops rather than the
 /// point at which it is merely no longer awaited.
 ///

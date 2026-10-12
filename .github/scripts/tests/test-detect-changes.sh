@@ -115,8 +115,8 @@ check_selection "wire contract selects codegen, SDKs, and journeys" \
 check_selection "shared client selects SDK platforms and journeys" \
   "full_gate=false rust_client=true typescript=true python=true identity=true ci_lanes~codegen:check ci_lanes~py:test:integration ci_lanes~ts:test:integration ci_lanes~test:bifrost:gate" \
   "crates/shared/wyrd-client/src/config.rs"
-check_selection "server change selects identity and storage journeys" \
-  "full_gate=false identity=true storage=true ci_lanes~test:wyrd ci_lanes~test:bifrost:gate" \
+check_selection "server change selects identity and storage journeys and HTTP codegen" \
+  "full_gate=false identity=true storage=true ci_lanes~test:wyrd ci_lanes~test:bifrost:gate ci_lanes~codegen:check" \
   "crates/wyrd/wyrd-server/src/state.rs"
 check_selection "gateway engine selects the gateway journeys" \
   "full_gate=false changed_packages=wyrd-gateway rust_packages~wyrd-server rust_packages~wyrd-testing ci_lanes~test:wyrd ci_lanes~test:gateway:gate" \
@@ -151,8 +151,8 @@ check_selection "planning-only change selects nothing" \
 check_selection "docs-only change runs docs checks" \
   "full_gate=false docs=true ui=false ci_lanes= rust_client=false identity=false" \
   "docs/src/index.mdx"
-check_selection "UI-only change runs UI checks" \
-  "full_gate=false ui=true ci_lanes= identity=false storage=false rust_client=false" \
+check_selection "UI-only change runs UI checks and its generated contract check" \
+  "full_gate=false ui=true ci_lanes=codegen:check identity=false storage=false rust_client=false" \
   "crates/wyrd/wyrd-server/wyrd-ui/src/routes/+page.svelte"
 check_selection "Python SDK change runs Python on both platforms and its journey" \
   "full_gate=false python=true typescript=false ci_lanes~py:test:integration ci_lanes~codegen:check" \

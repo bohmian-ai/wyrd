@@ -73,7 +73,7 @@ IDENTITY_PACKAGES = {
     "wyrd-auth", "wyrd-auth-check", "wyrd-auth-issue", "wyrd-auth-oidc",
     "wyrd-auth-verify", "wyrd-client", "wyrd-server", "wyrd-testing",
 }
-CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "wyrd-sdk-python"}
+CODEGEN_PACKAGES = {"wyrd-spec", "wyrd-client", "wyrd-sdk-python", "wyrd-server"}
 RUST_CLIENT_PACKAGES = {"wyrd-client", "wyrd-sdk-rust"}
 EXAMPLE_PACKAGES = {"wyrd-rust-examples", "wyrd-cli"}
 # release-plz publishes these crates.
@@ -223,6 +223,7 @@ def select(paths, root):
         if UI.match(path):
             sel.flag("ui", f"UI input {path}")
             sel.flag("package_server", f"UI bundle input {path}")
+            sel.lane("codegen:check", f"UI consumers type-check against generated HTTP contracts ({path})")
         if STORAGE.match(path):
             sel.flag("storage", f"storage environment input {path}")
         if IDENTITY.match(path):

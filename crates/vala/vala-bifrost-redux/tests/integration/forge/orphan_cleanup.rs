@@ -1460,10 +1460,14 @@ async fn assert_takeover_replays_the_same_batch(
     let fixture = &batch.promoted.fixture;
     fixture.expire_claims().await;
     let reclaimed = vala_sql::queries::forge_tasks::ForgeTasks::new(fixture.operator_pool.clone())
-        .reclaim_expired(8)
+        .reclaim_expired_attempts(8)
         .await
         .expect("expired claims reclaim");
-    assert_eq!(reclaimed, 1, "the lapsed lease returns exactly this task");
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "the lapsed claim returns exactly this task"
+    );
     fixture.clear_task_backoff().await;
 
     let taker = ForgeWorker::new(

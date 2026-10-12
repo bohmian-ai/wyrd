@@ -720,14 +720,15 @@ async fn scribe_promotion_deadline_expires_before_conflict_retry() {
 /// Cancellation drains a parked promotion without settling anything.
 ///
 /// The coordinator is cancelled while its inline promotion commit is parked
-/// before delegation, so acceptance is unknown by construction. Draining must therefore release the
-/// attempt and its lease while leaving the operation Prepared: settling it
-/// either way would claim knowledge the worker does not have.
+/// before delegation, so acceptance is unknown by construction. Draining must therefore
+/// leave the operation Prepared, with its task claim left to lapse for a
+/// successor: settling it either way would claim knowledge the worker does
+/// not have.
 ///
 /// # Panics
 ///
-/// Panics when the drained operation leaves `prepared`, any sealed row is
-/// settled, or the drained attempt still holds its lease.
+/// Panics when the drained operation leaves `prepared` or any sealed row is
+/// settled.
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn scribe_promotion_cancellation_drains_without_settlement() {
@@ -764,37 +765,7 @@ async fn scribe_promotion_cancellation_drains_without_settlement() {
             .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
         "a drained promotion settled nothing: {unsettled:?}"
     );
-    assert_eq!(
-        live_forge_leases(&fixture).await,
-        0,
-        "the drained attempt released its lease"
-    );
     forge.shutdown().await;
-}
-
-/// Counts unexpired Forge leases still held over the fixture's own table.
-///
-/// The lease key is derived through the production key builder, so a renamed
-/// or re-scoped lease identity fails this read rather than silently counting
-/// zero.
-///
-/// # Panics
-///
-/// Panics when the read-only diagnostic query fails.
-async fn live_forge_leases(fixture: &ForgeFixture) -> i64 {
-    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
-        fixture.tenant,
-        &fixture.binding.logical_namespace,
-        &fixture.binding.table_name,
-    );
-    sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM vala.maintenance_leases \
-         WHERE lease_key = $1 AND expires_at > statement_timestamp()",
-    )
-    .bind(&lease_key)
-    .fetch_one(fixture.operator_pool.pool())
-    .await
-    .expect("Forge lease inspection")
 }
 
 /// Brings a retryable task's production backoff forward to now.
@@ -827,14 +798,14 @@ async fn release_retry_backoff(fixture: &ForgeFixture) {
 
 /// A promotion whose fence is stolen settles exactly once, by the successor.
 ///
-/// The commit is held open after acceptance while the durable lease is taken
-/// over. The original worker therefore returns without settling — its fence is
-/// gone — and the successor reconciles the same operation identity. What must
+/// The commit is held open after acceptance while the task's claim lapses. The
+/// original worker therefore returns without settling — its fence is gone —
+/// and the successor reconciles the same operation identity. What must
 /// never happen is two settlements, or a settled row with no snapshot behind
 /// it.
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn scribe_promotion_lease_loss_and_takeover_settle_once() {
+async fn scribe_promotion_claim_loss_and_takeover_settle_once() {
     let server = start_engine_fixture_server().await;
     let fixture = seed_forge_group(&server, "promotion_takeover").await;
     let sealed = file_rows(&fixture)
@@ -859,7 +830,7 @@ async fn scribe_promotion_lease_loss_and_takeover_settle_once() {
     )
     .await
     .expect("promotion commit reached the catalog boundary");
-    let stolen = steal_forge_lease(&fixture).await;
+    lapse_forge_claim(&fixture).await;
     catalog.reject_paused_commit();
 
     let forge = tokio::time::timeout(std::time::Duration::from_mins(1), held)
@@ -869,7 +840,6 @@ async fn scribe_promotion_lease_loss_and_takeover_settle_once() {
     forge.shutdown().await;
 
     reclaim_stopped_claim(&fixture).await;
-    release_forge_lease(&fixture, stolen).await;
     let mut forge = SupervisedForge::start_with_seams(
         &fixture,
         fixture.config.clone(),
@@ -898,65 +868,26 @@ async fn scribe_promotion_lease_loss_and_takeover_settle_once() {
     );
 }
 
-/// Takes the fixture table's durable Forge lease away from its current holder.
+/// Lapses the claim of the fixture table's one active Forge task.
 ///
-/// Expiring the row and re-acquiring it through the production lease query is
-/// what makes the takeover real: the successor's fencing token is issued by
-/// the same transaction a second worker process would use, so the displaced
-/// worker's fence assertions fail for the production reason.
-///
-/// # Panics
-///
-/// Panics when the lease cannot be expired or re-acquired.
-async fn steal_forge_lease(fixture: &ForgeFixture) -> uuid::Uuid {
-    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
-        fixture.tenant,
-        &fixture.binding.logical_namespace,
-        &fixture.binding.table_name,
-    );
-    sqlx::query(
-        "UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 second' \
-         WHERE lease_key = $1",
-    )
-    .bind(&lease_key)
-    .execute(fixture.operator_pool.pool())
-    .await
-    .expect("expire the Forge lease for a deterministic takeover");
-    let successor = uuid::Uuid::now_v7();
-    vala_sql::queries::maintenance_leases::try_acquire_lease(
-        &fixture.operator_pool,
-        &lease_key,
-        successor,
-        i64::try_from(fixture.config.lease_ttl.as_secs()).expect("lease seconds"),
-    )
-    .await
-    .expect("successor lease acquisition")
-    .expect("successor owns the expired Forge lease");
-    successor
-}
-
-/// Releases a lease this test took, so a real worker can acquire it again.
-///
-/// The theft stands in for a second Forge process; once its point is made the
-/// lease has to go back, or the reconciling worker fails for the artificial
-/// reason instead of proving anything.
+/// The active task's claim is the table's only exclusive authority, so aging
+/// it is exactly what a lost fence looks like to the holder: its next renewal
+/// or fenced commit matches no live claim and refuses for the production
+/// reason. The task's state, attempt, and owner are untouched.
 ///
 /// # Panics
 ///
-/// Panics when the lease release query fails.
-async fn release_forge_lease(fixture: &ForgeFixture, owner: uuid::Uuid) {
-    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
-        fixture.tenant,
-        &fixture.binding.logical_namespace,
-        &fixture.binding.table_name,
-    );
-    sqlx::query(
-        "UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 second' \
-         WHERE lease_key = $1 AND owner = $2",
+/// Panics when the update fails or the table does not hold exactly one claim.
+async fn lapse_forge_claim(fixture: &ForgeFixture) {
+    let lapsed = sqlx::query(
+        "UPDATE vala.forge_tasks \
+         SET claim_expires_at = statement_timestamp() - interval '1 second' \
+         WHERE data_tenant_id = $1 AND state IN ('claimed', 'running', 'prepared')",
     )
-    .bind(&lease_key)
-    .bind(owner)
+    .bind(fixture.tenant.as_uuid())
     .execute(fixture.operator_pool.pool())
     .await
-    .expect("release the stolen Forge lease");
+    .expect("lapse the Forge claim for a deterministic takeover")
+    .rows_affected();
+    assert_eq!(lapsed, 1, "the promotion holds exactly one table claim");
 }

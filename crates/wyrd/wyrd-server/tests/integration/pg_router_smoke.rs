@@ -1388,7 +1388,6 @@ async fn run_worker_over_invalid_prepared_evidence(
     server: &WyrdTestServer,
     observer: &vala_bifrost_redux::forge::ForgeWorkerCompletionObserver,
     table: &str,
-    arm_release_failure: bool,
 ) -> (String, uuid::Uuid, sqlx::PgPool) {
     register_forge_table(server, table).await;
     let pool = server
@@ -1404,9 +1403,6 @@ async fn run_worker_over_invalid_prepared_evidence(
     )
     .await;
     prepare_lapsed_attempt(&pool, task_id, UNRETAINED_EVIDENCE).await;
-    if arm_release_failure {
-        observer.fail_next_lease_release();
-    }
     let stop = server.state().shutdown_token.child_token();
     let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
@@ -1447,8 +1443,7 @@ async fn prepared_evidence_validation_failure_never_publishes_ready() {
         .expect("the default target selects Forge")
         .worker_readiness();
     let (error, task_id, pool) =
-        run_worker_over_invalid_prepared_evidence(&server, &observer, "prepared_validation", false)
-            .await;
+        run_worker_over_invalid_prepared_evidence(&server, &observer, "prepared_validation").await;
     assert!(
         error.contains("Prepared evidence snapshot is no longer retained"),
         "recovery returned an unrelated error: {error}"
@@ -1465,48 +1460,6 @@ async fn prepared_evidence_validation_failure_never_publishes_ready() {
     assert_eq!(
         state, "prepared",
         "invalid evidence was settled instead of retained for a later owner"
-    );
-    server.shutdown().await.expect("test server shuts down");
-}
-
-/// A reconciliation failure stays the reported error when its table-lease
-/// release fails too.
-///
-/// Both failures are fatal, but they are not equally diagnostic: the release
-/// failure is downstream of a reconciliation that already refused to proceed,
-/// so surfacing the release error would name the wrong cause.
-///
-/// # Panics
-///
-/// Panics when the release failure displaces the reconciliation error or
-/// readiness survives the pair.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn reconciliation_failure_outranks_its_release_failure() {
-    let (server, observer) = Box::pin(server_with_forge_observer()).await;
-    let readiness = server
-        .state()
-        .forge()
-        .expect("the default target selects Forge")
-        .worker_readiness();
-    let (error, _, _) =
-        run_worker_over_invalid_prepared_evidence(&server, &observer, "prepared_release", true)
-            .await;
-    assert!(
-        error.contains("Prepared evidence snapshot is no longer retained"),
-        "the release failure displaced the reconciliation error: {error}"
-    );
-    assert!(
-        !error.contains("injected Forge lease release failure"),
-        "the secondary release failure was reported as the cause: {error}"
-    );
-    assert!(
-        !observer.lease_release_failure_armed(),
-        "the release site was never reached, so nothing outranked anything"
-    );
-    assert!(
-        !readiness.is_ready(),
-        "a worker advertised ready after a fatal reconciliation and release pair"
     );
     server.shutdown().await.expect("test server shuts down");
 }

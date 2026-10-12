@@ -1001,9 +1001,7 @@ impl Forge {
             "scribe_promotion",
             Some((task_id, attempt_id)),
         );
-        if !lease.renew().await?
-            || !lease.commit_window_fits(self.core.config.commit_window())
-        {
+        if !lease.renew().await? || !lease.commit_window_fits(self.core.config.commit_window()) {
             return Err(lease.fence_lost());
         }
         let transaction = iceberg::transaction::Transaction::new(table);

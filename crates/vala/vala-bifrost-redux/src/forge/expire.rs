@@ -36,7 +36,6 @@ use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::expiry_policy::{SnapshotExpiryDecision, SnapshotExpiryPolicy, SnapshotProtectionRoots};
 use super::lease::ForgeLease;
-#[cfg(feature = "test-support")]
 use super::metrics::ForgeTelemetry;
 
 /// The minimum information needed to select snapshots without relying on

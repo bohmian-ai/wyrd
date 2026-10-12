@@ -653,7 +653,12 @@ fn manifest_rewrite_task(
     })?;
     let plan = ForgeTaskPlan {
         version: FORGE_TASK_PAYLOAD_VERSION,
-        inputs: plan.rewrite_paths.into_iter().collect::<BTreeSet<_>>().into_iter().collect(),
+        inputs: plan
+            .rewrite_paths
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         parameters: serde_json::json!({ "kind": MANIFEST_REWRITE_PARAMETER_KIND }),
     };
     let plan_hash = plan_hash(&plan)?;

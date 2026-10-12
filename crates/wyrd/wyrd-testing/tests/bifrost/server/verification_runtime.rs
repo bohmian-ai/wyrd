@@ -304,7 +304,6 @@ async fn drift_runner_without_local_oracle_reads_through_a_peer() -> Result<(), 
     Ok(())
 }
 
-
 /// A monthly schedule whose current window opens at the start of the month.
 ///
 /// The window closes at the Postgres instant the binding is made due, so an

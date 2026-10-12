@@ -3614,9 +3614,9 @@ impl ForgeWorker {
         self.open_rewrite_frame(claim, attempt, &binding, &mut lease, shutdown)
             .await
             .map(|frame| match frame {
-            OpenedFrame::Complete(settled) => settled.result,
-            OpenedFrame::Planned(..) => None,
-        })
+                OpenedFrame::Complete(settled) => settled.result,
+                OpenedFrame::Planned(..) => None,
+            })
     }
 
     /// Invokes the pre-effect shutdown release directly for one planted claim.

@@ -1346,9 +1346,7 @@ impl Forge {
             "iceberg_rewrite",
             Some((request.identity.task_id, request.identity.attempt_id)),
         );
-        if !lease.renew().await?
-            || !lease.commit_window_fits(self.core.config.commit_window())
-        {
+        if !lease.renew().await? || !lease.commit_window_fits(self.core.config.commit_window()) {
             return Ok(RewriteSubmission::NotSubmitted(lease.fence_lost()));
         }
         let transaction = match request.encode(table) {

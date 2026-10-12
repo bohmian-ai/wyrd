@@ -451,7 +451,14 @@ mod pg_tests {
         .await
         .expect("committed cancellation state");
         assert_eq!(terminal, ("cancelled".to_owned(), None, None));
-        assert_eq!(tasks.reclaim_expired_attempts(10).await.expect("reclaim").len(), 0);
+        assert_eq!(
+            tasks
+                .reclaim_expired_attempts(10)
+                .await
+                .expect("reclaim")
+                .len(),
+            0
+        );
     }
 
     /// Claims and starts one task with a caller-selected watermark.
@@ -595,7 +602,14 @@ mod pg_tests {
                 .is_err(),
             "expired claim cannot be revived by heartbeat"
         );
-        assert_eq!(tasks.reclaim_expired_attempts(10).await.expect("reclaim").len(), 1);
+        assert_eq!(
+            tasks
+                .reclaim_expired_attempts(10)
+                .await
+                .expect("reclaim")
+                .len(),
+            1
+        );
         let successor = Uuid::now_v7();
         let second = tasks
             .claim_fair(successor, claim_limits, None)

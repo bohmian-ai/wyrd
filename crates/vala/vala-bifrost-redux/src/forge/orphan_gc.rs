@@ -36,7 +36,6 @@ use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::expire::table_resource_for_key;
 use super::lease::ForgeLease;
-#[cfg(feature = "test-support")]
 use super::live_reconcile::DestructiveMaintenance;
 use super::managed::identity::ForgeOutputIdentity;
 use super::metrics::ForgeTelemetry;
@@ -818,12 +817,11 @@ impl Forge {
         )?;
         let tasks = ForgeTasks::new(self.core.operator_pool.clone());
         let (task_id, worker_id) = (Uuid::now_v7(), Uuid::now_v7());
-        let lease_seconds =
-            u32::try_from(self.core.config.lease_ttl.as_secs()).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "Forge claim TTL exceeds u32 seconds".to_owned(),
-                }
-            })?;
+        let lease_seconds = u32::try_from(self.core.config.lease_ttl.as_secs()).map_err(|_| {
+            ForgeError::InvalidConfig {
+                detail: "Forge claim TTL exceeds u32 seconds".to_owned(),
+            }
+        })?;
         let claim = tasks
             .insert_claimed(task_id, &task, worker_id, lease_seconds)
             .await
@@ -849,9 +847,14 @@ impl Forge {
             )
             .await
             .map_err(ForgeError::Sql)?;
-        let mut lease =
-            ForgeLease::confirm(tasks.clone(), task_id, attempt, worker_id, self.core.config.lease_ttl)
-                .await?;
+        let mut lease = ForgeLease::confirm(
+            tasks.clone(),
+            task_id,
+            attempt,
+            worker_id,
+            self.core.config.lease_ttl,
+        )
+        .await?;
         let outcome = self
             .run_orphan_gc_for_table(
                 &mut lease,

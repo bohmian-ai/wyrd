@@ -570,10 +570,7 @@ impl Forge {
                     .get(&snapshot_id)
                     .and_then(|snapshot| snapshot.rewrite_volume);
                 Self::require_running(context.stop)?;
-                context
-                    .lease
-                    .require_fence()
-                    .await?;
+                context.lease.require_fence().await?;
                 if !context
                     .lease
                     .commit_window_fits(self.core.config.commit_window())
@@ -632,10 +629,7 @@ impl Forge {
         outcome: &mut IcebergReconciliationOutcome,
     ) -> Result<(), ForgeError> {
         Self::require_running(context.stop)?;
-        context
-            .lease
-            .require_fence()
-            .await?;
+        context.lease.require_fence().await?;
         if !context
             .lease
             .commit_window_fits(self.core.config.commit_window())

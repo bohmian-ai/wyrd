@@ -1810,6 +1810,7 @@ impl Forge {
             .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
+        lease.assert_transaction_fence(&mut conn).await?;
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
             .map_err(ForgeError::Sql)?;
         let transition = if operation == "forge.orphan_gc.prepared" {
@@ -1825,7 +1826,6 @@ impl Forge {
         match transition {
             ForgeOperationTransition::Applied | ForgeOperationTransition::AlreadyApplied => {}
         }
-        lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
     }
 

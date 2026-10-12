@@ -144,10 +144,14 @@ impl ForgeLease {
         self.require_renewal().await
     }
 
-    /// Asserts this claim inside a tenant transaction immediately before commit.
+    /// Locks this claim as the first statement of a fenced tenant transaction.
     ///
-    /// The task row is locked for the rest of the transaction, so the claim
-    /// cannot be reclaimed or taken over between this check and the commit.
+    /// The task row is the first lock in Forge's canonical order and is held
+    /// for the rest of the transaction, so the claim cannot be reclaimed or
+    /// taken over before the commit. It must precede any transition in the
+    /// same transaction that moves the row out of an active state, and no
+    /// renewal may run while the transaction is open, because renewal updates
+    /// the same row from another connection.
     ///
     /// # Errors
     ///

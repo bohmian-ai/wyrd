@@ -1165,13 +1165,14 @@ impl Forge {
             ForgeOperationFamily::ScribePromotion.operation_prefix(),
             phase_suffix(phase)
         );
+        lease.require_fence().await?;
         let mut conn = self
             .core
             .vala
             .tenant_conn(binding.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        lease.require_fence().await?;
+        lease.assert_transaction_fence(&mut conn).await?;
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::ScribePromotion)
             .map_err(ForgeError::Sql)?;
         let transition = if phase == ForgeScribePromotionPhase::Prepared {
@@ -1196,7 +1197,6 @@ impl Forge {
             .await
             .map_err(ForgeError::Sql)?;
         }
-        lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
     }
 }

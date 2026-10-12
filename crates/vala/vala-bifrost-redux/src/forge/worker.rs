@@ -5589,7 +5589,6 @@ impl ForgeWorker {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
-        lease.require_fence().await?;
         let table = self.forge.load_table(&binding.table_ident()).await?;
         Ok(ForgeDispatchResult::SnapshotExpiry(Box::new(
             ForgeSnapshotExpiryResult {
@@ -7533,7 +7532,6 @@ impl ForgeWorker {
         stop: &CancellationToken,
     ) -> Result<(ForgeTaskEvidence, ForgeExecutionEvidenceState), ForgeError> {
         require_running(stop)?;
-        lease.require_fence().await?;
         // A snapshot expiration settled its own task, operation, claims, audits,
         // and planning demand in one transaction and deliberately deleted
         // nothing: its exact candidates are the handoff to separate cleanup.
@@ -7555,11 +7553,11 @@ impl ForgeWorker {
             .tenant_conn(claim.data_tenant_id)
             .await
             .map_err(ForgeError::Sql)?;
+        lease.assert_transaction_fence(&mut prepared).await?;
         self.tasks
             .prepared(&mut prepared, claim.task_id, attempt, self.owner, &evidence)
             .await
             .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut prepared).await?;
         prepared.commit().await.map_err(ForgeError::Sql)?;
         #[cfg(feature = "test-support")]
         if self
@@ -8483,11 +8481,11 @@ impl ForgeWorker {
             .tenant_conn(claim.data_tenant_id)
             .await
             .map_err(ForgeError::Sql)?;
+        lease.assert_transaction_fence(&mut prepared).await?;
         self.tasks
             .prepared(&mut prepared, claim.task_id, attempt, self.owner, evidence)
             .await
             .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut prepared).await?;
         prepared.commit().await.map_err(ForgeError::Sql)?;
 
         let mut terminal = self
@@ -8497,6 +8495,7 @@ impl ForgeWorker {
             .tenant_conn(claim.data_tenant_id)
             .await
             .map_err(ForgeError::Sql)?;
+        lease.assert_transaction_fence(&mut terminal).await?;
         let progress_effect = task_progress_effect(
             &claim.strategy,
             claim.base_snapshot_id,
@@ -8519,7 +8518,6 @@ impl ForgeWorker {
             )
             .await
             .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut terminal).await?;
         terminal.commit().await.map_err(ForgeError::Sql)?;
         tracing::debug!(
             progressed = matches!(progress_effect, TaskProgressEffect::Progressed),
@@ -8548,11 +8546,11 @@ impl ForgeWorker {
             .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
+        lease.assert_transaction_fence(&mut terminal).await?;
         self.tasks
             .terminal_success(&mut terminal, transition, table_ref, progress_effect)
             .await
             .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut terminal).await?;
         terminal.commit().await.map_err(ForgeError::Sql)?;
         tracing::debug!(
             progressed = matches!(progress_effect, TaskProgressEffect::Progressed),

@@ -67,7 +67,7 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        lease.require_fence().await?;
+        lease.assert_transaction_fence(&mut conn).await?;
         #[cfg(feature = "test-support")]
         if operation == "forge.iceberg_rewrite.prepared"
             && FAIL_NEXT_PREPARED_LIVE_TRANSITION.swap(false, Ordering::AcqRel)
@@ -112,7 +112,6 @@ impl Forge {
                 .await
                 .map_err(ForgeError::Sql)?;
         }
-        lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
     }
 }

@@ -163,8 +163,8 @@ struct ClaimPublicationProbe {
     hold: bool,
     /// Claim publications currently waiting at the hold.
     held: usize,
-    /// Times a publisher found every claim slot held by another publication
-    /// and waited for one to be released.
+    /// Times an awaiting publisher waited for a claim another publication
+    /// drives, including one holding every claim slot.
     claim_slot_waits: usize,
     /// Claims whose publication committed and settled.
     published_claims: usize,
@@ -214,7 +214,7 @@ impl PersistenceFaults {
 
     /// Waits until a second publisher contends for the claim slots: either
     /// more than `budget` claim publications are held at once, or one waited
-    /// because every slot was held.
+    /// for a claim another publication drives.
     pub async fn wait_for_claim_contention_for_test(&self, budget: usize) {
         let mut probe = self.claim_probe.subscribe();
         let _ = probe
@@ -241,7 +241,7 @@ impl PersistenceFaults {
         self.claim_probe.send_modify(|probe| probe.held -= 1);
     }
 
-    /// Records that a publisher waited for another publication's claim slot.
+    /// Records that a publisher waited for a claim another publication drives.
     fn note_claim_slot_wait(&self) {
         self.claim_probe
             .send_modify(|probe| probe.claim_slot_waits += 1);
@@ -1364,7 +1364,8 @@ fn merge_lane_threads(
 enum ClaimSlotWait {
     /// End the pass; a periodic caller takes the remaining work next time.
     Yield,
-    /// Wait for another publisher's claim to settle or become retryable.
+    /// Wait for every claim another publisher drives to settle or become
+    /// retryable before ending.
     Await,
 }
 
@@ -2269,7 +2270,10 @@ impl PersistenceWorker {
     /// stops taking claims and lets its own in-flight claims settle; when it
     /// has none, `slots` decides whether it ends the pass
     /// ([`ClaimSlotWait::Yield`]) or waits for another publisher's claim to
-    /// end its drive ([`ClaimSlotWait::Await`]).
+    /// end its drive ([`ClaimSlotWait::Await`]). An awaiting publisher also
+    /// waits, with nothing left to take, until no other publisher in this
+    /// process drives a claim, so no member staged before it ends is still
+    /// being published when it returns.
     ///
     /// # Errors
     ///
@@ -2328,15 +2332,21 @@ impl PersistenceWorker {
                 }
             }
             if in_flight.is_empty() {
-                let (Some(budget), ClaimSlotWait::Await, None) = (exhausted, slots, &failure)
-                else {
+                let (ClaimSlotWait::Await, None) = (slots, &failure) else {
                     break;
                 };
+                // A claim another publisher drives holds members this pass
+                // must settle, whether or not it also holds the last slot.
                 if !staging.drives_no_claims() {
                     #[cfg(any(test, feature = "test-support"))]
                     self.faults.note_claim_slot_wait();
                     released.await;
-                } else if released.as_mut().now_or_never().is_none() {
+                    continue;
+                }
+                let Some(budget) = exhausted else {
+                    break;
+                };
+                if released.as_mut().now_or_never().is_none() {
                     failure = Some(ClaimTakeError::BudgetExhausted { budget }.into());
                     break;
                 }
@@ -2365,8 +2375,9 @@ impl PersistenceWorker {
     ///
     /// An outstanding claim whose publication was refused is resumed before
     /// the ready sweep, because settlement is what returns members to the
-    /// budget and a refused claim never settled. When every claim slot is held
-    /// by another publisher, the flush waits for one rather than failing.
+    /// budget and a refused claim never settled. While another publisher in
+    /// this process drives a claim, including one holding every claim slot,
+    /// the flush waits for it to settle rather than returning or failing.
     ///
     /// # Errors
     ///

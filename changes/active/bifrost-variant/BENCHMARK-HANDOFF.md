@@ -177,10 +177,9 @@ fix.
 ### Next steps
 
 1. Repeat the regressing hot reads and Parquet write rows to confirm them.
-2. Regenerate matched `cfe21dc90` profiles in the
-   `wyrd-bifrost-variant-task-003` worktree. The
-   `target/bifrost-query-capacity-premerge-cfe21dc90/` profiles cited below no
-   longer exist, so the merged profiles have nothing to be diffed against.
+2. Profile the merged branch. The baseline latency breakdowns and CPU
+   Paretos per case are recorded under "Open optimization opportunities"
+   below; compare against those, not against a rebuilt `cfe21dc90`.
 3. Diff the latency and CPU Paretos case by case, starting with selective
    x64 hot, the hot memory growth and the Parquet write p99. Trace each
    regressing stage with `WYRD_LOG` before changing code.

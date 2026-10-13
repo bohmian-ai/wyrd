@@ -77,9 +77,28 @@ jobs:
   # change runs format, lint, the boundary checks, and exactly the lanes
   # selected for its affected packages, with the identity and storage journeys
   # as their own jobs when selected.
+  # Compiles the third-party dependency set once, before any shard starts.
+  # workspace-hack is that set with the features every test build unifies to,
+  # so each shard restores it from the `test` cache instead of compiling it.
+  deps:
+    name: deps
+    needs: changes
+    if: needs.changes.outputs.ci_jobs != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          save-cache: always
+
+      - name: Build the shared dependencies
+        run: mise exec -- cargo build --locked -p workspace-hack
+
   ci:
     name: ci (${{ matrix.job.name }})
-    needs: changes
+    needs: [changes, deps]
     if: needs.changes.outputs.ci_jobs != '[]'
     runs-on: ubuntu-24.04
     timeout-minutes: 150
@@ -282,7 +301,7 @@ jobs:
 
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, ci, rust-client, typescript, python, docs, ui]
+    needs: [changes, matrix-plan, deps, ci, rust-client, typescript, python, docs, ui]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -295,6 +314,7 @@ jobs:
           .github/scripts/verify-required-jobs.sh
           "${{ needs.changes.result }}"
           "${{ needs.matrix-plan.result }}"
+          "${{ needs.deps.result }}"
           "${{ needs.ci.result }}"
           "${{ needs.rust-client.result }}"
           "${{ needs.typescript.result }}"

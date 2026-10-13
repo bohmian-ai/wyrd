@@ -24,9 +24,10 @@ inputs:
     default: test
   save-cache:
     description: >-
-      Save the cache after the job. Only one job per cache-key passes true, and
-      only main saves, so pull requests restore main's cache instead of
-      evicting it with their own.
+      Save the cache after the job: "true" saves on main only, so pull
+      requests restore main's cache instead of evicting it with their own;
+      "always" also saves on pull requests, for the one deps job whose cache
+      the run's shards restore. One job per cache-key saves.
     default: "false"
   bfd-linker:
     description: Force the GNU BFD linker on Linux (workaround for lld issues).
@@ -71,7 +72,7 @@ runs:
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: ${{ inputs.cache-key }}
-        save-if: ${{ inputs.save-cache == 'true' && github.ref == 'refs/heads/main' }}
+        save-if: ${{ inputs.save-cache == 'always' || (inputs.save-cache == 'true' && github.ref == 'refs/heads/main') }}
         # A red run still compiled the dependency set; saving it keeps the next
         # run from starting cold.
         cache-on-failure: true

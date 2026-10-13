@@ -20,8 +20,9 @@ WYRD_CARGO_METADATA names a prepared `cargo metadata` document for self-tests.
 `ci_jobs` is the JSON matrix of the Linux `ci` job: one entry per parallel job,
 each running its space-separated `lanes` and restoring the Rust cache named by
 `cache`. The complete gate runs one job per `gate:*` shard listed in mise.toml,
-so every lane runs exactly once; `save` marks the one shard per cache that
-refreshes it from main.
+so every lane runs exactly once. The `deps` job builds and saves the shared
+`test` cache before any shard starts; `save` marks the one shard that refreshes
+each other cache from main.
 """
 
 import json
@@ -120,7 +121,7 @@ def gate_jobs(root):
     with open(os.path.join(root, "mise.toml"), "rb") as manifest:
         shards = tomllib.load(manifest)["tasks"]["gate"]["depends"]
     jobs = [{"name": shard, "lanes": shard, "cache": SHARD_CACHE.get(shard, "test")} for shard in shards]
-    for cache in {job["cache"] for job in jobs}:
+    for cache in {job["cache"] for job in jobs} - {"test"}:
         next(job for job in jobs if job["cache"] == cache)["save"] = True
     return jobs
 

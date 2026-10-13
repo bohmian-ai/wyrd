@@ -5915,8 +5915,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when the query runtime has no spill directory, or when one
-    /// survives the envelope while a foreign runtime holder is still alive.
+    /// Panics when the query's first spill creates no spill directory, or when
+    /// one survives the envelope while a foreign runtime holder is still alive.
     #[test]
     fn query_spill_directory_ends_with_its_envelope_not_its_runtime() {
         let root = tempfile::tempdir().expect("scratch root");
@@ -5930,6 +5930,10 @@ mod tests {
             .try_acquire_query(analytical_query(8))
             .expect("an idle Oracle admits one analytical query");
         let holder = Arc::clone(query.execution().runtime());
+        let spill = holder
+            .disk_manager
+            .create_tmp_file("oracle-query-spill")
+            .expect("the first spill creates the spill directory");
         let directories = holder.disk_manager.temp_dir_paths();
         assert!(
             !directories.is_empty() && directories.iter().all(|path| path.exists()),
@@ -5941,6 +5945,7 @@ mod tests {
             directories.iter().all(|path| !path.exists()),
             "the envelope removed its spill directory while a holder kept the runtime"
         );
+        drop(spill);
         drop(holder);
     }
 

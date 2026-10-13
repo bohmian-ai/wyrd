@@ -585,15 +585,15 @@ mod tests {
         )
         .expect("the governed managed context builds");
         let runtime = context.runtime_env();
+        let spill_file = runtime
+            .disk_manager
+            .create_tmp_file("forge-rewrite-spill")
+            .expect("the disk manager creates a spill file");
         let spill_dirs = runtime.disk_manager.temp_dir_paths();
         assert!(
             !spill_dirs.is_empty() && spill_dirs.iter().all(|dir| dir.starts_with(spill.path())),
             "spills land beneath the leased forge-spill root, saw {spill_dirs:?}"
         );
-        let spill_file = runtime
-            .disk_manager
-            .create_tmp_file("forge-rewrite-spill")
-            .expect("the disk manager creates a spill file");
         assert!(
             spill_file
                 .path()

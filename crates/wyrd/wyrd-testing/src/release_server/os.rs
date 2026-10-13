@@ -1,12 +1,14 @@
 //! The host and process readings a [`super::LocalServer`] running on the
 //! whole host needs, for the two operating systems the benchmarks run on.
 //!
-//! Linux reads `/proc`. macOS asks the kernel through `libc`: `sysctl` for
-//! the host and `proc_pid_rusage` for a process.
+//! Linux reads `/proc`. macOS reads through safe wrappers over the kernel
+//! interfaces: `sysinfo` for the host and CPU time, and `libproc`'s
+//! `proc_pid_rusage` for a process's lifetime peak footprint.
 
+#[cfg(target_os = "linux")]
+pub(crate) use imp::reset_peak_memory;
 pub(crate) use imp::{
-    cpu_model, memory_bytes, peak_memory_bytes, process_cpu_usec, reset_peak_memory,
-    self_cpu_seconds,
+    cpu_model, memory_bytes, peak_memory_bytes, process_cpu_usec, self_cpu_seconds,
 };
 
 /// `/proc` readings.
@@ -124,153 +126,99 @@ mod imp {
     }
 }
 
-/// `sysctl` and `proc_pid_rusage` readings.
+/// `sysinfo` and `libproc` readings.
+///
+/// The workspace denies `unsafe`, so macOS reads through these safe
+/// wrappers rather than calling `libc` directly.
 #[cfg(target_os = "macos")]
 mod imp {
-    use std::ffi::CStr;
     use std::io;
-    use std::mem::MaybeUninit;
 
-    /// Ratio converting Mach absolute time to nanoseconds, which
-    /// `rusage_info_v4` CPU times are counted in on Apple silicon.
-    #[repr(C)]
-    struct Timebase {
-        /// Numerator of the ratio.
-        numer: u32,
-        /// Denominator of the ratio.
-        denom: u32,
-    }
-
-    unsafe extern "C" {
-        /// Fills `info` with the Mach timebase; `libc`'s binding is
-        /// deprecated in favour of the `mach2` crate, which this one call
-        /// does not warrant.
-        fn mach_timebase_info(info: *mut Timebase) -> libc::c_int;
-    }
+    use libproc::pid_rusage::{RUsageInfoV4, pidrusage};
+    use sysinfo::{
+        CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System,
+    };
 
     /// `machdep.cpu.brand_string`, or `unknown`.
     pub(crate) fn cpu_model() -> String {
-        let mut buffer = [0_u8; 256];
-        let mut len = buffer.len();
-        // SAFETY: `buffer` holds `len` writable bytes and the name is
-        // NUL-terminated; sysctlbyname writes at most `len` bytes.
-        let status = unsafe {
-            libc::sysctlbyname(
-                c"machdep.cpu.brand_string".as_ptr(),
-                buffer.as_mut_ptr().cast(),
-                &raw mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status != 0 {
-            return "unknown".to_owned();
-        }
-        String::from_utf8_lossy(&buffer[..len])
-            .trim_end_matches('\0')
-            .trim()
-            .to_owned()
+        let system =
+            System::new_with_specifics(RefreshKind::nothing().with_cpu(CpuRefreshKind::nothing()));
+        system
+            .cpus()
+            .first()
+            .map(|cpu| cpu.brand().trim().to_owned())
+            .filter(|brand| !brand.is_empty())
+            .unwrap_or_else(|| "unknown".to_owned())
     }
 
     /// `hw.memsize`, the physical memory in bytes.
     ///
     /// # Errors
     ///
-    /// Returns the OS error when the sysctl fails.
+    /// Returns an error when the kernel reports no physical memory.
     pub(crate) fn memory_bytes() -> io::Result<u64> {
-        sysctl_u64(c"hw.memsize")
+        let mut system = System::new();
+        system.refresh_memory();
+        match system.total_memory() {
+            0 => Err(io::Error::other("sysinfo read no physical memory")),
+            bytes => Ok(bytes),
+        }
     }
 
     /// Microseconds of user plus system CPU process `pid` has used; zero
     /// when it is gone.
+    ///
+    /// `sysinfo` converts Apple-silicon Mach time to wall units and reports
+    /// milliseconds.
     pub(crate) fn process_cpu_usec(pid: u32) -> u64 {
-        let Ok(info) = rusage(pid) else {
-            return 0;
-        };
-        let mut timebase = Timebase { numer: 0, denom: 0 };
-        // SAFETY: mach_timebase_info fills the two-field struct it is given.
-        if unsafe { mach_timebase_info(&raw mut timebase) } != 0 || timebase.denom == 0 {
-            return 0;
-        }
-        let nanos = u128::from(info.ri_user_time.saturating_add(info.ri_system_time))
-            * u128::from(timebase.numer)
-            / u128::from(timebase.denom);
-        u64::try_from(nanos / 1_000).unwrap_or(u64::MAX)
+        let pid = Pid::from_u32(pid);
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_cpu(),
+        );
+        system.process(pid).map_or(0, |process| {
+            process.accumulated_cpu_time().saturating_mul(1_000)
+        })
     }
 
     /// Seconds of user plus system CPU this process has used; zero when
     /// unreadable.
     pub(crate) fn self_cpu_seconds() -> f64 {
-        let mut usage = MaybeUninit::<libc::rusage>::uninit();
-        // SAFETY: getrusage writes a complete rusage on success.
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
-            return 0.0;
-        }
-        // SAFETY: the call succeeded, so the value is initialized.
-        let usage = unsafe { usage.assume_init() };
-        let seconds = |time: libc::timeval| time.tv_sec as f64 + f64::from(time.tv_usec) / 1e6;
-        seconds(usage.ru_utime) + seconds(usage.ru_stime)
-    }
-
-    /// macOS keeps only a process's lifetime peak, so there is nothing to
-    /// reset; a window's peak is the peak since the process started.
-    ///
-    /// # Errors
-    ///
-    /// Never fails; fallible to match the Linux reset.
-    pub(crate) fn reset_peak_memory(_pid: u32) -> io::Result<()> {
-        Ok(())
+        process_cpu_usec(std::process::id()) as f64 / 1e6
     }
 
     /// Process `pid`'s lifetime peak physical footprint, in bytes.
     ///
     /// # Errors
     ///
-    /// Returns the OS error when the process cannot be read.
+    /// Returns an error when the pid is out of range or the process cannot
+    /// be read.
     pub(crate) fn peak_memory_bytes(pid: u32) -> io::Result<u64> {
-        Ok(rusage(pid)?.ri_lifetime_max_phys_footprint)
+        let pid = i32::try_from(pid).map_err(io::Error::other)?;
+        let info = pidrusage::<RUsageInfoV4>(pid).map_err(io::Error::other)?;
+        Ok(info.ri_lifetime_max_phys_footprint)
     }
 
-    /// Reads an integer sysctl.
-    ///
-    /// # Errors
-    ///
-    /// Returns the OS error when the sysctl fails.
-    fn sysctl_u64(name: &CStr) -> io::Result<u64> {
-        let mut value = 0_u64;
-        let mut len = size_of::<u64>();
-        // SAFETY: `value` is a u64 of exactly `len` writable bytes and the
-        // name is NUL-terminated.
-        let status = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                (&raw mut value).cast(),
-                &raw mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if status != 0 {
-            return Err(io::Error::last_os_error());
+    #[cfg(test)]
+    mod tests {
+        /// This process has a CPU model, memory, CPU time, and a peak
+        /// footprint.
+        ///
+        /// # Panics
+        ///
+        /// Panics when a reading is missing or zero.
+        #[test]
+        fn reads_this_process_and_host() {
+            let pid = std::process::id();
+            assert_ne!(super::cpu_model(), "unknown");
+            assert!(super::memory_bytes().expect("hw.memsize") > 0);
+            let busy: u64 = (0..20_000_000_u64).fold(0, |sum, n| sum.wrapping_add(n * n));
+            std::hint::black_box(busy);
+            assert!(super::process_cpu_usec(pid) > 0);
+            assert!(super::self_cpu_seconds() > 0.0);
+            assert!(super::peak_memory_bytes(pid).expect("proc_pid_rusage") > 0);
         }
-        Ok(value)
-    }
-
-    /// Process `pid`'s `rusage_info_v4`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the OS error when the process cannot be read.
-    fn rusage(pid: u32) -> io::Result<libc::rusage_info_v4> {
-        let pid = libc::c_int::try_from(pid).map_err(io::Error::other)?;
-        let mut info = MaybeUninit::<libc::rusage_info_v4>::uninit();
-        // SAFETY: RUSAGE_INFO_V4 fills a complete rusage_info_v4.
-        let status =
-            unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) };
-        if status != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the call succeeded, so the value is initialized.
-        Ok(unsafe { info.assume_init() })
     }
 }

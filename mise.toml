@@ -173,11 +173,11 @@ run = [
   # share the test builds' third-party artifacts instead of rebuilding them.
   "cargo build --locked -p wyrd-cli -p wyrd-server --bins --tests",
   "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads)'",
-  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]",
-  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]",
-  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[exit]",
-  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]",
-  "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[exit]",
+  "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[python]",
+  "scripts/postgres/with-test-postgres.sh -- node scripts/check_ts_package.mjs mise exec -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m local_dev tests/integration/test_local_development.py::test_installed_cli_bootstrap[typescript]",
 ]
 
 [tasks."test:wyrdstate:journey"]
@@ -331,7 +331,6 @@ cargo nextest run --locked \
   -p wyrd-testing --test forge --test scribe --test oracle --test otlp --test server \
   -p wyrd-mcp --test mcp \
   -p vala-bifrost-redux --test integration \
-  --features wyrd-client/test-support \
   -P journey --run-ignored=only \
   -E "not test(=qualification::scribe_512_mib_physical_object_qualifies) and (not package(wyrd-client) or test(/^pg_bifrost_e2e::/))"'
 """
@@ -655,7 +654,7 @@ hide = true
 description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
 dir = "sdks/wyrd-sdk-python"
 depends = ["py:setup"]
-run = "uv run python -m pytest -q -m integration tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
+run = "uv run python -m pytest -q -m 'integration and not local_dev' tests/integration/bifrost tests/integration/test_query_bifrost.py tests/integration/test_otel_export.py tests/integration/otel/test_otel_signals.py tests/integration/test_observe_a_run.py tests/integration/observe/test_observation_surface.py tests/integration/test_verify_in_real_time.py tests/integration/test_local_development.py tests/integration/test_support_desk.py tests/integration/test_scheduled_drift_alerts_operator.py tests/integration/test_operator_connections.py"
 
 [tasks."test:bifrost:journey:typescript"]
 description = "Tier-1 journeys: TypeScript Bifrost client, query and write surfaces"
@@ -1130,7 +1129,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "Run wyrd.testing integration journeys against a live Postgres-backed server"
 dir = "sdks/wyrd-sdk-python"
-run = "uv run python -m pytest -q -m 'integration and not identity'"
+run = "uv run python -m pytest -q -m 'integration and not identity and not local_dev'"
 
 [tasks."py:test:cards:integration"]
 hide = true
@@ -1575,10 +1574,7 @@ exactly one shard. The only tests outside gate are the scheduled production-geom
 depends = [
   "gate:checks",
   "gate:rust",
-  "gate:bifrost",
   "gate:storage",
-  "gate:identity",
-  "gate:sdk-journeys",
   "gate:python",
   "gate:typescript",
 ]
@@ -1590,28 +1586,13 @@ depends = ["check", "check:deps", "check:tenant-isolation", "check:storage:drift
 
 [tasks."gate:rust"]
 hide = true
-description = "Gate shard: every Rust family lane and the ignored gateway journeys"
-depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:gateway:gate"]
-
-[tasks."gate:bifrost"]
-hide = true
-description = "Gate shard: the ignored Bifrost journeys; the family and SDK shards run every other Bifrost test"
-depends = ["test:bifrost:gate"]
+description = "Gate shard: every Rust family lane and every Rust-built journey (gateway, Bifrost, identity, SDK stories, installed CLI), sharing one compile"
+depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:gateway:gate", "test:bifrost:gate", "test:identity:journey", "test:rust-sdk:journey", "test:local-dev:journey"]
 
 [tasks."gate:storage"]
 hide = true
 description = "Gate shard: the object-store emulator matrix"
 depends = ["test:storage:matrix"]
-
-[tasks."gate:identity"]
-hide = true
-description = "Gate shard: every identity journey against Keycloak and Dex"
-depends = ["test:identity:journey"]
-
-[tasks."gate:sdk-journeys"]
-hide = true
-description = "Gate shard: the Rust SDK story journeys and the installed-CLI bootstrap journeys"
-depends = ["test:rust-sdk:journey", "test:local-dev:journey"]
 
 [tasks."gate:python"]
 hide = true

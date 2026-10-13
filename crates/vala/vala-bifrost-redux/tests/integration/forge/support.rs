@@ -2446,16 +2446,45 @@ impl SupervisedPromotion {
     ///
     /// Panics when a deterministic bound is missed or the attempt succeeded.
     pub(crate) async fn run_one_failure(&mut self) -> String {
+        self.run_one_failure_progressing(|| 0).await
+    }
+
+    /// Schedule one pass and await exactly one returned worker error, bounding
+    /// the attempt by stalls rather than by its total length.
+    ///
+    /// An attempt whose plans each spend the production conflict-retry
+    /// schedule sleeps for that schedule once per plan, so its total length
+    /// grows with the plan count while no single step does. The attempt bound
+    /// therefore restarts whenever `progress` — a monotonic counter such as
+    /// the catalog seam's commit attempts — has advanced since the last
+    /// window. A window of [`FIXTURE_BOUND`] with no progress is a stuck
+    /// worker. [`Self::run_one_failure`] passes a constant counter, so its
+    /// attempt keeps the single fixed bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a window passes without progress, another deterministic
+    /// bound is missed, or the attempt succeeded.
+    pub(crate) async fn run_one_failure_progressing(
+        &mut self,
+        progress: impl Fn() -> usize,
+    ) -> String {
         let before = self.worker_observer.returned_errors();
         self.worker_observer.hold_after_next_attempt_for_test();
         self.start_armed_worker();
         let pass = self.request_pass();
-        tokio::time::timeout(
+        let mut seen = progress();
+        while tokio::time::timeout(
             FIXTURE_BOUND,
             self.worker_observer.wait_for_held_attempt_for_test(),
         )
         .await
-        .expect("production Forge worker attempt bound");
+        .is_err()
+        {
+            let now = progress();
+            assert!(now > seen, "production Forge worker attempt bound");
+            seen = now;
+        }
         self.stop_worker().await;
         self.await_pass(pass).await;
         let after = self.worker_observer.returned_errors();

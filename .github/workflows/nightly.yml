@@ -25,14 +25,39 @@ jobs:
       - id: plan
         run: python3 .github/scripts/select-ci.py --gate
 
+  # Compiles the third-party dependency set once, before any shard starts:
+  # building the workspace's tests compiles every dependency with the features
+  # the shards' test builds use, and the cache keeps only those dependencies.
+  # Each shard restores it from the `test` cache instead of compiling it. An
+  # exact cache hit already holds the set, so the build is skipped.
+  deps:
+    name: deps
+    needs: plan
+    if: needs.plan.outputs.ci_jobs != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: setup
+        uses: ./.github/actions/setup-rust-ci
+        with:
+          save-cache: always
+
+      - name: Build the shared dependencies
+        if: steps.setup.outputs.cache-hit != 'true'
+        run: >-
+          mise exec -- cargo build --locked --workspace --tests
+          --exclude wyrd-sdk-python --exclude wyrd-sdk-ts --exclude wyrd-sdk-ts-testing
+
   # The complete gate, one parallel job per `gate:*` shard in mise.toml: the
   # same jobs a full-gate pull request runs. Live cloud and production-geometry
   # qualification run in their own workflows.
   gate:
     name: nightly ${{ matrix.job.name }}
-    needs: plan
+    needs: [plan, deps]
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
@@ -50,6 +75,8 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # Shards that never run uv have nothing to cache.
+          ignore-nothing-to-cache: true
           python-version: "3.12"
 
       - name: Install Rust components

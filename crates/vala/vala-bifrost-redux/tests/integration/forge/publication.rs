@@ -492,7 +492,11 @@ async fn assert_spent_retry_closes_every_operation(phase: SpentRetryPhase<'_>) {
     // success.
     catalog.reject_next_commits(usize::MAX);
     supervisor.restart_worker();
-    let error = supervisor.run_one_failure().await;
+    // Each refused plan sleeps the whole production retry schedule, so the
+    // attempt is bounded by stalls between commit attempts, not by its length.
+    let error = supervisor
+        .run_one_failure_progressing(|| catalog.attempts())
+        .await;
     supervisor.shutdown().await;
     let phases = promoted.fixture.rewrite_phases().await;
     let refused_plans = phases.iter().filter(|phase| *phase == "reset").count();

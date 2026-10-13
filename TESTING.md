@@ -85,8 +85,8 @@ mise run test:bifrost:journey:scribe:production-geometry  # scheduled 512 MiB ob
 ```
 
 `gate` runs every Bifrost test except the two production-geometry
-qualifications: `gate:bifrost` runs the ignored journeys, and the family, SDK,
-Python, and TypeScript shards run the rest. `test:bifrost` is the same proof as
+qualifications: `gate:rust` runs the ignored journeys with the family lanes, and
+the Python and TypeScript shards run the SDK files. `test:bifrost` is the same proof as
 one standalone lane, so `gate` does not run it again.
 
 ### SDKs
@@ -99,8 +99,8 @@ mise run test:identity:journey           # every identity journey against Keyclo
 ```
 
 The identity journeys need Keycloak and Dex, so they run only in
-`test:identity:journey`, not in the `verify:*-sdk` tasks; `gate` runs it once as
-its `gate:identity` shard.
+`test:identity:journey`, not in the `verify:*-sdk` tasks; `gate` runs it once in
+its `gate:rust` shard.
 
 ### Everything else
 

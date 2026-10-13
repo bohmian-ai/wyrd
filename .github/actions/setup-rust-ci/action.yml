@@ -24,13 +24,19 @@ inputs:
     default: test
   save-cache:
     description: >-
-      Save the cache after the job. Only one job per cache-key passes true, and
-      only main saves, so pull requests restore main's cache instead of
-      evicting it with their own.
+      Save the cache after the job: "true" saves on main only, so pull
+      requests restore main's cache instead of evicting it with their own;
+      "always" also saves on pull requests, for the one deps job whose cache
+      the run's shards restore. One job per cache-key saves.
     default: "false"
   bfd-linker:
     description: Force the GNU BFD linker on Linux (workaround for lld issues).
     default: "true"
+
+outputs:
+  cache-hit:
+    description: "true when the Rust cache restored an exact key match."
+    value: ${{ steps.rust-cache.outputs.cache-hit }}
 
 runs:
   using: composite
@@ -47,6 +53,20 @@ runs:
         docker-images: ${{ inputs.docker-images }}
         swap-storage: true
 
+    # Linking several server-sized test binaries at once exceeds the runner's
+    # RAM; without enough swap the runner is killed mid-link.
+    - name: Add swap
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo swapoff -a
+        sudo rm -f /mnt/swapfile
+        sudo fallocate -l 16G /mnt/swapfile
+        sudo chmod 600 /mnt/swapfile
+        sudo mkswap /mnt/swapfile
+        sudo swapon /mnt/swapfile
+        free -h
+
     - name: Set up mise
       uses: jdx/mise-action@v3
       with:
@@ -54,10 +74,11 @@ runs:
         cache: true
 
     - name: Cache Rust
+      id: rust-cache
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: ${{ inputs.cache-key }}
-        save-if: ${{ inputs.save-cache == 'true' && github.ref == 'refs/heads/main' }}
+        save-if: ${{ inputs.save-cache == 'always' || (inputs.save-cache == 'true' && github.ref == 'refs/heads/main') }}
         # A red run still compiled the dependency set; saving it keeps the next
         # run from starting cold.
         cache-on-failure: true

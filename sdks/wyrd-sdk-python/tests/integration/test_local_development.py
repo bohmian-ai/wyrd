@@ -411,6 +411,7 @@ def installed_local_cli(
                     os.close(master)
 
 
+@pytest.mark.local_dev
 @pytest.mark.parametrize("runtime", ["rust", "python", "typescript", "interrupt", "exit"])
 def test_installed_cli_bootstrap(runtime: str) -> None:
     """Run fresh SDK processes through real installed startup and shutdown.

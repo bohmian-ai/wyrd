@@ -328,6 +328,13 @@ allow_attributes_without_reason = "warn"
 [profile.dev]
 debug = "line-tables-only"
 
+# Pin build scripts and proc-macros to the same debug info. Left unset, Cargo
+# gives a build-time crate debug info only when the same build also uses it as
+# a normal dependency, so a workspace build and a per-package build hash
+# quote/syn/serde_derive differently and rebuild everything downstream of them.
+[profile.dev.build-override]
+debug = "line-tables-only"
+
 # Local image builds, test lanes, and benchmarks. Four codegen units recover
 # most cross-unit inlining without the single-unit build time `dist` pays.
 [profile.release]

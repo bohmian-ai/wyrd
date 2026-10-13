@@ -15,9 +15,10 @@
   // shared header drops its status chip — one status authority per page.
   const pageWorkspace = $derived(workspace?.layout === 'page' && !!detail.presentation);
   const viewingPrior = $derived(detail.version !== detail.currentVersion);
-  function versionHref(version: string): string {
-    return version === detail.currentVersion ? page.url.pathname : `?version=${version}`;
-  }
+  // Explicit: the URL's UID pins its own version, which need not be current.
+  const versionHref = (version: string) => `?version=${encodeURIComponent(version)}`;
+  // The live registry lists bare versions; provenance columns render only when known.
+  const provenance = $derived(detail.versions.some((row) => row.created));
 </script>
 
 <svelte:head><title>{detail.name} · Cards · Wyrd</title></svelte:head>
@@ -46,7 +47,7 @@
       <div class="notice">
         <p class="mono muted">
           Viewing {detail.version} read-only — {detail.currentVersion} is current.
-          <a href={page.url.pathname}>Back to {detail.currentVersion}</a>
+          <a href={versionHref(detail.currentVersion)}>Back to {detail.currentVersion}</a>
         </p>
       </div>
     {/if}
@@ -69,7 +70,11 @@
         {#snippet head()}<span class="mono muted">immutable · newest first</span>{/snippet}
         <Table label="Versions">
           <table>
-            <thead><tr><th>Version</th><th>Created</th><th>By</th><th>Note</th></tr></thead>
+            <thead
+              ><tr
+                ><th>Version</th>{#if provenance}<th>Created</th><th>By</th><th>Note</th>{/if}</tr
+              ></thead
+            >
             <tbody>
               {#each detail.versions as row (row.version)}
                 <tr class={row.version === detail.version ? 'sel' : ''}>
@@ -82,9 +87,11 @@
                       ></a
                     ></td
                   >
-                  <td class="mono">{row.created}</td>
-                  <td class="mono">{row.by}</td>
-                  <td class="mono">{row.note}</td>
+                  {#if provenance}
+                    <td class="mono">{row.created}</td>
+                    <td class="mono">{row.by}</td>
+                    <td class="mono">{row.note}</td>
+                  {/if}
                 </tr>
               {/each}
             </tbody>

@@ -68,8 +68,11 @@ export type KV = { k: string; v: string; href?: string };
 /** One typed Spec section for the shared fallback presentation. */
 export type SpecSection = { title: string; note?: string; entries: KV[]; absent?: string };
 
-/** One immutable version row; selecting a prior version re-renders read-only. */
-export type CardVersionRow = { version: string; created: string; by: string; note: string };
+/**
+ * One immutable version row; selecting a prior version re-renders read-only.
+ * The live registry lists versions only, so the provenance columns are optional.
+ */
+export type CardVersionRow = { version: string; created?: string; by?: string; note?: string };
 
 /** One server-derived relationship, rendered as `relation — label`. */
 export type CardRelationship = { relation: string; label: string; href?: string };

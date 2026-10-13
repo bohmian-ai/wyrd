@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { chromium, type BrowserContext, type Page } from 'playwright';
+import { chromium, type Browser as Chromium, type BrowserContext, type Page } from 'playwright';
 import { expect, test } from 'vitest';
 
 type Journey = {
@@ -1225,6 +1225,272 @@ test('live UI Card inventory', async () => {
     expect(refusal).not.toContain('inv-prompt-01');
     expect(refusal).not.toContain('checkout-api');
     await deniedPage.screenshot({ path: join(journey.evidence, 'cards-denied.png'), fullPage: true });
+  } finally {
+    await browser.close();
+  }
+}, 180_000);
+
+/** The UID of the exact Card `kind default/name@version`, read with the administrator's key. */
+async function uidOf(kind: string, name: string, version = '1.0.0'): Promise<string> {
+  const query = new URLSearchParams({ kind, space: 'default', name, version });
+  const read = await asKey(journey.ssoAdminKey, 'GET', `/cards/by-ref?${query}`);
+  expect(read.status).toBe(200);
+  return ((await read.json()) as { card: { metadata: { uid: string } } }).card.metadata.uid;
+}
+
+/** Development Card fixtures that must never reach a live detail page. */
+const cardFixtures = ['checkout-api', 'pii-review', 'payments-mcp', 'kind-owned sections'];
+
+/**
+ * The shared live detail acceptance for one Card line with two registered
+ * versions: the prior version's UID pins it in the server-rendered HTML,
+ * inventory opens the current one, version selection and relationship links
+ * are server loads, and unknown, cross-tenant and denied reads stay safe.
+ */
+async function detailJourney(
+  browser: Chromium,
+  line: {
+    kind: string;
+    name: string;
+    /** Text only the prior (1.0.0) and only the current (2.0.0) declaration render. */
+    prior: string;
+    current: string;
+    /** A Card related to the prior version: its relationship label, UID and name. */
+    related: { label: string; uid: string; name: string };
+  },
+  shot: string
+): Promise<{ context: BrowserContext; page: Page; priorUid: string; currentUid: string }> {
+  const sso = journey.ssoTenant;
+  const base = `${journey.origin}/t/${sso}`;
+  const [priorUid, currentUid] = await Promise.all([uidOf(line.kind, line.name), uidOf(line.kind, line.name, '2.0.0')]);
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  await browserLogin(page, sso, journey.users.admin);
+
+  // A UID pins its own version; the declaration, metadata and relationships are in the initial HTML.
+  const initial = await (await context.request.get(`${base}/cards/${priorUid}`)).text();
+  expect(initial).toContain(`<h1>${line.name}</h1>`);
+  expect(initial).toContain(line.prior);
+  expect(initial).not.toContain(line.current);
+  expect(initial).toContain('read-only — 2.0.0 is current.');
+  expect(initial).toContain(`href="/t/${sso}/cards/${line.related.uid}"`);
+  for (const fixture of cardFixtures) expect(initial).not.toContain(fixture);
+
+  // Inventory opens the current version.
+  await page.goto(`${base}/cards?q=${line.name}&kind=${line.kind}`);
+  await page.locator(`a[href="/t/${sso}/cards/${currentUid}"]`).click();
+  await page.waitForURL(`${base}/cards/${currentUid}`);
+  await expect.poll(() => page.locator('main').textContent()).toContain(line.current);
+  await page.screenshot({ path: join(journey.evidence, `${shot}-current.png`), fullPage: true });
+
+  // Selecting the prior version is a server load; the browser never calls the API.
+  const browserRequests: string[] = [];
+  page.on('request', (request) => browserRequests.push(new URL(request.url()).pathname));
+  await page.locator('tbody').getByRole('link', { name: '1.0.0', exact: true }).click();
+  await page.waitForURL(`${base}/cards/${currentUid}?version=1.0.0`);
+  await expect.poll(() => page.locator('main').textContent()).toContain(line.prior);
+  expect(await page.locator('main').textContent()).not.toContain(line.current);
+  expect(browserRequests).toContain(`/t/${sso}/cards/${currentUid}/__data.json`);
+  expect(browserRequests.filter((path) => path.startsWith('/v1/'))).toEqual([]);
+  await page.screenshot({ path: join(journey.evidence, `${shot}-prior.png`), fullPage: true });
+  // Refresh renders the selected version server-side; hydration does not fetch it again.
+  browserRequests.length = 0;
+  const refreshed = await page.reload();
+  expect(await refreshed!.text()).toContain(line.prior);
+  expect(browserRequests.filter((path) => path.endsWith('__data.json'))).toEqual([]);
+  // Back returns to the current version.
+  await page.goBack();
+  await page.waitForURL(`${base}/cards/${currentUid}`);
+  await expect.poll(() => page.locator('main').textContent()).toContain(line.current);
+
+  // A relationship link from the pinned version selects the related Card's identity, not this one.
+  await page.goto(`${base}/cards/${priorUid}`);
+  await page.getByRole('link', { name: line.related.label }).click();
+  await page.waitForURL(`${base}/cards/${line.related.uid}`);
+  await expect.poll(() => page.locator('h1').textContent()).toBe(line.related.name);
+
+  // Unknown versions and UIDs are structured 404s.
+  for (const missing of [`${priorUid}?version=9.9.9`, '00000000-0000-7000-8000-000000000000', 'not-a-uid']) {
+    const refused = await context.request.get(`${base}/cards/${missing}`);
+    expect(refused.status(), missing).toBe(404);
+    expect(await refused.text()).not.toContain(line.prior);
+  }
+
+  // Another tenant's reader cannot see the Card; a principal refused Card reads is denied.
+  const other = `${journey.origin}/t/${journey.apiKeyTenant}/cards/${priorUid}`;
+  const reader = await browser.newContext();
+  await apiKeyLogin(await reader.newPage(), journey.apiKeyTenant, journey.offReaderKey);
+  const hidden = await reader.request.get(other);
+  expect(hidden.status()).toBe(404);
+  expect(await hidden.text()).not.toContain(line.prior);
+  await reader.close();
+  const denied = await browser.newContext();
+  await apiKeyLogin(await denied.newPage(), journey.apiKeyTenant, journey.offNoRoleKey);
+  const refusal = await denied.request.get(other);
+  expect(refusal.status()).toBe(403);
+  expect(await refusal.text()).toContain('WYRD_PERMISSION_403');
+  await denied.close();
+  return { context, page, priorUid, currentUid };
+}
+
+/** `yaml` renamed to `name` at `version`, with `from → to` text replacements. */
+const variant = (yaml: string, name: string, version: string, ...edits: [string, string][]) =>
+  edits.reduce(
+    (text, [from, to]) => text.replace(from, to),
+    yaml.replace(/ {2}name: \S+\n {2}version: \S+\n/, `  name: ${name}\n  version: ${version}\n`)
+  );
+
+test('live UI Model detail', async () => {
+  await mkdir(journey.evidence, { recursive: true });
+  const model = await readFile(join(typedState, 'model-primary.yaml'), 'utf8');
+  await applyCards(journey.ssoAdminKey, {
+    'det-model-1': variant(model, 'det-model', '1.0.0', ['  version: 1.0.0\n', '  version: 1.0.0\n  labels:\n    team: ranking\n'])
+  });
+  await applyCards(journey.ssoAdminKey, {
+    'det-model-2': variant(model, 'det-model', '2.0.0', ['GradientBoostingClassifier', 'RandomForestClassifier'])
+  });
+  await applyCards(journey.ssoAdminKey, {
+    'det-model-svc': service('det-model-svc').replace('inv-model-a', 'det-model')
+  });
+  const svc = await uidOf('Service', 'det-model-svc');
+  const browser = await chromium.launch();
+  try {
+    const { context } = await detailJourney(
+      browser,
+      {
+        kind: 'Model',
+        name: 'det-model',
+        prior: 'GradientBoostingClassifier',
+        current: 'RandomForestClassifier',
+        related: { label: 'Service default/det-model-svc@1.0.0', uid: svc, name: 'det-model-svc' }
+      },
+      'model'
+    );
+    // Server-managed metadata of the pinned version.
+    const html = await (await context.request.get(`${journey.origin}/t/${journey.ssoTenant}/cards/${await uidOf('Model', 'det-model')}`)).text();
+    for (const text of ['team=ranking', 'BinaryClassification', 'signature', 'inputs[0].name', 'feature'])
+      expect(html).toContain(text);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+}, 180_000);
+
+test('live UI Data detail', async () => {
+  await mkdir(journey.evidence, { recursive: true });
+  const [data, drift] = await Promise.all(['training.yaml', 'model-drift.yaml'].map((file) => readFile(join(typedState, file), 'utf8')));
+  const column = (name: string): [string, string] => ['      - name: label\n', `      - name: ${name}\n`];
+  await applyCards(journey.ssoAdminKey, {
+    'det-data-1': variant(data, 'det-data', '1.0.0', column('det-clicked'), ['  version: 1.0.0\n', '  version: 1.0.0\n  labels:\n    owner: r.okafor\n']),
+    'det-data-2': variant(data, 'det-data', '2.0.0', column('det-converted'), ['Snappy', 'Zstd'])
+  });
+  await applyCards(journey.ssoAdminKey, {
+    'det-data-drift': variant(drift, 'det-data-drift', '1.0.0', ['name: training', 'name: det-data'])
+  });
+  const verifier = await uidOf('Verifier', 'det-data-drift');
+  const browser = await chromium.launch();
+  try {
+    const { context, priorUid } = await detailJourney(
+      browser,
+      {
+        kind: 'Data',
+        name: 'det-data',
+        prior: 'det-clicked',
+        current: 'det-converted',
+        related: { label: 'Verifier default/det-data-drift@1.0.0', uid: verifier, name: 'det-data-drift' }
+      },
+      'data'
+    );
+    // The declared schema, interface and stats and the server-managed metadata of the pinned version.
+    const html = await (await context.request.get(`${journey.origin}/t/${journey.ssoTenant}/cards/${priorUid}`)).text();
+    for (const text of ['columns[0].name', 'feature', 'columns[1].dtype', 'int64', 'Parquet', 'Snappy', 'row_count', 'owner=r.okafor'])
+      expect(html).toContain(text);
+    expect(html).not.toContain('Zstd');
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+}, 180_000);
+
+test('live UI Agent detail', async () => {
+  await mkdir(journey.evidence, { recursive: true });
+  const agent = (version: string, timeout: number) =>
+    `apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: det-agent\n  version: ${version}\n  space: default\nspec:\n  prompt: { kind: Prompt, name: det-agent-prompt, version: 1.0.0, space: default }\n  run_config:\n    max_iterations: 2\n    timeout_ms: ${timeout}\n`;
+  await applyCards(journey.ssoAdminKey, { 'det-agent-prompt': prompt('det-agent-prompt') });
+  await applyCards(journey.ssoAdminKey, { 'det-agent-1': agent('1.0.0', 43210) });
+  await applyCards(journey.ssoAdminKey, { 'det-agent-2': agent('2.0.0', 98765) });
+  const promptUid = await uidOf('Prompt', 'det-agent-prompt');
+  const browser = await chromium.launch();
+  try {
+    const { context, page, currentUid } = await detailJourney(
+      browser,
+      {
+        kind: 'Agent',
+        name: 'det-agent',
+        prior: '43210',
+        current: '98765',
+        related: { label: 'Prompt default/det-agent-prompt@1.0.0', uid: promptUid, name: 'det-agent-prompt' }
+      },
+      'agent'
+    );
+    // The current version declares the same exact Prompt; the Prompt shows both Agent versions inbound.
+    const html = await (await context.request.get(`${journey.origin}/t/${journey.ssoTenant}/cards/${currentUid}`)).text();
+    expect(html).toContain(`href="/t/${journey.ssoTenant}/cards/${promptUid}"`);
+    expect(html).toContain('max_iterations');
+    await expect.poll(() => page.locator('main').textContent()).toContain('Agent default/det-agent@2.0.0');
+    expect(await page.locator('main').textContent()).toContain('Agent default/det-agent@1.0.0');
+    // A declaration carries no execution evidence or actions.
+    for (const invented of ['Run agent', 'last run', 'Open traces']) expect(html).not.toContain(invented);
+    await context.close();
+  } finally {
+    await browser.close();
+  }
+}, 180_000);
+
+test('live UI Prompt detail', async () => {
+  await mkdir(journey.evidence, { recursive: true });
+  const message = (word: string) => `Summarize det-prompt-${word} <script>window.detPwned=1</script>`;
+  const declared = (version: string, word: string) =>
+    `apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: det-prompt\n  version: ${version}\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: ${JSON.stringify([message(word)])}\n`;
+  await applyCards(journey.ssoAdminKey, { 'det-prompt-1': declared('1.0.0', 'one') });
+  await applyCards(journey.ssoAdminKey, { 'det-prompt-2': declared('2.0.0', 'two') });
+  await applyCards(journey.ssoAdminKey, {
+    'det-prompt-agent': `apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: det-prompt-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: { kind: Prompt, name: det-prompt, version: 1.0.0, space: default }\n  run_config:\n    max_iterations: 1\n    timeout_ms: 1000\n`
+  });
+  const agentUid = await uidOf('Agent', 'det-prompt-agent');
+  const browser = await chromium.launch();
+  try {
+    const { context, page, priorUid } = await detailJourney(
+      browser,
+      {
+        kind: 'Prompt',
+        name: 'det-prompt',
+        prior: 'det-prompt-one',
+        current: 'det-prompt-two',
+        related: { label: 'Agent default/det-prompt-agent@1.0.0', uid: agentUid, name: 'det-prompt-agent' }
+      },
+      'prompt'
+    );
+    const url = `${journey.origin}/t/${journey.ssoTenant}/cards/${priorUid}`;
+    // Declared markup is text: escaped in the HTML, shown verbatim, never executed.
+    const html = await (await context.request.get(url)).text();
+    expect(html).not.toContain('<script>window.detPwned');
+    for (const text of ['openai', 'gpt-4o']) expect(html).toContain(text);
+    await page.goto(url);
+    expect(await page.locator('main').textContent()).toContain(message('one'));
+    expect(await page.evaluate(() => (window as { detPwned?: number }).detPwned)).toBeUndefined();
+    await page.screenshot({ path: join(journey.evidence, 'prompt-markup.png'), fullPage: true });
+    // Neither the page, its data channel nor browser storage carries the session or a token.
+    const [session] = (await context.cookies()).filter(({ name }) => name.startsWith('wyrd_session_'));
+    expect(session).toBeDefined();
+    const storage = await page.evaluate(() => JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage }));
+    for (const body of [html, await (await context.request.get(`${url}/__data.json`)).text(), storage]) {
+      expect(body).not.toContain(session.value);
+      expect(body).not.toMatch(jwt);
+    }
+    // A declaration carries no runtime outcome.
+    for (const invented of ['Run prompt', 'last run', 'latency', 'tokens used']) expect(html).not.toContain(invented);
+    await context.close();
   } finally {
     await browser.close();
   }

@@ -148,3 +148,54 @@ Report a concrete blocker if repository-managed setup cannot supply the required
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
 
+
+## Implementation Evidence
+
+Reuse map revalidated:
+- **Existing owners:** `WyrdClient.cardByUid`, from TASK-004, already resolved a bare UID with bounded per-kind `GET /v1/cards/by-uid/{kind}/{uid}` reads. The generic shell, `SpecSections` and the relationship rendering already existed.
+- **Gap:** there was no live `card()`. The mock version rows carry author, time and note, but `ListVersionsResponse` has bare versions only.
+- **Extension:**
+  - `card()` became async and live. It resolves the identity line through `cardByUid`, which is bounded at 15 parallel reads with no registry scan.
+  - It reads the selected version by `GET /v1/cards/by-ref` and lists versions with `GET /v1/cards/{kind}/{space}/{name}/versions?include_prerelease=true`.
+  - The new `liveCard` and `specSections` functions project the Card onto the existing `CardDetail`.
+- **No new route, endpoint, workspace or type** was added. `CardVersionRow` provenance fields became optional.
+
+URL semantics:
+- `/cards/{uid}` pins the UID's own registered version. `?version=` selects another version of the same line.
+- Version links are always explicit (`?version=…`), because the pinned version need not be current.
+- Current is the first entry of the server's newest-first version list.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-004 direct and inventory open; declaration and metadata | `wyrd.ts` `card`, `liveCard`, `specSections`, `flatten`; `+page.server.ts` async load | `live UI Model detail projection`; browser `live UI Model detail`: 2 real Model versions plus a Service via `wyrd apply`. The pinned 1.0.0 shows `GradientBoostingClassifier`, `team=ranking`, `inputs[0].name` and the read-only notice, and does not contain 2.0.0's `RandomForestClassifier` | PASS |
+| AC-004 select another registered version | `card()` by-ref read; `+page.svelte` `versionHref` and conditional provenance columns | Unit: exact `{kind,space,name,version}` by-ref query. Browser: the version click goes to `?version=1.0.0` and shows the prior declaration only | PASS |
+| AC-004 related Cards select target identity | `liveCard` `edges` (outbound/inbound `CardRef`; href only when the ref carries a UID) | Browser: the inbound `Service default/det-model-svc@1.0.0` link opens the Service's UID page (h1 `det-model-svc`) | PASS |
+| AC-004 missing and denied identity | `cardByUid` 404 means notFound; by-ref and versions failures go to `problemKind` | Unit: unknown version, unknown UID, malformed UID (zero upstream calls) and 403. Browser: `?version=9.9.9`, an unknown UUID and `not-a-uid` are 404; the other tenant's reader gets 404; the no-role principal gets 403 `WYRD_PERMISSION_403` | PASS |
+| AC-018 SSR, client nav, refresh/back, no browser `/v1` | SvelteKit server load only | Browser: the initial HTML (`context.request`) has the declaration and the relationship href. The version click fetches `__data.json` and makes no `/v1/` request. Reload makes no `__data.json` request. Back restores current | PASS |
+| No fixture fallback | No session means `upstream`; mock path unchanged | Browser: `checkout-api`, `pii-review`, `payments-mcp` and `kind-owned sections` are absent. `CardDetail.test.ts` mock cases 7/7 | PASS |
+
+Commands (all passed):
+```bash
+WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='live UI Model detail' mise run test:identity:journey   # 1 passed, 10 skipped
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/cards/core/CardDetail.test.ts   # 11 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib   # 187 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run check   # 0 errors
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run build   # run by the journey lane
+git diff --check
+```
+- Generated types consumed: `get_card_by_ref_http`, `list_versions_http`, `GetCardResponse`, `Card`, `Metadata`, `Relationships`, `CardRelationship`, `CardRef`, `ListVersionsResponse`.
+- There is no generation change, so `codegen:check` was not run.
+- There is no Rust change.
+
+Diagnosis (one test-only failure):
+- **Symptom:** the relationship-link click timed out.
+- **Evidence:** the locator waited for `Service default/det-model-svc@1.0.0` on the 2.0.0 page.
+- **Cause:** the Service references Model 1.0.0, so only that version has the inbound edge.
+- **Fix site:** `detailJourney` now follows relationships from the pinned prior version.
+
+Usability pass (`target/debug/wyrd-ui-live-login/model-*.png`, local only):
+- The read-only notice and "Back to 2.0.0" are clear, and spec sections are labelled by declared field.
+- The header UID is the shown version's UID while the breadcrumb shows the URL's pinned UID. This is truthful but worth noting.
+- No contextual Observe link is offered, because Observe is not live yet (TASK-010+), so no link would be valid.
+
+Non-goals stayed excluded: no new endpoint, registry scan, workspace, Rust change or contract change.

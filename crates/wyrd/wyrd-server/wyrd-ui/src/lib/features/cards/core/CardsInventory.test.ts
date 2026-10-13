@@ -144,9 +144,7 @@ test('another tenant sees a truthful empty registry, never acme cards', async ()
   expect(view.rows).toEqual([]);
   expect(view.total).toBe(0);
   expect(view.recent).toEqual([]);
-  expect(() => research.card('card_service_01')).toThrowError(
-    expect.objectContaining({ status: 404 })
-  );
+  await expect(research.card('card_service_01')).rejects.toMatchObject({ status: 404 });
 });
 
 test('cards:read is required before any inventory or detail projection', async () => {
@@ -159,7 +157,7 @@ test('cards:read is required before any inventory or detail projection', async (
     true
   );
   await expect(denied.cards({})).rejects.toMatchObject({ status: 403 });
-  expect(() => denied.card('card_service_01')).toThrowError(expect.objectContaining({ status: 403 }));
+  await expect(denied.card('card_service_01')).rejects.toMatchObject({ status: 403 });
 });
 
 test('server wildcard grants satisfy cards:read', async () => {

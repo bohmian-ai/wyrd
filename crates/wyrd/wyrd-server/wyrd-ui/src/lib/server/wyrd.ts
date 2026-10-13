@@ -27,7 +27,7 @@ import type {
   TracesView,
   GenAiView
 } from '$lib/features/observe/core/types';
-import { CARD_KINDS, type CardDetail, type CardKind, type CardsView } from '$lib/features/cards/core/types';
+import { CARD_KINDS, type CardDetail, type CardKind, type CardsView, type KV } from '$lib/features/cards/core/types';
 import { projectCard, projectCards } from './mock/cards/project';
 import {
   projectDashboard,
@@ -383,8 +383,8 @@ export class WyrdClient {
       page = found
         ? await this.listCards({
             ...query,
-            kind: found.kind,
-            name: found.metadata.name,
+            kind: found.card.kind,
+            name: found.card.metadata.name,
             include_prerelease: true,
             limit: 200
           })
@@ -407,10 +407,10 @@ export class WyrdClient {
   }
 
   /**
-   * Resolve a bare UID to its envelope by trying each candidate kind in
+   * Resolve a bare UID to its Card by trying each candidate kind in
    * parallel; a kind that does not own the UID answers 404.
    */
-  private async cardByUid(uid: string, kinds: readonly string[]) {
+  private async cardByUid(uid: string, kinds: readonly string[]): Promise<GetCardResponse | null> {
     const found = await Promise.all(
       kinds.map(async (kind) => {
         const response = await this.session!.api('get', '/cards/by-uid/{kind}/{card_uid}', {
@@ -418,16 +418,45 @@ export class WyrdClient {
         });
         if (response.status === 404) return null;
         if (!response.ok) reject(await problemKind(response));
-        return (await response.json()).card;
+        return response.json();
       })
     );
     return found.find(Boolean) ?? null;
   }
 
-  card(uid: string, version?: string): CardDetail {
-    const detail = this.cardsAccess() ? projectCard(uid, version) : null;
-    if (!detail) reject('notFound');
-    return detail;
+  /**
+   * One Card at an exact version. The URL's UID pins a registered version and
+   * names its identity line; `version` selects another version of that line
+   * through the exact by-reference read. Unknown UIDs and versions are 404s.
+   */
+  async card(uid: string, version?: string): Promise<CardDetail> {
+    if (this.mockData) {
+      const detail = this.cardsAccess() ? projectCard(uid, version) : null;
+      if (!detail) reject('notFound');
+      return detail;
+    }
+    if (!this.session) reject('upstream');
+    const id = uid.toLowerCase();
+    const pinned = cardUid.test(id) ? await this.cardByUid(id, CARD_KINDS) : null;
+    if (!pinned) reject('notFound');
+    const { kind, metadata } = pinned.card;
+    if (!metadata.space) reject('upstream');
+    const line = { kind, space: metadata.space, name: metadata.name };
+    const [versions, selected] = await Promise.all([
+      this.session.api('get', '/cards/{kind}/{space}/{name}/versions', {
+        path: line,
+        query: { include_prerelease: true }
+      }),
+      !version || version === metadata.version
+        ? pinned
+        : this.session.api('get', '/cards/by-ref', { query: { ...line, version } })
+    ]);
+    if (!versions.ok) reject(await problemKind(versions));
+    if (selected instanceof Response && !selected.ok) reject(await problemKind(selected));
+    return liveCard(
+      selected instanceof Response ? await selected.json() : selected,
+      (await versions.json()).versions
+    );
   }
 
   async home(): Promise<HomeView> {
@@ -450,6 +479,8 @@ export class WyrdClient {
 }
 
 type Lifecycle = components['schemas']['CardLifecycleStatus'];
+type GetCardResponse = components['schemas']['GetCardResponse'];
+type CardRef = components['schemas']['CardRef'];
 type ListCardsResponse = components['schemas']['ListCardsResponse'];
 
 /** Rows per inventory page; the registry caps a page at 200. */
@@ -490,6 +521,74 @@ function liveCards(page: ListCardsResponse, emptyTenant: boolean): CardsView {
     next: page.next_cursor ?? null
   };
 }
+/**
+ * Project one exact Card read onto the shared detail shell. The declaration
+ * renders as typed key/value sections (text only, never markup); versions are
+ * the registry's newest-first list, which carries no author or note.
+ */
+function liveCard(response: GetCardResponse, versions: string[]): CardDetail {
+  const { card } = response;
+  const { metadata } = card;
+  const phase = card.status?.phase ?? '';
+  const pairs = (map: Record<string, string> = {}) =>
+    Object.entries(map).map(([k, v]) => `${k}=${v}`).join(' · ') || 'none';
+  const ref = ({ kind, space, name, version }: CardRef) => `${kind} ${space ?? ''}/${name}@${version}`;
+  const edges = (relation: string, list: components['schemas']['CardRelationship'][] = []) =>
+    list.map(({ alias, ref: target }) => ({
+      relation: alias ? `${relation} · ${alias}` : relation,
+      label: ref(target),
+      href: target.uid ? `/cards/${encodeURIComponent(target.uid)}` : undefined
+    }));
+  return {
+    uid: metadata.uid ?? '',
+    name: metadata.name,
+    kind: card.kind as CardKind,
+    summary: `${card.kind} Card registered in space ${metadata.space}.`,
+    status: { label: phase || 'unknown', tone: lifecycleTone[phase as Lifecycle] ?? 'neutral' },
+    version: metadata.version ?? '',
+    currentVersion: versions[0] ?? metadata.version ?? '',
+    versions: versions.map((version) => ({ version })),
+    actions: [],
+    spec: specSections(card.spec),
+    metadata: [
+      { k: 'space', v: metadata.space ?? '' },
+      { k: 'labels', v: pairs(metadata.labels) },
+      { k: 'annotations', v: pairs(metadata.annotations) },
+      { k: 'spec hash', v: metadata.spec_hash ?? '—' },
+      ...(metadata.artifact_hash ? [{ k: 'artifact hash', v: metadata.artifact_hash }] : []),
+      { k: 'created', v: response.created_at },
+      { k: 'updated', v: response.updated_at }
+    ],
+    relationships: [
+      ...edges('outbound', card.relationships?.outbound_refs),
+      ...edges('inbound', card.relationships?.inbound_refs)
+    ]
+  };
+}
+
+/** Top-level scalars form the `Spec` section; each nested field gets its own. */
+function specSections(spec: unknown): CardDetail['spec'] {
+  const scalars: KV[] = [];
+  const nested: CardDetail['spec'] = [];
+  for (const [key, value] of Object.entries(spec ?? {})) {
+    if (value !== null && typeof value === 'object') {
+      const entries = flatten(value, '');
+      nested.push({ title: key, entries, absent: entries.length ? undefined : 'Declared empty.' });
+    } else scalars.push({ k: key, v: String(value) });
+  }
+  return scalars.length ? [{ title: 'Spec', entries: scalars }, ...nested] : nested;
+}
+
+/** Leaf values under dotted/indexed paths, e.g. `fields[0].name`. */
+function flatten(value: unknown, path: string): KV[] {
+  if (value === null || typeof value !== 'object') return [{ k: path, v: String(value) }];
+  const entries = Object.entries(value);
+  if (!entries.length) return path ? [{ k: path, v: JSON.stringify(value) }] : [];
+  return entries.flatMap(([k, v]) =>
+    flatten(v, Array.isArray(value) ? `${path}[${k}]` : path ? `${path}.${k}` : k)
+  );
+}
+
 const lifecycleTone: Record<Lifecycle, HomeView['cards'][number]['tone']> = {
   active: 'ok',
   pending: 'running',

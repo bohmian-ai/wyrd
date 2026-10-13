@@ -153,7 +153,7 @@ The p99 is the `attributes ->> 'customer.id'` key filter. On Parquet the two
 key filters are `customer.id` 294 → 161 ms and `region` 273 → 136 ms with the
 fix.
 
-### Variant key-filter fix (read opportunity 1): not landed
+### Variant key-filter fix (read opportunity 1): landed
 
 - **Where:** the DataFusion fork, `datafusion/functions-variant/src/get.rs`,
   commit `2183432dd`, pushed to `bohmian-ai/datafusion` `wyrd-production`.
@@ -169,8 +169,8 @@ fix.
     still renders non-strings as JSON text.
 - **Tests:** three fork unit tests (shredded strings, residual values, residual
   ints stay ints under `->`).
-- **To land:** bump the `fd02579cc` pin in `[patch.crates-io]` to
-  `2183432dd327d19041f9514250ed151798a08d9c` and refresh `Cargo.lock`.
+- **Landed:** Wyrd pins `2183432dd` (and `ORACLE_DATAFUSION_REVISION`)
+  in `87228203d`.
 - **What is left:** both filters are full-table scans with no time window.
   Hot stays slow (625 ms) because the memtable holds Variant unshredded.
 

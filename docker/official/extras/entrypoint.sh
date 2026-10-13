@@ -27,8 +27,10 @@ trap 'kill -TERM "${pids[@]}" 2>/dev/null; wait' TERM INT
 pids+=($!)
 wait_for_port "${WYRD_SERVER_BIND##*:}" wyrd-server "${pids[0]}"
 
-# The BFF reaches Rust through nginx's public listener, its default server URL.
+# The BFF reaches Rust through nginx's public listener, its default server URL,
+# and takes its public origin from the scheme and host nginx forwards.
 (cd /app/ui && HOST=127.0.0.1 PORT=3000 NODE_ENV=production \
+  PROTOCOL_HEADER=x-forwarded-proto HOST_HEADER=x-forwarded-host \
   exec node build/index.js) &
 pids+=($!)
 wait_for_port 3000 ui "${pids[1]}"

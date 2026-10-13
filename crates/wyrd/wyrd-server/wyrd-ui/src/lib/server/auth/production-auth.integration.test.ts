@@ -6,7 +6,8 @@
  * runs this file with the `WYRD_UI_JOURNEY` fixture. Every request goes over
  * the wire; nothing here mocks the BFF or the server.
  *
- * The BFF is the confidential OAuth client `wyrd-ui`: sign-in is the
+ * The BFF is the public OAuth client `wyrd-ui`, configured as the official
+ * image configures it (no secret, no public origin): sign-in is the
  * authorization code grant with PKCE, a replica that has not cached a
  * session's access token renews it with the refresh token, and logout revokes
  * that refresh token (RFC 7009).
@@ -84,7 +85,12 @@ class Browser {
     path: string,
     options: { form?: Record<string, string>; origin?: string } = {}
   ): Promise<Response> {
-    const headers = new Headers({ accept: 'text/html' });
+    // The scheme and host the gateway forwards, as the image's nginx does.
+    const headers = new Headers({
+      accept: 'text/html',
+      'x-forwarded-proto': 'http',
+      'x-forwarded-host': new URL(journey.origin).host
+    });
     if (this.cookies.size)
       headers.set('cookie', [...this.cookies].map(([k, v]) => `${k}=${v}`).join('; '));
     if (options.form) {
@@ -117,21 +123,18 @@ class Browser {
   }
 }
 
-/** Host-only, HttpOnly, Secure, SameSite=Lax, path `/`. */
+/** Host-only, HttpOnly, SameSite=Lax, path `/`; not `Secure` on the journey's plain-http origin. */
 function expectSafeCookie(raw: string): void {
   expect(raw).toMatch(/;\s*HttpOnly/i);
-  expect(raw).toMatch(/;\s*Secure/i);
+  expect(raw).not.toMatch(/;\s*Secure/i);
   expect(raw).toMatch(/;\s*SameSite=Lax/i);
   expect(raw).toMatch(/;\s*Path=\/(;|$)/i);
   expect(raw).not.toMatch(/;\s*Domain=/i);
 }
 
-/** A session cookie value is a compact `dir`/`A256GCM` JWE: no clear-text token inside. */
-function expectEncrypted(value: string): void {
-  expect(value).toMatch(/^eyJ[\w-]+\.\.[\w-]+\.[\w-]+\.[\w-]+$/);
-  const header = JSON.parse(Buffer.from(value.split('.')[0], 'base64url').toString());
-  expect(header).toEqual({ alg: 'dir', enc: 'A256GCM' });
-  expect(value).not.toMatch(jwt);
+/** A BFF cookie holds the renewing credential or PKCE state, never an access token. */
+function expectNoAccessToken(value: string): void {
+  expect(decodeURIComponent(value)).not.toMatch(jwt);
 }
 
 /**
@@ -189,7 +192,7 @@ async function beginSso(
   const begun = await browser.go(replica, `/t/${tenant}/login?/sso`, { form: {} });
   expect(begun.status).toBe(303);
   expectSafeCookie(browser.setCookie('wyrd_login'));
-  expectEncrypted(browser.cookies.get('wyrd_login')!);
+  expectNoAccessToken(browser.cookies.get('wyrd_login')!);
   const request = new URL(begun.headers.get('location')!);
   expect(request.origin + request.pathname).toBe(`${journey.origin}/auth/authorize`);
   const query = request.searchParams;
@@ -244,7 +247,7 @@ async function ssoLogin(
   expect(browser.cookies.has('wyrd_login')).toBe(false);
   const session = browser.cookies.get(sessionCookie(tenant))!;
   expectSafeCookie(browser.setCookie(sessionCookie(tenant)));
-  expectEncrypted(session);
+  expectNoAccessToken(session);
   return session;
 }
 
@@ -389,7 +392,7 @@ test('production SSO crosses replicas', async () => {
   expect(done.headers.get('location')).toBe(`/t/${sso}`);
   const session = alice.cookies.get(sessionCookie(sso))!;
   expectSafeCookie(alice.setCookie(sessionCookie(sso)));
-  expectEncrypted(session);
+  expectNoAccessToken(session);
   // The code is one-use: its replay with the same login sets no session.
   const replay = new Browser();
   replay.cookies.set('wyrd_login', secondLogin);
@@ -511,7 +514,7 @@ test('OIDC-off credential UI', async () => {
   expect(reader.headers.get('location')).toBe(`/t/${tenant}`);
   expectSafeCookie(browser.setCookie(sessionCookie(tenant)));
   const readerSession = browser.cookies.get(sessionCookie(tenant))!;
-  expectEncrypted(readerSession);
+  expectNoAccessToken(readerSession);
   await expectNoSecrets(browser, tenant, readerSession);
   for (const seen of browser.seen) expect(seen).not.toContain(journey.offReaderKey);
   expect((await browser.go(1, `${settings}?/deactivate`, { form: {} })).status).toBe(403);

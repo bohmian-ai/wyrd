@@ -1,12 +1,10 @@
-import { createHash, hkdfSync } from 'node:crypto';
-import { env } from '$env/dynamic/private';
+import { createHash } from 'node:crypto';
 import type { Cookies } from '@sveltejs/kit';
 import * as client from 'openid-client';
-import { EncryptJWT, decodeJwt, jwtDecrypt } from 'jose';
+import { decodeJwt } from 'jose';
 import type { SessionMetadata } from '$lib/views';
 import {
   grpcUrl,
-  loopback,
   serverUrl,
   v1Path,
   type V1,
@@ -29,7 +27,7 @@ const renewalMarginMs = 5_000;
 const tenantKeyPattern = /^[a-z0-9][a-z0-9_-]{0,62}$/;
 const apiKeyTokenType = 'urn:wyrd:oauth:token-type:api_key';
 
-/** What the encrypted session cookie holds: the tenant and the credential that renews it. */
+/** What the session cookie holds: the tenant and the credential that renews it. */
 type Sealed = { tenant: string; kind: 'refresh' | 'api_key'; credential: string };
 type Login = { tenant: string; verifier: string; state: string };
 /** Server-issued access token claims the BFF projects; authority stays with the server. */
@@ -40,7 +38,25 @@ type Claims = {
 };
 type Access = { token: string; expiresAt: number; claims: Claims };
 
-const cookieOptions = { path: '/', httpOnly: true, secure: true, sameSite: 'lax' } as const;
+/** HttpOnly, SameSite=Lax cookie options, `Secure` exactly when the browser reached the BFF over `https:`. */
+const cookieOptions = (url: URL, maxAge: number) =>
+  ({
+    path: '/',
+    httpOnly: true,
+    secure: url.protocol === 'https:',
+    sameSite: 'lax',
+    maxAge
+  }) as const;
+
+/** The JSON cookie `value`, or `null` when it is absent or not JSON. */
+function parse<T>(value: string | undefined): T | null {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
+}
 
 /** `resource:action` names of the token's permissions, the shape the UI gates on. */
 function permissionNames(claims: Claims): string[] {
@@ -55,12 +71,16 @@ function permissionNames(claims: Claims): string[] {
  */
 export class BrowserSession {
   readonly #token: string;
+  readonly #url: URL;
 
+  /** `url` is the browser's request URL; `/v1` calls forward its host and scheme. */
   constructor(
     readonly tenantKey: string,
-    access: Access
+    access: Access,
+    url: URL
   ) {
     this.#token = access.token;
+    this.#url = url;
     this.principalId = access.claims.principal.id;
     this.tenantId = access.claims.principal.tenant_id;
     this.permissions = permissionNames(access.claims);
@@ -86,7 +106,11 @@ export class BrowserSession {
     };
   }
 
-  /** Call a generated Wyrd `/v1` operation as this session's principal. */
+  /**
+   * Call a generated Wyrd `/v1` operation as this session's principal,
+   * forwarding the browser's host and scheme so the server derives the
+   * public origin (an identity connection's callback) from them.
+   */
   async api<P extends keyof V1, M extends V1Method<P>>(
     method: M,
     path: P,
@@ -99,6 +123,8 @@ export class BrowserSession {
         method: method.toUpperCase(),
         headers: {
           'x-wyrd-access-token': `Bearer ${this.#token}`,
+          'x-forwarded-host': this.#url.host,
+          'x-forwarded-proto': this.#url.protocol.slice(0, -1),
           ...(body === undefined ? {} : { 'content-type': 'application/json' })
         },
         body: body === undefined ? undefined : JSON.stringify(body),
@@ -144,71 +170,38 @@ export type Analytical = {
 };
 
 /**
- * The BFF as the confidential OAuth client `wyrd-ui` of Wyrd's authorization
+ * The BFF as the public OAuth client `wyrd-ui` of Wyrd's authorization
  * server, built on `openid-client`: authorization code + PKCE sign-in,
  * refresh, RFC 8693 API-key exchange (OIDC-off), and RFC 7009 revocation.
  *
- * Each tenant's session is one `jose`-encrypted HttpOnly cookie holding its
- * refresh token (or API key), so every replica reads it with no server-side
+ * It needs no secret and no discovery: the browser is sent to
+ * `/auth/authorize` on the origin it reached the BFF at, and the token and
+ * revocation endpoints are called on `WYRD_SERVER_URL`. Each tenant's session
+ * is one HttpOnly cookie holding the refresh token (or API key) the server
+ * validates on every renewal, so every replica reads it with no server-side
  * store. Access tokens are cached in memory by credential hash; a miss renews
  * through the token endpoint.
  */
 export class BrowserSessions {
-  readonly #configurations = new Map<string, Promise<client.Configuration>>();
   readonly #access = new Map<string, Access>();
-  #key?: Uint8Array;
 
-  /** The `wyrd-ui` client secret; the deployment registers its SHA-256 with the server. */
-  private secret(): string {
-    const secret = env.WYRD_UI_CLIENT_SECRET;
-    if (!secret) reject('upstream');
-    return secret;
-  }
-
-  /** Cookie encryption key, derived from the client secret with HKDF-SHA256. */
-  private key(): Uint8Array {
-    this.#key ??= new Uint8Array(
-      hkdfSync('sha256', this.secret(), '', 'wyrd-ui session cookie', 32)
+  /** The `wyrd-ui` client of the authorization server the browser reached at `origin`. */
+  private configuration(origin: string): client.Configuration {
+    const server = serverUrl();
+    const configuration = new client.Configuration(
+      {
+        issuer: origin,
+        authorization_endpoint: new URL('/auth/authorize', origin).toString(),
+        token_endpoint: new URL('/auth/token', server).toString(),
+        revocation_endpoint: new URL('/auth/revoke', server).toString()
+      },
+      'wyrd-ui',
+      undefined,
+      client.None()
     );
-    return this.#key;
-  }
-
-  /**
-   * The client configuration for the authorization server at `origin`, the
-   * public origin the BFF and Wyrd share. Discovery reads RFC 8414 metadata;
-   * requests for that origin are sent to the internal `WYRD_SERVER_URL`.
-   */
-  private configuration(origin: string): Promise<client.Configuration> {
-    let configuration = this.#configurations.get(origin);
-    if (!configuration) {
-      const issuer = new URL(origin);
-      const internal: client.CustomFetch = (url, options) => {
-        const target = new URL(url);
-        const routed =
-          target.origin === issuer.origin
-            ? new URL(target.pathname + target.search, serverUrl())
-            : target;
-        return fetch(routed, options as RequestInit);
-      };
-      configuration = client.discovery(
-        issuer,
-        'wyrd-ui',
-        undefined,
-        client.ClientSecretBasic(this.secret()),
-        {
-          algorithm: 'oauth2',
-          [client.customFetch]: internal,
-          execute:
-            issuer.protocol === 'http:' && loopback(issuer.hostname)
-              ? [client.allowInsecureRequests]
-              : []
-        }
-      );
-      // Only a successful discovery is reused; a failure is retried on the next request.
-      configuration.catch(() => this.#configurations.delete(origin));
-      this.#configurations.set(origin, configuration);
-    }
-    return configuration.catch(() => reject('upstream'));
+    // serverUrl() admits plaintext only for loopback.
+    if (new URL(server).protocol === 'http:') client.allowInsecureRequests(configuration);
+    return configuration;
   }
 
   /** Cookie name for one tenant's session; refuses keys that are not tenant slugs. */
@@ -217,36 +210,15 @@ export class BrowserSessions {
     return sessionPrefix + tenantKey;
   }
 
-  private seal(value: object, lifetimeSeconds: number): Promise<string> {
-    return new EncryptJWT({ ...value })
-      .setProtectedHeader({ alg: 'dir', enc: 'A256GCM' })
-      .setIssuedAt()
-      .setExpirationTime(`${lifetimeSeconds}s`)
-      .encrypt(this.key());
-  }
-
-  private async unseal<T>(value: string | undefined): Promise<T | null> {
-    if (!value) return null;
-    try {
-      return (await jwtDecrypt(value, this.key())).payload as T;
-    } catch {
-      return null;
-    }
-  }
-
   /** Begin sign-in: a PKCE + state login cookie and the authorization request URL. */
   async begin(tenantKey: string, url: URL, cookies: Cookies): Promise<string> {
     this.cookieName(tenantKey);
-    const configuration = await this.configuration(url.origin);
     const verifier = client.randomPKCECodeVerifier();
     const state = client.randomState();
     const login: Login = { tenant: tenantKey, verifier, state };
-    cookies.set(loginCookie, await this.seal(login, loginLifetimeSeconds), {
-      ...cookieOptions,
-      maxAge: loginLifetimeSeconds
-    });
+    cookies.set(loginCookie, JSON.stringify(login), cookieOptions(url, loginLifetimeSeconds));
     return client
-      .buildAuthorizationUrl(configuration, {
+      .buildAuthorizationUrl(this.configuration(url.origin), {
         redirect_uri: new URL('/login/callback', url.origin).toString(),
         code_challenge: await client.calculatePKCECodeChallenge(verifier),
         code_challenge_method: 'S256',
@@ -262,18 +234,18 @@ export class BrowserSessions {
    * any failure sets no session and returns to that tenant's sign-in.
    */
   async complete(url: URL, cookies: Cookies): Promise<string> {
-    const login = await this.unseal<Login>(cookies.get(loginCookie));
+    const login = parse<Login>(cookies.get(loginCookie));
     cookies.delete(loginCookie, { path: '/' });
     if (!login) return '/?login=failed';
     const failed = `/t/${encodeURIComponent(login.tenant)}/login?login=failed`;
     try {
       const tokens = await client.authorizationCodeGrant(
-        await this.configuration(url.origin),
+        this.configuration(url.origin),
         url,
         { pkceCodeVerifier: login.verifier, expectedState: login.state }
       );
       if (!tokens.refresh_token) return failed;
-      await this.establish(login.tenant, 'refresh', tokens.refresh_token, tokens, cookies);
+      await this.establish(login.tenant, 'refresh', tokens.refresh_token, tokens, url, cookies);
     } catch {
       return failed;
     }
@@ -290,7 +262,7 @@ export class BrowserSessions {
     this.cookieName(tenantKey);
     const tokens = await this.exchange(apiKey, url.origin);
     if (!tokens) reject('unauthenticated');
-    await this.establish(tenantKey, 'api_key', apiKey, tokens, cookies);
+    await this.establish(tenantKey, 'api_key', apiKey, tokens, url, cookies);
     return `/t/${encodeURIComponent(tenantKey)}`;
   }
 
@@ -299,14 +271,16 @@ export class BrowserSessions {
     kind: Sealed['kind'],
     credential: string,
     tokens: client.TokenEndpointResponse,
+    url: URL,
     cookies: Cookies
   ): Promise<void> {
     this.cache(credential, tokens.access_token);
     const sealed: Sealed = { tenant, kind, credential };
-    cookies.set(this.cookieName(tenant), await this.seal(sealed, sessionLifetimeSeconds), {
-      ...cookieOptions,
-      maxAge: sessionLifetimeSeconds
-    });
+    cookies.set(
+      this.cookieName(tenant),
+      JSON.stringify(sealed),
+      cookieOptions(url, sessionLifetimeSeconds)
+    );
   }
 
   private hash(credential: string): string {
@@ -328,7 +302,7 @@ export class BrowserSessions {
   private async exchange(apiKey: string, origin: string) {
     try {
       return await client.genericGrantRequest(
-        await this.configuration(origin),
+        this.configuration(origin),
         'urn:ietf:params:oauth:grant-type:token-exchange',
         { subject_token: apiKey, subject_token_type: apiKeyTokenType }
       );
@@ -347,10 +321,7 @@ export class BrowserSessions {
       return tokens && this.cache(sealed.credential, tokens.access_token);
     }
     try {
-      const tokens = await client.refreshTokenGrant(
-        await this.configuration(origin),
-        sealed.credential
-      );
+      const tokens = await client.refreshTokenGrant(this.configuration(origin), sealed.credential);
       return this.cache(sealed.credential, tokens.access_token);
     } catch (cause) {
       if (cause instanceof client.ResponseBodyError) return null;
@@ -358,27 +329,27 @@ export class BrowserSessions {
     }
   }
 
-  private async sealed(tenantKey: string, cookies: Cookies): Promise<Sealed | null> {
-    const sealed = await this.unseal<Sealed>(cookies.get(this.cookieName(tenantKey)));
+  private sealed(tenantKey: string, cookies: Cookies): Sealed | null {
+    const sealed = parse<Sealed>(cookies.get(this.cookieName(tenantKey)));
     return sealed?.tenant === tenantKey ? sealed : null;
   }
 
   /**
    * This tenant's session, renewed through the server when its cached access
    * token is missing or expiring. Returns `null` (and clears the cookie) when
-   * there is none, it does not decrypt, it belongs to another tenant, or the
+   * there is none, it does not parse, it belongs to another tenant, or the
    * server refuses to renew it.
    */
   async read(tenantKey: string, url: URL, cookies: Cookies): Promise<BrowserSession | null> {
     const name = this.cookieName(tenantKey);
     if (!cookies.get(name)) return null;
-    const sealed = await this.sealed(tenantKey, cookies);
+    const sealed = this.sealed(tenantKey, cookies);
     const access = sealed && (await this.access(sealed, url.origin));
     if (!access) {
       cookies.delete(name, { path: '/' });
       return null;
     }
-    return new BrowserSession(tenantKey, access);
+    return new BrowserSession(tenantKey, access, url);
   }
 
   /**
@@ -387,14 +358,14 @@ export class BrowserSessions {
    * is logged without token values and does not fail the logout.
    */
   async logout(tenantKey: string, url: URL, cookies: Cookies): Promise<void> {
-    const sealed = await this.sealed(tenantKey, cookies);
+    const sealed = this.sealed(tenantKey, cookies);
     cookies.delete(this.cookieName(tenantKey), { path: '/' });
     if (!sealed) return;
     this.#access.delete(this.hash(sealed.credential));
     // An operator API key is never revoked by signing out of the UI.
     if (sealed.kind !== 'refresh') return;
     try {
-      await client.tokenRevocation(await this.configuration(url.origin), sealed.credential, {
+      await client.tokenRevocation(this.configuration(url.origin), sealed.credential, {
         token_type_hint: 'refresh_token'
       });
     } catch (cause) {
@@ -413,15 +384,15 @@ export class BrowserSessions {
 
   /**
    * Safe page metadata: the current tenant plus every other tenant whose
-   * session cookie this BFF sealed for that tenant. Cookies that do not
-   * decrypt or name another tenant are cleared and never rendered.
+   * session cookie names that tenant. Cookies that do not parse or name
+   * another tenant are cleared and never rendered.
    */
   async metadata(session: BrowserSession, cookies: Cookies): Promise<SessionMetadata> {
     const tenants = [session.tenantKey];
     for (const { name } of cookies.getAll()) {
       const key = name.slice(sessionPrefix.length);
       if (!name.startsWith(sessionPrefix) || key === session.tenantKey) continue;
-      if (tenantKeyPattern.test(key) && (await this.sealed(key, cookies))) tenants.push(key);
+      if (tenantKeyPattern.test(key) && this.sealed(key, cookies)) tenants.push(key);
       else cookies.delete(name, { path: '/' });
     }
     return {

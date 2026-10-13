@@ -134,6 +134,7 @@ async fn start_bff(
         .env("HOST", "127.0.0.1")
         .env("PORT", port.to_string())
         .env("PROTOCOL_HEADER", "x-forwarded-proto")
+        .env("HOST_HEADER", "x-forwarded-host")
         .env("WYRD_SERVER_URL", server_url)
         .env("WYRD_GRPC_URL", grpc_url)
         .stdout(Stdio::inherit())
@@ -227,7 +228,7 @@ const GATEWAY_JS: &str = "\
 const http = require('node:http'), env = process.env, rust = new RegExp(env.RUST_ROUTES);\
 http.createServer((req, res) => {\
   const target = new URL(rust.test(req.url.split('?')[0]) ? env.SERVER : env.BFF);\
-  const headers = { ...req.headers, 'x-forwarded-proto': 'http', 'x-forwarded-for': req.socket.remoteAddress };\
+  const headers = { ...req.headers, 'x-forwarded-proto': 'http', 'x-forwarded-host': req.headers.host, 'x-forwarded-for': req.socket.remoteAddress };\
   const upstream = http.request({ host: target.hostname, port: target.port, method: req.method, path: req.url, headers }, (reply) => {\
     res.writeHead(reply.statusCode, reply.headers);\
     reply.pipe(res);\

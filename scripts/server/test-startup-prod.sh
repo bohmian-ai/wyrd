@@ -181,7 +181,8 @@ sdk_phase startup_image_verify
 passed+=(startup_image_journey:verify)
 fi
 
-# Sign in through the BFF's API-key recovery form into the cookie jar `$jar`.
+# Sign in through the BFF's API-key recovery form into the cookie jar `$jar`, then
+# once more as a browser behind a TLS proxy at another host.
 bff_signin() {
   public="${http/127.0.0.1/localhost}"
   jar="$work/bff-cookies"
@@ -192,6 +193,14 @@ bff_signin() {
   [[ $signin == "303 $public/t/acme" ]] \
     || fail "API-key sign-in through the BFF did not redirect home: $signin $(grep -oE 'WYRD_[A-Z0-9_]+' "$work/signin.html" | sort -u | tr '\n' ' ')"
   grep -q wyrd_session_acme "$jar" || fail "the BFF issued no session cookie"
+  # The same image behind a TLS proxy at another host: nothing configured, a Secure cookie.
+  local proxied
+  proxied="$(curl -sS -o /dev/null -D - -H 'host: wyrd.example.test' -H 'x-forwarded-proto: https' \
+    -H 'origin: https://wyrd.example.test' -H 'accept: text/html' \
+    --data-urlencode "apiKey=$api_key" "$public/t/acme/login/api-key")"
+  grep -qE '^HTTP/[0-9.]+ 303' <<<"$proxied" || fail "API-key sign-in behind a TLS proxy did not redirect: $proxied"
+  grep -qiE '^set-cookie: wyrd_session_acme=[^;]+;.*; Secure' <<<"$proxied" \
+    || fail "the BFF behind a TLS proxy issued no Secure session cookie: $proxied"
 }
 # The BFF's Service page for `$1` (a UID plus query), as the signed-in browser in `$jar`.
 bff_page() { curl -fsS -b "$jar" "$public/t/acme/cards/$1"; }

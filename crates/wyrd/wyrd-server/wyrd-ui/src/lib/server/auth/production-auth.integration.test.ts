@@ -33,6 +33,12 @@ type Journey = {
   ssoTenant: string;
   apiKeyTenant: string;
   ssoAdminKey: string;
+  /**
+   * The live browser cases' own Active Keycloak tenant and its owner key: the
+   * HTTP cases deactivate and replace connections on theirs.
+   */
+  liveTenant: string;
+  liveAdminKey: string;
   offAdminKey: string;
   offReaderKey: string;
   /** An OIDC-off service principal with no Role: every protected read is refused. */
@@ -138,9 +144,14 @@ function expectSafeCookie(raw: string): void {
   expect(raw).not.toMatch(/;\s*Domain=/i);
 }
 
-/** A BFF cookie holds the renewing credential or PKCE state, never an access token. */
-function expectNoAccessToken(value: string): void {
-  expect(decodeURIComponent(value)).not.toMatch(jwt);
+/** A login cookie holds only its tenant and PKCE state. */
+function expectLoginCookie(value: string): void {
+  expect(Object.keys(JSON.parse(decodeURIComponent(value))).sort()).toEqual(['state', 'tenant', 'verifier']);
+}
+
+/** A session cookie holds only its tenant and the credential that renews it, never an access token. */
+function expectSessionCookie(value: string): void {
+  expect(Object.keys(JSON.parse(decodeURIComponent(value))).sort()).toEqual(['credential', 'kind', 'tenant']);
 }
 
 /**
@@ -198,7 +209,7 @@ async function beginSso(
   const begun = await browser.go(replica, `/t/${tenant}/login?/sso`, { form: {} });
   expect(begun.status).toBe(303);
   expectSafeCookie(browser.setCookie('wyrd_login'));
-  expectNoAccessToken(browser.cookies.get('wyrd_login')!);
+  expectLoginCookie(browser.cookies.get('wyrd_login')!);
   const request = new URL(begun.headers.get('location')!);
   expect(request.origin + request.pathname).toBe(`${journey.origin}/auth/authorize`);
   const query = request.searchParams;
@@ -253,7 +264,7 @@ async function ssoLogin(
   expect(browser.cookies.has('wyrd_login')).toBe(false);
   const session = browser.cookies.get(sessionCookie(tenant))!;
   expectSafeCookie(browser.setCookie(sessionCookie(tenant)));
-  expectNoAccessToken(session);
+  expectSessionCookie(session);
   return session;
 }
 
@@ -398,7 +409,7 @@ test('production SSO crosses replicas', async () => {
   expect(done.headers.get('location')).toBe(`/t/${sso}`);
   const session = alice.cookies.get(sessionCookie(sso))!;
   expectSafeCookie(alice.setCookie(sessionCookie(sso)));
-  expectNoAccessToken(session);
+  expectSessionCookie(session);
   // The code is one-use: its replay with the same login sets no session.
   const replay = new Browser();
   replay.cookies.set('wyrd_login', secondLogin);
@@ -520,9 +531,11 @@ test('OIDC-off credential UI', async () => {
   expect(reader.headers.get('location')).toBe(`/t/${tenant}`);
   expectSafeCookie(browser.setCookie(sessionCookie(tenant)));
   const readerSession = browser.cookies.get(sessionCookie(tenant))!;
-  expectNoAccessToken(readerSession);
+  expectSessionCookie(readerSession);
   await expectNoSecrets(browser, tenant, readerSession);
-  for (const seen of browser.seen) expect(seen).not.toContain(journey.offReaderKey);
+  // Only the HttpOnly session cookie carries the key.
+  for (const seen of browser.seen.filter((value) => !value.startsWith('wyrd_session_')))
+    expect(seen).not.toContain(journey.offReaderKey);
   expect((await browser.go(1, `${settings}?/deactivate`, { form: {} })).status).toBe(403);
   const out = await browser.go(0, '/?/logout', { form: { tenantKey: tenant } });
   expect(out.headers.get('location')).toBe(login);
@@ -743,7 +756,7 @@ test('production provider replacement settings', async () => {
 /** The `user` principals with `email`, read with the tenant administrator's key. */
 async function usersWithEmail(email: string): Promise<{ principal_id: string }[]> {
   const listed = await asKey(
-    journey.ssoAdminKey,
+    journey.liveAdminKey,
     'GET',
     `/principals?kind=user&email=${encodeURIComponent(email)}`
   );
@@ -801,7 +814,7 @@ const principalOf = (token: string) =>
   }).principal.id;
 
 test('live UI login and CLI', async () => {
-  const sso = journey.ssoTenant;
+  const sso = journey.liveTenant;
   const fresh = journey.users.fresh;
   await mkdir(journey.evidence, { recursive: true });
   const config = await mkdtemp(join(tmpdir(), 'wyrd-live-cli-'));
@@ -967,7 +980,7 @@ async function apiKeyLogin(page: Page, tenant: string, apiKey: string) {
 const homeFixtures = ['Raise checkout ranking cutoff', 'checkout-api', 'change_01', 'Recent changes', 'Pick work back up'];
 
 test('live UI initial Home', async () => {
-  const sso = journey.ssoTenant;
+  const sso = journey.liveTenant;
   const home = `${journey.origin}/t/${sso}`;
   await mkdir(journey.evidence, { recursive: true });
   const cards = await mkdtemp(join(tmpdir(), 'wyrd-home-cards-'));
@@ -978,7 +991,7 @@ test('live UI initial Home', async () => {
     await browserLogin(page, sso, journey.users.admin);
 
     // Before registration Home shows exactly the tenant's authoritative Cards and no fixtures.
-    const before = await registeredCards(journey.ssoAdminKey);
+    const before = await registeredCards(journey.liveAdminKey);
     const initial = await (await context.request.get(home)).text();
     expect(initial).toContain(`${before.length} registered`);
     for (const { name } of before.slice(-5)) expect(initial).toContain(name);
@@ -995,7 +1008,7 @@ test('live UI initial Home', async () => {
         join(cards, `${name}.yaml`),
         `apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: ${name}\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [${name}]\n`
       );
-    await writeFile(join(cards, 'credentials.toml'), `[default]\napi_key = "${journey.ssoAdminKey}"\n`, {
+    await writeFile(join(cards, 'credentials.toml'), `[default]\napi_key = "${journey.liveAdminKey}"\n`, {
       mode: 0o600
     });
     // A directory is one Card tree with one root, so each independent Prompt is applied alone.
@@ -1003,7 +1016,7 @@ test('live UI initial Home', async () => {
       const applied = await wyrd(cards, ['apply', '--server', journey.origin, join(cards, `${name}.yaml`)]);
       expect(applied.code, applied.output).toBe(0);
     }
-    const after = await registeredCards(journey.ssoAdminKey);
+    const after = await registeredCards(journey.liveAdminKey);
     expect(after).toHaveLength(before.length + 2);
 
     // Returning Home by client navigation reads the change through a server load, not the browser.
@@ -1113,7 +1126,7 @@ async function shownRows(page: Page): Promise<string[]> {
 }
 
 test('live UI Card inventory', async () => {
-  const sso = journey.ssoTenant;
+  const sso = journey.liveTenant;
   const cardsUrl = `${journey.origin}/t/${sso}/cards`;
   await mkdir(journey.evidence, { recursive: true });
   const fixture = (file: string) => readFile(join(typedState, file), 'utf8');
@@ -1121,7 +1134,7 @@ test('live UI Card inventory', async () => {
   const named = (yaml: string, from: string, to: string, labels = '') =>
     yaml.replace(`  name: ${from}\n`, `  name: ${to}\n${labels}`);
   // Real Models, Data, an Agent and Prompts — more than one 20-row page — then two Services over them.
-  await applyCards(journey.ssoAdminKey, {
+  await applyCards(journey.liveAdminKey, {
     'inv-model-a': named(model, 'primary', 'inv-model-a', '  labels:\n    team: search\n'),
     'inv-model-b': named(model, 'primary', 'inv-model-b'),
     'inv-data-a': named(data, 'training', 'inv-data-a', '  labels:\n    owner: r.okafor\n'),
@@ -1131,12 +1144,12 @@ test('live UI Card inventory', async () => {
       Array.from({ length: 14 }, (_, i) => `inv-prompt-${String(i + 1).padStart(2, '0')}`).map((name) => [name, prompt(name)])
     )
   });
-  await applyCards(journey.ssoAdminKey, { 'inv-svc-a': service('inv-svc-a'), 'inv-svc-b': service('inv-svc-b') });
+  await applyCards(journey.liveAdminKey, { 'inv-svc-a': service('inv-svc-a'), 'inv-svc-b': service('inv-svc-b') });
   // Another tenant registers an overlapping name.
   await applyCards(journey.offAdminKey, { 'inv-prompt-01': prompt('inv-prompt-01') });
 
   const scope = { filter: 'name =~ "(?i)inv-"' };
-  const expected = await authoritative(journey.ssoAdminKey, scope);
+  const expected = await authoritative(journey.liveAdminKey, scope);
   expect(expected).toHaveLength(21);
   const browser = await chromium.launch();
   try {
@@ -1181,7 +1194,7 @@ test('live UI Card inventory', async () => {
     await page.waitForURL((url) => url.searchParams.has('cursor'));
     await page.getByRole('navigation', { name: 'Filter by kind' }).getByRole('link', { name: 'Service' }).click();
     await page.waitForURL(`${cardsUrl}?q=inv-&kind=Service`);
-    const services = await authoritative(journey.ssoAdminKey, { ...scope, kind: 'Service' });
+    const services = await authoritative(journey.liveAdminKey, { ...scope, kind: 'Service' });
     expect(services.map(({ name }) => name).sort()).toEqual(['inv-svc-a', 'inv-svc-b']);
     await expect.poll(() => shownRows(page)).toEqual(services.map(({ name }) => name));
     await page.screenshot({ path: join(journey.evidence, 'cards-services.png'), fullPage: true });
@@ -1212,7 +1225,7 @@ test('live UI Card inventory', async () => {
     expect(rowsOf(await html('q=00000000-0000-7000-8000-000000000000'))).toEqual([]);
 
     // The overlapping name resolves to this tenant's Card only.
-    const [ours] = await authoritative(journey.ssoAdminKey, { name: 'inv-prompt-01' });
+    const [ours] = await authoritative(journey.liveAdminKey, { name: 'inv-prompt-01' });
     const [theirs] = await authoritative(journey.offAdminKey, { name: 'inv-prompt-01' });
     const overlap = await html('q=inv-prompt-01');
     expect(overlap).toContain(ours.card_uid);
@@ -1246,7 +1259,7 @@ test('live UI Card inventory', async () => {
 /** The UID of the exact Card `kind default/name@version`, read with the administrator's key. */
 async function uidOf(kind: string, name: string, version = '1.0.0'): Promise<string> {
   const query = new URLSearchParams({ kind, space: 'default', name, version });
-  const read = await asKey(journey.ssoAdminKey, 'GET', `/cards/by-ref?${query}`);
+  const read = await asKey(journey.liveAdminKey, 'GET', `/cards/by-ref?${query}`);
   expect(read.status).toBe(200);
   return ((await read.json()) as { card: { metadata: { uid: string } } }).card.metadata.uid;
 }
@@ -1273,7 +1286,7 @@ async function detailJourney(
   },
   shot: string
 ): Promise<{ context: BrowserContext; page: Page; priorUid: string; currentUid: string }> {
-  const sso = journey.ssoTenant;
+  const sso = journey.liveTenant;
   const base = `${journey.origin}/t/${sso}`;
   const [priorUid, currentUid] = await Promise.all([uidOf(line.kind, line.name), uidOf(line.kind, line.name, '2.0.0')]);
   const context = await browser.newContext();
@@ -1356,13 +1369,13 @@ const variant = (yaml: string, name: string, version: string, ...edits: [string,
 test('live UI Model detail', async () => {
   await mkdir(journey.evidence, { recursive: true });
   const model = await readFile(join(typedState, 'model-primary.yaml'), 'utf8');
-  await applyCards(journey.ssoAdminKey, {
+  await applyCards(journey.liveAdminKey, {
     'det-model-1': variant(model, 'det-model', '1.0.0', ['  version: 1.0.0\n', '  version: 1.0.0\n  labels:\n    team: ranking\n'])
   });
-  await applyCards(journey.ssoAdminKey, {
+  await applyCards(journey.liveAdminKey, {
     'det-model-2': variant(model, 'det-model', '2.0.0', ['GradientBoostingClassifier', 'RandomForestClassifier'])
   });
-  await applyCards(journey.ssoAdminKey, {
+  await applyCards(journey.liveAdminKey, {
     'det-model-svc': service('det-model-svc').replace('inv-model-a', 'det-model')
   });
   const svc = await uidOf('Service', 'det-model-svc');
@@ -1380,7 +1393,7 @@ test('live UI Model detail', async () => {
       'model'
     );
     // Server-managed metadata of the pinned version.
-    const html = await (await context.request.get(`${journey.origin}/t/${journey.ssoTenant}/cards/${await uidOf('Model', 'det-model')}`)).text();
+    const html = await (await context.request.get(`${journey.origin}/t/${journey.liveTenant}/cards/${await uidOf('Model', 'det-model')}`)).text();
     for (const text of ['team=ranking', 'BinaryClassification', 'signature', 'inputs[0].name', 'feature'])
       expect(html).toContain(text);
     await context.close();
@@ -1393,11 +1406,11 @@ test('live UI Data detail', async () => {
   await mkdir(journey.evidence, { recursive: true });
   const [data, drift] = await Promise.all(['training.yaml', 'model-drift.yaml'].map((file) => readFile(join(typedState, file), 'utf8')));
   const column = (name: string): [string, string] => ['      - name: label\n', `      - name: ${name}\n`];
-  await applyCards(journey.ssoAdminKey, {
+  await applyCards(journey.liveAdminKey, {
     'det-data-1': variant(data, 'det-data', '1.0.0', column('det-clicked'), ['  version: 1.0.0\n', '  version: 1.0.0\n  labels:\n    owner: r.okafor\n']),
     'det-data-2': variant(data, 'det-data', '2.0.0', column('det-converted'), ['Snappy', 'Zstd'])
   });
-  await applyCards(journey.ssoAdminKey, {
+  await applyCards(journey.liveAdminKey, {
     'det-data-drift': variant(drift, 'det-data-drift', '1.0.0', ['name: training', 'name: det-data'])
   });
   const verifier = await uidOf('Verifier', 'det-data-drift');
@@ -1415,7 +1428,7 @@ test('live UI Data detail', async () => {
       'data'
     );
     // The declared schema, interface and stats and the server-managed metadata of the pinned version.
-    const html = await (await context.request.get(`${journey.origin}/t/${journey.ssoTenant}/cards/${priorUid}`)).text();
+    const html = await (await context.request.get(`${journey.origin}/t/${journey.liveTenant}/cards/${priorUid}`)).text();
     for (const text of ['columns[0].name', 'feature', 'columns[1].dtype', 'int64', 'Parquet', 'Snappy', 'row_count', 'owner=r.okafor'])
       expect(html).toContain(text);
     expect(html).not.toContain('Zstd');
@@ -1429,9 +1442,9 @@ test('live UI Agent detail', async () => {
   await mkdir(journey.evidence, { recursive: true });
   const agent = (version: string, timeout: number) =>
     `apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: det-agent\n  version: ${version}\n  space: default\nspec:\n  prompt: { kind: Prompt, name: det-agent-prompt, version: 1.0.0, space: default }\n  run_config:\n    max_iterations: 2\n    timeout_ms: ${timeout}\n`;
-  await applyCards(journey.ssoAdminKey, { 'det-agent-prompt': prompt('det-agent-prompt') });
-  await applyCards(journey.ssoAdminKey, { 'det-agent-1': agent('1.0.0', 43210) });
-  await applyCards(journey.ssoAdminKey, { 'det-agent-2': agent('2.0.0', 98765) });
+  await applyCards(journey.liveAdminKey, { 'det-agent-prompt': prompt('det-agent-prompt') });
+  await applyCards(journey.liveAdminKey, { 'det-agent-1': agent('1.0.0', 43210) });
+  await applyCards(journey.liveAdminKey, { 'det-agent-2': agent('2.0.0', 98765) });
   const promptUid = await uidOf('Prompt', 'det-agent-prompt');
   const browser = await chromium.launch();
   try {
@@ -1447,8 +1460,8 @@ test('live UI Agent detail', async () => {
       'agent'
     );
     // The current version declares the same exact Prompt; the Prompt shows both Agent versions inbound.
-    const html = await (await context.request.get(`${journey.origin}/t/${journey.ssoTenant}/cards/${currentUid}`)).text();
-    expect(html).toContain(`href="/t/${journey.ssoTenant}/cards/${promptUid}"`);
+    const html = await (await context.request.get(`${journey.origin}/t/${journey.liveTenant}/cards/${currentUid}`)).text();
+    expect(html).toContain(`href="/t/${journey.liveTenant}/cards/${promptUid}"`);
     expect(html).toContain('max_iterations');
     await expect.poll(() => page.locator('main').textContent()).toContain('Agent default/det-agent@2.0.0');
     expect(await page.locator('main').textContent()).toContain('Agent default/det-agent@1.0.0');
@@ -1465,9 +1478,9 @@ test('live UI Prompt detail', async () => {
   const message = (word: string) => `Summarize det-prompt-${word} <script>window.detPwned=1</script>`;
   const declared = (version: string, word: string) =>
     `apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: det-prompt\n  version: ${version}\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: ${JSON.stringify([message(word)])}\n`;
-  await applyCards(journey.ssoAdminKey, { 'det-prompt-1': declared('1.0.0', 'one') });
-  await applyCards(journey.ssoAdminKey, { 'det-prompt-2': declared('2.0.0', 'two') });
-  await applyCards(journey.ssoAdminKey, {
+  await applyCards(journey.liveAdminKey, { 'det-prompt-1': declared('1.0.0', 'one') });
+  await applyCards(journey.liveAdminKey, { 'det-prompt-2': declared('2.0.0', 'two') });
+  await applyCards(journey.liveAdminKey, {
     'det-prompt-agent': `apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: det-prompt-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: { kind: Prompt, name: det-prompt, version: 1.0.0, space: default }\n  run_config:\n    max_iterations: 1\n    timeout_ms: 1000\n`
   });
   const agentUid = await uidOf('Agent', 'det-prompt-agent');
@@ -1484,12 +1497,12 @@ test('live UI Prompt detail', async () => {
       },
       'prompt'
     );
-    const url = `${journey.origin}/t/${journey.ssoTenant}/cards/${priorUid}`;
+    const url = `${journey.origin}/t/${journey.liveTenant}/cards/${priorUid}`;
     // Declared markup is text: escaped in the HTML, shown verbatim, never executed.
     const html = await (await context.request.get(url)).text();
     expect(html).not.toContain('<script>window.detPwned');
     // The page shows the server's stored declaration, which normalizes the authored shorthand.
-    const stored = await asKey(journey.ssoAdminKey, 'GET', `/cards/by-ref?${new URLSearchParams({ kind: 'Prompt', space: 'default', name: 'det-prompt', version: '1.0.0' })}`);
+    const stored = await asKey(journey.liveAdminKey, 'GET', `/cards/by-ref?${new URLSearchParams({ kind: 'Prompt', space: 'default', name: 'det-prompt', version: '1.0.0' })}`);
     const { spec } = ((await stored.json()) as { card: { spec: { model: string; request: { provider: string } } } }).card;
     for (const text of ['request', 'provider', spec.request.provider, spec.model, 'body.messages[0].content']) expect(html).toContain(text);
     await page.goto(url);
@@ -1514,9 +1527,9 @@ test('live UI Prompt detail', async () => {
 
 test('live UI Service workspace', async () => {
   await mkdir(journey.evidence, { recursive: true });
-  const admin = WyrdClient.connect({ serverUrl: journey.servers[0], credential: journey.ssoAdminKey, grpcUrl: journey.grpcs[0] });
+  const admin = WyrdClient.connect({ serverUrl: journey.servers[0], credential: journey.liveAdminKey, grpcUrl: journey.grpcs[0] });
   const [passing, failing] = await serviceWorkload(admin);
-  const sso = journey.ssoTenant;
+  const sso = journey.liveTenant;
   const base = `${journey.origin}/t/${sso}`;
   const browser = await chromium.launch();
   try {

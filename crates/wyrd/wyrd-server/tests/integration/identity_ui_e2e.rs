@@ -70,6 +70,9 @@ const SWITCH_PEER_TENANT: &str = "ui-switch-peer";
 /// Tenant whose first-realm connection is replaced by the second realm
 /// through settings.
 const REPLACEMENT_TENANT: &str = "ui-replace";
+/// Tenant the live browser cases sign in to, with its own Active Keycloak
+/// connection: the HTTP cases deactivate the SSO tenant's.
+const LIVE_TENANT: &str = "ui-live";
 
 /// A journey child process (a BFF replica or the TLS terminator) killed when
 /// the journey ends, however it ends.
@@ -550,6 +553,15 @@ async fn production_ui_bff_journey() {
         KEYCLOAK_ALICE,
     )
     .await;
+    let live_admin_key = sso_tenant(
+        &srv,
+        &server,
+        &host,
+        LIVE_TENANT,
+        keycloak_connection(),
+        KEYCLOAK_ALICE,
+    )
+    .await;
     let replacement_owner_key = sso_tenant(
         &srv,
         &server,
@@ -585,6 +597,8 @@ async fn production_ui_bff_journey() {
         "ssoTenant": SSO_TENANT,
         "apiKeyTenant": API_KEY_TENANT,
         "ssoAdminKey": sso_admin_key,
+        "liveTenant": LIVE_TENANT,
+        "liveAdminKey": live_admin_key,
         "offAdminKey": off_admin.api_key().expect("admin key").expose_secret(),
         "offReaderKey": off_reader.api_key().expect("reader key").expose_secret(),
         "offNoRoleKey": off_no_role.api_key().expect("role-less key").expose_secret(),

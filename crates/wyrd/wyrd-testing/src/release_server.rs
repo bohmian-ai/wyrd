@@ -598,6 +598,7 @@ impl LocalServer {
                 Ok(MemoryPeak::Cgroup(file))
             }
             Meter::Process(pid) => {
+                #[cfg(target_os = "linux")]
                 os::reset_peak_memory(*pid)?;
                 Ok(MemoryPeak::Process(*pid))
             }

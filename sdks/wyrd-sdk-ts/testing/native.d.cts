@@ -160,8 +160,7 @@ export declare class NativeWyrdTestServer {
    * return its id: the fixture tenant when `tenantSlug` is absent, else a
    * newly seeded tenant of that slug with its own administrator.
    *
-   * Needs `startTestServer({ humanSso: true })` and the identity lane's
-   * Keycloak.
+   * Needs the identity lane's Keycloak.
    *
    * # Errors
    *
@@ -393,11 +392,6 @@ export interface NativeTestServerOptions {
   providerBaseUrl?: string
   /** `true` runs Drift baseline fitting and Verifier runs. */
   verificationRuntime?: boolean
-  /**
-   * `true` serves the public origin the identity lane's Keycloak clients
-   * register, for saved user login journeys.
-   */
-  humanSso?: boolean
   /**
    * Access-token lifetime in seconds, verified with no clock-skew
    * allowance, so a journey can outlive one token; omitted keeps the

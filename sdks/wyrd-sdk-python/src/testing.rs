@@ -20,7 +20,7 @@ use url::Url;
 use wyrd_runtime::Permission;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
-use wyrd_testing::human_login::{HUMAN_PUBLIC_ORIGIN, HumanSso};
+use wyrd_testing::human_login::HumanSso;
 use wyrd_testing::{
     Bootstrap, UnmigratedDatabase as EmptyDatabase, WyrdTestServer as TestServer,
     WyrdTestServerError,
@@ -99,10 +99,6 @@ fn publish_env(py: Python<'_>, key: &str, value: Option<&str>) -> WyrdPyResult<(
 
 /// Python context manager for the Wyrd in-process test server.
 #[pyclass(module = "wyrd._wyrd.testing")]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "preserve the established Python test-harness constructor flags"
-)]
 pub struct WyrdTestServer {
     /// Whether entering publishes the `WYRD_*` endpoint variables.
     mutate_env: bool,
@@ -114,9 +110,6 @@ pub struct WyrdTestServer {
     /// Whether every built-in gateway adapter targets its real provider
     /// endpoint, for the opt-in live smoke lane.
     live_providers: bool,
-    /// Whether the server answers at the public origin the Keycloak fixture
-    /// clients register, so human sign-ins can complete against it.
-    human_sso: bool,
     /// Access-token lifetime in seconds, verified with no clock-skew
     /// allowance, for a journey that outlives its first token; `None` keeps
     /// the production lifetime.
@@ -149,26 +142,19 @@ impl WyrdTestServer {
     /// `OpenAI` LLM judge of the verification runtime, so a continuous Eval
     /// journey's judge calls `<root>/v1/chat/completions`. `live_providers` instead points every
     /// built-in adapter at its real provider endpoint, which only the opt-in
-    /// live smoke lane asks for. `human_sso` serves the public origin the
-    /// identity lane's Keycloak clients register, for saved user login
-    /// journeys. `access_ttl_seconds` mints access tokens of that lifetime,
+    /// live smoke lane asks for. `access_ttl_seconds` mints access tokens of that lifetime,
     /// verified with no clock-skew allowance, so a journey can outlive one.
     ///
     /// # Errors
     /// Raises the harness error when `provider_base_url` is not an absolute
     /// URL, or when it is combined with `live_providers`.
     #[new]
-    #[pyo3(signature = (mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, human_sso = false, access_ttl_seconds = None))]
-    #[allow(
-        clippy::fn_params_excessive_bools,
-        reason = "PyO3 projects the existing Python test-harness flags directly"
-    )]
+    #[pyo3(signature = (mutate_env = true, verification_runtime = false, provider_base_url = None, live_providers = false, access_ttl_seconds = None))]
     fn __new__(
         mutate_env: bool,
         verification_runtime: bool,
         provider_base_url: Option<&str>,
         live_providers: bool,
-        human_sso: bool,
         access_ttl_seconds: Option<i64>,
     ) -> WyrdPyResult<Self> {
         if live_providers && provider_base_url.is_some() {
@@ -187,7 +173,6 @@ impl WyrdTestServer {
             verification_runtime,
             provider_base_url,
             live_providers,
-            human_sso,
             access_ttl_seconds,
             base_url: None,
             grpc_url: None,
@@ -209,18 +194,12 @@ impl WyrdTestServer {
         let root = slf.provider_base_url.clone();
         let live_providers = slf.live_providers;
         let verification_runtime = slf.verification_runtime;
-        let human_sso = slf.human_sso;
         let access_ttl_seconds = slf.access_ttl_seconds;
         let (server, api_key) = wyrd_runtime::runtime()
             .block_on(async {
                 let mut builder = TestServer::builder();
                 if verification_runtime {
                     builder = builder.with_verification_runtime_for_test();
-                }
-                if human_sso {
-                    builder = builder.with_public_origin(
-                        Url::parse(HUMAN_PUBLIC_ORIGIN).expect("the fixture origin is a URL"),
-                    );
                 }
                 if let Some(seconds) = access_ttl_seconds {
                     builder = builder
@@ -617,7 +596,7 @@ impl WyrdTestServer {
     /// tenant `admin_key` administers, mapping `wyrd-admins` to `admin`,
     /// `wyrd-editors` to `editor`, and `wyrd-viewers` to `viewer`.
     ///
-    /// Needs `human_sso=True` and the identity lane's Keycloak.
+    /// Needs the identity lane's Keycloak.
     ///
     /// # Errors
     /// Raises the harness error outside the context manager.

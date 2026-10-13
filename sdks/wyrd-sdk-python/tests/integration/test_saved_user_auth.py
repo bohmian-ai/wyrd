@@ -32,7 +32,7 @@ PROMPT = FIXTURES / "cards/gateway_inference/ask-prompt.yaml"
 @pytest.fixture(scope="module")
 def sso_server() -> Iterator[WyrdTestServer]:
     """A server accepting human sign-in for both tenants; it exports no environment."""
-    with WyrdTestServer(mutate_env=False, human_sso=True) as server:
+    with WyrdTestServer(mutate_env=False) as server:
         server.activate_human_sso(server.api_key)
         second = server.seed_tenant(SECOND_TENANT)
         server.activate_human_sso(

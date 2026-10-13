@@ -49,8 +49,6 @@ export interface ServerOptions {
   readonly provider?: (request: ReceivedRequest) => Reply;
   /** Run Drift baseline fitting, scheduled Verifier runs, and Operators. */
   readonly verificationRuntime?: boolean;
-  /** Accept human single sign-on, so saved user logins can authenticate. */
-  readonly humanSso?: boolean;
   /** Access-token lifetime in seconds, verified with no clock-skew allowance. */
   readonly accessTtlSeconds?: number;
 }
@@ -94,7 +92,6 @@ export function serverTest(options: ServerOptions = {}) {
         const server = startTestServer({
           providerBaseUrl: options.provider && provider.url,
           verificationRuntime: options.verificationRuntime,
-          humanSso: options.humanSso,
           accessTtlSeconds: options.accessTtlSeconds,
         });
         deploy(server);

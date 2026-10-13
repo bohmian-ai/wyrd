@@ -3,7 +3,7 @@ name: storage-integration-cloud
 # Runs credentialed storage tests against real S3, GCS, and Azure Blob: the
 # StorageHandle data-plane CRUD suite (read/write/list/delete) plus the real
 # WyrdStorageClient client/server upload and verified-download journey.
-# Emulators cannot verify: real IAM/role assumption, GCS workload-identity
+# Emulators cannot verify: real IAM/role assumption, GCS service-account
 # signed URLs, Azure user-delegation SAS, virtual-host vs path-style addressing
 # against real endpoints, and provider-specific error shapes.
 #
@@ -23,8 +23,9 @@ on:
 #   AWS_CLOUD_ROLE_ARN          — IAM role ARN for OIDC assumption (e.g. arn:aws:iam::ACCOUNT:role/wyrd-ci-storage)
 #   AWS_CLOUD_BUCKET_NAME       — S3 bucket name (e.g. wyrd-ci-storage)
 #   AWS_CLOUD_REGION            — S3 region (e.g. us-east-1)
-#   GCP_CLOUD_WORKLOAD_IDENTITY — GCP workload identity provider resource name
-#   GCP_CLOUD_SERVICE_ACCOUNT   — GCP service account email for impersonation
+#   GCP_CLOUD_ACCOUNT_JSON_BASE64 — base64 GCS service-account key JSON; object_store
+#                                   reads no workload-identity (external_account)
+#                                   credentials, and V4 URL signing needs the key
 #   GCP_CLOUD_BUCKET_NAME       — GCS bucket name
 #   AZURE_CLOUD_CLIENT_ID       — Azure AD app client ID for OIDC federation
 #   AZURE_CLOUD_TENANT_ID       — Azure AD tenant ID
@@ -38,7 +39,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # Required for OIDC credential federation
+  id-token: write   # Required for S3 and Azure OIDC credential federation
 
 env:
   MISE_LOCKED: "true"
@@ -87,15 +88,10 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
 
-      - name: Authenticate to GCP (workload identity)
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ secrets.GCP_CLOUD_WORKLOAD_IDENTITY }}
-          service_account: ${{ secrets.GCP_CLOUD_SERVICE_ACCOUNT }}
-
       - name: Run GCS cloud tests
         env:
           WYRD_STORAGE_URL: gs://${{ secrets.GCP_CLOUD_BUCKET_NAME }}
+          GOOGLE_ACCOUNT_JSON_BASE64: ${{ secrets.GCP_CLOUD_ACCOUNT_JSON_BASE64 }}
         run: mise run test:storage:gcs:cloud
 
   azure-cloud:

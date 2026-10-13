@@ -1363,7 +1363,9 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     // One dispatched full rewrite covers the closed partition's whole head.
     let (replacement_snapshot, outputs) = journey.compact(&table.binding).await;
     assert_ne!(replacement_snapshot, promoted_snapshot);
-    let (neighbour_snapshot, neighbour_files) = journey.live_files(&neighbour_table.binding).await;
+    // Settled task rows do not prove the neighbour was pulled: the leader holds
+    // its demand until a worker's next pull, so its own rewrite is awaited.
+    let (neighbour_snapshot, neighbour_files) = journey.compact(&neighbour_table.binding).await;
     assert_ne!(
         neighbour_snapshot, neighbour_promoted,
         "the competing table's own maintenance drained through the same worker \

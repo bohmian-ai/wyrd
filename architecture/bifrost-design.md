@@ -663,8 +663,10 @@ accepts the leader's stream, beneath its own local capacity root, or refuses
 at once with retry timing when full. No pending reservation, reservation
 expiry, or reclaim-by-timeout exists. When the leader stream completes, fails,
 is cancelled, or is dropped, or the deadline passes, the follower cancels the
-graph immediately and releases every owner once its structured tasks have
-joined; nothing waits for a later request or timer to reclaim it.
+graph immediately and releases every owner inline, without waiting for nested
+children still being torn down; a late child returns its bytes through the
+shared memory root as it frees them. Nothing waits for a later request or
+timer to reclaim it.
 
 Exchange buffers draw from the same finite query-owned memory pool as the
 operators; they are not precharged into a predicted child allocation. Before
@@ -1229,8 +1231,10 @@ use age.
   does not have.
 - Global resource owners account tenant and table attribution without creating
   an independent root pool per tenant.
-- Cancellation is structured: stop admission, cancel descendants, join work,
-  reconcile uncertain effects, and release ownership exactly once.
+- Cancellation is structured: stop admission, cancel descendants, reconcile
+  uncertain effects, and release ownership exactly once. Query graph release
+  does not join dependency-owned teardown; memory those children still hold
+  stays charged to the shared root until they free it.
 - Durable operations separate definite failure from uncertain completion.
   Uncertainty retains identity and evidence until reconciliation.
 - Catalog compare-and-swap and lease fences own publication authority. An

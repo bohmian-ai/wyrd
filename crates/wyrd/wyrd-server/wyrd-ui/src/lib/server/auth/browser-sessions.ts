@@ -91,9 +91,10 @@ export class BrowserSession {
     path: P,
     ...[request]: V1Args<P, M>
   ): Promise<V1Response<P, M>> {
-    const { body, path: params }: { body?: unknown; path?: unknown } = request ?? {};
+    const { body, path: params, query }: { body?: unknown; path?: unknown; query?: unknown } =
+      request ?? {};
     try {
-      return await fetch(new URL(`/v1${v1Path(path, params)}`, serverUrl()), {
+      return await fetch(new URL(`/v1${v1Path(path, params, query)}`, serverUrl()), {
         method: method.toUpperCase(),
         headers: {
           'x-wyrd-access-token': `Bearer ${this.#token}`,

@@ -13,7 +13,7 @@ import type { HomeView } from '$lib/views';
 import { reject, type TenantContext } from './auth/session';
 import type { BrowserSession } from './auth/browser-sessions';
 import { problemKind } from './problem';
-import type { components } from './generated/wyrd-http';
+import type { components, operations } from './generated/wyrd-http';
 import type {
   DashboardDetail,
   DashboardsView,
@@ -27,7 +27,7 @@ import type {
   TracesView,
   GenAiView
 } from '$lib/features/observe/core/types';
-import type { CardDetail, CardsView } from '$lib/features/cards/core/types';
+import { CARD_KINDS, type CardDetail, type CardKind, type CardsView } from '$lib/features/cards/core/types';
 import { projectCard, projectCards } from './mock/cards/project';
 import {
   projectDashboard,
@@ -353,8 +353,75 @@ export class WyrdClient {
     return this.context.tenant.key === 'acme';
   }
 
-  cards(filters: Record<string, string>): CardsView {
-    return projectCards(filters, this.cardsAccess());
+  /**
+   * The Card inventory under URL filters. Live reads page the registry by its
+   * opaque keyset `cursor`; `q` is a case-insensitive name match, or an exact
+   * Card UID resolved through bounded kind-qualified reads.
+   */
+  async cards(filters: Record<string, string>, cursor = ''): Promise<CardsView> {
+    if (this.mockData) return projectCards(filters, this.cardsAccess());
+    if (!this.session) reject('upstream');
+    const q = (filters.q ?? '').trim();
+    const uid = cardUid.test(q) ? q.toLowerCase() : null;
+    const query = {
+      kind: filters.kind || undefined,
+      space: filters.space || undefined,
+      status: filters.status || undefined,
+      filter:
+        [
+          !uid && q && `name =~ ${quoted(`(?i)${q.replace(/[\\^$.|?*+()[\]{}]/g, '\\$&')}`)}`,
+          filters.label && labelClause(filters.label),
+          filters.owner && labelClause(`owner=${filters.owner}`)
+        ]
+          .filter(Boolean)
+          .join(' and ') || undefined
+    };
+    let page: ListCardsResponse;
+    if (uid) {
+      const found = await this.cardByUid(uid, filters.kind ? [filters.kind] : CARD_KINDS);
+      // The UID's identity line under the same filters; the other versions drop out.
+      page = found
+        ? await this.listCards({
+            ...query,
+            kind: found.kind,
+            name: found.metadata.name,
+            include_prerelease: true,
+            limit: 200
+          })
+        : { items: [], next_cursor: null };
+      page = { items: page.items.filter((card) => card.card_uid === uid), next_cursor: null };
+    } else {
+      page = await this.listCards({ ...query, limit: cardsPageSize, cursor: cursor || undefined });
+    }
+    const scoped = Object.values(filters).some(Boolean) || Boolean(cursor);
+    return liveCards(page, !scoped && !page.items.length);
+  }
+
+  /** One registry page; the server's refusal is the page's refusal. */
+  private async listCards(
+    query: NonNullable<operations['list_cards_http']['parameters']['query']>
+  ): Promise<ListCardsResponse> {
+    const response = await this.session!.api('get', '/cards', { query });
+    if (!response.ok) reject(await problemKind(response));
+    return response.json();
+  }
+
+  /**
+   * Resolve a bare UID to its envelope by trying each candidate kind in
+   * parallel; a kind that does not own the UID answers 404.
+   */
+  private async cardByUid(uid: string, kinds: readonly string[]) {
+    const found = await Promise.all(
+      kinds.map(async (kind) => {
+        const response = await this.session!.api('get', '/cards/by-uid/{kind}/{card_uid}', {
+          path: { kind, card_uid: uid }
+        });
+        if (response.status === 404) return null;
+        if (!response.ok) reject(await problemKind(response));
+        return (await response.json()).card;
+      })
+    );
+    return found.find(Boolean) ?? null;
   }
 
   card(uid: string, version?: string): CardDetail {
@@ -383,6 +450,46 @@ export class WyrdClient {
 }
 
 type Lifecycle = components['schemas']['CardLifecycleStatus'];
+type ListCardsResponse = components['schemas']['ListCardsResponse'];
+
+/** Rows per inventory page; the registry caps a page at 200. */
+const cardsPageSize = 20;
+const cardUid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** A metadata-query string literal. */
+const quoted = (value: string) => `"${value.replace(/[\\"]/g, '\\$&')}"`;
+
+/** `key=value` selects a label value; a bare `key` selects Cards declaring it. */
+function labelClause(label: string): string {
+  const at = label.indexOf('=');
+  return at < 0
+    ? `labels.${quoted(label)} exists`
+    : `labels.${quoted(label.slice(0, at))} = ${quoted(label.slice(at + 1))}`;
+}
+
+/**
+ * Project one registry page onto the inventory. The wire has no population
+ * counts, so `total` is known only for an unscoped empty tenant.
+ */
+function liveCards(page: ListCardsResponse, emptyTenant: boolean): CardsView {
+  return {
+    total: emptyTenant ? 0 : null,
+    kinds: CARD_KINDS.map((kind) => ({ kind, count: null })),
+    rows: page.items.map((card) => ({
+      uid: card.card_uid,
+      name: card.name,
+      kind: card.kind as CardKind,
+      version: card.version,
+      space: card.space,
+      status: { label: card.status, tone: lifecycleTone[card.status] },
+      updated: `${card.updated_at.slice(0, 16).replace('T', ' ')}Z`,
+      updatedAt: card.updated_at
+    })),
+    recent: [],
+    order: 'oldest registered first',
+    next: page.next_cursor ?? null
+  };
+}
 const lifecycleTone: Record<Lifecycle, HomeView['cards'][number]['tone']> = {
   active: 'ok',
   pending: 'running',

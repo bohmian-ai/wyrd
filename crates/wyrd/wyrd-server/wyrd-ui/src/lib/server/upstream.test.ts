@@ -170,4 +170,7 @@ test('generated path templates are filled, encoded, and never sent with a missin
   );
   expect(v1Path('/identity/oidc/connections')).toBe('/identity/oidc/connections');
   expect(() => v1Path('/identity/oidc/connections/{id}', {})).toThrow('missing path parameter id');
+  expect(v1Path('/cards', {}, { kind: 'Model', filter: 'name =~ "a&b"', cursor: undefined })).toBe(
+    '/cards?kind=Model&filter=name+%3D%7E+%22a%26b%22'
+  );
 });

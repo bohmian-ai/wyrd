@@ -2,7 +2,7 @@ import { reject } from '$lib/server/auth/session';
 import { safeProblem } from '$lib/server/problem';
 import type { PageServerLoad } from './$types';
 
-export const load: PageServerLoad = ({ locals, url }) => {
+export const load: PageServerLoad = async ({ locals, url }) => {
   if (!locals.wyrd) reject('unauthenticated');
   const filters = Object.fromEntries(
     ['q', 'kind', 'space', 'status', 'label', 'owner'].map((key) => [
@@ -10,9 +10,10 @@ export const load: PageServerLoad = ({ locals, url }) => {
       url.searchParams.get(key) ?? ''
     ])
   );
+  const cursor = url.searchParams.get('cursor') ?? '';
   try {
-    return { view: locals.wyrd.cards(filters), filters, problem: null };
+    return { view: await locals.wyrd.cards(filters, cursor), filters, cursor, problem: null };
   } catch (cause) {
-    return { view: null, filters, problem: safeProblem(cause) };
+    return { view: null, filters, cursor, problem: safeProblem(cause) };
   }
 };

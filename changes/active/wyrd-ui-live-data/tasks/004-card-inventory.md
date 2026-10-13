@@ -149,3 +149,61 @@ Report a concrete blocker if repository-managed setup cannot supply the required
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
 
+
+## Implementation Evidence
+
+Reuse map revalidated: `WyrdClient.cards` (UI facade) gains its live branch over the existing `BrowserSession.api`; `GET /v1/cards` (S-CARDS) owns filtering and keyset paging, and `GET /v1/cards/by-uid/{kind}/{card_uid}` (S-CARD-UID) owns exact UID lookup. The only gap was that `api()` could not send query parameters. `V1Request`/`v1Path` now carry the generated operation's typed `query`. No new wire fields, routes, endpoints, scans or Rust changes.
+
+Mapping (UI → `list_cards_http`):
+- `kind`, `space` and `status` map to the same-named params.
+- `q` becomes `name =~ "(?i)<regex-escaped q>"`.
+- `label` becomes `labels."k" = "v"`, or `labels."k" exists` for a bare key.
+- `owner` becomes `labels."owner" = "v"`; owner is declared label metadata only.
+- Clauses are joined with `and` into `filter`. The request uses `limit=20`, and `cursor` is the opaque upstream cursor.
+- A UID-shaped `q` resolves through at most 15 parallel kind-qualified by-uid reads, or 1 read when `kind` is set. It is followed by one bounded identity-line list (`name`, `include_prerelease`, `limit=200`) under the same filters, keeping only that UID.
+
+Truthful presentation:
+- The wire has no counts, so `total` and the kind counts are `null` (not rendered). The exception is an unscoped, cursorless, empty first page, which renders the empty-tenant state.
+- The header reads "N on this page · oldest registered first", which is the server's keyset order.
+- The Owner column was removed because owner is not a `CardSummary` field.
+- Recently viewed is empty when live.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-003 search/kind/metadata filters, inclusion/exclusion, UID, two tenants | `wyrd.ts` `cards`/`listCards`/`cardByUid`/`labelClause`/`liveCards`; `upstream.ts` typed query | `live UI Card inventory projection`; browser `live UI Card inventory` covers label, owner, kind, name (case-insensitive), status=deprecated empty, unknown name/UID empty, UID with and without filters, overlapping `inv-prompt-01` across tenants, and the other tenant's reader | PASS |
+| AC-003 more than one page, no repeats, ordering, truthful counts, empty state | `+page.svelte` Next/First links via `filterHref`, with the cursor dropped on any scope change; `+page.server.ts` awaits the load with `cursor` | Browser case: 21 real Cards (2 Model, 2 Data with artifacts, 1 Agent, 14 Prompt, 2 Service via `wyrd apply`). Page 1 plus page 2 equals the authoritative paged `GET /v1/cards` read in order. A kind click from page 2 resets paging and matches the authoritative Service read | PASS |
+| AC-018 SSR content, client nav via server load, no browser `/v1`, refresh/back | SvelteKit server load only | Browser case: initial HTML (`context.request`) has page-1 UIDs and not the 21st. Next fetches `__data.json`, with no `/v1/` from the browser. Reload has no `__data.json`. Back restores page 1 | PASS |
+| Denied/unavailable never fall back to fixtures | `listCards` rejects with the server's problem; no session means `upstream` | Browser: the no-role principal sees `WYRD_PERMISSION_403_DENIED_RBAC` and no Cards or fixtures. Unit: 403, 400 cursor mismatch, and the 502 sessionless case | PASS |
+| Mock behavior retained | `projectCards` adds `order`/`next`; mock tests made async | `CardsInventory.test.ts` 9/9 | PASS |
+
+Commands (all passed):
+```bash
+WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='live UI Card inventory' mise run test:identity:journey   # 1 passed, 6 skipped
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/cards/core/CardsInventory.test.ts -t '^live UI Card inventory projection$'
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/cards/core/CardsInventory.test.ts src/lib/server/upstream.test.ts src/lib/server/wyrd.test.ts   # 17 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run check   # 0 errors
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run build
+git diff --check
+```
+- Generated operation types consumed: `list_cards_http` query, `ListCardsResponse`, `CardSummary`, and `GetCardResponse.card`.
+- `codegen:check` was not run: there is no generation change, only consumption.
+- No Rust change, so the fmt, lints and deps lanes are not applicable (lints were excluded by the user).
+
+Diagnosis (two test-only failures during iteration):
+- Failure 1:
+  - **Symptom:** page-2 rows `[]`.
+  - **Evidence:** a page dump showed `inv-svc-b` rendered.
+  - **Cause:** the `getByRole('table',{name:'Cards'})` locator matched nothing, because the inner `<table>` has no accessible name.
+  - **Fix site:** the test helper `shownRows`.
+- Failure 2:
+  - **Symptom:** `[inv-data-b, inv-data-a]` order.
+  - **Cause:** parallel registration makes registry order nondeterministic between those two.
+  - **Fix site:** the membership assertions now sort; order stays proven against the authoritative read in the paging step.
+
+Usability pass (screenshots under `target/debug/wyrd-ui-live-login/cards-*.png`, local only), recorded and not fixed:
+- There is no "Previous page" control; Back and "← First page" cover it.
+- No page number is shown.
+- The denied state renders inline with HTTP 200 (the existing page pattern), whereas Home returns 403.
+- Labels and owner are filterable by URL but not shown per row, because a summary carries no labels and fetching envelopes per row was declined.
+
+Non-goals stayed excluded: no new API, count endpoint, migration, Rust change, Changes/dashboard/Query work, or detail-page change. `mise.toml` adds only the required selector `"live UI Card inventory"`.

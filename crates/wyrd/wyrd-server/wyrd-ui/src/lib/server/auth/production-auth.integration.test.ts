@@ -12,9 +12,10 @@
  * that refresh token (RFC 7009).
  */
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { chromium, type BrowserContext, type Page } from 'playwright';
 import { expect, test } from 'vitest';
@@ -1047,3 +1048,184 @@ test('live UI initial Home', async () => {
     await rm(cards, { recursive: true, force: true });
   }
 }, 120_000);
+
+/** The CLI's typed lifecycle fixtures: real Model and Data specs with their artifacts. */
+const typedState = fileURLToPath(
+  new URL('../../../../../../wyrd-cli/tests/fixtures/card_lifecycle/typed_state/', import.meta.url)
+);
+type Listed = { name: string; card_uid: string; kind: string };
+
+/** Every Card matching `query`, paged through the registry with the administrator's key. */
+async function authoritative(apiKey: string, query: Record<string, string>): Promise<Listed[]> {
+  const items: Listed[] = [];
+  let cursor = '';
+  do {
+    const search = new URLSearchParams({ ...query, limit: '200', ...(cursor ? { cursor } : {}) });
+    const listed = await asKey(apiKey, 'GET', `/cards?${search}`);
+    expect(listed.status).toBe(200);
+    const page = (await listed.json()) as { items: Listed[]; next_cursor?: string | null };
+    items.push(...page.items);
+    cursor = page.next_cursor ?? '';
+  } while (cursor);
+  return items;
+}
+
+/** Apply each `name → yaml` Card with the `wyrd` CLI as the holder of `apiKey`, from a directory holding the fixture artifacts. */
+async function applyCards(apiKey: string, cards: Record<string, string>) {
+  const dir = await mkdtemp(join(tmpdir(), 'wyrd-inventory-'));
+  await cp(join(typedState, 'primary.bin'), join(dir, 'primary.bin'));
+  await cp(join(typedState, 'data'), join(dir, 'data'), { recursive: true });
+  await writeFile(join(dir, 'credentials.toml'), `[default]\napi_key = "${apiKey}"\n`, { mode: 0o600 });
+  try {
+    await Promise.all(
+      Object.entries(cards).map(async ([name, yaml]) => {
+        await writeFile(join(dir, `${name}.yaml`), yaml);
+        const applied = await wyrd(dir, ['apply', '--server', journey.origin, join(dir, `${name}.yaml`)]);
+        expect(applied.code, applied.output).toBe(0);
+      })
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+const prompt = (name: string) =>
+  `apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: ${name}\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [${name}]\n`;
+const service = (name: string) =>
+  `apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: ${name}\n  version: 1.0.0\n  space: default\nspec:\n  service_type: agent\n  components:\n    - alias: ranker\n      ref: { kind: Model, name: inv-model-a, version: 1.0.0, space: default }\n`;
+
+/** The Card names of the inventory table's rows, in rendered order. */
+async function shownRows(page: Page): Promise<string[]> {
+  return page.locator('tbody td[data-l="name"]').allTextContents();
+}
+
+test('live UI Card inventory', async () => {
+  const sso = journey.ssoTenant;
+  const cardsUrl = `${journey.origin}/t/${sso}/cards`;
+  await mkdir(journey.evidence, { recursive: true });
+  const fixture = (file: string) => readFile(join(typedState, file), 'utf8');
+  const [model, data, agent] = await Promise.all(['model-primary.yaml', 'training.yaml', 'agent-inline.yaml'].map(fixture));
+  const named = (yaml: string, from: string, to: string, labels = '') =>
+    yaml.replace(`  name: ${from}\n`, `  name: ${to}\n${labels}`);
+  // Real Models, Data, an Agent and Prompts — more than one 20-row page — then two Services over them.
+  await applyCards(journey.ssoAdminKey, {
+    'inv-model-a': named(model, 'primary', 'inv-model-a', '  labels:\n    team: search\n'),
+    'inv-model-b': named(model, 'primary', 'inv-model-b'),
+    'inv-data-a': named(data, 'training', 'inv-data-a', '  labels:\n    owner: r.okafor\n'),
+    'inv-data-b': named(data, 'training', 'inv-data-b'),
+    'inv-agent': named(agent, 'inline', 'inv-agent'),
+    ...Object.fromEntries(
+      Array.from({ length: 14 }, (_, i) => `inv-prompt-${String(i + 1).padStart(2, '0')}`).map((name) => [name, prompt(name)])
+    )
+  });
+  await applyCards(journey.ssoAdminKey, { 'inv-svc-a': service('inv-svc-a'), 'inv-svc-b': service('inv-svc-b') });
+  // Another tenant registers an overlapping name.
+  await applyCards(journey.offAdminKey, { 'inv-prompt-01': prompt('inv-prompt-01') });
+
+  const scope = { filter: 'name =~ "(?i)inv-"' };
+  const expected = await authoritative(journey.ssoAdminKey, scope);
+  expect(expected).toHaveLength(21);
+  const browser = await chromium.launch();
+  try {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await browserLogin(page, sso, journey.users.admin);
+
+    // The first page is in the server-rendered HTML, before any hydration, with no fixtures.
+    const initial = await (await context.request.get(`${cardsUrl}?q=inv-`)).text();
+    for (const { card_uid } of expected.slice(0, 20)) expect(initial).toContain(`/t/${sso}/cards/${card_uid}`);
+    expect(initial).not.toContain(expected[20].card_uid);
+    expect(initial).toContain('20 on this page · oldest registered first');
+    for (const fixture of ['checkout-api', 'pii-review', 'Recently viewed']) expect(initial).not.toContain(fixture);
+
+    // Sequential pages cover the settled population in registry order, without repeats.
+    const browserRequests: string[] = [];
+    page.on('request', (request) => browserRequests.push(new URL(request.url()).pathname));
+    await page.goto(`${cardsUrl}?q=inv-`);
+    const first = await shownRows(page);
+    browserRequests.length = 0;
+    await page.getByRole('link', { name: 'Next page →' }).click();
+    await page.waitForURL((url) => url.searchParams.has('cursor'));
+    await expect.poll(() => shownRows(page)).toHaveLength(1);
+    const second = await shownRows(page);
+    expect([...first, ...second]).toEqual(expected.map(({ name }) => name));
+    expect(browserRequests).toContain(`/t/${sso}/cards/__data.json`);
+    expect(browserRequests.filter((path) => path.startsWith('/v1/'))).toEqual([]);
+    await expect.poll(() => page.getByRole('link', { name: 'Next page →' }).count()).toBe(0);
+    await page.screenshot({ path: join(journey.evidence, 'cards-page-2.png'), fullPage: true });
+    // Refresh restores the same page server-side; hydration does not fetch it again.
+    browserRequests.length = 0;
+    const refreshed = await page.reload();
+    expect(await refreshed!.text()).toContain(expected[20].card_uid);
+    expect(browserRequests.filter((path) => path.endsWith('__data.json'))).toEqual([]);
+    // Back returns to the first page.
+    await page.goBack();
+    await page.waitForURL(`${cardsUrl}?q=inv-`);
+    await expect.poll(() => shownRows(page)).toEqual(first);
+
+    // A scope change from a later page resets paging and matches the authoritative read.
+    await page.getByRole('link', { name: 'Next page →' }).click();
+    await page.waitForURL((url) => url.searchParams.has('cursor'));
+    await page.getByRole('navigation', { name: 'Filter by kind' }).getByRole('link', { name: 'Service' }).click();
+    await page.waitForURL(`${cardsUrl}?q=inv-&kind=Service`);
+    const services = await authoritative(journey.ssoAdminKey, { ...scope, kind: 'Service' });
+    expect(services.map(({ name }) => name).sort()).toEqual(['inv-svc-a', 'inv-svc-b']);
+    await expect.poll(() => shownRows(page)).toEqual(services.map(({ name }) => name));
+    await page.screenshot({ path: join(journey.evidence, 'cards-services.png'), fullPage: true });
+    // Clearing the kind chip keeps the search.
+    await page.getByRole('group', { name: 'Active filters' }).getByRole('link').first().click();
+    await page.waitForURL(`${cardsUrl}?q=inv-`);
+
+    // Metadata filters: declared labels, the owner label, lifecycle status, and their negatives.
+    const html = async (query: string) => (await context.request.get(`${cardsUrl}?${query}`)).text();
+    // Membership only: registry order is proven by paging above.
+    const rowsOf = (markup: string) =>
+      expected.filter(({ card_uid }) => markup.includes(`/t/${sso}/cards/${card_uid}`)).map(({ name }) => name);
+    expect(rowsOf(await html('q=inv-&label=team%3Dsearch'))).toEqual(['inv-model-a']);
+    expect(rowsOf(await html('label=team'))).toEqual(['inv-model-a']);
+    expect(rowsOf(await html('owner=r.okafor'))).toEqual(['inv-data-a']);
+    expect(rowsOf(await html('q=inv-&kind=Data')).sort()).toEqual(['inv-data-a', 'inv-data-b']);
+    expect(rowsOf(await html('q=INV-MODEL')).sort()).toEqual(['inv-model-a', 'inv-model-b']);
+    const deprecated = await html('q=inv-&status=deprecated');
+    expect(deprecated).toContain('No matching cards');
+    expect(rowsOf(deprecated)).toEqual([]);
+    expect(await html('q=zzz-no-such-card')).toContain('No matching cards');
+
+    // An exact UID finds its Card, under the other filters too.
+    const ranker = expected.find(({ name }) => name === 'inv-model-a')!;
+    expect(rowsOf(await html(`q=${ranker.card_uid}`))).toEqual(['inv-model-a']);
+    expect(rowsOf(await html(`q=${ranker.card_uid}&kind=Model`))).toEqual(['inv-model-a']);
+    expect(rowsOf(await html(`q=${ranker.card_uid}&status=deprecated`))).toEqual([]);
+    expect(rowsOf(await html('q=00000000-0000-7000-8000-000000000000'))).toEqual([]);
+
+    // The overlapping name resolves to this tenant's Card only.
+    const [ours] = await authoritative(journey.ssoAdminKey, { name: 'inv-prompt-01' });
+    const [theirs] = await authoritative(journey.offAdminKey, { name: 'inv-prompt-01' });
+    const overlap = await html('q=inv-prompt-01');
+    expect(overlap).toContain(ours.card_uid);
+    expect(overlap).not.toContain(theirs.card_uid);
+    await context.close();
+
+    // The other tenant's reader sees its own Card under the same search, and nothing of this tenant.
+    const reader = await browser.newContext();
+    const readerPage = await reader.newPage();
+    await apiKeyLogin(readerPage, journey.apiKeyTenant, journey.offReaderKey);
+    await readerPage.goto(`${journey.origin}/t/${journey.apiKeyTenant}/cards?q=inv-`);
+    expect(await shownRows(readerPage)).toEqual(['inv-prompt-01']);
+    expect(await readerPage.content()).toContain(theirs.card_uid);
+    await reader.close();
+
+    // A principal the server refuses Card reads gets the denied state, never Cards or fixtures.
+    const denied = await browser.newContext();
+    const deniedPage = await denied.newPage();
+    await apiKeyLogin(deniedPage, journey.apiKeyTenant, journey.offNoRoleKey);
+    await deniedPage.goto(`${journey.origin}/t/${journey.apiKeyTenant}/cards`);
+    const refusal = await deniedPage.content();
+    expect(refusal).toContain('WYRD_PERMISSION_403');
+    expect(refusal).not.toContain('inv-prompt-01');
+    expect(refusal).not.toContain('checkout-api');
+    await deniedPage.screenshot({ path: join(journey.evidence, 'cards-denied.png'), fullPage: true });
+  } finally {
+    await browser.close();
+  }
+}, 180_000);

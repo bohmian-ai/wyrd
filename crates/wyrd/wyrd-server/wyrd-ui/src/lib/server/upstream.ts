@@ -9,9 +9,14 @@ export type V1Method<P extends keyof V1> = {
   [M in Method]: [NonNullable<V1[P][M]>] extends [never] ? never : M;
 }[Method];
 type Operation<P extends keyof V1, M extends V1Method<P>> = NonNullable<V1[P][M]>;
-/** Path parameters and JSON body of one operation, each required exactly when the contract requires it. */
+/** Path parameters, query parameters and JSON body of one operation, each required exactly when the contract requires it. */
 export type V1Request<P extends keyof V1, M extends V1Method<P>> =
   (Operation<P, M> extends { parameters: { path: infer A } } ? { path: A } : { path?: never }) &
+    (Operation<P, M> extends { parameters: { query: infer Q } }
+      ? { query: Q }
+      : Operation<P, M> extends { parameters: { query?: infer Q } }
+        ? { query?: Q }
+        : { query?: never }) &
     (Operation<P, M> extends { requestBody: { content: { 'application/json': infer B } } }
       ? { body: B }
       : Operation<P, M> extends { requestBody?: { content: { 'application/json': infer B } } }
@@ -35,13 +40,22 @@ export type V1Response<P extends keyof V1, M extends V1Method<P>> = {
   json(): Promise<V1Ok<P, M>>;
 } & Response;
 
-/** Fill the `{name}` segments of a generated path template; a missing parameter throws. */
-export function v1Path(template: string, params: unknown = {}): string {
+/**
+ * Fill the `{name}` segments of a generated path template and append the
+ * defined query parameters; a missing path parameter throws.
+ */
+export function v1Path(template: string, params: unknown = {}, query: unknown = {}): string {
   const values = (params ?? {}) as Record<string, unknown>;
-  return template.replace(/\{(\w+)\}/g, (_, name: string) => {
+  const path = template.replace(/\{(\w+)\}/g, (_, name: string) => {
     if (values[name] === undefined) throw new Error(`missing path parameter ${name}`);
     return encodeURIComponent(String(values[name]));
   });
+  const search = new URLSearchParams(
+    Object.entries((query ?? {}) as Record<string, unknown>)
+      .filter(([, value]) => value !== undefined)
+      .map(([name, value]) => [name, String(value)])
+  ).toString();
+  return search ? `${path}?${search}` : path;
 }
 
 /** `localhost` or a literal loopback address, as normalized by the URL parser. */

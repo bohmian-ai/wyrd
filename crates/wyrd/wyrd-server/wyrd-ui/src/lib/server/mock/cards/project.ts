@@ -7,7 +7,7 @@ function matchesExceptKind(row: CardRow, filters: Record<string, string>, q: str
   return (
     (!filters.space || row.space === filters.space) &&
     (!filters.status || row.status.label === filters.status) &&
-    (!filters.label || row.labels.includes(filters.label)) &&
+    (!filters.label || (row.labels ?? []).includes(filters.label)) &&
     (!filters.owner || (filters.owner === 'unowned' ? !row.owner : row.owner === filters.owner)) &&
     (!q || [row.name, row.kind, row.uid].join(' ').toLowerCase().includes(q))
   );
@@ -33,7 +33,9 @@ export function projectCards(filters: Record<string, string>, populated = true):
       count: scoped.filter((row) => row.kind === kind).length
     })),
     rows,
-    recent: populated ? recentCards : []
+    recent: populated ? recentCards : [],
+    order: 'sorted by updated',
+    next: null
   });
 }
 
@@ -73,7 +75,7 @@ export function projectCard(uid: string, version?: string): CardDetail | null {
     ],
     metadata: [
       { k: 'owner', v: row.owner || '— unowned' },
-      { k: 'labels', v: row.labels.join(' · ') || 'none' },
+      { k: 'labels', v: (row.labels ?? []).join(' · ') || 'none' },
       { k: 'updated', v: row.updated }
     ],
     relationships: []

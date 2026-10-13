@@ -27,7 +27,10 @@ export type CardKind = (typeof CARD_KINDS)[number];
 /** Non-color status pairing: the tone maps to a Badge glyph plus the label text. */
 export type CardStatus = { label: string; tone: 'neutral' | 'ok' | 'warn' | 'danger' | 'running' };
 
-/** One inventory row; `labels` backs the URL label filter, never a hierarchy. */
+/**
+ * One inventory row. `owner` and `labels` back the mock URL filters only; a
+ * Card summary on the wire carries neither, so live rows omit them.
+ */
 export type CardRow = {
   uid: string;
   name: string;
@@ -35,20 +38,28 @@ export type CardRow = {
   version: string;
   space: string;
   status: CardStatus;
-  owner: string;
-  /** Human-relative label rendered in the table. */
+  owner?: string;
+  /** Human-readable label rendered in the table. */
   updated: string;
-  /** ISO instant backing the sort order and `<time>` semantics. */
+  /** ISO instant backing `<time>` semantics. */
   updatedAt: string;
-  labels: string[];
+  labels?: string[];
 };
 
-/** C-01 — the inventory projection: kind counts, matching rows, recent rail. */
+/**
+ * C-01 — the inventory projection: kind counts, matching rows, recent rail.
+ * `total` and kind counts are `null` when the source reports none: the live
+ * registry pages by cursor and returns no population counts.
+ */
 export type CardsView = {
-  total: number;
-  kinds: { kind: CardKind; count: number }[];
+  total: number | null;
+  kinds: { kind: CardKind; count: number | null }[];
   rows: CardRow[];
   recent: { uid: string; name: string; kind: CardKind; viewed: string }[];
+  /** How `rows` are ordered, as the table states it. */
+  order: string;
+  /** The opaque cursor of the page after this one; `null` on the last page. */
+  next: string | null;
 };
 
 /** One key/value line; `href` (tenant-relative) turns the value into a link. */

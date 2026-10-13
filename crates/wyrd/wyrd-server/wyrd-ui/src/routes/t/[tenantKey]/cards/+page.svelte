@@ -14,6 +14,8 @@
   );
   function filterHref(key: string, value: string): string {
     const query = new URLSearchParams(page.url.search);
+    // Any scope change starts over at the first page.
+    if (key !== 'cursor') query.delete('cursor');
     if (value) query.set(key, value);
     else query.delete(key);
     return `?${query}` === '?' ? page.url.pathname : `?${query}`;
@@ -37,7 +39,7 @@
       actionHref={data.problem.status === 403 ? undefined : page.url.pathname + page.url.search}
     />
   {:else if data.view}
-    {#if !data.view.total}
+    {#if data.view.total === 0}
       <StateBlock
         state="empty"
         title="No Cards registered in this tenant"
@@ -49,7 +51,7 @@
           aria-label="Find a Card"
           name="q"
           value={data.filters.q}
-          placeholder="⌕ Find a Card by name, kind or uid…"
+          placeholder="⌕ Find a Card by name or uid…"
         />
         {#each Object.keys(CHIP_LABELS) as key (key)}
           {#if data.filters[key]}<input type="hidden" name={key} value={data.filters[key]} />{/if}
@@ -71,15 +73,17 @@
               >{/snippet}
             <nav class="kind-list" aria-label="Filter by kind">
               <a href={filterHref('kind', '')} aria-current={!data.filters.kind ? 'true' : undefined}
-                ><span>All kinds</span><span class="n"
-                  >{data.view.kinds.reduce((sum, entry) => sum + entry.count, 0)}</span
-                ></a
+                ><span>All kinds</span>{#if data.view.total !== null}<span class="n"
+                    >{data.view.kinds.reduce((sum, entry) => sum + (entry.count ?? 0), 0)}</span
+                  >{/if}</a
               >
               {#each data.view.kinds as entry (entry.kind)}
                 <a
                   href={filterHref('kind', entry.kind)}
                   aria-current={data.filters.kind === entry.kind ? 'true' : undefined}
-                  ><span>{entry.kind}</span><span class="n">{entry.count}</span></a
+                  ><span>{entry.kind}</span>{#if entry.count !== null}<span class="n"
+                      >{entry.count}</span
+                    >{/if}</a
                 >
               {/each}
             </nav>
@@ -114,14 +118,16 @@
           {:else}
             <Panel title="Cards" variant="raised">
               {#snippet head()}<span class="mono muted"
-                  >{data.view.rows.length} of {data.view.total} match · sorted by updated</span
+                  >{data.view.total === null
+                    ? `${data.view.rows.length} on this page`
+                    : `${data.view.rows.length} of ${data.view.total} match`} · {data.view.order}</span
                 >{/snippet}
               <Table label="Cards">
                 <table>
                   <thead>
                     <tr>
                       <th>Name</th><th>Kind</th><th>Version</th><th>Space</th><th>Status</th>
-                      <th>Owner</th><th>Updated</th>
+                      <th>Updated</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -142,11 +148,6 @@
                             ><Badge tone={row.status.tone}>{row.status.label}</Badge></a
                           ></td
                         >
-                        <td data-l="owner" class="mono"
-                          ><a href={filterHref('owner', row.owner || 'unowned')}
-                            >{row.owner || '— unowned'}</a
-                          ></td
-                        >
                         <td data-l="updated" class="mono"
                           ><time datetime={row.updatedAt}>{row.updated}</time></td
                         >
@@ -155,6 +156,13 @@
                   </tbody>
                 </table>
               </Table>
+              {#if data.cursor || data.view.next}
+                <nav class="row" aria-label="Pages">
+                  {#if data.cursor}<a href={filterHref('cursor', '')}>← First page</a>{/if}
+                  {#if data.view.next}<a href={filterHref('cursor', data.view.next)}>Next page →</a
+                    >{/if}
+                </nav>
+              {/if}
               <p class="muted">
                 Space is a subordinate filter, never a hierarchy — every Card lives directly in the
                 tenant.

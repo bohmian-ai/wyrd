@@ -156,7 +156,7 @@ fix.
 ### Variant key-filter fix (read opportunity 1): not landed
 
 - **Where:** the DataFusion fork, `datafusion/functions-variant/src/get.rs`,
-  local branch `wyrd-arrow60-variant-read-plan` at `fd02579cc`, uncommitted.
+  commit `2183432dd`, pushed to `bohmian-ai/datafusion` `wyrd-production`.
   Measured through a temporary path patch, since reverted.
 - **Change:** for a literal path, `variant_get` is called with no requested
   type, so a shredded leaf comes back shredded. Before, it was called with
@@ -169,8 +169,8 @@ fix.
     still renders non-strings as JSON text.
 - **Tests:** three fork unit tests (shredded strings, residual values, residual
   ints stay ints under `->`).
-- **To land:** commit and push to `bohmian-ai/datafusion` (needs approval),
-  then bump the `fd02579cc` pin in `[patch.crates-io]`.
+- **To land:** bump the `fd02579cc` pin in `[patch.crates-io]` to
+  `2183432dd327d19041f9514250ed151798a08d9c` and refresh `Cargo.lock`.
 - **What is left:** both filters are full-table scans with no time window.
   Hot stays slow (625 ms) because the memtable holds Variant unshredded.
 

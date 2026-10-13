@@ -201,12 +201,12 @@ async function exercise(
   }
   await provider.shutdown();
   await state.shutdown();
-  // The Drift binding judges this Service's own observations over the emitted window.
+  // The Service runs its own Drift binding over the emitted window; only its Card scope covers the subject.
   const { binding_ids = [] } = (await cards.get(root)).status?.verification ?? {};
   for (const binding_id of binding_ids) {
-    const status = (await v1(admin, 'GET', `/verification/bindings/${binding_id}`)) as { verifier_uid: string };
+    const status = (await v1(own, 'GET', `/verification/bindings/${binding_id}`)) as { verifier_uid: string };
     if (status.verifier_uid !== service.driftUid) continue;
-    await v1(admin, 'POST', '/verification/runs', {
+    await v1(own, 'POST', '/verification/runs', {
       target: { kind: 'binding', binding_id },
       input: { kind: 'drift_window', start: new Date(started - 2 * 3_600_000).toISOString(), end: new Date().toISOString() }
     });
@@ -231,9 +231,15 @@ async function ready(admin: WyrdClient, services: WorkloadService[]) {
           'SELECT implementation, COUNT(*) AS n FROM vala.verification.results WHERE owner_card_uid = $1 GROUP BY implementation',
           [s.uid]
         );
+        const [observed] = await rows<{ n: bigint }>(
+          'SELECT COUNT(*) AS n FROM vala.eval.observations WHERE card_uid = $1',
+          [s.agentUid]
+        );
         const count = (kind: string) => Number(results.find((r) => r.implementation === kind)?.n ?? 0);
         if (Number(spans?.n ?? 0) < s.recentSpans + 1 || count('eval') < s.evaluations || count('drift') < 1)
-          missing.push(`${s.name}: spans ${spans?.n ?? 0} eval ${count('eval')} drift ${count('drift')}`);
+          missing.push(
+            `${s.name}: spans ${spans?.n ?? 0} eval observations ${observed?.n ?? 0} eval ${count('eval')} drift ${count('drift')}`
+          );
       }
       if (!missing.length) return;
       if (Date.now() >= deadline) throw new Error(`workload evidence incomplete: ${missing.join('; ')}`);

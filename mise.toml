@@ -1655,7 +1655,9 @@ hide = true
 description = "Stage the built @wyrd/sdk addon in its linux-x64-gnu platform package, which the UI BFF and the official image install"
 depends = ["ts:build"]
 # ponytail: linux-x64-gnu only, the official image's platform; stage other platforms when the BFF runs elsewhere.
-run = "cp sdks/wyrd-sdk-ts/wyrd/wyrd.linux-x64-gnu.node sdks/wyrd-sdk-ts/wyrd-linux-x64-gnu/"
+# Replace by rename, never in place: the UI install hard-links this file, and
+# rewriting a native library a running process has mapped kills it with SIGBUS.
+run = "cp sdks/wyrd-sdk-ts/wyrd/wyrd.linux-x64-gnu.node sdks/wyrd-sdk-ts/wyrd-linux-x64-gnu/.wyrd.node.tmp && mv -f sdks/wyrd-sdk-ts/wyrd-linux-x64-gnu/.wyrd.node.tmp sdks/wyrd-sdk-ts/wyrd-linux-x64-gnu/wyrd.linux-x64-gnu.node"
 
 [tasks."ts:build:testing"]
 description = "Build the private @wyrd/testing napi harness addon (sdks/wyrd-sdk-ts/native-testing) into sdks/wyrd-sdk-ts/testing; feeds the integration lane only (slice 13a)"

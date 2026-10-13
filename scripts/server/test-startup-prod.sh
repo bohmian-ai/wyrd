@@ -14,12 +14,33 @@
 #                                (API, BFF, health, MCP stream, no authz check),
 #                                public Rust SDK over HTTP and derived gRPC,
 #                                restart into APP_ENV=production, persistence.
+#   authenticated_analytical_bff the image's production Node BFF, signed in
+#                                with an API key, renders a Service page from
+#                                evidence two Services emitted through the
+#                                public SDK, read by its installed native SDK
+#                                over the default HTTP and gRPC endpoints; an
+#                                unreachable analytical endpoint renders a
+#                                truthful failure with no fixture fallback.
+#
+# `WYRD_STARTUP_FILTER=<case>` runs exactly that case and the setup it needs;
+# an unknown selector fails before the build.
 #
 # Public gRPC is published on the fixed loopback port 50051 because the SDK
 # derives it from the server URL; HTTP uses an ephemeral loopback port.
+readonly cases=(migration_refusal_and_retry startup_image_journey authenticated_analytical_bff)
+readonly filter="${WYRD_STARTUP_FILTER:-}"
+if [[ -n $filter ]] && ! printf '%s\n' "${cases[@]}" | grep -qxF -- "$filter"; then
+  echo "FAIL: WYRD_STARTUP_FILTER=$filter is not one of: ${cases[*]}" >&2
+  exit 1
+fi
+selected() { [[ -z $filter || $filter == "$1" ]]; }
 startup_journey=prod
 source "$(dirname "${BASH_SOURCE[0]}")/startup-common.sh"
 readonly app_pw=app_pw_startup platform_pw=platform_pw_startup
+readonly ui_dir="$root/crates/wyrd/wyrd-server/wyrd-ui"
+# The production BFF's confidential OAuth client secret; the server holds only its digest.
+ui_secret="$(openssl rand -hex 32)"
+readonly ui_secret
 
 serving_env=(
   -e "WYRD_DATABASE_URL=postgres://wyrd_tenant:${app_pw}@${pg}:5432/wyrd"
@@ -29,6 +50,8 @@ serving_env=(
   -e WYRD_SERVER_TENANT_SLUG=acme
   -e WYRD_OPERATOR_KEK_SOURCE=file
   -e WYRD_OPERATOR_KEK_DIR=/run/wyrd/kek
+  -e "WYRD_UI_CLIENT_SECRET=$ui_secret"
+  -e "WYRD_UI_CLIENT_SECRET_SHA256=$(printf %s "$ui_secret" | sha256sum | cut -d' ' -f1)"
   ${WYRD_LOG:+-e "WYRD_LOG=$WYRD_LOG"}
 )
 
@@ -68,6 +91,7 @@ echo "== a DBA-created platform and tenant login"
   cat "$root/scripts/postgres/test-database-setup.sql"
 } | psql_owner >/dev/null
 
+if selected migration_refusal_and_retry; then
 echo "== migration_refusal_and_retry: refusals before and after migration"
 expect_serve_refusal WYRD_SQL_503_SCHEMA_NOT_READY
 migrate
@@ -86,14 +110,23 @@ psql_owner -c "ALTER POLICY tenant_isolation_off ON wyrd.$rls_table RENAME TO te
 psql_owner -c "GRANT TRUNCATE ON wyrd.$rls_table TO wyrd_tenant"
 expect_serve_refusal "holds TRUNCATE"
 psql_owner -c "REVOKE TRUNCATE ON wyrd.$rls_table FROM wyrd_tenant"
+else
+  migrate
+fi
 
+# Set the tenant up, keeping the administrator key it discloses the first time.
+setup_tenant() {
+  setup_out="$(docker exec "$app" wyrd-server setup --tenant acme)"
+  api_key="$(sed -n 's/^admin_credential: //p' <<<"$setup_out")"
+  [[ -n $api_key ]] || fail "setup disclosed no tenant credential: $setup_out"
+}
+
+if selected startup_image_journey; then
 echo "== startup_image_journey: serve, setup, routes"
 start_app development
 docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$app" | grep -q "$owner_pw" \
   && fail "the DBA credential reached the serving container"
-setup_out="$(docker exec "$app" wyrd-server setup --tenant acme)"
-api_key="$(sed -n 's/^admin_credential: //p' <<<"$setup_out")"
-[[ -n $api_key ]] || fail "setup disclosed no tenant credential: $setup_out"
+setup_tenant
 docker exec "$app" wyrd-server setup --tenant acme | grep -q "already set up" \
   || fail "second setup was not a no-op"
 
@@ -120,9 +153,11 @@ grep -qi '^content-type: text/event-stream' <<<"$mcp" || fail "MCP did not strea
 grep -q '"supportedVersions":\["2026-07-28"\]' <<<"$mcp" || fail "MCP discovery returned no supported version: $mcp"
 sdk_phase startup_image_write
 passed+=(startup_image_journey:write)
+fi
 
+if selected migration_refusal_and_retry; then
 echo "== migration_refusal_and_retry: failed release migration on a live deployment"
-docker rm -f "$app" >/dev/null
+docker rm -f "$app" >/dev/null 2>&1 || true
 iceberg_version="$(psql_owner -c "SELECT version FROM vala._sqlx_migrations WHERE description = 'iceberg catalog'")"
 [[ -n $iceberg_version ]] || fail "iceberg catalog migration not found in the ledger"
 psql_owner -c "DELETE FROM vala._sqlx_migrations WHERE version = $iceberg_version"
@@ -141,11 +176,89 @@ expect_serve_refusal WYRD_SQL_503_SCHEMA_NOT_READY
 psql_owner -c "DROP EVENT TRIGGER startup_fail_migration; DROP FUNCTION public.startup_fail_migration()"
 migrate
 passed+=(migration_refusal_and_retry)
+fi
 
+if selected startup_image_journey; then
 echo "== startup_image_journey: restart in the production profile"
+docker rm -f "$app" >/dev/null 2>&1 || true
 start_app production
 sdk_phase startup_image_verify
 passed+=(startup_image_journey:verify)
+fi
 
-[[ ${#passed[@]} -eq 3 ]] || fail "only ${passed[*]} ran"
+# Sign in through the BFF's API-key recovery form into the cookie jar `$jar`.
+# `localhost` is a secure context to curl, so it keeps the Secure session cookie over HTTP.
+bff_signin() {
+  public="${http/127.0.0.1/localhost}"
+  jar="$work/bff-cookies"
+  local signin
+  signin="$(curl -sS -o /dev/null -w '%{http_code} %{redirect_url}' -c "$jar" -H "origin: $public" \
+    --data-urlencode "apiKey=$api_key" "$public/t/acme/login/api-key")"
+  [[ $signin == "303 $public/t/acme" ]] || fail "API-key sign-in through the BFF did not redirect home: $signin"
+  grep -q wyrd_session_acme "$jar" || fail "the BFF issued no session cookie"
+}
+# The BFF's Service page for `$1` (a UID plus query), as the signed-in browser in `$jar`.
+bff_page() { curl -fsS -b "$jar" "$public/t/acme/cards/$1"; }
+# Field `$2` of workload Service `$1`.
+workload_field() { python3 -c 'import json,sys; print(json.loads(sys.argv[1])[int(sys.argv[2])][sys.argv[3]])' "$workload" "$1" "$2"; }
+
+if selected authenticated_analytical_bff; then
+echo "== authenticated_analytical_bff: the production BFF's live analytical read"
+docker rm -f "$app" >/dev/null 2>&1 || true
+start_app production
+[[ -n ${api_key:-} ]] || setup_tenant
+# The platform package is not hoisted: it resolves from the SDK's own install, as the SDK loads it.
+docker exec "$app" sh -c 'cd /app/ui && node --version && node --input-type=module -e "
+  import { createRequire } from \"node:module\";
+  const sdk = import.meta.resolve(\"@wyrd/sdk\");
+  console.log(\"native:\", createRequire(sdk).resolve(\"@wyrd/sdk-linux-x64-gnu\"));
+  const m = await import(\"@wyrd/sdk\");
+  console.log(\"@wyrd/sdk loaded:\", typeof m.Bifrost);"' \
+  | tee "$root/target/startup-prod-bff-layout.txt" || fail "the image BFF cannot load its native SDK"
+grep -q '@wyrd/sdk loaded: function' "$root/target/startup-prod-bff-layout.txt" || fail "the image BFF SDK has no Bifrost"
+# Two Services' evidence, written only through the public SDK and OTLP, with bounded readiness.
+pnpm --dir "$ui_dir" install --frozen-lockfile >/dev/null
+workload="$(cd "$ui_dir" && WYRD_SERVER_URL="$http" WYRD_API_KEY="$api_key" node --input-type=module -e '
+  import { WyrdClient } from "@wyrd/sdk";
+  import { serviceWorkload } from "./src/lib/server/auth/service-workload.ts";
+  const { WYRD_SERVER_URL: serverUrl, WYRD_API_KEY: credential } = process.env;
+  const admin = WyrdClient.connect({ serverUrl, credential, grpcUrl: "http://127.0.0.1:50051" });
+  const services = await serviceWorkload(admin);
+  console.log(JSON.stringify(services.map(({ name, uid, recentSpans }) => ({ name, uid, recentSpans }))));
+  process.exit(0);
+' | tail -n 1)"
+spans="$(workload_field 0 recentSpans)"
+bff_signin
+html="$(bff_page "$(workload_field 0 uid)?range=1h")"
+for text in '✓ VERIFICATION PASSING' "$spans root spans · 1h" 'WL-ANSWER 1.0.0 → agent'; do
+  grep -qF "$text" <<<"$html" || fail "the Service page lacks '$text'"
+done
+for text in "$(workload_field 1 name)" '▲ VERIFICATION FAILING' checkout-api WYRD_UI_ANALYTICAL; do
+  grep -qF "$text" <<<"$html" && fail "the Service page shows '$text' outside its scope"
+done
+grep -qF "$((spans + 1)) root spans · 6h" <<<"$(bff_page "$(workload_field 0 uid)?range=6h")" \
+  || fail "the 6h range does not include the older root span"
+grep -qF '▲ VERIFICATION FAILING' <<<"$(bff_page "$(workload_field 1 uid)?range=1h")" \
+  || fail "the failing Service is not shown failing"
+echo "== authenticated_analytical_bff: unreachable analytical endpoint"
+docker rm -f "$app" >/dev/null
+serving_env+=(-e WYRD_GRPC_URL=http://127.0.0.1:1)
+start_app production
+bff_signin
+html="$(bff_page "$(workload_field 0 uid)?range=1h")"
+for text in 'ASSESSMENT INCOMPLETE' 'unavailable · WYRD_' 'trace read failed — not zero'; do
+  grep -qF "$text" <<<"$html" || fail "the unavailable read is not truthful: lacks '$text'"
+done
+for text in '✓ VERIFICATION PASSING' 'root spans · 1h' checkout-api; do
+  grep -qF "$text" <<<"$html" && fail "the unavailable read shows '$text'"
+done
+passed+=(authenticated_analytical_bff)
+fi
+
+case $filter in
+  '') expected=4 ;;
+  startup_image_journey) expected=2 ;;
+  *) expected=1 ;;
+esac
+[[ ${#passed[@]} -eq $expected ]] || fail "only ${passed[*]:-nothing} ran"
 echo "server startup prod lane: PASS (${passed[*]})"

@@ -467,9 +467,14 @@ async fn production_ui_bff_journey() {
             .with_public_origin(origin.parse().expect("origin parses"))
             .with_ui_client_secret(&client_secret)
             .with_access_ttl(chrono::Duration::seconds(30))
-            .with_verification_runtime_for_test()
     };
-    let srv = builder().start_bound().await.expect("server starts");
+    // Only the primary runs verification: the Service workload writes its
+    // observations there, so the runner reads them where they committed.
+    let srv = builder()
+        .with_verification_runtime_for_test()
+        .start_bound()
+        .await
+        .expect("server starts");
     let server = srv.base_url().expect("bound server has a URL").to_owned();
     let replica = Box::pin(srv.start_bound_replica(builder()))
         .await

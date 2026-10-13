@@ -91,6 +91,100 @@ If the merged branch is worse, diagnose it against the
   worktrees.
 - Trace the regressing stage with `WYRD_LOG` before changing any code.
 
+## Merged-branch read results (2026-10-12)
+
+**Verdict: parity is not proven. The merged branch regresses on hot reads and
+on Parquet writes under read load. Writes and the open optimizations stay
+blocked until this is worked out.** The Variant key-filter fix below improves
+one case only and does not offset the regressions.
+
+Candidate: `integrate-main` at `5c775110f`, against the `cfe21dc90` reports in
+`benchmarks/pre-merge/`. Reports are in `benchmarks/merged-5c775110f/`. One
+run per case, host idle, nothing compiling. Per the rule above, repeat each
+regressing case before diagnosing it.
+
+### Standard fixture, hot tier: regressed
+
+| Case | qps base → merged | CPU per query | Peak memory |
+|---|---|---|---|
+| selective x32 | 6,466 → 6,283 (−2.8%) | +6.2% | 3.32 → 4.13 GiB |
+| selective x64 | 6,852 → 6,368 (−7.1%), p99 16.4 → 17.8 ms | +7.3% | 3.36 → 4.32 GiB |
+| small-aggregate x1 | 364 → 358 (−1.7%) | +12.5% | 3.31 → 4.34 GiB |
+| small-aggregate x32 | 3,820 → 3,654 (−4.3%) | +3.4% | 3.42 → 4.72 GiB |
+| 1m-aggregate x8 | 924 → 875 (−5.3%) | +4.5% | 3.40 → 4.85 GiB |
+| 1m-aggregate while writing | 414 → 419 (+1.2%), p99 24.2 → 28.1 ms | 0% | 13.94 → 18.38 GiB |
+| write during 1m-aggregate | 1.369M → 1.328M rows/s (−3.0%), p99 91 → 104 ms | +6.9% | 15.49 → 20.34 GiB |
+
+- Hot peak memory is higher in every step: about +1 GiB on reads and
+  +3–5 GiB on the steps that write while reading.
+- Gains: write events +21.6%, small-aggregate while writing +18.1%.
+- Per-query latency breakdown matches `cfe21dc90` stage by stage. Two new
+  costs are visible: `Oracle.audit_bind` at about 0.010 ms and ed25519
+  signature checking (`c:ge`) at about 0.019 ms per query. Together they are
+  about a quarter of the +0.11 ms per selective query. The rest is
+  unattributed.
+
+### Standard fixture, Parquet tier: reads fine, writes regressed
+
+Every read case is at or above baseline (table-aggregate +17.6%, broad-window
++12.2%, selective x64 +6.7%). CPU per query is still up on small-aggregate x1
+(+12.5%) and selective x32/x64 (+6%).
+
+| Case | Base → merged |
+|---|---|
+| write events x4 | 1.560M → 1.316M rows/s (−15.6%), p99 66 → 433 ms |
+| write during 1m-aggregate | 1.387M → 1.302M rows/s (−6.1%), p95 69 → 112 ms, p99 137 → 356 ms |
+| 1m-aggregate while writing | 186 → 193 qps, p99 35 → 74 ms |
+
+The write rows have no repeat yet. The fsync variance noted above could
+explain part of this, but not a p99 6.5x higher.
+
+### Telemetry fixture
+
+| Row | Hot base → merged | Parquet base → merged |
+|---|---|---|
+| export spans x4 | 61k → 73k rows/s (FAIL < 200k, as at baseline) | 60k → 68k rows/s (FAIL, as at baseline) |
+| exact answers p50 | 47.8 → 47.5 ms | 26.3 → 26.2 ms |
+| exact answers p99, merged as committed | 921 → 841 ms | 286 → 294 ms |
+| exact answers p99, with the fork fix below | 625 ms | 161 ms |
+| server CPU, exact answers | 24.8 → 23.0 cores | 16.2 → 13.0 cores |
+
+The p99 is the `attributes ->> 'customer.id'` key filter. On Parquet the two
+key filters are `customer.id` 294 → 161 ms and `region` 273 → 136 ms with the
+fix.
+
+### Variant key-filter fix (read opportunity 1): not landed
+
+- **Where:** the DataFusion fork, `datafusion/functions-variant/src/get.rs`,
+  local branch `wyrd-arrow60-variant-read-plan` at `fd02579cc`, uncommitted.
+  Measured through a temporary path patch, since reverted.
+- **Change:** for a literal path, `variant_get` is called with no requested
+  type, so a shredded leaf comes back shredded. Before, it was called with
+  Variant output, which made arrow-rs unshred the leaf so that
+  `variant_get_text` then decoded every row.
+  - When the leaf's `typed_value` is a string column and every row's residual
+    `value` is null, `->>` returns that column directly.
+  - Any other leaf goes through the existing row-wise path, so results are
+    unchanged: `->` still returns each value with its own type, and `->>`
+    still renders non-strings as JSON text.
+- **Tests:** three fork unit tests (shredded strings, residual values, residual
+  ints stay ints under `->`).
+- **To land:** commit and push to `bohmian-ai/datafusion` (needs approval),
+  then bump the `fd02579cc` pin in `[patch.crates-io]`.
+- **What is left:** both filters are full-table scans with no time window.
+  Hot stays slow (625 ms) because the memtable holds Variant unshredded.
+
+### Next steps
+
+1. Repeat the regressing hot reads and Parquet write rows to confirm them.
+2. Regenerate matched `cfe21dc90` profiles in the
+   `wyrd-bifrost-variant-task-003` worktree. The
+   `target/bifrost-query-capacity-premerge-cfe21dc90/` profiles cited below no
+   longer exist, so the merged profiles have nothing to be diffed against.
+3. Diff the latency and CPU Paretos case by case, starting with selective
+   x64 hot, the hot memory growth and the Parquet write p99. Trace each
+   regressing stage with `WYRD_LOG` before changing code.
+
 ## Write-capacity target and harness
 
 - **Target:** at least 30 MiB/s of OTLP wire per server core, and at least

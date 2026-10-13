@@ -37,13 +37,13 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: var(--lime);
+    background: var(--declare);
     flex: 0 0 auto;
   }
   .grp {
     font-family: var(--fm);
     font-size: 8.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.6px;
     text-transform: uppercase;
     color: var(--muted);
@@ -66,8 +66,7 @@
   }
   .item.active {
     color: var(--text);
-    background: var(--brand-soft);
+    background: var(--declare-soft);
     border-color: var(--border);
-    box-shadow: 2px 2px 0 0 var(--shadow);
   }
 </style>

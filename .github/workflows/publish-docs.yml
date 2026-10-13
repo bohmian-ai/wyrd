@@ -2,7 +2,7 @@ name: publish-docs
 
 # Builds the SvelteKit static docs site and deploys it to GitHub Pages.
 #
-# The site is served from the project subpath https://mitari-ai.github.io/wyrd/.
+# The site is served from the project subpath https://bohmian-ai.github.io/wyrd/.
 # `paths.base = '/wyrd'` in docs/svelte.config.js prefixes every asset and link
 # so the static output is correct under that subpath. There is no custom domain
 # / CNAME — do not add one without also changing paths.base and the llms.txt
@@ -38,7 +38,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
+      # Full history: page update dates come from each page's last commit, and a
+      # shallow clone would date every page to the tip commit.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Toolchain (node, pnpm) comes from mise.toml — do not pin here.
       - name: Set up mise

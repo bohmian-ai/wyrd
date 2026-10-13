@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Generate lightweight API reference pages from repository metadata."""
+"""Refresh published API reference pages from repository metadata.
+
+Like generate_card_docs.py, this only rewrites pages that already exist in the
+content tree; publishing a page means adding its file.
+"""
 
 from __future__ import annotations
 
@@ -36,7 +40,7 @@ def render_openapi() -> str:
         "title: OpenAPI",
         "description: Where the live Wyrd OpenAPI contract is served and how to consume it.",
         "pillar: wyrd",
-        "group: Reference",
+        "section: Reference",
         "order: 22",
         "---",
         "",
@@ -58,14 +62,8 @@ def render_openapi() -> str:
         "into Postman or Bruno to explore the API interactively.",
         "",
         "Every operation declares its authentication, typed request and response",
-        "bodies, error media types, and the stable Wyrd error codes it can return.",
-        "JSON API operations refuse with `application/problem+json`. The four OAuth",
-        "2.0 form endpoints (`/auth/token`, `/auth/platform/token`,",
-        "`/auth/device_authorization`, and `/auth/revoke`) refuse with the RFC 6749",
-        "section 5.2 JSON (`error`, optional `error_description`), which carries no",
-        "Wyrd error code. The browser sign-in endpoints (`/auth/authorize`,",
-        "`/auth/callback`, and `/auth/device`) answer with redirects and HTML pages",
-        "as well; each operation declares its own responses.",
+        "bodies, `application/problem+json` error media type, and the stable Wyrd",
+        "error codes it can return.",
         "",
     ]
     return "\n".join(lines)
@@ -95,7 +93,7 @@ def render_schemas() -> str:
         "title: Schemas",
         "description: Generated inventory of Wyrd JSON Schemas.",
         "pillar: wyrd",
-        "group: Reference",
+        "section: Reference",
         "order: 23",
         "---",
         "",
@@ -116,15 +114,13 @@ def render_errors() -> str:
             "title: Errors",
             "description: Error handling guidance for Wyrd API clients and agents.",
             "pillar: wyrd",
-            "group: Reference",
+            "section: Reference",
             "order: 21",
             "---",
             "",
             "# Errors",
             "",
-            "Wyrd's JSON API returns errors as structured RFC 9457 Problem Details objects (`application/problem+json`). Agents and SDK clients must preserve the full structure and must not collapse errors into prose. The browser sign-in endpoints (`/auth/authorize`, `/auth/callback`, and `/auth/device`) may instead redirect or show an HTML page; see the [OpenAPI reference](/api/openapi/).",
-            "",
-            "The other exception is the four OAuth 2.0 form endpoints (`/auth/token`, `/auth/platform/token`, `/auth/device_authorization`, and `/auth/revoke`). They refuse with the standard RFC 6749 section 5.2 JSON body (`error`, optional `error_description`), as OAuth clients expect. That body carries no Wyrd `code`, so branch on `error`; the codes below never appear in it. The Rust, Python, and TypeScript SDKs map such a refusal onto the nearest catalog code. See [SSO and OIDC](/self-hosting/sso-and-oidc/#oauth-endpoints).",
+            "Wyrd returns errors as structured RFC 9457 Problem Details objects (`application/problem+json`). Agents and SDK clients must preserve the full structure and must not collapse errors into prose.",
             "",
             "This page is the generated error catalog. For how an agent should act on these errors, see [Error remediation](/for-agents/error-remediation/).",
             "",
@@ -133,8 +129,7 @@ def render_errors() -> str:
             "| Code | Status | Title | Remediation |",
             "|---|---:|---|---|",
             "| `WYRD_CLIENT_400_CONFIG_INVALID` | 400 | Client transport configuration failed validation | Fix the `details.field` named on the error, then reconstruct the client. Not a retry path. |",
-            "| `WYRD_CLIENT_401_NO_CREDENTIALS` | 401 | Credential chain produced no usable credential | Set `WYRD_ACCESS_TOKEN`, `WYRD_WORKLOAD_TOKEN`+`WYRD_TENANT`, or `WYRD_API_KEY`, or run `wyrd auth login`. Not a retry path. |",
-            "| `WYRD_CLIENT_401_SAVED_LOGIN_UNUSABLE` | 401 | Saved user login cannot be used | Run `wyrd auth login` again or select the tenant. `details.reason` names the failure. Not a retry path. |",
+            "| `WYRD_CLIENT_401_NO_CREDENTIALS` | 401 | Credential chain produced no usable credential | Set `WYRD_ACCESS_TOKEN`, `WYRD_WORKLOAD_TOKEN`+`WYRD_TENANT`, or `WYRD_API_KEY`. Not a retry path. |",
             "| `WYRD_CLIENT_503_TRANSPORT_DOWN` | 503 | Client transport is unavailable | Retry with backoff once the network or server health recovers. |",
             "",
             "## Error fields",
@@ -181,7 +176,7 @@ def render_errors() -> str:
             "| `WYRD_WORKFLOW_422_MISSING_DEPENDENCY` | 422 | A step depends on an id that does not exist. |",
             "| `WYRD_WORKFLOW_422_DUPLICATE_STEP_ID` | 422 | Two steps share the same id. |",
             "| `WYRD_WORKFLOW_422_MISSING_NAME` | 422 | `save` or `to_card` was called on an anonymous workflow. |",
-            "| `WYRD_WORKFLOW_422_MISSING_PARAMETER` | 422 | A declared step binding or Workflow output selected a value the run did not produce. |",
+            "| `WYRD_WORKFLOW_422_MISSING_PARAMETER` | 422 | A prompt placeholder exists in neither workflow input nor upstream parameters. |",
             "",
             "## Prompt and CLI authoring codes",
             "",
@@ -229,11 +224,11 @@ def render_errors() -> str:
 
 
 def main() -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "openapi.md").write_text(render_openapi(), encoding="utf-8")
-    (OUT_DIR / "schemas.md").write_text(render_schemas(), encoding="utf-8")
-    (OUT_DIR / "errors.md").write_text(render_errors(), encoding="utf-8")
-
+    pages = {"openapi.md": render_openapi, "schemas.md": render_schemas, "errors.md": render_errors}
+    for name, render in pages.items():
+        page = OUT_DIR / name
+        if page.exists():
+            page.write_text(render(), encoding="utf-8")
 
 if __name__ == "__main__":
     main()

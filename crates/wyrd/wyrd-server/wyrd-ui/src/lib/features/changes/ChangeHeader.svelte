@@ -93,6 +93,5 @@
     border: 2px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);
-    box-shadow: 6px 6px 0 var(--shadow);
   }
 </style>

@@ -35,9 +35,8 @@ designed but not yet built.
   consumer — use `var(--token)` (or the workbench's Tailwind `bg-*`/`text-*`/`border-*`
   utilities, which resolve per mode). No consumer owns a second palette.
 - Regenerate after any token edit: `node brand/gen-theme.mjs` (from
-  `crates/wyrd/wyrd-server/wyrd-ui`). `mise run codegen:check` fails on projection
-  drift. Run generator regressions with `mise exec -- node --test
-  brand/gen-theme.test.mjs` from that directory. Never hand-edit a generated file.
+  `crates/wyrd/wyrd-server/wyrd-ui`). `mise run codegen:check` runs the generator tests and
+  fails on any projection drift. Never hand-edit a generated file.
 - Every token carries a documented `role` and a literal value per mode; the generator
   rejects aliases (`var(--x)` values) and undocumented tokens.
 - Light and dark are **two complete renderings of the same system**: same information,

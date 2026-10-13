@@ -43,10 +43,10 @@
           'border-radius: 5px',
           'background: var(--surface)',
           'color: var(--text)',
-          'font: 700 10px var(--font-mono)',
+          'font: var(--weight-strong) 10px var(--font-mono)',
           'padding: 6px 10px',
           'width: 210px',
-          span.id === selectedId ? 'box-shadow: 3px 3px 0 var(--shadow)' : ''
+          span.id === selectedId ? 'outline: 2px solid var(--declare)' : ''
         ].join(';')
       } as Node);
       if (parent)

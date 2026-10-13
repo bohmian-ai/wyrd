@@ -67,8 +67,7 @@ The authority is `crates/wyrd/wyrd-server/wyrd-ui/brand/`: read `DESIGN.md` firs
 `[data-theme='wyrd'].theme-light` / `.theme-dark` selectors, emitted from
 `brand/palette.json` by `brand/gen-theme.mjs`. Do not edit any generated projection by
 hand — change `palette.json`, then run `pnpm tokens`.
-`mise run codegen:check` checks projection drift. Run the generator regressions
-with `mise exec -- node --test brand/gen-theme.test.mjs` from the UI directory.
+`mise run codegen:check` runs the generator tests and fails on drift.
 
 Also inspect the current app files:
 

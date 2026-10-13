@@ -1,10 +1,34 @@
 import { describe, it, expect } from 'vitest';
-import { GROUP_ORDER, navGroups, siblings, stripBase } from './derived-nav.js';
+import { SECTIONS, type DocMetadata } from './content.js';
+import {
+  buildNav,
+  firstPage,
+  inPrimaryNav,
+  locate,
+  navGroups,
+  siblings,
+  stripBase,
+  type NavEntry
+} from './derived-nav.js';
 
-const nav = navGroups();
-// The flat spine mirrors derived-nav's internal navFlat (groups.flatMap(items)),
-// so boundary assertions track the real content tree without hardcoding slugs.
-const flat = nav.flatMap((g) => g.items);
+// Fixture corpus: the published content tree starts empty and grows one page at
+// a time, so navigation behavior is pinned against explicit entries rather than
+// whatever pages happen to exist today.
+function page(slug: string, meta: Partial<DocMetadata> & Pick<DocMetadata, 'section'>): NavEntry {
+  return { slug, meta: { title: slug, pillar: 'wyrd', ...meta } };
+}
+
+const corpus: NavEntry[] = [
+  page('reference/errors', { title: 'Error codes', section: 'Reference' }),
+  page('verify/run', { title: 'Run a verification', section: 'Build and verify', topic: 'Verify' }),
+  page('get-started/quickstart', { title: 'Quickstart', section: 'Get started', order: 2 }),
+  page('get-started/introduction', { title: 'Introduction', section: 'Get started', order: 1 }),
+  page('declare/service', { title: 'Define a service', section: 'Build and verify', topic: 'Declare' }),
+  page('get-started/planned', { title: 'Planned', section: 'Get started', status: 'planned' }),
+  page('get-started/draft', { title: 'Draft', section: 'Get started', draft: true })
+];
+const nav = buildNav(corpus);
+const flat = nav.flatMap((group) => group.items);
 
 describe('stripBase', () => {
   it('removes the base prefix and keeps a leading slash', () => {
@@ -24,89 +48,101 @@ describe('stripBase', () => {
   });
 });
 
-describe('nav ordering', () => {
-  it('orders named groups by GROUP_ORDER', () => {
-    const ranked = nav
-      .map((g) => GROUP_ORDER.findIndex((k) => k.toLowerCase() === g.label.toLowerCase()))
-      .filter((i) => i !== -1);
-    const sorted = [...ranked].sort((a, b) => a - b);
-    expect(ranked).toEqual(sorted);
+describe('published pages define navigation', () => {
+  it('builds no sections from an empty corpus', () => {
+    expect(buildNav([])).toEqual([]);
   });
 
-  it('places every configured group ahead of any unconfigured one', () => {
-    const isConfigured = (label: string) =>
-      GROUP_ORDER.some((k) => k.toLowerCase() === label.toLowerCase());
-    const firstUnconfigured = nav.findIndex((g) => !isConfigured(g.label));
-    if (firstUnconfigured === -1) return;
-    const lastConfigured = nav.map((g) => isConfigured(g.label)).lastIndexOf(true);
-    expect(lastConfigured).toBeLessThan(firstUnconfigured);
+  it('never exposes an empty section from the real content tree', () => {
+    for (const group of navGroups()) {
+      expect(SECTIONS).toContain(group.label);
+      expect(group.items.length).toBeGreaterThan(0);
+    }
   });
 
-  it('exposes a non-empty spine of pages', () => {
-    expect(flat.length).toBeGreaterThan(0);
+  it('shows only sections with a published page, in the approved order', () => {
+    expect(nav.map((group) => group.label)).toEqual(['Get started', 'Build and verify', 'Reference']);
   });
 
-  it('organizes the sidebar by reader intent', () => {
-    expect(nav.map((group) => group.label)).toEqual([
-      'Start here',
-      'Learn Wyrd',
-      'Build with Wyrd',
-      'Products and components',
-      'Reference',
-      'Operate Wyrd',
-      'For agents'
-    ]);
+  it('orders pages by frontmatter order, then slug', () => {
+    expect(nav[0].items.map((item) => item.label)).toEqual(['Introduction', 'Quickstart']);
   });
 
-  it('keeps product topics nested inside the products section', () => {
-    const products = nav.find((group) => group.label === 'Products and components');
-    expect(products?.sections.map((section) => section.label)).toEqual([
-      'Overview',
-      'Cards',
-      'Bifrost',
-      'Skald',
-      'Fathom'
-    ]);
-    expect(products?.items.some((item) => item.path === '/bifrost/')).toBe(true);
-    expect(products?.items.some((item) => item.path === '/cards/')).toBe(true);
+  it('nests Build and verify pages under Declare, Observe, Verify topics', () => {
+    const build = nav.find((group) => group.label === 'Build and verify')!;
+    expect(build.topics.map((topic) => topic.label)).toEqual(['Declare', 'Verify']);
+    expect(build.topics[0].items).toEqual([{ label: 'Define a service', path: '/declare/service/' }]);
   });
 
-  it('marks Fathom as coming soon without hiding it from navigation', () => {
-    const fathom = flat.find((item) => item.path === '/fathom/');
-    expect(fathom?.soon).toBe(true);
+  it('gives sections without topics one unlabeled page list', () => {
+    expect(nav[0].topics.map((topic) => topic.label)).toEqual([undefined]);
+  });
+
+  it('keeps planned and draft pages out of navigation', () => {
+    expect(flat.map((item) => item.label)).not.toContain('Planned');
+    expect(flat.map((item) => item.label)).not.toContain('Draft');
+    expect(inPrimaryNav({ title: 'X', pillar: 'wyrd', section: 'Operate', status: 'partial' })).toBe(true);
+    expect(inPrimaryNav({ title: 'X', pillar: 'fathom', section: 'Operate' })).toBe(false);
+  });
+
+  it('shows draft pages, but never planned ones, when drafts are enabled for dev', () => {
+    const labels = buildNav(corpus, true).flatMap((group) => group.items.map((item) => item.label));
+    expect(labels).toContain('Draft');
+    expect(labels).not.toContain('Planned');
+  });
+});
+
+describe('firstPage', () => {
+  it('returns the first published page of a section', () => {
+    expect(firstPage('Get started', nav)).toEqual({ label: 'Introduction', path: '/get-started/introduction/' });
+  });
+
+  it('returns undefined for a section with no published page', () => {
+    expect(firstPage('Operate', nav)).toBeUndefined();
+  });
+});
+
+describe('locate', () => {
+  it('names the section and page for the current location', () => {
+    expect(locate('/wyrd/declare/service/', '/wyrd', nav)).toEqual({
+      section: 'Build and verify',
+      item: { label: 'Define a service', path: '/declare/service/' }
+    });
+  });
+
+  it('matches without a trailing slash', () => {
+    expect(locate('/wyrd/reference/errors', '/wyrd', nav)?.section).toBe('Reference');
+  });
+
+  it('returns undefined off the spine', () => {
+    expect(locate('/wyrd/', '/wyrd', nav)).toBeUndefined();
   });
 });
 
 describe('siblings', () => {
   it('the first page has no prev and a next', () => {
-    const first = flat[0];
-    const pair = siblings(`/wyrd${first.path}`, '/wyrd');
-    expect(pair.prev).toBeUndefined();
-    expect(pair.next).toEqual(flat[1]);
+    expect(siblings(`/wyrd${flat[0].path}`, '/wyrd', nav)).toEqual({ prev: undefined, next: flat[1] });
   });
 
   it('the last page has a prev and no next', () => {
-    const last = flat[flat.length - 1];
-    const pair = siblings(`/wyrd${last.path}`, '/wyrd');
-    expect(pair.next).toBeUndefined();
-    expect(pair.prev).toEqual(flat[flat.length - 2]);
+    const last = flat.length - 1;
+    expect(siblings(`/wyrd${flat[last].path}`, '/wyrd', nav)).toEqual({ prev: flat[last - 1], next: undefined });
   });
 
-  it('a middle page links to both neighbours', () => {
-    const mid = Math.floor(flat.length / 2);
-    const pair = siblings(`/wyrd${flat[mid].path}`, '/wyrd');
-    expect(pair.prev).toEqual(flat[mid - 1]);
-    expect(pair.next).toEqual(flat[mid + 1]);
+  it('crosses section boundaries in sidebar order', () => {
+    expect(siblings('/wyrd/get-started/quickstart/', '/wyrd', nav).next).toEqual({
+      label: 'Define a service',
+      path: '/declare/service/'
+    });
   });
 
   it('returns empty for a pathname not in the spine', () => {
-    expect(siblings('/wyrd/not-a-real-page/', '/wyrd')).toEqual({});
+    expect(siblings('/wyrd/not-a-real-page/', '/wyrd', nav)).toEqual({});
   });
 
   it('matches regardless of trailing-slash normalization', () => {
-    const target = flat[1];
-    const withSlash = siblings(`/wyrd${target.path}`, '/wyrd');
-    const withoutSlash = siblings(`/wyrd${target.path.replace(/\/$/, '')}`, '/wyrd');
+    const withSlash = siblings(`/wyrd${flat[1].path}`, '/wyrd', nav);
+    const withoutSlash = siblings(`/wyrd${flat[1].path.replace(/\/$/, '')}`, '/wyrd', nav);
     expect(withoutSlash).toEqual(withSlash);
   });
 });

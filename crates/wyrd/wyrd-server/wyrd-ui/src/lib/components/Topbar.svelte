@@ -49,7 +49,7 @@
   }
   .crumb.cur {
     color: var(--text);
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .sep {
     color: var(--muted);

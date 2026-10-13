@@ -54,7 +54,6 @@
     border: 2px solid var(--border);
     border-radius: var(--r);
     background: var(--surface);
-    box-shadow: 3px 3px 0 0 var(--shadow);
     padding: 4px;
     align-self: flex-start;
     font-family: var(--fm);
@@ -70,7 +69,7 @@
     border: 0;
     background: none;
     color: var(--muted);
-    font: 700 9px var(--fm);
+    font: var(--weight-strong) 9px var(--fm);
     letter-spacing: 0.6px;
     cursor: pointer;
   }
@@ -79,7 +78,7 @@
   }
   summary {
     font-size: 10px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     letter-spacing: 0.4px;
     text-transform: uppercase;
     color: var(--muted);
@@ -107,7 +106,7 @@
     background: var(--surface-2);
   }
   li a.active {
-    background: var(--brand-soft);
+    background: var(--declare-soft);
     border-color: var(--border);
   }
   .val {

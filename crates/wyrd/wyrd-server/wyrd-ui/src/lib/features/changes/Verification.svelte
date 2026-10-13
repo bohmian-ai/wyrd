@@ -75,13 +75,13 @@
   }
   /* State as atmosphere: the verdict tints the whole banner body, not just a 24px icon. */
   .banner :global(.wy-panel-body) {
-    background: color-mix(in srgb, var(--danger-text) 9%, var(--surface));
+    background: color-mix(in srgb, var(--danger) 9%, var(--surface));
   }
   .banner.ok :global(.wy-panel-body) {
-    background: color-mix(in srgb, var(--ok-text) 9%, var(--surface));
+    background: color-mix(in srgb, var(--ok) 9%, var(--surface));
   }
   .check.failed {
-    background: color-mix(in srgb, var(--danger-text) 6%, transparent);
+    background: color-mix(in srgb, var(--danger) 6%, transparent);
     border-radius: var(--r);
   }
   /* A running Verifier breathes; frozen for viewers who ask for less motion. */
@@ -123,7 +123,7 @@
     cursor: pointer;
   }
   .cli-hint {
-    color: var(--brand-strong);
+    color: var(--declare);
   }
   .amend {
     margin: 14px 0 0;
@@ -132,8 +132,8 @@
     font-size: 12px;
   }
   details.amend summary {
-    font: 700 11px var(--font-mono);
-    color: var(--brand-strong);
+    font: var(--weight-strong) 11px var(--font-mono);
+    color: var(--declare);
     cursor: pointer;
   }
   .remove-list {
@@ -162,8 +162,8 @@
     gap: 6px;
   }
   .closed-line.error {
-    color: var(--danger-text);
-    font-weight: 700;
+    color: var(--danger);
+    font-weight: var(--weight-strong);
   }
   .claim[open] > summary .closed-lines {
     display: none;
@@ -208,7 +208,7 @@
   }
   .check .explanation {
     font-size: 12px;
-    font-family: var(--font-body, inherit);
+    font-family: var(--font-sans);
     color: var(--muted);
   }
   .check-actions {
@@ -224,7 +224,7 @@
   }
   .check-actions summary {
     font: 10px var(--font-mono);
-    color: var(--brand-strong);
+    color: var(--declare);
     cursor: pointer;
   }
   .inspection {

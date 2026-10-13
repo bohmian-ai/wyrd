@@ -150,12 +150,12 @@
     background: var(--surface-2);
   }
   .metric-list a[aria-current='true'] {
-    background: var(--brand-soft);
-    border-left-color: var(--brand-strong);
-    font-weight: 700;
+    background: var(--declare-soft);
+    border-left-color: var(--declare);
+    font-weight: var(--weight-strong);
   }
   .labels-title {
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted);

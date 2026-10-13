@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Generate Wyrd card reference pages from checked-in JSON Schemas."""
+"""Refresh published Wyrd card reference pages from checked-in JSON Schemas.
+
+A generated page is published by adding its file to the content tree; this
+script then keeps it in sync with the schema. It never creates a page, so a
+removed or unpublished page stays absent.
+"""
 
 from __future__ import annotations
 
@@ -13,9 +18,7 @@ REPO_ROOT = DOCS_ROOT.parent
 SCHEMA_DIR = REPO_ROOT / "crates" / "wyrd-spec" / "schemas"
 OUT_DIR = DOCS_ROOT / "src" / "content" / "docs" / "cards"
 
-# Only the three shipped card kinds get a generated reference page. The full
-# catalog of all kinds (with shipped/spec-only status) is the hand-authored
-# table in cards/index.mdx; spec-only kinds do not get standalone prose pages.
+# Card kinds whose reference page can be generated once published.
 CARD_SPECS = {
     "data": "data_spec.json",
     "model": "model_spec.json",
@@ -96,23 +99,20 @@ LIFECYCLE_NOTES = {
         "registry, and constructing the live agent via `Agent::from_def`.",
         "",
         "See [agent runtime](/concepts/agent-runtime/) for the layering and the",
-        "`tracing` spans it emits.",
+        "`Observer` hook surface.",
     ],
     "workflow": [
-        "A `WorkflowCard` is the declarative spec; the local engine lives in",
-        "`skald-workflow`. `Workflow::from_card` hydrates inline Agent steps and",
-        "`Workflow::from_card_with_agent_resolver` hydrates referenced ones.",
+        "A `WorkflowCard` is the declarative spec; the live workflow engine lives in",
+        "`skald-workflow`. A Wyrd consumer turns a `WorkflowCard` into a live",
+        "`Workflow` by unwrapping the inner `WorkflowDef` and calling",
+        "`Workflow::from_def(def, providers, tools, observer)`. The engine binds every",
+        "agent, validates the task graph, and produces a runnable workflow.",
         "",
-        "Dependencies order steps only. Each step binds its unresolved Prompt",
-        "variables to `input.<name>` or a dependency's `steps.<id>.output.text` /",
-        "`steps.<id>.output.structured[.<field>...]`, and the Workflow declares",
-        "named `outputs`. The whole graph is validated before any model call.",
+        "`Workflow::run` returns a `WorkflowRun` with per-task outcomes, events, and the",
+        "terminal task id. `Workflow::execute_task` runs one task at a time for callers",
+        "that own their own loop.",
         "",
-        "`Workflow::run_with_options` returns the portable `WorkflowRun` snapshot:",
-        "terminal `status`, named `outputs`, step results keyed by step id, and",
-        "the bounded primary `error`.",
-        "",
-        "See [agent runtime](/concepts/agent-runtime/) for observability.",
+        "See [agent runtime](/concepts/agent-runtime/) for handoff and observability.",
     ],
 }
 
@@ -153,7 +153,7 @@ def render(slug: str, schema_file: str, order: int) -> str:
         f"title: {title}",
         f"description: Generated reference for the Wyrd {title} card spec.",
         "pillar: wyrd",
-        "group: Reference",
+        "section: Reference",
         f"order: {order}",
         "---",
         "",
@@ -227,13 +227,10 @@ def render(slug: str, schema_file: str, order: int) -> str:
 
 
 def main() -> None:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
     for order, (slug, schema_file) in enumerate(CARD_SPECS.items(), start=11):
-        # Never clobber a hand-authored page for a kind (none exist today).
-        if (OUT_DIR / f"{slug}.svx").exists() or (OUT_DIR / f"{slug}.mdx").exists():
-            continue
-        (OUT_DIR / f"{slug}.md").write_text(render(slug, schema_file, order), encoding="utf-8")
-
+        page = OUT_DIR / f"{slug}.md"
+        if page.exists():
+            page.write_text(render(slug, schema_file, order), encoding="utf-8")
 
 if __name__ == "__main__":
     main()

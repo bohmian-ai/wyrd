@@ -254,8 +254,9 @@ def main() -> None:
         served = serve(desk)
         print(wait_for_verdicts(client, desk, timeout=300))
         for passed in (True, False):
-            run = next(request for request in served if request.passed is passed)
-            print(explain(client, run.run_id))
+            run = next((request for request in served if request.passed is passed), None)
+            if run is not None:
+                print(explain(client, run.run_id))
 
 
 if __name__ == "__main__":

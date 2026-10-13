@@ -1,11 +1,11 @@
 <script lang="ts">
   // The one reusable doc table. A plain markdown `| … |` table already gets the
   // shared frame automatically — reach for this only when a table needs semantic
-  // column roles (violet identifier, lime type, a status badge) or is generated
+  // column roles (mono identifier, muted type, a status badge) or is generated
   // from data. A column `role` styles that whole column; an individual cell may
   // override with an object form for a badge or inline HTML. Styling is the
-  // shared `.mk table.ref` recipe in styles/arcade.css, so this maps data →
-  // semantic markup and owns no colors of its own.
+  // shared `table.ref` recipe in styles/docs.css, so this maps data → semantic
+  // markup and owns no colors of its own.
   type Role = 'name' | 'type';
   type Tone = 'warn' | 'ok' | 'danger';
   type Column = { header: string; role?: Role };
@@ -17,6 +17,7 @@
     role === 'name' ? 'nm' : role === 'type' ? 'ty' : undefined;
 </script>
 
+<div class="table-scroll">
 <table class="ref">
   <thead>
     <tr>
@@ -40,3 +41,4 @@
     {/each}
   </tbody>
 </table>
+</div>

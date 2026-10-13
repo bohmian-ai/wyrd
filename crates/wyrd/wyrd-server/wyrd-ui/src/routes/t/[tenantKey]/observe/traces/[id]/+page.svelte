@@ -335,17 +335,17 @@
 
 <style>
   .back {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .genai-chip {
-    font: 700 8px var(--font-mono);
+    font: var(--weight-strong) 8px var(--font-mono);
     font-style: normal;
     letter-spacing: 0.06em;
     padding: 1px 4px;
     margin-left: 6px;
     border: 1px solid var(--border);
     border-radius: 3px;
-    background: var(--brand-soft);
+    background: var(--declare-soft);
     vertical-align: 1px;
   }
   .span-tabs {
@@ -357,8 +357,7 @@
     font-size: 11px;
   }
   .span-tabs .control[aria-selected='true'] {
-    background: var(--brand-soft);
-    box-shadow: 2px 2px 0 0 var(--shadow);
+    background: var(--declare-soft);
   }
   .events {
     gap: 10px;
@@ -389,7 +388,7 @@
   .role {
     margin: 10px 0 2px;
     font-size: 10px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
     text-transform: uppercase;
     letter-spacing: 0.05em;
   }
@@ -406,7 +405,7 @@
     margin: 0;
   }
   .msg.out {
-    background: var(--brand-soft);
+    background: var(--declare-soft);
   }
   .genai-timeline {
     gap: 14px;
@@ -425,7 +424,7 @@
   }
   .error {
     color: var(--danger);
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .trace-facts {
     grid-template-columns: auto minmax(0, 1fr) auto minmax(0, 1fr);
@@ -435,8 +434,7 @@
     gap: 8px;
   }
   .view-tabs .control[aria-selected='true'] {
-    background: var(--brand-soft);
-    box-shadow: 2px 2px 0 0 var(--shadow);
+    background: var(--declare-soft);
   }
   .legend {
     margin-left: auto;
@@ -467,7 +465,7 @@
   .tl-label {
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .tl-lane {
     position: relative;

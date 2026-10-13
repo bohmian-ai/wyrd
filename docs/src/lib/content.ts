@@ -2,14 +2,40 @@ import type { Component } from 'svelte';
 
 export type Pillar = 'wyrd' | 'fathom' | 'shared';
 
+// Availability of a task journey: `runnable` steps are backed by shipped
+// artifacts, `partial` pages lead with the supported portion and name the gap,
+// and `planned` pages stay out of primary navigation.
+export type JourneyStatus = 'runnable' | 'partial' | 'planned';
+const JOURNEY_STATUSES: readonly JourneyStatus[] = ['runnable', 'partial', 'planned'];
+
+// The approved reader-facing sections, in sidebar order. Only Build and verify
+// has topics; every other section lists its pages directly, so navigation is
+// never deeper than section → topic → page.
+export const SECTIONS = [
+  'Get started',
+  'Build and verify',
+  'Connect',
+  'Operate',
+  'Understand',
+  'Reference'
+] as const;
+export type Section = (typeof SECTIONS)[number];
+export const TOPICS: Partial<Record<Section, readonly string[]>> = {
+  'Build and verify': ['Declare', 'Observe', 'Verify']
+};
+
 export type DocMetadata = {
   title: string;
   description?: string;
   pillar?: Pillar;
-  section?: string;
-  group?: string;
+  section: Section;
+  topic?: string;
   order?: number;
   draft?: boolean;
+  status?: JourneyStatus;
+  // Date (YYYY-MM-DD) of the last commit that changed the page source. Injected
+  // at build time by the `remarkUpdated` plugin; absent for uncommitted pages.
+  updated?: string;
 };
 
 export type DocModule = {
@@ -20,17 +46,22 @@ export type DocModule = {
 // Eager glob: content modules are resolved at build time so the matched page
 // component is available synchronously during SSR/prerender (the rendered HTML
 // must contain the content, not an async-pending shell). The catch-all root is
-// docs/src/content/docs — Phase D converts the remaining `.mdx` to `.svx`.
-const modules = import.meta.glob<DocModule>('/src/content/docs/**/*.{svx,md}', {
-  eager: true
-});
+// docs/src/content/docs; an empty tree is a valid, landing-only site. Local
+// mock pages in docs/mocks/pages (gitignored) join only under
+// `vite dev --mode mocks`, for reviewing the shell without publishing anything.
+const modules = {
+  ...import.meta.glob<DocModule>('/src/content/docs/**/*.{svx,md}', { eager: true }),
+  ...(import.meta.env?.MODE === 'mocks'
+    ? import.meta.glob<DocModule>('/mocks/pages/**/*.{svx,md}', { eager: true })
+    : {})
+};
 
-// Deterministic content-path → slug map. This is the single slug authority:
-// 04 (nav), 07 (generators), and 08 (archetypes) all derive slugs from here.
+// Deterministic content-path → slug map. This is the single slug authority for
+// navigation and archetypes; scripts/generate_llms_txt.py mirrors it.
 // index → directory root; .svx/.md stripped; trailing slash removed.
 export function toSlug(path: string): string {
   return path
-    .replace('/src/content/docs/', '')
+    .replace(/^\/(src\/content\/docs|mocks\/pages)\//, '')
     .replace(/\.(svx|md)$/, '')
     .replace(/(^|\/)index$/, '$1')
     .replace(/\/$/, '');
@@ -38,7 +69,7 @@ export function toSlug(path: string): string {
 
 // Validate frontmatter for a single content file. Throws at build/module-eval
 // time so a missing or empty title is a hard build failure that names the file.
-// Commit 07's generators must emit frontmatter that passes this check.
+// Generated reference pages must emit frontmatter that passes this check.
 export function validateFrontmatter(contentPath: string, raw: unknown): DocMetadata {
   const meta = raw as Record<string, unknown> | null | undefined;
   const title = meta?.title;
@@ -56,12 +87,39 @@ export function validateFrontmatter(contentPath: string, raw: unknown): DocMetad
         `frontmatter. Expected one of: wyrd, fathom, shared.`
     );
   }
-  const result: DocMetadata = { title: title.trim(), pillar: meta.pillar };
+  // `section` places the page in the approved map; a typo must not silently
+  // move a page, so an unknown section or topic fails the build.
+  const section = meta.section as Section;
+  if (!SECTIONS.includes(section)) {
+    throw new Error(
+      `Content file "${contentPath}" has a missing or invalid "section" in its frontmatter. ` +
+        `Expected one of: ${SECTIONS.join(', ')}.`
+    );
+  }
+  const topics = TOPICS[section] ?? [];
+  if (topics.length > 0 ? !topics.includes(meta.topic as string) : meta.topic !== undefined) {
+    throw new Error(
+      `Content file "${contentPath}" has an invalid "topic" for section "${section}". ` +
+        (topics.length > 0 ? `Expected one of: ${topics.join(', ')}.` : 'This section has no topics.')
+    );
+  }
+  const result: DocMetadata = { title: title.trim(), pillar: meta.pillar, section };
+  if (topics.length > 0) result.topic = meta.topic as string;
   if (typeof meta?.description === 'string') result.description = meta.description;
-  if (typeof meta?.section === 'string') result.section = meta.section;
-  if (typeof meta?.group === 'string') result.group = meta.group;
   if (typeof meta?.order === 'number') result.order = meta.order;
   if (typeof meta?.draft === 'boolean') result.draft = meta.draft;
+  if (meta?.status !== undefined) {
+    if (!JOURNEY_STATUSES.includes(meta.status as JourneyStatus)) {
+      throw new Error(
+        `Content file "${contentPath}" has an invalid "status" in its frontmatter. ` +
+          `Expected one of: ${JOURNEY_STATUSES.join(', ')}.`
+      );
+    }
+    result.status = meta.status as JourneyStatus;
+  }
+  if (typeof meta?.updated === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(meta.updated)) {
+    result.updated = meta.updated;
+  }
   return result;
 }
 

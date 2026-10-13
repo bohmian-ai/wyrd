@@ -1,14 +1,17 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
-  import { lang as langStore, type Lang } from '$lib/lang.svelte';
+  import { getContext, type Snippet } from 'svelte';
+  import type { Lang } from '$lib/lang.svelte';
 
-  // One language panel inside a <LangTabs>. Both panels render into the DOM
-  // (so prerendered HTML + Pagefind see both code variants); the inactive one
-  // is hidden. `lang` here is the panel's language, not the shared store.
+  // One language panel inside a <LangTabs>. Every panel renders into the DOM
+  // (so prerendered HTML + Pagefind see each code variant); inactive ones are
+  // hidden. `lang` here is the panel's language; the parent block decides which
+  // panel is active.
   let { lang, children }: { lang: Lang; children?: Snippet } = $props();
+
+  const block = getContext<{ readonly active: Lang }>('wyrd:langtabs');
 </script>
 
-<div class="langtab" data-lang={lang} hidden={langStore.value !== lang}>
+<div class="langtab" data-lang={lang} hidden={block.active !== lang}>
   {@render children?.()}
 </div>
 

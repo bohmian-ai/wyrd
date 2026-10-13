@@ -1,11 +1,9 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
 
-  // Direction A callout. Renders the `.aside` recipe from arcade.css (2px ink
-  // border, 7px rune left-bar, rune-soft fill, `.at` mono uppercase label). The
-  // legacy content authored `<Aside title=… data-variant="wyrd|not">`; that
-  // still works — `type`/`data-variant` are accepted but Direction A uses one
-  // uniform aside treatment, so they only drive the default label text.
+  // Callout (`.aside` in docs.css). `type` sets the rule color and, for caution
+  // and danger, a glyph before the label so meaning never rests on color alone.
+  // Content may still author `data-variant="not"`, which reads as caution.
   type AsideType = 'note' | 'tip' | 'caution' | 'danger';
 
   let {
@@ -23,10 +21,10 @@
   const resolvedType = $derived<AsideType>(
     type ?? (rest['data-variant'] === 'not' ? 'caution' : 'note')
   );
-  const label = $derived(title ?? resolvedType);
+  const label = $derived(title ?? resolvedType[0].toUpperCase() + resolvedType.slice(1));
 </script>
 
-<div class="aside" {...rest}>
+<div class="aside" data-type={resolvedType} {...rest}>
   <div class="at">{label}</div>
   {@render children?.()}
 </div>

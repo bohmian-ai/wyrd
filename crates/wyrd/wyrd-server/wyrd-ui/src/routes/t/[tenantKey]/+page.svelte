@@ -74,7 +74,7 @@
       {#each data.home.summaries as item (item.href)}
         <Panel variant="flat">
           {#snippet head()}<h2>{item.label}</h2>{/snippet}
-          <div class="summary" class:lime={item.label === 'Observe'}>
+          <div class="summary" class:observe={item.label === 'Observe'}>
             <strong>{item.signal ? '! ' : ''}{fmtCount(item.value)} {item.unit}</strong>
             <p>{item.detail}</p>
             <a href={item.href}>Open {item.label} →</a>
@@ -106,7 +106,7 @@
     border-bottom: 2px solid var(--border);
   }
   h1 {
-    font: 700 24px var(--font-display);
+    font: var(--weight-strong) 24px var(--font-sans);
   }
   .heading p {
     font: 12px var(--font-sans);
@@ -131,7 +131,7 @@
     font: 11px var(--font-mono);
   }
   .actions input:focus {
-    border-color: var(--brand-strong);
+    border-color: var(--declare);
   }
   .actions a {
     text-decoration: none;
@@ -166,10 +166,13 @@
   .attention :global(.wy-panel) {
     min-height: 214px;
   }
-  /* Observe is the client/runtime plane — its numeral carries the lime voice, with the
-     "!" glyph and label as the textual channel. */
-  .summary.lime strong {
-    color: var(--lime-text);
+  /* Observe carries the Observation voice, with the "!" glyph and label as the
+     textual channel. */
+  .summary.observe strong {
+    text-decoration: underline;
+    text-decoration-color: var(--observe);
+    text-decoration-thickness: 2px;
+    text-underline-offset: 3px;
   }
   .work :global(.wy-panel-body) {
     padding: 0 10px 10px;
@@ -204,7 +207,7 @@
     transition: background 120ms ease;
   }
   tbody tr:hover {
-    background: var(--brand-soft);
+    background: var(--declare-soft);
   }
   @media (prefers-reduced-motion: reduce) {
     tbody tr {
@@ -222,7 +225,7 @@
   /* Every row leads with its human-readable title; identifiers live in the muted column. */
   .attention-table a,
   .changes-table a {
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   table {
     table-layout: fixed;
@@ -293,9 +296,9 @@
   .cards-table a,
   .recent a,
   .summary a {
-    color: var(--brand-strong);
+    color: var(--declare);
     text-decoration: none;
-    font-weight: 700;
+    font-weight: var(--weight-strong);
   }
   .summary {
     padding: 0 4px;
@@ -303,7 +306,7 @@
   }
   .summary strong {
     display: block;
-    font: 700 22px/26px var(--font-display);
+    font: var(--weight-strong) 22px/26px var(--font-sans);
     margin-bottom: 4px;
   }
   .summary p,

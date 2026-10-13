@@ -85,7 +85,7 @@
     padding: 8px 10px;
     border: 2px solid var(--ok);
     border-radius: var(--r);
-    color: var(--ok-text);
+    color: var(--ok);
     font-weight: 600;
   }
   .close-form {
@@ -116,7 +116,7 @@
     min-width: 0;
   }
   .claim-rows a {
-    font: 700 10px var(--font-mono);
+    font: var(--weight-strong) 10px var(--font-mono);
   }
   .rs-row {
     display: flex;
@@ -154,8 +154,8 @@
     border-left: 2px dashed var(--border);
   }
   .feed-event .event-kind {
-    color: var(--brand-strong);
-    font-weight: 700;
+    color: var(--declare);
+    font-weight: var(--weight-strong);
   }
   .comment-actions,
   .thread-actions {
@@ -180,8 +180,8 @@
   .comment-actions summary,
   .thread-actions summary,
   .text-control {
-    font: 700 10px var(--font-mono);
-    color: var(--brand-strong);
+    font: var(--weight-strong) 10px var(--font-mono);
+    color: var(--declare);
     border: 0;
     padding: 0;
     background: transparent;
@@ -239,7 +239,7 @@
       border: 0;
       padding: 2px;
       background: transparent;
-      color: var(--brand-strong);
+      color: var(--declare);
     }
     .review-form,
     .review-form fieldset {

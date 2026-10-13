@@ -6,7 +6,9 @@ use crate::settings::{BackendConfig, StorageSettings};
 use crate::signer::BackendSigner;
 use crate::telemetry::{ActiveOperation, StorageOperation};
 use crate::tenant_path::ValidatedPath;
-use futures_util::TryStreamExt as _;
+use bytes::Bytes;
+use futures_util::stream::BoxStream;
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use object_store::path::Path;
 use object_store::{ObjectStore, ObjectStoreExt as _};
 use std::sync::Arc;
@@ -257,6 +259,42 @@ impl StorageHandle {
             .map_err(|error| self.store_error(&error, "get_object", path));
         let bytes = result.as_ref().map_or(0, |body| body.len() as u64);
         active.finish(result, bytes)
+    }
+
+    /// Open an object's body as a byte stream, with its size.
+    ///
+    /// Serves the authenticated local download route, which streams the body
+    /// to the client without buffering it. The operation is recorded when the
+    /// GET opens, counting the object's size as the bytes read; a body error
+    /// after that surfaces on the stream as [`StorageError::Backend`]. The
+    /// object key is not recorded on the tracing span.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::ObjectNotFound`] when the object is absent, or
+    /// [`StorageError::Backend`] for any other backend failure while opening.
+    #[tracing::instrument(skip(self, path), fields(backend = ?self.backend()))]
+    pub async fn get_object_stream(
+        &self,
+        path: &ValidatedPath,
+    ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), StorageError> {
+        let active = self.start(StorageOperation::Get);
+        let result = self
+            .objects
+            .get(&path.location())
+            .await
+            .map_err(|error| self.store_error(&error, "get_object_stream", path));
+        let size = result.as_ref().map_or(0, |body| body.meta.size);
+        let body = active.finish(result, size)?;
+        let backend = self.signer.kind();
+        let stream = body
+            .into_stream()
+            .map_err(move |error| StorageError::Backend {
+                backend,
+                op: "get_object_stream",
+                message: error.to_string(),
+            })
+            .boxed();
+        Ok((stream, size))
     }
 
     /// Read an object's body, holding at most `limit + 1` bytes of it.

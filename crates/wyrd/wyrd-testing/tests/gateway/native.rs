@@ -29,11 +29,8 @@ use crate::harness::{
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires the repository-managed Postgres journey lifecycle"]
 async fn anthropic_messages_ingress_is_native_governed_and_fail_closed() {
-    let (_telemetry, traces) = init_test_capture(TelemetryConfig {
-        filter: "info,tower_http=debug,wyrd_server::http=debug".to_owned(),
-        ..TelemetryConfig::default()
-    })
-    .expect("production-shaped trace capture installs");
+    let (_telemetry, traces) = init_test_capture(TelemetryConfig::default())
+        .expect("production-shaped trace capture installs");
     let journey = Journey::start().await;
     let message = json!({"id": "msg_1", "type": "message", "role": "assistant", "model": "claude-sonnet-5", "content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn", "stop_sequence": null, "usage": {"input_tokens": 5, "output_tokens": 3}, "container": null});
     Mock::given(method("POST"))

@@ -205,7 +205,7 @@ pub fn install_capture_runtime(
     config: TelemetryConfig,
 ) -> Result<(WyrdTelemetryRuntime, wyrd_telemetry::TestTraceCapture), TelemetryRuntimeError> {
     let (guard, traces) =
-        wyrd_telemetry::init_capture(config).map_err(TelemetryRuntimeError::Tracing)?;
+        wyrd_telemetry::init_test_capture(config).map_err(TelemetryRuntimeError::Tracing)?;
     let prometheus = install_recorder().map_err(TelemetryRuntimeError::Metrics)?;
     Ok((
         WyrdTelemetryRuntime {

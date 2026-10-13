@@ -148,3 +148,41 @@ Report a concrete blocker if repository-managed setup cannot supply the required
 - [Implementation execution](../../../../architecture/references/languages/implementation-execution.md)
 - [Testing workflows](../../../../architecture/references/languages/testing-workflows.md)
 
+
+## Implementation Evidence
+
+The production side is verification-only:
+- The TASK-005 shared exact read renders real Prompt declarations safely without a Prompt-specific change.
+- `specSections` emits declared values as plain strings, and the shell renders them with Svelte text interpolation, never `{@html}`.
+- The only change in this task corrected one browser assertion (see Diagnosis).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-007 declaration fidelity | Shared `liveCard`/`specSections` | `live UI Prompt detail projection`; browser `live UI Prompt detail`: Prompt `det-prompt` 1.0.0 and 2.0.0 (distinct messages) via `wyrd apply`. The pinned 1.0.0 HTML contains `request`, `provider` and `body.messages[0].content`, plus the server-stored `spec.request.provider` and `spec.model` read authoritatively by `GET /v1/cards/by-ref`. It does not contain 2.0.0's message | PASS |
+| AC-007 versions and relationships | Shared | Browser: inventory opens 2.0.0, version click, refresh and Back. The inbound `Agent default/det-prompt-agent@1.0.0` link opens that Agent's UID | PASS |
+| AC-007 safe rendering | Svelte text escaping; payload `<script>` | Browser: the HTML lacks a raw `<script>window.detPwned`. The visible text equals the declared message verbatim, and `window.detPwned` is undefined after load | PASS |
+| AC-007 no credentials exposed | Session stays server-only (`BrowserSession`) | Browser: the page HTML, `/__data.json` and local/session storage contain neither the `wyrd_session_*` cookie value nor any JWT | PASS |
+| AC-007 no invented runtime outcome | `actions: []`, no presentation | Browser: no `Run prompt`, `last run`, `latency` or `tokens used`. Unit: `actions` empty, `presentation` undefined, and a missing server status is labelled `unknown` | PASS |
+| AC-007 missing and denied | Shared | Browser: unknown version/UID and `not-a-uid` are 404; the other tenant's reader gets 404; no-role gets 403 | PASS |
+| AC-018 SSR, nav, no browser `/v1` | Shared server load | Browser: as in TASK-005 | PASS |
+
+Commands (all passed):
+```bash
+WYRD_IDENTITY_TARGET=ui WYRD_IDENTITY_FILTER='live UI Prompt detail' mise run test:identity:journey   # 1 passed, 10 skipped
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/features/cards/core/CardDetail.test.ts   # 11 passed
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run check   # 0 errors
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui run build   # run by the journey lane
+git diff --check
+```
+
+Diagnosis (one test-only failure):
+- **Symptom:** the HTML did not contain `openai`.
+- **Evidence:** the rendered payload showed `request.provider: open_ai_chat_completion` and `request.body.messages[0].content`.
+- **Cause:** the server normalizes the authored Prompt shorthand (`provider`/`messages`) into its canonical `request` form, so the page renders the stored truth.
+- **Fix site:** the browser assertion now compares against the authoritative by-ref read.
+
+Usability pass (`target/debug/wyrd-ui-live-login/prompt-*.png`, local only):
+- The message text is readable and the markup is visibly inert.
+- The canonical `request.*` shape differs from what authors typed. This is truthful, but the authored shorthand is not shown, and a prompt-specific message view would be a later workspace.
+
+Non-goals stayed excluded: no Prompt runtime, outcome inference, workspace or new endpoint.

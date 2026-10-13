@@ -1475,7 +1475,10 @@ test('live UI Prompt detail', async () => {
     // Declared markup is text: escaped in the HTML, shown verbatim, never executed.
     const html = await (await context.request.get(url)).text();
     expect(html).not.toContain('<script>window.detPwned');
-    for (const text of ['openai', 'gpt-4o']) expect(html).toContain(text);
+    // The page shows the server's stored declaration, which normalizes the authored shorthand.
+    const stored = await asKey(journey.ssoAdminKey, 'GET', `/cards/by-ref?${new URLSearchParams({ kind: 'Prompt', space: 'default', name: 'det-prompt', version: '1.0.0' })}`);
+    const { spec } = ((await stored.json()) as { card: { spec: { model: string; request: { provider: string } } } }).card;
+    for (const text of ['request', 'provider', spec.request.provider, spec.model, 'body.messages[0].content']) expect(html).toContain(text);
     await page.goto(url);
     expect(await page.locator('main').textContent()).toContain(message('one'));
     expect(await page.evaluate(() => (window as { detPwned?: number }).detPwned)).toBeUndefined();

@@ -1,7 +1,7 @@
 ---
 id: TASK-002
 kind: implementation
-status: proposed
+status: approved
 spec: SPEC-bifrost-variant-main-integration
 spec_revision: 4
 requirements: [REQ-001, REQ-002, REQ-004, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-022, REQ-023, REQ-025, REQ-026, REQ-027]
@@ -168,7 +168,7 @@ After the last production change (`4066e46c3`, Q18) and the later fixes (Q19–Q
 | TASK-002-CLOSE-02 | Work Queue Q1–Q22 closed with diagnoses; server and MCP lanes pass in full (below) | PASS |
 | TASK-002-CLOSE-03 | `evidence.md` § P-028 (Q11) | PASS |
 | TASK-002-EVIDENCE | This section; `dispositions.tsv` names TASK-002 for this write set (`fcc3aceb1`, Q21 rows) | PASS |
-| TASK-002-REVIEW | Not run; the user decides | OPEN |
+| TASK-002-REVIEW | Approved by the user on 2026-10-13 at `9048465dd` in place of an independent task review | APPROVED |
 
 ## Acceptance Criteria
 
@@ -461,7 +461,7 @@ All tests ran through `mise` with
 | TASK-002-C04 | Main ClusterTask/single poller retained (no source per-role poller); `WyrdTestCluster::stop_node_restarting_another_during_drain` boots the Scribe only after drained roles are unready and the drain is still running | P08 (3) pass; P09 `unready_roles_heartbeat_until_teardown_ends_membership_tasks` and extended `oracle_only_pod_retains_audit_staged_before_its_drain` pass | PASS |
 | TASK-002-C05 | Capture peer listener decodes at `transport.message_limit_bytes()` (`grpc/mod.rs`); listener journey submits a 6,295,638-byte audit frame as a member, requires ACK, reads back the exact row length through an Oracle | P10 SQL (3) and peer-network (3) pass; P11 outbox (6) pass, including silent-peer retry and terminal refusal | PASS |
 | TASK-002-EVIDENCE | This section; `dispositions.tsv` rows for the write set set to TASK-002 | — | PASS |
-| TASK-002-REVIEW | Independent review not run here; the user decides | — | OPEN |
+| TASK-002-REVIEW | Approved by the user on 2026-10-13 at `9048465dd`; no independent task review ran | Human approval | APPROVED |
 
 #### Per-scenario RED/GREEN
 

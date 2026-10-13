@@ -1,112 +1,88 @@
 ---
 id: SPEC-authoring-api-version-default
-revision: 1
-status: draft
+revision: 2
+status: approved
 ---
 
-# Default `apiVersion` when authors omit it
+# Default omitted Card `apiVersion` to `wyrd/v1`
 
 ## Objective and user value
 
-Card authors stop writing `apiVersion: wyrd/v1` on every Card. Wyrd has one
-Card API version, so the field repeats a fact the tooling already knows. The
-canonical envelope, wire contract, and stored Cards stay explicit, so this is
-an authoring convenience, not a loosening of the contract.
-
-Commit `583a1d399` made `apiVersion` required everywhere, including authored
-YAML, by removing `#[serde(default)]` from the canonical `Card` envelope. This
-change restores the authoring convenience at the authoring boundary only and
-keeps the canonical envelope strict.
+Card authors may omit `apiVersion` from YAML or JSON. Wyrd interprets the
+omission as `wyrd/v1` at the two shared Card-deserialization seams, so every
+existing authoring consumer receives the behavior without surface-specific
+changes.
 
 ## Requirements
 
-- **REQ-001** A Card authored as YAML or JSON and read by a Wyrd client
-  authoring path is accepted without `apiVersion` and treated as `wyrd/v1`.
-  Authoring paths include, at minimum: the CLI (`wyrd plan`, `wyrd apply`),
-  `Cards` registration from a path in the Rust, Python, and TypeScript SDKs,
-  composite path references followed by the loader, and the Python SDK
-  constructors that load an authored Card file or text (`Agent.from_yaml`,
-  `Workflow.from_yaml`, `PromptCard.from_path`, and equivalents that read an
-  author-written envelope).
-- **REQ-002** An omitted `apiVersion` always means `wyrd/v1`. It never resolves
-  to the newest supported version, a configured default, or a server-chosen
-  value.
-- **REQ-003** An authored `apiVersion` that is present and is not `wyrd/v1` is
-  refused with the existing stable error for an invalid envelope, before any
-  network call.
-- **REQ-004** Every Card that leaves the client carries an explicit
-  `apiVersion: wyrd/v1`. The wire `CardSubmission`, HTTP and gRPC request
-  bodies, and server responses are unchanged.
-- **REQ-005** Content identity does not depend on whether the author wrote
-  `apiVersion`. The same Card with and without an authored `apiVersion: wyrd/v1`
-  produces the same spec hash and the same registration outcome
-  (deduplicated, not a new version or a `WYRD_REGISTRY_409_SPEC_DRIFT`).
-- **REQ-006** Documentation and generated authoring guidance describe
-  `apiVersion` as optional for authored Cards, defaulting to `wyrd/v1`, and
-  required on the wire.
+- **REQ-001** Deserializing a Card without `apiVersion` through the canonical
+  `wyrd-spec` Card deserializer produces a Card whose API version is
+  `wyrd/v1`.
+- **REQ-002** The shared loader applies the same default when it reads its raw
+  authored envelope, because that envelope builds `CardSubmission` values
+  without deserializing through `Card`.
+- **REQ-003** Serializing either result includes the explicit
+  `apiVersion: wyrd/v1` value.
+- **REQ-004** Documentation describes `apiVersion` as optional in authored
+  Card files and defaulting to `wyrd/v1`.
 
 ## Invariants
 
-- **INV-001** The canonical `wyrd_spec::envelope::Card` and the wire
-  `CardSubmission` keep `apiVersion` required. The server-side and wire JSON
-  Schemas continue to list it as required.
-- **INV-002** The server does not infer `apiVersion`. A raw HTTP or gRPC
-  submission without it is refused as it is today.
-- **INV-003** A missing `kind`, `metadata`, or `spec` is still refused.
-  Defaulting applies to `apiVersion` only.
-- **INV-004** Durable behavior stays server-owned; the default is a pure
-  client-side authoring normalization with no IO.
+- **INV-001** The default is owned by Card deserialization in `wyrd-spec` and
+  mirrored only by the shared loader's raw authored-envelope deserializer.
+  CLI, SDK, and per-kind authoring entry points do not implement their own
+  defaults.
+- **INV-002** `CardSubmission` remains strict: raw HTTP and gRPC registration
+  requests must carry an explicit `apiVersion`, and generated wire schemas and
+  client types continue to require it.
+- **INV-003** An explicit unsupported API version continues to be refused by
+  the existing validation path. This change adds no new local-before-network
+  guarantee or error contract.
+- **INV-004** Missing `kind`, `metadata`, or `spec` remains invalid. No other
+  envelope field gains a default.
+- **INV-005** The meaning of omission is permanently pinned to `wyrd/v1`; it
+  is not configuration, negotiation, or “latest version” selection.
 
 ## Scope and non-goals
 
-In scope: client authoring paths in the shared loader and SDKs, their tests,
-user-journey coverage for an omitted `apiVersion`, and the documentation and
-generated artifacts that describe authored Cards.
+In scope: the canonical Card deserializer, the loader's one raw-envelope
+deserializer, the existing Card default regression test, removal or correction
+of the obsolete loader rejection test, and one authoring-doc sentence.
 
 Not in scope:
 
-- making `apiVersion` optional on the wire, in server handlers, or in stored
-  Cards;
-- introducing a second API version or any version negotiation;
-- defaulting any other envelope field;
-- removing `apiVersion` from existing fixtures, examples, or docs. Existing
-  files stay valid; examples may omit it once this ships.
+- edits to CLI, Rust SDK, Python SDK, TypeScript SDK, Agent, Workflow, Prompt,
+  or other consumer-specific authoring entry points;
+- changes to `CardSubmission`, server request handling, generated wire
+  schemas, OpenAPI, TypeScript declarations, or stable errors;
+- version negotiation, a second API version, or defaults for other fields;
+- new cross-surface journeys, fixtures, or duplicate content-identity tests.
 
 ## Expensive-to-reverse decisions
 
-- **D-001 Boundary.** The default lives at the client authoring boundary, not
-  on the canonical envelope. Restoring `#[serde(default)]` on `Card` is
-  rejected because it would make the wire contract and every deserializer of
-  stored Cards lenient.
-- **D-002 Pinned meaning.** Omitted means `wyrd/v1` permanently. If a future
-  `wyrd/v2` ships, files without `apiVersion` keep their v1 meaning, and v2
-  authors must write the field. This keeps every file written today stable
-  across that future change.
-- **D-003 No wire change.** Generated wire schemas, OpenAPI, and the error
-  catalog are unchanged, so no client in any language needs regeneration to
-  stay compatible.
+- **D-001 Shared deserialization boundary.** Optional authored `apiVersion` is
+  canonical Card-deserialization behavior in `wyrd-spec`. The shared loader
+  mirrors it only because its raw envelope intentionally bypasses `Card` while
+  retaining artifact declarations. Consumers inherit the behavior from those
+  two seams.
+- **D-002 Strict registration wire.** `CardSubmission` does not default the
+  field. Server registration and generated wire contracts remain explicit.
+- **D-003 Pinned meaning.** Omission always means `wyrd/v1`, including after a
+  future API version exists.
 
 ## Acceptance criteria and evidence
 
-- **AC-001** `wyrd plan` and `wyrd apply` accept a composite whose Cards omit
-  `apiVersion`, and the registered Cards read back with `apiVersion: wyrd/v1`.
-  Evidence: a CLI user-journey test against `WyrdTestServer`.
-- **AC-002** Registration from a path succeeds with an omitted `apiVersion` in
-  each first-class SDK (Rust, Python, TypeScript). Evidence: one user-journey
-  test per SDK, or an extension of each SDK's existing registration journey.
-- **AC-003** Registering the same Card once with and once without an authored
-  `apiVersion` deduplicates. Evidence: a journey or integration test asserting
-  the second registration creates no new version.
-- **AC-004** An authored `apiVersion: wyrd/v2` is refused locally with the
-  invalid-envelope error and makes no network call. Evidence: a loader unit
-  test plus one SDK-surface negative test.
-- **AC-005** A raw wire submission without `apiVersion` is still refused.
-  Evidence: the existing `api_version_is_required` envelope test stays and
-  passes, plus a server integration check if one does not already exist.
-- **AC-006** The Python authoring constructors in REQ-001 accept an omitted
-  `apiVersion`. Evidence: Python unit tests through public `wyrd` modules.
-- **AC-007** `mise run codegen:check` passes with no wire-schema change, and
-  the docs that describe authored Cards say the field is optional.
+- **AC-001** The existing canonical Card test demonstrates that omitting
+  `apiVersion` deserializes as `wyrd/v1` and serializes explicitly.
+- **AC-002** The loader no longer rejects an otherwise valid authored envelope
+  solely because `apiVersion` is absent; its obsolete missing-version rejection
+  test is removed or changed to reflect the default.
+- **AC-003** Existing explicit-version inputs remain valid, and existing
+  unsupported-version validation remains unchanged.
+- **AC-004** `CardSubmission` source and generated wire contracts are
+  unchanged.
+- **AC-005** `architecture/wyrd-design.md` states that authored files may omit
+  `apiVersion`, which defaults to `wyrd/v1`.
 
 ## Open material decisions
 
@@ -114,15 +90,16 @@ None.
 
 ## Authority
 
-- `architecture/wyrd-design.md` (Card envelope; composite path references
-  require a full card envelope, line ~1870, which this revision narrows to
-  "`apiVersion` optional")
-- `architecture/wyrd-doctrine.mdx`
-- `AGENTS.md` §2 (Card envelope), §9 (server owns durable behavior)
-- Commit `583a1d399` (made `apiVersion` required at every layer)
+- `architecture/wyrd-design.md` — Card envelope and spec-file authoring.
+- `architecture/wyrd-doctrine.mdx` — shared Card contract and first-class SDK
+  projection.
+- `AGENTS.md` §2 and §9 — `wyrd-spec` contract ownership and explicit wire
+  contracts.
+- Commit `583a1d399` — current strict-deserialization behavior being narrowed.
 
 ## Revision history
 
 | Revision | Status | Change |
 | --- | --- | --- |
-| 1 | draft | Initial specification. |
+| 1 | superseded | Placed the default at every client authoring boundary and required duplicated cross-surface proof. |
+| 2 | approved | Moves the default to the two shared deserialization seams and removes consumer-specific work and redundant acceptance obligations; explicitly approved by Steven on 2026-10-13. |

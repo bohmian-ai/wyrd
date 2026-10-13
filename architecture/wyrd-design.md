@@ -1865,8 +1865,10 @@ relationship derivation, or durable persistence. The server, registry, and
   CWD, not apply-root.
 - Absolute paths are allowed but discouraged (breaks portability across
   machines and CI).
-- The referenced file is a **full card envelope** — `apiVersion` + `kind` +
-  `metadata` (`space`, `name`, `version`) + `spec`. Registration derives the
+- The referenced file is a **full card envelope** — `kind` + `metadata`
+  (`space`, `name`, `version`) + `spec`, plus `apiVersion`, which authored
+  files may omit and which then defaults to `wyrd/v1`; the registration wire
+  always carries it explicitly. Registration derives the
   child's identity from that `metadata`, and the parent slot becomes a `ref:`
   to it. This is what makes a `path:` target reusable and lineage-anchoring,
   unlike `inline:`.

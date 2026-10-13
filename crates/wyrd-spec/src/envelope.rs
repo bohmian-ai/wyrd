@@ -732,7 +732,7 @@ impl<'de> Deserialize<'de> for Card {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct CardHelper {
-            #[serde(rename = "apiVersion")]
+            #[serde(rename = "apiVersion", default)]
             api_version: ApiVersion,
             kind: CardKind,
             metadata: Metadata,

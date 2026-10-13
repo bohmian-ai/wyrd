@@ -1004,6 +1004,11 @@ impl ForgeOperations<'_> {
         let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
         let task_state = task_state(&mut tx, request.authority.task_id).await?;
+        // Only a Prepared task admits a write, so its fence is asserted first;
+        // a resolved task carries no live claim and may only replay.
+        if task_state == "prepared" {
+            lock_expiration_task(&mut tx, request.authority, request.table, &["prepared"]).await?;
+        }
         lock_table_authority(&mut tx, tenant, request.table).await?;
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         let state_row: ForgeOperationStateRow = self
@@ -1032,7 +1037,6 @@ impl ForgeOperations<'_> {
             request.table,
             &state_row.prepared_detail,
         )?;
-        lock_expiration_task(&mut tx, request.authority, request.table, &["prepared"]).await?;
 
         self.apply_terminal(&mut tx, operation_id, &detail, terminal_phase)
             .await?;
@@ -1083,6 +1087,11 @@ impl ForgeOperations<'_> {
         let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
         let task_state = task_state(&mut tx, request.authority.task_id).await?;
+        // Only a Prepared task admits a write, so its fence is asserted first;
+        // a resolved task carries no live claim and may only replay.
+        if task_state == "prepared" {
+            lock_expiration_task(&mut tx, request.authority, request.table, &["prepared"]).await?;
+        }
         lock_table_authority(&mut tx, tenant, request.table).await?;
         self.acquire_operation_lock(&mut tx, operation_id).await?;
         let state_row: ForgeOperationStateRow = self
@@ -1117,7 +1126,6 @@ impl ForgeOperations<'_> {
                     .to_owned(),
             });
         }
-        lock_expiration_task(&mut tx, request.authority, request.table, &["prepared"]).await?;
 
         self.apply_terminal(
             &mut tx,

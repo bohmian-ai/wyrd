@@ -35,6 +35,7 @@ base64 = { workspace = true }
 sha2 = { workspace = true }
 regex = { workspace = true }
 tempfile = { workspace = true }
+bytes = { workspace = true }
 object_store = { workspace = true }
 futures-util = { workspace = true }
 wyrd-tls = { workspace = true }

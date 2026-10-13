@@ -4,7 +4,7 @@
 # check that runs as a `gate` dependency (still runnable by name, just hidden).
 #
 #   mise run check       Pre-commit loop: fmt --check, workspace-hack, and Clippy.
-#   mise run gate        Full nightly/release/fallback aggregate.
+#   mise run gate        Full nightly/release/fallback aggregate (CI runs its gate:* shards in parallel).
 #
 #   mise run test:rust   Broad Rust aggregate.
 #   mise run verify:bifrost   Complete scoped Bifrost gate.
@@ -23,6 +23,9 @@ rust    = "1.98.1"
 "npm:pnpm" = "11.4.0"
 cmake = "3.26.4"
 protoc = "33.2"
+# mise installs cargo: tools with cargo-binstall when it is present, so CI
+# downloads these prebuilt instead of compiling them from source.
+cargo-binstall = "1.25.3"
 "cargo:cargo-nextest" = "0.9.143"
 "cargo:cargo-hakari" = "0.9.38"
 
@@ -166,7 +169,9 @@ run = "cargo test --locked -p wyrd-cli --test cli -- --nocapture --test-threads=
 description = "Installed CLI bootstrap and fresh saved-config Rust, Python, TypeScript, and MCP callers"
 depends = ["py:setup", "ts:build", "ts:build:testing"]
 run = [
-  "cargo build --locked -p wyrd-cli -p wyrd-server",
+  # --tests puts the dev-only workspace-hack in the graph, so these binaries
+  # share the test builds' third-party artifacts instead of rebuilding them.
+  "cargo build --locked -p wyrd-cli -p wyrd-server --bins --tests",
   "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p wyrd-cli --test cli -E 'test(=pg_tests::server_dev_first_run_is_client_ready) | test(=pg_tests::server_dev_repeat_and_partial_failure_preserve_state) | test(=pg_tests::server_dev_selected_mcp_host_reads)'",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[rust]",
   "scripts/postgres/with-test-postgres.sh -- uv run --directory sdks/wyrd-sdk-python python -m pytest -q -m integration tests/integration/test_local_development.py::test_installed_cli_bootstrap[interrupt]",
@@ -670,27 +675,30 @@ depends = ["check", "check:deps", "check:tenant-isolation", "test:bifrost"]
 [tasks."verify:python-sdk"]
 description = """Complete Python SDK gate: fmt, Clippy, codegen, Python format/lint/types, the wheel boundary, and
 every Python test tier. py:test:integration selects every integration-marked test, so it already runs the Bifrost,
-gateway, Card, WyrdState, and story journeys. The identity journeys need Keycloak and Dex, which one run owns at a
-time, so every verify task shares the one test:identity:journey dependency and gate runs it once."""
-depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "test:identity:journey", "test:local-dev:journey"]
+gateway, Card, WyrdState, and story journeys. The identity journeys need Keycloak and Dex and run only in
+test:identity:journey."""
+depends = ["check", "codegen:check", "py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "test:local-dev:journey"]
 
 [tasks."verify:rust-sdk"]
 description = """Complete Rust SDK gate: fmt, Clippy, the wyrd-sdk-rust unit tests and every story journey on one
-Postgres lifecycle, plus the shared identity journeys (see verify:python-sdk)."""
-depends = ["check", "test:identity:journey", "test:local-dev:journey"]
+Postgres lifecycle. The identity journeys run only in test:identity:journey."""
+depends = ["check", "test:rust-sdk:journey", "test:local-dev:journey"]
+
+[tasks."test:rust-sdk:journey"]
+hide = true
+description = "The wyrd-sdk-rust unit tests and every story journey except the identity and installed-CLI ones, on one Postgres lifecycle"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc \"mise run db:migrate:all:inner && cargo nextest run --locked -p wyrd-sdk-rust -P journey --run-ignored=all -E 'not test(/^(saved_user_auth|signed_in_development)::/) and not test(=local_development::cli_bootstrap_saved_config_connects)'\""
 
 [tasks."verify:typescript-sdk"]
 description = """Complete TypeScript SDK gate: fmt, Clippy, codegen, napi declarations, the package, types, unit
-tests, every integration journey (Bifrost, gateway, and story journeys), plus the shared identity journeys (see
-verify:python-sdk)."""
-depends = ["check", "codegen:check", "ts:napi:check", "ts:pack:check", "ts:format:check", "ts:lints", "ts:typecheck", "ts:test:unit", "ts:test:integration", "test:identity:journey", "test:local-dev:journey"]
+tests, and every integration journey (Bifrost, gateway, and story journeys). The identity journeys run only in
+test:identity:journey."""
+depends = ["check", "codegen:check", "ts:napi:check", "ts:pack:check", "ts:format:check", "ts:lints", "ts:typecheck", "ts:test:unit", "ts:test:integration", "test:local-dev:journey"]
 
 [tasks."test:rust"]
 description = """Aggregate Rust test gate: the family lanes + storage emulator matrix. Every workspace crate belongs to
 one family by its directory, so the focused crate lanes select no test this does not run.
-Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
-contention; add test:bifrost to gate or run it directly to include it locally.
+The ignored Bifrost, gateway, identity, and SDK journeys run in their own gate shards.
 Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are gated to
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
@@ -705,19 +713,16 @@ run = "cargo nextest run --locked -p wyrd-tonic --features server,client"
 
 [tasks."test:identity:journey"]
 hide = true
-description = """Stand up real OIDC providers (Keycloak + Dex), seed test users via the Keycloak
-admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
-Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
+description = """Every identity journey against real Keycloak and Dex: the server's OIDC journeys, the production
+UI BFF, the CLI device login, and each client's saved-login journey. Its tests are #[ignore]d so lanes without the
+providers skip them; gate runs it as its own shard.
 """
 env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:identity:journey:inner'"
 [tasks."test:identity:journey:inner"]
 hide = true
-description = """Stand up real OIDC providers (Keycloak + Dex), seed test users via the Keycloak
-admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
-Its tests are #[ignore]d so the family lanes, which start no identity providers, skip them visibly.
-"""
+description = "Run test:identity:journey against an already-provisioned Postgres lifecycle."
 env = { WYRD_KEYCLOAK_ISSUER = "http://localhost:8180/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 run = """
 set -e
@@ -812,150 +817,28 @@ create_user("alice", "alice@wyrd.test", "alice-password", "wyrd-admins", realm="
 print("Keycloak users seeded")
 PYEOF
 
-# WYRD_IDENTITY_TARGET selects the suite: `server` (Rust identity_e2e), `ui`
-# (the production BFF journey: identity_ui_e2e starts the real server and two
-# `node build` BFF replicas sharing its Postgres and public origin, then runs
-# the Vitest HTTP journey against them), or one saved-login journey: `cli`
-# (`wyrd auth login`), `rust`, `python`, and `typescript` (each public SDK over
-# a CLI-established login), and `client` (concurrent saved-login renewal
-# across processes). WYRD_IDENTITY_FILTER selects one exact test of that suite
-# and must select exactly one. Unfiltered runs every suite, and first proves
-# each named journey still selects exactly one test so a rename cannot
-# silently drop it.
-target="${WYRD_IDENTITY_TARGET:-}"
-case "$target" in
-  ""|server|ui|cli|rust|client|python|typescript) ;;
-  *) echo "unsupported WYRD_IDENTITY_TARGET=$target (supported: server, ui, cli, rust, client, python, typescript)" >&2; exit 2 ;;
-esac
-# One saved-login journey: its exact selector must select exactly one test,
-# and a filter, when given, must name that journey.
-saved_login_journey() {
-  case "$1" in
-    cli) name=cli_device_login_journey ;;
-    rust) name=saved_user_auth ;;
-    client) name=concurrent_saved_renewal ;;
-    python) name=saved_user_auth ;;
-    typescript) name=saved_user_auth ;;
-  esac
-  if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ "$WYRD_IDENTITY_FILTER" != "$name" ]; then
-    echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects no $1 journey; expected '$name'" >&2
-    exit 1
-  fi
-  case "$1" in
-    cli) rust_journey wyrd-cli cli "$name" ;;
-    rust)
-      # The story modules are the journey: six saved-login outcomes plus the
-      # signed-in development workflow.
-      expr="test(/^($name|signed_in_development)::/)"
-      count="$(cargo nextest list --locked -p wyrd-sdk-rust --test integration --run-ignored=all --message-format oneline -E "$expr" | grep -c . || true)"
-      if [ "$count" != 7 ]; then
-        echo "wyrd-sdk-rust journey $name selects $count tests; expected exactly 7" >&2
-        exit 1
-      fi
-      cargo nextest run --locked -p wyrd-sdk-rust --test integration --run-ignored=all -E "$expr"
-      ;;
-    client) rust_journey wyrd-client integration "pg_auth_e2e_against_fixture::$name" ;;
-    python)
-      mise run py:setup
-      # The story files are the journey: six saved-login outcomes plus the
-      # signed-in development workflow.
-      selector="tests/integration/test_$name.py tests/integration/test_signed_in_development.py"
-      count="$(cd sdks/wyrd-sdk-python && uv run python -m pytest -q --collect-only -m identity $selector | grep -c "::test_" || true)"
-      if [ "$count" != 7 ]; then
-        echo "Python journey $selector selects $count tests; expected exactly 7" >&2
-        exit 1
-      fi
-      (cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity $selector)
-      ;;
-    typescript)
-      mise run ts:build
-      mise run ts:build:testing
-      # The story files are the journey: six saved-login outcomes plus the
-      # signed-in development workflow.
-      journey="tests/integration/saved-user-auth.test.ts tests/integration/signed-in-development.test.ts"
-      count="$(cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest list $journey | grep -c . || true)"
-      if [ "$count" != 7 ]; then
-        echo "TypeScript journey $journey selects $count tests; expected exactly 7" >&2
-        exit 1
-      fi
-      (cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run $journey)
-      ;;
-  esac
-}
-# One ignored Rust journey by exact name, after proving it selects one test.
-rust_journey() {
-  expr="test(=$3)"
-  count="$(cargo nextest list --locked -p "$1" --test "$2" --run-ignored=all --message-format oneline -E "$expr" | grep -c . || true)"
-  if [ "$count" != 1 ]; then
-    echo "$1 --test $2 $3 selects $count tests; expected exactly 1" >&2
-    exit 1
-  fi
-  cargo nextest run --locked -p "$1" --test "$2" --run-ignored=all -E "$expr"
-}
-if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ -z "$target" ]; then
-  target=server
-fi
-ui_dir=crates/wyrd/wyrd-server/wyrd-ui
-ui_journey=src/lib/server/auth/production-auth.integration.test.ts
-# The server journeys author issuers and bindings through the real `wyrd` CLI.
-cargo build --locked -p wyrd-cli --bin wyrd
-selected_count() {
-  cargo nextest list --locked -p wyrd-server --test integration --run-ignored=all --message-format oneline -E "$1" | grep -c . || true
-}
-ui_selected_count() {
-  (cd "$ui_dir" && WYRD_UI_INTEGRATION=1 pnpm exec vitest list "$ui_journey" -t "$1" | grep -cF "$1") || true
-}
-run_ui() {
-  pnpm --dir "$ui_dir" install --frozen-lockfile
-  pnpm --dir "$ui_dir" build
-  for required in "production SSO crosses replicas" "OIDC-off credential UI" "production multi-provider tenant switch" "production provider replacement settings"; do
-    count="$(ui_selected_count "$required")"
-    if [ "$count" != 1 ]; then
-      echo "UI identity journey '$required' selects $count tests; expected exactly 1" >&2
-      exit 1
-    fi
-  done
-  # The host test's own name selects every UI journey it runs.
-  if [ -n "${WYRD_IDENTITY_FILTER:-}" ] && [ "$WYRD_IDENTITY_FILTER" != production_ui_bff_journey ]; then
-    count="$(ui_selected_count "$WYRD_IDENTITY_FILTER")"
-    if [ "$count" != 1 ]; then
-      echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects $count UI tests; expected exactly 1" >&2
-      exit 1
-    fi
-    export WYRD_UI_FILTER="$WYRD_IDENTITY_FILTER"
-  fi
-  cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E 'test(=identity_ui_e2e::production_ui_bff_journey)'
-}
-if [ "$target" = ui ]; then
-  run_ui
-elif [ -n "$target" ] && [ "$target" != server ]; then
-  saved_login_journey "$target"
-elif [ -n "${WYRD_IDENTITY_FILTER:-}" ]; then
-  expr="test(=identity_e2e::${WYRD_IDENTITY_FILTER})"
-  count="$(selected_count "$expr")"
-  if [ "$count" != 1 ]; then
-    echo "WYRD_IDENTITY_FILTER=$WYRD_IDENTITY_FILTER selects $count tests; expected exactly 1" >&2
-    exit 1
-  fi
-  cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --test-threads=1 -E "$expr"
-else
-  for required in tenant_connection_admin_journey tenant_connection_rotation_journey tenant_connection_session_cutoff_journey tenant_human_login_journey tenant_callback_refusal_journey tenant_callback_issuer_binding_journey tenant_connection_test_sign_in_journey tenant_provider_switch_journey tenant_machine_independence_journey; do
-    count="$(selected_count "test(=identity_e2e::$required)")"
-    if [ "$count" != 1 ]; then
-      echo "identity journey $required selects $count tests; expected exactly 1" >&2
-      exit 1
-    fi
-  done
-  if [ "$target" != server ]; then
-    run_ui
-  fi
-  cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --test-threads=1 -E 'test(/^identity_e2e::/)'
-  if [ "$target" != server ]; then
-    for journey in cli rust client python typescript; do
-      saved_login_journey "$journey"
-    done
-  fi
-fi
+# Every identity journey, in order: the server's OIDC journeys, the production
+# UI BFF journey, the CLI device login, and each client's saved-login journey.
+# Run one with its own nextest/pytest/vitest command while Keycloak and Dex are up.
+# --tests puts the dev-only workspace-hack in the graph, so the binary shares
+# the test builds' third-party artifacts instead of rebuilding them.
+cargo build --locked -p wyrd-cli --bins --tests
+cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --test-threads=1 -E 'test(/^identity_e2e::/)'
+
+pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile
+pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
+cargo nextest run --locked -p wyrd-server --test integration --run-ignored=all --no-capture -E 'test(=identity_ui_e2e::production_ui_bff_journey)'
+
+cargo nextest run --locked -p wyrd-cli --test cli --run-ignored=all -E 'test(=cli_device_login_journey)'
+cargo nextest run --locked -p wyrd-client --test integration --run-ignored=all -E 'test(=pg_auth_e2e_against_fixture::concurrent_saved_renewal)'
+cargo nextest run --locked -p wyrd-sdk-rust --test integration --run-ignored=all -E 'test(/^(saved_user_auth|signed_in_development)::/)'
+
+mise run py:setup
+(cd sdks/wyrd-sdk-python && uv run python -m pytest -q -m identity tests/integration/test_saved_user_auth.py tests/integration/test_signed_in_development.py)
+
+mise run ts:build
+mise run ts:build:testing
+(cd sdks/wyrd-sdk-ts/wyrd && pnpm exec vitest run tests/integration/saved-user-auth.test.ts tests/integration/signed-in-development.test.ts)
 """
 
 [tasks."build:server"]
@@ -1034,21 +917,21 @@ hide = true
 description = "Run wyrd-storage S3 integration tests against the local RustFS emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
-run = "cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(/^integration_rustfs::/)'"
+run = "cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(/^integration_rustfs::/)'"
 
 [tasks."test:storage:gcs-emu"]
 hide = true
 description = "Run wyrd-storage GCS emulator integration tests; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_URL = "gs://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:4443" }
-run = "GOOGLE_APPLICATION_CREDENTIALS_JSON=\"$(scripts/storage/gcs-emulator-key.sh)\" cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=integration_gcs::gcs_head_on_missing_returns_not_found)'"
+run = "GOOGLE_APPLICATION_CREDENTIALS_JSON=\"$(scripts/storage/gcs-emulator-key.sh)\" cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=integration_gcs::gcs_head_on_missing_returns_not_found)'"
 
 [tasks."test:storage:azurite"]
 hide = true
 description = "Run wyrd-storage Azurite integration tests; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_URL = "az://devstoreaccount1/wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://127.0.0.1:10000/devstoreaccount1", AZURE_STORAGE_ACCOUNT_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" }
-run = "cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(/^integration_azurite::/)'"
+run = "cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(/^integration_azurite::/)'"
 
 [tasks."test:storage:e2e"]
 hide = true
@@ -1076,7 +959,7 @@ hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real AWS S3 (merge-to-main only; requires AWS credentials and region and WYRD_STORAGE_URL in env)"
 env = { WYRD_STORAGE_PART_SIZE_BYTES = "16777216", WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES = "8388608" }
 run = """
-cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=handle_crud::s3_handle_crud)'
+cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::s3_handle_crud)'
 cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::s3_multipart_e2e)'
 """
 
@@ -1090,7 +973,7 @@ hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real GCS (merge-to-main only; requires GCP credentials and WYRD_STORAGE_URL in env)"
 env = { WYRD_STORAGE_PART_SIZE_BYTES = "16777216", WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES = "8388608" }
 run = """
-cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=handle_crud::gcs_handle_crud) | test(/^integration_gcs::gcs_multipart_/)'
+cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::gcs_handle_crud) | test(/^integration_gcs::gcs_multipart_/)'
 cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::gcs_multipart_e2e) | test(=storage_e2e::gcs_single_put_e2e)'
 """
 
@@ -1104,7 +987,7 @@ hide = true
 description = "Run the StorageHandle CRUD + server multipart e2e against real Azure Blob Storage (merge-to-main only; requires Azure credentials and WYRD_STORAGE_URL in env)"
 env = { WYRD_STORAGE_PART_SIZE_BYTES = "16777216", WYRD_STORAGE_MULTIPART_THRESHOLD_BYTES = "8388608" }
 run = """
-cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=handle_crud::azure_handle_crud)'
+cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::azure_handle_crud)'
 cargo nextest run -p wyrd-server --features storage-emulator --test integration --test-threads=1 -E 'test(=storage_e2e::azure_multipart_e2e)'
 """
 
@@ -1125,27 +1008,27 @@ hide = true
 description = "Run StorageHandle CRUD tests against the RustFS S3 emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_URL = "s3://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:9000", AWS_REGION = "us-east-1", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret" }
-run = "cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=handle_crud::s3_handle_crud)'"
+run = "cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::s3_handle_crud)'"
 
 [tasks."test:storage:handle:gcs-emu"]
 hide = true
 description = "Run StorageHandle CRUD tests against the fake-gcs emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_URL = "gs://wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://localhost:4443" }
-run = "cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=handle_crud::gcs_handle_crud)'"
+run = "cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::gcs_handle_crud)'"
 
 [tasks."test:storage:handle:azure-emu"]
 hide = true
 description = "Run StorageHandle CRUD tests against the Azurite emulator; requires storage:up"
 depends = ["storage:up"]
 env = { WYRD_STORAGE_URL = "az://devstoreaccount1/wyrd-storage-test", WYRD_STORAGE_ENDPOINT_URL = "http://127.0.0.1:10000/devstoreaccount1", AZURE_STORAGE_ACCOUNT_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==" }
-run = "cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=handle_crud::azure_handle_crud)'"
+run = "cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::azure_handle_crud)'"
 
 [tasks."test:storage:handle:emulators"]
 hide = true
 description = "Run all StorageHandle CRUD tests: the three cloud emulators plus the local temporary-root handle; requires storage:up"
 depends = ["test:storage:handle:s3-emu", "test:storage:handle:gcs-emu", "test:storage:handle:azure-emu"]
-run = "cargo nextest run -p wyrd-storage --all-features --test integration -E 'test(=handle_crud::local_handle_crud)'"
+run = "cargo nextest run -p wyrd-storage --features emulator --test integration -E 'test(=handle_crud::local_handle_crud)'"
 
 [tasks."check:storage:drift"]
 hide = true
@@ -1684,25 +1567,61 @@ dir = "sdks/wyrd-sdk-ts/wyrd"
 run = "pnpm exec vitest run tests/integration --exclude tests/integration/saved-user-auth.test.ts --exclude tests/integration/signed-in-development.test.ts"
 
 [tasks."gate"]
-description = "Full repository aggregate for nightly, release, mixed, global, and unclassified changes. Run as `mise run -c gate` to finish every lane and report all failures; without -c mise stops at the first failed lane."
+description = """Full repository aggregate for nightly, release, mixed, global, and unclassified changes: every lane,
+each exactly once. Run as `mise run -c gate` to finish every lane and report all failures; without -c mise stops at
+the first failed lane. CI runs each `gate:*` shard as its own parallel job, read from this list, so a lane belongs to
+exactly one shard. The only tests outside gate are the scheduled production-geometry qualifications
+(performance.yml) and the live-credential lanes (storage-integration-cloud.yml, the *:smoke:live tasks)."""
 depends = [
-  "check",
-  "check:deps",
-  "check:tenant-isolation",
-  "check:storage:drift",
-  "check:ci-selection",
-  "check:docs",
-  "check:examples",
-  "codegen:check",
-  "docs:check",
-  "test:rust",
-  "test:bifrost:gate",
-  "test:gateway:gate",
-  "verify:python-sdk",
-  "verify:rust-sdk",
-  "verify:typescript-sdk",
-  "examples:python:datacard",
+  "gate:checks",
+  "gate:rust",
+  "gate:bifrost",
+  "gate:storage",
+  "gate:identity",
+  "gate:sdk-journeys",
+  "gate:python",
+  "gate:typescript",
 ]
+
+[tasks."gate:checks"]
+hide = true
+description = "Gate shard: format, Clippy, workspace-hack, boundary, codegen, docs, example, and CI-selection checks"
+depends = ["check", "check:deps", "check:tenant-isolation", "check:storage:drift", "check:ci-selection", "check:docs", "check:examples", "codegen:check", "docs:check"]
+
+[tasks."gate:rust"]
+hide = true
+description = "Gate shard: every Rust family lane and the ignored gateway journeys"
+depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:gateway:gate"]
+
+[tasks."gate:bifrost"]
+hide = true
+description = "Gate shard: the ignored Bifrost journeys; the family and SDK shards run every other Bifrost test"
+depends = ["test:bifrost:gate"]
+
+[tasks."gate:storage"]
+hide = true
+description = "Gate shard: the object-store emulator matrix"
+depends = ["test:storage:matrix"]
+
+[tasks."gate:identity"]
+hide = true
+description = "Gate shard: every identity journey against Keycloak and Dex"
+depends = ["test:identity:journey"]
+
+[tasks."gate:sdk-journeys"]
+hide = true
+description = "Gate shard: the Rust SDK story journeys and the installed-CLI bootstrap journeys"
+depends = ["test:rust-sdk:journey", "test:local-dev:journey"]
+
+[tasks."gate:python"]
+hide = true
+description = "Gate shard: Python format, lint, types, wheel boundary, every Python test tier, and the DataCard example"
+depends = ["py:format:check", "py:lints", "py:typecheck", "check:py-wheel-no-testing", "py:test:unit", "py:test:tensorflow", "py:test:testing", "py:test:integration", "examples:python:datacard"]
+
+[tasks."gate:typescript"]
+hide = true
+description = "Gate shard: napi declarations, the package, format, lint, types, unit tests, and every integration journey"
+depends = ["ts:napi:check", "ts:pack:check", "ts:format:check", "ts:lints", "ts:typecheck", "ts:test:unit", "ts:test:integration"]
 
 [tasks."db:migrate"]
 hide = true

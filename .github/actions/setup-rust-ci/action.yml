@@ -1,8 +1,9 @@
 name: Setup Rust CI
 description: >-
-  Shared CI bring-up for Rust jobs: free disk space, install mise, cache the
-  cargo build, and select the GNU BFD linker on Linux. Assumes the repo is
-  already checked out.
+  Shared CI bring-up for Rust jobs: free disk space, install mise, restore the
+  shared cargo build cache, and select the GNU BFD linker on Linux. Assumes the
+  repo is already checked out. Every Rust job goes through this action so all
+  of them build with the same RUSTFLAGS and can reuse one another's caches.
 
 inputs:
   free-disk:
@@ -14,9 +15,19 @@ inputs:
   tool-cache:
     description: Let free-disk-space remove the hosted-tool cache.
     default: "true"
-  rust-cache-key:
-    description: Optional extra key passed to Swatinem/rust-cache to isolate a cache slot.
-    default: ""
+  cache-key:
+    description: >-
+      The shared Rust cache this job restores. Jobs that build the same graph
+      share one: `test` (cargo test builds and the Python extension, which
+      share third-party artifacts through workspace-hack), `clippy`
+      (check-only artifacts), and `napi` (the TypeScript addons' --target tree).
+    default: test
+  save-cache:
+    description: >-
+      Save the cache after the job. Only one job per cache-key passes true, and
+      only main saves, so pull requests restore main's cache instead of
+      evicting it with their own.
+    default: "false"
   bfd-linker:
     description: Force the GNU BFD linker on Linux (workaround for lld issues).
     default: "true"
@@ -45,7 +56,8 @@ runs:
     - name: Cache Rust
       uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ inputs.rust-cache-key }}
+        shared-key: ${{ inputs.cache-key }}
+        save-if: ${{ inputs.save-cache == 'true' && github.ref == 'refs/heads/main' }}
         # A red run still compiled the dependency set; saving it keeps the next
         # run from starting cold.
         cache-on-failure: true

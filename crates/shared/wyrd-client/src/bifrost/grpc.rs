@@ -483,6 +483,7 @@ mod tests {
     use wyrd_tonic::error::wyrd_error_to_status;
     use wyrd_tonic::tonic::Response;
     use wyrd_tonic::tonic::transport::Server;
+    use wyrd_tonic::tonic::transport::server::TcpIncoming;
     use wyrd_tonic::wyrd::v1::InsertBatchResponse;
     use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
         BifrostIngestService, BifrostIngestServiceServer,
@@ -491,6 +492,34 @@ mod tests {
     /// Renders `error` through the server's own gRPC problem producer.
     fn refusal(error: BifrostError) -> Status {
         wyrd_error_to_status(WyrdError::from(error), None)
+    }
+
+    /// Serves `service` on an ephemeral loopback port and returns its address
+    /// with the server task.
+    ///
+    /// The bound listener is handed to the server rather than dropped and
+    /// rebound, so the port accepts connections before this returns and a
+    /// client configured with no connect retries cannot race server startup.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the loopback port cannot be bound or its address read.
+    async fn serve_ingest<S: BifrostIngestService>(
+        service: S,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<Result<(), wyrd_tonic::tonic::transport::Error>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test port binds");
+        let address = listener.local_addr().expect("test address resolves");
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(BifrostIngestServiceServer::new(service))
+                .serve_with_incoming(TcpIncoming::from(listener)),
+        );
+        (address, server)
     }
 
     /// Scripted real gRPC service that returns busy, ACK, then permanent capacity.
@@ -593,15 +622,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_busy_retries_same_batch_and_permanent_capacity_is_terminal() {
         let service = ScriptedIngest::default();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test port binds");
-        let address = listener.local_addr().expect("test address resolves");
-        drop(listener);
-        let server = tokio::spawn(
-            Server::builder()
-                .add_service(BifrostIngestServiceServer::new(service.clone()))
-                .serve(address),
-        );
-        tokio::task::yield_now().await;
+        let (address, server) = serve_ingest(service.clone()).await;
 
         let config = ClientConfig {
             grpc: crate::transport::GrpcConfig {
@@ -759,15 +780,7 @@ mod tests {
         credential: ResolvedCredential,
         http_timeout_ms: u64,
     ) -> (usize, Vec<u64>, Arc<AuthMiddleware>) {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test port binds");
-        let address = listener.local_addr().expect("test address resolves");
-        drop(listener);
-        let server = tokio::spawn(
-            Server::builder()
-                .add_service(BifrostIngestServiceServer::new(service))
-                .serve(address),
-        );
-        tokio::task::yield_now().await;
+        let (address, server) = serve_ingest(service).await;
 
         let config = ClientConfig {
             grpc: crate::transport::GrpcConfig {
@@ -1109,15 +1122,7 @@ mod tests {
     #[tokio::test]
     async fn unauthenticated_refusal_forces_one_shared_refresh_and_resends() {
         let service = RefreshGatedIngest::default();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test port binds");
-        let address = listener.local_addr().expect("test address resolves");
-        drop(listener);
-        let server = tokio::spawn(
-            Server::builder()
-                .add_service(BifrostIngestServiceServer::new(service.clone()))
-                .serve(address),
-        );
-        tokio::task::yield_now().await;
+        let (address, server) = serve_ingest(service.clone()).await;
 
         let exchange = wiremock::MockServer::start().await;
         for token in ["token-1", "token-2"] {

@@ -52,14 +52,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up mise
-        uses: jdx/mise-action@v3
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          install: true
-          cache: true
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+          docker-images: "false"
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -79,14 +74,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up mise
-        uses: jdx/mise-action@v3
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          install: true
-          cache: true
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+          docker-images: "false"
 
       - name: Run GCS cloud tests
         env:
@@ -101,14 +91,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up mise
-        uses: jdx/mise-action@v3
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          install: true
-          cache: true
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+          docker-images: "false"
 
       - name: Authenticate to Azure (OIDC)
         uses: azure/login@v2

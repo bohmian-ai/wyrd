@@ -135,9 +135,6 @@ importers:
       '@wyrd/sdk-linux-x64-gnu':
         specifier: 0.0.1
         version: link:../wyrd-linux-x64-gnu
-      '@wyrd/sdk-win32-x64-msvc':
-        specifier: 0.0.1
-        version: link:../wyrd-win32-x64-msvc
 
   wyrd-darwin-arm64: {}
 
@@ -146,8 +143,6 @@ importers:
   wyrd-linux-arm64-gnu: {}
 
   wyrd-linux-x64-gnu: {}
-
-  wyrd-win32-x64-msvc: {}
 
 packages:
 

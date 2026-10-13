@@ -14,7 +14,6 @@ const targetPackage = {
   "darwin-x64": "darwin-x64",
   "linux-arm64": "linux-arm64-gnu",
   "linux-x64": "linux-x64-gnu",
-  "win32-x64": "win32-x64-msvc",
 }[target];
 
 if (targetPackage === undefined) {

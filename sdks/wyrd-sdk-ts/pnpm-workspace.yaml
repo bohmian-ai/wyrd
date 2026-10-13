@@ -5,7 +5,6 @@ packages:
   - wyrd-linux-arm64-gnu
   - wyrd-darwin-x64
   - wyrd-darwin-arm64
-  - wyrd-win32-x64-msvc
   - ../../examples/support-desk/typescript
 allowBuilds:
   esbuild: true

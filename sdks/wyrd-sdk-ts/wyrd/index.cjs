@@ -21,9 +21,6 @@ const target = (() => {
     if (process.arch === "x64") return "darwin-x64";
     if (process.arch === "arm64") return "darwin-arm64";
   }
-  if (process.platform === "win32" && process.arch === "x64") {
-    return "win32-x64-msvc";
-  }
   return undefined;
 })();
 

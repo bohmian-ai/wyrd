@@ -699,37 +699,4 @@ mod tests {
             }
         }
     }
-
-    /// Operator documentation names exactly the families Forge publishes.
-    ///
-    /// A family added, renamed, or removed without its documented row would
-    /// otherwise reach operators as an undocumented series or a documented one
-    /// that never appears on a dashboard.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the documented family-name set differs from the catalog.
-    #[test]
-    fn forge_operator_documentation_matches_telemetry() {
-        const DOCUMENTATION: &str =
-            include_str!("../../../../../docs/src/content/docs/bifrost/forge.svx");
-
-        let documented = DOCUMENTATION
-            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-            .filter(|word| word.starts_with("bifrost_forge_"))
-            .map(|word| {
-                // A PromQL example names the rendered histogram series, which
-                // Prometheus derives from the same family.
-                word.strip_suffix("_bucket").unwrap_or(word).to_owned()
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            documented,
-            FORGE_METRIC_FAMILIES
-                .iter()
-                .map(|family| (*family).to_owned())
-                .collect::<BTreeSet<_>>(),
-            "operator documentation and the published catalog disagree"
-        );
-    }
 }

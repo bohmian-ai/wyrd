@@ -50,6 +50,8 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # Shards that never run uv have nothing to cache.
+          ignore-nothing-to-cache: true
           python-version: "3.12"
 
       - name: Install Rust components

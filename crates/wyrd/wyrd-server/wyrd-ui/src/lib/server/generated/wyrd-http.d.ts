@@ -12,9 +12,11 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * `GET /.well-known/oauth-authorization-server` — RFC 8414 §3 metadata.
+         * `GET /.well-known/oauth-authorization-server` — RFC 8414 §3 metadata,
+         *     with every endpoint on the origin the request arrived at.
          * @description # Errors
-         *     Returns problem JSON when auth or the public origin is not configured.
+         *     Returns problem JSON when auth is not configured or the request names no
+         *     usable host.
          */
         get: operations["metadata"];
         put?: never;
@@ -36,8 +38,9 @@ export interface paths {
          * `GET /auth/authorize` — begin a sign-in for an OAuth client (RFC 6749
          *     §4.1.1, RFC 7636 §4.3).
          * @description Only `wyrd-ui` uses the authorization code grant, so `client_id` must
-         *     name it once and `redirect_uri` must appear once and equal its registered
-         *     `{public_origin}/login/callback` exactly (RFC 6749 §3.1.2); otherwise the
+         *     name it once and `redirect_uri` must appear once and equal
+         *     `{origin}/login/callback` exactly (RFC 6749 §3.1.2), on the origin this
+         *     request arrived at; otherwise the
          *     browser is shown an error page and never redirected. After that, any
          *     other repeated parameter, a missing `response_type`, `code_challenge`, or
          *     `tenant`, a challenge method other than `S256`, or a refused sign-in
@@ -45,11 +48,12 @@ export interface paths {
          *     when the request sent exactly one. A valid request
          *     redirects (`303`) to the tenant's provider sign-in, bound to the client,
          *     redirect URI, challenge, and `state`. No request header selects the
-         *     tenant, connection, or redirect, and initiation appends no audit event:
-         *     it evaluates no principal permission.
+         *     tenant or connection, and initiation appends no audit event: it
+         *     evaluates no principal permission.
          *
          *     # Errors
-         *     Returns problem JSON when auth or the public origin is not configured.
+         *     Returns problem JSON when auth is not configured or the request names no
+         *     usable host.
          */
         get: operations["authorize"];
         put?: never;
@@ -114,7 +118,7 @@ export interface paths {
         put?: never;
         /**
          * `POST /auth/device` — approve or deny a user code (RFC 8628 §3.3).
-         * @description Only a form posted from the deployment's own origin is accepted, so
+         * @description Only a form posted from the origin the request arrived at is accepted, so
          *     another site cannot approve its own code in the person's browser. Approve
          *     redirects (`303`) to the tenant's provider sign-in, bound to the code's
          *     device authorization; Deny ends the CLI's login.
@@ -273,8 +277,8 @@ export interface paths {
         put?: never;
         /**
          * `POST /auth/revoke` — revoke a refresh token (RFC 7009 §2).
-         * @description The client identifies itself as for the token endpoint: `wyrd-ui` with
-         *     its Basic secret, `wyrd-cli` with `client_id`. Revoking a token revokes
+         * @description The client identifies itself as for the token endpoint, with
+         *     `client_id`. Revoking a token revokes
          *     its whole login; the User's other logins continue. An unknown, malformed,
          *     or already revoked token also answers `200` (RFC 7009 §2.2), and
          *     `token_type_hint` is ignored: only refresh tokens are revocable. The
@@ -309,8 +313,7 @@ export interface paths {
          *     §4.1.3, `wyrd-ui`), a refresh token (§6), an RFC 8628 device code
          *     (`wyrd-cli`), an RFC 8693 token exchange — a Wyrd API key as subject, or
          *     a delegation — and an RFC 7523 workload assertion. The human grants
-         *     require their client: `wyrd-ui` authenticates with its Basic secret and
-         *     `wyrd-cli` names itself with `client_id`. Tenant and principal are derived
+         *     require their client, which names itself with `client_id`. Tenant and principal are derived
          *     from the verified credential, never from a client-supplied header.
          *
          *     # Errors
@@ -1679,7 +1682,7 @@ export interface paths {
          *     body was valid.
          *
          *     # Errors
-         *     Returns `400` for invalid input, a missing public origin, or an unsupported
+         *     Returns `400` for invalid input or an unsupported
          *     client authentication method, `403` without `identity_connections:write`,
          *     `409` for a stale `expected_revision`, and `503` when the store is
          *     unavailable.
@@ -1746,7 +1749,7 @@ export interface paths {
          *     credential, or User.
          *
          *     # Errors
-         *     Returns `400` when no public origin or sealing key is configured, `403`
+         *     Returns `400` when no sealing key is configured, `403`
          *     without `identity_connections:write`, `409` for a stale revision
          *     (`CONNECTION_CONFLICT`) or a failed check (`CONNECTION_NOT_TESTED`), and
          *     `503` when the provider is refused by address screening or unavailable, the
@@ -3026,9 +3029,7 @@ export interface components {
          *     parameters plus the public client's `client_id` (RFC 6749 §2.3.1, §3.2.1).
          *
          *     It exists for the served contract only. Requests are read by
-         *     [`OAuthForm`] and the client is identified by [`OAuthClients`]; a
-         *     confidential client sends HTTP Basic (RFC 7617) instead of `client_id`,
-         *     which the operation declares as its alternative security requirement.
+         *     [`OAuthForm`] and the client is identified by [`identify_client`].
          */
         ClientForm_DeviceAuthorizationRequest: {
             /** @description The tenant's route key (its slug). */
@@ -3041,9 +3042,7 @@ export interface components {
          *     parameters plus the public client's `client_id` (RFC 6749 §2.3.1, §3.2.1).
          *
          *     It exists for the served contract only. Requests are read by
-         *     [`OAuthForm`] and the client is identified by [`OAuthClients`]; a
-         *     confidential client sends HTTP Basic (RFC 7617) instead of `client_id`,
-         *     which the operation declares as its alternative security requirement.
+         *     [`OAuthForm`] and the client is identified by [`identify_client`].
          */
         ClientForm_TokenRequest: ({
             /** @description The code `GET /auth/authorize` returned to the redirect URI. */
@@ -3088,9 +3087,7 @@ export interface components {
          *     parameters plus the public client's `client_id` (RFC 6749 §2.3.1, §3.2.1).
          *
          *     It exists for the served contract only. Requests are read by
-         *     [`OAuthForm`] and the client is identified by [`OAuthClients`]; a
-         *     confidential client sends HTTP Basic (RFC 7617) instead of `client_id`,
-         *     which the operation declares as its alternative security requirement.
+         *     [`OAuthForm`] and the client is identified by [`identify_client`].
          */
         ClientForm_TokenRevocationRequest: {
             /**
@@ -8713,7 +8710,7 @@ export interface operations {
                     "application/json": components["schemas"]["AuthorizationServerMetadata"];
                 };
             };
-            /** @description No public origin is configured (WYRD_SPEC_400_VALIDATION) */
+            /** @description The request names no usable host (WYRD_SPEC_400_VALIDATION) */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -8766,7 +8763,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description An unknown client or unregistered redirect URI is shown an HTML page; a deployment without a public origin answers WYRD_SPEC_400_VALIDATION */
+            /** @description An unknown client or a redirect URI off the request origin is shown an HTML page; a request without a usable host answers WYRD_SPEC_400_VALIDATION */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -8823,7 +8820,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description The query carries both or neither of `code` and `error` (WYRD_SPEC_400_VALIDATION), the login state is unknown, expired, or replayed (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match (WYRD_AUTH_400_INVALID_NONCE), or the deployment has no public origin (WYRD_SPEC_400_VALIDATION) */
+            /** @description The query carries both or neither of `code` and `error` (WYRD_SPEC_400_VALIDATION), the login state is unknown, expired, or replayed (WYRD_AUTH_400_INVALID_STATE), the ID token nonce does not match (WYRD_AUTH_400_INVALID_NONCE) */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -14746,7 +14743,7 @@ export interface operations {
                     "application/json": components["schemas"]["HumanConnectionView"];
                 };
             };
-            /** @description Invalid input or no public origin configured (WYRD_SPEC_400_VALIDATION), or an unsupported client authentication method (WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH) */
+            /** @description Invalid input (WYRD_SPEC_400_VALIDATION), or an unsupported client authentication method (WYRD_AUTH_400_UNSUPPORTED_CLIENT_AUTH) */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -14893,7 +14890,7 @@ export interface operations {
                     "application/json": components["schemas"]["ConnectionTestResponse"];
                 };
             };
-            /** @description No public origin or sealing key is configured (WYRD_SPEC_400_VALIDATION) */
+            /** @description No sealing key is configured (WYRD_SPEC_400_VALIDATION) */
             400: {
                 headers: {
                     [name: string]: unknown;

@@ -134,9 +134,8 @@ If a record lacks optional Card correlation, the UI must not invent it.
   the UI with an API key, and through SSO once the tenant's connection is
   active. Neither the BFF nor the server requires a client secret, a public
   origin, or a UI `ORIGIN`: the deployment's public origin is the origin each
-  request arrived at (its `Host`, with the scheme the image's proxy forwards),
-  and an operator may still pin `WYRD_PUBLIC_ORIGIN` when a proxy rewrites
-  `Host`.
+  request arrived at (the host and scheme the image's proxy forwards, else its
+  `Host`). Nothing pins it.
 
 ### Home and Cards
 
@@ -425,7 +424,7 @@ integration changes its behavior.
 | **AC-016 — Combined journey and isolation** | In one user story, login → register → inspect Cards → execute → investigate telemetry → inspect verification → return home. Repeat targeted access checks with a restricted user and another tenant containing overlapping names; attempted scope/URL manipulation leaks no protected rows or details. | REQ-001–019, INV-001–009 |
 | **AC-017 — Generated contract gate** | Before accepting live page integrations, regenerate from the locally served composed contract and type-check the consumers. Repeating regeneration yields identical artifacts. Demonstrate that stale/missing output fails the check, and that a representative consumed field/parameter or operation change leaves an unchanged adapter failing type-check after regeneration. Actual JSON/error serialization agrees with the served schema; analytical schema mismatches fail truthfully. Every page's acceptance record identifies its generated wire contract and typed projection. | REQ-020–022, INV-010 |
 | **AC-018 — SvelteKit loading gate** | For each included page, verify primary content in the initial server-rendered response before hydration, then operate client navigation, supported preloading, URL filters and refresh/invalidation. Network evidence shows protected upstream access remains in the BFF and hydration does not redundantly fetch the same initial dataset. Navigation after session expiry and tenant changes revalidates authority; preloads perform no writes or cross-session reuse. | REQ-023–025, INV-011 |
-| **AC-020 — Zero-configuration image login** | Build the official image and run it with only its database and storage settings: no `WYRD_PUBLIC_ORIGIN`, client secret or UI `ORIGIN`. Reach it over plain `http` at a non-`localhost` host and through an `https`-forwarding proxy; sign in with an API key and load an authenticated page each way. On the server, an authorization request is redirected back only to `{request origin}/login/callback`, a redirect URI on another origin is refused, a pinned `WYRD_PUBLIC_ORIGIN` wins over the request, and `wyrd-ui` redeems, refreshes and revokes with `client_id` alone. The SSO browser journey passes with no secret or pinned origin. | REQ-001, REQ-003, REQ-016, REQ-027, INV-003–004 |
+| **AC-020 — Zero-configuration image login** | Build the official image and run it with only its database and storage settings: no `WYRD_PUBLIC_ORIGIN`, client secret or UI `ORIGIN`. Reach it over plain `http` at a non-`localhost` host and through an `https`-forwarding proxy; sign in with an API key and load an authenticated page each way. On the server, an authorization request is redirected back only to `{request origin}/login/callback`, a redirect URI on another origin is refused, and `wyrd-ui` redeems, refreshes and revokes with `client_id` alone. The SSO browser journey passes with no secret or origin setting. | REQ-001, REQ-003, REQ-016, REQ-027, INV-003–004 |
 | **AC-019 — Full-scale simulation** | After the page gates and the combined journey, run the shared setup at twenty Services through public pathways and settle it with bounded readiness. In a real browser, every included page (Home, Cards inventory and details, Service workspaces, Observe overview, traces and trace detail, logs, metrics, evaluations and task detail, drift) shows each Service's evidence; paging covers each authoritative population without overlap; filters, counts and Home summaries agree with authoritative reads under equivalent scope; another tenant and a restricted user still see nothing protected. Record per-page server-render and navigation timings and the dataset sizes they were measured on. | REQ-004–019, REQ-023–024, REQ-026, INV-006–008 |
 
 ## Acceptance evidence and verification
@@ -485,13 +484,14 @@ No broad gate is required merely because this draft exists.
    and handlers cover applicable interactions. Client-only initial fetching
    is not an alternative implementation of these requirements.
 
-9. Login derives the deployment's public origin from each request: `Host`,
-   and the scheme from the image proxy's `X-Forwarded-Proto` (`http` when
-   absent). Wyrd's own redirect to `wyrd-ui` must stay on the origin the
+9. Login derives the deployment's public origin from each request: the host
+   from `X-Forwarded-Host`, else `Host`, and the scheme from
+   `X-Forwarded-Proto` (`http` when absent). The image's nginx forwards an
+   incoming pair, else its own, and the BFF reads them through adapter-node's
+   `HOST_HEADER`/`PROTOCOL_HEADER` and forwards them on its `/v1` calls. Wyrd's own redirect to `wyrd-ui` must stay on the origin the
    authorization request arrived at, and the identity provider's registered
    redirect URIs remain the trust anchor for its callback, so a forged `Host`
-   only redirects its own sender. `WYRD_PUBLIC_ORIGIN` is an optional pin that
-   wins when set. `wyrd-ui` becomes a public client; its refresh token still
+   only redirects its own sender. There is no origin setting. `wyrd-ui` becomes a public client; its refresh token still
    does not rotate, because concurrent page requests renew one session, and
    it keeps its bounded absolute lifetime. This supersedes the confidential
    `wyrd-ui` client, its `WYRD_UI_CLIENT_SECRET`/`WYRD_UI_CLIENT_SECRET_SHA256`

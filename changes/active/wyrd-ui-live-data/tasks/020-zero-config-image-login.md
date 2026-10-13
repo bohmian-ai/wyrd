@@ -21,7 +21,7 @@ A person who pulls the official image and runs it with only its database and sto
 | Capability | Existing owner/symbol | Inspected callers/tests | Missing behavior | Selected extension | New machinery justification |
 |---|---|---|---|---|---|
 | OAuth client identification | `wyrd-server/src/auth/oauth.rs::OAuthClients` | `cli_login.rs` device and revoke handlers, `components/auth/routes.rs` token handler, `oauth.rs` unit tests, `identity_e2e.rs` | `wyrd-ui` requires a configured secret | `wyrd-ui` identifies by `client_id`, like `wyrd-cli`; the secret, its config and the Basic path are deleted | None: deletion. `OAuthClients` holds no state any more, so it becomes two free functions. |
-| Public origin | `wyrd-auth/src/connections.rs::HumanConnections::require_callback`, `config.rs` `public_origin` | `authorize.rs`, `cli_login.rs::device_decision`, `cli_logins.rs::authorize`, `login.rs::begin_bound`, admin identity routes | Required configuration; a missing value is a runtime refusal | The callback comes from the request origin unless `WYRD_PUBLIC_ORIGIN` pins it | One request-origin extractor in the server's auth module; no new config. |
+| Public origin | `wyrd-auth/src/connections.rs::HumanConnections::require_callback`, `config.rs` `public_origin` | `authorize.rs`, `cli_login.rs::device_decision`, `cli_logins.rs::authorize`, `login.rs::begin_bound`, admin identity routes | Required configuration; a missing value is a runtime refusal | The callback comes from the request origin (`X-Forwarded-Host`/`Host`, `X-Forwarded-Proto`); `public_origin` and `WYRD_PUBLIC_ORIGIN` are deleted | One request-origin extractor in the server's auth module; no config. |
 | BFF session | `wyrd-ui/src/lib/server/auth/browser-sessions.ts::BrowserSessions` | `hooks.server.ts`, the login routes, `browser-sessions.test.ts`, `production-auth.integration.test.ts` | Discovery at the public origin, a client secret, and a cookie key derived from it | A locally built `openid-client` configuration over `WYRD_SERVER_URL` with `client.None()`; the cookie holds the server-validated credential | None: the existing library and cookie API. |
 | Image | `docker/official/extras/entrypoint.sh`, `nginx.conf.template` | `scripts/server/test-startup-prod.sh` | The BFF assumes `https`; a TLS proxy's forwarded scheme is overwritten | `PROTOCOL_HEADER=x-forwarded-proto`; nginx forwards an incoming `X-Forwarded-Proto`, otherwise its own scheme | None. |
 
@@ -38,8 +38,8 @@ Prohibited: a generated or persisted UI key, an image-generated secret, another 
 
 ### Scenario 2 — The request supplies the public origin
 
-**Behavior.** Without a pin, `/auth/authorize` accepts only `{scheme}://{Host}/login/callback` and sends the provider `{origin}/auth/callback`; another origin's redirect URI is refused; a pinned origin wins.
-**RED.** `authorize.rs` pg tests `authorize_derives_the_origin_from_the_request` and `a_pinned_origin_wins`.
+**Behavior.** `/auth/authorize` accepts only `{request origin}/login/callback` and sends the provider `{origin}/auth/callback`; another origin's redirect URI is refused.
+**RED.** `auth::tests::origin_is_the_host_with_the_forwarded_scheme`; `authorize.rs` pg tests `authorize_derives_the_callback_from_the_request_origin` and `a_redirect_off_the_request_origin_is_refused`.
 **GREEN.** A request-origin extractor; `HumanConnections` takes the request origin where it needs the callback.
 **REFACTOR.** Delete `public_origin_missing`.
 
@@ -54,7 +54,7 @@ Prohibited: a generated or persisted UI key, an image-generated secret, another 
 
 **Behavior.** `test-startup-prod.sh` case `authenticated_analytical_bff` signs in over plain `http` with no public origin or secret.
 **RED.** The case as it stands fails sign-in.
-**GREEN.** Entrypoint `PROTOCOL_HEADER`; nginx forwarded-scheme pass-through.
+**GREEN.** Entrypoint `PROTOCOL_HEADER`/`HOST_HEADER`; nginx forwards an incoming scheme and host, else its own.
 
 ## Verification and Evidence
 

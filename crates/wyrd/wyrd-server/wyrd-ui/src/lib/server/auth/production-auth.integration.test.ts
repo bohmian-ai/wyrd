@@ -64,11 +64,17 @@ const sessionCookie = (tenant: string) => `wyrd_session_${tenant}`;
 /** Each journey drives many real logins, key verifications, and renewals. */
 const journeyTimeout = 60_000;
 
-/** The gateway's routing of a public-origin `/auth/*` URL to Wyrd replica `replica`. */
-function gateway(url: string, replica: 0 | 1 = 0): string {
+/**
+ * The gateway's routing of a public-origin `/auth/*` URL to Wyrd replica
+ * `replica`, with the scheme and host it forwards; the redirect is returned.
+ */
+function gateway(url: string, replica: 0 | 1 = 0): Promise<Response> {
   const target = new URL(url);
   expect(target.origin).toBe(journey.origin);
-  return journey.servers[replica] + target.pathname + target.search;
+  return fetch(journey.servers[replica] + target.pathname + target.search, {
+    redirect: 'manual',
+    headers: { 'x-forwarded-proto': 'http', 'x-forwarded-host': target.host }
+  });
 }
 
 /**
@@ -203,7 +209,7 @@ async function beginSso(
   expect(query.get('code_challenge')).toMatch(/^[\w-]{43}$/);
   expect(query.get('state')).toBeTruthy();
   expect(query.get('tenant')).toBe(tenant);
-  const authorized = await fetch(gateway(request.toString(), replica), { redirect: 'manual' });
+  const authorized = await gateway(request.toString(), replica);
   expect(authorized.status, await authorized.clone().text()).toBe(303);
   const authorization = authorized.headers.get('location')!;
   expect(authorization.startsWith(issuer)).toBe(true);
@@ -223,7 +229,7 @@ async function providerCallback(
 ): Promise<string> {
   const callback = new URL(await providerLogin(authorization, user));
   expect(callback.origin + callback.pathname).toBe(`${journey.origin}/auth/callback`);
-  const response = await fetch(gateway(callback.toString(), replica), { redirect: 'manual' });
+  const response = await gateway(callback.toString(), replica);
   expect(response.status, await response.clone().text()).toBe(303);
   const returned = new URL(response.headers.get('location')!);
   expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);
@@ -288,7 +294,7 @@ async function expectMixedCallbackRefused(
 async function providerAuthorizationDenied(browser: Browser, tenant: string): Promise<string> {
   const begun = await browser.go(0, `/t/${tenant}/login?/sso`, { form: {} });
   expect(begun.status).toBe(303);
-  const denied = await fetch(gateway(begun.headers.get('location')!), { redirect: 'manual' });
+  const denied = await gateway(begun.headers.get('location')!);
   expect(denied.status).toBe(303);
   const returned = new URL(denied.headers.get('location')!);
   expect(returned.origin + returned.pathname).toBe(`${journey.origin}/login/callback`);
@@ -682,7 +688,7 @@ test('production provider replacement settings', async () => {
   expect(testSignIn.startsWith(secondIssuer)).toBe(true);
   const testReturn = await providerLogin(testSignIn, journey.users.admin);
   expect(testReturn.startsWith(`${journey.origin}/auth/callback?`)).toBe(true);
-  const testCallback = await fetch(gateway(testReturn, 1), { redirect: 'manual' });
+  const testCallback = await gateway(testReturn, 1);
   expect(testCallback.status, await testCallback.clone().text()).toBe(200);
   expect(await testCallback.text()).toContain('Connection test complete');
   expect(testCallback.headers.getSetCookie()).toEqual([]);

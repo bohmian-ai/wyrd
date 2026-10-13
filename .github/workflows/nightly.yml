@@ -14,39 +14,37 @@ env:
   MISE_LOCKED: "true"
 
 jobs:
-  # gate plus the lanes it does not reach. gate already covers the storage
-  # emulator matrix, the real-server journeys, the Python and TypeScript
-  # integration suites, and the identity journey; live cloud and performance
-  # run elsewhere.
-  gate:
-    name: nightly ${{ matrix.task }}
+  plan:
+    name: gate shards
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 5
+    outputs:
+      ci_jobs: ${{ steps.plan.outputs.ci_jobs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: plan
+        run: python3 .github/scripts/select-ci.py --gate
+
+  # The complete gate, one parallel job per `gate:*` shard in mise.toml: the
+  # same jobs a full-gate pull request runs. Live cloud and production-geometry
+  # qualification run in their own workflows.
+  gate:
+    name: nightly ${{ matrix.job.name }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        task:
-          - gate
-          - py:test:testing
+        job: ${{ fromJSON(needs.plan.outputs.ci_jobs) }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: true
-
-      - name: Set up mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
+          docker-images: "false"
+          cache-key: ${{ matrix.job.cache }}
+          save-cache: ${{ matrix.job.save && 'true' || 'false' }}
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@v6
@@ -57,17 +55,14 @@ jobs:
       - name: Install Rust components
         run: rustup component add --toolchain "$RUSTUP_TOOLCHAIN" rustfmt clippy
 
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
       - name: Install system tools
         run: sudo apt-get update && sudo apt-get install -y ripgrep libcurl4-openssl-dev pkg-config
 
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Run ${{ matrix.task }}
-        run: mise run ${{ matrix.task }}
+      - name: Run ${{ matrix.job.lanes }}
+        run: mise run ${{ matrix.job.lanes }}
 
   postgres:
     name: isolated Postgres checks

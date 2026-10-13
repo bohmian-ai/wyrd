@@ -100,3 +100,13 @@ unused-ignore-comment = "error"
 
 [tool.uv]
 package = false
+
+# Linux takes the CPU-only torch build: no test uses a GPU, and the default
+# Linux wheel pulls about 3 GB of CUDA libraries into every environment.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

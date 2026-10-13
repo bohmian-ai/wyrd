@@ -48,6 +48,11 @@ name = "gateway"
 path = "tests/gateway/main.rs"
 
 [dependencies]
+# A normal edge, unlike every other member's dev-only one: the Python
+# `testing` extension and the TypeScript testing addon reach the hack only
+# through this harness, so their builds reuse the Rust test builds' third-party
+# artifacts. The harness never ships, so its test-only features never do.
+workspace-hack.workspace = true
 async-trait = { workspace = true }
 async-stream = { workspace = true }
 axum = { workspace = true }
@@ -126,7 +131,6 @@ libproc = { workspace = true }
 sysinfo = { workspace = true }
 
 [dev-dependencies]
-workspace-hack.workspace = true
 # The peer-context journey encodes a Scribe fragment exactly as a leader does.
 datafusion-proto = { workspace = true }
 # The leaf-predicate peer journey plans its filter as a leader's session does.

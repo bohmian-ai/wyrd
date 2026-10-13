@@ -33,6 +33,11 @@ inputs:
     description: Force the GNU BFD linker on Linux (workaround for lld issues).
     default: "true"
 
+outputs:
+  cache-hit:
+    description: "true when the Rust cache restored an exact key match."
+    value: ${{ steps.rust-cache.outputs.cache-hit }}
+
 runs:
   using: composite
   steps:
@@ -69,6 +74,7 @@ runs:
         cache: true
 
     - name: Cache Rust
+      id: rust-cache
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: ${{ inputs.cache-key }}

@@ -20,8 +20,8 @@ WYRD_CARGO_METADATA names a prepared `cargo metadata` document for self-tests.
 `ci_jobs` is the JSON matrix of the Linux `ci` job: one entry per parallel job,
 each running its space-separated `lanes` and restoring the Rust cache named by
 `cache`. The complete gate runs one job per `gate:*` shard listed in mise.toml,
-so every lane runs exactly once. The `deps` job builds and saves the shared
-`test` cache before any shard starts; `save` marks the one shard that refreshes
+so every lane runs exactly once. The `deps` job builds the workspace tests and
+saves their dependencies as the shared `test` cache before any shard starts; `save` marks the one shard that refreshes
 each other cache from main.
 """
 

@@ -77,24 +77,30 @@ jobs:
   # change runs format, lint, the boundary checks, and exactly the lanes
   # selected for its affected packages, with the identity and storage journeys
   # as their own jobs when selected.
-  # Compiles the third-party dependency set once, before any shard starts.
-  # workspace-hack is that set with the features every test build unifies to,
-  # so each shard restores it from the `test` cache instead of compiling it.
+  # Compiles the third-party dependency set once, before any shard starts:
+  # building the workspace's tests compiles every dependency with the features
+  # the shards' test builds use, and the cache keeps only those dependencies.
+  # Each shard restores it from the `test` cache instead of compiling it. An
+  # exact cache hit already holds the set, so the build is skipped.
   deps:
     name: deps
     needs: changes
     if: needs.changes.outputs.ci_jobs != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup-rust-ci
+      - id: setup
+        uses: ./.github/actions/setup-rust-ci
         with:
           save-cache: always
 
       - name: Build the shared dependencies
-        run: mise exec -- cargo build --locked -p workspace-hack
+        if: steps.setup.outputs.cache-hit != 'true'
+        run: >-
+          mise exec -- cargo build --locked --workspace --tests
+          --exclude wyrd-sdk-python --exclude wyrd-sdk-ts --exclude wyrd-sdk-ts-testing
 
   ci:
     name: ci (${{ matrix.job.name }})

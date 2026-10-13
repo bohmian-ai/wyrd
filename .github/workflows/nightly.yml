@@ -25,24 +25,30 @@ jobs:
       - id: plan
         run: python3 .github/scripts/select-ci.py --gate
 
-  # Compiles the third-party dependency set once, before any shard starts.
-  # workspace-hack is that set with the features every test build unifies to,
-  # so each shard restores it from the `test` cache instead of compiling it.
+  # Compiles the third-party dependency set once, before any shard starts:
+  # building the workspace's tests compiles every dependency with the features
+  # the shards' test builds use, and the cache keeps only those dependencies.
+  # Each shard restores it from the `test` cache instead of compiling it. An
+  # exact cache hit already holds the set, so the build is skipped.
   deps:
     name: deps
     needs: plan
     if: needs.plan.outputs.ci_jobs != '[]'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ./.github/actions/setup-rust-ci
+      - id: setup
+        uses: ./.github/actions/setup-rust-ci
         with:
           save-cache: always
 
       - name: Build the shared dependencies
-        run: mise exec -- cargo build --locked -p workspace-hack
+        if: steps.setup.outputs.cache-hit != 'true'
+        run: >-
+          mise exec -- cargo build --locked --workspace --tests
+          --exclude wyrd-sdk-python --exclude wyrd-sdk-ts --exclude wyrd-sdk-ts-testing
 
   # The complete gate, one parallel job per `gate:*` shard in mise.toml: the
   # same jobs a full-gate pull request runs. Live cloud and production-geometry
